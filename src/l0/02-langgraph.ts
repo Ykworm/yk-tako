@@ -1,17 +1,17 @@
 /**
  * ② LangGraph.js 版 —— 看运行时接管了什么
  *
- * 对照 ①：while 循环不见了。createReactAgent 帮你建了一张图：
+ * 对照 ①：while 循环不见了。createAgent 帮你建了一张图：
  *
- *      ┌──────────┐   tool_calls   ┌───────────┐
- *      │  agent   │ ─────────────→ │  ToolNode │
- *      │ (调模型) │ ←───────────── │ (执行工具) │
- *      └────┬─────┘   工具结果      └───────────┘
- *           │ 无 tool_calls
- *           ▼
- *          END
+ *      ┌────────────────┐   tool_calls   ┌───────────┐
+ *      │ model_request  │ ─────────────→ │   tools   │
+ *      │    (调模型)    │ ←───────────── │ (执行工具) │
+ *      └───────┬────────┘   工具结果      └───────────┘
+ *              │ 无 tool_calls
+ *              ▼
+ *             END
  *
- * 循环逻辑（toolsCondition）变成了图的"条件边"。
+ * 循环逻辑变成了图的条件边。
  * 真正值钱的是白送的三样东西：
  *   - checkpointer：每一轮状态自动落盘，thread_id 一给，重启进程会话还在（① 里没有）
  *   - stream()：图内每个节点的执行过程都能流式观测（① 里你只能干等 invoke）
@@ -21,12 +21,12 @@ import "dotenv/config";
 import * as readline from "node:readline/promises";
 import { HumanMessage } from "@langchain/core/messages";
 import { MemorySaver } from "@langchain/langgraph";
-import { createReactAgent } from "@langchain/langgraph/prebuilt";
+import { createAgent } from "langchain";
 import { model, modelRef } from "../config/model";
 import { tools } from "../tools";
 
-const agent = createReactAgent({
-  llm: model,
+const agent = createAgent({
+  model,
   tools,
   // MemorySaver = 内存版 checkpointer；换 PostgresSaver 就是生产级持久化
   checkpointer: new MemorySaver(),

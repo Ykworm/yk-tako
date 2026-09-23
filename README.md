@@ -47,7 +47,7 @@ TAKO_MODEL=deepseek/deepseek-v4-flash
 
 ```bash
 pnpm l0:raw          # ① 手写 while 循环
-pnpm l0:langgraph    # ② createReactAgent
+pnpm l0:langgraph    # ② createAgent
 pnpm l0:deepagents   # ③ createDeepAgent
 ```
 
@@ -67,7 +67,7 @@ pnpm typecheck
 
 **② LangGraph.js**（`src/l0/02-langgraph.ts`）
 
-`createReactAgent` 把循环收成一张图：`agent` 节点调模型，有工具调用就走到 `ToolNode`，否则结束。`MemorySaver` 按 `thread_id` 记住会话；`stream()` 能看到每个节点的增量。换 `PostgresSaver` 才是可重启的持久化，当前还是内存。
+`createAgent` 把循环收成一张图：`model_request` 节点调模型，有工具调用就走到 `tools`，否则结束。`MemorySaver` 按 `thread_id` 记住会话；`stream()` 能看到每个节点的增量。换 `PostgresSaver` 才是可重启的持久化，当前还是内存。
 
 **③ deepagents**（`src/l0/03-deepagents.ts`）
 

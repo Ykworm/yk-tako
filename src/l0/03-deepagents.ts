@@ -1,7 +1,7 @@
 /**
  * ③ deepagents 版 —— 看"harness"又白送了什么
  *
- * 对照 ②：代码几乎没变，但 createDeepAgent 在 createReactAgent 之上
+ * 对照 ②：代码几乎没变，但 createDeepAgent 在 createAgent 之上
  * 又叠了一整套中间件（middleware）。试试这些对话，感受差异：
  *
  *   - "帮我规划一下：先查现在时间，再算 1234*5678，最后写个总结"
