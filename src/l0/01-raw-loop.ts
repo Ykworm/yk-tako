@@ -59,6 +59,8 @@ async function chat(userInput: string, history: BaseMessage[]): Promise<void> {
 }
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+// 管道输入（如 printf | pnpm ...）结束时 stdin 会 EOF，直接干净退出
+rl.on("close", () => process.exit(0));
 const history: BaseMessage[] = [];
 console.log(`① 裸写版 agent（pi 式 while 循环）。模型 ${modelRef}。输入 quit 退出。\n`);
 

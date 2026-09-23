@@ -33,6 +33,8 @@ const agent = createAgent({
 });
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+// 管道输入（如 printf | pnpm ...）结束时 stdin 会 EOF，直接干净退出
+rl.on("close", () => process.exit(0));
 // 同一个 thread_id = 同一段会话；换一个就是新会话，互不干扰
 const config = { configurable: { thread_id: "demo-1" } };
 console.log(`② LangGraph.js 版 agent。模型 ${modelRef}。输入 quit 退出。\n`);

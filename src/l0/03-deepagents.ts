@@ -30,6 +30,8 @@ const agent = createDeepAgent({
 });
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+// 管道输入（如 printf | pnpm ...）结束时 stdin 会 EOF，直接干净退出
+rl.on("close", () => process.exit(0));
 const config = { configurable: { thread_id: "demo-1" } };
 console.log(`③ deepagents 版 agent（完整 harness）。模型 ${modelRef}。输入 quit 退出。\n`);
 

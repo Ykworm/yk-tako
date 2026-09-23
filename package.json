@@ -8,6 +8,7 @@
     "l0:raw": "tsx src/l0/01-raw-loop.ts",
     "l0:langgraph": "tsx src/l0/02-langgraph.ts",
     "l0:deepagents": "tsx src/l0/03-deepagents.ts",
+    "l1:guard": "tsx src/l1/01-tool-guard.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

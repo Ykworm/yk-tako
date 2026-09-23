@@ -230,3 +230,77 @@ if (last.tool_calls?.length) {
 `continue` 结束本轮循环，直接去取 `Object.entries` 的下一项。`!last` 为真时，后面的 `console.log` 不会执行。
 
 `last` 有值时，`!last` 为假，`continue` 不触发。执行流落到下一行 `if (last.tool_calls?.length)`。这条消息带了工具调用，就会打出 `调用:`。
+
+## 数组方法 `some`
+
+出处：`src/middleware/filesystemGuard.ts` 里判断路径是否在工作区内。
+
+```ts
+const inWorkspace = candidates.some((c) => c === root || c.startsWith(root + path.sep));
+```
+
+`candidates` 是候选路径数组。里面通常有两条：模型传来、经 `path.resolve` 得到的逻辑路径，以及 `realpath` 展开符号链接后的真实路径。`(c) => ...` 是交给 `some` 的回调，`c` 是当前这一项。函数体只有一个表达式时，表达式的值就是返回值，不必写 `return`。
+
+`some` 从第一项开始调用这个函数。只要有一项让函数返回真，`some` 立刻得到 `true`，剩下的项不再看。每一项都返回假时，`some` 得到 `false`。
+
+所以上面这行的意思是：只要其中一条在工作区内，`inWorkspace` 就是 `true`。
+
+手写等价于：
+
+```ts
+let inWorkspace = false;
+for (const c of candidates) {
+  if (c === root || c.startsWith(root + path.sep)) {
+    inWorkspace = true;
+    break;
+  }
+}
+```
+
+工作区根是 `/proj`，`candidates` 是 `["/proj/leak", "/private/etc/passwd"]` 时：第一项 `/proj/leak` 以 `/proj/` 开头，回调返回真，`some` 得到 `true`。第二条已经在工作区外，这一轮不会再被检查。
+
+同文件的 `pathMatches` 里也有一处 `some`，意思同样是候选路径里只要有一条配上这条 glob：
+
+```ts
+return pathCandidates.some((c) => re.test(c) || (prefixRe?.test(c) ?? false));
+```
+
+## 工具类型 `ReturnType<T>`
+
+仅类型。出处：`src/middleware/toolGuard.ts` 里 `toolGuardMiddleware` 返回对象的字段标注。
+
+```ts
+middleware: ReturnType<typeof createMiddleware>;
+```
+
+`ReturnType` 是 TypeScript 自带的工具类型（utility type），不用 import，直接写。给它一个函数类型，它抽出这个函数的返回值类型。上面这行读作：`middleware` 字段的类型 = `createMiddleware` 这个函数的返回值类型。
+
+`typeof createMiddleware` 先取这个函数值的类型（`typeof` 写在类型位置时是「取值的类型」，和运行时的 `typeof x === "string"` 不是同一回事），`ReturnType<...>` 再从中抽出返回类型。好处是不用手抄一份返回类型：`createMiddleware` 的实现改了，这里的标注自动跟着变，两处不会脱节。
+
+它的定义在 TypeScript 源码里只有一行：
+
+```ts
+type ReturnType<T> = T extends (...args: any[]) => infer R ? R : never;
+```
+
+读法：如果 `T` 能匹配「某个函数类型」，就用 `infer` 把返回值位置推断成一个新名字 `R` 并取出；否则得到 `never`。`extends ... ? ... : ...` 是类型位置的条件表达式，和运行时的三元表达式形状相同，但判断的是类型能不能匹配。
+
+手写等价于把返回类型抄一遍：
+
+```ts
+middleware: AgentMiddleware; // 假设 createMiddleware 返回的是这个类型
+```
+
+能写，但 `createMiddleware` 的返回类型一变，这处就要手动同步，漏了就类型报错或更糟——悄悄错着。
+
+同族的常用内置工具类型：
+
+| 工具类型 | 作用 |
+|---|---|
+| `Parameters<T>` | 抽函数的参数类型，得到一个元组 |
+| `Partial<T>` / `Required<T>` | 属性全变可选 / 全变必填 |
+| `Pick<T, K>` / `Omit<T, K>` | 只留 / 去掉指定属性 |
+| `Record<K, V>` | 构造「键是 K、值是 V」的对象类型 |
+| `Awaited<T>` | 拆掉 Promise，取出 resolve 的类型 |
+
+读第三方库的类型定义时，这一族出现频率很高。

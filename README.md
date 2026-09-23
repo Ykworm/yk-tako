@@ -6,13 +6,13 @@
 
 ## 当前进度
 
-停在 **L0**：三个可交互脚本，对照同一套模型和工具，看主循环被框架一层层接走之后还剩下什么。还没有 HTTP 服务、前端或持久化存储。
+进行到 **L1**：工具安全层三件套（命令守卫 / 文件守卫 / PII 脱敏）已上线，两个守卫都是三态（放行 / 硬拒 / 暂停问人），审批用 LangGraph 原生 `interrupt` 实现；工作区外访问默认弹审批，对齐 Codex 的 workspace-write 提权模型。
 
 | 层 | 能力 | 状态 |
 | --- | --- | --- |
-| L0 | tool-call 主循环 | 三个对照脚本 |
-| L1 | 工具权限与安全 | 下一步 |
-| L2 | 任务规划 | |
+| L0 | tool-call 主循环 | ✅ 三个对照脚本 |
+| L1 | 工具权限与安全 | ✅ 三件套中间件 + 人工审批 |
+| L2 | 任务规划 | 下一步 |
 | L3 | 上下文管理 | |
 | L4 | 子代理 | |
 | L5 | 记忆 | |
@@ -49,6 +49,7 @@ TAKO_MODEL=deepseek/deepseek-v4-flash
 pnpm l0:raw          # ① 手写 while 循环
 pnpm l0:langgraph    # ② createAgent
 pnpm l0:deepagents   # ③ createDeepAgent
+pnpm l1:guard        # L1 工具安全层（含人工审批，危险命令试试 rm -rf /tmp/xx）
 ```
 
 类型检查：
