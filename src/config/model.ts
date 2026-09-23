@@ -1,17 +1,36 @@
 import "dotenv/config";
+import { ChatAnthropic } from "@langchain/anthropic";
 import { ChatOpenAI } from "@langchain/openai";
+import { resolveModel, type ResolvedModel } from "./resolve";
+
+export type TakoChatModel = ChatOpenAI | ChatAnthropic;
 
 /**
- * 模型配置：DeepSeek（OpenAI 兼容接口）。
- * 想换厂商只改这里——LangChain 的模型抽象会把差异全部抹平，
- * 这就是为什么上层代码（agent、graph）一行都不用动。
+ * 多厂商入口，对齐 Octop / harness-agent 的模型工厂：
+ * 目录决定协议，协议决定 LangChain 类。
+ * openai 协议都走 ChatOpenAI，只换 baseURL；anthropic 协议走 ChatAnthropic。
+ * 三个 L0 脚本只依赖这里导出的 model。
  */
-export const model = new ChatOpenAI({
-  model: process.env.TAKO_MODEL ?? "deepseek-chat",
-  apiKey: process.env.DEEPSEEK_API_KEY,
-  configuration: {
-    baseURL: process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com",
-  },
-  // 温度放低：工具调用场景要的是稳定，不是文采
-  temperature: 0,
-});
+export const activeModel = resolveModel(process.env);
+export const modelRef = activeModel.ref;
+export const model: TakoChatModel = buildChatModel(activeModel);
+
+export function buildChatModel(resolved: ResolvedModel): TakoChatModel {
+  const { provider, modelId } = resolved;
+  // 温度放低：工具调用要的是稳定。
+  if (provider.protocol === "anthropic") {
+    return new ChatAnthropic({
+      model: modelId,
+      apiKey: provider.apiKey,
+      // SDK 会自己拼 /v1/messages，目录里的官方地址多写了一层 /v1。
+      anthropicApiUrl: provider.baseURL.replace(/\/v1\/?$/, ""),
+      temperature: 0,
+    });
+  }
+  return new ChatOpenAI({
+    model: modelId,
+    apiKey: provider.apiKey,
+    configuration: { baseURL: provider.baseURL },
+    temperature: 0,
+  });
+}

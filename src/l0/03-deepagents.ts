@@ -19,7 +19,7 @@ import * as readline from "node:readline/promises";
 import { HumanMessage } from "@langchain/core/messages";
 import { MemorySaver } from "@langchain/langgraph";
 import { createDeepAgent } from "deepagents";
-import { model } from "../config/model";
+import { model, modelRef } from "../config/model";
 import { tools } from "../tools";
 
 const agent = createDeepAgent({
@@ -31,7 +31,7 @@ const agent = createDeepAgent({
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const config = { configurable: { thread_id: "demo-1" } };
-console.log("③ deepagents 版 agent（完整 harness）。输入 quit 退出。\n");
+console.log(`③ deepagents 版 agent（完整 harness）。模型 ${modelRef}。输入 quit 退出。\n`);
 
 while (true) {
   const input = (await rl.question("你: ")).trim();

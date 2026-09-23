@@ -18,7 +18,7 @@ import {
   type BaseMessage,
 } from "@langchain/core/messages";
 import type { StructuredToolInterface } from "@langchain/core/tools";
-import { model } from "../config/model";
+import { model, modelRef } from "../config/model";
 import { tools } from "../tools";
 
 const toolsByName: Record<string, StructuredToolInterface> = Object.fromEntries(
@@ -60,7 +60,7 @@ async function chat(userInput: string, history: BaseMessage[]): Promise<void> {
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const history: BaseMessage[] = [];
-console.log("① 裸写版 agent（pi 式 while 循环）。输入 quit 退出。\n");
+console.log(`① 裸写版 agent（pi 式 while 循环）。模型 ${modelRef}。输入 quit 退出。\n`);
 
 while (true) {
   const input = (await rl.question("你: ")).trim();

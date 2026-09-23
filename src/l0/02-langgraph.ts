@@ -22,7 +22,7 @@ import * as readline from "node:readline/promises";
 import { HumanMessage } from "@langchain/core/messages";
 import { MemorySaver } from "@langchain/langgraph";
 import { createReactAgent } from "@langchain/langgraph/prebuilt";
-import { model } from "../config/model";
+import { model, modelRef } from "../config/model";
 import { tools } from "../tools";
 
 const agent = createReactAgent({
@@ -35,7 +35,7 @@ const agent = createReactAgent({
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 // 同一个 thread_id = 同一段会话；换一个就是新会话，互不干扰
 const config = { configurable: { thread_id: "demo-1" } };
-console.log("② LangGraph.js 版 agent。输入 quit 退出。\n");
+console.log(`② LangGraph.js 版 agent。模型 ${modelRef}。输入 quit 退出。\n`);
 
 while (true) {
   const input = (await rl.question("你: ")).trim();
