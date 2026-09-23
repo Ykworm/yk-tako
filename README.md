@@ -1,0 +1,93 @@
+# yk-tako
+
+从 pi 式 agent 循环长出来的 AI 工作伙伴。目标是生长式复刻 [Octop](https://github.com/TencentCloud/Octop) 的核心能力：每一层自己先写，卡住再对照 harness 源码，而不是把存量代码翻译过来。
+
+技术栈：TypeScript、LangGraph.js、deepagents、DeepSeek（OpenAI 兼容接口）。
+
+## 当前进度
+
+停在 **L0**：三个可交互脚本，对照同一套模型和工具，看主循环被框架一层层接走之后还剩下什么。还没有 HTTP 服务、前端或持久化存储。
+
+| 层 | 能力 | 状态 |
+| --- | --- | --- |
+| L0 | tool-call 主循环 | 三个对照脚本 |
+| L1 | 工具权限与安全 | 下一步 |
+| L2 | 任务规划 | |
+| L3 | 上下文管理 | |
+| L4 | 子代理 | |
+| L5 | 记忆 | |
+| L6 | 断点恢复与流式 | |
+| L7 | 多入口统一路由 | |
+| L8 | 多用户、多 Agent | |
+
+决策过程和 Octop 架构笔记在 `doc/`。
+
+## 快速开始
+
+需要 Node.js 与 [pnpm](https://pnpm.io/)。
+
+```bash
+pnpm install
+cp .env.example .env
+```
+
+在 `.env` 里填入 DeepSeek API Key：
+
+```bash
+DEEPSEEK_API_KEY=sk-你的key
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+TAKO_MODEL=deepseek-chat
+```
+
+三个脚本都是命令行对话，输入 `quit` 退出。可以试「现在几点」或「算一下 1234*5678」。
+
+```bash
+pnpm l0:raw          # ① 手写 while 循环
+pnpm l0:langgraph    # ② createReactAgent
+pnpm l0:deepagents   # ③ createDeepAgent
+```
+
+类型检查：
+
+```bash
+pnpm typecheck
+```
+
+## 三个 L0 脚本
+
+共用 `src/config/model.ts` 和 `src/tools/index.ts`（`get_current_time`、`calculate`）。差别只在循环由谁负责。
+
+**① 裸写版**（`src/l0/01-raw-loop.ts`）
+
+`while (true)`：把历史发给模型；没有 `tool_calls` 就结束本轮，否则执行工具、把 `ToolMessage` 塞回历史，再问一次。循环本身很短，状态持久化、中断、流式都不在这里。
+
+**② LangGraph.js**（`src/l0/02-langgraph.ts`）
+
+`createReactAgent` 把循环收成一张图：`agent` 节点调模型，有工具调用就走到 `ToolNode`，否则结束。`MemorySaver` 按 `thread_id` 记住会话；`stream()` 能看到每个节点的增量。换 `PostgresSaver` 才是可重启的持久化，当前还是内存。
+
+**③ deepagents**（`src/l0/03-deepagents.ts`）
+
+`createDeepAgent` 在上面再叠中间件。复杂任务会先列 todo，也可以写文件、派子代理。Octop 的 harness-agent 就是 `createDeepAgent` 加上自研中间件；后面每爬一层，就是往这里插一个。
+
+可以拿这句感受和前两版的差别：
+
+```text
+帮我规划一下：先查现在时间，再算 1234*5678，最后写个总结
+```
+
+## 目录
+
+```text
+src/
+  config/model.ts    模型配置，换厂商只改这里
+  tools/index.ts     工具定义
+  l0/                三个对照脚本
+doc/                 立项、技术路线、Octop 架构与移植计划
+  ts-syntax.md       读代码时记下的 TypeScript 语法
+```
+
+## 参考
+
+- Octop 源码：`/Users/yuweikang/dev/ykcode/Octop`
+- harness 包源码：`/Users/yuweikang/dev/ykcode/harness-pkg/`
+- WeKnora：`/Users/yuweikang/dev/ykcode/WeKnora`
