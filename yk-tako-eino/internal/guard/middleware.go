@@ -157,6 +157,11 @@ func (h *filesystemHandler) WrapInvokableToolCall(_ context.Context, endpoint ad
 	}, nil
 }
 
+// BeforeModelRewriteState 把历史里的密钥打码后再给模型。RewriteState 钩子官方
+// 允许就地改 state（chatmodel.go 的生命周期注释："can modify state"）；注意
+// state.Messages 与事件流、调用方 history 共享消息指针，这里的改写会写穿回
+// REPL 历史——当前语义下正是想要的（历史同样脱敏）。如果哪天需要"对模型脱敏、
+// 历史保留原文"，这里要先浅拷贝消息再改。
 func (h *piiHandler) BeforeModelRewriteState(ctx context.Context, state *adk.ChatModelAgentState, mc *adk.ModelContext) (context.Context, *adk.ChatModelAgentState, error) {
 	for _, msg := range state.Messages {
 		if msg == nil || msg.Content == "" {

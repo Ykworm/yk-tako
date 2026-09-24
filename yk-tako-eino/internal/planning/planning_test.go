@@ -121,7 +121,7 @@ func TestParallelWriteDoesNotReplace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(out, "错误：write_todos 每轮只能调用一次") {
+	if !strings.HasPrefix(out, "错误：write_todos 必须独占一轮") {
 		t.Fatalf("parallel: %q", out)
 	}
 	if len(kit.List.Snapshot()) != 0 {
@@ -149,6 +149,57 @@ func TestParallelWriteDoesNotReplace(t *testing.T) {
 	}
 	if !strings.HasPrefix(bad, "错误：") || len(kit.List.Snapshot()) != 1 {
 		t.Fatalf("非法 status 不该替换清单: %q %+v", bad, kit.List.Snapshot())
+	}
+}
+
+// write_todos 与干活工具同轮混排：write_todos 回错误、清单不动，同轮其它工具不受影响。
+func TestMixedTurnWriteRejected(t *testing.T) {
+	kit, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &adk.ChatModelAgentState{Messages: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{
+			{ID: "1", Type: "function", Function: schema.FunctionCall{Name: WriteTodosTool, Arguments: "{}"}},
+			{ID: "2", Type: "function", Function: schema.FunctionCall{Name: "get_current_time", Arguments: "{}"}},
+		}),
+	}}
+	if _, _, err := kit.Handler.AfterModelRewriteState(context.Background(), state, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Messages[0].ToolCalls) != 2 {
+		t.Fatal("混排防守不该改掉原有 tool call")
+	}
+	writeTool := kit.Middleware.AdditionalTools[0].(tool.InvokableTool)
+	out, err := writeTool.InvokableRun(context.Background(), `{"todos":[{"content":"查时间","status":"in_progress"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(out, "错误：write_todos 必须独占一轮") {
+		t.Fatalf("mixed turn: %q", out)
+	}
+	if len(kit.List.Snapshot()) != 0 {
+		t.Fatal("混排轮不该改清单")
+	}
+
+	// write_todos 独占一轮时不触发防守，清单正常更新。
+	solo := &adk.ChatModelAgentState{Messages: []*schema.Message{
+		schema.AssistantMessage("", []schema.ToolCall{
+			{ID: "3", Type: "function", Function: schema.FunctionCall{Name: WriteTodosTool, Arguments: "{}"}},
+		}),
+	}}
+	if _, _, err := kit.Handler.AfterModelRewriteState(context.Background(), solo, nil); err != nil {
+		t.Fatal(err)
+	}
+	out, err = writeTool.InvokableRun(context.Background(), `{"todos":[{"content":"查时间","status":"in_progress"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasPrefix(out, "错误") {
+		t.Fatalf("独占一轮应成功: %q", out)
+	}
+	if got := kit.List.Snapshot(); len(got) != 1 || got[0].Status != StatusInProgress {
+		t.Fatalf("独占一轮应更新清单: %+v", got)
 	}
 }
 

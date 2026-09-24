@@ -28,7 +28,7 @@ yk-tako 的主线实现（Go + Eino）。模型按厂商目录接，OpenAI 兼�
 
 L1 的三件套语义和 TypeScript 版一致：命令守卫三模式、文件守卫三态（区外默认问人）、API Key 打码。挂载点换成 ADK 的 `WrapInvokableToolCall`。审批用 `compose.StatefulInterrupt`，恢复用 `Runner.ResumeWithParams`。resume 值是 `"approve"` / `"reject"`。
 
-L2 手写版的四个零件和 `src/middleware/planning.ts` 相同：清单、`write_todos` 全量替换、紧凑中文提示词、并行防守，外加半途而废提醒。ChatModelAgent 没有自定义 state 频道，清单放在进程内，`/todos` 读它；checkpoint 不记这份清单。模型节点之后只看最后一条消息有没有 tool call，所以提醒不是追加一条 HumanMessage，而是补一次对模型隐藏的 `planning_nudge` 工具调用，让图走进工具节点再回到模型。并行的 `write_todos` 不改清单，只回错误，同轮其它工具照常执行。Eino 执行完工具总会回到模型，错误在同一轮就可见；LangGraph 在这一轮全是 `write_todos` 时会直接出图。
+L2 手写版的四个零件和 `src/middleware/planning.ts` 相同：清单、`write_todos` 全量替换、紧凑中文提示词、并行防守，外加半途而废提醒。ChatModelAgent 没有自定义 state 频道，清单放在进程内，`/todos` 读它；checkpoint 不记这份清单。模型节点之后只看最后一条消息有没有 tool call，所以提醒不是追加一条 HumanMessage，而是补一次对模型隐藏的 `planning_nudge` 工具调用，让图走进工具节点再回到模型。`write_todos` 同轮多次、或与其它干活工具同轮混排时不改清单、只回错误（全量替换语义要求清单更新独占一轮，混排会让清单状态和执行结果对不上时序），同轮其它工具照常执行。Eino 执行完工具总会回到模型，错误在同一轮就可见；LangGraph 在这一轮全是 `write_todos` 时会直接出图。
 
 官方对照用 `deep.New` 自带的 `write_todos`。Instruction 留空就是框架那篇长提示词（默认英文），回执是 JSON，没有提醒，也没有 L1 守卫。通用子代理和文件后端都关掉，工具只留时间和计算。
 
@@ -92,7 +92,8 @@ internal/config    厂商目录和模型工厂（TS 版曾共用同一份目录 
 internal/tools     时间、计算、bash、文件
 internal/guard     命令守卫、文件守卫、PII、ADK middleware
 internal/planning  手写任务清单、并行防守、半途而废提醒
-internal/planexec  planexecute 入口闸门（Gate/Plan/ToolsSummary）+ 事件解析（Classify）
+internal/planexec  planexecute 入口闸门（Gate/Plan/ToolsSummary）+ 事件解析与打印（Classify/Run）
 internal/fsbackend DeepAgent 用的本地文件后端
+internal/repl      控制台输入 + Clip/Exitf/Indent 打印小工具
 internal/adkrun    事件打印、interrupt 审批回路、内存 checkpoint
 ```

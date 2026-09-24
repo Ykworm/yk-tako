@@ -31,3 +31,28 @@ func (c *Console) ReadLine(prompt string) (string, bool) {
 	}
 	return line, true
 }
+
+// Clip 把多行文本压成一行，再按 rune 截断。工具回执的单行预览用它。
+func Clip(s string, n int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "…"
+}
+
+// Exitf 打印错误并退出。只在各脚本的 main 初始化阶段用。
+func Exitf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
+}
+
+// Indent 给每行加统一前导空格。任务清单的缩进打印用它。
+func Indent(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = "     " + line
+	}
+	return strings.Join(lines, "\n")
+}

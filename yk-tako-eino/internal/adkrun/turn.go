@@ -10,6 +10,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 	"yk-tako-eino/internal/guard"
 	"yk-tako-eino/internal/planning"
+	"yk-tako-eino/internal/repl"
 )
 
 // Store 是内存版 checkpoint。进程退出就没了，够演 interrupt。
@@ -159,12 +160,12 @@ func printMessage(agentName, root string, mv *adk.MessageVariant, msg *schema.Me
 		}
 		if name == planning.WriteTodosTool {
 			if list, ok := planning.IconList(msg.Content); ok {
-				fmt.Printf("  📋 %s任务清单:\n%s\n", prefix, indent(list))
+				fmt.Printf("  📋 %s任务清单:\n%s\n", prefix, repl.Indent(list))
 			} else if list, ok := planning.StatusList(msg.Content); ok {
 				fmt.Printf("  📋 %s任务清单: %s\n", prefix, list)
 			}
 		}
-		fmt.Printf("  ← 🔧 %s%s: %s\n", prefix, name, clip(msg.Content, 120))
+		fmt.Printf("  ← 🔧 %s%s: %s\n", prefix, name, repl.Clip(msg.Content, 120))
 		return
 	}
 	if msg.Content != "" {
@@ -207,21 +208,4 @@ func ensureNudgeCall(history []*schema.Message, msg *schema.Message) {
 			Arguments: "{}",
 		},
 	})
-}
-
-func indent(s string) string {
-	lines := strings.Split(s, "\n")
-	for i, line := range lines {
-		lines[i] = "     " + line
-	}
-	return strings.Join(lines, "\n")
-}
-
-func clip(s string, n int) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
-	}
-	return string(runes[:n]) + "…"
 }

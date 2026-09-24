@@ -26,15 +26,15 @@ func main() {
 	chatModel, ref := config.MustOpen(ctx)
 	cwd, err := os.Getwd()
 	if err != nil {
-		exitf("%v", err)
+		repl.Exitf("%v", err)
 	}
 	bash, err := tools.Bash(ctx)
 	if err != nil {
-		exitf("bash: %v", err)
+		repl.Exitf("bash: %v", err)
 	}
 	files, err := tools.Files(ctx)
 	if err != nil {
-		exitf("files: %v", err)
+		repl.Exitf("files: %v", err)
 	}
 	all := append(tools.MustBasic(ctx), bash)
 	all = append(all, files...)
@@ -52,7 +52,7 @@ func main() {
 		MaxIterations: 20,
 	})
 	if err != nil {
-		exitf("创建 agent: %v", err)
+		repl.Exitf("创建 agent: %v", err)
 	}
 	runner := adk.NewRunner(ctx, adk.RunnerConfig{
 		Agent:           agent,
@@ -112,9 +112,4 @@ func main() {
 		history = append(history, schema.UserMessage(input))
 		history = append(history, produced...)
 	}
-}
-
-func exitf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
-	os.Exit(1)
 }

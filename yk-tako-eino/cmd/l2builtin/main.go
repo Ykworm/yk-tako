@@ -12,7 +12,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/adk/prebuilt/deep"
@@ -36,7 +35,7 @@ func main() {
 		MaxIteration:           30,
 	})
 	if err != nil {
-		exitf("创建 DeepAgent: %v", err)
+		repl.Exitf("创建 DeepAgent: %v", err)
 	}
 	runner := adk.NewRunner(ctx, adk.RunnerConfig{
 		Agent:           agent,
@@ -63,9 +62,4 @@ func main() {
 		history = append(history, schema.UserMessage(input))
 		history = append(history, produced...)
 	}
-}
-
-func exitf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
-	os.Exit(1)
 }

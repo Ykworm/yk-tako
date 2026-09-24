@@ -10,7 +10,9 @@
 // Executor 每轮只执行计划的第一步，跑完才进 Replanner 改计划/收工。
 // 对应 Eino 分层思想：要不要规划 = 判断题交给模型（结构化收束），执行时序 = 编排题交给图。
 //
-// 工具只留时间和计算（同 l2builtin），不接 L1 守卫。试两句对比：
+// 工具只留时间和计算（同 l2builtin），不接 L1 守卫——Gate 不执行工具，
+// Executor 的 ExecutorConfig 不暴露 middleware 入口（见 planexec/gate.go 头注）。
+// 试两句对比：
 //
 //	1+1 等于几                                        # Gate 直接答复，不进循环
 //	帮我规划一下：先查现在时间，再算 1234*5678，最后写个总结  # Gate 出计划，逐步执行
@@ -19,8 +21,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
-	"strings"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/adk/prebuilt/planexecute"
@@ -49,26 +49,26 @@ func main() {
 		ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: ts}},
 	})
 	if err != nil {
-		exitf("创建 executor: %v", err)
+		repl.Exitf("创建 executor: %v", err)
 	}
 	replanner, err := planexecute.NewReplanner(ctx, &planexecute.ReplannerConfig{
 		ChatModel: planModel,
 	})
 	if err != nil {
-		exitf("创建 replanner: %v", err)
+		repl.Exitf("创建 replanner: %v", err)
 	}
 	loop, err := adk.NewLoopAgent(ctx, &adk.LoopAgentConfig{
 		SubAgents:     []adk.Agent{executor, replanner},
 		MaxIterations: 10, // 同 planexecute.New 的默认值
 	})
 	if err != nil {
-		exitf("创建 loop: %v", err)
+		repl.Exitf("创建 loop: %v", err)
 	}
 	agent, err := adk.NewSequentialAgent(ctx, &adk.SequentialAgentConfig{
 		SubAgents: []adk.Agent{gate, loop},
 	})
 	if err != nil {
-		exitf("创建 plan-execute agent: %v", err)
+		repl.Exitf("创建 plan-execute agent: %v", err)
 	}
 	runner := adk.NewRunner(ctx, adk.RunnerConfig{
 		Agent:           agent,
@@ -87,7 +87,7 @@ func main() {
 			continue
 		}
 		turn := append(append([]*schema.Message{}, history...), schema.UserMessage(input))
-		answer, err := run(ctx, runner, turn)
+		answer, err := planexec.Run(ctx, runner, turn)
 		if err != nil {
 			fmt.Println("出错了:", err)
 			continue
@@ -97,98 +97,4 @@ func main() {
 			history = append(history, schema.AssistantMessage(answer, nil))
 		}
 	}
-}
-
-// run 跑一轮 plan-execute，逐个打印阶段事件，返回 replanner 的最终答复。
-// 各阶段的中间消息（planner 的计划 JSON、executor 的步骤输入）不进入对话历史：
-// 它们是各 agent 用 GenModelInput 从 session 现拼的工作记忆，不是共享对话。
-// 历史只保留"用户说了什么 + 最终答复"，供下一轮规划参考。
-func run(ctx context.Context, runner *adk.Runner, input []*schema.Message) (string, error) {
-	iter := runner.Run(ctx, input)
-	var answer string
-	for {
-		event, ok := iter.Next()
-		if !ok {
-			return answer, nil
-		}
-		if event.Err != nil {
-			return answer, event.Err
-		}
-		if event.Output == nil || event.Output.MessageOutput == nil {
-			continue
-		}
-		msg, err := event.Output.MessageOutput.GetMessage()
-		if err != nil {
-			return answer, err
-		}
-		if msg == nil {
-			continue
-		}
-		if final, ok := printEvent(event.AgentName, event.Output.MessageOutput, msg); ok {
-			answer = final
-		}
-	}
-}
-
-// printEvent 按来源打印一条事件。gate / replanner 的"消息"其实是工具参数 JSON
-// （强制工具调用的产物），按形状分类后展示；executor 的是正常的工具调用循环。
-// 返回最终答复（gate respond 或 replanner respond）。
-func printEvent(agent string, mv *adk.MessageVariant, msg *schema.Message) (string, bool) {
-	if len(msg.ToolCalls) > 0 {
-		names := make([]string, 0, len(msg.ToolCalls))
-		for _, call := range msg.ToolCalls {
-			names = append(names, call.Function.Name)
-		}
-		fmt.Printf("  → 🔧 [%s] 调用: %s\n", agent, strings.Join(names, ", "))
-		return "", false
-	}
-	if mv.Role == schema.Tool || msg.Role == schema.Tool {
-		name := mv.ToolName
-		if name == "" {
-			name = msg.ToolName
-		}
-		fmt.Printf("  ← 🔧 %s: %s\n", name, clip(msg.Content, 120))
-		return "", false
-	}
-	if msg.Content == "" {
-		return "", false
-	}
-	kind, steps, response := planexec.Classify(msg.Content)
-	switch kind {
-	case planexec.KindPlan:
-		title := "📋 计划"
-		if agent == "replanner" {
-			title = "📋 更新计划（只含剩余步骤）"
-		}
-		fmt.Printf("  %s:\n", title)
-		for i, step := range steps {
-			fmt.Printf("     %d. %s\n", i+1, step)
-		}
-		fmt.Println()
-	case planexec.KindRespond:
-		fmt.Printf("\n🐙 %s\n\n", response)
-		return response, true
-	default:
-		// Gate 直接答复（respond）已是纯文本而非 JSON，按最终答复处理并进历史。
-		if agent == "gate" {
-			fmt.Printf("\n🐙 %s\n\n", msg.Content)
-			return msg.Content, true
-		}
-		fmt.Printf("  ✅ [%s] %s\n", agent, clip(msg.Content, 200))
-	}
-	return "", false
-}
-
-func clip(s string, n int) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
-	}
-	return string(runes[:n]) + "…"
-}
-
-func exitf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
-	os.Exit(1)
 }

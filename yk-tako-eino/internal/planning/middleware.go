@@ -14,9 +14,11 @@
 //     BeforeModelRewriteState 把它从模型可见的工具列表里拿掉。
 //     图走到工具再回到模型，效果和 jumpTo 一样，而且不会跳过同轮里其它待执行的工具。
 //
-// 并行防守也不跳回模型。多于一次 write_todos 时工具不改清单，只回错误。
-// 其它工具照常执行。LangGraph 在「这一轮全是 write_todos」时会直接出图，
-// 模型要到下一句用户输入才看见错误；Eino 执行完工具总会回到模型，所以错误在同一轮就可见。
+// 并行防守也不跳回模型。同轮出现多次 write_todos，或 write_todos 与其它干活工具
+// 混排时，write_todos 不改清单、只回错误，同轮其它工具照常执行。全量替换语义下
+// 清单更新必须独占一轮，混排会让清单状态和执行结果对不上时序。LangGraph 在
+// 「这一轮全是 write_todos」时会直接出图，模型要到下一句用户输入才看见错误；
+// Eino 执行完工具总会回到模型，所以错误在同一轮就可见。
 package planning
 
 import (
@@ -149,7 +151,7 @@ func (h *Handler) BeforeModelRewriteState(ctx context.Context, state *adk.ChatMo
 }
 
 // AfterModelRewriteState 看模型刚返回的那条消息。
-// 并行 write_todos 只打标记，不改消息，让同轮其它工具继续走。
+// write_todos 同轮多次、或与其它工具混排时只打标记，不改消息，让同轮其它工具继续走。
 // 该催的时候给这条助手消息补一次 planning_nudge，路由就会进工具节点再回到模型。
 func (h *Handler) AfterModelRewriteState(ctx context.Context, state *adk.ChatModelAgentState, _ *adk.ModelContext) (context.Context, *adk.ChatModelAgentState, error) {
 	h.setParallel(false)
@@ -166,7 +168,7 @@ func (h *Handler) AfterModelRewriteState(ctx context.Context, state *adk.ChatMod
 			writes++
 		}
 	}
-	if writes > 1 {
+	if writes > 1 || (writes == 1 && len(last.ToolCalls) > 1) {
 		h.setParallel(true)
 		return ctx, state, nil
 	}

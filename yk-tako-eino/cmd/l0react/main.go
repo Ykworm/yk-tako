@@ -8,8 +8,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
-	"strings"
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
@@ -35,7 +33,7 @@ func main() {
 		MaxStep: 40,
 	})
 	if err != nil {
-		exitf("创建 ReAct agent: %v", err)
+		repl.Exitf("创建 ReAct agent: %v", err)
 	}
 
 	console := repl.New()
@@ -78,7 +76,7 @@ func (t loggingTool) InvokableRun(ctx context.Context, args string, opts ...tool
 		fmt.Printf("  ← %s\n", err)
 		return "", err
 	}
-	fmt.Printf("  ← %s\n", clip(out, 100))
+	fmt.Printf("  ← %s\n", repl.Clip(out, 100))
 	return out, nil
 }
 
@@ -87,23 +85,9 @@ func logTools(items []tool.BaseTool) []tool.BaseTool {
 	for _, item := range items {
 		inv, ok := item.(tool.InvokableTool)
 		if !ok {
-			exitf("工具不能被同步调用")
+			repl.Exitf("工具不能被同步调用")
 		}
 		out = append(out, loggingTool{InvokableTool: inv})
 	}
 	return out
-}
-
-func clip(s string, n int) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
-	}
-	return string(runes[:n])
-}
-
-func exitf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
-	os.Exit(1)
 }

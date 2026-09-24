@@ -33,22 +33,22 @@ func main() {
 	chatModel, ref := config.MustOpen(ctx)
 	cwd, err := os.Getwd()
 	if err != nil {
-		exitf("%v", err)
+		repl.Exitf("%v", err)
 	}
 	bash, err := tools.Bash(ctx)
 	if err != nil {
-		exitf("bash: %v", err)
+		repl.Exitf("bash: %v", err)
 	}
 	files, err := tools.Files(ctx)
 	if err != nil {
-		exitf("files: %v", err)
+		repl.Exitf("files: %v", err)
 	}
 	all := append(tools.MustBasic(ctx), bash)
 	all = append(all, files...)
 
 	plan, err := planning.New(planning.Options{})
 	if err != nil {
-		exitf("planning: %v", err)
+		repl.Exitf("planning: %v", err)
 	}
 	engine := guard.NewEngine(guard.ModeApprove, nil)
 	guards := guard.Handlers(engine, guard.Options{WorkspaceRoot: cwd})
@@ -68,7 +68,7 @@ func main() {
 		MaxIterations: 30,
 	})
 	if err != nil {
-		exitf("创建 agent: %v", err)
+		repl.Exitf("创建 agent: %v", err)
 	}
 	runner := adk.NewRunner(ctx, adk.RunnerConfig{
 		Agent:           agent,
@@ -90,7 +90,7 @@ func main() {
 			continue
 		}
 		if input == "/todos" {
-			fmt.Printf("📋 当前任务清单:\n%s\n\n", indent(planning.FormatTodos(plan.List.Snapshot())))
+			fmt.Printf("📋 当前任务清单:\n%s\n\n", repl.Indent(planning.FormatTodos(plan.List.Snapshot())))
 			continue
 		}
 		if mode, ok := strings.CutPrefix(input, "/mode "); ok {
@@ -132,17 +132,4 @@ func main() {
 		history = append(history, schema.UserMessage(input))
 		history = append(history, produced...)
 	}
-}
-
-func indent(s string) string {
-	lines := strings.Split(s, "\n")
-	for i, line := range lines {
-		lines[i] = "     " + line
-	}
-	return strings.Join(lines, "\n")
-}
-
-func exitf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
-	os.Exit(1)
 }

@@ -10,6 +10,12 @@
 //   - 纯知识问答 → Gate 调 respond 直接答复 + Exit 动作终止 Sequential，Loop 不执行；
 //   - 需要工具/多步 → Gate 调 plan（prompt 里注入了 Executor 的工具清单，治幻觉），
 //     把计划写入 session，Loop 照常执行。
+//
+// 为什么 Gate 是裸 adk.Agent 而不是 ChatModelAgent：它不需要工具节点和循环，
+// 只要一次强制 tool_choice 调用 + 自己解析参数 + 发 Exit 动作，裸 Run 是最小表达。
+// 也因此 L1 的命令/文件守卫对它无的放矢——守卫包的是工具执行，Gate 不执行工具；
+// 执行侧的 planexecute.ExecutorConfig 又不暴露 middleware 入口，所以 l2planexec
+// 整体不接 L1 是有意为之，不是遗漏。
 package planexec
 
 import (
@@ -24,6 +30,7 @@ import (
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
+	"yk-tako-eino/internal/repl"
 )
 
 // Plan 是 planexecute.Plan 接口的最小实现——官方的 defaultPlan 未导出，
@@ -134,7 +141,7 @@ func (g *Gate) Run(ctx context.Context, input *adk.AgentInput, _ ...adk.AgentRun
 
 		tc := msg.ToolCalls[0]
 		if os.Getenv("GATE_DEBUG") != "" {
-			fmt.Fprintf(os.Stderr, "[gate debug] tool=%s args=%s\n", tc.Function.Name, clipRunes(tc.Function.Arguments, 200))
+			fmt.Fprintf(os.Stderr, "[gate debug] tool=%s args=%s\n", tc.Function.Name, repl.Clip(tc.Function.Arguments, 200))
 		}
 		switch tc.Function.Name {
 		case planexecute.RespondToolInfo.Name:
@@ -171,14 +178,6 @@ func (g *Gate) Run(ctx context.Context, input *adk.AgentInput, _ ...adk.AgentRun
 		}
 	}()
 	return iter
-}
-
-func clipRunes(s string, n int) string {
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
-	}
-	return string(runes[:n]) + "…"
 }
 
 // buildMessages 只把"当前请求"给闸门做决策，不给对话历史：

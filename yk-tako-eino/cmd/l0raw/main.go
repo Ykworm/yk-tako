@@ -7,7 +7,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
@@ -26,18 +25,18 @@ func main() {
 	for _, item := range baseTools {
 		inv, ok := item.(tool.InvokableTool)
 		if !ok {
-			exitf("工具不能被同步调用")
+			repl.Exitf("工具不能被同步调用")
 		}
 		info, err := inv.Info(ctx)
 		if err != nil {
-			exitf("%v", err)
+			repl.Exitf("%v", err)
 		}
 		infos = append(infos, info)
 		byName[info.Name] = inv
 	}
 	llm, err := chatModel.WithTools(infos)
 	if err != nil {
-		exitf("%v", err)
+		repl.Exitf("%v", err)
 	}
 
 	console := repl.New()
@@ -74,7 +73,7 @@ func chat(ctx context.Context, llm model.ToolCallingChatModel, byName map[string
 		for _, call := range ai.ToolCalls {
 			fmt.Printf("  → 🔧 %s(%s)\n", call.Function.Name, call.Function.Arguments)
 			result := runTool(ctx, byName[call.Function.Name], call.Function.Name, call.Function.Arguments)
-			fmt.Printf("  ← %s\n", clip(result, 100))
+			fmt.Printf("  ← %s\n", repl.Clip(result, 100))
 			history = append(history, schema.ToolMessage(result, call.ID, schema.WithToolName(call.Function.Name)))
 		}
 	}
@@ -89,17 +88,4 @@ func runTool(ctx context.Context, inv tool.InvokableTool, name, args string) str
 		return "工具执行失败: " + err.Error()
 	}
 	return result
-}
-
-func clip(s string, n int) string {
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
-	}
-	return string(runes[:n])
-}
-
-func exitf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
-	os.Exit(1)
 }
