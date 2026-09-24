@@ -151,10 +151,9 @@ channels（飞书/钉钉/QQ/Telegram/企微）+ manager + push_routing + hitl + 
 
 ## 4. 当前决策点
 
-~~唯一阻塞事项：阶段 3 的技术选型~~ → ✅ 已定案（2026-09-23）：**全栈 TypeScript**
-（LangGraph.js + deepagents JS，依据见《02-技术路线讨论》第 7 节；
-owner 曾用 TS/Go 双语复刻 pi agent，实测体感 TS 更适合）。
-生长式路线直接从 L1 开工（L0 已由 pi 复刻版覆盖）。
+~~唯一阻塞事项：阶段 3 的技术选型~~ → ✅ 已定案：**Go + Eino**（2026-09-24 终版，
+依据见《06-Eino规划机制调研与路线定案》；此前 2026-09-23 的"全栈 TypeScript"定案已被推翻，
+TS 实现已删除）。生长式路线从 L1 开工（L0 已由 pi 复刻版覆盖），L1/L2 已在 `yk-tako-eino/` 完成。
 
 ## 5. 计划调整（2026-09-23）：从"移植"改为"生长式复刻"
 
@@ -189,6 +188,23 @@ Google ADK 经验 = Agent/Runner/Session/子代理概念已见过
 | L7 | 多入口统一路由 | cron / Web / IM（HarnessProcessor） | |
 | L8 | 多用户/多 Agent | manager + runtime 层级 | |
 
+### 翻译原则（2026-09-24）：按 Eino 的思想复刻，WeKnora 补位
+
+复刻 Octop 是**功能翻译，不是设计移植**。每爬一层：
+
+- Octop / harness 源码只回答"**要什么**"——功能规格、行为对照、卡住时的参考答案；
+- "**怎么设计、怎么写**"一律遵循 Eino 的架构思想与工程最佳实践：compose
+  （Chain/Graph/Workflow）管确定性编排，ADK（ChatModelAgent / middleware / prebuilt）
+  管自主性，官方 prebuilt 优先于手搓，middleware 只做横切关注点——不被 Octop 的
+  Python/LangGraph 设计（middleware 矩阵、state 频道那套）带偏；
+- Eino **没有的类库**（长时记忆、RAG、MCP、IM 接入、沙箱、任务队列等），参考
+  WeKnora（`/Users/yuweikang/dev/ykcode/WeKnora`）的 Go 工程实现，
+  而不是找 Octop 的 Python 版对应物。
+
+L2 已经验证过一次：硬编排对照（`cmd/l2planexec`）直接用 Eino 官方 `planexecute` 编图，
+而不是翻译 LangGraph 的 afterModel 防守思路——那条路在 Eino 里根本不存在，硬翻只会碰壁
+（见《06》）。
+
 ### 对原六阶段 Plan 的修订
 
 - 原阶段 1（Agent 核心规格化）改为：**伴随式阅读**——不再先整块精读，
@@ -198,6 +214,8 @@ Google ADK 经验 = Agent/Runner/Session/子代理概念已见过
 - 新增收益：每层结束产出一篇小结（可作为系列技术博客素材）
 
 ### 选型影响
+
+> 2026-09-24 更新：选型已终版定为 Go/Eino（见《06》），本小节权衡仅作历史参考。
 
 生长式路线下，**语言选型 ≈ "pi 复刻版用什么语言写的 + 想在哪门语言里继续深入"**。
 阶梯在任何一门语言里都能爬，TS 与 Go 的权衡不变（见《02-技术路线讨论》第 7 节），
