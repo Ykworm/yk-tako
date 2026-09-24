@@ -28,6 +28,8 @@ import (
 	"yk-tako-eino/internal/tools"
 )
 
+// main 建 ChatModelAgent、手写 planning 中间件和 L1 守卫，进 REPL 循环，
+// 顺带支持 /todos 看清单和 /mode 切 ToolGuard 模式。
 func main() {
 	ctx := context.Background()
 	chatModel, ref := config.MustOpen(ctx)
@@ -63,7 +65,6 @@ func main() {
 		ToolsConfig: adk.ToolsConfig{
 			ToolsNodeConfig: compose.ToolsNodeConfig{Tools: all},
 		},
-		Middlewares:   []adk.AgentMiddleware{plan.Middleware},
 		Handlers:      handlers,
 		MaxIterations: 30,
 	})

@@ -7,6 +7,7 @@ import (
 	"yk-tako-eino/internal/planning"
 )
 
+// TestEnsureNudgeCall 验证提醒回执的 tool call 会被补回助手消息里。
 func TestEnsureNudgeCall(t *testing.T) {
 	assistant := schema.AssistantMessage("先总结到这", nil)
 	nudge := schema.ToolMessage(planning.NudgePrefix+" 还有 1 项", "call_nudge_1", schema.WithToolName(planning.NudgeTool))

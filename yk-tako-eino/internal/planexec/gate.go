@@ -39,6 +39,7 @@ type Plan struct {
 	Steps []string `json:"steps"`
 }
 
+// FirstStep 返回计划的第一步，Executor 每轮循环取它执行。
 func (p *Plan) FirstStep() string {
 	if len(p.Steps) == 0 {
 		return ""
@@ -46,11 +47,13 @@ func (p *Plan) FirstStep() string {
 	return p.Steps[0]
 }
 
+// MarshalJSON 用别名类型序列化，避开自己的方法递归。
 func (p *Plan) MarshalJSON() ([]byte, error) {
 	type alias Plan // 防止方法递归
 	return json.Marshal((*alias)(p))
 }
 
+// UnmarshalJSON 同上，反序列化也走别名类型。
 func (p *Plan) UnmarshalJSON(v []byte) error {
 	type alias Plan
 	return json.Unmarshal(v, (*alias)(p))
@@ -106,12 +109,15 @@ func NewGate(m model.ToolCallingChatModel, toolsSummary string) *Gate {
 	return &Gate{model: m, toolsSummary: toolsSummary}
 }
 
+// Name 是 agent 名。
 func (g *Gate) Name(context.Context) string { return "gate" }
 
+// Description 给上层看的一句话说明。
 func (g *Gate) Description(context.Context) string {
 	return "任务分流闸门：简单请求直接答复，复杂请求生成执行计划"
 }
 
+// Run 做一次强制 tool_choice 调用，按模型选的工具回答复或写计划，然后结束这轮。
 func (g *Gate) Run(ctx context.Context, input *adk.AgentInput, _ ...adk.AgentRunOption) *adk.AsyncIterator[*adk.AgentEvent] {
 	iter, gen := adk.NewAsyncIteratorPair[*adk.AgentEvent]()
 	go func() {

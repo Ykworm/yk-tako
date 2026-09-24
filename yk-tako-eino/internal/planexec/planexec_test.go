@@ -2,6 +2,7 @@ package planexec
 
 import "testing"
 
+// TestClassifyPlan 验证 steps 形状的 JSON 被认成计划。
 func TestClassifyPlan(t *testing.T) {
 	kind, steps, response := Classify(`{"steps":["查现在时间","算 1234*5678","写总结"]}`)
 	if kind != KindPlan {
@@ -15,6 +16,7 @@ func TestClassifyPlan(t *testing.T) {
 	}
 }
 
+// TestClassifyRespond 验证 response 形状的 JSON 被认成最终答复。
 func TestClassifyRespond(t *testing.T) {
 	kind, steps, response := Classify(`{"response":"现在是 2026 年，乘积是 7006652。"}`)
 	if kind != KindRespond {
@@ -28,6 +30,7 @@ func TestClassifyRespond(t *testing.T) {
 	}
 }
 
+// TestClassifyText 验证既不是计划也不是答复的文本原样归类。
 func TestClassifyText(t *testing.T) {
 	cases := []string{
 		"现在是下午三点。",         // 普通中文文本

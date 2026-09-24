@@ -13,6 +13,7 @@ type Console struct {
 	in *bufio.Reader
 }
 
+// New 建一个读 stdin 的控制台。
 func New() *Console {
 	return &Console{in: bufio.NewReader(os.Stdin)}
 }

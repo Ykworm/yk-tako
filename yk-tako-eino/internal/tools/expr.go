@@ -30,6 +30,7 @@ func Eval(expression string) (string, error) {
 	return formatNumber(value), nil
 }
 
+// formatNumber 整数不带小数点，其余用最短精确表示。
 func formatNumber(value float64) string {
 	if value == float64(int64(value)) {
 		return strconv.FormatInt(int64(value), 10)
@@ -37,17 +38,20 @@ func formatNumber(value float64) string {
 	return strconv.FormatFloat(value, 'f', -1, 64)
 }
 
+// parser 是递归下降解析器的游标：s 是表达式，i 是当前位置。
 type parser struct {
 	s string
 	i int
 }
 
+// skip 跳过空白字符。
 func (p *parser) skip() {
 	for p.i < len(p.s) && (p.s[p.i] == ' ' || p.s[p.i] == '\t') {
 		p.i++
 	}
 }
 
+// parseExpr 处理加减，优先级最低。
 func (p *parser) parseExpr() (float64, error) {
 	left, err := p.parseTerm()
 	if err != nil {
@@ -75,6 +79,7 @@ func (p *parser) parseExpr() (float64, error) {
 	}
 }
 
+// parseTerm 处理乘除取模，优先级高于加减。
 func (p *parser) parseTerm() (float64, error) {
 	left, err := p.parseUnary()
 	if err != nil {
@@ -111,6 +116,7 @@ func (p *parser) parseTerm() (float64, error) {
 	}
 }
 
+// parseUnary 处理一元正负号，允许连续叠加。
 func (p *parser) parseUnary() (float64, error) {
 	p.skip()
 	if p.i < len(p.s) && (p.s[p.i] == '+' || p.s[p.i] == '-') {
@@ -128,6 +134,7 @@ func (p *parser) parseUnary() (float64, error) {
 	return p.parsePrimary()
 }
 
+// parsePrimary 处理括号和数字字面量，递归的最底层。
 func (p *parser) parsePrimary() (float64, error) {
 	p.skip()
 	if p.i >= len(p.s) {

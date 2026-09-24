@@ -21,6 +21,7 @@ import (
 	"yk-tako-eino/internal/tools"
 )
 
+// main 建模型、工具和三层守卫，进 REPL 循环；审批走 interrupt 加 Resume。
 func main() {
 	ctx := context.Background()
 	chatModel, ref := config.MustOpen(ctx)

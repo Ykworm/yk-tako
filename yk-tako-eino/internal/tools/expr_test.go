@@ -2,6 +2,7 @@ package tools
 
 import "testing"
 
+// TestEval 验证四则运算结果和白名单之外字符的拒绝。
 func TestEval(t *testing.T) {
 	got, err := Eval("1234*5678")
 	if err != nil || got != "7006652" {

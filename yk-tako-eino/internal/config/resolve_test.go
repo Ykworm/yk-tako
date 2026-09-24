@@ -2,6 +2,7 @@ package config
 
 import "testing"
 
+// TestResolveDeepSeekBareName 验证只写模型名（不带厂商前缀）也能解析。
 func TestResolveDeepSeekBareName(t *testing.T) {
 	got, err := ResolveModel(Env{
 		"DEEPSEEK_API_KEY":  "sk-test",
@@ -22,6 +23,7 @@ func TestResolveDeepSeekBareName(t *testing.T) {
 	}
 }
 
+// TestResolveRequiresKey 验证没配密钥时报错，并把配置方法说清楚。
 func TestResolveRequiresKey(t *testing.T) {
 	if _, err := ResolveModel(Env{}); err == nil {
 		t.Fatal("expected missing provider error")

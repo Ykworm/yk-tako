@@ -18,6 +18,7 @@ import (
 	"yk-tako-eino/internal/tools"
 )
 
+// main 建 ReAct agent 和 REPL 循环；历史由脚本自己攒，每轮整段传进 agent。
 func main() {
 	ctx := context.Background()
 	chatModel, ref := config.MustOpen(ctx)
@@ -61,10 +62,12 @@ func main() {
 	}
 }
 
+// loggingTool 给工具包一层打印，演示时能看见调用和回执。
 type loggingTool struct {
 	tool.InvokableTool
 }
 
+// InvokableRun 打印调用和回执，再转交被包的工具。
 func (t loggingTool) InvokableRun(ctx context.Context, args string, opts ...tool.Option) (string, error) {
 	name := "tool"
 	if info, err := t.Info(ctx); err == nil && info != nil {
@@ -80,6 +83,7 @@ func (t loggingTool) InvokableRun(ctx context.Context, args string, opts ...tool
 	return out, nil
 }
 
+// logTools 把工具逐个包成带日志的版本。
 func logTools(items []tool.BaseTool) []tool.BaseTool {
 	out := make([]tool.BaseTool, 0, len(items))
 	for _, item := range items {

@@ -12,6 +12,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 )
 
+// init 把 interrupt 载荷注册进 schema，checkpoint 序列化靠它。
 func init() {
 	schema.RegisterName[ApprovalInfo]("tako_approval_info")
 	schema.RegisterName[savedCall]("tako_saved_call")
@@ -38,16 +39,19 @@ const (
 	ResumeReject  = "reject"
 )
 
+// toolGuardHandler 是命令守卫：扫规则命中，按模式拦、问或放行。
 type toolGuardHandler struct {
 	adk.BaseChatModelAgentMiddleware
 	engine *Engine
 }
 
+// filesystemHandler 是路径守卫：工作区内外、敏感文件规则都在这一层判。
 type filesystemHandler struct {
 	adk.BaseChatModelAgentMiddleware
 	options Options
 }
 
+// piiHandler 是出口脱敏：模型输入和工具输出各过一遍打码。
 type piiHandler struct {
 	adk.BaseChatModelAgentMiddleware
 }
@@ -61,6 +65,7 @@ func Handlers(engine *Engine, fs Options) []adk.ChatModelAgentMiddleware {
 	}
 }
 
+// WrapInvokableToolCall 包一层工具执行：先认自己那笔中断的续跑，再扫规则决定放行、打断还是拒绝。
 func (h *toolGuardHandler) WrapInvokableToolCall(_ context.Context, endpoint adk.InvokableToolCallEndpoint, tCtx *adk.ToolContext) (adk.InvokableToolCallEndpoint, error) {
 	return func(ctx context.Context, args string, opts ...tool.Option) (string, error) {
 		if stored, ok := ownInterrupt(ctx, kindToolGuard); ok {
@@ -98,6 +103,7 @@ const (
 	kindFSGuard   = "fs_guard"
 )
 
+// ownInterrupt 判断这次恢复是不是自己之前那次中断（Kind 用来分辨嵌套守卫里的归属）。
 func ownInterrupt(ctx context.Context, kind string) (savedCall, bool) {
 	was, has, stored := compose.GetInterruptState[savedCall](ctx)
 	if !was || !has || stored.Kind != kind {
@@ -106,12 +112,14 @@ func ownInterrupt(ctx context.Context, kind string) (savedCall, bool) {
 	return stored, true
 }
 
+// interruptCall 用保存的载荷重新暂停，把人的决定留给下一次 Resume。
 func interruptCall(ctx context.Context, kind string, stored savedCall) error {
 	return compose.StatefulInterrupt(ctx, ApprovalInfo{
 		Kind: kind, Tool: stored.Tool, Args: stored.Args, Message: stored.Message,
 	}, stored)
 }
 
+// approvalInfo 拼一份给 REPL 看的审批载荷。
 func approvalInfo(engine *Engine, toolName, args string) ApprovalInfo {
 	params := parseArgs(args)
 	findings := engine.Guard(toolName, params)
@@ -127,6 +135,7 @@ func approvalInfo(engine *Engine, toolName, args string) ApprovalInfo {
 	}
 }
 
+// WrapInvokableToolCall 包一层工具执行：先处理自己的中断，再按路径规则放行、问人或硬拒。
 func (h *filesystemHandler) WrapInvokableToolCall(_ context.Context, endpoint adk.InvokableToolCallEndpoint, tCtx *adk.ToolContext) (adk.InvokableToolCallEndpoint, error) {
 	return func(ctx context.Context, args string, opts ...tool.Option) (string, error) {
 		if stored, ok := ownInterrupt(ctx, kindFSGuard); ok {
@@ -172,6 +181,7 @@ func (h *piiHandler) BeforeModelRewriteState(ctx context.Context, state *adk.Cha
 	return ctx, state, nil
 }
 
+// WrapInvokableToolCall 把工具输出里的密钥打码后再交回给模型。
 func (h *piiHandler) WrapInvokableToolCall(_ context.Context, endpoint adk.InvokableToolCallEndpoint, _ *adk.ToolContext) (adk.InvokableToolCallEndpoint, error) {
 	return func(ctx context.Context, args string, opts ...tool.Option) (string, error) {
 		out, err := endpoint(ctx, args, opts...)
@@ -182,6 +192,7 @@ func (h *piiHandler) WrapInvokableToolCall(_ context.Context, endpoint adk.Invok
 	}, nil
 }
 
+// resumeDecision 读这次 Resume 带回来的人的决定。
 func resumeDecision(ctx context.Context) (string, bool) {
 	isTarget, hasData, data := compose.GetResumeContext[string](ctx)
 	if !isTarget || !hasData {
@@ -190,6 +201,7 @@ func resumeDecision(ctx context.Context) (string, bool) {
 	return data, true
 }
 
+// parseArgs 把工具参数 JSON 解成 map；解不开就原样放进 _raw，规则照样能扫到。
 func parseArgs(raw string) map[string]any {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -202,6 +214,7 @@ func parseArgs(raw string) map[string]any {
 	return params
 }
 
+// formatFindings 把命中清单排成人读的几行，最多列 5 条。
 func formatFindings(findings []Finding, header string) string {
 	toolName := "?"
 	if len(findings) > 0 {

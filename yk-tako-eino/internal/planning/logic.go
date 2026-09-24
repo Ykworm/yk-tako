@@ -176,6 +176,7 @@ func StatusList(content string) (string, bool) {
 	return strings.Join(parts, " | "), true
 }
 
+// incomplete 过滤出未完成项（pending 和 in_progress）。
 func incomplete(todos []Todo) []Todo {
 	out := make([]Todo, 0, len(todos))
 	for _, todo := range todos {
@@ -186,6 +187,7 @@ func incomplete(todos []Todo) []Todo {
 	return out
 }
 
+// hasInProgress 判断清单里是否有进行中的项。
 func hasInProgress(todos []Todo) bool {
 	for _, todo := range todos {
 		if todo.Status == StatusInProgress {
@@ -195,6 +197,7 @@ func hasInProgress(todos []Todo) bool {
 	return false
 }
 
+// isWriteTodosResult 判断消息是否是 write_todos 的工具结果。
 func isWriteTodosResult(msg *schema.Message) bool {
 	if msg.Role != schema.Tool && msg.ToolCallID == "" {
 		return false
@@ -202,10 +205,12 @@ func isWriteTodosResult(msg *schema.Message) bool {
 	return msg.ToolName == WriteTodosTool || msg.Name == WriteTodosTool
 }
 
+// isErrorReceipt 判断回执是否为错误提示。
 func isErrorReceipt(content string) bool {
 	return strings.HasPrefix(content, "错误")
 }
 
+// validate 校验每项 status 取值是否合法。
 func validate(todos []Todo) error {
 	for i, todo := range todos {
 		switch todo.Status {

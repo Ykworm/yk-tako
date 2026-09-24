@@ -16,6 +16,7 @@ import (
 	"yk-tako-eino/internal/tools"
 )
 
+// main 建模型和工具后进 REPL 循环，每次输入交给 chat 跑完整轮。
 func main() {
 	ctx := context.Background()
 	chatModel, ref := config.MustOpen(ctx)
@@ -58,6 +59,7 @@ func main() {
 	}
 }
 
+// chat 就是手写的那层循环：发历史给模型，有 tool_calls 就执行工具再问一次。
 func chat(ctx context.Context, llm model.ToolCallingChatModel, byName map[string]tool.InvokableTool, history []*schema.Message, input string) ([]*schema.Message, error) {
 	history = append(history, schema.UserMessage(input))
 	for {
@@ -79,6 +81,7 @@ func chat(ctx context.Context, llm model.ToolCallingChatModel, byName map[string
 	}
 }
 
+// runTool 同步执行一次工具调用；失败也当文本回执交给模型，不中断循环。
 func runTool(ctx context.Context, inv tool.InvokableTool, name, args string) string {
 	if inv == nil {
 		return "未知工具: " + name

@@ -9,10 +9,12 @@ import (
 	"github.com/cloudwego/eino/components/tool/utils"
 )
 
+// readArgs 是 read_file 的参数。
 type readArgs struct {
 	Path string `json:"path" jsonschema:"description=文件路径，绝对路径或相对当前目录"`
 }
 
+// writeArgs 是 write_file 的参数。
 type writeArgs struct {
 	Path    string `json:"path" jsonschema:"description=文件路径"`
 	Content string `json:"content" jsonschema:"description=要写入的完整内容"`

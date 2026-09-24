@@ -9,8 +9,10 @@ import (
 	"github.com/cloudwego/eino/components/tool/utils"
 )
 
+// emptyArgs 是无参工具的占位参数。
 type emptyArgs struct{}
 
+// calcArgs 是 calculate 的参数。
 type calcArgs struct {
 	Expression string `json:"expression" jsonschema:"description=要计算的数学表达式，例如 1234*5678"`
 }

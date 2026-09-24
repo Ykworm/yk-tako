@@ -40,6 +40,7 @@ func OpenForForcedToolChoice(ctx context.Context) (model.ToolCallingChatModel, s
 	return open(ctx, true)
 }
 
+// open 是 Open 和 OpenForForcedToolChoice 的共同入口：读环境、解析厂商模型、建客户端。
 func open(ctx context.Context, forForcedToolChoice bool) (model.ToolCallingChatModel, string, error) {
 	LoadDotEnv()
 	resolved, err := ResolveModel(Environ())
@@ -53,6 +54,7 @@ func open(ctx context.Context, forForcedToolChoice bool) (model.ToolCallingChatM
 	return chatModel, resolved.Ref, nil
 }
 
+// build 按协议建客户端：anthropic 走 claude，openai 兼容走 openai，只换 baseURL。
 func build(ctx context.Context, resolved ResolvedModel, forForcedToolChoice bool) (model.ToolCallingChatModel, error) {
 	temp := float32(0)
 	provider := resolved.Provider
@@ -98,6 +100,7 @@ func MustOpenForForcedToolChoice(ctx context.Context) (model.ToolCallingChatMode
 	return must(OpenForForcedToolChoice(ctx))
 }
 
+// must 把「建模型失败」压成脚本级退出，省得每个 main 重复写。
 func must(chatModel model.ToolCallingChatModel, ref string, err error) (model.ToolCallingChatModel, string) {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

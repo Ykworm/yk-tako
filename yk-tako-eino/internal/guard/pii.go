@@ -5,6 +5,7 @@ import (
 	"sort"
 )
 
+// span 是文本里一段待脱敏的区间。
 type span struct {
 	start int
 	end   int
@@ -56,6 +57,7 @@ func MaskSecrets(text string) string {
 	return text
 }
 
+// maskToken 保留头尾各 4 位、中间打星；太短的整个打星。
 func maskToken(value string) string {
 	if len(value) <= 8 {
 		return "********"[:len(value)]

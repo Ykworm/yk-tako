@@ -2,6 +2,7 @@ package guard
 
 import "testing"
 
+// TestToolGuard 验证危险命令识别、注释行处理，以及两种模式下拦不拦。
 func TestToolGuard(t *testing.T) {
 	engine := NewEngine(ModeBlock, nil)
 	rm := engine.Guard("bash", map[string]any{"command": "rm -rf /tmp/l1test"})
@@ -36,6 +37,7 @@ func TestToolGuard(t *testing.T) {
 	}
 }
 
+// TestFilesystemGuard 验证工作区内放行、敏感文件和越界路径的处置。
 func TestFilesystemGuard(t *testing.T) {
 	opts := Options{WorkspaceRoot: t.TempDir()}
 	env := Decide(opts, "read_file", map[string]any{"path": opts.WorkspaceRoot + "/notes.txt"})
@@ -60,6 +62,7 @@ func TestFilesystemGuard(t *testing.T) {
 	}
 }
 
+// TestMaskSecrets 验证密钥被打码，且二次打码结果稳定（幂等）。
 func TestMaskSecrets(t *testing.T) {
 	key := "sk-" + "abcdefghijklmnopqrstuvwxyz"
 	masked := MaskSecrets("我的 key 是 " + key)
@@ -76,6 +79,7 @@ func TestMaskSecrets(t *testing.T) {
 	}
 }
 
+// containsStars 判断字符串里有没有星号，用来确认打码确实发生。
 func containsStars(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] == '*' {

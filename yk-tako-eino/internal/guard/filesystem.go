@@ -7,6 +7,7 @@ import (
 	"strings"
 )
 
+// opKind 把文件工具分成读、写两类，规则按它匹配。
 type opKind string
 
 const (
@@ -19,6 +20,7 @@ var fsToolOps = map[string]opKind{
 	"write_file": opWrite, "edit_file": opWrite, "delete": opWrite,
 }
 
+// Action 是路径规则的处置结果。
 type Action string
 
 const (
@@ -27,6 +29,7 @@ const (
 	Ask   Action = "ask"
 )
 
+// FsRule 是一条路径规则：命中 Paths（glob）且操作在 Ops 里，就按 Mode 处置。
 type FsRule struct {
 	Paths  []string
 	Ops    []opKind
@@ -34,12 +37,14 @@ type FsRule struct {
 	Reason string
 }
 
+// Options 是文件守卫的配置：工作区根目录、用户规则、越界时的默认处置。
 type Options struct {
 	WorkspaceRoot    string
 	Rules            []FsRule
 	OutsideWorkspace Action
 }
 
+// Decision 是 Decide 的结论：动作加一句给人看的理由。
 type Decision struct {
 	Action Action
 	Reason string
@@ -50,6 +55,7 @@ var defaultFsRules = []FsRule{
 	{Paths: []string{"/etc/**", "/private/etc/**", "/System/**", "/usr/**", "/bin/**", "/sbin/**"}, Ops: []opKind{opWrite}, Mode: Deny, Reason: "系统目录不可写"},
 }
 
+// pathFromArgs 从工具参数里取路径，兼容 path / file_path 两种写法。
 func pathFromArgs(params map[string]any) string {
 	for _, key := range []string{"path", "file_path"} {
 		raw, ok := params[key].(string)
@@ -60,6 +66,7 @@ func pathFromArgs(params map[string]any) string {
 	return ""
 }
 
+// globToRegExp 把 glob 编译成正则：**/ 可跨目录，* 不跨 /，~ 展开成 HOME。
 func globToRegExp(glob string) *regexp.Regexp {
 	expanded := glob
 	if strings.HasPrefix(glob, "~") {
@@ -85,6 +92,7 @@ func globToRegExp(glob string) *regexp.Regexp {
 	return regexp.MustCompile("^" + re + "$")
 }
 
+// pathMatches 逐个候选项比对；模式以 /** 结尾时，目录本身也算命中。
 func pathMatches(candidates []string, pattern string) bool {
 	re := globToRegExp(pattern)
 	var prefix *regexp.Regexp
@@ -102,6 +110,7 @@ func pathMatches(candidates []string, pattern string) bool {
 	return false
 }
 
+// realpathIfAvailable 解析符号链接；路径还不存在时解析失败，返回空串。
 func realpathIfAvailable(path string) string {
 	real, err := filepath.EvalSymlinks(path)
 	if err != nil {
@@ -182,6 +191,7 @@ func Decide(options Options, toolName string, params map[string]any) Decision {
 	return Decision{Action: outside, Reason: verb + " " + absolute + "（超出工作区 " + root + "）"}
 }
 
+// containsOp 判断规则是否覆盖某个操作。
 func containsOp(ops []opKind, op opKind) bool {
 	for _, candidate := range ops {
 		if candidate == op {

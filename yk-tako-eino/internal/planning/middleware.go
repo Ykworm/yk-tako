@@ -62,28 +62,55 @@ type Options struct {
 
 // Planning 是挂到 ChatModelAgent 上的一整套：提示词、两个工具、状态钩子、清单。
 type Planning struct {
-	List       *List
-	Middleware adk.AgentMiddleware
-	Handler    *Handler
+	List    *List
+	Handler *Handler
+	Tools   []tool.BaseTool
 }
 
 // Handler 负责模型前后的两道检查。工具闭包和它共享同一份清单。
+// 并行防守标记不放在 Handler 上：它描述的是「本次运行刚产生的这批工具调用」，
+// 写进 Eino 的 run-local 状态，两次并发运行各读各的；interrupt/resume 时
+// run-local 值随状态一起序列化和恢复，标记不会丢。
+// 不放 session：session value 会触发默认 GenModelInput 把提示词当 FString
+// 模板格式化，自定义提示词里出现 {} 就会报错；run-local 不参与那套格式化。
 type Handler struct {
 	adk.BaseChatModelAgentMiddleware
 	list   *List
+	prompt string
+	tools  []tool.BaseTool
 	nudge  bool
 	mu     sync.Mutex
-	reject bool
 	seq    int
 }
 
+// rejectKey 是本次运行 run-local 状态里并行防守标记的键。
+const rejectKey = "planning.parallel_write_reject"
+
+// setParallel 把本次运行的并行防守标记写进 run-local 状态。
+// 不在 agent 运行上下文里（比如脱离 agent 直接调用）时是空操作。
+func setParallel(ctx context.Context, reject bool) {
+	_ = adk.SetRunLocalValue(ctx, rejectKey, reject)
+}
+
+// parallelRejected 读本次运行的并行防守标记；读不到就当未标记。
+func parallelRejected(ctx context.Context) bool {
+	v, ok, err := adk.GetRunLocalValue(ctx, rejectKey)
+	if err != nil {
+		return false
+	}
+	reject, _ := v.(bool)
+	return ok && reject
+}
+
+// writeTodosArgs 是 write_todos 的参数。
 type writeTodosArgs struct {
 	Todos []Todo `json:"todos" jsonschema:"description=完整的任务清单（全量替换现有清单）"`
 }
 
+// emptyArgs 是 planning_nudge 的占位参数。
 type emptyArgs struct{}
 
-// New 建好手写规划。Middleware 注入提示词和工具，Handler 插进 Handlers，顺序在文件守卫之后、PII 之前。
+// New 建好手写规划。Handler 注入提示词和工具，插进 Handlers，顺序在文件守卫之后、PII 之前。
 func New(opts Options) (*Planning, error) {
 	list := &List{}
 	handler := &Handler{list: list, nudge: !opts.DisableNudge}
@@ -107,18 +134,31 @@ func New(opts Options) (*Planning, error) {
 	if prompt == "" {
 		prompt = defaultPrompt
 	}
+	handler.prompt = prompt
+	handler.tools = []tool.BaseTool{writeTool, nudgeTool}
 	return &Planning{
-		List: list,
-		Middleware: adk.AgentMiddleware{
-			AdditionalInstruction: prompt,
-			AdditionalTools:       []tool.BaseTool{writeTool, nudgeTool},
-		},
+		List:    list,
 		Handler: handler,
+		Tools:   handler.tools,
 	}, nil
 }
 
-func (h *Handler) writeTodos(_ context.Context, args writeTodosArgs) (string, error) {
-	if h.parallelRejected() {
+// BeforeAgent 把规划提示词和两个工具注入 agent 运行时。
+func (h *Handler) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelAgentContext) (context.Context, *adk.ChatModelAgentContext, error) {
+	if h.prompt != "" {
+		if runCtx.Instruction != "" {
+			runCtx.Instruction += "\n\n"
+		}
+		runCtx.Instruction += h.prompt
+	}
+	runCtx.Tools = append(runCtx.Tools, h.tools...)
+	return ctx, runCtx, nil
+}
+
+// writeTodos 处理 write_todos 工具调用：校验后全量替换清单。
+// 并行防守命中时只回错误，不改清单。标记从本次运行的 session 读。
+func (h *Handler) writeTodos(ctx context.Context, args writeTodosArgs) (string, error) {
+	if parallelRejected(ctx) {
 		return parallelError, nil
 	}
 	if err := validate(args.Todos); err != nil {
@@ -128,14 +168,16 @@ func (h *Handler) writeTodos(_ context.Context, args writeTodosArgs) (string, er
 	return Receipt(args.Todos), nil
 }
 
+// remind 处理 planning_nudge 工具调用：返回未完成清单的提醒正文。
+// 系统合成调用用，模型不该主动调它。
 func (h *Handler) remind(context.Context, emptyArgs) (string, error) {
 	return NudgeText(h.list.Snapshot()), nil
 }
 
-// BeforeModelRewriteState 清掉上一轮的并行标记，并让模型看不见 planning_nudge。
+// BeforeModelRewriteState 清掉本次运行上一轮的并行标记，并让模型看不见 planning_nudge。
 // 工具仍留在工具节点上，图可以执行这次合成调用。
 func (h *Handler) BeforeModelRewriteState(ctx context.Context, state *adk.ChatModelAgentState, _ *adk.ModelContext) (context.Context, *adk.ChatModelAgentState, error) {
-	h.setParallel(false)
+	setParallel(ctx, false)
 	if state == nil {
 		return ctx, state, nil
 	}
@@ -154,7 +196,7 @@ func (h *Handler) BeforeModelRewriteState(ctx context.Context, state *adk.ChatMo
 // write_todos 同轮多次、或与其它工具混排时只打标记，不改消息，让同轮其它工具继续走。
 // 该催的时候给这条助手消息补一次 planning_nudge，路由就会进工具节点再回到模型。
 func (h *Handler) AfterModelRewriteState(ctx context.Context, state *adk.ChatModelAgentState, _ *adk.ModelContext) (context.Context, *adk.ChatModelAgentState, error) {
-	h.setParallel(false)
+	setParallel(ctx, false)
 	if state == nil || len(state.Messages) == 0 {
 		return ctx, state, nil
 	}
@@ -169,7 +211,7 @@ func (h *Handler) AfterModelRewriteState(ctx context.Context, state *adk.ChatMod
 		}
 	}
 	if writes > 1 || (writes == 1 && len(last.ToolCalls) > 1) {
-		h.setParallel(true)
+		setParallel(ctx, true)
 		return ctx, state, nil
 	}
 	if ShouldNudge(state.Messages, h.list.Snapshot(), h.nudge) {
@@ -178,18 +220,8 @@ func (h *Handler) AfterModelRewriteState(ctx context.Context, state *adk.ChatMod
 	return ctx, state, nil
 }
 
-func (h *Handler) setParallel(reject bool) {
-	h.mu.Lock()
-	h.reject = reject
-	h.mu.Unlock()
-}
-
-func (h *Handler) parallelRejected() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.reject
-}
-
+// attachNudge 给助手消息追加一次合成的 planning_nudge 工具调用，
+// 让路由进工具节点再回到模型，实现同轮提醒。
 func (h *Handler) attachNudge(msg *schema.Message) {
 	h.mu.Lock()
 	h.seq++

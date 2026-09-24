@@ -11,6 +11,7 @@ import (
 	"github.com/cloudwego/eino/components/tool/utils"
 )
 
+// bashArgs 是 bash 的参数。
 type bashArgs struct {
 	Command string `json:"command" jsonschema:"description=要执行的 shell 命令"`
 }
@@ -43,6 +44,7 @@ func Bash(ctx context.Context) (tool.BaseTool, error) {
 		})
 }
 
+// joinOutput 合并 stdout 和 stderr，各自去掉首尾空白，空的就不占位置。
 func joinOutput(stdout, stderr string) string {
 	stdout = trimSpace(stdout)
 	stderr = trimSpace(stderr)
@@ -56,6 +58,7 @@ func joinOutput(stdout, stderr string) string {
 	}
 }
 
+// trimSpace 去掉首尾的空白字符（含换行和制表符）。
 func trimSpace(s string) string {
 	for len(s) > 0 && (s[0] == ' ' || s[0] == '\n' || s[0] == '\t' || s[0] == '\r') {
 		s = s[1:]

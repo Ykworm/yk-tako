@@ -11,6 +11,7 @@ import (
 // Env 是进程环境的快照。测试直接传 map，不碰真正的环境变量。
 type Env map[string]string
 
+// ResolvedProvider 是解析后的一家厂商：id、协议、地址、密钥、可选模型都齐了。
 type ResolvedProvider struct {
 	ID       string
 	Name     string
@@ -20,6 +21,7 @@ type ResolvedProvider struct {
 	Models   []ModelPreset
 }
 
+// ResolvedModel 是这次要用的模型：厂商加模型 id，Ref 是能打印的 厂商/模型。
 type ResolvedModel struct {
 	// Ref 带厂商前缀。模型 id 本身也可以含 /。
 	Ref      string
@@ -27,12 +29,15 @@ type ResolvedModel struct {
 	Provider ResolvedProvider
 }
 
+// customKey 认出 TAKO_PROVIDER_<名字>_API_KEY 这类自定义厂商密钥变量。
 var customKey = regexp.MustCompile(`^TAKO_PROVIDER_([A-Z0-9]+)_API_KEY$`)
 
+// envToken 把厂商 id 转成环境变量里的大写下划线形式。
 func envToken(providerID string) string {
 	return strings.ToUpper(strings.ReplaceAll(providerID, "-", "_"))
 }
 
+// presetForEnvName 拿变量里的名字去目录里找厂商，下划线和短横线都认。
 func presetForEnvName(raw string) (ProviderPreset, bool) {
 	lower := strings.ToLower(raw)
 	if preset, ok := findPreset(lower); ok {
@@ -41,6 +46,7 @@ func presetForEnvName(raw string) (ProviderPreset, bool) {
 	return findPreset(strings.ReplaceAll(lower, "_", "-"))
 }
 
+// baseURLFor 定 baseURL：专用变量优先，其次厂商级变量，最后目录默认值。
 func baseURLFor(env Env, preset *ProviderPreset, rawEnvName string) string {
 	if specific := strings.TrimSpace(env["TAKO_PROVIDER_"+rawEnvName+"_BASE_URL"]); specific != "" {
 		return specific
@@ -67,6 +73,7 @@ func baseURLFor(env Env, preset *ProviderPreset, rawEnvName string) string {
 	return preset.BaseURL
 }
 
+// protocolFor 定协议：专用变量优先，其次目录预设，最后按 openai 兼容处理。
 func protocolFor(env Env, preset *ProviderPreset, rawEnvName string) (ProtocolName, error) {
 	raw := strings.ToLower(strings.TrimSpace(env["TAKO_PROVIDER_"+rawEnvName+"_PROTOCOL"]))
 	switch ProtocolName(raw) {
@@ -82,6 +89,7 @@ func protocolFor(env Env, preset *ProviderPreset, rawEnvName string) (ProtocolNa
 	}
 }
 
+// discoverProviders 扫环境变量里的各家 API Key，拼出已配置的厂商（按变量名排序，结果稳定）。
 func discoverProviders(env Env) ([]ResolvedProvider, error) {
 	byID := map[string]ResolvedProvider{}
 	var order []string
@@ -161,6 +169,7 @@ func discoverProviders(env Env) ([]ResolvedProvider, error) {
 	return out, nil
 }
 
+// withOllama 处理本地 Ollama：只有 TAKO_MODEL 指到 ollama/ 时才补这条厂商。
 func withOllama(providers []ResolvedProvider, env Env, spec string) []ResolvedProvider {
 	for _, provider := range providers {
 		if provider.ID == "ollama" {
@@ -202,10 +211,12 @@ func withOllama(providers []ResolvedProvider, env Env, spec string) []ResolvedPr
 	})
 }
 
+// pack 把厂商和模型 id 打包成解析结果。
 func pack(provider ResolvedProvider, modelID string) ResolvedModel {
 	return ResolvedModel{Provider: provider, ModelID: modelID, Ref: provider.ID + "/" + modelID}
 }
 
+// exampleRef 给报错信息造一个当前就能用的 TAKO_MODEL 例子。
 func exampleRef(provider ResolvedProvider) string {
 	modelID := "模型名"
 	if len(provider.Models) > 0 {
@@ -214,6 +225,7 @@ func exampleRef(provider ResolvedProvider) string {
 	return provider.ID + "/" + modelID
 }
 
+// requireProvider 取指定厂商，取不到时按「没配密钥」和「没这家厂商」分别给提示。
 func requireProvider(providers []ResolvedProvider, id string) (ResolvedProvider, error) {
 	for _, provider := range providers {
 		if provider.ID == id {
@@ -230,6 +242,7 @@ func requireProvider(providers []ResolvedProvider, id string) (ResolvedProvider,
 	return ResolvedProvider{}, fmt.Errorf("未知厂商 %s。已配置：%s", id, configured)
 }
 
+// joinIDs 把厂商 id 连成一句人读的列表。
 func joinIDs(providers []ResolvedProvider) string {
 	ids := make([]string, len(providers))
 	for i, provider := range providers {

@@ -19,10 +19,12 @@ type Store struct {
 	m  map[string][]byte
 }
 
+// NewStore 建一个空的内存 checkpoint。
 func NewStore() *Store {
 	return &Store{m: map[string][]byte{}}
 }
 
+// Get 读 checkpoint，返回拷贝，调用方改不到内部字节。
 func (s *Store) Get(_ context.Context, key string) ([]byte, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -35,6 +37,7 @@ func (s *Store) Get(_ context.Context, key string) ([]byte, bool, error) {
 	return out, true, nil
 }
 
+// Set 写 checkpoint，同样存拷贝。
 func (s *Store) Set(_ context.Context, key string, value []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -87,6 +90,7 @@ func Run(ctx context.Context, runner *adk.Runner, checkpointID, root string, inp
 	}
 }
 
+// consume 收完一轮事件：打印过程、攒主 agent 的消息、收 interrupt。
 func consume(iter *adk.AsyncIterator[*adk.AgentEvent], root string) ([]*schema.Message, []*adk.InterruptCtx, error) {
 	var msgs []*schema.Message
 	var interrupts []*adk.InterruptCtx
@@ -129,6 +133,7 @@ func consume(iter *adk.AsyncIterator[*adk.AgentEvent], root string) ([]*schema.M
 	return msgs, interrupts, nil
 }
 
+// printMessage 打印一条事件消息，子代理的消息带名字前缀。
 func printMessage(agentName, root string, mv *adk.MessageVariant, msg *schema.Message) {
 	if msg == nil {
 		return
@@ -173,6 +178,7 @@ func printMessage(agentName, root string, mv *adk.MessageVariant, msg *schema.Me
 	}
 }
 
+// approvalFrom 把 interrupt 的载荷转成审批信息，类型对不上就退化成一段文本。
 func approvalFrom(info any) guard.ApprovalInfo {
 	switch typed := info.(type) {
 	case guard.ApprovalInfo:
@@ -185,6 +191,7 @@ func approvalFrom(info any) guard.ApprovalInfo {
 	return guard.ApprovalInfo{Message: fmt.Sprint(info)}
 }
 
+// ensureNudgeCall 给提醒回执补上对应的 tool call，避免下一轮出现没有调用来源的 ToolMessage。
 func ensureNudgeCall(history []*schema.Message, msg *schema.Message) {
 	if msg == nil || msg.Role != schema.Tool || !planning.IsPlanningNudge(msg) || len(history) == 0 {
 		return

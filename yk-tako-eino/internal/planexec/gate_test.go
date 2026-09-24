@@ -16,6 +16,7 @@ type fakeGateModel struct {
 	args     string
 }
 
+// Generate 固定返回预设的那次工具调用。
 func (f *fakeGateModel) Generate(context.Context, []*schema.Message, ...model.Option) (*schema.Message, error) {
 	return &schema.Message{
 		Role: schema.Assistant,
@@ -25,14 +26,17 @@ func (f *fakeGateModel) Generate(context.Context, []*schema.Message, ...model.Op
 	}, nil
 }
 
+// Stream 用不上，测试只走 Generate。
 func (f *fakeGateModel) Stream(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
 	panic("not implemented")
 }
 
+// WithTools 返回自己：Gate 绑什么工具不影响这个假模型。
 func (f *fakeGateModel) WithTools([]*schema.ToolInfo) (model.ToolCallingChatModel, error) {
 	return f, nil
 }
 
+// runGate 跑一次闸门，把事件流收成切片方便断言。
 func runGate(t *testing.T, g *Gate, userText string) []*adk.AgentEvent {
 	t.Helper()
 	iter := g.Run(context.Background(), &adk.AgentInput{
@@ -48,6 +52,7 @@ func runGate(t *testing.T, g *Gate, userText string) []*adk.AgentEvent {
 	}
 }
 
+// TestPlanFirstStep 验证空计划返回空串，正常计划返回第一步。
 func TestPlanFirstStep(t *testing.T) {
 	if got := (&Plan{}).FirstStep(); got != "" {
 		t.Fatalf("空计划 FirstStep 应为空串，实际 %q", got)
@@ -58,6 +63,7 @@ func TestPlanFirstStep(t *testing.T) {
 	}
 }
 
+// TestPlanJSONRoundTrip 验证计划能原样序列化再反序列化。
 func TestPlanJSONRoundTrip(t *testing.T) {
 	p := &Plan{Steps: []string{"查时间", "算乘法"}}
 	data, err := p.MarshalJSON()
@@ -73,6 +79,7 @@ func TestPlanJSONRoundTrip(t *testing.T) {
 	}
 }
 
+// TestGateRespondExits 验证 respond 分支：先发答复，再发 Exit 动作终止流程。
 func TestGateRespondExits(t *testing.T) {
 	g := NewGate(&fakeGateModel{toolName: "respond", args: `{"response":"四"}`}, "- t: d\n")
 	events := runGate(t, g, "1+3 等于几")
@@ -92,6 +99,7 @@ func TestGateRespondExits(t *testing.T) {
 	}
 }
 
+// TestGatePlan 验证 plan 分支：只发一个事件，且内容能被 Classify 认成计划。
 func TestGatePlan(t *testing.T) {
 	g := NewGate(&fakeGateModel{toolName: "plan", args: `{"steps":["查时间","算乘法"]}`}, "- t: d\n")
 	events := runGate(t, g, "复杂请求")
@@ -115,6 +123,7 @@ func TestGatePlan(t *testing.T) {
 	}
 }
 
+// TestGateNoToolCall 验证模型没给工具调用时报错，而不是静默成功。
 func TestGateNoToolCall(t *testing.T) {
 	g := NewGate(&fakeGateModel{toolName: "", args: ""}, "")
 	events := runGate(t, g, "x")
@@ -123,6 +132,7 @@ func TestGateNoToolCall(t *testing.T) {
 	}
 }
 
+// TestGateBuildMessagesInjectsTools 验证闸门输入是 system（含工具清单）+ 当前请求。
 func TestGateBuildMessagesInjectsTools(t *testing.T) {
 	g := NewGate(&fakeGateModel{}, "- get_current_time: 获取当前时间\n")
 	msgs := g.buildMessages([]*schema.Message{schema.UserMessage("现在几点")})

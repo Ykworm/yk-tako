@@ -17,11 +17,13 @@ const (
 	ProtocolAnthropic ProtocolName = "anthropic"
 )
 
+// ModelPreset 是目录里的一条模型条目。
 type ModelPreset struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 }
 
+// ProviderPreset 是目录里的一家厂商：协议、默认 baseURL、密钥环境变量名、可选模型。
 type ProviderPreset struct {
 	ID        string
 	Name      string
@@ -31,6 +33,7 @@ type ProviderPreset struct {
 	Models    []ModelPreset
 }
 
+// catalogItem 是 provider-catalog.json 的原始条目，Protocol 这时还是字符串。
 type catalogItem struct {
 	ID        string        `json:"id"`
 	Name      string        `json:"name"`
@@ -40,6 +43,7 @@ type catalogItem struct {
 	Models    []ModelPreset `json:"models"`
 }
 
+// loadPresets 把内嵌的 JSON 目录解成预设，协议名在这里校验。
 func loadPresets() ([]ProviderPreset, error) {
 	var items []catalogItem
 	if err := json.Unmarshal(catalogJSON, &items); err != nil {
@@ -63,6 +67,7 @@ func loadPresets() ([]ProviderPreset, error) {
 	return presets, nil
 }
 
+// asProtocol 校验协议名，只认 openai 和 anthropic。
 func asProtocol(value, id string) (ProtocolName, error) {
 	switch ProtocolName(value) {
 	case ProtocolOpenAI, ProtocolAnthropic:
@@ -72,8 +77,10 @@ func asProtocol(value, id string) (ProtocolName, error) {
 	}
 }
 
+// providerPresets 是进程启动时加载一次的厂商目录，之后只读。
 var providerPresets = mustPresets()
 
+// mustPresets 启动时加载目录；目录坏了直接 panic，不留到运行期。
 func mustPresets() []ProviderPreset {
 	presets, err := loadPresets()
 	if err != nil {
@@ -82,6 +89,7 @@ func mustPresets() []ProviderPreset {
 	return presets
 }
 
+// findPreset 按 id 找厂商预设。
 func findPreset(id string) (ProviderPreset, bool) {
 	for _, preset := range providerPresets {
 		if preset.ID == id {

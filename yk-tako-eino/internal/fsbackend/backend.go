@@ -15,10 +15,14 @@ import (
 	"github.com/cloudwego/eino/adk/filesystem"
 )
 
+// Backend 是直接读写本机文件的本地后端：相对路径相对 Root 解析，
+// 绝对路径原样使用，不把访问限制在 Root 里。越界和敏感文件防护是
+// guard 层（internal/guard）的事，这个后端只管读写。
 type Backend struct {
 	Root string
 }
 
+// New 把 root 转成绝对路径建后端。
 func New(root string) (*Backend, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
@@ -27,6 +31,8 @@ func New(root string) (*Backend, error) {
 	return &Backend{Root: abs}, nil
 }
 
+// resolve 把请求路径落成绝对路径：空路径给 Root，相对路径拼在 Root 下，
+// 绝对路径原样使用。Clean 之后 .. 可能指到 Root 外，这里不拦。
 func (b *Backend) resolve(path string) (string, error) {
 	if path == "" {
 		return b.Root, nil
@@ -37,6 +43,7 @@ func (b *Backend) resolve(path string) (string, error) {
 	return filepath.Clean(path), nil
 }
 
+// LsInfo 列目录，逐项带上大小和修改时间。
 func (b *Backend) LsInfo(_ context.Context, req *filesystem.LsInfoRequest) ([]filesystem.FileInfo, error) {
 	dir, err := b.resolve(req.Path)
 	if err != nil {
@@ -57,6 +64,7 @@ func (b *Backend) LsInfo(_ context.Context, req *filesystem.LsInfoRequest) ([]fi
 	return out, nil
 }
 
+// Read 读文件：支持按行 offset/limit 取片段，超 8000 字截断，免得一次灌爆上下文。
 func (b *Backend) Read(_ context.Context, req *filesystem.ReadRequest) (*filesystem.FileContent, error) {
 	path, err := b.resolve(req.FilePath)
 	if err != nil {
@@ -88,6 +96,7 @@ func (b *Backend) Read(_ context.Context, req *filesystem.ReadRequest) (*filesys
 	return &filesystem.FileContent{Content: text}, nil
 }
 
+// Write 覆盖写文件，父目录不存在就先建。
 func (b *Backend) Write(_ context.Context, req *filesystem.WriteRequest) error {
 	path, err := b.resolve(req.FilePath)
 	if err != nil {
@@ -99,6 +108,7 @@ func (b *Backend) Write(_ context.Context, req *filesystem.WriteRequest) error {
 	return os.WriteFile(path, []byte(req.Content), 0o644)
 }
 
+// Edit 按 old_string 替换；默认要求唯一匹配，replace_all 才全量替换。
 func (b *Backend) Edit(_ context.Context, req *filesystem.EditRequest) error {
 	if req.OldString == "" {
 		return fmt.Errorf("old_string 不能为空")
@@ -131,6 +141,7 @@ func (b *Backend) Edit(_ context.Context, req *filesystem.EditRequest) error {
 	return os.WriteFile(path, []byte(next), 0o644)
 }
 
+// GrepRaw 在目录里逐行搜正则，最多收 40 条就停。
 func (b *Backend) GrepRaw(_ context.Context, req *filesystem.GrepRequest) ([]filesystem.GrepMatch, error) {
 	pattern := req.Pattern
 	if req.CaseInsensitive && !strings.HasPrefix(pattern, "(?i)") {
@@ -169,6 +180,7 @@ func (b *Backend) GrepRaw(_ context.Context, req *filesystem.GrepRequest) ([]fil
 	return matches, err
 }
 
+// GlobInfo 按 glob 找文件或目录，最多收 80 条就停。
 func (b *Backend) GlobInfo(_ context.Context, req *filesystem.GlobInfoRequest) ([]filesystem.FileInfo, error) {
 	root, err := b.resolve(req.Path)
 	if err != nil {
@@ -200,6 +212,7 @@ func (b *Backend) GlobInfo(_ context.Context, req *filesystem.GlobInfoRequest) (
 	return out, err
 }
 
+// fileInfo 把标准库的 FileInfo 转成后端接口要的形状。
 func fileInfo(path string, info fs.FileInfo) filesystem.FileInfo {
 	return filesystem.FileInfo{
 		Path:       path,
@@ -209,6 +222,7 @@ func fileInfo(path string, info fs.FileInfo) filesystem.FileInfo {
 	}
 }
 
+// globToRegexp 把 glob 编译成正则：**/ 可跨目录，* 不跨 /。
 func globToRegexp(glob string) *regexp.Regexp {
 	var b strings.Builder
 	for i := 0; i < len(glob); i++ {

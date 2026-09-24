@@ -32,6 +32,7 @@ import (
 	"yk-tako-eino/internal/tools"
 )
 
+// main 建 Gate + Executor/Replanner 的 plan-execute 流程并进 REPL 循环。
 func main() {
 	ctx := context.Background()
 	// executor 用默认模型（干活的，保留完整能力）；planner/replanner 用强制

@@ -2,14 +2,19 @@ package planning
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/cloudwego/eino/adk"
+	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
+	"github.com/cloudwego/eino/components/tool/utils"
+	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 )
 
+// TestFormatTodos 验证清单和回执的排版，以及空清单的提示。
 func TestFormatTodos(t *testing.T) {
 	if got := FormatTodos(nil); got != "（清单为空）" {
 		t.Fatalf("empty: %q", got)
@@ -32,6 +37,7 @@ func TestFormatTodos(t *testing.T) {
 	}
 }
 
+// TestShouldNudge 验证半途而废提醒的各种触发和不该触发的边界。
 func TestShouldNudge(t *testing.T) {
 	wrote := []*schema.Message{
 		schema.UserMessage("帮我规划一下"),
@@ -99,48 +105,198 @@ func TestShouldNudge(t *testing.T) {
 	}
 }
 
+// scriptModel 是按脚本回消息的假模型：每次 Generate 弹出下一条，弹空报错。
+// 并行防守的标记存在 run-local 状态里，脱离真实运行造不出带运行状态的 ctx，
+// 所以这几个测试都走完整 runner，不再直接调钩子。
+type scriptModel struct {
+	msgs []*schema.Message
+}
+
+// Generate 弹出脚本里的下一条消息。
+func (m *scriptModel) Generate(context.Context, []*schema.Message, ...model.Option) (*schema.Message, error) {
+	if len(m.msgs) == 0 {
+		return nil, errors.New("脚本用完了，模型不该再被调用")
+	}
+	msg := m.msgs[0]
+	m.msgs = m.msgs[1:]
+	return msg, nil
+}
+
+// Stream 不支持：测试都跑非流式。
+func (m *scriptModel) Stream(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	return nil, errors.New("测试不开流式")
+}
+
+// WithTools 直接返回自己：假模型不真的绑定工具。
+func (m *scriptModel) WithTools([]*schema.ToolInfo) (model.ToolCallingChatModel, error) {
+	return m, nil
+}
+
+// runScript 用假模型跑一轮完整 agent，返回这轮产生的全部消息。
+// extra 是挂工具节点的额外工具；planning 的两个工具由 BeforeAgent 注入。
+func runScript(t *testing.T, kit *Planning, extra []tool.BaseTool, script ...*schema.Message) []*schema.Message {
+	t.Helper()
+	ctx := context.Background()
+	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:  "test",
+		Model: &scriptModel{msgs: script},
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{Tools: extra},
+		},
+		Handlers:      []adk.ChatModelAgentMiddleware{kit.Handler},
+		MaxIterations: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: agent})
+	iter := runner.Run(ctx, []*schema.Message{schema.UserMessage("开始")})
+	var msgs []*schema.Message
+	for {
+		event, ok := iter.Next()
+		if !ok {
+			break
+		}
+		if event.Err != nil {
+			t.Fatal(event.Err)
+		}
+		if event.Output == nil || event.Output.MessageOutput == nil {
+			continue
+		}
+		msg, err := event.Output.MessageOutput.GetMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if msg != nil && msg.ToolName == "" {
+			msg.ToolName = event.Output.MessageOutput.ToolName
+		}
+		msgs = append(msgs, msg)
+	}
+	return msgs
+}
+
+// toolReplies 收集某个工具在这轮里的全部回执正文。
+func toolReplies(t *testing.T, msgs []*schema.Message, toolName string) []string {
+	t.Helper()
+	var out []string
+	for _, msg := range msgs {
+		if msg != nil && msg.Role == schema.Tool && msg.ToolName == toolName {
+			out = append(out, msg.Content)
+		}
+	}
+	if len(out) == 0 {
+		t.Fatalf("没有 %s 的工具回执", toolName)
+	}
+	return out
+}
+
+// writeCall 造一次 write_todos 调用，参数是一条 in_progress 的合法清单。
+func writeCall(id string) schema.ToolCall {
+	return schema.ToolCall{
+		ID:   id,
+		Type: "function",
+		Function: schema.FunctionCall{
+			Name:      WriteTodosTool,
+			Arguments: `{"todos":[{"content":"查时间","status":"in_progress"}]}`,
+		},
+	}
+}
+
+// 同轮两次 write_todos：两次都回并行错误，清单不动。
 func TestParallelWriteDoesNotReplace(t *testing.T) {
-	kit, err := New(Options{})
+	kit, err := New(Options{DisableNudge: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	state := &adk.ChatModelAgentState{Messages: []*schema.Message{
-		schema.AssistantMessage("", []schema.ToolCall{
-			{ID: "1", Type: "function", Function: schema.FunctionCall{Name: WriteTodosTool, Arguments: "{}"}},
-			{ID: "2", Type: "function", Function: schema.FunctionCall{Name: WriteTodosTool, Arguments: "{}"}},
-		}),
-	}}
-	if _, _, err := kit.Handler.AfterModelRewriteState(context.Background(), state, nil); err != nil {
-		t.Fatal(err)
-	}
-	if len(state.Messages[0].ToolCalls) != 2 {
-		t.Fatal("并行防守不该改掉原有 tool call")
-	}
-	writeTool := kit.Middleware.AdditionalTools[0].(tool.InvokableTool)
-	out, err := writeTool.InvokableRun(context.Background(), `{"todos":[{"content":"查时间","status":"in_progress"}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasPrefix(out, "错误：write_todos 必须独占一轮") {
-		t.Fatalf("parallel: %q", out)
+	msgs := runScript(t, kit, nil,
+		schema.AssistantMessage("", []schema.ToolCall{writeCall("1"), writeCall("2")}),
+		schema.AssistantMessage("收工", nil),
+	)
+	for _, got := range toolReplies(t, msgs, WriteTodosTool) {
+		if !strings.HasPrefix(got, "错误：write_todos 必须独占一轮") {
+			t.Fatalf("parallel: %q", got)
+		}
 	}
 	if len(kit.List.Snapshot()) != 0 {
 		t.Fatal("并行调用不该改清单")
 	}
+}
 
-	if _, _, err := kit.Handler.BeforeModelRewriteState(context.Background(), &adk.ChatModelAgentState{}, nil); err != nil {
-		t.Fatal(err)
-	}
-	out, err = writeTool.InvokableRun(context.Background(), `{"todos":[{"content":"查时间","status":"in_progress"}]}`)
+// 拒绝标记只管当轮：并行轮被拒后，下一轮独占的 write_todos 照常生效。
+func TestParallelRejectResetsNextRound(t *testing.T) {
+	kit, err := New(Options{DisableNudge: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.HasPrefix(out, "错误") {
-		t.Fatalf("下一轮单次调用应成功: %q", out)
+	msgs := runScript(t, kit, nil,
+		schema.AssistantMessage("", []schema.ToolCall{writeCall("1"), writeCall("2")}),
+		schema.AssistantMessage("", []schema.ToolCall{writeCall("3")}),
+		schema.AssistantMessage("收工", nil),
+	)
+	replies := toolReplies(t, msgs, WriteTodosTool)
+	if len(replies) != 3 {
+		t.Fatalf("回执数: %d", len(replies))
+	}
+	for _, got := range replies[:2] {
+		if !strings.HasPrefix(got, "错误：write_todos 必须独占一轮") {
+			t.Fatalf("第一轮该被拒: %q", got)
+		}
+	}
+	if strings.HasPrefix(replies[2], "错误") {
+		t.Fatalf("下一轮独占调用应成功: %q", replies[2])
 	}
 	got := kit.List.Snapshot()
 	if len(got) != 1 || got[0].Status != StatusInProgress {
 		t.Fatalf("list: %+v", got)
+	}
+}
+
+// write_todos 与干活工具同轮混排：write_todos 回错误、清单不动，同轮其它工具不受影响。
+func TestMixedTurnWriteRejected(t *testing.T) {
+	kit, err := New(Options{DisableNudge: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock, err := utils.InferTool("get_current_time", "返回固定时间，测试混排用",
+		func(context.Context, emptyArgs) (string, error) { return "12:00", nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := runScript(t, kit, []tool.BaseTool{clock},
+		schema.AssistantMessage("", []schema.ToolCall{
+			writeCall("1"),
+			{ID: "2", Type: "function", Function: schema.FunctionCall{Name: "get_current_time", Arguments: "{}"}},
+		}),
+		schema.AssistantMessage("收工", nil),
+	)
+	if got := toolReplies(t, msgs, WriteTodosTool)[0]; !strings.HasPrefix(got, "错误：write_todos 必须独占一轮") {
+		t.Fatalf("mixed turn: %q", got)
+	}
+	if got := toolReplies(t, msgs, "get_current_time")[0]; got != "12:00" {
+		t.Fatalf("同轮其它工具照常执行: %q", got)
+	}
+	if len(kit.List.Snapshot()) != 0 {
+		t.Fatal("混排轮不该改清单")
+	}
+}
+
+// write_todos 独占一轮时不触发防守，清单正常更新；非法 status 不替换清单。
+// 直接调工具时 ctx 里没有运行状态，标记按未设置读，正好覆盖这条路径。
+func TestSoloWriteAndValidation(t *testing.T) {
+	kit, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTool := kit.Tools[0].(tool.InvokableTool)
+	out, err := writeTool.InvokableRun(context.Background(), `{"todos":[{"content":"查时间","status":"in_progress"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasPrefix(out, "错误") {
+		t.Fatalf("独占一轮应成功: %q", out)
+	}
+	if got := kit.List.Snapshot(); len(got) != 1 || got[0].Status != StatusInProgress {
+		t.Fatalf("独占一轮应更新清单: %+v", got)
 	}
 
 	bad, err := writeTool.InvokableRun(context.Background(), `{"todos":[{"content":"x","status":"doing"}]}`)
@@ -152,57 +308,7 @@ func TestParallelWriteDoesNotReplace(t *testing.T) {
 	}
 }
 
-// write_todos 与干活工具同轮混排：write_todos 回错误、清单不动，同轮其它工具不受影响。
-func TestMixedTurnWriteRejected(t *testing.T) {
-	kit, err := New(Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	state := &adk.ChatModelAgentState{Messages: []*schema.Message{
-		schema.AssistantMessage("", []schema.ToolCall{
-			{ID: "1", Type: "function", Function: schema.FunctionCall{Name: WriteTodosTool, Arguments: "{}"}},
-			{ID: "2", Type: "function", Function: schema.FunctionCall{Name: "get_current_time", Arguments: "{}"}},
-		}),
-	}}
-	if _, _, err := kit.Handler.AfterModelRewriteState(context.Background(), state, nil); err != nil {
-		t.Fatal(err)
-	}
-	if len(state.Messages[0].ToolCalls) != 2 {
-		t.Fatal("混排防守不该改掉原有 tool call")
-	}
-	writeTool := kit.Middleware.AdditionalTools[0].(tool.InvokableTool)
-	out, err := writeTool.InvokableRun(context.Background(), `{"todos":[{"content":"查时间","status":"in_progress"}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasPrefix(out, "错误：write_todos 必须独占一轮") {
-		t.Fatalf("mixed turn: %q", out)
-	}
-	if len(kit.List.Snapshot()) != 0 {
-		t.Fatal("混排轮不该改清单")
-	}
-
-	// write_todos 独占一轮时不触发防守，清单正常更新。
-	solo := &adk.ChatModelAgentState{Messages: []*schema.Message{
-		schema.AssistantMessage("", []schema.ToolCall{
-			{ID: "3", Type: "function", Function: schema.FunctionCall{Name: WriteTodosTool, Arguments: "{}"}},
-		}),
-	}}
-	if _, _, err := kit.Handler.AfterModelRewriteState(context.Background(), solo, nil); err != nil {
-		t.Fatal(err)
-	}
-	out, err = writeTool.InvokableRun(context.Background(), `{"todos":[{"content":"查时间","status":"in_progress"}]}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.HasPrefix(out, "错误") {
-		t.Fatalf("独占一轮应成功: %q", out)
-	}
-	if got := kit.List.Snapshot(); len(got) != 1 || got[0].Status != StatusInProgress {
-		t.Fatalf("独占一轮应更新清单: %+v", got)
-	}
-}
-
+// TestNudgeAttachesHiddenToolCall 验证提醒会补一次隐藏工具调用，且模型看不见这个工具、同轮不重复催。
 func TestNudgeAttachesHiddenToolCall(t *testing.T) {
 	kit, err := New(Options{})
 	if err != nil {
@@ -273,6 +379,7 @@ func TestNudgeAttachesHiddenToolCall(t *testing.T) {
 	}
 }
 
+// TestListParsing 验证从回执里反解清单（图标行和状态行两种形状）。
 func TestListParsing(t *testing.T) {
 	icons, ok := IconList(Receipt([]Todo{{Content: "查时间", Status: StatusPending}}))
 	if !ok || icons != "⬜ 1. 查时间" {

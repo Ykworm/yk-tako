@@ -21,6 +21,7 @@ import (
 	"yk-tako-eino/internal/tools"
 )
 
+// main 建 DeepAgent（自带 write_todos、文件工具和通用子代理）并进 REPL 循环。
 func main() {
 	ctx := context.Background()
 	chatModel, ref := config.MustOpen(ctx)

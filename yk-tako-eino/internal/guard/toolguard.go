@@ -6,6 +6,7 @@ import (
 	"strings"
 )
 
+// Severity 是规则命中的严重级别，从 CRITICAL 到 INFO。
 type Severity string
 
 const (
@@ -16,6 +17,7 @@ const (
 	Info     Severity = "INFO"
 )
 
+// Rule 是一条工具调用检查规则：限定工具与参数名，用正则找危险特征，Excludes 用来放过误报。
 type Rule struct {
 	ID          string
 	Tools       []string
@@ -32,6 +34,7 @@ var (
 	commandArg = []string{"command"}
 )
 
+// must 编译正则；写错了就在启动时炸掉，不留到运行期。
 func must(pattern string) *regexp.Regexp {
 	return regexp.MustCompile(pattern)
 }
@@ -120,6 +123,7 @@ var DefaultRules = []Rule{
 // commentLine 的源码要和 isCommentLineExclude 里的字面量一致。
 var commentLine = must(`^\s*#`)
 
+// Mode 是工具守卫的运行模式：block 直接拦，require_approval 暂停问人，warn 只提示。
 type Mode string
 
 const (
@@ -128,6 +132,7 @@ const (
 	ModeApprove Mode = "require_approval"
 )
 
+// Finding 是一条命中记录，带命中片段的前后文，方便人判读。
 type Finding struct {
 	RuleID      string
 	Severity    Severity
@@ -138,18 +143,21 @@ type Finding struct {
 	Remediation string
 }
 
+// blocking 是模式到「该拦哪些级别」的映射：warn 全放行，approve 连 Medium 也拦。
 var blocking = map[Mode]map[Severity]bool{
 	ModeBlock:   {Critical: true, High: true},
 	ModeApprove: {Critical: true, High: true, Medium: true},
 	ModeWarn:    {},
 }
 
+// Engine 拿着规则表和当前模式，扫描工具参数并判断拦不拦。
 type Engine struct {
 	rules   []Rule
 	enabled bool
 	mode    Mode
 }
 
+// NewEngine 建引擎；mode 留空按 block，rules 为 nil 用 DefaultRules。
 func NewEngine(mode Mode, rules []Rule) *Engine {
 	if mode == "" {
 		mode = ModeBlock
@@ -160,14 +168,17 @@ func NewEngine(mode Mode, rules []Rule) *Engine {
 	return &Engine{rules: rules, enabled: true, mode: mode}
 }
 
+// Configure 切换运行时模式，空值不改。
 func (e *Engine) Configure(mode Mode) {
 	if mode != "" {
 		e.mode = mode
 	}
 }
 
+// Mode 返回当前模式。
 func (e *Engine) Mode() Mode { return e.mode }
 
+// Guard 扫一遍工具调用的参数，返回命中清单；片段前后各留 40 字上下文。
 func (e *Engine) Guard(toolName string, params map[string]any) []Finding {
 	if !e.enabled {
 		return nil
@@ -229,6 +240,7 @@ func (e *Engine) Guard(toolName string, params map[string]any) []Finding {
 	return findings
 }
 
+// ShouldBlock 按当前模式判断命中清单里有没有该拦的级别。
 func (e *Engine) ShouldBlock(findings []Finding) bool {
 	blocked := blocking[e.mode]
 	for _, finding := range findings {
@@ -239,6 +251,7 @@ func (e *Engine) ShouldBlock(findings []Finding) bool {
 	return false
 }
 
+// contains 判断字符串切片里有没有这一项。
 func contains(list []string, item string) bool {
 	for _, candidate := range list {
 		if candidate == item {
@@ -248,6 +261,7 @@ func contains(list []string, item string) bool {
 	return false
 }
 
+// isCommentLineExclude 认出 commentLine 这条特殊排除：它只剥注释行，不代表整段跳过。
 func isCommentLineExclude(pattern *regexp.Regexp) bool {
 	return pattern.String() == commentLine.String()
 }
