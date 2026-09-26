@@ -1,6 +1,5 @@
-// Package adkrun 是 ADK Runner 的驱动层：事件消费（打印过程、攒历史）与
-// interrupt 审批回路，外加一个内存版 checkpoint store。唯一入口 cmd/yktako
-// 使用，实现都在本文件。
+// 本文件：ADK Runner 的驱动循环——Run 跑一轮、consume 收事件并产出、interrupt 审批。
+// 事件契约（Event / Sink / eventFrom 的分类）在 event.go。
 package adkrun
 
 import (
