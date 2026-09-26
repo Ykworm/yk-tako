@@ -49,7 +49,7 @@ public sealed class GuardEngine
 
     /// <summary>
     /// DefaultRules：从 harness 的危险命令表里抽出的 10 条（与 Eino DefaultRules 逐条一致，
-    /// 安全知识与语言、框架无关）。这里只放第一条，后续任务补齐。
+    /// 安全知识与语言、框架无关）。
     /// </summary>
     public static readonly GuardRule[] DefaultRules =
     [
@@ -58,6 +58,51 @@ public sealed class GuardEngine
             [CommentLine],
             "命令包含 rm/del，可能造成数据丢失",
             "执行删除前与用户确认"),
+        new("TOOL_CMD_DANGEROUS_MV", ShellTools, CommandArg, GuardSeverity.High,
+            [@"\bmv\b"], [],
+            "命令包含 mv，可能意外移动或覆盖文件",
+            "执行移动/重命名前与用户确认"),
+        new("TOOL_CMD_FS_DESTRUCTION", ShellTools, CommandArg, GuardSeverity.Critical,
+            [@"(?i)\bmkfs(\.[a-z0-9_]+)?\b", @"(?i)\bmke2fs\b", @"(?i)\bdd\s+.*of=/dev/",
+             @">\s*/dev/(sd[a-z]\d*|vd[a-z]\d*|nvme\d+n\d+(p\d+)?)"],
+            [],
+            "检测到磁盘格式化/擦除等底层破坏性命令",
+            "直接拦截。agent 不应操作裸块设备。"),
+        new("TOOL_CMD_DOS_FORK_BOMB", ShellTools, CommandArg, GuardSeverity.Critical,
+            [@":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", @"\bkill\s+-9\s+(-1\b|1\b)"],
+            [],
+            "检测到 fork 炸弹或批量杀进程命令",
+            "立即拦截。这类命令会搞垮宿主机。"),
+        new("TOOL_CMD_PIPE_TO_SHELL", ShellTools, CommandArg, GuardSeverity.Critical,
+            [@"(?i)\b(curl|wget)\b\s+.*\|.*\b(bash|sh|zsh|ash|dash)\b"],
+            [],
+            "检测到 curl|bash 模式：下载并立即执行远程脚本",
+            "与用户确认。agent 应先审查脚本内容再执行。"),
+        new("TOOL_CMD_REVERSE_SHELL", ShellTools, CommandArg, GuardSeverity.Critical,
+            [@"(?i)/dev/(tcp|udp)/", @"(?i)\bnc\s+.*-e\s*\S+", @"(?i)\bncat\s+.*-e\s*\S+", @"(?i)\bsocat\s+.*EXEC:"],
+            [],
+            "检测到反弹 shell / 未授权网络隧道",
+            "直接拦截。agent 无需绑定交互式 shell 或隧道。"),
+        new("TOOL_CMD_UNICODE_WHITESPACE", ShellTools, CommandArg, GuardSeverity.High,
+            ["[\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]"],
+            [],
+            "命令含 Unicode 空白字符，可能造成解析歧义绕过检查",
+            "拦截含非 ASCII 空白的命令，使用普通空格。"),
+        new("TOOL_CMD_PROC_ENVIRON", ShellTools, CommandArg, GuardSeverity.High,
+            [@"/proc/(?:self|\d+)/environ(?:\b|$)"],
+            [CommentLine],
+            "访问 /proc/*/environ，可能泄露 API Key 等环境变量",
+            "拦截对进程环境变量文件的访问。"),
+        new("TOOL_CMD_JQ_SYSTEM", ShellTools, CommandArg, GuardSeverity.High,
+            [@"(?i)\bjq\b.*\bsystem\s*\("],
+            [CommentLine],
+            "jq 的 system() 可执行任意命令，把数据处理工具变成执行通道",
+            "拦截使用 system() 的 jq 命令。"),
+        new("TOOL_CMD_SUDO", ShellTools, CommandArg, GuardSeverity.Medium,
+            [@"(?i)\bsudo\b", @"(?i)\bdoas\b"],
+            [CommentLine],
+            "命令试图提升权限（sudo/doas）",
+            "agent 原则上不应需要提权，与用户确认。"),
     ];
 
     private readonly (GuardRule Rule, Regex[] Patterns, Regex[] Excludes)[] _rules;

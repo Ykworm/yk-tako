@@ -25,4 +25,59 @@ public sealed class GuardEngineTests
         Assert.Equal(GuardSeverity.High, finding.Severity);
         Assert.Equal("command", finding.ParamName);
     }
+
+    [Fact]
+    public void CommentLines_AreStripped_BeforeMatching()
+    {
+        var findings = NewApproveEngine().Guard("execute", Args("# rm -rf /\nls"));
+        Assert.Empty(findings);
+    }
+
+    [Fact]
+    public void UnicodeWhitespace_IsCaught()
+    {
+        var findings = NewApproveEngine().Guard("execute", Args("rm\u00a0-rf /tmp/x"));
+        Assert.Contains(findings, f => f.RuleId == "TOOL_CMD_UNICODE_WHITESPACE");
+    }
+
+    [Fact]
+    public void Sudo_Medium_IsBlockedOnlyInApproveMode()
+    {
+        var approve = new GuardEngine(GuardMode.RequireApproval);
+        var block = new GuardEngine(GuardMode.Block);
+        var args = Args("sudo apt update");
+
+        Assert.True(approve.ShouldBlock(approve.Guard("execute", args)));
+        Assert.False(block.ShouldBlock(block.Guard("execute", args)));
+    }
+
+    [Fact]
+    public void WarnMode_NeverBlocks()
+    {
+        var warn = new GuardEngine(GuardMode.Warn);
+        Assert.False(warn.ShouldBlock(warn.Guard("execute", Args("rm -rf /tmp/x"))));
+    }
+
+    [Fact]
+    public void BenignCommand_HasNoFindings()
+    {
+        Assert.Empty(NewApproveEngine().Guard("execute", Args("echo hi")));
+    }
+
+    [Fact]
+    public void NonShellTool_IsNotScanned()
+    {
+        Assert.Empty(NewApproveEngine().Guard("calculate", Args("rm -rf /tmp/x")));
+    }
+
+    [Fact]
+    public void WholeValueExclude_SkipsRule()
+    {
+        var rule = new GuardRule("T_LS", ["execute"], ["command"], GuardSeverity.High,
+            [@"\bls\b"], [@"\bsafe\b"], "d", "r");
+        var engine = new GuardEngine(GuardMode.Block, [rule]);
+
+        Assert.Empty(engine.Guard("execute", Args("ls safe")));
+        Assert.Single(engine.Guard("execute", Args("ls x")));
+    }
 }
