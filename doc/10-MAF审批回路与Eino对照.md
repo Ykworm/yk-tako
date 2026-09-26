@@ -148,3 +148,49 @@ RequestId 认领，重建调用执行——没有传话员，只有绑定。
   落盘未移植（spec §6 范围外）。
 - 并行多中断的排队行为只依框架文档与单请求实测，未专门构造同响应多 execute 场景。
 - thinking 模型缺口的修法未在本仓库实现（属 MEAI/MAF 上游），只记录现象与对策。
+
+## 9. 附：代码级对照——从发起到拿到结果
+
+两边各走一遍同一条流程，标出每一步「谁的代码里可见」。
+
+### 9.1 Eino（interrupt → resume）
+
+| 步 | 代码锚点 | 发生了什么 |
+| --- | --- | --- |
+| ① 发起中断 | `guard/middleware.go:119` `compose.StatefulInterrupt(ctx, info, savedCall{Args: args})` | 规则命中后**在业务代码里显式调用**，把审批载荷与原始参数写进信号树，并以 error 位结束本次调用 |
+| ② 框架出境 | 信号树 → `SignalToPersistenceMaps` → checkpoint（`id2addr`/`id2state`）；`adkrun/turn.go:142-150` 收 `InterruptContexts` | ID↔地址登记进 checkpoint，真因列表随事件交给调用方 |
+| ③ 写入端 | `adkrun/turn.go:98-110` `targets[point.ID] = decision` → `ResumeWithParams` | 纯 map：键=框架给的 UUID，值=approve/reject 字符串 |
+| ④ 框架入站 | `PopulateInterruptState` → `BatchResumeWithData` → 按地址重入 | 状态表与回执表铺进 ctx 公告板，执行链按地址重跑 |
+| ⑤ 读取端 | `guard/middleware.go:98-107` `ownInterrupt` + `resumeDecision`（`GetInterruptState`/`GetResumeContext`） | **与发起同一个函数**（wrapper 闭包）第一行分支：批准 `:106` 用 `stored.Args` 执行；拒绝 `:104` 返回拒绝文案 |
+| ⑥ 拿到结果 | 工具输出或拒绝文案 → `ToolMessage` | ReAct 继续 |
+
+代码级特征：中断与读取在同一个函数里首尾相接；钥匙是裸 UUID（地址映射藏在
+checkpoint，代码里看不见）；写入端是匿名 map，抄错键不会报错、只是静默不命中。
+
+### 9.2 MAF（approval request → response）
+
+| 步 | 代码锚点 | 发生了什么 |
+| --- | --- | --- |
+| ① 发起 | `maf/Program.cs:62` 标记 `ApprovalRequiredAIFunction`；`Program.cs:67-80` `guardRule` 决定批不批；框架 FICC `TryReplaceFunctionCallsWithApprovalRequests` | **声明式发起**：业务代码不调用任何「中断」API，中断由标记+框架转换涌现；RequestId 由 `ComposeApprovalRequestId(CallId)` 在框架内生成 |
+| ② 暂停出境 | `Program.cs:125` `RunAsync` 返回；`Program.cs:148` 从 `response.Messages` 取 `ToolApprovalRequestContent` | ToolApprovalAgent 已把 surfaced 请求记进 `AgentSession.StateBag` 并排队 |
+| ③ 写入端 | `Program.cs:141-192` `ResolveApprovalsAsync`：block 直拒（:159-163）／兜底静默批／问人 → `request.CreateResponse(approved, reason)`（:189）→ `ChatMessage(user)`（:192）→ `RunAsync` | 类型化回执；**调用方代码里不出现钥匙** |
+| ④ 框架入站 | TAA `BindApprovalResponses`（按 RequestId 对 surfaced 快照）→ `InjectCollectedResponses` → FICC `ExtractAndRemoveApprovalRequestsAndResponses` | 批准：重建 FunctionCall 并执行；拒绝：生成失败工具结果 |
+| ⑤ 读取端 | **业务代码里没有**：`BasicTools.Execute` 零审批感知，只在批准后被执行一次 | 读取与重入全在框架内部 |
+| ⑥ 拿到结果 | 工具结果或失败结果 → 模型继续（同一 `RunAsync` 内可多次自动批） | 协议闭环 |
+
+代码级特征：发起是声明式（标记+策略）；中断、重入、读取全被框架吸走，调用方只
+实现「请求→回执」协议；钥匙根本不进入业务代码；回执对不上 surfaced 快照时框架
+显式拒绝（不静默）。
+
+### 9.3 哪边更明确
+
+- **读代码追踪机制**：Eino 更明确。中断点与读取点在同一函数、读取只有两行
+  （`middleware.go:98-99`），「谁写的、谁读的」肉眼可循；MAF 的中段全在框架里，
+  调用方代码更短但不自证。
+- **契约安全与防错**：MAF 更明确。钥匙由框架生成与匹配，业务代码想抄错都没有机会；
+  回执绑定失败有显式校验（对 surfaced 请求的快照比对）。Eino 的裸 UUID 曾因注释与
+  实现不符误导读者（doc 09 §11），且写入端抄错键是静默失败。
+- **结论**：Eino 的显式是「实现细节显式」——为读懂机制服务，代价是业务代码与
+  框架机制耦合（wrapper 里必须写恢复分支）；MAF 的显式是「接口边界显式」——为
+  正确使用服务，代价是黑盒（出问题要读框架内部；§6 的 reasoning_content 缺口正是
+  黑盒重建导致，调用方无从修补）。
