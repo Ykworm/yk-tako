@@ -8,9 +8,11 @@ import (
 	"testing"
 
 	"yk-tako-eino/internal/adkrun"
+	"yk-tako-eino/internal/taskboard"
 )
 
-// TestREPLSinkFormat 覆盖四种事件 + 子代理前缀 + 长回执截断六种输出。
+// TestREPLSinkFormat 覆盖四种事件 + 子代理前缀（四类模板）+ 空 Agent + 未知 Kind
+// + 长回执截断，逐字符锁定终端格式。
 func TestREPLSinkFormat(t *testing.T) {
 	long := strings.Repeat("a", 130)
 	cases := []struct {
@@ -24,9 +26,19 @@ func TestREPLSinkFormat(t *testing.T) {
 			want: "  → 🔧 调用: read_file, calculate\n",
 		},
 		{
+			name: "工具调用带子代理前缀",
+			ev:   adkrun.Event{Kind: adkrun.EventToolCall, Agent: "worker", ToolNames: []string{"read_file"}},
+			want: "  → 🔧 [worker] 调用: read_file\n",
+		},
+		{
 			name: "工具回执",
 			ev:   adkrun.Event{Kind: adkrun.EventToolResult, Agent: "yk-tako", ToolName: "read_file", Text: "第一行\n第二行"},
 			want: "  ← 🔧 read_file: 第一行 第二行\n",
+		},
+		{
+			name: "工具回执带子代理前缀",
+			ev:   adkrun.Event{Kind: adkrun.EventToolResult, Agent: "worker", ToolName: "read_file", Text: "内容"},
+			want: "  ← 🔧 [worker] read_file: 内容\n",
 		},
 		{
 			name: "回执超长截断",
@@ -37,8 +49,13 @@ func TestREPLSinkFormat(t *testing.T) {
 			// 看板原文自带「📋 任务看板」头（taskboard/tools.go 的 board），sink 又贴
 			// 「  📋 」标记——重构前终端就是两个 📋，逐字符锁死，不许顺手去重。
 			name: "看板回执不截断",
-			ev:   adkrun.Event{Kind: adkrun.EventBoard, Agent: "yk-tako", ToolName: "TaskList", Text: "📋 看板\n第二行"},
+			ev:   adkrun.Event{Kind: adkrun.EventBoard, Agent: "yk-tako", ToolName: taskboard.ToolList, Text: "📋 看板\n第二行"},
 			want: "  📋 📋 看板\n第二行\n",
+		},
+		{
+			name: "看板带子代理前缀",
+			ev:   adkrun.Event{Kind: adkrun.EventBoard, Agent: "worker", ToolName: taskboard.ToolList, Text: "📋 看板"},
+			want: "  📋 [worker] 📋 看板\n",
 		},
 		{
 			name: "正文",
@@ -49,6 +66,16 @@ func TestREPLSinkFormat(t *testing.T) {
 			name: "子代理带前缀",
 			ev:   adkrun.Event{Kind: adkrun.EventMessage, Agent: "worker", Text: "子代理说"},
 			want: "\n🐙 [worker] 子代理说\n\n",
+		},
+		{
+			name: "空 Agent 不加前缀",
+			ev:   adkrun.Event{Kind: adkrun.EventMessage, Agent: "", Text: "匿名"},
+			want: "\n🐙 匿名\n\n",
+		},
+		{
+			name: "未知 Kind 不输出",
+			ev:   adkrun.Event{Kind: adkrun.EventKind("unknown"), Agent: "yk-tako", Text: "x"},
+			want: "",
 		},
 	}
 	for _, tc := range cases {

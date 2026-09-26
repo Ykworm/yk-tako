@@ -36,6 +36,8 @@ func newREPLSink(w io.Writer, root string) adkrun.Sink {
 			fmt.Fprintf(w, "  ← 🔧 %s%s: %s\n", prefix, ev.ToolName, repl.Clip(ev.Text, 120))
 		case adkrun.EventMessage:
 			fmt.Fprintf(w, "\n🐙 %s%s\n\n", prefix, ev.Text)
+		default:
+			// 未知 Kind 不呈现；approval / error 按 T1 口径不走 sink（见 adkrun.EventKind 注释）。
 		}
 	}
 }
