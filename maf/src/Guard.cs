@@ -127,6 +127,34 @@ public sealed class GuardEngine
     /// <summary>切换运行时模式（对齐 Eino Engine.Configure）。</summary>
     public void Configure(GuardMode mode) => _mode = mode;
 
+    /// <summary>解析 /mode 的 wire 名（与 Eino 命令行一致）：block / warn / require_approval。</summary>
+    public static bool TryParseMode(string value, out GuardMode mode)
+    {
+        switch (value.Trim())
+        {
+            case "block":
+                mode = GuardMode.Block;
+                return true;
+            case "warn":
+                mode = GuardMode.Warn;
+                return true;
+            case "require_approval":
+                mode = GuardMode.RequireApproval;
+                return true;
+            default:
+                mode = GuardMode.RequireApproval;
+                return false;
+        }
+    }
+
+    /// <summary>模式转 wire 名（打印与解析共用一个口径）。</summary>
+    public static string ModeName(GuardMode mode) => mode switch
+    {
+        GuardMode.Block => "block",
+        GuardMode.Warn => "warn",
+        _ => "require_approval",
+    };
+
     /// <summary>扫一遍工具调用的参数，返回命中清单；片段前后各留 40 字上下文（对齐 Eino Engine.Guard）。</summary>
     public IReadOnlyList<Finding> Guard(string toolName, IDictionary<string, object?>? args)
     {

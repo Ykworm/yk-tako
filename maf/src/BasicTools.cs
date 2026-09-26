@@ -32,6 +32,18 @@ public static class BasicTools
         }
     }
 
+    /// <summary>
+    /// 假 shell：审批回路的演示载体，不真正执行任何命令，只回显。
+    /// 它是规则表唯一能命中的工具（DefaultRules 瞄 shellTools = bash/execute；
+    /// MAF 演示里没有 bash，故不注册）。
+    /// </summary>
+    [Description("执行一条 shell 命令（演示用假 shell：不会真正执行，只回显命令文本）")]
+    public static string Execute([Description("要执行的命令行")] string command)
+    {
+        Console.WriteLine($"  ⚙️ （假 shell）将执行: {command}");
+        return $"（演示用假 shell，未真正执行）命令已受理：{command}";
+    }
+
     /// <summary>递归下降四则运算：expr = term (('+'|'-') term)*，term = factor (('*'|'/'|'%') factor)*，factor = 数字 | '(' expr ')' | 一元负号。</summary>
     private sealed class ExprParser
     {
