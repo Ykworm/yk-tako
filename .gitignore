@@ -1,5 +1,7 @@
 .env
 *.log
+# 可视化头脑风暴会话产物（superpowers visual companion）
+.superpowers/
 # .NET 构建产物（maf/）
 bin/
 obj/
