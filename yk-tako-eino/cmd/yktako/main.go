@@ -2,28 +2,37 @@
 //
 // 组装（doc/01 §5）：ChatModelAgent 的 Handlers 链 = [taskboard] + guard 三件套；
 // 看板正本在 taskboard middleware 里跨轮存活，镜像随 interrupt 落 checkpoint。
+// 两个入口：默认 REPL；-web 起最小 Web UI（internal/webui），共用同一套审批语义。
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
+
 	"yk-tako-eino/internal/adkrun"
 	"yk-tako-eino/internal/config"
 	"yk-tako-eino/internal/guard"
 	"yk-tako-eino/internal/repl"
 	"yk-tako-eino/internal/taskboard"
 	"yk-tako-eino/internal/tools"
+	"yk-tako-eino/internal/webui"
 )
 
-// main 建模型、工具、看板与守卫，进 REPL 循环；审批走 interrupt 加 Resume。
+// main 建模型、工具、看板与守卫，进 REPL 循环；-web 时改成起 Web 服务。
+// 审批两个入口共用 interrupt/resume：REPL 读 stdin，Web 挂起等 POST（《10》§4.3）。
 func main() {
 	ctx := context.Background()
+	webAddr := flag.String("web", "", "启动最小 Web UI 的监听地址（如 127.0.0.1:8765），留空进 REPL")
+	flag.Parse()
+
 	chatModel, ref := config.MustOpen(ctx)
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -40,35 +49,43 @@ func main() {
 	all := append(tools.MustBasic(ctx), bash)
 	all = append(all, files...)
 
-	// 看板：正本在 store（跨轮存活），middleware 注入四个记账工具。
-	boardMW, err := taskboard.New(taskboard.NewStore())
-	if err != nil {
-		repl.Exitf("taskboard: %v", err)
+	engine := guard.NewEngine(guard.ModeApprove, nil)
+
+	// newAgent 造一套会话 agent。看板正本挂在 taskboard middleware 实例上，
+	// 所以每个会话要造一份——共用会把不同会话的账本串在一起；模型与守卫引擎共享。
+	newAgent := func(ctx context.Context) (adk.Agent, error) {
+		boardMW, err := taskboard.New(taskboard.NewStore())
+		if err != nil {
+			return nil, fmt.Errorf("taskboard: %w", err)
+		}
+		handlers := append([]adk.ChatModelAgentMiddleware{boardMW}, guard.Handlers(engine, guard.Options{WorkspaceRoot: cwd})...)
+		return adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+			Name:        config.AgentName(),
+			Description: "带任务看板与工具安全层的工作伙伴",
+			Instruction: config.SystemPrompt() + "\n\n" + taskboard.Instruction,
+			Model:       chatModel,
+			ToolsConfig: adk.ToolsConfig{
+				// all 是静态组装的 5 个基础工具；taskboard 的 4 个记账工具由
+				// middleware 的 BeforeAgent 每轮动态注入 runCtx.Tools（运行时合计 9 个）。
+				// ExecuteSequentially：同批工具调用串行（秩序偏好，不是正确性保证，见 doc/01 §4）。
+				ToolsNodeConfig: compose.ToolsNodeConfig{Tools: all, ExecuteSequentially: true},
+			},
+			Handlers:      handlers,
+			MaxIterations: 20,
+		})
 	}
 
-	engine := guard.NewEngine(guard.ModeApprove, nil)
-	handlers := append([]adk.ChatModelAgentMiddleware{boardMW}, guard.Handlers(engine, guard.Options{WorkspaceRoot: cwd})...)
-	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
-		Name:        config.AgentName(),
-		Description: "带任务看板与工具安全层的工作伙伴",
-		Instruction: config.SystemPrompt() + "\n\n" + taskboard.Instruction,
-		Model:       chatModel,
-		ToolsConfig: adk.ToolsConfig{
-			// all 是静态组装的 5 个基础工具，共三处来源：
-			//   - tools.MustBasic → get_current_time、calculate（internal/tools/basic.go，
-			//     MustBasic 是 Basic 的 panic 包装）；
-			//   - tools.Bash → bash（internal/tools/shell.go）；
-			//   - tools.Files → read_file、write_file（internal/tools/files.go）。
-			// taskboard 的 4 个记账工具（TaskCreate/Update/List/Get）不在这 5 个里：
-			// 它们由 taskboard middleware 的 BeforeAgent 每轮动态注入 runCtx.Tools
-			//（internal/taskboard/middleware.go），运行时合计 9 个。
-			// ExecuteSequentially：同批工具调用串行，「同批里先 Update 再干活」
-			// 降低打架（秩序偏好，不是正确性保证，见 doc/01 §4）。
-			ToolsNodeConfig: compose.ToolsNodeConfig{Tools: all, ExecuteSequentially: true},
-		},
-		Handlers:      handlers,
-		MaxIterations: 20,
-	})
+	// Web 模式：单用户、无鉴权，只该绑本机地址（《10》§5 范围冻结）。
+	if *webAddr != "" {
+		srv := webui.New(ctx, webui.Config{NewAgent: newAgent})
+		fmt.Printf("yk-tako Web UI: http://%s（Ctrl-C 退出）\n", *webAddr)
+		if err := http.ListenAndServe(*webAddr, srv); err != nil {
+			repl.Exitf("web: %v", err)
+		}
+		return
+	}
+
+	agent, err := newAgent(ctx)
 	if err != nil {
 		repl.Exitf("创建 agent: %v", err)
 	}
