@@ -34,6 +34,7 @@ type Server struct {
 func New(ctx context.Context, cfg Config) *Server {
 	s := &Server{ctx: ctx, newAgent: cfg.NewAgent, sessions: map[string]*session{}}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", s.handleIndex)
 	mux.HandleFunc("POST /api/chat", s.handleChat)
 	mux.HandleFunc("POST /api/approval", s.handleApproval)
 	s.mux = mux

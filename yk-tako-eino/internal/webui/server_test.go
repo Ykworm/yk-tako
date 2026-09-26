@@ -395,3 +395,32 @@ func TestApprovalBadRequest(t *testing.T) {
 		})
 	}
 }
+
+// TestIndexPage 验证单页可出：200 + HTML，且带聊天/审批/看板的关键挂点。
+func TestIndexPage(t *testing.T) {
+	srv := New(context.Background(), Config{NewAgent: func(context.Context) (adk.Agent, error) {
+		return newTestAgent(t, &scriptModel{}, nil), nil
+	}})
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("Content-Type = %q，want text/html", ct)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读页面: %v", err)
+	}
+	for _, marker := range []string{`id="log"`, `id="board-body"`, `id="approval"`, "api/chat", "api/approval"} {
+		if !strings.Contains(string(body), marker) {
+			t.Fatalf("页面缺挂点 %q", marker)
+		}
+	}
+}
