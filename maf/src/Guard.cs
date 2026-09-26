@@ -267,6 +267,26 @@ public sealed class GuardEngine
         return (string.Join("\n", kept), true);
     }
 
+    /// <summary>把命中清单排成人读的几行，最多列 5 条（对齐 Eino formatFindings）。</summary>
+    public static string FormatFindings(IReadOnlyList<Finding> findings, string header)
+    {
+        var toolName = findings.Count > 0 ? findings[0].ToolName : "?";
+        var lines = new List<string> { header, "Tool: " + toolName, "" };
+        var limit = Math.Min(findings.Count, 5);
+        for (var i = 0; i < limit; i++)
+        {
+            var finding = findings[i];
+            lines.Add($"- [{finding.Severity}] {finding.Description}");
+            lines.Add($"  snippet: {finding.Snippet}");
+            lines.Add($"  remediation: {finding.Remediation}");
+        }
+        if (findings.Count > 5)
+        {
+            lines.Add($"... 以及另外 {findings.Count - 5} 条告警");
+        }
+        return string.Join("\n", lines);
+    }
+
     /// <summary>认出 CommentLine 这条特殊排除（判等用源码字面量，和 Eino isCommentLineExclude 同法）。</summary>
     private static bool IsCommentLine(Regex pattern) => pattern.ToString() == CommentLine;
 }

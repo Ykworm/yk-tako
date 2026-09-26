@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Xunit;
 using YkTako.MafL2;
 
@@ -79,5 +80,27 @@ public sealed class GuardEngineTests
 
         Assert.Empty(engine.Guard("execute", Args("ls safe")));
         Assert.Single(engine.Guard("execute", Args("ls x")));
+    }
+
+    [Fact]
+    public void JsonElementArguments_AreRead()
+    {
+        using var doc = JsonDocument.Parse("\"rm -rf /tmp/x\"");
+        var findings = NewApproveEngine().Guard("execute", new Dictionary<string, object?> { ["command"] = doc.RootElement });
+        Assert.Single(findings);
+    }
+
+    [Fact]
+    public void FormatFindings_CapsAtFive_AndCountsRest()
+    {
+        var findings = Enumerable.Range(0, 7)
+            .Select(i => new Finding($"R{i}", GuardSeverity.High, "execute", "command", $"snippet{i}", $"desc{i}", $"fix{i}"))
+            .ToList();
+
+        var text = GuardEngine.FormatFindings(findings, "表头");
+
+        Assert.Contains("表头", text);
+        Assert.Equal(5, text.Split('\n').Count(line => line.StartsWith("- [")));
+        Assert.Contains("... 以及另外 2 条告警", text);
     }
 }
