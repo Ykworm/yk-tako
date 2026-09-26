@@ -46,7 +46,9 @@ type Sink func(Event)
 // eventFrom 把一条消息输出分类成呈现事件。ok=false 表示没有可呈现内容（空消息），
 // 调用方直接忽略。分类口径与重构前 printMessage 的分支一一对应：
 // ToolCalls→tool_call、Role==Tool→tool_result/board、Content→message。
-// mv 与 msg 的关系：Role / ToolName 以 mv（框架元数据）优先，msg 兜底。
+// mv 与 msg 的关系：tool 判定取「mv.Role == Tool || msg.Role == Tool」；
+// ToolName 取 mv 优先、msg 兜底；Event.Role 一律沿用 msg.Role（mv 只做判定）。
+// mv 由调用方保证非 nil（consume 里 MessageOutput 非空才调）。
 func eventFrom(agentName string, mv *adk.MessageVariant, msg *schema.Message) (Event, bool) {
 	if msg == nil {
 		return Event{}, false

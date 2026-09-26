@@ -52,6 +52,18 @@ func TestEventFrom(t *testing.T) {
 			want: Event{Kind: EventToolResult, Agent: "yk-tako", Role: schema.Tool, ToolName: "read_file", Text: "文件内容"},
 		},
 		{
+			name: "调用与正文并存时弃正文", agent: "yk-tako",
+			mv:   &adk.MessageVariant{Role: schema.Assistant, Message: schema.AssistantMessage("我先查一下", []schema.ToolCall{{ID: "c3", Function: schema.FunctionCall{Name: "read_file"}}})},
+			msg:  schema.AssistantMessage("我先查一下", []schema.ToolCall{{ID: "c3", Function: schema.FunctionCall{Name: "read_file"}}}),
+			want: Event{Kind: EventToolCall, Agent: "yk-tako", Role: schema.Assistant, ToolNames: []string{"read_file"}},
+		},
+		{
+			name: "回执角色只取 msg（mv.Role 只做判定）", agent: "yk-tako",
+			mv:   &adk.MessageVariant{Role: schema.Tool, ToolName: "read_file", Message: &schema.Message{Content: "回执", ToolName: "read_file"}},
+			msg:  &schema.Message{Content: "回执", ToolName: "read_file"},
+			want: Event{Kind: EventToolResult, Agent: "yk-tako", ToolName: "read_file", Text: "回执"},
+		},
+		{
 			name: "正文", agent: "yk-tako",
 			mv:   &adk.MessageVariant{Role: schema.Assistant, Message: textMsg},
 			msg:  textMsg,
