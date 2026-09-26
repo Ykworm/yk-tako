@@ -1,3 +1,4 @@
+// 本文件：三件套守卫的单元测试——规则命中、路径判定与打码幂等。不打模型。
 package guard
 
 import "testing"

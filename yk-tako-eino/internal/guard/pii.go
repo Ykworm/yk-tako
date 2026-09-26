@@ -1,3 +1,5 @@
+// 本文件：出口 PII 脱敏——识别 API Key 并打成头尾保留、中间打星（幂等）。
+// 挂载点见 middleware.go 的 piiHandler。
 package guard
 
 import (

@@ -1,3 +1,7 @@
+// 本文件：身份常量（人设、主 agent 名字）与按厂商目录建 Eino ChatModel
+// （Open / OpenForForcedToolChoice）。
+// 返回值实现 model.ToolCallingChatModel 接口——github.com/cloudwego/eino/components/model
+// 包 interface.go:99（eino v0.9.21）；具体实现来自 eino-ext 的 openai / claude 组件。
 package config
 
 import (
@@ -16,6 +20,15 @@ const systemPrompt = "你是 yk-tako，一个正在成长中的 AI 工作伙伴�
 
 // SystemPrompt 是三个 L0 脚本和 L1 共用的人设。
 func SystemPrompt() string { return systemPrompt }
+
+// agentName 是主 agent 的标识。adk 把它写进每个事件（TypedChatModelAgent.Name，
+// eino/adk/chatmodel.go:680），adkrun 靠它分辨「哪条消息是自己说的、谁算子代理」。
+// 四个入口共用这一份：以前各脚本手写字符串，一旦某处改了名字，
+// 另一处不会报错，只是历史变空——所以收在这里，由 AgentName 统一暴露。
+const agentName = "yk-tako"
+
+// AgentName 是主 agent 的名字，给 ChatModelAgentConfig.Name / deep.Config.Name 用。
+func AgentName() string { return agentName }
 
 // LoadDotEnv 读取 .env。在 yk-tako-eino 目录里运行时读当前目录；在仓库根运行时再试 yk-tako-eino/.env。
 func LoadDotEnv() {

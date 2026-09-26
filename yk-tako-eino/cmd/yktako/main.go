@@ -1,14 +1,7 @@
-// L2 任务规划。对照 TypeScript 的 src/l2/01-planning.ts。
+// yk-tako 唯一入口：裸 ReAct + 任务看板（taskboard）+ L1 三件套守卫。
 //
-// L1 三件套不动，planning 插在文件守卫之后、PII 之前。
-// 清单不在图 state 里，/todos 读进程内的那份。
-//
-// 试试：
-//
-//	现在几点
-//	帮我规划一下：先查现在时间，再算 1234*5678，最后写个总结
-//	/todos
-//	/mode block|warn|require_approval
+// 组装（doc/01 §5）：ChatModelAgent 的 Handlers 链 = [taskboard] + guard 三件套；
+// 看板正本在 taskboard middleware 里跨轮存活，镜像随 interrupt 落 checkpoint。
 package main
 
 import (
@@ -23,13 +16,12 @@ import (
 	"yk-tako-eino/internal/adkrun"
 	"yk-tako-eino/internal/config"
 	"yk-tako-eino/internal/guard"
-	"yk-tako-eino/internal/planning"
 	"yk-tako-eino/internal/repl"
+	"yk-tako-eino/internal/taskboard"
 	"yk-tako-eino/internal/tools"
 )
 
-// main 建 ChatModelAgent、手写 planning 中间件和 L1 守卫，进 REPL 循环，
-// 顺带支持 /todos 看清单和 /mode 切 ToolGuard 模式。
+// main 建模型、工具、看板与守卫，进 REPL 循环；审批走 interrupt 加 Resume。
 func main() {
 	ctx := context.Background()
 	chatModel, ref := config.MustOpen(ctx)
@@ -48,25 +40,34 @@ func main() {
 	all := append(tools.MustBasic(ctx), bash)
 	all = append(all, files...)
 
-	plan, err := planning.New(planning.Options{})
+	// 看板：正本在 store（跨轮存活），middleware 注入四个记账工具。
+	boardMW, err := taskboard.New(taskboard.NewStore())
 	if err != nil {
-		repl.Exitf("planning: %v", err)
+		repl.Exitf("taskboard: %v", err)
 	}
-	engine := guard.NewEngine(guard.ModeApprove, nil)
-	guards := guard.Handlers(engine, guard.Options{WorkspaceRoot: cwd})
-	// cap 截断，避免 append 写穿原来的 PII handler。
-	handlers := append(guards[:2:2], plan.Handler, guards[2])
 
+	engine := guard.NewEngine(guard.ModeApprove, nil)
+	handlers := append([]adk.ChatModelAgentMiddleware{boardMW}, guard.Handlers(engine, guard.Options{WorkspaceRoot: cwd})...)
 	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
-		Name:        "yk-tako",
-		Description: "会列计划的工作伙伴",
-		Instruction: config.SystemPrompt(),
+		Name:        config.AgentName(),
+		Description: "带任务看板与工具安全层的工作伙伴",
+		Instruction: config.SystemPrompt() + "\n\n" + taskboard.Instruction,
 		Model:       chatModel,
 		ToolsConfig: adk.ToolsConfig{
-			ToolsNodeConfig: compose.ToolsNodeConfig{Tools: all},
+			// all 是静态组装的 5 个基础工具，共三处来源：
+			//   - tools.MustBasic → get_current_time、calculate（internal/tools/basic.go，
+			//     MustBasic 是 Basic 的 panic 包装）；
+			//   - tools.Bash → bash（internal/tools/shell.go）；
+			//   - tools.Files → read_file、write_file（internal/tools/files.go）。
+			// taskboard 的 4 个记账工具（TaskCreate/Update/List/Get）不在这 5 个里：
+			// 它们由 taskboard middleware 的 BeforeAgent 每轮动态注入 runCtx.Tools
+			//（internal/taskboard/middleware.go），运行时合计 9 个。
+			// ExecuteSequentially：同批工具调用串行，「同批里先 Update 再干活」
+			// 降低打架（秩序偏好，不是正确性保证，见 doc/01 §4）。
+			ToolsNodeConfig: compose.ToolsNodeConfig{Tools: all, ExecuteSequentially: true},
 		},
 		Handlers:      handlers,
-		MaxIterations: 30,
+		MaxIterations: 20,
 	})
 	if err != nil {
 		repl.Exitf("创建 agent: %v", err)
@@ -80,18 +81,14 @@ func main() {
 	console := repl.New()
 	var history []*schema.Message
 	turn := 0
-	fmt.Printf("L2 任务规划演示（手写 planning 中间件）。模型 %s。\n", ref)
-	fmt.Printf("ToolGuard 模式: %s。/todos 看清单，quit 退出。\n\n", engine.Mode())
+	fmt.Printf("yk-tako。模型 %s。\n", ref)
+	fmt.Printf("ToolGuard 模式: %s（/mode 可切换）。输入 quit 退出。\n\n", engine.Mode())
 	for {
 		input, ok := console.ReadLine("你: ")
 		if !ok || input == "quit" || input == "exit" {
 			break
 		}
 		if input == "" {
-			continue
-		}
-		if input == "/todos" {
-			fmt.Printf("📋 当前任务清单:\n%s\n\n", repl.Indent(planning.FormatTodos(plan.List.Snapshot())))
 			continue
 		}
 		if mode, ok := strings.CutPrefix(input, "/mode "); ok {
@@ -106,7 +103,7 @@ func main() {
 		}
 		turn++
 		messages := append(append([]*schema.Message{}, history...), schema.UserMessage(input))
-		produced, err := adkrun.Run(ctx, runner, fmt.Sprintf("l2-%d", turn), "yk-tako", messages, func(info guard.ApprovalInfo) (string, error) {
+		produced, err := adkrun.Run(ctx, runner, agent, fmt.Sprintf("turn-%d", turn), messages, func(info guard.ApprovalInfo) (string, error) {
 			fmt.Println("\n⏸️  ═══════════════ 人工审批（interrupt）═══════════════")
 			fmt.Printf("工具: %s   参数: %s\n", info.Tool, info.Args)
 			if info.Message != "" {

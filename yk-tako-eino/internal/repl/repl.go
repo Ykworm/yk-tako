@@ -1,3 +1,5 @@
+// Package repl 提供控制台输入与打印小工具（Clip / Exitf），与 Eino 无关。
+// 实现都在本文件。
 package repl
 
 import (
@@ -47,13 +49,4 @@ func Clip(s string, n int) string {
 func Exitf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)
-}
-
-// Indent 给每行加统一前导空格。任务清单的缩进打印用它。
-func Indent(s string) string {
-	lines := strings.Split(s, "\n")
-	for i, line := range lines {
-		lines[i] = "     " + line
-	}
-	return strings.Join(lines, "\n")
 }

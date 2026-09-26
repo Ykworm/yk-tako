@@ -1,3 +1,4 @@
+// 本文件：read_file / write_file 两个文件工具，供 L1 的文件守卫包住做路径检查。
 package tools
 
 import (
@@ -21,6 +22,7 @@ type writeArgs struct {
 }
 
 // Files 是 filesystem guard 的被保护对象。路径校验不在工具里。
+// 两个工具经 utils.InferTool 生成，实现工具接口（见包注释）。
 func Files(ctx context.Context) ([]tool.BaseTool, error) {
 	readFile, err := utils.InferTool("read_file", "读取指定路径的文件内容（绝对路径或相对当前目录）。",
 		func(_ context.Context, args readArgs) (string, error) {

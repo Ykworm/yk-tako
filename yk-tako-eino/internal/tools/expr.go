@@ -1,3 +1,4 @@
+// 本文件：四则运算求值的白名单校验与递归下降解析器。纯函数，不碰 Eino。
 package tools
 
 import (

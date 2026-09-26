@@ -1,3 +1,4 @@
+// 本文件：bash 工具——在宿主机 shell 里执行命令。危险命令的拦截在 guard 层。
 package tools
 
 import (
@@ -17,6 +18,7 @@ type bashArgs struct {
 }
 
 // Bash 给 agent 真实的 shell。故意不做拦截，拦截是中间件的事。
+// 工具经 utils.InferTool 生成，最终实现 tool.InvokableTool（接口说明见包注释）。
 func Bash(ctx context.Context) (tool.BaseTool, error) {
 	return utils.InferTool("bash", "在宿主机 shell 中执行命令并返回输出。工作目录为进程当前目录，超时 10 秒。",
 		func(ctx context.Context, args bashArgs) (string, error) {

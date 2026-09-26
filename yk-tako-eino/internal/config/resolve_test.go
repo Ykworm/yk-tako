@@ -1,3 +1,4 @@
+// 本文件：厂商/模型解析（ResolveModel）的单元测试。直接传 Env map，不碰真实环境变量。
 package config
 
 import "testing"

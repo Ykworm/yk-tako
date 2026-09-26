@@ -3,3 +3,5 @@
 # .NET 构建产物（maf/）
 bin/
 obj/
+# Go 编译产物（yk-tako-eino/，go build ./cmd/yktako 默认落在包目录）
+yk-tako-eino/yktako

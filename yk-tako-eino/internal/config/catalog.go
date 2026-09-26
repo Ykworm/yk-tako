@@ -1,3 +1,7 @@
+// Package config 把 TAKO_MODEL 和厂商目录解析成 Eino ChatModel：本文件读内嵌的
+// provider-catalog.json，resolve.go 解析环境变量，model.go 建客户端。
+//
+// 本文件：厂商目录的加载与查询。纯数据，不碰 Eino。
 package config
 
 import (

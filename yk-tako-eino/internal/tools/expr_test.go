@@ -1,3 +1,4 @@
+// 本文件：四则运算求值的单元测试。
 package tools
 
 import "testing"

@@ -1,3 +1,4 @@
+// 本文件：环境变量与厂商目录的解析——把 TAKO_MODEL 解析成可用的厂商、模型与密钥。
 package config
 
 import (

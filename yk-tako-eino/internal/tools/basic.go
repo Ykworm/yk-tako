@@ -1,3 +1,9 @@
+// Package tools 是给 agent 用的基础工具集：时间、四则运算、bash、文件读写。
+//
+// 工具都由 utils.InferTool（github.com/cloudwego/eino/components/tool/utils）生成，
+// 产物实现 tool.InvokableTool 接口（github.com/cloudwego/eino/components/tool 包
+// interface.go:42，eino v0.9.21），对外用更宽的 tool.BaseTool（同文件 :32）承载。
+// 路径/命令的安全检查不在工具里，在 internal/guard 层。
 package tools
 
 import (
@@ -18,6 +24,7 @@ type calcArgs struct {
 }
 
 // Basic 是 L0 的两个无害工具：时间和四则运算。
+// 两个工具经 utils.InferTool 生成，实现工具接口（见包注释）。
 func Basic(ctx context.Context) ([]tool.BaseTool, error) {
 	clock, err := utils.InferTool("get_current_time", "获取当前的日期和时间（东八区）",
 		func(context.Context, emptyArgs) (string, error) {

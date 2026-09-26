@@ -1,3 +1,6 @@
+// 本文件：L1 三件套守卫的 ADK middleware 实现、interrupt 载荷与恢复判定。
+// 命令规则在 toolguard.go，路径规则在 filesystem.go，打码算法在 pii.go；
+// 包的整体说明见 filesystem.go 的文件头。
 package guard
 
 import (
@@ -40,21 +43,41 @@ const (
 )
 
 // toolGuardHandler 是命令守卫：扫规则命中，按模式拦、问或放行。
+//
+// 实现接口：adk.ChatModelAgentMiddleware —— github.com/cloudwego/eino/adk 包
+// handler.go:139 定义的 TypedChatModelAgentMiddleware[*schema.Message]（eino v0.9.21；
+// 第 259 行起别名 ChatModelAgentMiddleware）。内嵌 adk.BaseChatModelAgentMiddleware
+// （同文件 :277）提供其余钩子的空实现，本类型覆盖 WrapInvokableToolCall。
 type toolGuardHandler struct {
 	adk.BaseChatModelAgentMiddleware
 	engine *Engine
 }
 
+// 编译期校验 toolGuardHandler 实现了 adk.ChatModelAgentMiddleware。
+var _ adk.ChatModelAgentMiddleware = (*toolGuardHandler)(nil)
+
 // filesystemHandler 是路径守卫：工作区内外、敏感文件规则都在这一层判。
+//
+// 实现接口：adk.ChatModelAgentMiddleware（同上，eino/adk/handler.go:139；基类 :277）。
+// 覆盖 WrapInvokableToolCall。
 type filesystemHandler struct {
 	adk.BaseChatModelAgentMiddleware
 	options Options
 }
 
+// 编译期校验 filesystemHandler 实现了 adk.ChatModelAgentMiddleware。
+var _ adk.ChatModelAgentMiddleware = (*filesystemHandler)(nil)
+
 // piiHandler 是出口脱敏：模型输入和工具输出各过一遍打码。
+//
+// 实现接口：adk.ChatModelAgentMiddleware（同上，eino/adk/handler.go:139；基类 :277）。
+// 覆盖 BeforeModelRewriteState 和 WrapInvokableToolCall。
 type piiHandler struct {
 	adk.BaseChatModelAgentMiddleware
 }
+
+// 编译期校验 piiHandler 实现了 adk.ChatModelAgentMiddleware。
+var _ adk.ChatModelAgentMiddleware = (*piiHandler)(nil)
 
 // Handlers 是 L1 的三件套，顺序就是包裹顺序：命令守卫在外，文件守卫居中，PII 最贴工具。
 func Handlers(engine *Engine, fs Options) []adk.ChatModelAgentMiddleware {
@@ -65,7 +88,11 @@ func Handlers(engine *Engine, fs Options) []adk.ChatModelAgentMiddleware {
 	}
 }
 
-// WrapInvokableToolCall 包一层工具执行：先认自己那笔中断的续跑，再扫规则决定放行、打断还是拒绝。
+// WrapInvokableToolCall 实现 adk.ChatModelAgentMiddleware 的 WrapInvokableToolCall
+// 钩子（github.com/cloudwego/eino/adk/handler.go:193）：框架在每次工具即将执行时调用它，
+// 传入真执行的 endpoint、接收包过一层的新 endpoint——守卫就是靠这个挂进工具执行链。
+// 本实现借这层拦截：先认自己那笔中断的续跑，再扫规则决定放行、打断还是拒绝；
+// 批准后的续跑执行保存下来的原始参数，拒绝则不执行工具、只回一句拒绝说明。
 func (h *toolGuardHandler) WrapInvokableToolCall(_ context.Context, endpoint adk.InvokableToolCallEndpoint, tCtx *adk.ToolContext) (adk.InvokableToolCallEndpoint, error) {
 	return func(ctx context.Context, args string, opts ...tool.Option) (string, error) {
 		if stored, ok := ownInterrupt(ctx, kindToolGuard); ok {
@@ -135,7 +162,10 @@ func approvalInfo(engine *Engine, toolName, args string) ApprovalInfo {
 	}
 }
 
-// WrapInvokableToolCall 包一层工具执行：先处理自己的中断，再按路径规则放行、问人或硬拒。
+// WrapInvokableToolCall 实现 adk.ChatModelAgentMiddleware 的 WrapInvokableToolCall
+// 钩子（github.com/cloudwego/eino/adk/handler.go:193，与命令守卫同一钩子）：框架在每次
+// 工具即将执行时调用它并传入真执行 endpoint。本实现借它按路径规则放行、问人或硬拒；
+// 问人时用 StatefulInterrupt 暂停整轮，用户拒绝就返回拒绝文案而不执行工具。
 func (h *filesystemHandler) WrapInvokableToolCall(_ context.Context, endpoint adk.InvokableToolCallEndpoint, tCtx *adk.ToolContext) (adk.InvokableToolCallEndpoint, error) {
 	return func(ctx context.Context, args string, opts ...tool.Option) (string, error) {
 		if stored, ok := ownInterrupt(ctx, kindFSGuard); ok {
@@ -166,7 +196,10 @@ func (h *filesystemHandler) WrapInvokableToolCall(_ context.Context, endpoint ad
 	}, nil
 }
 
-// BeforeModelRewriteState 把历史里的密钥打码后再给模型。RewriteState 钩子官方
+// BeforeModelRewriteState 实现 adk.ChatModelAgentMiddleware 的 BeforeModelRewriteState
+// 钩子（github.com/cloudwego/eino/adk/handler.go:171）：框架在每次模型调用前调用，
+// 返回的 state 会被持久化并作为模型输入，是官方推荐改消息/工具表的位置。
+// 本实现借它把历史里的密钥打码后再给模型。RewriteState 钩子官方
 // 允许就地改 state（chatmodel.go 的生命周期注释："can modify state"）；注意
 // state.Messages 与事件流、调用方 history 共享消息指针，这里的改写会写穿回
 // REPL 历史——当前语义下正是想要的（历史同样脱敏）。如果哪天需要"对模型脱敏、
@@ -181,7 +214,10 @@ func (h *piiHandler) BeforeModelRewriteState(ctx context.Context, state *adk.Cha
 	return ctx, state, nil
 }
 
-// WrapInvokableToolCall 把工具输出里的密钥打码后再交回给模型。
+// WrapInvokableToolCall 实现 adk.ChatModelAgentMiddleware 的 WrapInvokableToolCall
+// 钩子（github.com/cloudwego/eino/adk/handler.go:193，与命令守卫同一钩子）：框架在每次
+// 工具即将执行时调用它。本实现借它在 endpoint 返回之后把工具输出里的密钥打码，
+// 再交回给模型——只改模型看到的内容，不碰工具真实执行结果。
 func (h *piiHandler) WrapInvokableToolCall(_ context.Context, endpoint adk.InvokableToolCallEndpoint, _ *adk.ToolContext) (adk.InvokableToolCallEndpoint, error) {
 	return func(ctx context.Context, args string, opts ...tool.Option) (string, error) {
 		out, err := endpoint(ctx, args, opts...)

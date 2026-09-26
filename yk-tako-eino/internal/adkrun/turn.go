@@ -1,3 +1,6 @@
+// Package adkrun 是 ADK Runner 的驱动层：事件消费（打印过程、攒历史）与
+// interrupt 审批回路，外加一个内存版 checkpoint store。唯一入口 cmd/yktako
+// 使用，实现都在本文件。
 package adkrun
 
 import (
@@ -6,25 +9,35 @@ import (
 	"strings"
 	"sync"
 
+	"yk-tako-eino/internal/guard"
+	"yk-tako-eino/internal/repl"
+	"yk-tako-eino/internal/taskboard"
+
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/schema"
-	"yk-tako-eino/internal/guard"
-	"yk-tako-eino/internal/planning"
-	"yk-tako-eino/internal/repl"
 )
 
 // Store 是内存版 checkpoint。进程退出就没了，够演 interrupt。
+//
+// 实现接口：compose.CheckPointStore —— github.com/cloudwego/eino/compose 包
+// checkpoint.go:53 的同名别名（eino v0.9.21）；adk.RunnerConfig.CheckPointStore
+// 用的 adk.CheckPointStore 是同一个类型（eino/adk/runner.go:64），覆盖 Get / Set。
 type Store struct {
 	mu sync.Mutex
 	m  map[string][]byte
 }
+
+// 编译期校验 Store 实现了 adk.CheckPointStore（即 compose.CheckPointStore）。
+var _ adk.CheckPointStore = (*Store)(nil)
 
 // NewStore 建一个空的内存 checkpoint。
 func NewStore() *Store {
 	return &Store{m: map[string][]byte{}}
 }
 
-// Get 读 checkpoint，返回拷贝，调用方改不到内部字节。
+// Get 实现 compose.CheckPointStore 的 Get 方法：Runner 续跑时按 checkpointID 回调它
+// 取回图状态（compose 的 checkPointer.get 反序列化用）。这里返回内部字节的拷贝，
+// 调用方改不到 store；key 不存在返回 ok=false，Runner 视为从头跑。
 func (s *Store) Get(_ context.Context, key string) ([]byte, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -37,7 +50,9 @@ func (s *Store) Get(_ context.Context, key string) ([]byte, bool, error) {
 	return out, true, nil
 }
 
-// Set 写 checkpoint，同样存拷贝。
+// Set 实现 compose.CheckPointStore 的 Set 方法：图在暂停（如 interrupt）等存点时刻
+// 由 compose 的 checkPointer.set 回调，按 checkpointID 写入序列化后的图状态。
+// 这里同样存拷贝，防止调用方后续改字节穿透 store。
 func (s *Store) Set(_ context.Context, key string, value []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -51,8 +66,17 @@ func (s *Store) Set(_ context.Context, key string, value []byte) error {
 type Ask func(info guard.ApprovalInfo) (string, error)
 
 // Run 跑一轮，遇到 interrupt 就问人再 Resume，直到这轮结束。
-// root 是主 agent 的名字。只有它的消息会回到历史里，子代理的过程只打印。
-func Run(ctx context.Context, runner *adk.Runner, checkpointID, root string, input []*schema.Message, ask Ask) ([]*schema.Message, error) {
+// agent 是主 agent：过滤历史用的 root 名从它自己的 Name 取，不再让脚本另传一份。
+// 以前 root 要脚本手写，和 ChatModelAgentConfig.Name 写重复——对不上时不报错也不 panic，
+// 只是历史悄悄变空、子代理前缀不打了，属于最难查的那种错。
+// 事件里的 AgentName 用的就是同一个 Name：adk 的 flowAgent 直接内嵌 Agent
+// （adk/flow.go:42），Name 原样转发给里层的 ChatModelAgent。
+// 只有 root 的消息回到历史，子代理的过程只打印。
+//
+// 参数类型用 adk.Agent（github.com/cloudwego/eino/adk 包 interface.go:467 的
+// TypedAgent[*schema.Message] 别名，Name 在 :454 声明）：这里只要 Name，runner 自己拿着 agent。
+func Run(ctx context.Context, runner *adk.Runner, agent adk.Agent, checkpointID string, input []*schema.Message, ask Ask) ([]*schema.Message, error) {
+	root := agent.Name(ctx)
 	var opts []adk.AgentRunOption
 	if checkpointID != "" {
 		opts = append(opts, adk.WithCheckPointID(checkpointID))
@@ -112,10 +136,6 @@ func consume(iter *adk.AsyncIterator[*adk.AgentEvent], root string) ([]*schema.M
 			}
 			printMessage(event.AgentName, root, event.Output.MessageOutput, msg)
 			if msg != nil && event.AgentName == root {
-				// 模型事件在 AfterModel 改写之前就发出了。半途而废提醒补上的
-				// planning_nudge 不在那条助手消息里，工具回执却在。下一轮原样送回会变成
-				// 没有对应 tool call 的 ToolMessage，接口直接 400。这里按 id 补上。
-				ensureNudgeCall(msgs, msg)
 				msgs = append(msgs, msg)
 			}
 		}
@@ -143,6 +163,8 @@ func printMessage(agentName, root string, mv *adk.MessageVariant, msg *schema.Me
 		prefix = "[" + agentName + "] "
 	}
 	if len(msg.ToolCalls) > 0 {
+		// len(msg.ToolCalls) > 0：模型返回的助手消息（Role=Assistant），带 tool_calls，表示「我要调工具」→ 打印 → 🔧 调用: xxx 后 return。
+
 		names := make([]string, 0, len(msg.ToolCalls))
 		for _, call := range msg.ToolCalls {
 			names = append(names, call.Function.Name)
@@ -151,24 +173,16 @@ func printMessage(agentName, root string, mv *adk.MessageVariant, msg *schema.Me
 		return
 	}
 	if mv.Role == schema.Tool || msg.Role == schema.Tool {
+		// mv.Role == schema.Tool || msg.Role == schema.Tool：工具执行完返回的回执消息（Role=Tool），不带 ToolCalls，只有 Content → 打印 ← 🔧 结果: xxx。
 		name := mv.ToolName
 		if name == "" {
 			name = msg.ToolName
 		}
-		if name == planning.NudgeTool || strings.HasPrefix(msg.Content, planning.NudgePrefix) {
-			line := msg.Content
-			if i := strings.IndexByte(line, '\n'); i >= 0 {
-				line = line[:i]
-			}
-			fmt.Printf("  ↩️  %s%s（已跳回模型继续）\n", prefix, line)
+		if taskboard.IsBoardTool(name) {
+			// 账本工具的回执自带看板与催更块（taskboard/tools.go 的 withBoard），
+			// 原样投影，不走 Clip 截断——截断会把看板截烂。
+			fmt.Printf("  📋 %s%s\n", prefix, msg.Content)
 			return
-		}
-		if name == planning.WriteTodosTool {
-			if list, ok := planning.IconList(msg.Content); ok {
-				fmt.Printf("  📋 %s任务清单:\n%s\n", prefix, repl.Indent(list))
-			} else if list, ok := planning.StatusList(msg.Content); ok {
-				fmt.Printf("  📋 %s任务清单: %s\n", prefix, list)
-			}
 		}
 		fmt.Printf("  ← 🔧 %s%s: %s\n", prefix, name, repl.Clip(msg.Content, 120))
 		return
@@ -189,30 +203,4 @@ func approvalFrom(info any) guard.ApprovalInfo {
 		}
 	}
 	return guard.ApprovalInfo{Message: fmt.Sprint(info)}
-}
-
-// ensureNudgeCall 给提醒回执补上对应的 tool call，避免下一轮出现没有调用来源的 ToolMessage。
-func ensureNudgeCall(history []*schema.Message, msg *schema.Message) {
-	if msg == nil || msg.Role != schema.Tool || !planning.IsPlanningNudge(msg) || len(history) == 0 {
-		return
-	}
-	prev := history[len(history)-1]
-	if prev == nil || prev.Role != schema.Assistant {
-		return
-	}
-	for _, call := range prev.ToolCalls {
-		if msg.ToolCallID != "" && call.ID == msg.ToolCallID {
-			return
-		}
-	}
-	index := len(prev.ToolCalls)
-	prev.ToolCalls = append(prev.ToolCalls, schema.ToolCall{
-		Index: &index,
-		ID:    msg.ToolCallID,
-		Type:  "function",
-		Function: schema.FunctionCall{
-			Name:      planning.NudgeTool,
-			Arguments: "{}",
-		},
-	})
 }

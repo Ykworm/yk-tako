@@ -1,3 +1,4 @@
+// 本文件：打印小工具（Clip）的单元测试。
 package repl
 
 import "testing"
@@ -13,12 +14,5 @@ func TestClip(t *testing.T) {
 	got := Clip("一二三四五六七八九十", 5)
 	if got != "一二三四五…" {
 		t.Fatalf("按 rune 截断并加省略号: %q", got)
-	}
-}
-
-// TestIndent 验证每行统一加前导空格。
-func TestIndent(t *testing.T) {
-	if got := Indent("a\nb"); got != "     a\n     b" {
-		t.Fatalf("每行加前导空格: %q", got)
 	}
 }

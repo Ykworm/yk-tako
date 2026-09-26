@@ -1,3 +1,11 @@
+// Package guard 是 L1 工具安全层：命令守卫、文件路径守卫、出口 PII 脱敏。
+//
+// 三个守卫都实现 ADK 的 middleware 接口——github.com/cloudwego/eino/adk 包
+// handler.go:139 定义的 ChatModelAgentMiddleware（eino v0.9.21）：挂在
+// adk.ChatModelAgentConfig.Handlers 上包住工具执行；需要人工审批时用
+// compose.StatefulInterrupt 暂停、Runner.ResumeWithParams 恢复（装配见 middleware.go）。
+//
+// 本文件放路径规则与判定（Decide）；命令规则在 toolguard.go，打码在 pii.go。
 package guard
 
 import (

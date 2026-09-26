@@ -1,5 +1,8 @@
-// 给 DeepAgent 用的本地文件后端。
+// Package fsbackend 是给 DeepAgent 用的本地文件后端。
 // 官方 eino-ext/adk/backend/local 会带上 PDF 解析依赖，这门课只需要读写和搜索。
+//
+// Backend 实现 github.com/cloudwego/eino/adk/filesystem 包 backend.go:243 定义的
+// Backend 接口（eino v0.9.21）；deep.Config.Backend 要的就是这个接口。
 package fsbackend
 
 import (
@@ -18,9 +21,16 @@ import (
 // Backend 是直接读写本机文件的本地后端：相对路径相对 Root 解析，
 // 绝对路径原样使用，不把访问限制在 Root 里。越界和敏感文件防护是
 // guard 层（internal/guard）的事，这个后端只管读写。
+//
+// 实现接口：filesystem.Backend —— github.com/cloudwego/eino/adk/filesystem
+// 包的 backend.go:243（eino v0.9.21），覆盖 LsInfo / Read / Write / Edit /
+// GrepRaw / GlobInfo 六个方法。
 type Backend struct {
 	Root string
 }
+
+// 编译期校验 Backend 实现了 filesystem.Backend。
+var _ filesystem.Backend = (*Backend)(nil)
 
 // New 把 root 转成绝对路径建后端。
 func New(root string) (*Backend, error) {
@@ -43,7 +53,8 @@ func (b *Backend) resolve(path string) (string, error) {
 	return filepath.Clean(path), nil
 }
 
-// LsInfo 列目录，逐项带上大小和修改时间。
+// LsInfo 实现 filesystem.Backend 的 LsInfo 方法：DeepAgent 的 ls 工具执行时回调到这里
+// （adk/middlewares/filesystem 生成的内置文件工具，下同）；列目录，逐项带上大小和修改时间。
 func (b *Backend) LsInfo(_ context.Context, req *filesystem.LsInfoRequest) ([]filesystem.FileInfo, error) {
 	dir, err := b.resolve(req.Path)
 	if err != nil {
@@ -64,7 +75,8 @@ func (b *Backend) LsInfo(_ context.Context, req *filesystem.LsInfoRequest) ([]fi
 	return out, nil
 }
 
-// Read 读文件：支持按行 offset/limit 取片段，超 8000 字截断，免得一次灌爆上下文。
+// Read 实现 filesystem.Backend 的 Read 方法：DeepAgent 的 read_file 工具执行时回调到这里；
+// 读文件，支持按行 offset/limit 取片段，超 8000 字截断，免得一次灌爆上下文。
 func (b *Backend) Read(_ context.Context, req *filesystem.ReadRequest) (*filesystem.FileContent, error) {
 	path, err := b.resolve(req.FilePath)
 	if err != nil {
@@ -96,7 +108,8 @@ func (b *Backend) Read(_ context.Context, req *filesystem.ReadRequest) (*filesys
 	return &filesystem.FileContent{Content: text}, nil
 }
 
-// Write 覆盖写文件，父目录不存在就先建。
+// Write 实现 filesystem.Backend 的 Write 方法：DeepAgent 的 write_file 工具执行时回调到这里；
+// 覆盖写文件，父目录不存在就先建。
 func (b *Backend) Write(_ context.Context, req *filesystem.WriteRequest) error {
 	path, err := b.resolve(req.FilePath)
 	if err != nil {
@@ -108,7 +121,8 @@ func (b *Backend) Write(_ context.Context, req *filesystem.WriteRequest) error {
 	return os.WriteFile(path, []byte(req.Content), 0o644)
 }
 
-// Edit 按 old_string 替换；默认要求唯一匹配，replace_all 才全量替换。
+// Edit 实现 filesystem.Backend 的 Edit 方法：DeepAgent 的 edit_file 工具执行时回调到这里；
+// 按 old_string 替换；默认要求唯一匹配，replace_all 才全量替换。
 func (b *Backend) Edit(_ context.Context, req *filesystem.EditRequest) error {
 	if req.OldString == "" {
 		return fmt.Errorf("old_string 不能为空")
@@ -141,7 +155,8 @@ func (b *Backend) Edit(_ context.Context, req *filesystem.EditRequest) error {
 	return os.WriteFile(path, []byte(next), 0o644)
 }
 
-// GrepRaw 在目录里逐行搜正则，最多收 40 条就停。
+// GrepRaw 实现 filesystem.Backend 的 GrepRaw 方法：DeepAgent 的 grep 工具执行时回调到这里；
+// 在目录里逐行搜正则，最多收 40 条就停。
 func (b *Backend) GrepRaw(_ context.Context, req *filesystem.GrepRequest) ([]filesystem.GrepMatch, error) {
 	pattern := req.Pattern
 	if req.CaseInsensitive && !strings.HasPrefix(pattern, "(?i)") {
@@ -180,7 +195,8 @@ func (b *Backend) GrepRaw(_ context.Context, req *filesystem.GrepRequest) ([]fil
 	return matches, err
 }
 
-// GlobInfo 按 glob 找文件或目录，最多收 80 条就停。
+// GlobInfo 实现 filesystem.Backend 的 GlobInfo 方法：DeepAgent 的 glob 工具执行时回调到这里；
+// 按 glob 找文件或目录，最多收 80 条就停。
 func (b *Backend) GlobInfo(_ context.Context, req *filesystem.GlobInfoRequest) ([]filesystem.FileInfo, error) {
 	root, err := b.resolve(req.Path)
 	if err != nil {
