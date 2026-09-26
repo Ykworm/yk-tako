@@ -5,12 +5,9 @@ package adkrun
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 
 	"yk-tako-eino/internal/guard"
-	"yk-tako-eino/internal/repl"
-	"yk-tako-eino/internal/taskboard"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/schema"
@@ -70,11 +67,14 @@ type Ask func(info guard.ApprovalInfo) (string, error)
 // 只是历史悄悄变空、子代理前缀不打了，属于最难查的那种错。
 // 事件里的 AgentName 用的就是同一个 Name：adk 的 flowAgent 直接内嵌 Agent
 // （adk/flow.go:42），Name 原样转发给里层的 ChatModelAgent。
-// 只有 root 的消息回到历史，子代理的过程只打印。
+// 只有 root 的消息回到历史，子代理的过程只产事件。
+//
+// sink 收每条呈现事件（《10》§4.2 的 message/tool_call/tool_result/board 四类）；
+// 传 nil 合法，表示不呈现（只攒历史、收 interrupt），无头调用与测试可用。
 //
 // 参数类型用 adk.Agent（github.com/cloudwego/eino/adk 包 interface.go:467 的
 // TypedAgent[*schema.Message] 别名，Name 在 :454 声明）：这里只要 Name，runner 自己拿着 agent。
-func Run(ctx context.Context, runner *adk.Runner, agent adk.Agent, checkpointID string, input []*schema.Message, ask Ask) ([]*schema.Message, error) {
+func Run(ctx context.Context, runner *adk.Runner, agent adk.Agent, checkpointID string, input []*schema.Message, sink Sink, ask Ask) ([]*schema.Message, error) {
 	root := agent.Name(ctx)
 	var opts []adk.AgentRunOption
 	if checkpointID != "" {
@@ -83,7 +83,7 @@ func Run(ctx context.Context, runner *adk.Runner, agent adk.Agent, checkpointID 
 	iter := runner.Run(ctx, input, opts...)
 	var history []*schema.Message
 	for {
-		msgs, interrupts, err := consume(iter, root)
+		msgs, interrupts, err := consume(iter, root, sink)
 		history = append(history, msgs...)
 		if err != nil {
 			return history, err
@@ -113,8 +113,8 @@ func Run(ctx context.Context, runner *adk.Runner, agent adk.Agent, checkpointID 
 	}
 }
 
-// consume 收完一轮事件：打印过程、攒主 agent 的消息、收 interrupt。
-func consume(iter *adk.AsyncIterator[*adk.AgentEvent], root string) ([]*schema.Message, []*adk.InterruptCtx, error) {
+// consume 收完一轮事件：产出呈现事件、攒主 agent 的消息、收 interrupt。
+func consume(iter *adk.AsyncIterator[*adk.AgentEvent], root string, sink Sink) ([]*schema.Message, []*adk.InterruptCtx, error) {
 	var msgs []*schema.Message
 	var interrupts []*adk.InterruptCtx
 	if iter == nil {
@@ -133,7 +133,13 @@ func consume(iter *adk.AsyncIterator[*adk.AgentEvent], root string) ([]*schema.M
 			if err != nil {
 				return msgs, interrupts, err
 			}
-			printMessage(event.AgentName, root, event.Output.MessageOutput, msg)
+			if sink != nil {
+				// 分类（含 IsBoardTool）在驱动层完成：HTTP sink 将来只做呈现，
+				// 不能再把 taskboard 的判定重做一遍。
+				if ev, ok := eventFrom(event.AgentName, event.Output.MessageOutput, msg); ok {
+					sink(ev)
+				}
+			}
 			if msg != nil && event.AgentName == root {
 				msgs = append(msgs, msg)
 			}
@@ -150,45 +156,6 @@ func consume(iter *adk.AsyncIterator[*adk.AgentEvent], root string) ([]*schema.M
 		}
 	}
 	return msgs, interrupts, nil
-}
-
-// printMessage 打印一条事件消息，子代理的消息带名字前缀。
-func printMessage(agentName, root string, mv *adk.MessageVariant, msg *schema.Message) {
-	if msg == nil {
-		return
-	}
-	prefix := ""
-	if agentName != "" && agentName != root {
-		prefix = "[" + agentName + "] "
-	}
-	if len(msg.ToolCalls) > 0 {
-		// len(msg.ToolCalls) > 0：模型返回的助手消息（Role=Assistant），带 tool_calls，表示「我要调工具」→ 打印 → 🔧 调用: xxx 后 return。
-
-		names := make([]string, 0, len(msg.ToolCalls))
-		for _, call := range msg.ToolCalls {
-			names = append(names, call.Function.Name)
-		}
-		fmt.Printf("  → 🔧 %s调用: %s\n", prefix, strings.Join(names, ", "))
-		return
-	}
-	if mv.Role == schema.Tool || msg.Role == schema.Tool {
-		// mv.Role == schema.Tool || msg.Role == schema.Tool：工具执行完返回的回执消息（Role=Tool），不带 ToolCalls，只有 Content → 打印 ← 🔧 结果: xxx。
-		name := mv.ToolName
-		if name == "" {
-			name = msg.ToolName
-		}
-		if taskboard.IsBoardTool(name) {
-			// 账本工具的回执自带看板与催更块（taskboard/tools.go 的 withBoard），
-			// 原样投影，不走 Clip 截断——截断会把看板截烂。
-			fmt.Printf("  📋 %s%s\n", prefix, msg.Content)
-			return
-		}
-		fmt.Printf("  ← 🔧 %s%s: %s\n", prefix, name, repl.Clip(msg.Content, 120))
-		return
-	}
-	if msg.Content != "" {
-		fmt.Printf("\n🐙 %s%s\n\n", prefix, msg.Content)
-	}
 }
 
 // approvalFrom 把 interrupt 的载荷转成审批信息，类型对不上就退化成一段文本。

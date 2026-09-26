@@ -26,7 +26,7 @@ const (
 	ToolGet    = "TaskGet"
 )
 
-// IsBoardTool 判断工具名是不是四个记账工具之一。adkrun 的 printMessage 用它做看板投影。
+// IsBoardTool 判断工具名是不是四个记账工具之一。adkrun 的 eventFrom 用它把回执分到看板事件。
 func IsBoardTool(name string) bool {
 	switch name {
 	case ToolCreate, ToolUpdate, ToolList, ToolGet:

@@ -58,7 +58,7 @@ func TestRunDerivesRootFromAgent(t *testing.T) {
 	agent := &fakeAgent{name: "假主脑", replies: []string{"第一轮答复", "第二轮答复"}}
 	runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: agent})
 
-	history, err := Run(ctx, runner, agent, "", []*schema.Message{schema.UserMessage("在吗")}, nil)
+	history, err := Run(ctx, runner, agent, "", []*schema.Message{schema.UserMessage("在吗")}, nil, nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}

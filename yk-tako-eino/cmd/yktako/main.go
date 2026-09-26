@@ -78,6 +78,9 @@ func main() {
 		CheckPointStore: adkrun.NewStore(),
 	})
 
+	// 呈现归消费方：REPL sink 写 stdout；root 从 agent 自己取，与 adkrun.Run 同源。
+	sink := newREPLSink(os.Stdout, agent.Name(ctx))
+
 	console := repl.New()
 	var history []*schema.Message
 	turn := 0
@@ -103,7 +106,7 @@ func main() {
 		}
 		turn++
 		messages := append(append([]*schema.Message{}, history...), schema.UserMessage(input))
-		produced, err := adkrun.Run(ctx, runner, agent, fmt.Sprintf("turn-%d", turn), messages, func(info guard.ApprovalInfo) (string, error) {
+		produced, err := adkrun.Run(ctx, runner, agent, fmt.Sprintf("turn-%d", turn), messages, sink, func(info guard.ApprovalInfo) (string, error) {
 			fmt.Println("\n⏸️  ═══════════════ 人工审批（interrupt）═══════════════")
 			fmt.Printf("工具: %s   参数: %s\n", info.Tool, info.Args)
 			if info.Message != "" {

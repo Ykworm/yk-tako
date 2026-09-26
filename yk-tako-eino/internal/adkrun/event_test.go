@@ -102,3 +102,41 @@ func TestEventFromNoContent(t *testing.T) {
 		t.Fatal("空内容不应产出事件")
 	}
 }
+
+// TestConsumeEmitsEvents 用脚本事件流验证 consume 的产出顺序与载荷：
+// 工具调用 → 看板回执 → 正文（T1.5 的事件序列断言）；同时确认 root 消息仍进历史。
+func TestConsumeEmitsEvents(t *testing.T) {
+	callMsg := schema.AssistantMessage("", []schema.ToolCall{{ID: "c1", Function: schema.FunctionCall{Name: taskboard.ToolList}}})
+	boardMsg := schema.ToolMessage("📋 看板", "c1", schema.WithToolName(taskboard.ToolList))
+	textMsg := schema.AssistantMessage("收尾", nil)
+
+	iter, gen := adk.NewAsyncIteratorPair[*adk.AgentEvent]()
+	go func() {
+		defer gen.Close()
+		for _, m := range []*schema.Message{callMsg, boardMsg, textMsg} {
+			gen.Send(&adk.AgentEvent{
+				AgentName: "yk-tako",
+				Output: &adk.AgentOutput{MessageOutput: &adk.MessageVariant{
+					Role:     m.Role,
+					ToolName: m.ToolName,
+					Message:  m,
+				}},
+			})
+		}
+	}()
+
+	var got []Event
+	msgs, interrupts, err := consume(iter, "yk-tako", func(ev Event) { got = append(got, ev) })
+	if err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+	if len(interrupts) != 0 {
+		t.Fatalf("interrupts 应为空，实际 %v", interrupts)
+	}
+	if len(got) != 3 || got[0].Kind != EventToolCall || got[1].Kind != EventBoard || got[2].Kind != EventMessage {
+		t.Fatalf("事件序列 = %+v，want [tool_call board message]", got)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("history 应收到 3 条 root 消息（含工具回执），实际 %d", len(msgs))
+	}
+}
