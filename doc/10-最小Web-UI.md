@@ -2,7 +2,7 @@
 
 > 性质：**定案**。新系列第十篇，记 2026-09-26 的一次路线讨论：在「先接 UI」与「按《07》§7
 > 顺序先做上下文管理」之间，选了**方案 A——最小 Web UI 先行**。本篇按推理链记
-> 「为什么这么定、范围冻在哪、事件契约怎么落」，实现计划仿《02》另起（待写）。
+> 「为什么这么定、范围冻在哪、事件契约怎么落」，实现计划另起《11》执行台账（T1 已完成）。
 > 关联：能力路线表在《05》§4（本篇改变了它的顺序）、审批回路缺口在《06》§8、
 > 事件产出与呈现现状在《07》§6、`internal/adkrun/event.go` 与 `cmd/yktako/sink.go`、
 > `//go:embed` 机制在《09》§10。
@@ -23,10 +23,10 @@
 |---|---|---|
 | 无 HTTP 层 | `internal/` 下没有任何 server 包，唯一 I/O 是 REPL 的 stdin/stdout | `cmd/yktako/main.go` 全文 |
 | 无流式 | `EnableStreaming: false`，整轮跑完才一次性拿到结果 | `main.go:77` |
-| 会话在进程内存 | `history` 是 main 的局部变量，重启即丢；checkpoint 只在 interrupt 时用 | `main.go:82` |
-| 审批阻塞在 stdin | 审批回调 = `console.ReadLine("批准执行？[y/N]")`，同步阻塞 | `main.go:106-125` |
+| 会话在进程内存 | `history` 是 main 的局部变量，重启即丢；checkpoint 只在 interrupt 时用 | `main.go:85` |
+| 审批阻塞在 stdin | 审批回调 = `console.ReadLine("批准执行？[y/N]")`，同步阻塞 | `main.go:109-128` |
 
-外加一个隐性的第五缺口：**`adkrun` 直接往 stdout 打印**（规划时在 `internal/adkrun/turn.go`
+外加一个隐性的第五缺口：**规划时 `adkrun` 直接往 stdout 打印**（规划时在 `internal/adkrun/turn.go`
 的打印分支与看板投影；T1 重构后分类在 `internal/adkrun/event.go` 的 `eventFrom`，
 格式化在 `cmd/yktako/sink.go` 的 `newREPLSink`）——事件的「产生」和「呈现」焊死在一起，
 UI 需要的「同一份事件换个消费者」当前做不到。
@@ -204,8 +204,10 @@ checkpoint 仍是 `adkrun` 的内存 Store（`turn.go:21`）。磁盘持久化�
 - 《07》§7「下一层 = 上下文管理」：改为「下一层 = 最小 Web UI（《10》），
   之后回上下文管理」——原判断不删，注明顺延原因；
 - 《01》§9 索引补一行本篇；
-- 本篇只记定案与契约，**逐任务实现计划仿《02》另起一篇**（待写，
-  等 sink 重构的实现细节定型后再写，避免计划先行于已知事实）。
+- 本篇只记定案与契约，**逐任务实现计划仿《02》另起一篇**（当时留待 sink 重构的实现细节
+  定型后再写，避免计划先行于已知事实）。
+- **更新（2026-09-26）**：计划已另起——执行台账《11-最小Web-UI实施计划》与细粒度计划
+  `docs/superpowers/plans/2026-09-26-web-ui-sink.md`；T1（事件 sink 重构）已完成，见《11》§1/§6。
 
 ## 8. 风险与反例（主动找的）
 

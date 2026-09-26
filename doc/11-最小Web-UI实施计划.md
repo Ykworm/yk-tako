@@ -84,6 +84,10 @@
 
 > 细粒度执行计划（TDD 步骤 + 完整代码 + 提交切分）在
 > `docs/superpowers/plans/2026-09-26-web-ui-sink.md`；本节是概要台账，两边状态同步。
+>
+> 行号说明：§3.1/§3.2 的行号与 `printMessage` 是 T1 动手前的侦察/计划快照，`printMessage`
+> 已删除；实际落点：分类 `internal/adkrun/event.go`（`eventFrom`）、格式化
+> `cmd/yktako/sink.go`（`newREPLSink`）。当前行号以代码为准，完成情况见 §3.4。
 
 - ✅ **T1.1** 定义事件类型与 Sink：新文件（候选 `internal/adkrun/event.go`）——
   `Event{Kind, Agent, Text, ToolNames...}` + `Kind` 常量 + `type Sink func(Event)`，全部中文注释。
@@ -148,12 +152,12 @@ cd yk-tako-eino && gofmt -l . && go build ./... && go vet ./... && go test ./...
 
 | # | 问题 | 事实 | 建议 | 状态 |
 |---|---|---|---|---|
-| P1 | **doc 编号冲突**：两个 `10-` | `10-MAF审批回路与Eino对照.md`（maf 冻结线）与 `10-最小Web-UI.md`（新系列）并存 | 移入 `maf/doc/` 冻结存档，新系列编号归位；《01》§9 加说明 | ✅ 2026-09-26 已执行（工作区未提交） |
+| P1 | **doc 编号冲突**：两个 `10-` | `10-MAF审批回路与Eino对照.md`（maf 冻结线）与 `10-最小Web-UI.md`（新系列）并存 | 移入 `maf/doc/` 冻结存档，新系列编号归位；《01》§9 加说明 | ✅ 2026-09-26 已执行（已随 `e1aafd9` 提交） |
 | P2 | T1.3 sink 具体落点 | 候选：`cmd/yktako`（贴「呈现归消费方」）vs 新建 `internal/sink`（若 REPL 与 HTTP 要共享打印逻辑） | 已定：`cmd/yktako`——HTTP sink 输出 SSE JSON，与终端文本没有可共享的格式化，不必新开包；理由记在 `sink.go` 注释（T1.5 捕获方式随之定：注入 `io.Writer` + `bytes.Buffer`） | ✅ 2026-09-26（`12e08c0`） |
 
 ## 6. 进度日志（倒序追加，格式：日期 | 任务 | commit | 摘要）
 
-- 2026-09-26 | T1 | 本次 doc 提交 | T1 完成：事件 sink 重构落地——adkrun 只产事件，REPL sink 在 cmd/yktako；README/doc/01/doc/07/doc/09/doc/10 锚点刷新；计划偏差补记入执行计划文件
+- 2026-09-26 | T1 | `cff708c` | T1 完成：事件 sink 重构落地——adkrun 只产事件，REPL sink 在 cmd/yktako；README/doc/01/doc/07/doc/09/doc/10 锚点刷新；计划偏差补记入执行计划文件
 - 2026-09-26 | T1 | —（验收） | 关口 2 通过：全量 `-race` 绿、`fmt.Printf` 出 adkrun 归零；人工跑 REPL 多步任务（查时间→计算→总结）：`→ 🔧`×6、`← 🔧`×2、`🐙`×1、看板 📋 投影正常，格式与重构前一致
 - 2026-09-26 | T1 | `c0e4c7b`+`d609d3d`+`6ecd330` | 驱动层接线：Run/consume 加 sink、删 printMessage、main/turn_test 接线；consume 序列载荷测试 + interrupt 同帧测试（审查加固）
 - 2026-09-26 | T1 | `12e08c0`+`6950f85` | REPL sink（cmd/yktako）+ 格式锁定 11 用例；P2 落点定在 cmd/yktako
