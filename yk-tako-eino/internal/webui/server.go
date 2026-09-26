@@ -9,6 +9,8 @@ import (
 	"sync"
 
 	"github.com/cloudwego/eino/adk"
+
+	"yk-tako-eino/internal/guard"
 )
 
 // Config 是装配参数。
@@ -33,6 +35,7 @@ func New(ctx context.Context, cfg Config) *Server {
 	s := &Server{ctx: ctx, newAgent: cfg.NewAgent, sessions: map[string]*session{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/chat", s.handleChat)
+	mux.HandleFunc("POST /api/approval", s.handleApproval)
 	s.mux = mux
 	return s
 }
@@ -108,4 +111,33 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// approvalRequest 是 POST /api/approval 的请求体。
+type approvalRequest struct {
+	SessionID string `json:"sessionId"`
+	RequestID string `json:"requestId"`
+	Decision  string `json:"decision"`
+}
+
+// handleApproval 把前端决定塞回挂起的 ask（《10》§4.3）。
+// resume 值不变：只接受 guard.ResumeApprove / guard.ResumeReject。
+func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
+	var req approvalRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "请求体必须是 JSON", http.StatusBadRequest)
+		return
+	}
+	if req.Decision != guard.ResumeApprove && req.Decision != guard.ResumeReject {
+		http.Error(w, "decision 只能是 approve / reject", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	sess, ok := s.sessions[req.SessionID]
+	s.mu.Unlock()
+	if !ok || !sess.resolveApproval(req.RequestID, req.Decision) {
+		http.Error(w, "审批请求不存在或已处理", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
