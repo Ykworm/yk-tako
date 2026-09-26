@@ -13,7 +13,7 @@
  *        │
  *   [agent run 中间件：本轮清单没走完就想收工 → 追加提醒再跑一次]
  *
- * 2026-09-26 追加 L1 最小审批回路（对照 yk-tako-eino 的 interrupt/resume，见 doc/10）：
+ * 2026-09-26 追加 L1 最小审批回路（对照 yk-tako-eino 的 interrupt/resume，见 maf/doc/10-MAF审批回路与Eino对照.md）：
  *   execute 工具被 ApprovalRequiredAIFunction 标记 → FICC 把调用换成「待批准请求」
  *   返回 REPL（ToolApprovalAgent 驱动）；guardRule 无阻断命中时自动批准（用户不可见），
  *   有阻断命中时留给 REPL 问人或直拒，回执经 CreateResponse 作为新 user 消息回传。
@@ -58,7 +58,7 @@ var baseAgent = new ChatClientAgent(
         AIFunctionFactory.Create(BasicTools.Calculate, name: "calculate"),
         planning.CreateWriteTodosTool(),
         // execute：规则表唯一能命中的工具；ApprovalRequiredAIFunction 让 FICC 把它的调用
-        // 换成「待批准请求」返回调用方（这是 MAF 原生的 interrupt 等价物，见 doc/10）。
+        // 换成「待批准请求」返回调用方（这是 MAF 原生的 interrupt 等价物，见 maf/doc/10-MAF审批回路与Eino对照.md）。
         new ApprovalRequiredAIFunction(AIFunctionFactory.Create(BasicTools.Execute, name: "execute")),
     ]);
 

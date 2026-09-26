@@ -5,7 +5,7 @@
 > 机制对照描述仍然有效。
 >
 > 2026-09-26 限定解冻：追加 L1 最小审批回路（`src/Guard.cs` + `Program.cs` 的
-> approval 管线接线），用于与 Go/Eino 的 interrupt/resume 做机制对照（见 `doc/10`）。
+> approval 管线接线），用于与 Go/Eino 的 interrupt/resume 做机制对照（见 `maf/doc/10-MAF审批回路与Eino对照.md`）。
 > 主线仍在 Go/Eino；本目录除该回路外不再演进。
 
 用微软 [MAF](https://github.com/microsoft/agent-framework)（.NET，`Microsoft.Agents.AI` 1.22）
@@ -105,4 +105,4 @@ tests/              GuardEngine 规则引擎单测（xunit，不打模型）
 > 冒烟注意：`deepseek-flash`（thinking 模型）下 approval 路径会 400
 > （FICC 重建 tool-call 消息时丢掉 `reasoning_content`，DeepSeek 要求带 tools 的
 > 请求原样回传）。用非 thinking 别名 `TAKO_MODEL=deepseek/deepseek-chat` 可跑通；
-> 根因与生态现状见 `doc/10`。
+> 根因与生态现状见 `maf/doc/10-MAF审批回路与Eino对照.md`。
