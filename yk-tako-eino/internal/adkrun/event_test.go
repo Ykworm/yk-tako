@@ -164,12 +164,14 @@ func TestConsumeEmitsEvents(t *testing.T) {
 	}
 }
 
-// TestConsumeEmitsMessageBeforeInterrupt 锁定「同帧消息照常呈现、interrupt 随后收集」：
+// TestConsumeEmitsMessageOnInterruptFrame 锁定 interrupt 帧上的输出不被跳过：
 // 一个 AgentEvent 可以同时带 MessageOutput 与 Interrupted——模型在触发审批前已经吐出的
 // 正文（如「要暂停了」）必须照常进 sink，否则用户只看到审批框、看不到为什么暂停。
-// 顺序也钉死：presentation 在收 interrupt 之前完成，未来重构若在 interrupt 帧上跳过
-// 产出，这个测试立刻红。
-func TestConsumeEmitsMessageBeforeInterrupt(t *testing.T) {
+// 本测试锁的是同帧不被跳过（interrupt 帧里的输出仍要呈现）；呈现与 interrupt 收集的
+// 先后由 consume 代码块顺序保证，不在本测试可观测范围内。
+// 另用两个 interrupt ctx（一根因一非根因）钉住只保留根因的过滤：若把根因判定删掉、
+// 走 len==0 的兜底收集，len(interrupts) 会变成 2，断言即红。
+func TestConsumeEmitsMessageOnInterruptFrame(t *testing.T) {
 	iter, gen := adk.NewAsyncIteratorPair[*adk.AgentEvent]()
 	go func() {
 		defer gen.Close()
@@ -180,7 +182,10 @@ func TestConsumeEmitsMessageBeforeInterrupt(t *testing.T) {
 				Message: schema.AssistantMessage("要暂停了", nil),
 			}},
 			Action: &adk.AgentAction{Interrupted: &adk.InterruptInfo{
-				InterruptContexts: []*adk.InterruptCtx{{ID: "i1", IsRootCause: true}},
+				InterruptContexts: []*adk.InterruptCtx{
+					{ID: "i1", IsRootCause: true},
+					{ID: "i2", IsRootCause: false},
+				},
 			}},
 		})
 	}()
@@ -194,7 +199,7 @@ func TestConsumeEmitsMessageBeforeInterrupt(t *testing.T) {
 		t.Fatalf("事件 = %+v，want 一条 text=要暂停了的 message", got)
 	}
 	if len(interrupts) != 1 || interrupts[0].ID != "i1" {
-		t.Fatalf("interrupts = %+v，want 一条 id=i1 的根因中断", interrupts)
+		t.Fatalf("interrupts = %+v，want 只留根因 i1（非根因 i2 被过滤）", interrupts)
 	}
 	if len(msgs) != 1 {
 		t.Fatalf("history 应收到 1 条 root 消息，实际 %d", len(msgs))
