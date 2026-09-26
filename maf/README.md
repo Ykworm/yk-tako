@@ -3,6 +3,10 @@
 > 状态：**冻结存档**（2026-09-24 起不再推进）。主线已定为 Go/Eino（`yk-tako-eino/`），
 > 原 TypeScript 实现已删除；下文中"TS 版"均指这份已删除的 LangGraph.js 实现，
 > 机制对照描述仍然有效。
+>
+> 2026-09-26 限定解冻：追加 L1 最小审批回路（`src/Guard.cs` + `Program.cs` 的
+> approval 管线接线），用于与 Go/Eino 的 interrupt/resume 做机制对照（见 `doc/10`）。
+> 主线仍在 Go/Eino；本目录除该回路外不再演进。
 
 用微软 [MAF](https://github.com/microsoft/agent-framework)（.NET，`Microsoft.Agents.AI` 1.22）
 复刻 L2 任务规划层（与 `yk-tako-eino/cmd/l2planning` 同源）。只覆盖 L2（L1 守卫不在内），
@@ -40,6 +44,7 @@ MAF 没有"图"和"状态频道"，它的定制点是三层中间件（chat / fu
 | `afterModel` 并行防守 | **chat 中间件**数调用（发现）+ **function 中间件**按 CallId 拦截（执行） | `ChatMiddleware` + `FunctionMiddleware` |
 | `afterModel` + `jumpTo:"model"` 半途而废提醒 | **agent run 中间件**：`RunAsync` 返回后追加提醒消息，再调一次 `innerAgent.RunAsync` | `NudgeMiddleware` |
 | `checkpointer: MemorySaver` | `AgentSession`（进程内存会话） | `Program.cs` |
+| L1 工具守卫的审批回路（Go/Eino：interrupt + resume） | 规则引擎 `GuardEngine` 判「自动批 / 不批」+ MAF `ToolApprovalAgent` 与 FICC 的 approval 管线承担暂停/回执/执行 | `src/Guard.cs` + `Program.cs` |
 
 几处语义对应值得说明：
 
@@ -76,12 +81,14 @@ MAF 没有"图"和"状态频道"，它的定制点是三层中间件（chat / fu
 ## 文件
 
 ```text
-Program.cs          REPL：组装三层中间件 + /todos 命令
+Program.cs          REPL：组装三层中间件 + 审批回路 + /todos /mode 命令
 src/Planning.cs     规划中间件三件套（chat / function / agent run）+ write_todos 工具
 src/Todo.cs         TodoItem + TodoStore（todos 频道的 MAF 等价物）
-src/BasicTools.cs   get_current_time / calculate（递归下降解析器）
+src/BasicTools.cs   get_current_time / calculate（递归下降解析器）/ execute（假 shell，审批回路演示载体）
+src/Guard.cs        L1 规则引擎（移植自 Go/Eino 的 toolguard.go：10 条危险命令规则 + 三模式）+ 命中格式化
 src/ModelConfig.cs  TAKO_MODEL + provider-catalog.json 解析（resolve.ts 的 C# 移植）
 src/EnvFile.cs      向上找仓库根、加载 .env
+tests/              GuardEngine 规则引擎单测（xunit，不打模型）
 ```
 
 ## 实测记录
@@ -90,3 +97,12 @@ src/EnvFile.cs      向上找仓库根、加载 .env
 | --- | --- |
 | `现在几点` | 直接回答，不列清单 ✅ |
 | `帮我规划一下：先查现在时间，再算 1234*5678，最后写个总结` | 先列 3 项清单（首项 in_progress）→ 更新 2/3 → 更新 3/3 → 总结；`/todos` 读到全 ✅ |
+| `请调用 execute 工具执行命令：echo hi` | 无审批打扰，假 shell 直接回执（2026-09-26 实测）✅ |
+| `请调用 execute 工具执行命令：rm -rf /tmp/x` | 命中危险规则 → ⏸️ 人工审批；拒绝→模型收到拒绝理由并继续，批准→假 shell 回执（同上）✅ |
+| `/mode warn` 后同上 | 打印 ⚠️ 命中清单后直接回执（同上）✅ |
+| `/mode block` 后同上 | 不进人，直接拦截并把拦截文案回给模型（同上）✅ |
+
+> 冒烟注意：`deepseek-flash`（thinking 模型）下 approval 路径会 400
+> （FICC 重建 tool-call 消息时丢掉 `reasoning_content`，DeepSeek 要求带 tools 的
+> 请求原样回传）。用非 thinking 别名 `TAKO_MODEL=deepseek/deepseek-chat` 可跑通；
+> 根因与生态现状见 `doc/10`。
