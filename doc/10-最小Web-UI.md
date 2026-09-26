@@ -4,7 +4,8 @@
 > 顺序先做上下文管理」之间，选了**方案 A——最小 Web UI 先行**。本篇按推理链记
 > 「为什么这么定、范围冻在哪、事件契约怎么落」，实现计划仿《02》另起（待写）。
 > 关联：能力路线表在《05》§4（本篇改变了它的顺序）、审批回路缺口在《06》§8、
-> 事件打印现状在《07》§6 与 `internal/adkrun/turn.go`、`//go:embed` 机制在《09》§10。
+> 事件产出与呈现现状在《07》§6、`internal/adkrun/event.go` 与 `cmd/yktako/sink.go`、
+> `//go:embed` 机制在《09》§10。
 
 ## 0. 问题
 
@@ -25,8 +26,9 @@
 | 会话在进程内存 | `history` 是 main 的局部变量，重启即丢；checkpoint 只在 interrupt 时用 | `main.go:82` |
 | 审批阻塞在 stdin | 审批回调 = `console.ReadLine("批准执行？[y/N]")`，同步阻塞 | `main.go:106-125` |
 
-外加一个隐性的第五缺口：**`adkrun` 直接往 stdout 打印**（`internal/adkrun/turn.go:157`
-`printMessage`、:184 看板投影）——事件的「产生」和「呈现」焊死在一起，
+外加一个隐性的第五缺口：**`adkrun` 直接往 stdout 打印**（规划时在 `internal/adkrun/turn.go`
+的打印分支与看板投影；T1 重构后分类在 `internal/adkrun/event.go` 的 `eventFrom`，
+格式化在 `cmd/yktako/sink.go` 的 `newREPLSink`）——事件的「产生」和「呈现」焊死在一起，
 UI 需要的「同一份事件换个消费者」当前做不到。
 
 **推导**：这五个缺口里，流式对应路线 **#7（断点恢复与流式）**，HTTP 层 + 审批结构 +
@@ -117,11 +119,11 @@ WeKnora 的 `cmd/desktop`（wails v2）是现成参照。
 
 ### 4.1 事件 sink 抽象
 
-`adkrun.Run` 现在把事件直接 `fmt.Printf` 出去（`turn.go:157-193`）。重构目标：
+`adkrun.Run` 规划时把事件直接 `fmt.Printf` 出去（原 `turn.go` 的打印分支，当时 157-193 行）。重构目标：
 
 - `adkrun` 只**产生**结构化事件（channel 或回调，实现时定）；
-- 消费方各取所需：REPL sink 接现在的打印逻辑（`printMessage` 整体搬过去），
-  HTTP sink 把事件转 SSE；
+- 消费方各取所需：REPL sink 接现在的打印逻辑（分类留 `adkrun.eventFrom`，
+  格式化搬到 `cmd/yktako/sink.go` 的 `newREPLSink`），HTTP sink 把事件转 SSE；
 - 判定标准：**做完后 `adkrun` 不再自己决定输出到哪**，输出格式归 sink 所有。
 
 这一步不引入任何 UI，单独可验收（现有 `turn_test.go` 回归 + sink 单测），
@@ -129,19 +131,20 @@ WeKnora 的 `cmd/desktop`（wails v2）是现成参照。
 
 ### 4.2 事件类型（第一期：整消息级）
 
-按 `consume`（`turn.go:118-154`）现有的事件分类推导，第一期事件类型：
+按 `consume`（`turn.go:117-159`；分类在 `event.go:52` 的 `eventFrom`）现有的事件分类推导，
+第一期事件类型：
 
 | 事件 | 载荷 | 来源 |
 |---|---|---|
 | `message` | 文本、agent 名（子代理带前缀）、role | `MessageOutput` 完整消息 |
-| `tool_call` | 工具名列表 | `msg.ToolCalls`（`turn.go:165-174`） |
-| `tool_result` | 工具名 + 内容（截断） | `Role=Tool` 消息（`turn.go:175-188`） |
-| `board` | 看板回执原文 | `taskboard.IsBoardTool` 命中（`turn.go:181-186`） |
-| `approval` | `guard.ApprovalInfo`（Kind/Tool/Args/Message，`guard/middleware.go:33`） | interrupt（`turn.go:142-151`） |
+| `tool_call` | 工具名列表 | `msg.ToolCalls`（`event.go:56-61`） |
+| `tool_result` | 工具名 + 内容（截断） | `Role=Tool` 消息（`event.go:63-72`） |
+| `board` | 看板回执原文 | `taskboard.IsBoardTool` 命中（`event.go:69-71`） |
+| `approval` | `guard.ApprovalInfo`（Kind/Tool/Args/Message，`guard/middleware.go:33`） | interrupt（`turn.go:147-156`；T1 口径：由消费方 ask 产出，不经 sink） |
 | `error` | 错误信息 | `event.Err` |
 
 **明确分期**：第一期**不做 token 级 delta**。理由：当前 `consume` 消费的是
-`AgentEvent` 里 `GetMessage()` 拿到的完整消息（`turn.go:132-141`），
+`AgentEvent` 里 `GetMessage()` 拿到的完整消息（`turn.go:131-146`），
 delta 需要开 `EnableStreaming` 并改消费方式，牵动 `Runner` 配置与历史攒取逻辑。
 SSE 推整消息级事件**已经是流式**（逐事件推送，不是跑完才回），
 用户可见的最小收益（过程实时可见、审批卡片实时弹出）第一期就拿得到；
@@ -151,12 +154,12 @@ token delta 列为第二期，跟着 #7 的 streaming 一起做。
 
 这是方案 A 最核心的技术难点，先说清结构再动手：
 
-- 现状：`Run` 的循环里 `ask(info)` 同步阻塞在 stdin（`turn.go:104`），
+- 现状：`Run` 的循环里 `ask(info)` 同步阻塞在 stdin（`turn.go:103`），
   整个 run 挂在 REPL 这一个 goroutine 上。
 - Web 下：`ask` 不能再等 stdin，但 run 也不能退出。解法是**通道挂起**——
   run 在自己的 goroutine 里跑，`ask` 内部阻塞在一个 channel 上；
   前端收到 `approval` 事件后 POST 决定，HTTP handler 把 `"approve"` / `"reject"`
-  塞进 channel，`ask` 返回，`Run` 走既有的 `ResumeWithParams`（`turn.go:110`）继续。
+  塞进 channel，`ask` 返回，`Run` 走既有的 `ResumeWithParams`（`turn.go:109`）继续。
 - **不变量**：resume 的值仍然是字符串 `"approve"` / `"reject"`
   （`guard/middleware.go:41-42`），`ApprovalInfo` 结构不动——
   只换「谁来回答」，不换「回答什么」。REPL 的 stdin 回答方式保留为 sink 之一，
@@ -166,7 +169,7 @@ token delta 列为第二期，跟着 #7 的 streaming 一起做。
 
 第一期会话存进程内 map（session id → history），与现状同级——**不引入数据库、
 不做断线重连后的事件回放**（sink 是易失的，断线即这一轮作废，重连只能看后续轮）。
-checkpoint 仍是 `adkrun` 的内存 Store（`turn.go:25`）。磁盘持久化是 #7 的另一半，
+checkpoint 仍是 `adkrun` 的内存 Store（`turn.go:21`）。磁盘持久化是 #7 的另一半，
 跟 token delta 一起留给后续，本期不做。
 
 ## 5. 明确不做什么（范围冻结）
@@ -218,7 +221,7 @@ checkpoint 仍是 `adkrun` 的内存 Store（`turn.go:25`）。磁盘持久化�
 - WeKnora（`ref-agent/WeKnora`）：`internal/handler/session/qa.go`（SSE 契约与
   header 顺序）、`internal/stream/`（传输解耦）、`mcp_tool_approval`（审批 API 形态）、
   `cmd/desktop`（Wails 壳，后置参照）；
-- 本仓库：`cmd/yktako/main.go`（四个缺口的出处）、`internal/adkrun/turn.go`
-  （事件分类与审批回路现状）、`internal/guard/middleware.go`（ApprovalInfo 契约）；
+- 本仓库：`cmd/yktako/main.go`（四个缺口的出处）、`internal/adkrun/event.go`（事件分类契约）、
+  `internal/adkrun/turn.go`（审批回路现状）、`internal/guard/middleware.go`（ApprovalInfo 契约）；
 - Eino：`Runner` 的 streaming 配置与 `ResumeWithParams`（《09》§12 拆过 resume 中段）。
 

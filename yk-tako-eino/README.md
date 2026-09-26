@@ -70,5 +70,5 @@ internal/guard     命令守卫、文件守卫、PII、ADK middleware
 internal/taskboard 任务看板：四个记账工具、Store 正本、session 镜像、middleware
 internal/fsbackend 本地文件后端（filesystem.Backend 实现，暂无调用方，保留）
 internal/repl      控制台输入 + Clip/Exitf 打印小工具
-internal/adkrun    事件打印（含看板投影）、interrupt 审批回路、内存 checkpoint
+internal/adkrun    事件产出（Event/Sink，呈现归消费方）、interrupt 审批回路、内存 checkpoint
 ```

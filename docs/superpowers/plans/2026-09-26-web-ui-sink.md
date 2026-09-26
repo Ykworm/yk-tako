@@ -333,9 +333,11 @@ func TestREPLSinkFormat(t *testing.T) {
 			want: "  ← 🔧 read_file: " + strings.Repeat("a", 120) + "…\n",
 		},
 		{
+			// 看板原文自带「📋 任务看板」头（taskboard/tools.go 的 board），sink 又贴
+			// 「  📋 」标记——重构前终端就是两个 📋，逐字符锁死，不许顺手去重。
 			name: "看板回执不截断",
 			ev:   adkrun.Event{Kind: adkrun.EventBoard, Agent: "yk-tako", ToolName: "TaskList", Text: "📋 看板\n第二行"},
-			want: "  📋 看板\n第二行\n",
+			want: "  📋 📋 看板\n第二行\n",
 		},
 		{
 			name: "正文",
@@ -400,7 +402,9 @@ func newREPLSink(w io.Writer, root string) adkrun.Sink {
 			fmt.Fprintf(w, "  → 🔧 %s调用: %s\n", prefix, strings.Join(ev.ToolNames, ", "))
 		case adkrun.EventBoard:
 			// 账本工具的回执自带看板与催更块（taskboard/tools.go 的 withBoard），
-			// 原样投影，不走 Clip 截断——截断会把看板截烂。
+			// 原样投影，不走 Clip 截断——截断会把看板截烂。看板原文自带
+			// 「📋 任务看板」头，故终端显示「  📋 📋 …」两个标记——这是重构前的
+			// 既有格式，本重构只搬不改，不许顺手去重。
 			fmt.Fprintf(w, "  📋 %s%s\n", prefix, ev.Text)
 		case adkrun.EventToolResult:
 			fmt.Fprintf(w, "  ← 🔧 %s%s: %s\n", prefix, ev.ToolName, repl.Clip(ev.Text, 120))
@@ -432,6 +436,7 @@ git commit -m "yktako：REPL sink（事件→终端）与格式锁定测试；P2
 - Modify: `yk-tako-eino/internal/adkrun/turn.go`（`Run` / `consume` / 删 `printMessage` / imports）
 - Modify: `yk-tako-eino/internal/adkrun/turn_test.go:61`
 - Modify: `yk-tako-eino/cmd/yktako/main.go`（构造 sink + 注入）
+- Modify: `yk-tako-eino/internal/taskboard/tools.go:29`（`IsBoardTool` 注释里引用的 `printMessage` 改指 `eventFrom`——删函数后该引用会悬空，AGENTS 禁过时注释）
 
 - [ ] **Step 1: 先追加 consume 事件序列测试（失败）**
 
@@ -606,6 +611,11 @@ func consume(iter *adk.AsyncIterator[*adk.AgentEvent], root string, sink Sink) (
 
 3d. 删除整个 `printMessage` 函数（原 `turn.go:156-193`，含其注释）。`approvalFrom` 及其后的 `Store` 相关代码不动。
 
+3e. 同步 `internal/taskboard/tools.go:29` 的注释（质量审查发现的原计划遗漏）：
+
+原：`// IsBoardTool 判断工具名是不是四个记账工具之一。adkrun 的 printMessage 用它做看板投影。`
+改：`// IsBoardTool 判断工具名是不是四个记账工具之一。adkrun 的 eventFrom 用它把回执分到看板事件。`
+
 - [ ] **Step 4: 接线 `turn_test.go` 与 `main.go`**
 
 `turn_test.go:61`：
@@ -633,7 +643,7 @@ Expected: `gofmt` 无输出；全部包测试通过（含 taskboard 集成测试
 - [ ] **Step 6: 提交**
 
 ```bash
-git add yk-tako-eino/internal/adkrun/event_test.go yk-tako-eino/internal/adkrun/turn.go yk-tako-eino/internal/adkrun/turn_test.go yk-tako-eino/cmd/yktako/main.go
+git add yk-tako-eino/internal/adkrun/event_test.go yk-tako-eino/internal/adkrun/turn.go yk-tako-eino/internal/adkrun/turn_test.go yk-tako-eino/cmd/yktako/main.go yk-tako-eino/internal/taskboard/tools.go
 git commit -m "adkrun：事件产出接线，打印从驱动层搬走；Run/consume 加 sink（nil=不呈现）"
 ```
 
@@ -753,3 +763,20 @@ git commit -m "doc：T1 事件 sink 完成——锚点刷新、README 与台账�
 - `approval` / `error` 的事件化：T2.3 再定（approval 目前由消费方 ask 产出）；
 - token 级 delta、HTTP + SSE、会话存储、embed 单页：T2，等 T1 定型后另出计划；
 - `internal/repl` 的任何改动（保持「与 Eino 无关」）。
+
+---
+
+## 执行偏差记录（执行后补记，2026-09-26）
+
+计划在实施中被两轮审查修正，代码以提交为准，偏差逐条记录：
+
+| 位置 | 计划原文 | 实际执行 | 依据 |
+|---|---|---|---|
+| Task 1 测试 | `TestEventFrom` 6 用例 | 8 用例（补「调用与正文并存时弃正文」「回执角色只取 msg」） | 质量审查：钉分类优先级与 mv.Role 路径 → `eaa8e41` |
+| Task 1 注释 | 「Role / ToolName 以 mv 优先，msg 兜底」 | 改为「tool 判定取 OR；ToolName mv 优先、msg 兜底；Event.Role 一律取 msg」 | 同上（注释虚述） |
+| Task 2 看板用例 | `want: "  📋 看板\n第二行\n"`（计划笔误） | `"  📋 📋 看板\n第二行\n"`——旧 printMessage 同样双 marker，逐字符一致优先 | 实现者发现、双审确认 |
+| Task 2 测试加固 | 6 用例 | 11 用例（前缀矩阵、空 Agent、未知 Kind）+ `default` 注释 + `taskboard.ToolList` | 质量审查 → `6950f85` |
+| Task 3 范围 | 未列 `taskboard/tools.go` | 增补 3e：`IsBoardTool` 注释改指 `eventFrom` | 质量审查发现悬空引用 |
+| Task 3 测试加固 | 序列测试只断言 Kind | 断言载荷 + 子代理透传；新增 interrupt 同帧测试（后改名并钉根因过滤） | 质量审查 → `d609d3d`、`6ecd330` |
+
+T1 提交对应：Task 0 `e1aafd9`；Task 1 `31e88a6`+`eaa8e41`；Task 2 `12e08c0`+`6950f85`；Task 3 `c0e4c7b`+`d609d3d`+`6ecd330`；Task 4 验收（无代码提交，证据见 doc/11 §6）；Task 5 本文件所在提交。
