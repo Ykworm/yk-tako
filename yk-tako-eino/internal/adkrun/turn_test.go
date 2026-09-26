@@ -1,5 +1,6 @@
 // 本文件：adkrun 的单元测试——Run 从 agent 自己取 root 名的那条路径（用假 agent，不打模型）。
-// 账本工具回执的看板投影由 taskboard.IsBoardTool 判定，投影格式测试在 taskboard 包。
+// 账本工具回执的看板投影由 taskboard.IsBoardTool 判定，投影格式测试在 taskboard 包；
+// 终端投影格式（前缀、截断、看板不截断）锁在 cmd/yktako/sink_test.go。
 package adkrun
 
 import (
@@ -50,15 +51,19 @@ func (f *fakeAgent) Run(_ context.Context, _ *adk.AgentInput, _ ...adk.AgentRunO
 	return iter
 }
 
-// TestRunDerivesRootFromAgent 验证 root 名来自 agent 自己报的 Name。
+// TestRunDerivesRootFromAgent 验证 root 名来自 agent 自己报的 Name，并且 Run 把自己的
+// sink 原样转发给 consume（事件真的到消费方手里）。
 // 旧写法要在调用处手写一遍名字，和 ChatModelAgentConfig.Name 写重复：
 // 一旦两处走散，事件会被当成子代理的，消息静默进不了历史——这个测试就是盯这个坑。
+// sink 断言防 turn.go 里 consume(iter, root, sink) 被改回传 nil：那样呈现会静默失联，
+// 而只有本测试能报警。
 func TestRunDerivesRootFromAgent(t *testing.T) {
 	ctx := context.Background()
 	agent := &fakeAgent{name: "假主脑", replies: []string{"第一轮答复", "第二轮答复"}}
 	runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: agent})
 
-	history, err := Run(ctx, runner, agent, "", []*schema.Message{schema.UserMessage("在吗")}, nil, nil)
+	var got []Event
+	history, err := Run(ctx, runner, agent, "", []*schema.Message{schema.UserMessage("在吗")}, func(ev Event) { got = append(got, ev) }, nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -68,6 +73,14 @@ func TestRunDerivesRootFromAgent(t *testing.T) {
 	for i, want := range agent.replies {
 		if history[i] == nil || history[i].Content != want {
 			t.Fatalf("第 %d 条历史应为 %q，实际 %+v", i, want, history[i])
+		}
+	}
+	if len(got) != len(agent.replies) {
+		t.Fatalf("sink 应收到 %d 条事件，实际 %d 条: %+v", len(agent.replies), len(got), got)
+	}
+	for i, want := range agent.replies {
+		if got[i].Kind != EventMessage || got[i].Text != want || got[i].Agent != agent.name {
+			t.Fatalf("第 %d 条事件应为 %q（来自 %s），实际 %+v", i, want, agent.name, got[i])
 		}
 	}
 }

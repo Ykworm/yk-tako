@@ -32,7 +32,7 @@ const (
 type Event struct {
 	Kind      EventKind       // 事件种类，决定 Text / ToolName / ToolNames 哪个有意义
 	Agent     string          // 事件所属 agent 名（adk 盖的 AgentName），子代理前缀由 sink 决定
-	Role      schema.RoleType // 消息角色：正文/调用为 assistant，回执/看板为 tool
+	Role      schema.RoleType // 消息角色，沿用 msg.Role（可能为空，如流式回执）；分流请以 Kind 为准
 	Text      string          // 正文 / 工具回执原文 / 看板原文
 	ToolName  string          // 工具名（tool_result / board 用）
 	ToolNames []string        // 工具名列表（tool_call 用，一条助手消息可带多个）

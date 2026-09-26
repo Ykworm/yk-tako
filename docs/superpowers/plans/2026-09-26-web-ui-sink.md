@@ -779,5 +779,6 @@ git commit -m "doc：T1 事件 sink 完成——锚点刷新、README 与台账�
 | Task 3 范围 | 未列 `taskboard/tools.go` | 增补 3e：`IsBoardTool` 注释改指 `eventFrom` | 质量审查发现悬空引用 |
 | Task 3 测试加固 | 序列测试只断言 Kind | 断言载荷 + 子代理透传；新增 interrupt 同帧测试（后改名并钉根因过滤） | 质量审查 → `d609d3d`、`6ecd330` |
 | Task 5 收尾 | Step 8 的 git add 清单未含计划文件本身；doc/10 §1 的 main.go 锚点首轮漏刷 | 计划文件随本次 doc 提交入库；main.go 锚点于终审修正 | 质量审查 → 本修正提交 |
+| 终审 | `Run`→`sink` 转发无回归、`Event.Role` 注释不精确 | Run 级事件断言 + 字段注释补正 | 终审审查 → 本提交 |
 
 T1 提交对应：Task 0 `e1aafd9`；Task 1 `31e88a6`+`eaa8e41`；Task 2 `12e08c0`+`6950f85`；Task 3 `c0e4c7b`+`d609d3d`+`6ecd330`；Task 4 验收（无代码提交，证据见 doc/11 §6）；Task 5 本文件所在提交。
