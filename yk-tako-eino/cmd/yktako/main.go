@@ -15,9 +15,9 @@ import (
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/compose"
-	"github.com/cloudwego/eino/schema"
 
 	"yk-tako-eino/internal/adkrun"
+	"yk-tako-eino/internal/compact"
 	"yk-tako-eino/internal/config"
 	"yk-tako-eino/internal/guard"
 	"yk-tako-eino/internal/repl"
@@ -31,9 +31,21 @@ import (
 func main() {
 	ctx := context.Background()
 	webAddr := flag.String("web", "", "启动最小 Web UI 的监听地址（如 127.0.0.1:8765），留空进 REPL")
+	webDB := flag.String("web-db", "yktako-webui.db", "Web UI 事件库路径，仅和 -web 一起用；REPL 不打开它")
 	flag.Parse()
 
 	chatModel, ref := config.MustOpen(ctx)
+	windowKey := ref
+	var windowLookup compact.Lookup
+	if resolved, err := config.ResolveModel(config.Environ()); err == nil {
+		windowKey = resolved.Ref
+		windowLookup = compact.HTTPLookup(resolved.Provider.BaseURL, resolved.Provider.APIKey, resolved.ModelID)
+	}
+	estimator, err := compact.NewEstimator()
+	if err != nil {
+		repl.Exitf("compact: %v", err)
+	}
+	windows := compact.NewWindowStore(compact.DefaultPath())
 	cwd, err := os.Getwd()
 	if err != nil {
 		repl.Exitf("%v", err)
@@ -58,15 +70,31 @@ func main() {
 		if err != nil {
 			return nil, fmt.Errorf("taskboard: %w", err)
 		}
-		handlers := append([]adk.ChatModelAgentMiddleware{boardMW}, guard.Handlers(engine, guard.Options{WorkspaceRoot: cwd})...)
+		// taskboard 只改工具表。compact 在 piiHandler 前面，返回新的消息对象，打码才不会写穿 modelMsgs。
+		// search_archive 由 compact 的 BeforeAgent 注入，不在下面的静态工具列表里。
+		handlers := []adk.ChatModelAgentMiddleware{boardMW}
+		if mem, ok := compact.MemoryFrom(ctx); ok {
+			compactMW, err := compact.NewHandler(compact.HandlerConfig{
+				Model:     chatModel,
+				WindowKey: windowKey,
+				Windows:   windows,
+				Lookup:    windowLookup,
+				Estimator: estimator,
+			}, mem)
+			if err != nil {
+				return nil, err
+			}
+			handlers = append(handlers, compactMW)
+		}
+		handlers = append(handlers, guard.Handlers(engine, guard.Options{WorkspaceRoot: cwd})...)
 		return adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
 			Name:        config.AgentName(),
 			Description: "带任务看板与工具安全层的工作伙伴",
 			Instruction: config.SystemPrompt() + "\n\n" + taskboard.Instruction,
 			Model:       chatModel,
 			ToolsConfig: adk.ToolsConfig{
-				// all 是静态组装的 5 个基础工具；taskboard 的 4 个记账工具由
-				// middleware 的 BeforeAgent 每轮动态注入 runCtx.Tools（运行时合计 9 个）。
+				// all 是静态组装的 5 个基础工具。taskboard 的 4 个记账工具，以及装了压缩时的
+				// search_archive，由各自 middleware 的 BeforeAgent 注入，不在这个静态列表里。
 				// ExecuteSequentially：同批工具调用串行（秩序偏好，不是正确性保证，见 doc/01 §4）。
 				ToolsNodeConfig: compose.ToolsNodeConfig{Tools: all, ExecuteSequentially: true},
 			},
@@ -77,7 +105,11 @@ func main() {
 
 	// Web 模式：单用户、无鉴权，只该绑本机地址（《10》§5 范围冻结）。
 	if *webAddr != "" {
-		srv := webui.New(ctx, webui.Config{NewAgent: newAgent})
+		srv, err := webui.New(ctx, webui.Config{NewAgent: newAgent, DBPath: *webDB})
+		if err != nil {
+			repl.Exitf("web: %v", err)
+		}
+		defer srv.Close()
 		fmt.Printf("yk-tako Web UI: http://%s（Ctrl-C 退出）\n", *webAddr)
 		if err := http.ListenAndServe(*webAddr, srv); err != nil {
 			repl.Exitf("web: %v", err)
@@ -85,7 +117,8 @@ func main() {
 		return
 	}
 
-	agent, err := newAgent(ctx)
+	mem := compact.NewReplMemory(os.Stdout)
+	agent, err := newAgent(compact.WithMemory(ctx, mem))
 	if err != nil {
 		repl.Exitf("创建 agent: %v", err)
 	}
@@ -99,7 +132,6 @@ func main() {
 	sink := newREPLSink(os.Stdout, agent.Name(ctx))
 
 	console := repl.New()
-	var history []*schema.Message
 	turn := 0
 	fmt.Printf("yk-tako。模型 %s。\n", ref)
 	fmt.Printf("ToolGuard 模式: %s（/mode 可切换）。输入 quit 退出。\n\n", engine.Mode())
@@ -122,7 +154,8 @@ func main() {
 			continue
 		}
 		turn++
-		messages := append(append([]*schema.Message{}, history...), schema.UserMessage(input))
+		mem.BeginTurn(input)
+		messages := mem.Prompt(input)
 		produced, err := adkrun.Run(ctx, runner, agent, fmt.Sprintf("turn-%d", turn), messages, sink, func(info guard.ApprovalInfo) (string, error) {
 			fmt.Println("\n⏸️  ═══════════════ 人工审批（interrupt）═══════════════")
 			fmt.Printf("工具: %s   参数: %s\n", info.Tool, info.Args)
@@ -144,10 +177,10 @@ func main() {
 			return guard.ResumeReject, nil
 		})
 		if err != nil {
+			mem.AbortTurn()
 			fmt.Println("出错了:", err)
 			continue
 		}
-		history = append(history, schema.UserMessage(input))
-		history = append(history, produced...)
+		_ = mem.FinishTurn(produced)
 	}
 }

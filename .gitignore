@@ -7,3 +7,8 @@ bin/
 obj/
 # Go 编译产物（yk-tako-eino/，go build ./cmd/yktako 默认落在包目录）
 yk-tako-eino/yktako
+yktako-webui.db
+yktako-webui.db-wal
+yktako-webui.db-shm
+# 运行时写入的窗口大小（当前目录，和 yktako-webui.db 一样）
+model-windows.json

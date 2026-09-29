@@ -94,19 +94,19 @@ OctopServer（单进程，启动时从控制面 DB 重建全部状态，可重�
 - 其他：`subagents`、`teams`、`skills`、`mcp`、`providers`（多厂商模型路由）、
   `security/tool_guard`（命令防护规则）、`acp`、`observability`（Langfuse）
 
-**结论：harness-agent ≈ deepagents 配置层 + 中间件矩阵。** 它的每一条中间件都是一层能力的"要什么"清单，
-但**实现方式不照抄**——同一件事在 Eino 里可能落在完全不同的一层（例如"规划与执行的时序"，
+**结论：harness-agent ≈ deepagents 配置层加中间件矩阵。** 它的每一条中间件都是一层能力的「要什么」清单，
+但**实现方式不直接照抄**——同一件事在 Eino 里可能落在完全不同的一层（例如"规划与执行的时序"，
 harness 只能用中间件的软钩子，"Eino 的正式答案"是编图，见《08》）。
 
 ### 2.3 harness-memory（3.2 万行）
 
-ports & adapters 整洁架构：`core / domain / application / pipeline / operations / adapters`。
+采用 ports & adapters 整洁架构：`core / domain / application / pipeline / operations / adapters`。
 分层记忆 + 全文检索，记忆随工作区迁移。**接口边界清晰，适合整体替换**——这正是 T-Mem 二期可以插入的位置。
 
 ### 2.4 harness-gateway（1.4 万行）
 
 channels（飞书/钉钉/QQ/Telegram/企微）+ manager + push_routing + hitl + media。
-统一管线：各渠道消息 → 归一化 → HarnessProcessor。二期再碰。
+统一管线：各渠道的消息 → 归一化 → HarnessProcessor。二期再碰。
 
 ## 3. 为什么是"生长式复刻"而不是"移植"
 
@@ -116,9 +116,9 @@ channels（飞书/钉钉/QQ/Telegram/企微）+ manager + push_routing + hitl + 
         最终功能对齐 Octop MVP，但每一行代码都知道为什么存在
 ```
 
-- 起点不是零：owner 亲手写透过 pi 的 tool-call 主循环，也玩过 Google ADK
+- 起点不是零：owner 亲手写过一遍 pi 的 tool-call 主循环，也玩过 Google ADK
   （Agent/Runner/Session/多智能体概念，与 Eino 的 ADK 大量同源）。
-- 每层节奏固定：**先自己尝试 → 卡住时读参考实现对应代码 → 实现 → 对比反思**（反思写成本系列文档）。
+- 每层节奏固定：**先自己尝试 → 卡住时读参考实现的对应代码 → 实现 → 对比反思**（反思写成本系列文档）。
 - 原六阶段 Plan（架构侦察 → Agent 核心规格化 → MVP 范围冻结 → 选型终审 → 骨架 + 主循环 →
   垂直切片 → 增量移植）只保留前两步的成果：架构侦察就是本文 §1、§2；
   "Agent 核心规格化"改成**伴随式阅读**——不再先整块精读，而是每长一层、带着问题精读对应模块。
@@ -134,11 +134,11 @@ channels（飞书/钉钉/QQ/Telegram/企微）+ manager + push_routing + hitl + 
 | 1 | 主循环 + 工具（时间/计算/bash/文件） | deepagents 核心 | ✅ |
 | 2 | 工具安全：命令守卫 / 文件守卫 / PII + 人工审批 | `security/tool_guard`、`middleware/{tool_guard,filesystem_guard,pii}.py` | ✅（实现于 `internal/guard`，见《06》） |
 | 3 | 任务看板：Plan / Tasks / Actions 三层分离 | 不照 `write_todos` 整表覆盖，自研记账工具 | 🔶 定案完成、实现进行中（见《01》《02》《07》） |
-| 4 | 上下文管理 | `compaction` / `media_offload` / `context_usage` | ⬜ 顺延一位（最小 Web UI 先行，见《10》） |
+| 4 | 上下文管理 | `compaction` / `media_offload` / `context_usage` | ✅ 上下文压缩已实现（算法见《12》第 9 节，任务见《13》）。`media_offload` 与 `context_usage` 仍未做 |
 | 5 | 子代理 | `subagents/` + ADK | ⬜ |
 | 6 | 记忆 | `memory` / `memory_recall` → 二期 T-Mem（见《04》§2） | ⬜ |
-| 7 | 断点恢复与流式 | checkpoint / interrupt | 🔶 内存 checkpoint + interrupt 审批已有；进行中——最小 Web UI 提前拉动流式主体（见《10》） |
-| 8 | 多入口统一路由 | `HarnessProcessor`（Web / IM / cron） | 🔶 进行中——Web 入口主体（HTTP + SSE + HITL 审批结构）由《10》提前拉动；IM / cron 未动 |
+| 7 | 断点恢复与流式 | checkpoint / interrupt | 🔶 内存 checkpoint + interrupt 审批已有。Web 事件已落 SQLite，断线可按 seq 回放；在途轮次崩溃后续跑仍未做（见《10》第 4.4 节） |
+| 8 | 多入口统一路由 | `HarnessProcessor`（Web / IM / cron） | 🔶 Web 入口有 SSE、审批、续传与显式停止；IM / cron 未动 |
 | 9 | 多用户、多 Agent | `HarnessAgentManager` + `AgentRuntime` | ⬜ |
 
 节奏与纪律：
@@ -161,7 +161,7 @@ channels（飞书/钉钉/QQ/Telegram/企微）+ manager + push_routing + hitl + 
 - Eino **没有的类库**（长时记忆、RAG、MCP、IM 接入、沙箱、任务队列等），参考
   WeKnora（`ref-agent/WeKnora`）的 Go 工程实现，而不是找 Octop 的 Python 对应物。
 
-已经验证过一次：L2（任务规划）阶段曾照 Octop 的 `afterModel` 设想手搓软约束线，
+已经验证过一次：L2（任务规划）阶段曾依照 Octop 的 `afterModel` 设想手搓软约束线，
 后来按 Eino 的方式收口（先编图），2026-09-26 定案又收敛为看板 + 单入口（见《07》《08》）。
 反面教训是：**硬翻 LangGraph 的防守思路在 Eino 里没有落脚点**，那条路只会碰壁。
 

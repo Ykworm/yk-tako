@@ -3,7 +3,7 @@
 package adkrun
 
 import (
-	"strings"
+	"fmt"
 	"testing"
 
 	"yk-tako-eino/internal/taskboard"
@@ -31,7 +31,13 @@ func TestEventFrom(t *testing.T) {
 			name: "工具调用", agent: "yk-tako",
 			mv:   &adk.MessageVariant{Role: schema.Assistant, Message: callMsg},
 			msg:  callMsg,
-			want: Event{Kind: EventToolCall, Agent: "yk-tako", Role: schema.Assistant, ToolNames: []string{"read_file"}},
+			want: Event{Kind: EventToolCall, Agent: "yk-tako", Role: schema.Assistant, ToolCalls: []ToolCall{{Name: "read_file"}}},
+		},
+		{
+			name: "工具调用保留原始参数", agent: "yk-tako",
+			mv:   &adk.MessageVariant{Role: schema.Assistant, Message: schema.AssistantMessage("", []schema.ToolCall{{ID: "c9", Function: schema.FunctionCall{Name: "bash", Arguments: `{"command":"date"}`}}})},
+			msg:  schema.AssistantMessage("", []schema.ToolCall{{ID: "c9", Function: schema.FunctionCall{Name: "bash", Arguments: `{"command":"date"}`}}}),
+			want: Event{Kind: EventToolCall, Agent: "yk-tako", Role: schema.Assistant, ToolCalls: []ToolCall{{Name: "bash", Args: `{"command":"date"}`}}},
 		},
 		{
 			name: "账本回执走看板", agent: "yk-tako",
@@ -55,7 +61,7 @@ func TestEventFrom(t *testing.T) {
 			name: "调用与正文并存时弃正文", agent: "yk-tako",
 			mv:   &adk.MessageVariant{Role: schema.Assistant, Message: schema.AssistantMessage("我先查一下", []schema.ToolCall{{ID: "c3", Function: schema.FunctionCall{Name: "read_file"}}})},
 			msg:  schema.AssistantMessage("我先查一下", []schema.ToolCall{{ID: "c3", Function: schema.FunctionCall{Name: "read_file"}}}),
-			want: Event{Kind: EventToolCall, Agent: "yk-tako", Role: schema.Assistant, ToolNames: []string{"read_file"}},
+			want: Event{Kind: EventToolCall, Agent: "yk-tako", Role: schema.Assistant, ToolCalls: []ToolCall{{Name: "read_file"}}},
 		},
 		{
 			name: "回执角色只取 msg（mv.Role 只做判定）", agent: "yk-tako",
@@ -84,12 +90,24 @@ func TestEventFrom(t *testing.T) {
 				t.Fatal("eventFrom ok = false，want true")
 			}
 			if got.Kind != tc.want.Kind || got.Agent != tc.want.Agent || got.Role != tc.want.Role ||
-				got.Text != tc.want.Text || got.ToolName != tc.want.ToolName ||
-				strings.Join(got.ToolNames, ",") != strings.Join(tc.want.ToolNames, ",") {
+				got.Text != tc.want.Text || got.ToolName != tc.want.ToolName || !sameCalls(got.ToolCalls, tc.want.ToolCalls) {
 				t.Fatalf("eventFrom = %+v，want %+v", got, tc.want)
 			}
 		})
 	}
+}
+
+// sameCalls 比较两批工具调用。不用 reflect，字段就两个，差在哪一眼能看出来。
+func sameCalls(got, want []ToolCall) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // TestEventFromNoContent 验证没有可呈现内容时静默跳过（旧 printMessage 的空分支语义）：
@@ -147,8 +165,8 @@ func TestConsumeEmitsEvents(t *testing.T) {
 	}
 	// 载荷逐字段钉死；got[3] 的 Agent 断言锁 eventFrom(event.AgentName, ...)：
 	// 若误传 root，子代理名字会变成 "yk-tako"，透传就断了。
-	if got[0].Agent != "yk-tako" || strings.Join(got[0].ToolNames, ",") != taskboard.ToolList || got[0].Text != "" {
-		t.Fatalf("got[0] = %+v，want agent=yk-tako toolNames=[%s] text 为空", got[0], taskboard.ToolList)
+	if got[0].Agent != "yk-tako" || len(got[0].ToolCalls) != 1 || got[0].ToolCalls[0].Name != taskboard.ToolList || got[0].ToolCalls[0].Args != "" || got[0].Text != "" {
+		t.Fatalf("got[0] = %+v，want agent=yk-tako toolCalls=[%s] text 为空", got[0], taskboard.ToolList)
 	}
 	if got[1].Agent != "yk-tako" || got[1].ToolName != taskboard.ToolList || got[1].Text != "📋 看板" {
 		t.Fatalf("got[1] = %+v，want agent=yk-tako toolName=%s text=📋 看板", got[1], taskboard.ToolList)
@@ -161,6 +179,67 @@ func TestConsumeEmitsEvents(t *testing.T) {
 	}
 	if len(msgs) != 3 {
 		t.Fatalf("history 应只收 3 条 root 消息（子代理正文被过滤），实际 %d", len(msgs))
+	}
+}
+
+// TestConsumeStreamsAssistantText 逐块正文先交出累计文本，结束再交一条完整消息。
+// 半截不进入历史；历史里只有拼好的那一条。
+func TestConsumeStreamsAssistantText(t *testing.T) {
+	iter, gen := adk.NewAsyncIteratorPair[*adk.AgentEvent]()
+	go func() {
+		defer gen.Close()
+		gen.Send(&adk.AgentEvent{
+			AgentName: "yk-tako",
+			Output: &adk.AgentOutput{MessageOutput: &adk.MessageVariant{
+				Role:        schema.Assistant,
+				IsStreaming: true,
+				MessageStream: schema.StreamReaderFromArray([]*schema.Message{
+					schema.AssistantMessage("你", nil),
+					schema.AssistantMessage("好", nil),
+				}),
+			}},
+		})
+	}()
+	var got []Event
+	msgs, _, err := consume(iter, "yk-tako", func(ev Event) { got = append(got, ev) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || !got[0].Partial || got[0].Text != "你" || !got[1].Partial || got[1].Text != "你好" || got[2].Partial || got[2].Text != "你好" {
+		t.Fatalf("流出 = %+v", got)
+	}
+	if len(msgs) != 1 || msgs[0].Content != "你好" {
+		t.Fatalf("历史 = %+v", msgs)
+	}
+}
+
+// TestConsumeDropsPartialOnStreamError 流出中途失败时通知丢掉半截，历史里没有这句。
+func TestConsumeDropsPartialOnStreamError(t *testing.T) {
+	reader, writer := schema.Pipe[*schema.Message](1)
+	iter, gen := adk.NewAsyncIteratorPair[*adk.AgentEvent]()
+	go func() {
+		defer gen.Close()
+		gen.Send(&adk.AgentEvent{
+			AgentName: "yk-tako",
+			Output: &adk.AgentOutput{MessageOutput: &adk.MessageVariant{
+				Role:          schema.Assistant,
+				IsStreaming:   true,
+				MessageStream: reader,
+			}},
+		})
+	}()
+	go func() {
+		defer writer.Close()
+		writer.Send(schema.AssistantMessage("半", nil), nil)
+		writer.Send(nil, fmt.Errorf("boom"))
+	}()
+	var got []Event
+	msgs, _, err := consume(iter, "yk-tako", func(ev Event) { got = append(got, ev) })
+	if err == nil || len(msgs) != 0 {
+		t.Fatalf("err=%v msgs=%v", err, msgs)
+	}
+	if len(got) != 2 || !got[0].Partial || got[0].Text != "半" || !got[1].Drop {
+		t.Fatalf("失败流出 = %+v", got)
 	}
 }
 

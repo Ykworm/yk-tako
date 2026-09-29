@@ -25,7 +25,8 @@ func newREPLSink(w io.Writer, root string) adkrun.Sink {
 		}
 		switch ev.Kind {
 		case adkrun.EventToolCall:
-			fmt.Fprintf(w, "  → 🔧 %s调用: %s\n", prefix, strings.Join(ev.ToolNames, ", "))
+			// 参数在产生侧是完整的。终端一行放不下，打印前按与回执相同的 120 个 rune 截断。
+			fmt.Fprintf(w, "  → 🔧 %s调用: %s\n", prefix, formatToolCalls(ev.ToolCalls))
 		case adkrun.EventBoard:
 			// 账本工具的回执自带看板与催更块（taskboard/tools.go 的 withBoard），
 			// 原样投影，不走 Clip 截断——截断会把看板截烂。看板原文自带
@@ -40,4 +41,18 @@ func newREPLSink(w io.Writer, root string) adkrun.Sink {
 			// 未知 Kind 不呈现；approval / error 按 T1 口径不走 sink（见 adkrun.EventKind 注释）。
 		}
 	}
+}
+
+// formatToolCalls 把一批调用收成终端上的一截。没有参数时只留名字，
+// 这样无参数的旧输出仍逐字符不变；有参数时接在名字后面，超长走 repl.Clip。
+func formatToolCalls(calls []adkrun.ToolCall) string {
+	parts := make([]string, 0, len(calls))
+	for _, c := range calls {
+		if c.Args == "" {
+			parts = append(parts, c.Name)
+			continue
+		}
+		parts = append(parts, c.Name+" "+repl.Clip(c.Args, 120))
+	}
+	return strings.Join(parts, ", ")
 }

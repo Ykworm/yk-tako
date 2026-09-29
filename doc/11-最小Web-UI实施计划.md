@@ -1,7 +1,7 @@
 # 11 · 最小 Web-UI 实施计划（方案 A 执行台账）
 
 > 性质：**实施计划 + 进度追踪**。定案在《10》§2.4（四步走），本篇是《10》§7 说的
-> 「仿《02》另起的实现计划」，但比《02》多一个职责：**它是唯一执行台账**——每推进一步
+> 「参照《02》另起的实现计划」，但比《02》多一个职责：**它是唯一执行台账**——每推进一步
 > 就更新状态列与 §6 进度日志，未完成的写清卡在哪。后来者（包括未来的自己）
 > 先读本篇状态表，再决定从哪开工。
 > 编号说明：maf 冻结线的《10-MAF审批回路与Eino对照》已移入 `maf/doc/`（2026-09-26，
@@ -25,6 +25,7 @@
 | **T1** | 事件 sink 重构（《10》§2.4 步 1） | `adkrun` 只产事件；REPL sink 落消费方；sink 单测 | 《10》§6 关口 2：`turn_test` 回归 + sink 事件序列断言 + REPL 打印格式不破 | ✅ 2026-09-26（`31e88a6`+`eaa8e41`、`12e08c0`+`6950f85`、`c0e4c7b`+`d609d3d`+`6ecd330`） |
 | **T2** | HTTP + SSE 最小 UI（步 2） | SSE handler、会话 map、审批 channel 化、embed 单页 | 《10》§6 关口 3/4：SSE 事件序列断言、审批端到端、`-race` 全绿 | ⬜（细化时机见 §4） |
 | **T3** | 回 #4 上下文管理（步 3） | 能力路线 #4 落地 | 该层自己的计划另起（不在本台账展开） | ⬜ 占位 |
+| **流式枢纽** | 事件落盘、seq 续传、断线不取消、显式停止。编号与上面的 sink T1 / HTTP T2 不是同一套 | `internal/webui` 事件库 + 契约；REPL 不写库 | `cd yk-tako-eino && go test -race ./...` | 🔶 2026-09-29 代码与文档已按设计稿 v3 落地，尚未提交。设计 `docs/superpowers/specs/2026-09-28-webui-stream-hub-design.md`，执行 `docs/superpowers/plans/2026-09-29-webui-stream-hub.md` |
 
 前置关系：T0 → T1 → T2 → T3，严格串行；T1 不依赖 T2 的任何东西（所以 T1 是
 「无悔改动」，中途叫停也不浪费，《10》§4.1）。
@@ -83,7 +84,7 @@
 ### 3.2 实现子步骤（未开始的打 ⬜，做一步勾一步）
 
 > 细粒度执行计划（TDD 步骤 + 完整代码 + 提交切分）在
-> `docs/superpowers/plans/2026-09-26-web-ui-sink.md`；本节是概要台账，两边状态同步。
+> `docs/superpowers/plans/2026-09-26-web-ui-sink.md`；本节是概要台账，两边保持同步。
 >
 > 行号说明：§3.1/§3.2 的行号与 `printMessage` 是 T1 动手前的侦察/计划快照，`printMessage`
 > 已删除；实际落点：分类 `internal/adkrun/event.go`（`eventFrom`）、格式化
@@ -157,6 +158,7 @@ cd yk-tako-eino && gofmt -l . && go build ./... && go vet ./... && go test ./...
 
 ## 6. 进度日志（倒序追加，格式：日期 | 任务 | commit | 摘要）
 
+- 2026-09-29 | 流式枢纽 | 工作区（未提交） | 事件先落 SQLite，`tool_call` 带原始参数；按 `from=最后收到的 seq` 续传；断线不取消 run；`POST /api/stop` 只取消上下文，退出路径写一条 `stop`。设计稿 v3，执行计划同日
 - 2026-09-26 | T1 | `cff708c` | T1 完成：事件 sink 重构落地——adkrun 只产事件，REPL sink 在 cmd/yktako；README/doc/01/doc/07/doc/09/doc/10 锚点刷新；计划偏差补记入执行计划文件
 - 2026-09-26 | T1 | —（验收） | 关口 2 通过：全量 `-race` 绿、`fmt.Printf` 出 adkrun 归零；人工跑 REPL 多步任务（查时间→计算→总结）：`→ 🔧`×6、`← 🔧`×2、`🐙`×1、看板 📋 投影正常，格式与重构前一致
 - 2026-09-26 | T1 | `c0e4c7b`+`d609d3d`+`6ecd330` | 驱动层接线：Run/consume 加 sink、删 printMessage、main/turn_test 接线；consume 序列载荷测试 + interrupt 同帧测试（审查加固）

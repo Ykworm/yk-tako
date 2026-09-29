@@ -136,12 +136,16 @@ WeKnora 的 `cmd/desktop`（wails v2）是现成参照。
 
 | 事件 | 载荷 | 来源 |
 |---|---|---|
+| `start` | run、seq、用户消息文本 | Web 在调用模型之前写入事件库。不在 `adkrun.Event` 上 |
 | `message` | 文本、agent 名（子代理带前缀）、role | `MessageOutput` 完整消息 |
-| `tool_call` | 工具名列表 | `msg.ToolCalls`（`event.go:56-61`） |
-| `tool_result` | 工具名 + 内容（截断） | `Role=Tool` 消息（`event.go:63-72`） |
-| `board` | 看板回执原文 | `taskboard.IsBoardTool` 命中（`event.go:69-71`） |
-| `approval` | `guard.ApprovalInfo`（Kind/Tool/Args/Message，`guard/middleware.go:33`） | interrupt（`turn.go:147-156`；T1 口径：由消费方 ask 产出，不经 sink） |
-| `error` | 错误信息 | `event.Err` |
+| `tool_call` | `toolCalls: [{name, args}]`，args 是模型给出的原始参数字符串 | `msg.ToolCalls`（`event.go` 的 `eventFrom`） |
+| `tool_result` | 工具名 + 内容（截断归消费方） | `Role=Tool` 消息 |
+| `board` | 看板回执原文 | `taskboard.IsBoardTool` 命中 |
+| `approval` | id、tool、args、message | Web 的 ask，落盘后才挂起。不经 adkrun sink |
+| `approval_result` | id、decision | ask 收到决定后、继续执行前落盘 |
+| `complete` / `error` / `stop` | 终局。一场 run 只有一条 | run 退出路径与档案 `is_completed` 同一事务 |
+
+`seq` 与 `run` 是 Web 信封上的地址，在写入 SQLite 时分配。`adkrun.Event` 只有呈现字段，REPL 不写库、也不分配序号。
 
 **明确分期**：第一期**不做 token 级 delta**。理由：当前 `consume` 消费的是
 `AgentEvent` 里 `GetMessage()` 拿到的完整消息（`turn.go:131-146`），
@@ -165,12 +169,22 @@ token delta 列为第二期，跟着 #7 的 streaming 一起做。
   只换「谁来回答」，不换「回答什么」。REPL 的 stdin 回答方式保留为 sink 之一，
   两条入口共用同一套 interrupt/resume 语义。
 
-### 4.4 会话与持久化（第一期边界）
+### 4.4 会话与持久化
 
-第一期会话存进程内 map（session id → history），与现状同级——**不引入数据库、
-不做断线重连后的事件回放**（sink 是易失的，断线即这一轮作废，重连只能看后续轮）。
-checkpoint 仍是 `adkrun` 的内存 Store（`turn.go:21`）。磁盘持久化是 #7 的另一半，
-跟 token delta 一起留给后续，本期不做。
+模型下一轮读档案里已经写上产出的轮次（用户消息加上 `produced_json`）。失败、停止、没写上终局的轮次没有产出，不进入下一轮。checkpoint 仍是
+`adkrun` 的内存 Store，进程崩溃后不能把在途轮次续跑。
+
+事件和档案另有 SQLite（`-web-db`，默认 `yktako-webui.db`）。开跑时插入档案行并写下
+`start`；终局信封（`complete` / `error` / `stop`）与 `is_completed=1` 在同一事务。
+没写上终局的行，下次启动对账标 `failed`，已落盘的事件仍可按 seq 回放。
+
+页面读进程内的事件列表，按序号取副本，读走不删。列表里还没有这场 run 时，从事件表装回来再读。进程重启后内存是空的，第一次读取完成这次装载。
+助手正文逐字进这份列表，同一序号随着字变长再推一次；写完才进事件表。没写完的半截不落库，模型出错则读者看到失败后从内存删掉。
+已结束的对话按会话从 `event_log` 懒加载：滚到顶才取更早的一页，游标用 `(created_at, run_id)`。Chrome 只保留 `yktakoSession`，不保存助手正文。
+连接只是读者：断线不取消 run，重连带上最后收到的 seq（`GET /api/chat/stream?run&from=`）。
+停止是 `POST /api/stop`，由 run 自己的退出路径写一条 `stop`。同一会话同时只跑一轮，
+冲突在写 SSE 响应头之前返回 409。后来打开的页面用 `GET /api/session?id=` 拿当前 run。
+定案与任务拆分见 `docs/superpowers/specs/2026-09-28-webui-stream-hub-design.md`。
 
 ## 5. 明确不做什么（范围冻结）
 
@@ -178,7 +192,7 @@ checkpoint 仍是 `adkrun` 的内存 Store（`turn.go:21`）。磁盘持久化�
 
 - ❌ 多用户 / 鉴权 / RBAC——单用户，服务只绑 `127.0.0.1`；
 - ❌ token 级流式 delta（见 4.2，第二期）；
-- ❌ 断线重连、事件回放、跨实例（无 redis stream）；
+- ❌ 跨实例、Redis。同一进程内的断线续传与事件回放已由流式枢纽落地（第 4.4 节）；
 - ❌ steer 运行中插话；
 - ❌ 前端构建链（Vue/Vite/TDesign）——一个 embed 静态页；
 - ❌ Wails 桌面壳（协议定型后再套，A → C）；

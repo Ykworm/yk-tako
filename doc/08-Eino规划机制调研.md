@@ -27,7 +27,7 @@ Eino 把这个问题拆成了**三套东西**，而不是在 `write_todos` 上�
 和 Google ADK / Microsoft Workflows 同一层，而不是把 TodoListMiddleware 升级成状态机。
 
 对照之下，LangGraph + deepagents 只有 middleware 一层可做文章，同类约束只能靠 `afterModel`
-钩子防守——**用软机制模拟硬约束**。这就是"Eino 比 LangGraph + deepagents 更好"的具体含义：
+钩子防守——**用软钩子模拟硬约束**。这就是"Eino 比 LangGraph + deepagents 更好"的具体含义：
 **对"确定性"有一等公民的正式答案（编图），而不是在 middleware 层打补丁。**
 
 > 终局（2026-09-26 定案）：yk-tako 既没有加 afterModel 式防守，也没有把产品做成流程图——

@@ -24,7 +24,7 @@ func init() {
 // "CheckpointSchema: persisted via serialization.RunCtx (gob)" 标注）。
 const SessionKey = "taskboard_session_key_tasks"
 
-// Status 是任务状态：pending → in_progress → completed，不要了用 deleted。
+// Status 是任务状态：pending → in_progress → completed，不再需要时用 deleted。
 type Status string
 
 // 四个合法状态值，与 eino plantask / Claude Tasks 对齐。

@@ -18,9 +18,12 @@
 
 ```bash
 cd yk-tako-eino
-go run ./cmd/yktako   # 唯一入口
-go test ./...         # 单元测试不打模型，不需要 API Key
+go run ./cmd/yktako                              # REPL
+go run ./cmd/yktako -web 127.0.0.1:8765          # 本机 Web UI
+go test ./...                                    # 单元测试不打模型，不需要 API Key
 ```
+
+Web UI 单用户、无鉴权。事件库是 `-web-db`（默认 `yktako-webui.db`）：断线后续传，停止按钮取消这一轮，另一个标签页可以看同一场 run。REPL 不写这个库。
 
 详见 `yk-tako-eino/README.md`。
 

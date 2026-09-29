@@ -30,7 +30,10 @@ cmd/yktako（唯一入口）
 
 ```bash
 go run ./cmd/yktako
+go run ./cmd/yktako -web 127.0.0.1:8765
 ```
+
+`-web` 起本机 Web UI（单用户、无鉴权，只绑本机地址）。事件写在 `-web-db`（默认 `yktako-webui.db`）。断线不取消这一轮，刷新后从最后一帧接上；停止走页面上的停止按钮。REPL 不打开这个库。窗口大小写在当前目录的 `model-windows.json`，和 `yktako`、`yktako-webui.db` 放在一起。
 
 `.env` 已经放好。改模型时改 `TAKO_MODEL`：`厂商/模型`，只配了一个厂商时可省略前缀；目录外厂商用 `TAKO_PROVIDER_<NAME>_API_KEY` / `_BASE_URL` / `_PROTOCOL`。
 
@@ -71,4 +74,5 @@ internal/taskboard 任务看板：四个记账工具、Store 正本、session �
 internal/fsbackend 本地文件后端（filesystem.Backend 实现，暂无调用方，保留）
 internal/repl      控制台输入 + Clip/Exitf 打印小工具
 internal/adkrun    事件产出（Event/Sink，呈现归消费方）、interrupt 审批回路、内存 checkpoint
+internal/webui     最小 Web UI：事件库、SSE、续传与停止
 ```

@@ -201,9 +201,9 @@ func (h *filesystemHandler) WrapInvokableToolCall(_ context.Context, endpoint ad
 // 返回的 state 会被持久化并作为模型输入，是官方推荐改消息/工具表的位置。
 // 本实现借它把历史里的密钥打码后再给模型。RewriteState 钩子官方
 // 允许就地改 state（chatmodel.go 的生命周期注释："can modify state"）；注意
-// state.Messages 与事件流、调用方 history 共享消息指针，这里的改写会写穿回
-// REPL 历史——当前语义下正是想要的（历史同样脱敏）。如果哪天需要"对模型脱敏、
-// 历史保留原文"，这里要先浅拷贝消息再改。
+// 压缩 Handler 注册在本钩子前面，返回的是新的消息对象。这里改的是那些副本的 Content，
+// modelMsgs 和 event_log 里已经写下的原文不是这一批。没有装压缩 Handler 时，
+// state.Messages 仍可能和调用方历史共享指针，改写会写到那些对象上。
 func (h *piiHandler) BeforeModelRewriteState(ctx context.Context, state *adk.ChatModelAgentState, mc *adk.ModelContext) (context.Context, *adk.ChatModelAgentState, error) {
 	for _, msg := range state.Messages {
 		if msg == nil || msg.Content == "" {

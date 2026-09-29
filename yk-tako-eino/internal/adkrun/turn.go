@@ -5,6 +5,7 @@ package adkrun
 import (
 	"context"
 	"fmt"
+	"io"
 	"sync"
 
 	"yk-tako-eino/internal/guard"
@@ -129,16 +130,21 @@ func consume(iter *adk.AsyncIterator[*adk.AgentEvent], root string, sink Sink) (
 			return msgs, interrupts, event.Err
 		}
 		if event.Output != nil && event.Output.MessageOutput != nil {
-			msg, err := event.Output.MessageOutput.GetMessage()
+			mv := event.Output.MessageOutput
+			var msg *schema.Message
+			var err error
+			if mv.IsStreaming && mv.MessageStream != nil && mv.Role != schema.Tool && mv.ToolName == "" {
+				msg, err = streamAssistant(event.AgentName, mv, sink)
+			} else {
+				msg, err = mv.GetMessage()
+				if err == nil && sink != nil {
+					if ev, ok := eventFrom(event.AgentName, mv, msg); ok {
+						sink(ev)
+					}
+				}
+			}
 			if err != nil {
 				return msgs, interrupts, err
-			}
-			if sink != nil {
-				// 分类（含 IsBoardTool）在驱动层完成：HTTP sink 将来只做呈现，
-				// 不能再把 taskboard 的判定重做一遍。
-				if ev, ok := eventFrom(event.AgentName, event.Output.MessageOutput, msg); ok {
-					sink(ev)
-				}
 			}
 			if msg != nil && event.AgentName == root {
 				msgs = append(msgs, msg)
@@ -156,6 +162,59 @@ func consume(iter *adk.AsyncIterator[*adk.AgentEvent], root string, sink Sink) (
 		}
 	}
 	return msgs, interrupts, nil
+}
+
+// streamAssistant 逐块读助手正文。每多一块字就交给 sink 一条 Partial 事件，
+// 文本是到目前为止的全文。流正常结束后再交一条非 Partial 的最终事件。
+// 最终若是工具调用，用 Discard 丢掉半截正文。流出失败用 Drop，半截不进入历史。
+func streamAssistant(agent string, mv *adk.MessageVariant, sink Sink) (*schema.Message, error) {
+	var chunks []*schema.Message
+	var acc string
+	for {
+		chunk, err := mv.MessageStream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			if sink != nil {
+				sink(Event{Kind: EventMessage, Drop: true, Agent: agent})
+			}
+			return nil, err
+		}
+		chunks = append(chunks, chunk)
+		if chunk.Content == "" {
+			continue
+		}
+		acc += chunk.Content
+		if sink != nil {
+			role := chunk.Role
+			if role == "" {
+				role = mv.Role
+			}
+			sink(Event{Kind: EventMessage, Partial: true, Agent: agent, Role: role, Text: acc})
+		}
+	}
+	if len(chunks) == 0 {
+		return nil, nil
+	}
+	msg, err := schema.ConcatMessages(chunks)
+	if err != nil {
+		if sink != nil {
+			sink(Event{Kind: EventMessage, Drop: true, Agent: agent})
+		}
+		return nil, err
+	}
+	if sink != nil {
+		if ev, ok := eventFrom(agent, mv, msg); ok {
+			if ev.Kind != EventMessage && acc != "" {
+				sink(Event{Kind: EventMessage, Discard: true, Agent: agent})
+			}
+			sink(ev)
+		} else if acc != "" {
+			sink(Event{Kind: EventMessage, Discard: true, Agent: agent})
+		}
+	}
+	return msg, nil
 }
 
 // approvalFrom 把 interrupt 的载荷转成审批信息，类型对不上就退化成一段文本。

@@ -22,12 +22,22 @@ func TestREPLSinkFormat(t *testing.T) {
 	}{
 		{
 			name: "工具调用",
-			ev:   adkrun.Event{Kind: adkrun.EventToolCall, Agent: "yk-tako", ToolNames: []string{"read_file", "calculate"}},
+			ev:   adkrun.Event{Kind: adkrun.EventToolCall, Agent: "yk-tako", ToolCalls: []adkrun.ToolCall{{Name: "read_file"}, {Name: "calculate"}}},
 			want: "  → 🔧 调用: read_file, calculate\n",
 		},
 		{
+			name: "工具调用带原始参数",
+			ev:   adkrun.Event{Kind: adkrun.EventToolCall, Agent: "yk-tako", ToolCalls: []adkrun.ToolCall{{Name: "bash", Args: `{"command":"date"}`}}},
+			want: "  → 🔧 调用: bash {\"command\":\"date\"}\n",
+		},
+		{
+			name: "工具参数超长截断",
+			ev:   adkrun.Event{Kind: adkrun.EventToolCall, Agent: "yk-tako", ToolCalls: []adkrun.ToolCall{{Name: "bash", Args: long}}},
+			want: "  → 🔧 调用: bash " + strings.Repeat("a", 120) + "…\n",
+		},
+		{
 			name: "工具调用带子代理前缀",
-			ev:   adkrun.Event{Kind: adkrun.EventToolCall, Agent: "worker", ToolNames: []string{"read_file"}},
+			ev:   adkrun.Event{Kind: adkrun.EventToolCall, Agent: "worker", ToolCalls: []adkrun.ToolCall{{Name: "read_file"}}},
 			want: "  → 🔧 [worker] 调用: read_file\n",
 		},
 		{
