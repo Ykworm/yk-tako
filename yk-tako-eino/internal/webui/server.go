@@ -14,6 +14,7 @@ import (
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/schema"
+	"github.com/gin-gonic/gin"
 
 	"yk-tako-eino/internal/compact"
 	"yk-tako-eino/internal/guard"
@@ -34,7 +35,7 @@ type Server struct {
 	newAgent func(ctx context.Context) (adk.Agent, error)
 	db       *LogDB
 	events   *eventMem // 页面读的事件列表；不因完成而删除
-	mux      *http.ServeMux
+	engine   *gin.Engine
 
 	mu       sync.Mutex
 	sessions map[string]*session
@@ -55,16 +56,16 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{ctx: ctx, newAgent: cfg.NewAgent, db: db, events: newEventMem(), sessions: map[string]*session{}}
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", s.handleIndex)
-	mux.HandleFunc("GET /api/session", s.handleSession)
-	mux.HandleFunc("GET /api/session/history", s.handleHistory)
-	mux.HandleFunc("POST /api/chat", s.handleChat)
-	mux.HandleFunc("GET /api/chat/stream", s.handleStream)
-	mux.HandleFunc("POST /api/approval", s.handleApproval)
-	mux.HandleFunc("POST /api/stop", s.handleStop)
-	mux.HandleFunc("POST /api/chat/restore", s.handleRestore)
-	s.mux = mux
+	engine := gin.New()
+	engine.GET("/", s.handleIndex)
+	engine.GET("/api/session", s.handleSession)
+	engine.GET("/api/session/history", s.handleHistory)
+	engine.POST("/api/chat", s.handleChat)
+	engine.GET("/api/chat/stream", s.handleStream)
+	engine.POST("/api/approval", s.handleApproval)
+	engine.POST("/api/stop", s.handleStop)
+	engine.POST("/api/chat/restore", s.handleRestore)
+	s.engine = engine
 	return s, nil
 }
 
@@ -77,7 +78,7 @@ func (s *Server) Close() error {
 }
 
 // ServeHTTP 实现 net/http.Handler。
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.engine.ServeHTTP(w, r) }
 
 // session 取或建会话；同一 id 的并发首访由 s.mu 串行。
 func (s *Server) session(id string) (*session, error) {
@@ -105,7 +106,9 @@ type chatRequest struct {
 
 // handleChat 跑一轮并把事件以 SSE 推给前端。冲突检查（同会话已有 run）在写
 // SSE header 之前——流一旦开了就没法回头报错，这个顺序照学 WeKnora（《10》§3.1）。
-func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleChat(c *gin.Context) {
+	w := c.Writer
+	r := c.Request
 	var req chatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.SessionID == "" || req.Message == "" {
 		http.Error(w, "sessionId 与 message 必填", http.StatusBadRequest)
@@ -204,7 +207,9 @@ func terminalOf(err error, produced []*schema.Message, stopped bool) (kind, text
 
 // handleStream 按 run 与 from 续传。from 缺省或 0 表示从头（seq > 0）。
 // 不创建会话，也不取消 run。run 不在档案里则 404。
-func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleStream(c *gin.Context) {
+	w := c.Writer
+	r := c.Request
 	runID := r.URL.Query().Get("run")
 	if runID == "" {
 		http.Error(w, "run 必填", http.StatusBadRequest)
@@ -233,7 +238,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSession 告诉后来的页面这场会话有没有在跑的 run。未知会话不创建，liveRun 为空字符串。
-func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSession(c *gin.Context) {
+	w := c.Writer
+	r := c.Request
 	id := r.URL.Query().Get("id")
 	if id == "" {
 		http.Error(w, "id 必填", http.StatusBadRequest)
@@ -255,7 +262,9 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 
 // handleHistory 返回会话里已结束的 run，按 created_at 降序分页。
 // 正在跑的 run 不在结果里——由 /api/session 报告，页面用 from=0 接上。
-func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleHistory(c *gin.Context) {
+	w := c.Writer
+	r := c.Request
 	sessionID := r.URL.Query().Get("session")
 	if sessionID == "" {
 		http.Error(w, "session 必填", http.StatusBadRequest)
@@ -287,7 +296,9 @@ type stopRequest struct {
 }
 
 // handleStop 核对 liveRun 后取消这场 run。不写日志。对不上则 404。
-func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleStop(c *gin.Context) {
+	w := c.Writer
+	r := c.Request
 	var req stopRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.SessionID == "" || req.Run == "" {
 		http.Error(w, "sessionId 与 run 必填", http.StatusBadRequest)
@@ -442,7 +453,9 @@ type restoreRequest struct {
 
 // handleRestore 在服务重启后把浏览器记下的正文补进库。
 // 内存里已经有、库里已经有、或这轮还在跑，都不写。
-func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRestore(c *gin.Context) {
+	w := c.Writer
+	r := c.Request
 	var req restoreRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.SessionID == "" || req.Run == "" || req.Seq <= 0 || req.Text == "" {
 		http.Error(w, "sessionId、run、seq 与 text 必填", http.StatusBadRequest)
@@ -487,7 +500,9 @@ type approvalRequest struct {
 
 // handleApproval 把前端决定塞回挂起的 ask（《10》§4.3）。
 // resume 值不变：只接受 guard.ResumeApprove / guard.ResumeReject。
-func (s *Server) handleApproval(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleApproval(c *gin.Context) {
+	w := c.Writer
+	r := c.Request
 	var req approvalRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "请求体必须是 JSON", http.StatusBadRequest)

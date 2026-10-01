@@ -4,14 +4,15 @@ package webui
 
 import (
 	_ "embed"
-	"net/http"
+
+	"github.com/gin-gonic/gin"
 )
 
 //go:embed static/index.html
 var indexHTML []byte
 
 // handleIndex 出单页。注意 `//` 与 `go:embed` 之间不能有空格，否则静默退化（《09》§10.1）。
-func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(indexHTML)
+func (s *Server) handleIndex(c *gin.Context) {
+	c.Writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = c.Writer.Write(indexHTML)
 }
