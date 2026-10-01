@@ -7,6 +7,8 @@ import (
 	"maps"
 	"strings"
 
+	"yk-tako-eino/internal/msgtext"
+
 	"github.com/cloudwego/eino/schema"
 )
 
@@ -161,11 +163,13 @@ func renderTurn(item turn) string {
 }
 
 // writeMsg 把一条消息收成一行角色加正文。工具调用单独成行，参数留在原文里。
+// 正文经 msgtext 取：enhanced 工具（read_file 回图片）的回执在片段里，Content 是空的，
+// 直接读 Content 会让摘要和 run_archive 里少掉整段工具输出。
 func writeMsg(b *strings.Builder, msg *schema.Message) {
 	if msg == nil {
 		return
 	}
-	fmt.Fprintf(b, "%s: %s\n", msg.Role, msg.Content)
+	fmt.Fprintf(b, "%s: %s\n", msg.Role, msgtext.Of(msg))
 	if msg.ReasoningContent != "" {
 		fmt.Fprintf(b, "reasoning: %s\n", msg.ReasoningContent)
 	}

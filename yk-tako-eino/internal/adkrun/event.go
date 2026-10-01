@@ -4,6 +4,7 @@
 package adkrun
 
 import (
+	"yk-tako-eino/internal/msgtext"
 	"yk-tako-eino/internal/taskboard"
 
 	"github.com/cloudwego/eino/adk"
@@ -83,10 +84,11 @@ func eventFrom(agentName string, mv *adk.MessageVariant, msg *schema.Message) (E
 		if taskboard.IsBoardTool(name) {
 			kind = EventBoard
 		}
-		return Event{Kind: kind, Agent: agentName, Role: msg.Role, Text: msg.Content, ToolName: name}, true
+		// 正文经 msgtext 取：enhanced 工具（read_file 回图片）的回执在片段里，Content 是空的。
+		return Event{Kind: kind, Agent: agentName, Role: msg.Role, Text: msgtext.Of(msg), ToolName: name}, true
 	}
-	if msg.Content != "" {
-		return Event{Kind: EventMessage, Agent: agentName, Role: msg.Role, Text: msg.Content}, true
+	if text := msgtext.Of(msg); text != "" {
+		return Event{Kind: EventMessage, Agent: agentName, Role: msg.Role, Text: text}, true
 	}
 	return Event{}, false
 }

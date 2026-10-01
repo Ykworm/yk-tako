@@ -12,3 +12,5 @@ yktako-webui.db-wal
 yktako-webui.db-shm
 # 运行时写入的窗口大小（当前目录，和 yktako-webui.db 一样）
 model-windows.json
+# 媒体落盘缓存（工作区根下，media_offload 把图/音/视频换占位符时写入）
+.media-cache/

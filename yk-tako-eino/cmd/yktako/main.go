@@ -1,6 +1,6 @@
 // yk-tako 唯一入口：裸 ReAct + 任务看板（taskboard）+ L1 三件套守卫。
 //
-// 组装（doc/01 §5）：ChatModelAgent 的 Handlers 链 = [taskboard] + guard 三件套；
+// 组装（doc/01 §5）：ChatModelAgent 的 Handlers 链 = [taskboard, mediaoffload, compact] + guard 三件套；
 // 看板正本在 taskboard middleware 里跨轮存活，镜像随 interrupt 落 checkpoint。
 // 两个入口：默认 REPL；-web 起最小 Web UI（internal/webui），共用同一套审批语义。
 package main
@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/cloudwego/eino/adk"
@@ -20,6 +21,7 @@ import (
 	"yk-tako-eino/internal/compact"
 	"yk-tako-eino/internal/config"
 	"yk-tako-eino/internal/guard"
+	"yk-tako-eino/internal/mediaoffload"
 	"yk-tako-eino/internal/repl"
 	"yk-tako-eino/internal/taskboard"
 	"yk-tako-eino/internal/tools"
@@ -50,6 +52,8 @@ func main() {
 	if err != nil {
 		repl.Exitf("%v", err)
 	}
+	// 媒体缓存放在工作区根下，和文件守卫同一个根：read_file 取回落盘的图时不需要额外放行。
+	mediaStore := mediaoffload.NewStore(filepath.Join(cwd, mediaoffload.DefaultDir), 0)
 	bash, err := tools.Bash(ctx)
 	if err != nil {
 		repl.Exitf("bash: %v", err)
@@ -73,6 +77,11 @@ func main() {
 		// taskboard 只改工具表。compact 在 piiHandler 前面，返回新的消息对象，打码才不会写穿 modelMsgs。
 		// search_archive 由 compact 的 BeforeAgent 注入，不在下面的静态工具列表里。
 		handlers := []adk.ChatModelAgentMiddleware{boardMW}
+		// mediaoffload 也每场会话一份：它记着本轮哪些媒体已经给模型看过，共用会串台。
+		// 放在 compact 前面——图先换成占位符，压缩再数 token 数的才是真要发出去的那一份。
+		if mediaMW := mediaoffload.NewHandler(mediaoffload.Config{Store: mediaStore}); mediaMW != nil {
+			handlers = append(handlers, mediaMW)
+		}
 		if mem, ok := compact.MemoryFrom(ctx); ok {
 			compactMW, err := compact.NewHandler(compact.HandlerConfig{
 				Model:     chatModel,
