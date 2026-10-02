@@ -5,8 +5,9 @@
 # .NET 构建产物（maf/）
 bin/
 obj/
-# Go 编译产物（yk-tako-eino/，go build ./cmd/yktako 默认落在包目录）
+# Go 编译产物（yk-tako-eino/，go build ./cmd/yktako 默认落在包目录；backup 为翻篇前留档）
 yk-tako-eino/yktako
+yk-tako-eino-backup/yktako
 yktako-webui.db
 yktako-webui.db-wal
 yktako-webui.db-shm
@@ -14,3 +15,5 @@ yktako-webui.db-shm
 model-windows.json
 # 媒体落盘缓存（工作区根下，media_offload 把图/音/视频换占位符时写入）
 .media-cache/
+# 执行台账（planning.md / todos.md），用户验收完即清理，不进版本库
+tmp/
