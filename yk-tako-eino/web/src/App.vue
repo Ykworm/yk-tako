@@ -2,7 +2,7 @@
 import { nextTick, onMounted, ref, watch } from 'vue'
 import { useChat } from './chat'
 
-const { bubbles, draft, busy, loadingOlder, atStart, send, reconcile, loadOlder, newSession } = useChat()
+const { bubbles, draft, pending, loadingOlder, atStart, send, reconcile, loadOlder, newSession } = useChat()
 
 const listEl = ref<HTMLElement | null>(null)
 const pinned = ref(true)
@@ -44,7 +44,7 @@ async function onScroll() {
           <span class="brand-dot" aria-hidden="true"></span>
           <h1>tako</h1>
         </div>
-        <button class="ghost" :disabled="busy" @click="newSession">
+        <button class="ghost" @click="newSession">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
             <path d="M8 3v10M3 8h10" />
           </svg>
@@ -70,9 +70,21 @@ async function onScroll() {
 
         <div v-for="b in bubbles" :key="b.key" :class="['bubble', b.role, b.state]">
           <p v-if="b.text">{{ b.text }}</p>
-          <span v-else-if="b.state === 'streaming'" class="typing" aria-label="正在生成">
+          <span v-else-if="b.state === 'streaming' || b.state === 'offline'" class="typing" aria-label="正在生成">
             <i></i><i></i><i></i>
           </span>
+          <p v-if="b.state === 'offline'" class="queue-note">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+              <path d="M2.6 13.4 13.4 2.6M6.2 9.8a3.4 3.4 0 0 1 3.6-.8" /><path d="M3.4 6.8a6.2 6.2 0 0 1 8.4-1.4" />
+            </svg>
+            拉不到帧，改看会话状态
+          </p>
+          <p v-if="b.state === 'queued'" class="queue-note">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+              <circle cx="8" cy="8" r="6.2" /><path d="M8 4.6V8l2.2 1.6" />
+            </svg>
+            会话忙，排队待发
+          </p>
           <p v-if="b.state === 'error'" class="err-note">
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
               <circle cx="8" cy="8" r="6.2" /><path d="M8 5v3.6M8 11h.01" />
@@ -83,8 +95,12 @@ async function onScroll() {
       </section>
 
       <form class="composer" @submit.prevent="send">
-        <input v-model="draft" :disabled="busy" placeholder="说点什么…" aria-label="消息输入框" />
-        <button type="submit" :disabled="busy || !draft.trim()" aria-label="发送">
+        <input
+          v-model="draft"
+          :placeholder="pending.length ? `排队 ${pending.length} 条，当前回复收口后自动发出` : '说点什么…'"
+          aria-label="消息输入框"
+        />
+        <button type="submit" :disabled="!draft.trim()" aria-label="发送">
           <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
             <path d="M3.1 2.2 18 10 3.1 17.8c-.7.4-1.6-.1-1.6-.9v-4.4l9-2.5-9-2.5V3.1c0-.8.9-1.3 1.6-.9z" />
           </svg>
@@ -307,6 +323,13 @@ header h1 {
   color: #b03434;
   box-shadow: none;
 }
+/* 排队待发：还没投递成功，视觉上就该和「已在服务端」的气泡分开 */
+.bubble.queued {
+  opacity: 0.62;
+  border-style: dashed;
+  border-color: #dfe3ee;
+  box-shadow: none;
+}
 
 /* 打字指示（streaming 且尚无文本） */
 .typing {
@@ -338,6 +361,19 @@ header h1 {
   opacity: 0.85;
 }
 .err-note svg {
+  width: 0.8rem;
+  height: 0.8rem;
+  flex: none;
+}
+.queue-note {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.72rem;
+  margin-top: 0.4rem !important;
+  color: #6e6e7a;
+}
+.queue-note svg {
   width: 0.8rem;
   height: 0.8rem;
   flex: none;
