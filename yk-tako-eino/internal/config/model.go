@@ -1,4 +1,4 @@
-// 本文件：按厂商目录建 Eino ChatModel（接法参考 yk-tako-eino-backup/internal/config，不 import）。
+// 本文件：按厂商目录建 Eino ChatModel。
 // 返回值实现 model.ToolCallingChatModel 接口——github.com/cloudwego/eino/components/model
 // 包 interface.go（eino v0.9.21）；具体实现来自 eino-ext 的 openai / claude 组件。
 package config
@@ -20,11 +20,9 @@ const systemPrompt = "你是 yk-tako，一个正在成长中的 AI 工作伙伴�
 // SystemPrompt 是 run worker 组模型侧消息时用的系统消息。
 func SystemPrompt() string { return systemPrompt }
 
-// LoadDotEnv 读取 .env。在 yk-tako-eino/ 里运行时读当前目录，再试仓库根的 ../.env；
-// 最后试 ../yk-tako-eino-backup/.env——用户密钥目前暂放在 backup 仓的那一份里，
-// 新仓自己的 .env 一旦建立，前面的命中会让这条 fallback 自然失效。
+// LoadDotEnv 读取 .env。在 yk-tako-eino/ 里运行时读当前目录，再试仓库根的 ../.env。
 func LoadDotEnv() {
-	for _, path := range []string{".env", "../.env", "../yk-tako-eino-backup/.env"} {
+	for _, path := range []string{".env", "../.env"} {
 		if err := godotenv.Load(path); err == nil {
 			return
 		}
