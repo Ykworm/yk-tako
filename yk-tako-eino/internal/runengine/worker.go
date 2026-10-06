@@ -11,6 +11,8 @@ import (
 	"context"
 	"io"
 	"log"
+	"sync"
+	"time"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
@@ -69,33 +71,49 @@ func einoChunkText(chunk *schema.Message) (string, bool) {
 
 // Worker 消费 user message，流式产出 delta 帧，收完收尾（doc/19 §7）。
 // 一个 run 一次 Run 调用；由 POST handler 在抢闸成功后以 goroutine 启动。
+// leaseRenew 是 watchdog 续约间隔（A7）：生成期间每 leaseRenew 把闸的租约续回，进程死了没人续 → 三键 TTL 到期自动解锁。
 type Worker struct {
-	store     *RedisStore
-	chat      ChatStream
-	translate Translator
-	system    string
+	store      *RedisStore
+	chat       ChatStream
+	translate  Translator
+	system     string
+	leaseRenew time.Duration
 }
 
-// NewWorker 组一个 worker。translate 传 TranslatorFor(config 的协议)；system 是系统消息（可为空）。
-func NewWorker(store *RedisStore, chat ChatStream, translate Translator, system string) *Worker {
-	return &Worker{store: store, chat: chat, translate: translate, system: system}
+// NewWorker 组一个 worker。translate 传 TranslatorFor(config 的协议)；system 是系统消息（可为空）；
+// leaseRenew 是 watchdog 续约间隔（dev 5s）。
+func NewWorker(store *RedisStore, chat ChatStream, translate Translator, system string, leaseRenew time.Duration) *Worker {
+	return &Worker{store: store, chat: chat, translate: translate, system: system, leaseRenew: leaseRenew}
 }
 
 // Run 是 run 的执行体。**收尾无条件化**：endRun 挂在唯一出口（defer），不散在各级 return 前——
 // 超时 / 429 / 连接断（Stream 或 Recv 报错）都走同一出口放闸，worker 自己收的尾（新 A3 用例 6 在真源侧的延续）。
 // status 唯一的活变量：默认 complete，任何错误出口置 error。
+//
+// **watchdog 生命周期严格在 EndRun 之前结束**（A7）：defer 是 LIFO，EndRun 先注册故最后跑；
+// 停 watchdog 的 defer 后注册故先跑，且 `wg.Wait()` 确保续约 goroutine 完全退出——否则续约会把 runlive
+// 定稿后的 300s TTL 覆盖回 lease 的 30s。
 func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 	status := "complete"
 	defer func() {
 		_, _, ok, err := w.store.EndRun(ctx, sessionID, runID, status)
 		switch {
 		case err != nil:
-			// 收尾失败 = 闸没放：那个 session 之后每次 POST 都 409，而 A7 的 reaper 之前没有别的解法。
+			// 收尾失败 = 闸没放。A7 之后这不再是永久锁死：闸带租约，没人续到点自蒸、会话自动解锁。仍留痕。
 			log.Printf("endRun %s/%s (%s): %v", sessionID, runID, status, err)
 		case !ok:
 			log.Printf("endRun %s/%s (%s): 闸已不在，空转", sessionID, runID, status)
 		}
 	}()
+
+	leaseCtx, cancelLease := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		w.watchdog(leaseCtx, sessionID, runID)
+	}()
+	defer func() { cancelLease(); wg.Wait() }()
 
 	msgs, err := w.modelInput(ctx, sessionID)
 	if err != nil {
@@ -126,7 +144,36 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 				return
 			}
 			if !live {
-				// run 已被 reset 清掉 / 闸已不在：停止推流。defer 的 EndRun 拿不到闸自然空转。
+				// run 已被判死（draft 随租约到期蒸发）/ 被 reset 清掉 / 闸已不在：停止推流。
+				// defer 的 EndRun 拿不到闸自然空转。
+				return
+			}
+		}
+	}
+}
+
+// watchdog 在生成期间每 leaseRenew 续约一次闸的租约（A7）。续约 no-op（CAS 失败：闸已易主 / 已放 / 已到期）
+// = 本 run 被判死 → **记日志、退出 watchdog，但不主动杀 LLM 流**（dev 默认）：主循环的 AppendDelta 会因 draft
+// 蒸发自然停写（返 !live）、EndRun 被守卫挡住空转，都是现役既有语义，不用新代码去中断流。
+// ctx 由 Run 在退出前 cancel，watchdog 随即返回；wg.Wait() 保证它完全退出后 EndRun 才跑。
+func (w *Worker) watchdog(ctx context.Context, sessionID SessionID, runID RunID) {
+	t := time.NewTicker(w.leaseRenew)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			ok, err := w.store.RenewLease(ctx, sessionID, runID)
+			if err != nil {
+				if ctx.Err() != nil {
+					return // Run 已收工、ctx 被 cancel 导致的在途续约失败，安静退出
+				}
+				log.Printf("lease renew %s/%s: %v", sessionID, runID, err)
+				continue
+			}
+			if !ok {
+				log.Printf("lease renew %s/%s: 闸已不属于本 run，停止续约（本 run 判死）", sessionID, runID)
 				return
 			}
 		}

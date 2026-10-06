@@ -9,12 +9,17 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// 存储层不变量的回归网（A4-2）。curl 打不到的三类：`gone` 的 TTL 到期、Lua 的跨键原子性、
-// Reset 的前缀隔离。dev 运行时用真 Redis 6390，miniredis 只服务本文件。
+// 存储层不变量的回归网（A4-2 + A7 租约）。curl 打不到的三类：`gone` 的 TTL 到期、Lua 的跨键原子性、
+// Reset 的前缀隔离；再加 A7 的闸租约（抢闸带 TTL、watchdog 续约三键同刷、CAS 防误续、越过后闸自开）。
+// dev 运行时用真 Redis 6390，miniredis 只服务本文件。
 //
-// A7 改这一层时，1/4/8 三条对 `tk:live` 闸的断言会按新语义变红——那时是**同拍改网**，不是改坏了。
+// A7 落地后 1/4/8 三条对 `tk:live` 闸的断言**仍绿**：miniredis 的 TTL 只在 `FastForward` 时推进，
+// 而这三条都没在闸存活期间拨钟（test 5 拨钟发生在 EndRun 放闸之后）。租约由新增的 10/11 两条覆盖。
 
-const testTTL = 300 * time.Second
+const (
+	testTTL      = 300 * time.Second
+	testLeaseTTL = 30 * time.Second
+)
 
 func newTestStore(t *testing.T) (*RedisStore, *miniredis.Miniredis) {
 	t.Helper()
@@ -22,7 +27,7 @@ func newTestStore(t *testing.T) (*RedisStore, *miniredis.Miniredis) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := NewRedisStore(mr.Addr(), testTTL)
+	s := NewRedisStore(mr.Addr(), testTTL, testLeaseTTL)
 	t.Cleanup(func() {
 		s.rdb.Close()
 		mr.Close()
@@ -89,7 +94,7 @@ func TestAcquireRunGateBlocksSecondRun(t *testing.T) {
 	sid, r1, r2 := SessionID("s_1"), RunID("r_1"), RunID("r_2")
 
 	s.mustAcquire(t, sid, r1, "m_1", "hi")
-	ok, err := s.AcquireRun(ctx, sid, r2, Row{RunID: r2, Role: "user", MessageID: "m_2", Text:"second"})
+	ok, err := s.AcquireRun(ctx, sid, r2, Row{RunID: r2, Role: "user", MessageID: "m_2", Text: "second"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,5 +428,88 @@ func TestResetOnlyDeletesOwnPrefix(t *testing.T) {
 
 	if _, _, exists, err := s.SessionStatus(ctx, sid); err != nil || exists {
 		t.Errorf("reset 后 session 应不存在: exists=%v err=%v", exists, err)
+	}
+}
+
+func (s *RedisStore) ttlOf(t *testing.T, ctx context.Context, key string) time.Duration {
+	t.Helper()
+	d, err := s.rdb.TTL(ctx, key).Result()
+	if err != nil {
+		t.Fatalf("TTL %s: %v", key, err)
+	}
+	return d
+}
+
+// 10. 闸租约（A7）：抢闸即给 tk:live 设 TTL；watchdog 续一拍把 live/draft/runlive 三键同刷租约；
+// 越过 lease TTL 后三键**同生同灭**、闸自开——同 session 再抢闸成功（永久锁死问题就此了结）。
+func TestGateLeaseExpiresAndAutoUnlocks(t *testing.T) {
+	ctx := context.Background()
+	s, mr := newTestStore(t)
+	sid, rid := SessionID("s_1"), RunID("r_1")
+	s.mustAcquire(t, sid, rid, "m_1", "hi")
+	s.mustDelta(t, ctx, rid, "world")
+
+	// 抢闸即带租约：tk:live TTL > 0（draft/runlive 此刻还没 TTL，要等 watchdog 续约才三键同刷）。
+	if ttl := s.ttlOf(t, ctx, keyLive(sid)); ttl <= 0 {
+		t.Fatalf("抢闸后 tk:live 应带租约 TTL, got %v", ttl)
+	}
+
+	// watchdog 续一拍：三键同刷租约。
+	if ok, err := s.RenewLease(ctx, sid, rid); err != nil || !ok {
+		t.Fatalf("RenewLease: ok=%v err=%v", ok, err)
+	}
+	for _, k := range []string{keyLive(sid), keyDraft(rid), keyRunlive(rid)} {
+		if ttl := s.ttlOf(t, ctx, k); ttl <= 0 {
+			t.Errorf("续约后 %s 应带租约 TTL, got %v", k, ttl)
+		}
+	}
+
+	// 越过 lease TTL：没人续约 → 三键一起蒸发。
+	mr.FastForward(testLeaseTTL + time.Second)
+	s.mustGone(t, ctx, keyLive(sid))
+	s.mustGone(t, ctx, keyDraft(rid))
+	s.mustGone(t, ctx, keyRunlive(rid))
+
+	// 会话自动解锁：同 session 再抢闸成功（不是 409）。
+	r2 := RunID("r_2")
+	ok, err := s.AcquireRun(ctx, sid, r2, Row{RunID: r2, Role: "user", MessageID: "m_2", Text: "again"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("闸随租约到期自开后，同 session 应能重新抢闸")
+	}
+}
+
+// 11. CAS 防误续（A7）：闸已易主后，老 run 的 watchdog 续约 no-op——不给别人的租约续命、不改写其 TTL。
+func TestRenewLeaseCASNoopWhenGateLost(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTestStore(t)
+	sid, rid := SessionID("s_1"), RunID("r_1")
+	s.mustAcquire(t, sid, rid, "m_1", "hi")
+	s.mustDelta(t, ctx, rid, "world")
+	if ok, err := s.RenewLease(ctx, sid, rid); err != nil || !ok {
+		t.Fatalf("首次续约（闸属本 run）应成功: ok=%v err=%v", ok, err)
+	}
+
+	// 闸易主：手工把 tk:live 改成别的 run，带一个已知租约作为「别人的」基准。
+	if err := s.rdb.Set(ctx, keyLive(sid), "r_other", testLeaseTTL).Err(); err != nil {
+		t.Fatal(err)
+	}
+	before := s.ttlOf(t, ctx, keyLive(sid))
+
+	// 老 run 的 watchdog 再续 → CAS 失败、no-op。
+	ok, err := s.RenewLease(ctx, sid, rid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("闸已易主，老 run 续约应 no-op（返 false）")
+	}
+	if after := s.ttlOf(t, ctx, keyLive(sid)); after != before {
+		t.Errorf("续约 no-op 不应改写别人的租约 TTL: %v → %v", before, after)
+	}
+	if v, _ := s.rdb.Get(ctx, keyLive(sid)).Result(); v != "r_other" {
+		t.Errorf("tk:live = %q, want %q（续约不得覆盖闸值）", v, "r_other")
 	}
 }

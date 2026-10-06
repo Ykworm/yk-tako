@@ -1,4 +1,4 @@
-// 本文件是 v6 存储层的 Redis 形态（doc/19 §7「六类结构」；真 A4 转正，替 memstore.go）。
+// 本文件是 v6 存储层的唯一形态：Redis（doc/19 §7「六类结构」；A4 转正后 server/worker 只接它）。
 //
 // 三条实现约定（tmp/19-v6/planning.md §3）：
 //   - 帧/行的 JSON 里**不存** offset，读时按 LIST index 注入（offset = index+1）——
@@ -31,10 +31,12 @@ func keyRunlive(runID RunID) string              { return keyPrefix + "runlive:"
 func keyDraft(runID RunID) string                { return keyPrefix + "draft:" + string(runID) }
 func keyModelHistory(sessionID SessionID) string { return keyPrefix + "mh:" + string(sessionID) }
 
-// acquireScript 是 POST 事务（doc/19 §1）：`SET NX` 抢到闸才写其余五键，抢不到**一个键都不写**。
-// KEYS: live session runlog runlive draft mh；ARGV: runID userRowJSON startFrameJSON userModelMessageJSON。
+// acquireScript 是 POST 事务（doc/19 §1）：`SET NX PX` 抢到**带租约的**闸才写其余五键，抢不到**一个键都不写**。
+// 闸带短租约（A7）：进程死亡后没人续约，闸到点自然蒸发、会话自动解锁——不再是「SET NX 无 TTL、持有者死了永久锁死」。
+// 生成期间由 worker watchdog 定期续约（renewScript），长回复不被误放。
+// KEYS: live session runlog runlive draft mh；ARGV: runID userRowJSON startFrameJSON userModelMessageJSON leaseMillis。
 var acquireScript = redis.NewScript(`
-if redis.call('SET', KEYS[1], ARGV[1], 'NX') == false then
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[5]) == false then
   return 0
 end
 redis.call('SET', KEYS[2], '1')
@@ -42,6 +44,21 @@ redis.call('RPUSH', KEYS[3], ARGV[2])
 redis.call('RPUSH', KEYS[4], ARGV[3])
 redis.call('SET', KEYS[5], '')
 redis.call('RPUSH', KEYS[6], ARGV[4])
+return 1
+`)
+
+// renewScript 是 watchdog 续约（A7 闸租约化）：**CAS 防误续**——闸仍等于本 run 才动手，否则 no-op（返 0），
+// 绝不给已易主 / 已放的闸续命（防网络分区复活的老 worker 把新 run 的租约续上）。
+// 三键同刷 lease：live + draft + runlive **同生同灭**——进程死了没人续约，三键一起 TTL 到期消失，
+// 客户端拉到 frames `gone` + `liveRunId:""`，靠 B1 的冗余收口信号自愈，无「闸没了帧还在」的半死残留。
+// KEYS: live draft runlive；ARGV: runID leaseMillis。
+var renewScript = redis.NewScript(`
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+  return 0
+end
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+redis.call('PEXPIRE', KEYS[2], ARGV[2])
+redis.call('PEXPIRE', KEYS[3], ARGV[2])
 return 1
 `)
 
@@ -83,16 +100,20 @@ redis.call('DEL', KEYS[3])
 return {1, eventOffset, redis.call('LLEN', KEYS[4])}
 `)
 
-// RedisStore 是四个 API 的存储后端。ttl 是 runlive 在 run 结束后的回收期限
-// （doc/19 §7「设 TTL」，数值 dev 取 300s——它只是回收参数，不是正确性参数：
-// `done` 与 `gone` 收敛到同一条收口路径）。
+// RedisStore 是四个 API 的存储后端。
+//   - ttl：runlive 在 run **正常结束**后的回收期限（doc/19 §7「设 TTL」，dev 取 300s）——只是回收参数，
+//     不是正确性参数：`done` 与 `gone` 收敛到同一条收口路径。
+//   - leaseTTL：闸（`tk:live`）与 draft/runlive 在**生成期间**的租约期限（A7，dev 取 30s）。抢闸时 `PX` 设上，
+//     watchdog 每 leaseRenew 续回；进程死亡后没人续约，三键到点同生同灭。同为回收参数：误放概率随 leaseTTL
+//     放宽指数下降（30s/5s = 连续 6 次续约全失败才误放）。
 type RedisStore struct {
-	rdb *redis.Client
-	ttl time.Duration
+	rdb      *redis.Client
+	ttl      time.Duration
+	leaseTTL time.Duration
 }
 
-func NewRedisStore(addr string, ttl time.Duration) *RedisStore {
-	return &RedisStore{rdb: redis.NewClient(&redis.Options{Addr: addr}), ttl: ttl}
+func NewRedisStore(addr string, ttl, leaseTTL time.Duration) *RedisStore {
+	return &RedisStore{rdb: redis.NewClient(&redis.Options{Addr: addr}), ttl: ttl, leaseTTL: leaseTTL}
 }
 
 // Ping 是启动期探针（main 调用）：Redis 不可达就不起进程，
@@ -128,7 +149,20 @@ func (s *RedisStore) AcquireRun(ctx context.Context, sessionID SessionID, runID 
 	n, err := acquireScript.Run(ctx, s.rdb, []string{
 		keyLive(sessionID), keySession(sessionID), keyRunlog(sessionID),
 		keyRunlive(runID), keyDraft(runID), keyModelHistory(sessionID),
-	}, string(runID), userJSON, startJSON, modelJSON).Int64()
+	}, string(runID), userJSON, startJSON, modelJSON, int64(s.leaseTTL/time.Millisecond)).Int64()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// RenewLease 由 worker watchdog 在生成期间定期调用（A7 闸租约化）：CAS 通过（闸仍属本 run）才把
+// live/draft/runlive 三键的 TTL 同刷回 leaseTTL。ok=false = 闸已不属于本 run（已放 / 已易主 / 已到期），
+// 续约 no-op——调用方据此判定本 run 已被判死。
+func (s *RedisStore) RenewLease(ctx context.Context, sessionID SessionID, runID RunID) (bool, error) {
+	n, err := renewScript.Run(ctx, s.rdb, []string{
+		keyLive(sessionID), keyDraft(runID), keyRunlive(runID),
+	}, string(runID), int64(s.leaseTTL/time.Millisecond)).Int64()
 	if err != nil {
 		return false, err
 	}

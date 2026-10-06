@@ -19,6 +19,24 @@ type Server struct {
 	worker *Worker
 }
 
+// NewRouter 挂 v6 第一步的全部四个 API（doc/19 §0）。整张面的心智模型就一条循环：
+// **投一条消息，轮询看着回复一点点生成、定稿**。四个端点各管一段，两条游标别混：
+//
+//	eventOffset    —— run 内序号（1 起，start/delta/terminal 各占一个）。只挂在 frames 上。
+//	                  定稿后 runlive 有 TTL，到期即失效 ⇒ 它不是历史地址。
+//	runlogOffset   —— session 内全局序号（跨 run 单调，每条定稿记录占一个）。只挂在 log 上。
+//	                  永久有效 ⇒ 双向合法：往前拨补新、往回拨翻旧。
+//
+// 客户端 reconcile（refresh / reconnect 同一条路径，doc/19 §5）：
+//  1. GET /api/sessions/{id}      → {liveRunId, runlogOffset=高水位 H}
+//  2. GET /api/sessions/{id}/log  → 游标取 max(0, H-窗口)（**不是 0**），分批拉定稿记录渲染
+//  3. liveRunId 非空 → GET /api/runs/{runId}/frames 轮询，delta 按 eventOffset 追加成「正在生成」气泡
+//  4. 收口：frames 见 terminal / status:gone / liveRunId 变 "" 或变了 → 回第 2 步拉 log，
+//     按 runId 把 assistant 全文**替换**半截气泡（三个信号互为冗余，不押注单一信号）
+//
+// 不变量：两个**对齐游标**各自只在自己的端点前进；往上滚翻旧历史用的是**临时翻页游标**，
+// 拉完即弃，不回退对齐游标。实时性 = 客户端轮询节奏（dev 建议 300–500ms），服务端无长连接、
+// 无推送、无 heartbeat。两个拉取端点一律有界：单批上限 W（-batch-window，dev 默认 200）。
 func NewRouter(store *RedisStore, batchWindow int, dev bool, worker *Worker) *gin.Engine {
 	s := &Server{store: store, w: batchWindow, worker: worker}
 	r := gin.Default()
@@ -62,6 +80,32 @@ type logResponse struct {
 	NextOffset int   `json:"nextOffset"`
 }
 
+// postRuns（doc/19 §1）= 创建一场 run，语义上就是「投递一条用户消息并立刻开跑」。
+//
+// 请求体（三个字段，按情形发）：
+//
+//	{"sessionId":"s_01","messageId":"m_2","text":"..."}
+//
+//	sessionId  —— 可省。**不带 = 懒建会话**（服务端在投递事务内铸 s_<ULID>，客户端必须把
+//	              返回的 sessionId 存下来，之后所有请求都带着它）；
+//	            **带上 = 准入检查**：只认登记过的，未知一律 404，绝不隐式创建。
+//	messageId  —— 客户端生成、投递前就有（绑本地气泡），不参与排序。超时重发就原样重投
+//	              （同 messageId 同 text）；服务端**不按 messageId 去重**，幂等只在「闸」层面。
+//	text       —— 消息正文。
+//
+// 响应（字段序即契约字节序：sessionId → runId → messageId）：
+//
+//	202 {"sessionId":"s_01","runId":"r_01","messageId":"m_1"}
+//	400 {"error":"bad_request"}          ← 请求体不是合法 JSON
+//	404 {"error":"session_not_found"}    ← 只可能出现在「带未知 sessionId」时
+//	409 {"error":"session_busy"}         ← 该会话已有活 run；**什么都没写**，客户端本地排队、本轮收口后补投
+//	500 {"error":"internal"}
+//
+// 服务端在**一笔原子写**里做完：抢闸 + run 行 + runlog 追加 role:user 记录（占一个
+// runlogOffset）+ 建 runlive:{runId} 并压 start 帧（eventOffset=1）+ 建空 draft。
+// 要么整笔成功（消息开跑），要么整笔回滚（409）；**没有「入队待调度」这种中间态**。
+// POST 本身不返回任何生成内容——客户端拿 runId 去 §2 轮询观测。拿到 runId 就能直接拉
+// frames，不必先查 session；§4 那个状态查询是给 reconnect / 新 tab 用的入口。
 func (s *Server) postRuns(c *gin.Context) {
 	ctx := c.Request.Context()
 	var req postRunsRequest
@@ -108,6 +152,21 @@ func (s *Server) postRuns(c *gin.Context) {
 	c.JSON(http.StatusAccepted, postRunsResponse{SessionID: sessionID, RunID: runID, MessageID: req.MessageID})
 }
 
+// getSession（doc/19 §4）= 会话状态查询，reconcile 的**第一步**（refresh / 新 tab 都从它进）。
+//
+//	GET /api/sessions/s_01
+//	200 {"liveRunId":"r_1","runlogOffset":1}   ← 有 run 正在跑；runlog 已有 1 条（刚投递的 user 消息）
+//	200 {"liveRunId":"","runlogOffset":2}      ← run 已结束；助手全文已进 runlog
+//	404 {"error":"session_not_found"}
+//
+// 两个字段各回答一个问题，客户端据此决定后面拉哪个端点：
+//   - `liveRunId`：该会话当前的活 run（读闸），`""` = 会话闲着。**非空才需要去拉 §2 的 frames**；
+//     它从非空变 `""`、或换成了另一个 runId，本身就是「该收口了」的触发信号之一。
+//   - `runlogOffset`：`runlog:{sessionId}` 的**高水位**（LLEN）。两个用处——判断有没有新定稿
+//     要补（本地对齐游标 < 高水位 就还得拉），以及给 §3 算初始窗口游标 `max(0, H - 窗口)`。
+//
+// 它**不返回任何生成内容**，也不参与投递：发消息后可以直接拿 runId 去轮询 frames，不必先过这里。
+// 三条读命令（登记 / 闸 / 高水位）走一笔 MULTI 快照，所以不会出现「读到活 run 却配了旧高水位」。
 func (s *Server) getSession(c *gin.Context) {
 	liveRunID, runlogOffset, exists, err := s.store.SessionStatus(c.Request.Context(), SessionID(c.Param("id")))
 	if err != nil {
@@ -121,8 +180,34 @@ func (s *Server) getSession(c *gin.Context) {
 	c.JSON(http.StatusOK, sessionResponse{LiveRunID: liveRunID, RunlogOffset: runlogOffset})
 }
 
-// getFrames（doc/19 §2）：status 三态只靠「键存在性 + 本批是否含 terminal」推出，无额外状态字段。
-// run 不存在 → gone（200，不 404——「从未存在」与「已过期删除」故意不区分，客户端都转拉 log）。
+// getFrames（doc/19 §2）= 拉某场 run **正在生成**的帧序列（Redis LIST `runlive:{runId}`）。
+//
+//	GET /api/runs/r_1/frames?eventOffset=0
+//	200 {"frames":[
+//	  {"eventOffset":1,"kind":"start","messageId":"m_1"},
+//	  {"eventOffset":2,"kind":"delta","text":"好的"},
+//	  {"eventOffset":3,"kind":"delta","text":"，我来读"},
+//	  {"eventOffset":4,"kind":"terminal","status":"complete"}
+//	],"nextOffset":4,"status":"done"}
+//
+// 游标语义：`eventOffset=N` 返回该 run 内 offset **> N** 的帧，升序，单批最多 W 条；缺省、
+// 非法、负数都当 0（= 从 start 起，新客户端能看到整段生成，超长回复分批拉完）。实现是
+// `LRANGE runlive:{runId} N N+W-1`，**index+1 才是 eventOffset**。
+// `nextOffset` = 本批最大 offset，**空批 = N**；被 W 截断时它就是本批末帧的 offset，
+// 客户端直接拿它当下次游标续拉即补齐。
+//
+// 帧只有三种 kind：`start`（带 messageId）、`delta`（text 是**增量片段**不是累计全文，
+// 客户端按 eventOffset 顺序**追加**进气泡；去重 = 「见过的 eventOffset 跳过」）、
+// `terminal`（这场 run 的最后一个事件，带终态 status，本步只有 complete/error，
+// stopped 留给后续 loop）。
+//
+// status 三态**只靠「runlive 键存在性 + 本批是否含 terminal」推出**，无额外状态字段：
+//   - generating → 还没 terminal，按轮询间隔继续拉 nextOffset 之后；
+//   - done       → 见 terminal，**收口**：回 log 端点按 runId 拿 assistant 全文替换半截气泡；
+//   - gone       → runlive 键已过期删除，该 run 早已定稿，**转拉 log**。
+//
+// 未知 run **故意不返 404**：「从未存在」与「TTL 到期删除」不区分，都是 200 gone——
+// 客户端两种情况的动作本来相同（转拉 log），区分它没有价值。
 func (s *Server) getFrames(c *gin.Context) {
 	from := queryOffset(c, "eventOffset")
 	frames, next, exists, err := s.store.ReadFrames(c.Request.Context(), RunID(c.Param("runId")), from, s.w)
@@ -144,7 +229,28 @@ func (s *Server) getFrames(c *gin.Context) {
 	c.JSON(http.StatusOK, framesResponse{Frames: frames, NextOffset: next, Status: status})
 }
 
-// getSessionLog（doc/19 §3）：session 未登记 → 404。
+// getSessionLog（doc/19 §3）= 拉 session 的**定稿历史**（Redis LIST `runlog:{sessionId}`）。
+//
+//	GET /api/sessions/s_01/log?runlogOffset=0
+//	200 {"rows":[
+//	  {"runlogOffset":1,"runId":"r_1","role":"user","messageId":"m_1","text":"读一下 doc/19"},
+//	  {"runlogOffset":2,"runId":"r_1","role":"assistant","text":"好的，我来读……"}
+//	],"nextOffset":2}
+//	404 {"error":"session_not_found"}
+//
+// 游标语义：`runlogOffset` 是 **session 内全局序号**（跨 run 单调，每条定稿记录占一个，
+// index+1 即 offset），跟 §2 那个 run 内的 eventOffset 是两个东西，别混。N 返回 offset **> N**
+// 的记录，升序，单批最多 W 条；`nextOffset` = 本批最大 offset，空批 = N，被 W 截断时续拉即补齐。
+//
+// **初始游标不是 0，是 max(0, 高水位 - 窗口)**：高水位从 §4 拿。
+// **为什么初始值不能是 0**：runlog 永久增长且无上限（compact 压的是 model_history，不动
+// runlog；它是历史真源，未来搬 DB 后 Redis 只作缓存），「从 0 全量」在长会话下就是无界请求。
+// 窗口多大由客户端定，服务端只用 W 兜底截断。offset 永久有效 ⇒ **往回拨翻更早的历史同样合法**
+// （那是临时翻页游标，拉完渲染即可，别拿它回退本地的对齐游标）。
+//
+// 内容约定：**这里永远只有已定稿的 message**，没有半截——生成中的半截在 §2 的 frames 里。
+// 所以 error 结局的残缺文本不进 runlog、也不另留痕（它只在 runlive 的 TTL 窗口内可见）。
+// 每条记录带 `runId`：客户端就是按它把定稿的 assistant 全文对上「正在生成」气泡做**替换**（收口）。
 func (s *Server) getSessionLog(c *gin.Context) {
 	from := queryOffset(c, "runlogOffset")
 	rows, next, exists, err := s.store.ReadLog(c.Request.Context(), SessionID(c.Param("id")), from, s.w)
