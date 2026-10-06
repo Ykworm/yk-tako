@@ -33,6 +33,8 @@ func keyModelHistory(sessionID SessionID) string { return keyPrefix + "mh:" + st
 
 // acquireScript 是 POST 事务（doc/19 §1）：`SET NX PX` 抢到**带租约的**闸才写其余五键，抢不到**一个键都不写**。
 // 闸带短租约（A7）：进程死亡后没人续约，闸到点自然蒸发、会话自动解锁——不再是「SET NX 无 TTL、持有者死了永久锁死」。
+// draft/runlive 出生即带同一租约（A7-2 出生窗口）：抢闸与续约之间进程死亡，三键也到点同灭——
+// 不留「闸自放了、draft/runlive 永存」的泄漏（修前它们要等首次续约才有 TTL，裸建期间死掉即成垃圾键）。
 // 生成期间由 worker watchdog 定期续约（renewScript），长回复不被误放。
 // KEYS: live session runlog runlive draft mh；ARGV: runID userRowJSON startFrameJSON userModelMessageJSON leaseMillis。
 var acquireScript = redis.NewScript(`
@@ -42,7 +44,9 @@ end
 redis.call('SET', KEYS[2], '1')
 redis.call('RPUSH', KEYS[3], ARGV[2])
 redis.call('RPUSH', KEYS[4], ARGV[3])
+redis.call('PEXPIRE', KEYS[4], ARGV[5])
 redis.call('SET', KEYS[5], '')
+redis.call('PEXPIRE', KEYS[5], ARGV[5])
 redis.call('RPUSH', KEYS[6], ARGV[4])
 return 1
 `)

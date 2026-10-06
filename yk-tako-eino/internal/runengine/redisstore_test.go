@@ -440,8 +440,8 @@ func (s *RedisStore) ttlOf(t *testing.T, ctx context.Context, key string) time.D
 	return d
 }
 
-// 10. 闸租约（A7）：抢闸即给 tk:live 设 TTL；watchdog 续一拍把 live/draft/runlive 三键同刷租约；
-// 越过 lease TTL 后三键**同生同灭**、闸自开——同 session 再抢闸成功（永久锁死问题就此了结）。
+// 10. 闸租约（A7 + A7-2 出生窗口）：抢闸即给 live/draft/runlive **三键**同设租约；
+// watchdog 续一拍三键同刷；越过 lease TTL 后三键**同生同灭**、闸自开——同 session 再抢闸成功（永久锁死问题就此了结）。
 func TestGateLeaseExpiresAndAutoUnlocks(t *testing.T) {
 	ctx := context.Background()
 	s, mr := newTestStore(t)
@@ -449,9 +449,11 @@ func TestGateLeaseExpiresAndAutoUnlocks(t *testing.T) {
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 	s.mustDelta(t, ctx, rid, "world")
 
-	// 抢闸即带租约：tk:live TTL > 0（draft/runlive 此刻还没 TTL，要等 watchdog 续约才三键同刷）。
-	if ttl := s.ttlOf(t, ctx, keyLive(sid)); ttl <= 0 {
-		t.Fatalf("抢闸后 tk:live 应带租约 TTL, got %v", ttl)
+	// 出生即带租约：三键同设（A7-2——draft/runlive 不再等首次续约才有 TTL）。
+	for _, k := range []string{keyLive(sid), keyDraft(rid), keyRunlive(rid)} {
+		if ttl := s.ttlOf(t, ctx, k); ttl <= 0 {
+			t.Fatalf("抢闸后 %s 应带租约 TTL, got %v", k, ttl)
+		}
 	}
 
 	// watchdog 续一拍：三键同刷租约。
@@ -478,6 +480,32 @@ func TestGateLeaseExpiresAndAutoUnlocks(t *testing.T) {
 	}
 	if !ok {
 		t.Fatal("闸随租约到期自开后，同 session 应能重新抢闸")
+	}
+}
+
+// 12. 出生窗口（A7-2）：进程死在「抢闸 → 首次续约」之间（一次续约都没做成）时，三键也随租约到期
+// 一起蒸发、闸自开——修前 draft/runlive 出生不带 TTL，这个窗口里死掉会永久泄漏（frames 永不 gone）。
+func TestGateLeaseBirthWindowExpiresWithoutRenew(t *testing.T) {
+	ctx := context.Background()
+	s, mr := newTestStore(t)
+	sid, rid := SessionID("s_1"), RunID("r_1")
+	s.mustAcquire(t, sid, rid, "m_1", "hi")
+	s.mustDelta(t, ctx, rid, "world")
+
+	// 零续约（= 进程死在首次续约前），直接越过 lease TTL。
+	mr.FastForward(testLeaseTTL + time.Second)
+	s.mustGone(t, ctx, keyLive(sid))
+	s.mustGone(t, ctx, keyDraft(rid))
+	s.mustGone(t, ctx, keyRunlive(rid))
+
+	// 闸随租约自开：同 session 再抢成功。
+	r2 := RunID("r_2")
+	ok, err := s.AcquireRun(ctx, sid, r2, Row{RunID: r2, Role: "user", MessageID: "m_2", Text: "again"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("出生窗口死亡后闸应随租约自开，同 session 应能重新抢闸")
 	}
 }
 

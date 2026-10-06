@@ -14,8 +14,8 @@ import (
 // 它不是正确性参数，只是回收参数：`done` 与 `gone` 收敛到同一条收口路径（planning §5 第 4 条）。
 const runliveTTL = 300 * time.Second
 
-// 闸租约（A7）：抢闸时给 tk:live 设 leaseTTL 短租约，worker watchdog 每 leaseRenew 续回；进程死亡后没人续 →
-// live/draft/runlive 三键到点同生同灭、会话自动解锁。二者同为回收参数：30s/5s = 连续 6 次续约全失败才误放。
+// 闸租约（A7/A7-2）：抢闸时给 tk:live + tk:draft + tk:runlive 三键同设 leaseTTL 短租约，worker watchdog 每 leaseRenew 续回；进程死亡后没人续 →
+// 三键到点同生同灭、会话自动解锁。二者同为回收参数：30s/5s = 连续 6 次续约全失败才误放。
 const (
 	defaultLeaseTTL   = 30 * time.Second
 	defaultLeaseRenew = 5 * time.Second
