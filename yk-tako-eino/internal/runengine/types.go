@@ -6,7 +6,7 @@ package runengine
 type SessionID string
 type RunID string
 
-// Row 是 runlog 里的一条定稿记录（doc/19 §3）。
+// Row 是 runlog 里的一条定稿记录（19v6-01 §3）。
 // RunlogOffset 不落存储、读时按 index+1 注入（omitempty 保证存储形态不含它）。
 type Row struct {
 	RunlogOffset int    `json:"runlogOffset,omitempty"`
@@ -16,7 +16,7 @@ type Row struct {
 	Text         string `json:"text"`
 }
 
-// Frame 是 runlive 里的一帧（doc/19 §2）。EventOffset 同理，读时注入。
+// Frame 是 runlive 里的一帧（19v6-01 §2）。EventOffset 同理，读时注入。
 type Frame struct {
 	EventOffset int    `json:"eventOffset,omitempty"`
 	Kind        string `json:"kind"`
@@ -25,9 +25,13 @@ type Frame struct {
 	Status      string `json:"status,omitempty"`
 }
 
-// ModelMessage 是 model_history 里的一条模型侧消息（doc/19 §7 真源划分：
+// ModelMessage 是 model_history 里的一条模型侧消息（19v6-03「真源划分」：
 // runlog 记「产出了什么」，model_history 记「模型现在该看到什么」）。
+// RunID/Seq 是 C 系列（compact）加的行内坐标：分组按 RunID、seq=0 识别摘要行、
+// 挂点唯一性靠 (RunID, Seq)。内部类型，不进任何 API 契约面。
 type ModelMessage struct {
-	Role string `json:"role"`
-	Text string `json:"text"`
+	RunID RunID  `json:"runId"`
+	Seq   int    `json:"seq"`
+	Role  string `json:"role"`
+	Text  string `json:"text"`
 }
