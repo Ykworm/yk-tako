@@ -19,16 +19,17 @@ export type Bubble = {
 }
 
 // 一条待投投递 = 已渲染的 user 气泡 + 它那条 assistant 气泡 + 请求前就定下的 messageId
-// （doc/19 §1 情形 3：重发不换 id）。
+// （19v6-01 §1 情形 3：重发不换 id）。
 type Pending = { messageId: string; text: string; assistant: Bubble }
 
 const LS_SESSION = 'tako.sessionId'
 const POLL_MS = 400
 // 冗余信号核对节奏：每 STATUS_EVERY 拍 frames 顺带查一次 session（≈2s 一次 GET）。
-// 闸释放与 terminal 压入是同一笔原子写（doc/19 §7），所以「闸已空」必然意味着「terminal 已在」，
-// 这一拍只会让收口提前，不会误收。
+// 放闸与定稿是同一笔 PG 事务（19v6-03 D1：UPDATE runs 落终态 + assistant 行入 runlog），
+// 所以「闸已空」必然意味着「runlog 已定稿」；terminal 帧是 commit 后的 Redis 半、可能比闸晚到，
+// 收口本就以 log 为准，这一拍只会让收口提前，不会误收。
 const STATUS_EVERY = 5
-// 窗口化初始游标 = max(0, 高水位 - HISTORY_WINDOW)（doc/19 §3：初始值不是 0；窗口大小客户端定）。
+// 窗口化初始游标 = max(0, 高水位 - HISTORY_WINDOW)（19v6-01 §3：初始值不是 0；窗口大小客户端定）。
 // 10 = 刷新后先见最近五轮，更早的上滚翻页拿（U5）。
 const HISTORY_WINDOW = 10
 const PAGE = 10
@@ -42,12 +43,16 @@ export function useChat() {
   const loadingOlder = ref(false)
   const atStart = ref(true)
 
-  // 对齐游标：只在拉 log 时前进（doc/19 §5 不变量）。翻页游标是 loadOlder 里的临时值，不碰它。
+  // 对齐游标：只在拉 log 时前进（19v6-02 不变量）。翻页游标是 loadOlder 里的临时值，不碰它。
   let runlogOffset = 0
-  // 已渲染最老一行的 offset；0 = 还没渲染任何历史。
+  // 已渲染最老一行的 offset（含本 tab 乐观渲染的气泡所对应的行）；0 = 还没渲染任何历史。
   let oldestOffset = 0
   let pollToken = 0
   let pumping = false
+  // 本 tab 投递时乐观渲染过的 user 行（气泡当场就有）的 messageId 集合。收口补渲染（drainLog）
+  // 拉到的 log 行里，靠它认出自己的 user 行跳过，免得画两遍；messageId 是投递前就定好、
+  // 服务端原样回写的那个（19v6-01 §1）。
+  const renderedMessageIds = new Set<string>()
 
   function push(b: Bubble): Bubble {
     bubbles.value.push(b)
@@ -64,13 +69,14 @@ export function useChat() {
     if (!text) return
     draft.value = ''
     const messageId = newMessageId()
+    renderedMessageIds.add(messageId)
     push({ key: `${messageId}:user`, runId: null, role: 'user', text, state: 'done' })
     const assistant = push({ key: `${messageId}:assistant`, runId: null, role: 'assistant', text: '', state: 'queued' })
     pending.value.push({ messageId, text, assistant })
     void pump()
   }
 
-  // 队列泵（doc/19 §1「409 = 客户端本地排队、本轮收口后补投」）：本 tab 有 run 在跑、
+  // 队列泵（19v6-01 §1「409 = 客户端本地排队、本轮收口后补投」）：本 tab 有 run 在跑、
   // 或闸被别的 tab 占着，都退避重查而不是把消息判死。
   async function pump() {
     if (pumping) return
@@ -99,7 +105,7 @@ export function useChat() {
     atStart.value = true
   }
 
-  // gateIdle：闸空 = 会话没有活 run（doc/19 §4）。404 = 本地 sid 已被 reset 清成僵尸，
+  // gateIdle：闸空 = 会话没有活 run（19v6-01 §4）。404 = 本地 sid 已被 reset 清成僵尸，
   // 它必然不占闸——丢掉本地值连同游标，这一条改走懒建；其余查不到一律算「不空」，宁可下一拍再试。
   async function gateIdle(): Promise<boolean> {
     const sid = sessionId.value
@@ -129,7 +135,7 @@ export function useChat() {
       await pollFrames(resp.runId, assistant, 0, token)
     } catch (e) {
       if (isBusy(e)) {
-        // 别的客户端抢到了闸：什么都不写（doc/19 §1），所以原样回队首等补投，不是投递失败。
+        // 别的客户端抢到了闸：什么都不写（19v6-01 §1），所以原样回队首等补投，不是投递失败。
         // 但「新对话」之后的补投属于另一个会话，不能把它塞回队列（幽灵消息）。
         assistant.state = 'queued'
         if (token === pollToken) pending.value.unshift(p)
@@ -142,7 +148,7 @@ export function useChat() {
     }
   }
 
-  // 僵尸 sessionId 自愈：本地存的 sid 被 dev reset / 空重启清走之后，带它投递只会在 §1 的准入
+  // 僵尸 sessionId 自愈：本地存的 sid 被 dev reset / 空重启清走之后，带它投递只会在 19v6-01 §1 的准入
   // 检查上稳定 404（「带 = 只认登记过的，不隐式创建」）。客户端的补救是认它不存在——
   // 丢掉本地值、不带 sid 重投一次走懒建。只重投这一次，不把 500 之类拖进循环。
   async function postWithFreshSession(p: Pending) {
@@ -158,8 +164,8 @@ export function useChat() {
     }
   }
 
-  // doc/19 §2：delta 按 eventOffset 顺序追加，本地游标 = nextOffset。
-  // terminal 帧 / status:gone / liveRunId 易主，三者任一即停轮询并收口（§5 第 4 步），不押注单一信号。
+  // 19v6-01 §2：delta 按 eventOffset 顺序追加，本地游标 = nextOffset。
+  // terminal 帧 / status:gone / liveRunId 易主，三者任一即停轮询并收口（19v6-02 第 4 步），不押注单一信号。
   async function pollFrames(runId: RunID, assistant: Bubble, eventOffset: number, token: number) {
     let ticks = 0
     for (;;) {
@@ -193,7 +199,7 @@ export function useChat() {
     }
   }
 
-  // runSettled：doc/19 §4 的 `liveRunId` 变空或易主 = 那场 run 已结束（terminal 与放闸同笔写入）。
+  // runSettled：19v6-01 §4 的 `liveRunId` 变空或易主 = 那场 run 已结束（放闸与定稿同笔 PG 事务写入，19v6-03）。
   // 查询失败算「未结束」——收口时机由 frames 自己的错误分支负责，不在这里猜。
   async function runSettled(runId: RunID, token: number): Promise<boolean> {
     const sid = sessionId.value
@@ -213,14 +219,15 @@ export function useChat() {
     }
   }
 
-  // 收口（doc/19 概念表「收口」）：定稿后权威内容以 runlog 为准，按 run 整条替换半截气泡。
+  // 收口（doc/19-v6 index 概念表「收口」）：定稿后权威内容以 runlog 为准，按 run 整条替换半截气泡；
+  // 拉 log 经过的别人的定稿行顺带补渲染（drainLog）。
   // error 终态不进 runlog（新 A6 已裁）——不拉 log，气泡转错误态。
   async function closeOut(runId: RunID, assistant: Bubble, terminalStatus: string | null) {
     if (terminalStatus === 'error') {
       assistant.state = 'error'
       return
     }
-    const row = await fetchAssistantRow(runId)
+    const row = await drainLog(runId, assistant)
     if (row) {
       assistant.text = row.text
       assistant.state = 'done'
@@ -231,22 +238,39 @@ export function useChat() {
     }
   }
 
-  // 从对齐游标续拉 log 直到追平（空批 = 追平），只找该 run 的 assistant 行、不渲染
-  // （本 tab 的 user 气泡是投递时乐观渲染的，再渲染就重复）。
-  async function fetchAssistantRow(runId: RunID): Promise<Row | null> {
+  // 从对齐游标续拉 log 直到追平（空批 = 追平），这正是 19v6-02 第 4 步的「回第 2 步拉一次 log」：
+  // 游标经过的**别人的**定稿行不能白过——不是本 tab 的就当场补渲染（多 tab/他端投递的整轮
+  // 借此进列表）；本 tab 乐观渲染过的 user 行按 messageId 认出跳过（气泡早就在）；本次要替换的
+  // 那条 assistant 行只记下、不渲染，交给 closeOut 整条替换半截气泡。
+  async function drainLog(runId: RunID, assistant: Bubble): Promise<Row | null> {
     const sid = sessionId.value
     if (!sid) return null
+    let hit: Row | null = null
+    let ownUserOffset = 0
+    const foreign: Row[] = []
     for (;;) {
       const resp = await getLog(sid, runlogOffset)
-      const hit = resp.rows.find((r) => r.role === 'assistant' && r.runId === runId) ?? null
+      for (const r of resp.rows) {
+        if (r.role === 'assistant' && r.runId === runId) {
+          hit = r
+        } else if (r.role === 'user' && r.messageId && renderedMessageIds.has(r.messageId)) {
+          // 自己的 user 行：气泡早渲染过，但「最老已渲染」的记账仍要含它——否则 atStart 撒谎，
+          // 翻页会把这两行当没渲染过的再拉一遍、画成两份。
+          ownUserOffset = r.runlogOffset ?? 0
+          noteRendered(r)
+        } else {
+          foreign.push(r)
+        }
+      }
       const advanced = resp.nextOffset > runlogOffset
       runlogOffset = resp.nextOffset
-      if (hit) return hit
-      if (!advanced) return null
+      if (!advanced) break
     }
+    renderForeign(foreign, assistant, ownUserOffset)
+    return hit
   }
 
-  // reconcile（doc/19 §5 四步）：查状态 → 窗口化补历史 → 有活 run 则 frames(0) 重建半截气泡。
+  // reconcile（19v6-02 四步）：查状态 → 窗口化补历史 → 有活 run 则 frames(0) 重建半截气泡。
   async function reconcile() {
     const sid = localStorage.getItem(LS_SESSION) as SessionID | null
     if (!sid) return
@@ -275,17 +299,36 @@ export function useChat() {
     }
   }
 
-  function appendRows(rows: Row[]) {
-    for (const r of rows) {
-      push({ key: `log:${r.runlogOffset}`, runId: r.runId, role: r.role, text: r.text, state: 'done' })
-      const off = r.runlogOffset ?? 0
-      if (off > 0 && (oldestOffset === 0 || off < oldestOffset)) oldestOffset = off
-    }
+  // 一条 log 行 → 气泡，并记账「最老已渲染 offset」（loadOlder 的翻页基准）。
+  function rowBubble(r: Row): Bubble {
+    noteRendered(r)
+    return { key: `log:${r.runlogOffset}`, runId: r.runId, role: r.role, text: r.text, state: 'done' }
+  }
+
+  function noteRendered(r: Row) {
+    const off = r.runlogOffset ?? 0
+    if (off > 0 && (oldestOffset === 0 || off < oldestOffset)) oldestOffset = off
     atStart.value = oldestOffset <= 1
   }
 
-  // 翻页：临时游标只用于这一次请求，拉完 prepend，**不回退对齐游标**（doc/19「两种游标别混」）。
-  // 批被 W 截断时按 nextOffset 续拉补齐（doc/19 §3：「客户端从它继续拉即补齐」）。
+  // 别人的定稿行按日志顺序落位：早于本 tab 本轮 user 行的插到本轮那对气泡之前——与刷新后
+  // reconcile 重放出的全量顺序一致，不让「刚补上的整轮」排在自己新消息后面；晚于它的
+  // （收口检测与拉 log 之间别人的投递，竞态窗口）紧跟本轮气泡之后、排队气泡之前。
+  function renderForeign(rows: Row[], assistant: Bubble, ownUserOffset: number) {
+    for (const r of rows) {
+      const idx = bubbles.value.indexOf(assistant)
+      if (idx < 0) return // 列表已被 newSession 清空，整批作废
+      const before = ownUserOffset > 0 && (r.runlogOffset ?? 0) < ownUserOffset
+      bubbles.value.splice(Math.max(0, before ? idx - 1 : idx + 1), 0, rowBubble(r))
+    }
+  }
+
+  function appendRows(rows: Row[]) {
+    for (const r of rows) push(rowBubble(r))
+  }
+
+  // 翻页：临时游标只用于这一次请求，拉完 prepend，**不回退对齐游标**（19v6-02「两种游标别混」）。
+  // 批被 W 截断时按 nextOffset 续拉补齐（19v6-01 §3：「客户端从它继续拉即补齐」）。
   async function loadOlder() {
     const sid = sessionId.value
     if (!sid || loadingOlder.value || atStart.value) return
@@ -324,12 +367,13 @@ export function useChat() {
     bubbles.value = []
     draft.value = ''
     busy.value = false
+    renderedMessageIds.clear()
   }
 
   return { sessionId, bubbles, draft, busy, pending, loadingOlder, atStart, send, reconcile, loadOlder, newSession }
 }
 
-// 409 = 闸被占（doc/19 §1），处置是排队；404 session_not_found = 本地 sid 已成僵尸，处置是懒建重投。
+// 409 = 闸被占（19v6-01 §1），处置是排队；404 session_not_found = 本地 sid 已成僵尸，处置是懒建重投。
 // 只认 error 码不认 HTTP 状态：500 与 404 都可能是别的原因。
 function isBusy(e: unknown): boolean {
   return e instanceof ApiError && e.body?.error === 'session_busy'
