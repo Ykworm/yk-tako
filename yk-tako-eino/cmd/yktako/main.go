@@ -59,6 +59,7 @@ func main() {
 	leaseTTL := flag.Duration("lease-ttl", durationEnv("TAKO_LEASE_TTL", defaultLeaseTTL), "gate lease TTL; watchdog keeps renewing it during generation (env TAKO_LEASE_TTL)")
 	leaseRenew := flag.Duration("lease-renew", durationEnv("TAKO_LEASE_RENEW", defaultLeaseRenew), "watchdog renew interval (must be < lease-ttl; env TAKO_LEASE_RENEW)")
 	compactWindow := flag.Int("compact-window", defaultCompactWindow, "context window in tokens for compaction; limit = window * 4/5; 0 disables")
+	agentsDir := flag.String("agents-dir", "agents", "directory of sub-agent specs (*.md + YAML frontmatter); scanned at each run start (relative to CWD)")
 	flag.Parse()
 
 	// 必须 leaseRenew 严格小于 leaseTTL：
@@ -94,7 +95,8 @@ func main() {
 		}
 	}
 	// agent 装配（T1）失败也是启动错误：装配不出来 = 主循环跑不了，fail fast 一贯式。
-	worker, err := runengine.NewWorker(store, opened.Chat, runengine.TranslatorFor(string(opened.Protocol)), config.SystemPrompt(), *leaseRenew, *compactWindow, counter)
+	// T3：agentsDir 只是规格目录位置（装载是 run 起手扫盘、失败降级为 log）——目录不存在不算启动错误。
+	worker, err := runengine.NewWorker(store, opened.Chat, runengine.TranslatorFor(string(opened.Protocol)), config.SystemPrompt(), *agentsDir, *leaseRenew, *compactWindow, counter)
 	if err != nil {
 		log.Fatalf("agent 装配: %v", err)
 	}

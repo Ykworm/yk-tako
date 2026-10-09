@@ -13,6 +13,10 @@
 // T2 的工具环（帧契约见 19v6-01 §2）：流式模型事件排干后拿到合并全文（ConcatMessages），
 // 其中 ToolCalls 逐条压 tool_call 帧；非流式 Role=Tool 事件 = 工具结果（ADK 的 typedToolInvokeEvent），
 // 压一条 tool_result 帧。两类事件同时进 turn（EndRun 落 mh 行 + runlog 扩展行）。
+//
+// T3 的帧路由：事件按 event.AgentName 归属——"" = root（主线程直走 agent.Run、不过 flowAgent 指名），
+// 非空 = 子代理（AgentTool 内转发事件，经内层 flowAgent 着名、EmitInternalEvents 打开才到场）。
+// 帧上带 Agent；子代理的 delta 走 AppendFrame（不写 draft——draft 只装 root），turn 只收 root 条目。
 package runengine
 
 import (
@@ -106,7 +110,11 @@ type Worker struct {
 // 模型输入 = 它打头的 system 消息 + 历史）；leaseRenew 是 watchdog 续约间隔（dev 10s）；
 // compactWindow > 0 时**必须**给 counter（main 用 NewCl100kCounter 装配）——窗口开着却没有计数器是装配错误，
 // 不静默降级成「不压缩」。agent 装配失败 = 启动错误，调用方 fail fast（同 config/Redis/PG 一贯式）。
-func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, system string, leaseRenew time.Duration,
+//
+// T3：agentsDir 是子代理规格目录——装载 handler 在每 run 起手扫盘（挂 Handlers 首位），
+// 装配出的委派工具经 runCtx.Tools 进模型声明面；EmitInternalEvents 打开 AgentTool 的内转发
+// （子代理事件由此汇进本 worker 消费的事件流）。
+func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, system, agentsDir string, leaseRenew time.Duration,
 	compactWindow int, counter TokenCounter) (*Worker, error) {
 	getTime, err := newGetTimeTool()
 	if err != nil {
@@ -120,8 +128,9 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 			ToolsNodeConfig: compose.ToolsNodeConfig{
 				Tools: []tool.BaseTool{getTime},
 			},
+			EmitInternalEvents: true,
 		},
-		Handlers: []adk.ChatModelAgentMiddleware{NewAgentLogHandler()},
+		Handlers: []adk.ChatModelAgentMiddleware{newAgentSpecHandler(agentsDir, chat), NewAgentLogHandler()},
 	})
 	if err != nil {
 		return nil, err
@@ -193,6 +202,7 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 			continue
 		}
 		mo := event.Output.MessageOutput
+		agent := event.AgentName // T3 路由："" = root / 非空 = 子代理（转发事件）
 		if !mo.IsStreaming {
 			// 非流式事件 = 工具结果（ADK typedToolInvokeEvent：Message 已成形、Role=Tool）。一次调用一条
 			// tool_result 帧（非流式，19v6-01 §2）；同时进 turn（mh tool 行 + runlog 扩展行）。
@@ -205,8 +215,10 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 						name = mo.Message.ToolName
 					}
 				}
-				turn = append(turn, TurnEntry{Role: "tool", Text: out, ToolCallID: callID, ToolName: name})
-				live, err := w.store.AppendFrame(ctx, runID, Frame{Kind: "tool_result", Name: name, Output: out})
+				if agent == "" { // turn 只收 root 条目（T3-1 中间态；T3-2 补子代理记录）
+					turn = append(turn, TurnEntry{Role: "tool", Text: out, ToolCallID: callID, ToolName: name})
+				}
+				live, err := w.store.AppendFrame(ctx, runID, Frame{Kind: "tool_result", Agent: agent, Name: name, Output: out})
 				if err != nil {
 					log.Printf("frame %s/%s: %v", sessionID, runID, err)
 					status = "error"
@@ -218,7 +230,7 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 			}
 			continue
 		}
-		merged, live, err := w.drain(ctx, runID, mo.MessageStream)
+		merged, live, err := w.drain(ctx, runID, agent, mo.MessageStream)
 		if err != nil {
 			log.Printf("stream %s/%s: %v", sessionID, runID, err)
 			status = "error"
@@ -229,10 +241,12 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 			// defer 的 EndRun 拿不到闸自然空转。
 			return
 		}
-		// 本轮合并全文进 turn（assistant 轮）；ToolCalls 逐条压 tool_call 帧，args 取模型原始 JSON 原文。
-		turn = append(turn, TurnEntry{Role: "assistant", Text: merged.Content, ToolCalls: merged.ToolCalls})
+		// 本轮合并全文进 turn（assistant 轮，仅 root）；ToolCalls 逐条压 tool_call 帧，args 取模型原始 JSON 原文。
+		if agent == "" {
+			turn = append(turn, TurnEntry{Role: "assistant", Text: merged.Content, ToolCalls: merged.ToolCalls})
+		}
 		for _, tc := range merged.ToolCalls {
-			live, err := w.store.AppendFrame(ctx, runID, Frame{Kind: "tool_call", Name: tc.Function.Name, Args: tc.Function.Arguments})
+			live, err := w.store.AppendFrame(ctx, runID, Frame{Kind: "tool_call", Agent: agent, Name: tc.Function.Name, Args: tc.Function.Arguments})
 			if err != nil {
 				log.Printf("frame %s/%s: %v", sessionID, runID, err)
 				status = "error"
@@ -245,11 +259,13 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 	}
 }
 
-// drain 排干一条模型输出流：chunk → Translator → AppendDelta；EOF 时把全部 chunk 合并成完整消息返回
+// drain 排干一条模型输出流：chunk → Translator → delta 帧；EOF 时把全部 chunk 合并成完整消息返回
 // （T2：merged.ToolCalls 是 tool_call 帧的来源、merged.Content 是本轮 assistant 行）。
+// T3：agent = "" 走 AppendDelta（root——draft 的唯一写入方）；子代理文本走 AppendFrame
+// （delta 帧带 agent，**不 APPEND draft**——收口锚「Σ root delta」不被子代理文本污染）。
 // 返回 live=false = run 已判死（该收摊，不是错误）；err != nil = 错误结局。
 // close 责任也在本函数：事件流的另一副本由 agent 内部排干，早退不关会把两边一起吊住。
-func (w *Worker) drain(ctx context.Context, runID RunID, stream *schema.StreamReader[*schema.Message]) (*schema.Message, bool, error) {
+func (w *Worker) drain(ctx context.Context, runID RunID, agent string, stream *schema.StreamReader[*schema.Message]) (*schema.Message, bool, error) {
 	defer stream.Close()
 	var chunks []*schema.Message
 	for {
@@ -267,7 +283,12 @@ func (w *Worker) drain(ctx context.Context, runID RunID, stream *schema.StreamRe
 		}
 		chunks = append(chunks, chunk)
 		if text, ok := w.translate(chunk); ok {
-			_, live, err := w.store.AppendDelta(ctx, runID, text)
+			var live bool
+			if agent == "" {
+				_, live, err = w.store.AppendDelta(ctx, runID, text)
+			} else {
+				live, err = w.store.AppendFrame(ctx, runID, Frame{Kind: "delta", Agent: agent, Text: text})
+			}
 			if err != nil {
 				return nil, false, err
 			}
