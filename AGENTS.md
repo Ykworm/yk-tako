@@ -87,8 +87,19 @@ v1/v2 方案文档与旧实现（run 级协议、409 表示「会话忙」、旧
 - 启动：`go run ./cmd/yktako -engine 127.0.0.1:<port>`（旧 `-web` 单页前端只在 backup 里，v6 验收不用）。
 - **端口被占时先 `lsof` 查是谁**，可能是用户自己留着的实例——换一个端口验收，不要杀别人的进程。
 
+## 参考实现
+
+`/Users/yuweikang/dev/ykcode/ref-agent/` 下是**可供参考的项目**（pi / WeKnora / Octop / deepseek-harness /
+codex / hermes-agent / eino-examples / claude-agent-sdk-python）；Octop 的 agent 核心 **harness-agent**
+的源码快照在 `/Users/yuweikang/dev/ykcode/harness-pkg/`（不在 ref-agent 里）。
+讨论「参考谁 / 抄什么 / 惯例出处」先查这两处；借鉴纪律见 doc/16 §1——区分「当前态 vs 演进方向」，
+抄「问题本质」不抄「历史包袱」。
+
 ## 记忆
 
-项目级记忆在 `~/.qoder-cn/projects/-Users-yuweikang-dev-ykcode-learn-yk-tako/memory/`，
-用户级在 `~/.qoder-cn/memory/`。承重论断先验前提：**文档注释、记忆、印象、已废代码都不是证据**，
+指 **Qoder 的 auto memory**，落盘在 `~/.qoder-cn/` 下：项目级记忆在
+`~/.qoder-cn/projects/-Users-yuweikang-dev-ykcode-learn-yk-tako/memory/`，用户级在 `~/.qoder-cn/memory/`。
+其他 IDE / coding agent 各有自己的记忆机制，两边互不读写——不要把别家的记忆目录、记忆文件当成本项目的记忆，也不要把这里的约定推广到别家工具上。
+
+承重论断先验前提：**文档注释、记忆、印象、已废代码都不是证据**，
 证据只有代码、配置和用户的原话。被纠正后除了改文档，还要回头改记忆。
