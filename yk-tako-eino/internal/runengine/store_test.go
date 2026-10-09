@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudwego/eino/schema"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -305,7 +306,9 @@ func TestEndRunCompleteFinalizes(t *testing.T) {
 	s.mustDelta(t, ctx, rid, "Hello, ")
 	s.mustDelta(t, ctx, rid, "world")
 
-	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "complete", nil)
+	// T2 起 mh 的 assistant 半来自 worker 累积的 turn（不再由 EndRun 从 draft 合成）：测试给合成 turn 走同一路。
+	turn := []TurnEntry{{Role: "assistant", Text: "Hello, world"}}
+	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, turn)
 	if err != nil || !ok {
 		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
 	}
@@ -352,7 +355,7 @@ func TestReadFramesGoneAfterTTL(t *testing.T) {
 	s := newTestStore(t, testLease, 2*time.Second)
 	sid, rid := SessionID("s_1"), RunID("r_1")
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
-	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil); err != nil || !ok {
 		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
 	}
 
@@ -383,8 +386,9 @@ func TestReadFramesGoneAfterTTL(t *testing.T) {
 	}
 }
 
-// 6. 落盘原文：runlive 的帧 JSON 不含 offset（读时按 index+1 注入，写侧无计数器、多副本并发不重号）；
-// PG 侧钉行形状——assistant 行 message_id 为 NULL（契约：assistant 无此字段）、user 行带 m_1。
+// 6. 落盘原文：runlive 的帧 JSON 不含 offset（读时按 index+1 注入，写侧无计数器、多副本并发不重号），
+// 且恒带 agent（T2，空 = root）；PG 侧钉行形状——assistant 行 message_id 为 NULL（契约：assistant 无此字段）、
+// user 行带 m_1、agent/payload 缺省为 NULL。
 // 逐字节钉存储形态顺带钉字段序（读出来的字节要被客户端按名取）；重头判据在 curl baseline（A4-1 重跑）。
 func TestStoredShapeCarriesNoOffset(t *testing.T) {
 	ctx := context.Background()
@@ -392,14 +396,14 @@ func TestStoredShapeCarriesNoOffset(t *testing.T) {
 	sid, rid := SessionID("s_1"), RunID("r_1")
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 	s.mustDelta(t, ctx, rid, "world")
-	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil); err != nil || !ok {
 		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
 	}
 
 	wantFrames := []string{
-		`{"kind":"start","messageId":"m_1"}`,
-		`{"kind":"delta","text":"world"}`,
-		`{"kind":"terminal","status":"complete"}`,
+		`{"kind":"start","agent":"","messageId":"m_1"}`,
+		`{"kind":"delta","agent":"","text":"world"}`,
+		`{"kind":"terminal","agent":"","status":"complete"}`,
 	}
 	for i, want := range wantFrames {
 		if got := s.lindex(t, ctx, keyRunlive(rid), i); got != want {
@@ -412,6 +416,10 @@ func TestStoredShapeCarriesNoOffset(t *testing.T) {
 	}
 	if !s.sqlBool(t, `SELECT message_id = 'm_1' FROM runlog_entries WHERE run_id = ? AND role = 'user'`, rid) {
 		t.Error("runlog user 行的 message_id 应为 m_1")
+	}
+	// T2 两列同理走「缺省即 NULL」约定（读侧归一到 "" 对外）：本拍 agent 恒空、payload 只有扩展行有。
+	if !s.sqlBool(t, `SELECT bool_and(agent IS NULL AND payload IS NULL) FROM runlog_entries WHERE run_id = ?`, rid) {
+		t.Error("user/assistant 行 agent/payload 应为 NULL（缺省不写字面空串）")
 	}
 }
 
@@ -426,7 +434,7 @@ func TestBatchWindowCapsBothEndpoints(t *testing.T) {
 	for _, rid := range []RunID{"r_1", "r_2"} {
 		s.mustAcquire(t, sid, rid, "m_u", "q")
 		s.mustDelta(t, ctx, rid, "a")
-		if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil); err != nil || !ok {
+		if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil); err != nil || !ok {
 			t.Fatalf("EndRun %s: ok=%v err=%v", rid, ok, err)
 		}
 	}
@@ -466,7 +474,7 @@ func TestBatchWindowCapsBothEndpoints(t *testing.T) {
 	// 同一条规则也管 runlive：start+2 delta+terminal = 4 帧，W=1 时每批一帧。
 	s.mustDelta(t, ctx, rid3, "d1")
 	s.mustDelta(t, ctx, rid3, "d2")
-	if _, _, ok, err := s.EndRun(ctx, sid, rid3, "complete", nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid3, "complete", nil, nil); err != nil || !ok {
 		t.Fatalf("EndRun %s: ok=%v err=%v", rid3, ok, err)
 	}
 	for _, c := range []struct {
@@ -496,12 +504,12 @@ func TestEndRunAfterGateLostIsNoop(t *testing.T) {
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 	s.mustDelta(t, ctx, rid, "world")
 
-	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil); err != nil || !ok {
 		t.Fatalf("首次 EndRun: ok=%v err=%v", ok, err)
 	}
 	before := s.count(t, &RunlogEntry{}, "session_id = ?", sid)
 
-	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "complete", nil)
+	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -777,7 +785,7 @@ func TestEndRunRefusesExpiredGate(t *testing.T) {
 		return n == 0 && s.sqlBool(t, `SELECT lease_until < now() FROM runs WHERE id = ?`, rid)
 	})
 
-	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "complete", nil)
+	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -804,7 +812,7 @@ func TestEndRunErrorKeepsLogUntouched(t *testing.T) {
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 	s.mustDelta(t, ctx, rid, "partial...")
 
-	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "error", nil)
+	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "error", nil, nil)
 	if err != nil || !ok {
 		t.Fatalf("EndRun(error): ok=%v err=%v", ok, err)
 	}
@@ -830,5 +838,86 @@ func TestEndRunErrorKeepsLogUntouched(t *testing.T) {
 	}
 	if len(last) != 1 || last[0].Kind != "terminal" || last[0].Status != "error" {
 		t.Errorf("末帧 = %+v, want {kind:terminal status:error}", last)
+	}
+}
+
+// 17. T2 的 turn 落库（tool loop 的存储级证据）：assistant 轮（带 tool_calls）→ tool 轮 → assistant 终轮——
+// mh 逐轮落（seq 2/3/4；tool_calls/tool_call_id 两列按 OpenAI 工具协议回填，ModelMessages 原样读回 =
+// prepareInput 回放链的实证），runlog 落 tool_call/tool_result 扩展行（text 可展示、payload 结构化）+ 终稿行。
+func TestEndRunLandsTurnRows(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid, rid := SessionID("s_1"), RunID("r_1")
+	s.mustAcquire(t, sid, rid, "m_1", "现在几点")
+	s.mustDelta(t, ctx, rid, "我查一下")
+	s.mustDelta(t, ctx, rid, "，现在是 15:04")
+
+	call := schema.ToolCall{ID: "call_1", Type: "function",
+		Function: schema.FunctionCall{Name: "get_time", Arguments: `{"timezone":"Asia/Shanghai"}`}}
+	turn := []TurnEntry{
+		{Role: "assistant", Text: "我查一下", ToolCalls: []schema.ToolCall{call}},
+		{Role: "tool", Text: "2026-10-08 15:04:05 +0800 CST", ToolCallID: "call_1", ToolName: "get_time"},
+		{Role: "assistant", Text: "，现在是 15:04"},
+	}
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, turn); err != nil || !ok {
+		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
+	}
+
+	// mh：4 行（user + 3 轮）；tool_calls 的 args 原样（模型原始 JSON 字串，不重编码）。
+	mh, err := s.ModelMessages(ctx, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mh) != 4 {
+		t.Fatalf("mh 行数 = %d, want 4", len(mh))
+	}
+	if mh[1].Role != "assistant" || len(mh[1].ToolCalls) != 1 ||
+		mh[1].ToolCalls[0].ID != "call_1" || mh[1].ToolCalls[0].Function.Name != "get_time" ||
+		mh[1].ToolCalls[0].Function.Arguments != `{"timezone":"Asia/Shanghai"}` {
+		t.Errorf("mh[1] = %+v, want assistant + get_time 调用（args 原样）", mh[1])
+	}
+	if mh[2].Role != "tool" || mh[2].ToolCallID != "call_1" || mh[2].Text != "2026-10-08 15:04:05 +0800 CST" {
+		t.Errorf("mh[2] = %+v, want tool + 回指 call_1", mh[2])
+	}
+	if mh[3].Role != "assistant" || mh[3].Text != "，现在是 15:04" {
+		t.Errorf("mh[3] = %+v, want 终轮 assistant 本体", mh[3])
+	}
+	// 两列「缺席即 NULL」（存储形态级）：assistant 行无 tool_call_id、tool 行无 tool_calls、终轮两列皆空。
+	if !s.sqlBool(t, `SELECT (tool_calls IS NOT NULL AND tool_call_id IS NULL) FROM run_model_messages WHERE run_id = ? AND seq = 2`, rid) {
+		t.Error("seq2 assistant 行应为 tool_calls 非空 + tool_call_id NULL")
+	}
+	if !s.sqlBool(t, `SELECT (tool_calls IS NULL AND tool_call_id = 'call_1') FROM run_model_messages WHERE run_id = ? AND seq = 3`, rid) {
+		t.Error("seq3 tool 行应为 tool_calls NULL + tool_call_id 回指")
+	}
+	if !s.sqlBool(t, `SELECT (tool_calls IS NULL AND tool_call_id IS NULL) FROM run_model_messages WHERE run_id = ? AND seq = 4`, rid) {
+		t.Error("seq4 终轮 assistant 行两列皆 NULL（缺省不写字面空串）")
+	}
+
+	// runlog：user + tool_call + tool_result + assistant 四行；扩展行 payload 与帧字段一一对应。
+	rows, _, exists, err := s.ReadLog(ctx, sid, 0, 200)
+	if err != nil || !exists {
+		t.Fatalf("ReadLog: exists=%v err=%v", exists, err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("runlog 行数 = %d, want 4", len(rows))
+	}
+	if rows[1].Role != "tool_call" || rows[1].Text != `get_time({"timezone":"Asia/Shanghai"})` ||
+		rows[1].Payload != `{"name":"get_time","args":"{\"timezone\":\"Asia/Shanghai\"}"}` {
+		t.Errorf("rows[1] = %+v, want tool_call 扩展行（text 可展示 + payload 结构化）", rows[1])
+	}
+	if rows[2].Role != "tool_result" || rows[2].Text != "2026-10-08 15:04:05 +0800 CST" ||
+		rows[2].Payload != `{"name":"get_time","output":"2026-10-08 15:04:05 +0800 CST"}` {
+		t.Errorf("rows[2] = %+v, want tool_result 扩展行", rows[2])
+	}
+	if rows[3].Role != "assistant" || rows[3].Text != "我查一下，现在是 15:04" {
+		t.Errorf("rows[3] = %+v, want 终稿 = Σ delta", rows[3])
+	}
+	for i, r := range rows {
+		if r.Agent != "" {
+			t.Errorf("rows[%d].agent = %q, want \"\"（本拍恒空，读侧从 NULL 归一）", i, r.Agent)
+		}
+	}
+	if !s.sqlBool(t, `SELECT bool_and(agent IS NULL) FROM runlog_entries WHERE run_id = ? AND role IN ('tool_call','tool_result')`, rid) {
+		t.Error("扩展行 agent 应为 NULL（缺省不写字面空串）")
 	}
 }

@@ -13,8 +13,11 @@ package runengine
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
+	"fmt"
 	"time"
 
+	"github.com/cloudwego/eino/schema"
 	"github.com/oklog/ulid/v2"
 	"gorm.io/gorm"
 )
@@ -46,15 +49,25 @@ func (Run) TableName() string { return "runs" }
 // worker 组装模型输入的唯一读源（单表：WHERE session_id AND compacted=false ORDER BY run_id, seq）。
 // 表名即真源划分——模型侧投影，历史展示永不读它（只读 runlog）。
 // 主键 id（msg_<ULID>）供未来 tool_call/HITL 引用某条消息；与契约字段 messageId（客户端生成的 m_1）是两回事。
+// T2 加 tool_calls / tool_call_id 两列：重建 OpenAI 工具消息（assistant 带 calls、tool 带回指）。
+// 一次工具循环的 4 行样例（同一 run 内）：
+//
+//	Seq  Role       Text                                         ToolCalls                                                                                             ToolCallID  说明
+//	1    user       "现在几点？"                                  ""                                                                                                    ""          POST 投递
+//	2    assistant  ""                                           `[{"id":"call_abc","type":"function","function":{"name":"get_time","arguments":"{\"tz\":\"Asia/Shanghai\"}"}}]`  ""          模型返回工具调用，原生 JSON 不重编码
+//	3    tool       "2026-10-10T15:30:00+08:00"                 ""                                                                                                    "call_abc"  工具结果，tool_call_id 必须与上一行某条 id 字面完全相等（模型靠字符串关联，非行号）
+//	4    assistant  "现在是 15:30。"                              ""                                                                                                    ""          终稿正文
 type RunModelMessage struct {
-	ID        string    `gorm:"primaryKey"`
-	SessionID SessionID `gorm:"not null;index:run_model_messages_input,where:compacted = false"` // 冗余列：消息不跨 run/session 移动
-	RunID     RunID     `gorm:"not null;uniqueIndex:run_model_messages_run_seq,priority:1"`
-	Seq       int       `gorm:"not null;uniqueIndex:run_model_messages_run_seq,priority:2"` // run 内序号，从 1 起；0 = compact 摘要行
-	Role      string    `gorm:"not null"`                                                   // OpenAI 标准枚举：system/user/assistant/tool（本步只产生 user、assistant）
-	Text      string    `gorm:"not null"`
-	Compacted bool      `gorm:"not null"` // true = 被 compact 压掉的原文行：保留作审计，不进模型输入
-	CreatedAt time.Time `gorm:"not null"`
+	ID         string    `gorm:"primaryKey"`
+	SessionID  SessionID `gorm:"not null;index:run_model_messages_input,where:compacted = false"` // 冗余列：消息不跨 run/session 移动
+	RunID      RunID     `gorm:"not null;uniqueIndex:run_model_messages_run_seq,priority:1"`
+	Seq        int       `gorm:"not null;uniqueIndex:run_model_messages_run_seq,priority:2"` // run 内序号，从 1 起；0 = compact 摘要行
+	Role       string    `gorm:"not null"`                                                   // OpenAI 标准枚举：system/user/assistant/tool（本步产生 user/assistant/tool）
+	Text       string    `gorm:"not null"`
+	ToolCalls  string    // assistant 行：[]schema.ToolCall 的原生 JSON（Index 保留，回放/续轮原样）——可空
+	ToolCallID string    // tool 行：回指 assistant 行 tool_calls 里的 id——可空
+	Compacted  bool      `gorm:"not null"` // true = 被 compact 压掉的原文行：保留作审计，不进模型输入
+	CreatedAt  time.Time `gorm:"not null"`
 }
 
 func (RunModelMessage) TableName() string { return "run_model_messages" }
@@ -62,14 +75,18 @@ func (RunModelMessage) TableName() string { return "run_model_messages" }
 // RunlogEntry = `runlog_entries` 表：历史真源；seq 从 1 起连续——**seq 即 runlogOffset 的列形态**，
 // 契约词汇（runlogOffset/nextOffset）不变；列名避用 offset（PG 保留字）。
 // 只增不删：「seq N 恒指同一条消息」是客户端对齐游标只前进的地基。
+// T2 加 agent / payload 两列：agent 空 = root（T2 恒空，T3 起子代理行非空）；
+// payload 只有工具扩展行（role=tool_call/tool_result）有，存帧同款结构化负载的 JSON。
 type RunlogEntry struct {
 	ID        string    `gorm:"primaryKey"` // rl_<ULID>
 	SessionID SessionID `gorm:"not null;uniqueIndex:runlog_entries_session_seq,priority:1"`
 	Seq       int64     `gorm:"not null;uniqueIndex:runlog_entries_session_seq,priority:2"` // session 内序号 = runlogOffset
 	RunID     RunID     `gorm:"not null"`
-	Role      string    `gorm:"not null"` // 本步：user（POST 投递）/ assistant（纯回复正文）；扩展行随 HITL/tool loop
+	Role      string    `gorm:"not null"` // user / assistant / tool_call / tool_result（扩展行随 T2 工具循环）
+	Agent     string    // 产出该行的 agent 名；空 = root
 	MessageID string    // 仅 user 行（契约：assistant 行无此字段）——可空
 	Text      string    `gorm:"not null"`
+	Payload   string    // 工具扩展行的结构化 JSON（{"name","args"|"output"}）——可空
 	CreatedAt time.Time `gorm:"not null"`
 }
 
@@ -119,9 +136,10 @@ SELECT EXISTS (SELECT 1 FROM sessions WHERE id = ?),
 
 // ModelMessages 返回 session 的模型侧消息全序（worker 组装本次生成的输入）——单表、双列过滤，无 JOIN。
 // ORDER BY run_id, seq：run_id 是 ULID，字典序即 run 时序；seq 同理（0=摘要行排在本 run 最前）。
-// user 半在 AcquireRun 入、assistant 半在 EndRun(complete) 入——error 结局只留 user 那一半。
+// user 半在 AcquireRun 入、assistant/tool 半在 EndRun(complete) 逐轮入——error 结局只留 user 那一半。
 // run_id/seq 一并读出：compact 的分组与 seq=0 识别靠它（C 系列）；
 // 被压行（compacted=true）读不出来是**有意的**——「压掉」= 不回模型输入，只在库里留档。
+// T2：tool_calls 列在这里解成 []schema.ToolCall（坏 JSON = 硬错误，不静默吞——归一层写的，坏了就是坏了）。
 func (s *Store) ModelMessages(ctx context.Context, sessionID SessionID) ([]ModelMessage, error) {
 	var rows []RunModelMessage
 	if err := s.db.WithContext(ctx).
@@ -131,7 +149,16 @@ func (s *Store) ModelMessages(ctx context.Context, sessionID SessionID) ([]Model
 	}
 	out := make([]ModelMessage, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, ModelMessage{RunID: r.RunID, Seq: r.Seq, Role: r.Role, Text: r.Text})
+		var calls []schema.ToolCall
+		if r.ToolCalls != "" {
+			if err := json.Unmarshal([]byte(r.ToolCalls), &calls); err != nil {
+				return nil, fmt.Errorf("mh %s tool_calls: %w", r.ID, err)
+			}
+		}
+		out = append(out, ModelMessage{
+			RunID: r.RunID, Seq: r.Seq, Role: r.Role, Text: r.Text,
+			ToolCalls: calls, ToolCallID: r.ToolCallID,
+		})
 	}
 	return out, nil
 }
@@ -161,8 +188,10 @@ func (s *Store) ReadLog(ctx context.Context, sessionID SessionID, from, w int) (
 			RunlogOffset: int(e.Seq),
 			RunID:        e.RunID,
 			Role:         e.Role,
+			Agent:        e.Agent,
 			MessageID:    e.MessageID,
 			Text:         e.Text,
+			Payload:      e.Payload,
 		})
 		nextOffset = int(e.Seq)
 	}

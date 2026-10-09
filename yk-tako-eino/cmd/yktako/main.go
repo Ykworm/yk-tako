@@ -4,6 +4,8 @@ import (
 	"context"
 	"flag"
 	"log"
+	"os"
+	"strings"
 	"time"
 
 	"yk-tako-eino/internal/config"
@@ -17,10 +19,10 @@ const runliveTTL = 300 * time.Second
 // 闸租约（A7/A7-2；D1 落库后闸 = runs 活行）：抢闸的 INSERT 出生即带 lease_until（DB 时钟 now()+lease），
 // tk:draft / tk:runlive 两键同笔出生、同租约（A7-2 的 Redis 半边）；worker watchdog 每 leaseRenew 续回。
 // 进程死亡后没人续 → 活行按 lease 判死（读侧即回收、新 POST 清扫翻 error）、两键到点蒸发——同生同灭、会话自动解锁。
-// 二者同为回收参数：30s/5s = 连续 6 次续约全失败才误放。
+// 二者同为回收参数：30s/10s = 连续 3 次续约全失败才误放；默认值可被 .env 的 TAKO_LEASE_* 改（见 durationEnv）。
 const (
 	defaultLeaseTTL   = 30 * time.Second
-	defaultLeaseRenew = 5 * time.Second
+	defaultLeaseRenew = 10 * time.Second
 )
 
 // defaultPGDSN 指向 dev 的独立 PG 实例（dev.sh 自举的一半；双 fail fast：PG 不在引擎起不来）。
@@ -30,16 +32,44 @@ const defaultPGDSN = "host=127.0.0.1 port=5433 dbname=tako sslmode=disable"
 // 触发阈值 limit = window × 4/5（doc/12 §9）；0 = 关压缩（验收对照跑法）。
 const defaultCompactWindow = 256000
 
+// durationEnv 取 .env/进程环境里的时长变量（TAKO_LEASE_* 约定同 TAKO_MODEL；进程环境非空时 godotenv 不覆盖它），
+// 未设置回落 fallback；设置了但解析失败 = 启动即退（fail fast 一贯式，.env 手误不静默吞掉）。
+func durationEnv(key string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		log.Fatalf("%s=%q 不是合法时长（如 30s、10s）：%v", key, raw, err)
+	}
+	return d
+}
+
 func main() {
+	// 先读 .env 再注册旗标：-lease-ttl/-lease-renew 的默认值取自 TAKO_LEASE_TTL/TAKO_LEASE_RENEW。
+	// Open() 内那次调用照旧（godotenv 不覆盖已设变量、可重复调），这里只是把它提前一步。
+	config.LoadDotEnv()
+
 	engine := flag.String("engine", "127.0.0.1:8090", "listen address")
 	batch := flag.Int("batch-window", 200, "per-batch limit for frames/log reads")
 	dev := flag.Bool("dev", true, "register dev-only endpoints (reset)")
 	redisAddr := flag.String("redis", "127.0.0.1:6390", "redis address holding the tk:runlive/tk:draft keys")
 	pgDSN := flag.String("pg", defaultPGDSN, "postgres DSN (sessions/runs/run_model_messages/runlog_entries)")
-	leaseTTL := flag.Duration("lease-ttl", defaultLeaseTTL, "gate lease TTL; watchdog keeps renewing it during generation")
-	leaseRenew := flag.Duration("lease-renew", defaultLeaseRenew, "watchdog renew interval (must be < lease-ttl)")
+	leaseTTL := flag.Duration("lease-ttl", durationEnv("TAKO_LEASE_TTL", defaultLeaseTTL), "gate lease TTL; watchdog keeps renewing it during generation (env TAKO_LEASE_TTL)")
+	leaseRenew := flag.Duration("lease-renew", durationEnv("TAKO_LEASE_RENEW", defaultLeaseRenew), "watchdog renew interval (must be < lease-ttl; env TAKO_LEASE_RENEW)")
 	compactWindow := flag.Int("compact-window", defaultCompactWindow, "context window in tokens for compaction; limit = window * 4/5; 0 disables")
 	flag.Parse()
+
+	// 必须 leaseRenew 严格小于 leaseTTL：
+	//   ① renew >= ttl → 第一次 watchdog 触发前租约已过期 = 进程稳定地自己放闸，
+	//      其他副本能抢同 session，并发写 runlog/model_messages 把帧序和历史写乱。
+	//   ② renew == ttl 容错余量为 0，一次 ticker 抖动 / GC / 存储瞬断就踩线。
+	//   默认 30s/10s 给 2 次漏续余量（连续 3 拍全丢才误放）。
+	// .env 的 TAKO_LEASE_* 是新增的配置面，手误把两个值输反是常见坑，fail fast 起不来比跑起来自毁好。
+	if *leaseRenew >= *leaseTTL {
+		log.Fatalf("lease-renew %s ≥ lease-ttl %s：必须严格小于（默认 30s/10s = 2 次漏续余量）", *leaseRenew, *leaseTTL)
+	}
 
 	ctx := context.Background()
 
@@ -63,7 +93,11 @@ func main() {
 			log.Fatalf("compact counter (cl100k): %v", err)
 		}
 	}
-	worker := runengine.NewWorker(store, opened.Chat, runengine.TranslatorFor(string(opened.Protocol)), config.SystemPrompt(), *leaseRenew, *compactWindow, counter)
+	// agent 装配（T1）失败也是启动错误：装配不出来 = 主循环跑不了，fail fast 一贯式。
+	worker, err := runengine.NewWorker(store, opened.Chat, runengine.TranslatorFor(string(opened.Protocol)), config.SystemPrompt(), *leaseRenew, *compactWindow, counter)
+	if err != nil {
+		log.Fatalf("agent 装配: %v", err)
+	}
 	if *compactWindow > 0 {
 		log.Printf("compact window %d tok (limit %d)", *compactWindow, *compactWindow*4/5)
 	} else {

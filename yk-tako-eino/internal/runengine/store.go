@@ -172,12 +172,28 @@ func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID
 	return true, nil
 }
 
+// toolCallPayload / toolResultPayload 是 runlog 扩展行 payload 列的 JSON 形状（T2）——
+// 字段与同名帧一一对应（19v6-01 §3）：客户端对帧与历史行可用同一套渲染。
+// args 在这里仍是字符串（模型原始 JSON 原文）：不重编码，坏 JSON 也破不了 payload 本身。
+type toolCallPayload struct {
+	Name string `json:"name"`
+	Args string `json:"args"`
+}
+
+type toolResultPayload struct {
+	Name   string `json:"name"`
+	Output string `json:"output"`
+}
+
 // EndRun 是 run 侧动作的唯一入口（doc/19-v6 index 概念表「run 结束」；§8.4 endRun 行）：
 // **同一笔 PG 事务**「放闸 + 定稿」——UPDATE runs 落终态（放闸 = 没有独立解锁动作）与 complete 的
-// mh/runlog assistant 行同事务，「mh 与闸同事务」就此从措辞变成事务边界（D 系列的立项理由之二）。
+// mh/runlog 消息行同事务，「mh 与闸同事务」就此从措辞变成事务边界（D 系列的立项理由之二）。
 // staged（可 nil）是发送前 Stage 的折叠产物（C 系列）：**仅 complete 分支**并入同一笔事务——
 // 被压 run 原文行 compacted=true（保留不删）+ 新 seq=0 摘要行；error / 闸失 = 零写入，
 // 下一轮从原文重压（「原文从未被动过」，§10.4 落库时机的全部含义）。
+// turn 是 worker 累积的模型侧消息全序（T2）：complete 分支逐轮落 mh（seq 接 user 的 1 往下排）+
+// runlog 扩展行（tool_call / tool_result）；终稿 assistant 行仍以 draft 为准（= 全 run delta 累计，
+// 收口替换的锚）。**error / 闸失 = turn 零写入**——与「error 结局只留 user 那一半」的既有形状一致。
 //
 // 守卫 = 统一谓词「闸在手上」（status='running' AND lease_until > now()，与读侧同式）：
 // 影响 0 行 = 本 run 不归自己了（已放 / 已被清扫 / 租约已过）→ 空转（false, nil）。
@@ -185,7 +201,8 @@ func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID
 //
 // Redis 半在 commit 后：压 terminal + EXPIRE ttl + 删 draft。失败不补偿（§8.4）：闸确实放了（ok=true），
 // runlive 到 TTL 收敛成 gone、客户端从 log 拿全文——B1 冗余收口兜住。
-func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, status string, staged *StagedCompaction) (eventOffset, runlogOffset int, ok bool, err error) {
+func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, status string,
+	staged *StagedCompaction, turn []TurnEntry) (eventOffset, runlogOffset int, ok bool, err error) {
 	var draft string
 	if status == "complete" {
 		// 定稿文本的真源在 draft（只有 Redis 有）；本 run 的 worker 已停止产出，无并发追加。
@@ -236,20 +253,79 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 					return err
 				}
 			}
-			msgID, err := newRowID("msg_")
-			if err != nil {
-				return err
+			// 本 run 的模型侧消息逐轮落 mh（seq 从 user 的 1 往下排）：assistant 轮带 tool_calls、
+			// tool 轮带 tool_call_id——下一轮 prepareInput 就按这两列重建 OpenAI 工具消息。
+			// 两列「缺席即 NULL」（与 message_id 同约定）：assistant 轮的 tool_call_id、tool 轮的
+			// tool_calls、无调用的终轮两列，一律不写字面空串。
+			// turn 末项 = 终轮 assistant：正文 = 终轮本体（工具轮前导语各在自己那轮里，不重复）。
+			for i, e := range turn {
+				var callsSQL, callIDSQL any // nil = NULL
+				if len(e.ToolCalls) > 0 {
+					b, err := json.Marshal(e.ToolCalls)
+					if err != nil {
+						return err
+					}
+					callsSQL = string(b)
+				}
+				if e.ToolCallID != "" {
+					callIDSQL = e.ToolCallID
+				}
+				msgID, err := newRowID("msg_")
+				if err != nil {
+					return err
+				}
+				if err := tx.Exec(
+					`INSERT INTO run_model_messages (id, session_id, run_id, seq, role, text, tool_calls, tool_call_id, compacted, created_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, false, now())`,
+					msgID, sessionID, runID, i+2, e.Role, e.Text, callsSQL, callIDSQL).Error; err != nil {
+					return err
+				}
 			}
-			if err := tx.Exec(
-				`INSERT INTO run_model_messages (id, session_id, run_id, seq, role, text, compacted, created_at)
-				 VALUES (?, ?, ?, 2, 'assistant', ?, false, now())`,
-				msgID, sessionID, runID, draft).Error; err != nil {
-				return err
+			// runlog 扩展行（消息粒度）：tool_call 每次调用一行、tool_result 每个结果一行——
+			// text 可直接展示、payload 结构化（字段与同名帧对应）。与 assistant 定稿行同笔：
+			// 要么整轮可见，要么整笔没写。
+			for _, e := range turn {
+				if e.Role == "tool" {
+					payload, err := json.Marshal(toolResultPayload{Name: e.ToolName, Output: e.Text})
+					if err != nil {
+						return err
+					}
+					logID, err := newRowID("rl_")
+					if err != nil {
+						return err
+					}
+					if err := tx.Exec(
+						`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, message_id, text, payload, created_at)
+						 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
+						         ?, 'tool_result', NULL, ?, ?, now())`,
+						logID, sessionID, sessionID, runID, e.Text, string(payload)).Error; err != nil {
+						return err
+					}
+					continue
+				}
+				for _, tc := range e.ToolCalls {
+					payload, err := json.Marshal(toolCallPayload{Name: tc.Function.Name, Args: tc.Function.Arguments})
+					if err != nil {
+						return err
+					}
+					logID, err := newRowID("rl_")
+					if err != nil {
+						return err
+					}
+					if err := tx.Exec(
+						`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, message_id, text, payload, created_at)
+						 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
+						         ?, 'tool_call', NULL, ?, ?, now())`,
+						logID, sessionID, sessionID, runID, tc.Function.Name+"("+tc.Function.Arguments+")", string(payload)).Error; err != nil {
+						return err
+					}
+				}
 			}
 			logID, err := newRowID("rl_")
 			if err != nil {
 				return err
 			}
+			// 终稿 assistant 行（text=draft）：与旧形状逐字节一致，「Σ delta == 定稿全文」的收口锚。
 			// RETURNING 拿回本行 seq 即 runlogOffset（旧 Lua 的 LLEN 语义）。
 			if err := tx.Raw(
 				`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, message_id, text, created_at)
