@@ -21,9 +21,9 @@
 
 | 词 | 形状（正向定义） | 住处 | 消费者 | 例子 |
 |---|---|---|---|---|
-| **ref** | 字符串，格式 = `厂商ID / 模型ID`。唯一身份：带厂商命名空间，避免同名模型撞车。 | 不单独存：从环境变量 `TAKO_MODEL` 读、或从子代理 md 的 `model:` 行读 | `ResolveModel` 解析它、Registry 拿它当缓存 key、帧/行里的 `model` 字段存它 | `deepseek/deepseek-v4-flash`、`anthropic/claude-sonnet-4`、`ollama/qwen2.5-coder:14b` |
+| **ref** | 字符串，格式 = `厂商ID / 模型ID`。唯一身份：带厂商命名空间，避免同名模型撞车。 | 不单独存：从环境变量 `TAKO_MODEL` 读、或从子代理 md 的 `model:` 行读 | `ResolveModel` 解析它、ModelRegistry 拿它当缓存 key、帧/行里的 `model` 字段存它 | `deepseek/deepseek-v4-flash`、`anthropic/claude-sonnet-4`、`ollama/qwen2.5-coder:14b` |
 | **ChatModel 实例** | 一个具体的 HTTP 客户端：里面装好了 baseURL、API Key、协议（openai/anthropic）、模型 ID。**无状态，不记任何对话**。 | 进程内存（Go struct） | ChatModelAgent / AgentTool 的 loop 用它发 LLM 请求 | 主 worker 启动时 `config.Open()` 返回的那一个；子代理按 ref 新建的那些 |
-| **ModelRegistry（简称 Registry）** | 一张进程内的**懒加载缓存表**：`map[ref]ChatModel实例`。懒加载 = 进程启动时是空的，**第一次用到某个 ref 才解析并建客户端**，之后同样的 ref 直接复用。 | 进程内存（Go struct，带读写锁防并发重复建） | 装配层（BeforeAgent）把子代理规格转成 ChatModelAgent 时用它取实例 | 一条规格写了 `model: anthropic/claude-sonnet-4`，第一次遇到时 Registry 去解析环境变量、建 claude 客户端、存进 map；下一条同样写了这个 ref 的规格直接拿 map 里的，不再重复解析 |
+| **ModelRegistry** | 一张进程内的**懒加载缓存表**：`map[ref]ChatModel实例`。懒加载 = 进程启动时是空的，**第一次用到某个 ref 才解析并建客户端**，之后同样的 ref 直接复用。 | 进程内存（Go struct，带读写锁防并发重复建） | 装配层（BeforeAgent）把子代理规格转成 ChatModelAgent 时用它取实例 | 一条规格写了 `model: anthropic/claude-sonnet-4`，第一次遇到时 ModelRegistry 去解析环境变量、建 claude 客户端、存进 map；下一条同样写了这个 ref 的规格直接拿 map 里的，不再重复解析 |
 
 index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型输入侧叫 Model message、观测侧叫帧/runlive」，
 以及两者**永不混写**：子代理的 Model message 不进 mh、帧不进 mh。
@@ -78,8 +78,8 @@ index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型�
 
   | 写法编号 | 在 agents/*.md 里怎么写 `model:` | 含义 | 行为 | YAML 例子 |
   |---|---|---|---|---|
-  | 写法一 | **根本不写** `model:` 这一行 | 隐式继承主 worker 的模型 | 直接拿主 worker 启动时建好的那个 ChatModel 实例用，不查注册表、不新建 | （不写这行） |
-  | 写法二 | 写了且去前后空格后（大小写不敏感）**正好等于**三者之一：`default` / `inherit` / `继承` | 显式声明「用主 worker 的模型」 | 与写法一**完全同义**，拿同一个主实例，不进注册表、不新建 | `model: inherit` |
+  | 写法一 | **根本不写** `model:` 这一行 | 隐式继承主 worker 的模型 | 直接拿主 worker 启动时建好的那个 ChatModel 实例用，不查 ModelRegistry、不新建 | （不写这行） |
+  | 写法二 | 写了且去前后空格后（大小写不敏感）**正好等于**三者之一：`default` / `inherit` / `继承` | 显式声明「用主 worker 的模型」 | 与写法一**完全同义**，拿同一个主实例，不进 ModelRegistry、不新建 | `model: inherit` |
   | 写法三 | 除了写法一、写法二以外的**任何字符串**（排中律：不是前两种就一定是这种） | 明确指定要用哪个模型 | 字符串必须是 `厂商/模型` 格式（与 `TAKO_MODEL` 完全相同的写法，例：`deepseek/deepseek-v4-flash`）。调用 `ModelRegistry.Get(ctx, ref)`（进程内懒加载缓存表，见下）拿到该 ref 对应的 ChatModel 实例：<br>• 缓存里已有 → 直接复用<br>• 缓存里没有 → 走与 `TAKO_MODEL` 相同的 `ResolveModel` 链（扫环境变量找 Key → 查厂商目录 → 定 baseURL 和协议 → `build` 建客户端），建好后塞进缓存，下次再用<br>• 解析失败（没配这家厂商的 Key、厂商不在目录、格式不对缺模型名等）→ **这条规格不装载**，进程启动日志打一行明确报错，其余规格照常装载 | `model: anthropic/claude-sonnet-4` |
 
   **不加展示字段**（emoji/color 等）。**不设信任门**（T3：规格 = 部署态只读产物；运行时写 = 挂账，真做前先裁真源）；
@@ -118,7 +118,7 @@ index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型�
               │        └──► 走「继承分支」                      │
               │              直接用主 worker 已有的那个         │
               │              deepseek/deepseek-v4-flash 实例    │
-              │              （不查 Registry、不新建）          │
+              │              （不查 ModelRegistry、不新建）           │
               │                                                 │
               │  ③ code-review.md → "anthropic/claude-sonnet-4"│
               │        │                                         │
@@ -215,7 +215,7 @@ index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型�
   几个**有意这样设计**、不按直觉改的点（别看到进程内就想搬去共享存储）：
 
   - 「多实例」= 同一张缓存表里可以同时有 deepseek 客户端、claude 客户端、ollama 客户端——只要你在规格里写了不同 ref，第一次用到时就各建各的，互不干扰。
-  - 「晚解析」= 进程启动时 Registry.cache 是空的。你写了 20 条子代理规格，但只有 3 个被真正装载用到 → 只建 3 个客户端。剩下 17 个永远不会浪费内存去建。
+  - 「晚解析」= 进程启动时 ModelRegistry.cache 是空的。你写了 20 条子代理规格，但只有 3 个被真正装载用到 → 只建 3 个客户端。剩下 17 个永远不会浪费内存去建。
   - **解析链同源**：写法三里那个「ResolveModel + build」和主 worker 启动时 `config.Open()` 调的是**同两个函数**（只是 `ResolveModel` 会抽一个通用版 `ResolveModelWithRef`，主 worker 的 `TAKO_MODEL` 也是拿这个通用版喂环境变量），保证 `TAKO_MODEL=deepseek/x` 和 md 里 `model: deepseek/x` 行为 100% 一致——不会出现「主 worker 能调通、子代理调不通」这种同一个 ref 两种行为的诡异 bug。
 
 - **为什么 ModelRegistry 放「进程内存」，不放 PG/Redis 共享存储？（一张表说清楚判断依据）**
@@ -227,7 +227,7 @@ index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型�
   | 会话「单 run 跑着」的闸 | 互斥锁：两副本同时抢同一会话会出两份 run、写乱帧序 | ✅ 必须全集群唯一 | PG `runs` 表部分唯一索引（插入失败本身就是 409） | 共享可变状态 = 必须放共享存储。进程内 `chan` 或 mutex 一上多副本就废 |
   | runlive 帧流 | 生成中帧的实时队列：客户端不管打哪个副本的 frames API 都得看到同一批帧、同一顺序 | ✅ 必须全集群同序 | Redis `tk:runlive:{runId}` LIST（TTL 300s） | 时序队列 = 必须放共享。各副本各写各的，客户端轮询就丢帧乱序了 |
   | runlog 历史行 | 会话的定稿历史：用户关了浏览器再开，历史必须还在 | ✅ 必须持久、不丢 | PG `runlog_entries` 表 | 持久化数据 = 必须放共享。进程内存里一重启就没了 |
-  | **ChatModel 客户端实例** | 一个无状态的 HTTP 请求发件器：装着 URL + Key + 协议 + 模型 ID，**不记任何对话**，同样的 ref 建 100 个和建 1 个行为字节级一样 | ❌ **不需要一致** | **进程内存（本进程的 ModelRegistry）** | 它是「连接句柄」，不是「数据」：<br>1. 跨进程传不了 HTTP client（里面有连接池、goroutine 私域），物理上就没法塞 Redis<br>2. 多副本各建一份成本可以忽略：扫几十条环境变量（μs 级）+ 分配几个 struct，真金白银的成本是后面几百 ms 的 LLM 请求本身<br>3. 同 ref 解析结果必然一致：所有副本读的同一套环境变量 + 同一套厂商目录，不存在「A 副本解析成功、B 副本解析失败」的可能（除非滚动部署时半更新，那是部署纪律的锅）<br>4. 缓存丢了也没关系：进程一重启、Registry 空了，下次 `Get` 再建就行，不丢任何业务数据——缓存只是「省一次解析」，不是真源 |
+  | **ChatModel 客户端实例** | 一个无状态的 HTTP 请求发件器：装着 URL + Key + 协议 + 模型 ID，**不记任何对话**，同样的 ref 建 100 个和建 1 个行为字节级一样 | ❌ **不需要一致** | **进程内存（本进程的 ModelRegistry）** | 它是「连接句柄」，不是「数据」：<br>1. 跨进程传不了 HTTP client（里面有连接池、goroutine 私域），物理上就没法塞 Redis<br>2. 多副本各建一份成本可以忽略：扫几十条环境变量（μs 级）+ 分配几个 struct，真金白银的成本是后面几百 ms 的 LLM 请求本身<br>3. 同 ref 解析结果必然一致：所有副本读的同一套环境变量 + 同一套厂商目录，不存在「A 副本解析成功、B 副本解析失败」的可能（除非滚动部署时半更新，那是部署纪律的锅）<br>4. 缓存丢了也没关系：进程一重启、ModelRegistry 空了，下次 `Get` 再建就行，不丢任何业务数据——缓存只是「省一次解析」，不是真源 |
 
   总结成一句话：**数据（要持久、要跨副本一致的）放共享存储；连接句柄（用了就扔、重建成本极低的）放进程内。** ChatModel 客户端是连接句柄，不是数据。
 
