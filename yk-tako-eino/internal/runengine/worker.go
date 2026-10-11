@@ -16,7 +16,10 @@
 //
 // T3 的帧路由：事件按 event.AgentName 归属——"" = root（主线程直走 agent.Run、不过 flowAgent 指名），
 // 非空 = 子代理（AgentTool 内转发事件，经内层 flowAgent 着名、EmitInternalEvents 打开才到场）。
-// 帧上带 Agent；子代理的 delta 走 AppendFrame（不写 draft——draft 只装 root），turn 只收 root 条目。
+// 帧上带 Agent；子代理的 delta 走 AppendFrame（不写 draft——draft 只装 root），turn 收 root 与
+// 子代理条目（T3-2 起带 Agent 归属，EndRun 按投影分拣：mh 只装 root、runlog 全量）。
+// T3-1b：帧上再带 Model（生效 ref）——Run 建「agent 名 → 模型身份」表（agentModelTable）塞 ctx，
+// 装载 handler 在同一 ctx 下填表，这里按 event.AgentName 查它：写帧取 model 值、drain 取 translator。
 package runengine
 
 import (
@@ -97,9 +100,10 @@ type Worker struct {
 	agent         adk.Agent   // 主循环：ADK ChatModelAgent（T2 起挂 get_time）
 	translate     Translator
 	system        string
+	rootRef       string // 主模型生效 ref（T3-1b，= config.ChatModel.Ref）：root 帧的 model 值 + 身份表 root 条目
 	leaseRenew    time.Duration
 	compactWindow int
-	compactLimit  int // window×4/5（window=0 时 0）：触发线 / 准入线 / 摘要预算帽三处共用，不各自重算
+	compactLimit  int // window×4/5（window=0 时 0）：触发线 / 准入线两处共用，不各自重算；摘要预算帽自 A7 起归 summarizeCeiling 分档
 	counter       TokenCounter
 }
 
@@ -119,8 +123,19 @@ type Worker struct {
 // F1：workspace 是文件工具的作业根（绝对路径，main 启动作 Abs + MkdirAll 后传入）——
 // F 系列文件工具入池即受它约束；池内全部工具经 wrapToolErrors 包成「错误→结果」回注模型
 // （tools.go 的机制说明）。
+//
+// C5-A7：modelRef 是主模型生效 ref（config.ChatModel.Ref，Claude override 判定用）、
+// maxOutput 是 TAKO_MODEL_MAX_OUTPUT（正整数 tok，0 = 不顶）——摘要预算帽 =
+// summarizeCeiling(compactWindow, modelRef, maxOutput)，装配期一次算好注给 summarizer。
+//
+// T3-1b：resolver 是子代理 `model:` 写值档的解析口（进程内 ModelRegistry，main 侧适配）——
+// 装载 handler 拿它换出对应 ChatModel + 生效 ref + 协议。
+//
+// T3-3：subagentConcurrency 是委派并发闸容量（-subagent-concurrency，main 已保证 >= 1）——
+// 池级信号量、全部规格共享；subagentReturnCap 是子代理回传上限字节数（-subagent-return-cap，
+// <=0 = 不裁剪）——超帽截断的语义在 delegationTool（agents.go）。
 func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, system, workspace, agentsDir string, leaseRenew time.Duration,
-	compactWindow int, counter TokenCounter) (*Worker, error) {
+	compactWindow int, modelRef string, maxOutput int, subagentConcurrency, subagentReturnCap int, resolver ModelResolver, counter TokenCounter) (*Worker, error) {
 	// file_effect 启动 lint（C5-A4，fileops.go）：F1 起注册表非空（write_file 首条），
 	// lint 从空转变成真检查——此后任何文件工具漏声明 = 启动失败。
 	if err := lintFileEffects(firstPartyFileEffects); err != nil {
@@ -155,14 +170,16 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 			},
 			EmitInternalEvents: true,
 		},
-		Handlers: []adk.ChatModelAgentMiddleware{newAgentSpecHandler(agentsDir, chat), NewAgentLogHandler()},
+		Handlers: []adk.ChatModelAgentMiddleware{newAgentSpecHandler(agentsDir, chat, modelRef, translate, resolver,
+			make(chan struct{}, subagentConcurrency), subagentReturnCap), NewAgentLogHandler()},
 	})
 	if err != nil {
 		return nil, err
 	}
 	compactLimit := compactWindow * 4 / 5
-	return &Worker{store: store, sum: newSummarizer(chat, compactLimit), agent: agent, translate: translate, system: system,
-		leaseRenew: leaseRenew, compactWindow: compactWindow, compactLimit: compactLimit, counter: counter}, nil
+	ceiling := summarizeCeiling(compactWindow, modelRef, maxOutput)
+	return &Worker{store: store, sum: newSummarizer(chat, ceiling), agent: agent, translate: translate, system: system,
+		rootRef: modelRef, leaseRenew: leaseRenew, compactWindow: compactWindow, compactLimit: compactLimit, counter: counter}, nil
 }
 
 // Run 是 run 的执行体。**收尾无条件化**：endRun 挂在唯一出口（defer），不散在各级 return 前——
@@ -181,6 +198,7 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 	var stagedCompaction *StagedCompaction
 	// turn 是本 run 模型侧消息的全序（T2）：流式事件合并全文（assistant 轮，带 tool_calls）与
 	// 工具结果事件（tool 轮）按事件序累积，defer 交给 EndRun——complete 才落库，error/闸失零写入。
+	// T3-2 起子代理条目也在列（带 Agent 归属）：分拣归 EndRun 的两个投影，worker 只负责记全。
 	var turn []TurnEntry
 	defer func() {
 		_, _, ok, err := w.store.EndRun(ctx, sessionID, runID, status, stagedCompaction, turn)
@@ -213,6 +231,10 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 	stagedCompaction = staged
 	// T1：主循环 = ADK agent 事件流。正文 chunk 经同一 Translator 翻成 delta 帧（归一层语义不变，换的只是载体）。
 	// T2：工具环两态事件——流式（模型输出，含 tool_calls）与非流式（工具结果，Role=Tool）。
+	// T3-1b：身份表先落 root 条目（主 ref + 主 translator），塞 ctx 给装载 handler 填子代理条目
+	// （handler 先于事件消费到场：agent.Run 内部同步跑完 BeforeAgent 才开事件 goroutine）。
+	table := newAgentModelTable(w.rootRef, w.translate)
+	ctx = withAgentModelTable(ctx, table)
 	it := w.agent.Run(ctx, &adk.AgentInput{Messages: msgs, EnableStreaming: true})
 	for {
 		event, ok := it.Next()
@@ -228,7 +250,8 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 			continue
 		}
 		mo := event.Output.MessageOutput
-		agent := event.AgentName // T3 路由："" = root / 非空 = 子代理（转发事件）
+		agent := event.AgentName       // T3 路由："" = root / 非空 = 子代理（转发事件）
+		entry := table.entryFor(agent) // T3-1b：该事件的模型身份（写帧的 model 值 + drain 的 translator）
 		if !mo.IsStreaming {
 			// 非流式事件 = 工具结果（ADK typedToolInvokeEvent：Message 已成形、Role=Tool）。一次调用一条
 			// tool_result 帧（非流式，19v6-01 §2）；同时进 turn（mh tool 行 + runlog 扩展行）。
@@ -241,10 +264,9 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 						name = mo.Message.ToolName
 					}
 				}
-				if agent == "" { // turn 只收 root 条目（T3-1 中间态；T3-2 补子代理记录）
-					turn = append(turn, TurnEntry{Role: "tool", Text: out, ToolCallID: callID, ToolName: name})
-				}
-				live, err := w.store.AppendFrame(ctx, runID, Frame{Kind: "tool_result", Agent: agent, Name: name, Output: out})
+				// T3-2：子代理条目也收（root 的委派回传事件 agent 为空——它属于 root 的循环）。
+				turn = append(turn, TurnEntry{Role: "tool", Agent: agent, Text: out, ToolCallID: callID, ToolName: name, Model: entry.ref})
+				live, err := w.store.AppendFrame(ctx, runID, Frame{Kind: "tool_result", Agent: agent, Model: entry.ref, Name: name, Output: out})
 				if err != nil {
 					log.Printf("frame %s/%s: %v", sessionID, runID, err)
 					status = "error"
@@ -256,7 +278,7 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 			}
 			continue
 		}
-		merged, live, err := w.drain(ctx, runID, agent, mo.MessageStream)
+		merged, live, err := w.drain(ctx, runID, agent, entry, mo.MessageStream)
 		if err != nil {
 			log.Printf("stream %s/%s: %v", sessionID, runID, err)
 			status = "error"
@@ -267,12 +289,11 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 			// defer 的 EndRun 拿不到闸自然空转。
 			return
 		}
-		// 本轮合并全文进 turn（assistant 轮，仅 root）；ToolCalls 逐条压 tool_call 帧，args 取模型原始 JSON 原文。
-		if agent == "" {
-			turn = append(turn, TurnEntry{Role: "assistant", Text: merged.Content, ToolCalls: merged.ToolCalls})
-		}
+		// 本轮合并全文进 turn（assistant 轮，root 与子代理都收——T3-2 起按 Agent 分拣归 EndRun）；
+		// ToolCalls 逐条压 tool_call 帧，args 取模型原始 JSON 原文。
+		turn = append(turn, TurnEntry{Role: "assistant", Agent: agent, Text: merged.Content, ToolCalls: merged.ToolCalls, Model: entry.ref})
 		for _, tc := range merged.ToolCalls {
-			live, err := w.store.AppendFrame(ctx, runID, Frame{Kind: "tool_call", Agent: agent, Name: tc.Function.Name, Args: tc.Function.Arguments})
+			live, err := w.store.AppendFrame(ctx, runID, Frame{Kind: "tool_call", Agent: agent, Model: entry.ref, Name: tc.Function.Name, Args: tc.Function.Arguments})
 			if err != nil {
 				log.Printf("frame %s/%s: %v", sessionID, runID, err)
 				status = "error"
@@ -289,9 +310,11 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 // （T2：merged.ToolCalls 是 tool_call 帧的来源、merged.Content 是本轮 assistant 行）。
 // T3：agent = "" 走 AppendDelta（root——draft 的唯一写入方）；子代理文本走 AppendFrame
 // （delta 帧带 agent，**不 APPEND draft**——收口锚「Σ root delta」不被子代理文本污染）。
+// T3-1b：drain 的 translator 与 model 值都取自 entry（该 agent 的模型身份）——继承档 = 主 translator/主 ref，
+// 写值档 = 按该模型协议选的 translator / 其生效 ref；root 与子代理共用同一条排干逻辑。
 // 返回 live=false = run 已判死（该收摊，不是错误）；err != nil = 错误结局。
 // close 责任也在本函数：事件流的另一副本由 agent 内部排干，早退不关会把两边一起吊住。
-func (w *Worker) drain(ctx context.Context, runID RunID, agent string, stream *schema.StreamReader[*schema.Message]) (*schema.Message, bool, error) {
+func (w *Worker) drain(ctx context.Context, runID RunID, agent string, entry agentModelEntry, stream *schema.StreamReader[*schema.Message]) (*schema.Message, bool, error) {
 	defer stream.Close()
 	var chunks []*schema.Message
 	for {
@@ -308,12 +331,12 @@ func (w *Worker) drain(ctx context.Context, runID RunID, agent string, stream *s
 			return nil, false, err
 		}
 		chunks = append(chunks, chunk)
-		if text, ok := w.translate(chunk); ok {
+		if text, ok := entry.translate(chunk); ok {
 			var live bool
 			if agent == "" {
-				_, live, err = w.store.AppendDelta(ctx, runID, text)
+				_, live, err = w.store.AppendDelta(ctx, runID, entry.ref, text)
 			} else {
-				live, err = w.store.AppendFrame(ctx, runID, Frame{Kind: "delta", Agent: agent, Text: text})
+				live, err = w.store.AppendFrame(ctx, runID, Frame{Kind: "delta", Agent: agent, Model: entry.ref, Text: text})
 			}
 			if err != nil {
 				return nil, false, err
@@ -387,7 +410,7 @@ func (w *Worker) prepareInput(ctx context.Context, sessionID SessionID, runID Ru
 		limit := w.compactLimit
 		if total := countInput(w.counter, w.system, history); total > limit {
 			log.Printf("compact %s/%s: 输入 %d tok > limit %d，进入折叠", sessionID, runID, total, limit)
-			history, stagedCompaction, err = foldInput(ctx, w.system, history, runID, limit, w.counter, w.sum.summarize)
+			history, stagedCompaction, err = foldInput(ctx, w.system, history, runID, limit, w.counter, w.sum.summarize, firstPartyFileEffects)
 			if err != nil {
 				return nil, nil, err
 			}

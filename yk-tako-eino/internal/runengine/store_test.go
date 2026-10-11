@@ -190,7 +190,9 @@ func (s *Store) mustAcquire(t *testing.T, sid SessionID, rid RunID, msgID, text 
 
 func (s *Store) mustDelta(t *testing.T, ctx context.Context, rid RunID, text string) {
 	t.Helper()
-	if _, ok, err := s.AppendDelta(ctx, rid, text); err != nil || !ok {
+	// model 传空串：多数用例验的是生命周期语义、不关心 model 值（帧上恒在字段，无 omitempty）。
+	// model 值的序列化往返另有专测（TestAppendDeltaThenRead）。
+	if _, ok, err := s.AppendDelta(ctx, rid, "", text); err != nil || !ok {
 		t.Fatalf("AppendDelta(%s): ok=%v err=%v", rid, ok, err)
 	}
 }
@@ -270,7 +272,7 @@ func TestReadFramesStartFrameAndBeyondEnd(t *testing.T) {
 	}
 }
 
-// 3. delta 追加后从上一游标续读，offset 连续。
+// 3. delta 追加后从上一游标续读，offset 连续；model 值随帧序列化往返（T3-1b 帧上的恒在字段）。
 func TestAppendDeltaThenRead(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t, testLease, testTTL)
@@ -278,7 +280,7 @@ func TestAppendDeltaThenRead(t *testing.T) {
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 
 	for i, want := range []int{2, 3} {
-		n, ok, err := s.AppendDelta(ctx, rid, "你好")
+		n, ok, err := s.AppendDelta(ctx, rid, "deepseek/deepseek-v4-flash", "你好")
 		if err != nil || !ok {
 			t.Fatalf("AppendDelta #%d: ok=%v err=%v", i, ok, err)
 		}
@@ -293,6 +295,9 @@ func TestAppendDeltaThenRead(t *testing.T) {
 	}
 	if len(frames) != 2 || frames[0].EventOffset != 2 || frames[1].EventOffset != 3 || next != 3 {
 		t.Fatalf("ReadFrames(1) = %+v next=%d, want offset 2,3 next=3", frames, next)
+	}
+	if frames[0].Model != "deepseek/deepseek-v4-flash" || frames[1].Model != "deepseek/deepseek-v4-flash" {
+		t.Fatalf("delta 帧应带 model 生效 ref: %+v", frames)
 	}
 }
 
@@ -387,7 +392,8 @@ func TestReadFramesGoneAfterTTL(t *testing.T) {
 }
 
 // 6. 落盘原文：runlive 的帧 JSON 不含 offset（读时按 index+1 注入，写侧无计数器、多副本并发不重号），
-// 且恒带 agent（T2，空 = root）；PG 侧钉行形状——assistant 行 message_id 为 NULL（契约：assistant 无此字段）、
+// 且恒带 agent（T2，空 = root）与 model（T3-1b，空 = 非模型产物；start/terminal 即此形态——delta 的
+// model 本位验证在用例 3）；PG 侧钉行形状——assistant 行 message_id 为 NULL（契约：assistant 无此字段）、
 // user 行带 m_1、agent/payload 缺省为 NULL。
 // 逐字节钉存储形态顺带钉字段序（读出来的字节要被客户端按名取）；重头判据在 curl baseline（A4-1 重跑）。
 func TestStoredShapeCarriesNoOffset(t *testing.T) {
@@ -401,9 +407,9 @@ func TestStoredShapeCarriesNoOffset(t *testing.T) {
 	}
 
 	wantFrames := []string{
-		`{"kind":"start","agent":"","messageId":"m_1"}`,
-		`{"kind":"delta","agent":"","text":"world"}`,
-		`{"kind":"terminal","agent":"","status":"complete"}`,
+		`{"kind":"start","agent":"","model":"","messageId":"m_1"}`,
+		`{"kind":"delta","agent":"","model":"","text":"world"}`,
+		`{"kind":"terminal","agent":"","model":"","status":"complete"}`,
 	}
 	for i, want := range wantFrames {
 		if got := s.lindex(t, ctx, keyRunlive(rid), i); got != want {
@@ -417,9 +423,10 @@ func TestStoredShapeCarriesNoOffset(t *testing.T) {
 	if !s.sqlBool(t, `SELECT message_id = 'm_1' FROM runlog_entries WHERE run_id = ? AND role = 'user'`, rid) {
 		t.Error("runlog user 行的 message_id 应为 m_1")
 	}
-	// T2 两列同理走「缺省即 NULL」约定（读侧归一到 "" 对外）：本拍 agent 恒空、payload 只有扩展行有。
-	if !s.sqlBool(t, `SELECT bool_and(agent IS NULL AND payload IS NULL) FROM runlog_entries WHERE run_id = ?`, rid) {
-		t.Error("user/assistant 行 agent/payload 应为 NULL（缺省不写字面空串）")
+	// T2 两列同理走「缺省即 NULL」约定（读侧归一到 "" 对外）：本拍 agent 恒空、payload 只有扩展行有；
+	// T3-2 的 model 列同款（本用例 turn 为 nil，终稿行取不到 root ref → NULL）。
+	if !s.sqlBool(t, `SELECT bool_and(agent IS NULL AND model IS NULL AND payload IS NULL) FROM runlog_entries WHERE run_id = ?`, rid) {
+		t.Error("user/assistant 行 agent/model/payload 应为 NULL（缺省不写字面空串）")
 	}
 }
 
@@ -919,6 +926,106 @@ func TestEndRunLandsTurnRows(t *testing.T) {
 	}
 	if !s.sqlBool(t, `SELECT bool_and(agent IS NULL) FROM runlog_entries WHERE run_id = ? AND role IN ('tool_call','tool_result')`, rid) {
 		t.Error("扩展行 agent 应为 NULL（缺省不写字面空串）")
+	}
+}
+
+// 18. T3-2 的委派落库：turn 混入子代理条目（Agent 归属）——两个投影分拣的存储级证据。
+// mh 只装 root 条目且 seq 连续（子代理中间过程不进模型输入）；runlog 全量（子代理的工具动作行 +
+// 终稿行，agent/model 两列随行；root 委派回传行 = 完整回传文本）；root 终稿行 model = 主 ref。
+func TestEndRunLandsDelegationRows(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid, rid := SessionID("s_1"), RunID("r_1")
+	s.mustAcquire(t, sid, rid, "m_1", "帮我查一下时间")
+	s.mustDelta(t, ctx, rid, "好的，")
+	s.mustDelta(t, ctx, rid, "已经查完：15:04")
+
+	const mainRef, subRef = "deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"
+	deleg := schema.ToolCall{ID: "call_1", Type: "function",
+		Function: schema.FunctionCall{Name: "researcher", Arguments: `{"request":"查时间"}`}}
+	subCall := schema.ToolCall{ID: "call_2", Type: "function",
+		Function: schema.FunctionCall{Name: "get_time", Arguments: `{"timezone":"Asia/Shanghai"}`}}
+	turn := []TurnEntry{
+		{Role: "assistant", Agent: "", Text: "好的，", ToolCalls: []schema.ToolCall{deleg}, Model: mainRef},
+		{Role: "assistant", Agent: "researcher", Text: "", ToolCalls: []schema.ToolCall{subCall}, Model: subRef},
+		{Role: "tool", Agent: "researcher", Text: "2026-10-11 15:04:05 +0800 CST", ToolCallID: "call_2", ToolName: "get_time", Model: subRef},
+		{Role: "assistant", Agent: "researcher", Text: "现在是 15:04。", Model: subRef},
+		{Role: "tool", Agent: "", Text: "现在是 15:04。", ToolCallID: "call_1", ToolName: "researcher", Model: mainRef},
+		{Role: "assistant", Agent: "", Text: "已经查完：15:04", Model: mainRef},
+	}
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, turn); err != nil || !ok {
+		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
+	}
+
+	// mh：root-only 四行（user + 委派轮 assistant/tool + 终轮），seq 连续——子代理的 get_time 调用
+	// 与其结果一行都不在（模型输入看不到子代理中间过程）。
+	mh, err := s.ModelMessages(ctx, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mh) != 4 {
+		t.Fatalf("mh 行数 = %d, want 4（root-only，子代理条目被过滤）", len(mh))
+	}
+	for i, m := range mh {
+		if m.Seq != i+1 {
+			t.Errorf("mh[%d].Seq = %d, want %d（跳过子代理后 seq 仍连续）", i, m.Seq, i+1)
+		}
+	}
+	if mh[1].ToolCalls[0].Function.Name != "researcher" || mh[1].Text != "好的，" {
+		t.Errorf("mh[1] = %+v, want root 委派调用（前导语随行）", mh[1])
+	}
+	if mh[2].Role != "tool" || mh[2].ToolCallID != "call_1" || mh[2].Text != "现在是 15:04。" {
+		t.Errorf("mh[2] = %+v, want 委派回传（tool 行文本 = 子代理终稿全文、回指 call_1）", mh[2])
+	}
+	if mh[3].Role != "assistant" || mh[3].Text != "已经查完：15:04" {
+		t.Errorf("mh[3] = %+v, want root 终轮", mh[3])
+	}
+
+	// runlog：七行——user → tool_call(委派，root) → [researcher：tool_call + tool_result + 终稿] →
+	// tool_result(回传，root) → assistant(root 终稿=draft)。agent/model 两列随行直查。
+	rows, _, exists, err := s.ReadLog(ctx, sid, 0, 200)
+	if err != nil || !exists {
+		t.Fatalf("ReadLog: exists=%v err=%v", exists, err)
+	}
+	if len(rows) != 7 {
+		t.Fatalf("runlog 行数 = %d, want 7", len(rows))
+	}
+	type want struct{ role, agent, model, text string }
+	wants := []want{
+		{"user", "", "", "帮我查一下时间"},
+		{"tool_call", "", mainRef, `researcher({"request":"查时间"})`},
+		{"tool_call", "researcher", subRef, `get_time({"timezone":"Asia/Shanghai"})`},
+		{"tool_result", "researcher", subRef, "2026-10-11 15:04:05 +0800 CST"},
+		{"assistant", "researcher", subRef, "现在是 15:04。"},
+		{"tool_result", "", mainRef, "现在是 15:04。"},
+		{"assistant", "", mainRef, "好的，已经查完：15:04"},
+	}
+	for i, w := range wants {
+		r := rows[i]
+		if r.Role != w.role || r.Agent != w.agent || r.Model != w.model || r.Text != w.text {
+			t.Errorf("rows[%d] = {role:%q agent:%q model:%q text:%q}, want {role:%q agent:%q model:%q text:%q}",
+				i, r.Role, r.Agent, r.Model, r.Text, w.role, w.agent, w.model, w.text)
+		}
+		if r.RunlogOffset != i+1 {
+			t.Errorf("rows[%d].RunlogOffset = %d, want %d", i, r.RunlogOffset, i+1)
+		}
+	}
+	if rows[1].Payload != `{"name":"researcher","args":"{\"request\":\"查时间\"}"}` {
+		t.Errorf("rows[1].Payload = %s, want 委派调用结构化负载", rows[1].Payload)
+	}
+	if rows[5].Payload != `{"name":"researcher","output":"现在是 15:04。"}` {
+		t.Errorf("rows[5].Payload = %s, want 回传结构化负载", rows[5].Payload)
+	}
+	// NULL 惯例（存储形态级）：user 行两列 NULL；root 行 agent NULL + model 非 NULL；
+	// researcher 行两列都非 NULL。
+	if !s.sqlBool(t, `SELECT (agent IS NULL AND model IS NULL) FROM runlog_entries WHERE run_id = ? AND role = 'user'`, rid) {
+		t.Error("user 行 agent/model 应为 NULL")
+	}
+	if !s.sqlBool(t, `SELECT bool_and(agent IS NULL AND model = '`+mainRef+`') FROM runlog_entries WHERE run_id = ? AND agent IS NULL AND role IN ('tool_call','tool_result','assistant')`, rid) {
+		t.Error("root 行应为 agent NULL + model 主 ref")
+	}
+	if !s.sqlBool(t, `SELECT bool_and(agent = 'researcher' AND model = '`+subRef+`') FROM runlog_entries WHERE run_id = ? AND role IN ('tool_call','tool_result','assistant') AND agent IS NOT NULL`, rid) {
+		t.Error("researcher 行应为 agent=researcher + model 其生效 ref")
 	}
 }
 

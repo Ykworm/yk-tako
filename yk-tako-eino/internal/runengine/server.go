@@ -247,8 +247,8 @@ func (s *Server) getFrames(c *gin.Context) {
 //
 //	GET /api/sessions/s_01/log?runlogOffset=0
 //	200 {"rows":[
-//	  {"runlogOffset":1,"runId":"r_1","role":"user","messageId":"m_1","text":"读一下 doc/19"},
-//	  {"runlogOffset":2,"runId":"r_1","role":"assistant","text":"好的，我来读……"}
+//	  {"runlogOffset":1,"runId":"r_1","role":"user","agent":"","model":"","messageId":"m_1","text":"读一下 doc/19"},
+//	  {"runlogOffset":2,"runId":"r_1","role":"assistant","agent":"","model":"deepseek/deepseek-flash","text":"好的，我来读……"}
 //	],"nextOffset":2}
 //	404 {"error":"session_not_found"}
 //
@@ -265,6 +265,8 @@ func (s *Server) getFrames(c *gin.Context) {
 // 内容约定：**这里永远只有已定稿的 message**，没有半截——生成中的半截在 §2 的 frames 里。
 // 所以 error 结局的残缺文本不进 runlog、也不另留痕（它只在 runlive 的 TTL 窗口内可见）。
 // 每条记录带 `runId`：客户端就是按它把定稿的 assistant 全文对上「正在生成」气泡做**替换**（收口）。
+// T3-2 起子代理的行也在列（工具动作行 + 各 agent 的终稿行）：`agent`/`model` 两列是溯源坐标
+// （agent 空 = root；model 空 = 非模型产物——user 行两列皆空）。
 func (s *Server) getSessionLog(c *gin.Context) {
 	from := queryOffset(c, "runlogOffset")
 	rows, next, exists, err := s.store.ReadLog(c.Request.Context(), SessionID(c.Param("id")), from, s.w)

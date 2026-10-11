@@ -191,9 +191,11 @@ type toolResultPayload struct {
 // staged（可 nil）是发送前 Stage 的折叠产物（C 系列）：**仅 complete 分支**并入同一笔事务——
 // 被压 run 原文行 compacted=true（保留不删）+ 新 seq=0 摘要行；error / 闸失 = 零写入，
 // 下一轮从原文重压（「原文从未被动过」，§10.4 落库时机的全部含义）。
-// turn 是 worker 累积的模型侧消息全序（T2）：complete 分支逐轮落 mh（seq 接 user 的 1 往下排）+
-// runlog 扩展行（tool_call / tool_result）；终稿 assistant 行仍以 draft 为准（= 全 run delta 累计，
-// 收口替换的锚）。**error / 闸失 = turn 零写入**——与「error 结局只留 user 那一半」的既有形状一致。
+// turn 是 worker 累积的模型侧消息全序（T2），T3-2 起含子代理条目（Agent 归属）：complete 分支
+// 按两个投影分拣——mh 只装 root 条目（seq 接 user 的 1 往下连续排、跳过子代理），runlog 全量
+// （扩展行 + 各 agent 的终稿行，agent/model 两列随行）；root 终稿 assistant 行仍以 draft 为准
+// （= 全 run delta 累计，收口替换的锚）。**error / 闸失 = turn 零写入**——与「error 结局只留
+// user 那一半」的既有形状一致。
 //
 // 守卫 = 统一谓词「闸在手上」（status='running' AND lease_until > now()，与读侧同式）：
 // 影响 0 行 = 本 run 不归自己了（已放 / 已被清扫 / 租约已过）→ 空转（false, nil）。
@@ -255,10 +257,16 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 			}
 			// 本 run 的模型侧消息逐轮落 mh（seq 从 user 的 1 往下排）：assistant 轮带 tool_calls、
 			// tool 轮带 tool_call_id——下一轮 prepareInput 就按这两列重建 OpenAI 工具消息。
+			// T3-2：mh 只装 root 条目（子代理中间过程不进模型输入，19v6-05 §4 三投影）——
+			// seq 用显式计数器保持连续，被跳过的子代理条目不占号。
 			// 两列「缺席即 NULL」（与 message_id 同约定）：assistant 轮的 tool_call_id、tool 轮的
 			// tool_calls、无调用的终轮两列，一律不写字面空串。
 			// turn 末项 = 终轮 assistant：正文 = 终轮本体（工具轮前导语各在自己那轮里，不重复）。
-			for i, e := range turn {
+			mhSeq := 2
+			for _, e := range turn {
+				if e.Agent != "" {
+					continue
+				}
 				var callsSQL, callIDSQL any // nil = NULL
 				if len(e.ToolCalls) > 0 {
 					b, err := json.Marshal(e.ToolCalls)
@@ -277,14 +285,20 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 				if err := tx.Exec(
 					`INSERT INTO run_model_messages (id, session_id, run_id, seq, role, text, tool_calls, tool_call_id, compacted, created_at)
 					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, false, now())`,
-					msgID, sessionID, runID, i+2, e.Role, e.Text, callsSQL, callIDSQL).Error; err != nil {
+					msgID, sessionID, runID, mhSeq, e.Role, e.Text, callsSQL, callIDSQL).Error; err != nil {
 					return err
 				}
+				mhSeq++
 			}
-			// runlog 扩展行（消息粒度）：tool_call 每次调用一行、tool_result 每个结果一行——
-			// text 可直接展示、payload 结构化（字段与同名帧对应）。与 assistant 定稿行同笔：
-			// 要么整轮可见，要么整笔没写。
+			// runlog 全量行（T3-2，消息粒度）：root 与子代理都写——tool 条目 → tool_result 行；
+			// assistant 条目 → tool_call 行 + 文本进该 agent 的暂存。子代理遇无 tool_calls 的末轮 =
+			// 它的终稿：落一行 assistant（agent=名、model=其生效 ref），与 root 终稿=draft 同构；
+			// root 的暂存不落行（它的终稿行在下面——draft）。会话内同一 agent 二次委派 = 暂存清空重算
+			// （终稿各归各的调用）。各行的 agent/model 两列空值照「缺省即 NULL」惯例（读侧归一成 ""）。
+			// 与 assistant 定稿行同笔：要么整轮可见，要么整笔没写。
+			pending := map[string]string{} // agent 名 → 该 agent 已出的 assistant 文本累计（root 键 = ""）
 			for _, e := range turn {
+				agentSQL, modelSQL := nullable(e.Agent), nullable(e.Model)
 				if e.Role == "tool" {
 					payload, err := json.Marshal(toolResultPayload{Name: e.ToolName, Output: e.Text})
 					if err != nil {
@@ -295,12 +309,28 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 						return err
 					}
 					if err := tx.Exec(
-						`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, message_id, text, payload, created_at)
+						`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, payload, created_at)
 						 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
-						         ?, 'tool_result', NULL, ?, ?, now())`,
-						logID, sessionID, sessionID, runID, e.Text, string(payload)).Error; err != nil {
+						         ?, 'tool_result', ?, ?, NULL, ?, ?, now())`,
+						logID, sessionID, sessionID, runID, agentSQL, modelSQL, e.Text, string(payload)).Error; err != nil {
 						return err
 					}
+					continue
+				}
+				pending[e.Agent] += e.Text
+				if e.Agent != "" && len(e.ToolCalls) == 0 {
+					logID, err := newRowID("rl_")
+					if err != nil {
+						return err
+					}
+					if err := tx.Exec(
+						`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, created_at)
+						 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
+						         ?, 'assistant', ?, ?, NULL, ?, now())`,
+						logID, sessionID, sessionID, runID, agentSQL, modelSQL, pending[e.Agent]).Error; err != nil {
+						return err
+					}
+					pending[e.Agent] = ""
 					continue
 				}
 				for _, tc := range e.ToolCalls {
@@ -313,26 +343,36 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 						return err
 					}
 					if err := tx.Exec(
-						`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, message_id, text, payload, created_at)
+						`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, payload, created_at)
 						 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
-						         ?, 'tool_call', NULL, ?, ?, now())`,
-						logID, sessionID, sessionID, runID, tc.Function.Name+"("+tc.Function.Arguments+")", string(payload)).Error; err != nil {
+						         ?, 'tool_call', ?, ?, NULL, ?, ?, now())`,
+						logID, sessionID, sessionID, runID, agentSQL, modelSQL, tc.Function.Name+"("+tc.Function.Arguments+")", string(payload)).Error; err != nil {
 						return err
 					}
+				}
+			}
+			// root 模型生效 ref（终稿行的 model 值）：取自 root 条目的 Model（T3-1b 起每条都带；
+			// turn 全空 = 无模型产物，照旧 NULL）。
+			rootModel := ""
+			for _, e := range turn {
+				if e.Agent == "" && e.Model != "" {
+					rootModel = e.Model
+					break
 				}
 			}
 			logID, err := newRowID("rl_")
 			if err != nil {
 				return err
 			}
-			// 终稿 assistant 行（text=draft）：与旧形状逐字节一致，「Σ delta == 定稿全文」的收口锚。
+			// 终稿 assistant 行（text=draft）：与旧形状逐字节一致（agent NULL + model=主 ref），
+			// 「Σ delta == 定稿全文」的收口锚。
 			// RETURNING 拿回本行 seq 即 runlogOffset（旧 Lua 的 LLEN 语义）。
 			if err := tx.Raw(
-				`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, message_id, text, created_at)
+				`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, created_at)
 				 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
-				         ?, 'assistant', NULL, ?, now())
+				         ?, 'assistant', NULL, ?, NULL, ?, now())
 				 RETURNING seq`,
-				logID, sessionID, sessionID, runID, draft).Scan(&nextSeq).Error; err != nil {
+				logID, sessionID, sessionID, runID, nullable(rootModel), draft).Scan(&nextSeq).Error; err != nil {
 				return err
 			}
 		} else {
@@ -412,6 +452,15 @@ func (s *Store) Reset(ctx context.Context) (deleted int, err error) {
 		}
 		cursor = next
 	}
+}
+
+// nullable 把「空串 = 缺省」翻成 SQL NULL（T3-2：runlog 的 agent/model 两列空/非空都可能，
+// 惯例不变——NULL 入、读侧归一成 ""）。
+func nullable(v string) any {
+	if v == "" {
+		return nil
+	}
+	return v
 }
 
 // isUniqueViolation 认「唯一约束冲突」：TranslateError 路径翻成 gorm.ErrDuplicatedKey；

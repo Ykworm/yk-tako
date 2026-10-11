@@ -10,23 +10,29 @@ type RunID string
 
 // Row 是 runlog 里的一条定稿记录（19v6-01 §3）。
 // RunlogOffset 不落存储、读时按 index+1 注入（omitempty 保证存储形态不含它）。
-// Agent 恒在（空 = root，19v6-01 §3）；Payload 只有工具扩展行（role=tool_call/tool_result）有。
+// Agent / Model 恒在（19v6-01 §3）：Agent 空 = root；Model = 产出该行的模型生效 ref，
+// 空 = 非模型产物（user 行——两列都空）。
+// Payload 只有工具扩展行（role=tool_call/tool_result）有。
 type Row struct {
 	RunlogOffset int    `json:"runlogOffset,omitempty"`
 	RunID        RunID  `json:"runId"`
 	Role         string `json:"role"`
 	Agent        string `json:"agent"`
+	Model        string `json:"model"`
 	MessageID    string `json:"messageId,omitempty"`
 	Text         string `json:"text"`
 	Payload      string `json:"payload,omitempty"`
 }
 
 // Frame 是 runlive 里的一帧（19v6-01 §2）。EventOffset 同理，读时注入。
-// Agent 恒在（空 = root，含 start/terminal）；Name/Args/Output 是工具帧（kind=tool_call/tool_result）的负载。
+// Agent / Model 恒在（无 omitempty）：Agent 空 = root（含 start/terminal）；Model = 产出该帧的模型
+// 生效 ref（T3-1b，与 TAKO_MODEL 同词表），空 = 非模型产物（start/terminal）。
+// Name/Args/Output 是工具帧（kind=tool_call/tool_result）的负载。
 type Frame struct {
 	EventOffset int    `json:"eventOffset,omitempty"`
 	Kind        string `json:"kind"`
 	Agent       string `json:"agent"`
+	Model       string `json:"model"`
 	MessageID   string `json:"messageId,omitempty"`
 	Name        string `json:"name,omitempty"`
 	Args        string `json:"args,omitempty"`
@@ -53,10 +59,14 @@ type ModelMessage struct {
 // TurnEntry 是 worker 在 run 内累积的一条模型侧消息（T2 归一层产物，随 defer 交 EndRun 落库），
 // 与 ModelMessage 同形状、方向相反（产出侧）：assistant 轮带 ToolCalls，tool 轮带 ToolCallID/ToolName。
 // 全部 PG 写收在 EndRun 的一笔事务里：要么整轮消息齐进 mh/runlog，要么一字不写（error / 闸失 = 零写入）。
+// T3-2 加 Agent（空 = root、非空 = 子代理名）：EndRun 按它分拣两个投影——mh 只装 root 条目，
+// runlog 全量装（子代理条目连 agent/model 两列一起落，供历史溯源）。
 type TurnEntry struct {
 	Role       string            // "assistant" / "tool"
 	Text       string            // assistant：本轮正文（前导语就在自己这轮）；tool：结果全文
 	ToolCalls  []schema.ToolCall // assistant 轮：模型给出的工具调用（原样落 JSON）
 	ToolCallID string            // tool 轮：回指 assistant 轮 tool_calls 里的 id
 	ToolName   string            // tool 轮：工具名（tool_result 帧 / runlog 扩展行用）
+	Agent      string            // T3-2：产出该条目的 agent 名；空 = root
+	Model      string            // 产出该条目的模型生效 ref（T3-1b 填）
 }

@@ -158,10 +158,11 @@ func (s *Store) ReadFrames(ctx context.Context, runID RunID, from, w int) (frame
 }
 
 // AppendDelta 追加一帧 delta 并累加 draft 全文（19v6-03「生命周期」）——每 delta 一次的热路径，D1 零变化。
-// ok=false = run 不存在或已结束（draft 已随 run 结束删除，即「liveness 由 draft 承载」）。
-func (s *Store) AppendDelta(ctx context.Context, runID RunID, text string) (eventOffset int, ok bool, err error) {
+// model 是产出该 delta 的模型生效 ref（T3-1b）：本口只服务 root 正文（子代理 delta 走 AppendFrame、
+// 不累 draft）。ok=false = run 不存在或已结束（draft 已随 run 结束删除，即「liveness 由 draft 承载」）。
+func (s *Store) AppendDelta(ctx context.Context, runID RunID, model, text string) (eventOffset int, ok bool, err error) {
 	// 帧本身在写侧不填 EventOffset——读时 ReadFrames 按 LIST index+1 统一注入，写侧只读 LLEN 当返回值。
-	frameJSON, err := json.Marshal(Frame{Kind: "delta", Text: text})
+	frameJSON, err := json.Marshal(Frame{Kind: "delta", Model: model, Text: text})
 	if err != nil {
 		return 0, false, err
 	}

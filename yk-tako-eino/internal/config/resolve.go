@@ -252,9 +252,16 @@ func joinIDs(providers []ResolvedProvider) string {
 	return strings.Join(ids, "、")
 }
 
-// ResolveModel 从环境变量选出当前要用的厂商和模型。
+// ResolveModel 从环境变量选出当前要用的厂商和模型（TAKO_MODEL 的解析入口）。
 func ResolveModel(env Env) (ResolvedModel, error) {
-	spec := strings.TrimSpace(env["TAKO_MODEL"])
+	return ResolveModelWithRef(env, env["TAKO_MODEL"])
+}
+
+// ResolveModelWithRef 把一条 ref 解析成厂商+模型：ref 与 TAKO_MODEL 同词表同写法（「厂商/模型」，
+// 也照 TAKO_MODEL 的既有宽松度认裸模型名）。TAKO_MODEL 与子代理 md 的 model: 行同走这一条链
+// （19v6-05 §4「解析链同源」）——同一个 ref 两边行为一致，不会出现「主 worker 能调通、子代理调不通」。
+func ResolveModelWithRef(env Env, ref string) (ResolvedModel, error) {
+	spec := strings.TrimSpace(ref)
 	providers, err := discoverProviders(env)
 	if err != nil {
 		return ResolvedModel{}, err

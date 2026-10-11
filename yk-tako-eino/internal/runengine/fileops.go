@@ -1,5 +1,6 @@
-// 本文件是 fileOps 机械路径保留的提取与分类（C5-A4；设计真源 = 19v6-07 §5「fileOps 式机械路径保留」，
-// 2026-10-11 细化定稿；本拍只做提取与分类，钉块/跨压缩继承/块往返归 A5）。
+// 本文件是 fileOps 机械路径保留的提取、分类与块往返（C5-A4 提取器 + C5-A5 钉块；
+// 设计真源 = 19v6-07 §5「fileOps 式机械路径保留」）。块本体（标记+两组条目的渲染、
+// 解析、合并）在本文件末节；钉块与三档收口检查的接线在 compact.go 的 foldInput。
 //
 // 动机（WeKnora 战例）：散文最先丢路径——模型丢掉「我写过 /workspace/output/deck.html」的
 // 记忆后，会去重建磁盘上已存在的文件（大文件分块写 + 重启 = 永不终止的循环）。治法 = 从
@@ -371,7 +372,7 @@ func hasToken(seg []string, tok string) bool {
 }
 
 // fileOpsTableCap 是减灾档的单表上限（19v6-07 §5 三档降级链，2026-10-11 用户裁定）：
-// 常态不封顶；钉块时 S+块+tail 超预算帽 → 两张表各砍到此数（读过 50、改过 50，公平对待、
+// 常态不封顶；钉块时含块收口检查不过 → 两张表各砍到此数（读过 50、改过 50，公平对待、
 // 无优先级），重渲染再验；仍超 → 折叠失败走干净 A。
 const fileOpsTableCap = 50
 
@@ -384,7 +385,7 @@ type resolvedOps struct {
 // resolveOps 把三张清单归并成两表（常态不封顶——三档降级链第 1 档）：
 //   - 改过 = written 与 edited 合并（同 path 保留先进；written 条目先于 edited 入池）；
 //   - 读过 = read 剔除改过表里的 path（写过的不会出现在读过里，与收集顺序无关）；
-//   - 封顶是减灾档动作（第 2 档）：capOps 由 A5 在 S+块+tail 超帽时调用，不在此处常驻。
+//   - 封顶是减灾档动作（第 2 档）：capOps 由 A5 在含块收口检查不过时调用，不在此处常驻。
 func resolveOps(ops fileOps) resolvedOps {
 	changed := make([]fileOpEntry, 0, len(ops.written)+len(ops.edited))
 	taken := make(map[string]bool, len(ops.written)+len(ops.edited))
@@ -408,7 +409,7 @@ func resolveOps(ops fileOps) resolvedOps {
 }
 
 // capOps 淘汰最老：超出上限时从头部砍（进池先后 = 淘汰顺序，先进的先淘汰）。
-// 身份 = 减灾档工具（A5 在 S+块+tail 超帽时调用）；常态不调用——resolveOps 不封顶。
+// 身份 = 减灾档工具（A5 在含块收口检查不过时调用）；常态不调用——resolveOps 不封顶。
 func capOps(list []fileOpEntry) []fileOpEntry {
 	if len(list) <= fileOpsTableCap {
 		return list
@@ -421,4 +422,119 @@ func capOps(list []fileOpEntry) []fileOpEntry {
 //   - /workspace/output/deck.html（write_file，r_XXXX）
 func renderFileOpLine(e fileOpEntry) string {
 	return fmt.Sprintf("- %s（%s，%s）", e.path, e.tool, e.runID)
+}
+
+// ---- 块往返（C5-A5）：格式常量 + 渲染/解析/合并。字节契约 = 19v6-07 §5 样本 ----
+
+// fileOpsBlockOpen / fileOpsBlockClose 是块的稳定标记（含版本位 v1——程序靠它认块；
+// 没有标记的旧散文摘要自然无从继承）。fileOpsBlockSep 是钉块时摘要正文与块之间的分隔。
+const (
+	fileOpsBlockOpen  = "<!-- tako:file-ops v1 -->"
+	fileOpsBlockClose = "<!-- /tako:file-ops -->"
+	fileOpsBlockSep   = "\n\n"
+)
+
+// renderFileOpsBlock 渲染块（改过组在前、读过组在后，组序恒定；空组整段省略——空槽省略的
+// 同款语义）。两组都空 → 空串 = 无块（钉块点据此跳过检查，无 file 工具的会话零行为变化的落点）。
+func renderFileOpsBlock(r resolvedOps) string {
+	if len(r.changed) == 0 && len(r.read) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(fileOpsBlockOpen)
+	b.WriteString("\n")
+	if len(r.changed) > 0 {
+		b.WriteString("改过:\n")
+		for _, e := range r.changed {
+			b.WriteString(renderFileOpLine(e))
+			b.WriteString("\n")
+		}
+	}
+	if len(r.read) > 0 {
+		b.WriteString("读过:\n")
+		for _, e := range r.read {
+			b.WriteString(renderFileOpLine(e))
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString(fileOpsBlockClose)
+	return b.String()
+}
+
+// parseFileOpsBlock 解析一段摘要文本里的块（继承半边；失败 = 按空处理 + log，不拒收——
+// 验货不扩面的同一原则）。取**最后一个**开标记：程序钉的块永远在摘要末尾，模型若把见过的
+// 旧块 echo 进正文，靠后的才是权威那份——echo 冒充不了继承源。
+func parseFileOpsBlock(text string) fileOps {
+	i := strings.LastIndex(text, fileOpsBlockOpen)
+	if i < 0 {
+		return fileOps{}
+	}
+	rest := text[i+len(fileOpsBlockOpen):]
+	j := strings.Index(rest, fileOpsBlockClose)
+	if j < 0 {
+		log.Printf("fileops: 摘要里的 file-ops 块缺闭标记，按空处理")
+		return fileOps{}
+	}
+	var ops fileOps
+	bucket := ""
+	for _, raw := range strings.Split(rest[:j], "\n") {
+		line := strings.TrimSpace(raw)
+		switch {
+		case line == "":
+		case line == "改过:":
+			bucket = "written"
+		case line == "读过:":
+			bucket = "read"
+		case bucket == "" || !strings.HasPrefix(line, "- "):
+			// 单行坏点跳过（逐行容错）：坏一行丢一行，不丢整块——保管方向宁多留
+			log.Printf("fileops: file-ops 块里跳过无法解析的行: %q", line)
+		default:
+			e, ok := parseFileOpLine(strings.TrimPrefix(line, "- "))
+			if !ok {
+				log.Printf("fileops: file-ops 块条目行形状不对，跳过: %q", line)
+				continue
+			}
+			ops.add(bucket, e)
+		}
+	}
+	return ops
+}
+
+// parseFileOpLine 解析一条条目行（renderFileOpLine 的逆）：path（tool，runID）——
+// path 取最后一个「（」之前（路径本身可能含括号）；工具名 / run id 里不会出现「，」。
+func parseFileOpLine(s string) (fileOpEntry, bool) {
+	open := strings.LastIndex(s, "（")
+	if open <= 0 || !strings.HasSuffix(s, "）") {
+		return fileOpEntry{}, false
+	}
+	parts := strings.Split(s[open+len("（"):len(s)-len("）")], "，")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return fileOpEntry{}, false
+	}
+	return fileOpEntry{path: s[:open], tool: parts[0], runID: RunID(parts[1])}, true
+}
+
+// inheritFileOps 解析全部旧摘要文本里的块并合并（正常一代一块；多块按文本序，早的先进池）。
+func inheritFileOps(oldTexts []string) fileOps {
+	var ops fileOps
+	for _, t := range oldTexts {
+		ops = mergeFileOps(ops, parseFileOpsBlock(t))
+	}
+	return ops
+}
+
+// mergeFileOps 两批并一批：旧条目在前、新提取排后——这个先后就是淘汰顺序
+// （capOps 砍头 = 最老先走）。跨批按 path 去重交给 resolveOps 的 taken 表。
+func mergeFileOps(old, next fileOps) fileOps {
+	return fileOps{
+		read:    concatFileOpEntries(old.read, next.read),
+		written: concatFileOpEntries(old.written, next.written),
+		edited:  concatFileOpEntries(old.edited, next.edited),
+	}
+}
+
+func concatFileOpEntries(a, b []fileOpEntry) []fileOpEntry {
+	out := make([]fileOpEntry, 0, len(a)+len(b))
+	out = append(out, a...)
+	return append(out, b...)
 }

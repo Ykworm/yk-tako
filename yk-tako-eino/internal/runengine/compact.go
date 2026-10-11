@@ -87,11 +87,21 @@ var errStall = errors.New("compact: 摘要流 stall 超时")
 const (
 	// summarizeTemp 低温档 0.3（借 WeKnora 经验值）——摘要要稳不要花活。
 	summarizeTemp = 0.3
-	// summarizeMaxTokens 自设上限 = 三层验货算术主检的比对基线（completion ≥ 它 ⇒ 截断拒收）。
-	// 4096 是初值（dev 校准）：正常摘要远低于它，误杀代价仅多一次重试。
-	summarizeMaxTokens = 4096
 	// summarizeMaxAttempts = 1 + 重试 ≤2（19v6-07 §3「重试 ≤2 次」）。
 	summarizeMaxAttempts = 3
+)
+
+// 摘要预算帽分档的档常量（C5-A7；19v6-07 §5 分档表 = 2026-10-11 用户表落码）。
+// maxTokens（= 分档 ceiling）是两层身份：硬预算帽 + 三层验货算术主检的比对基线
+// （completion ≥ 它 ⇒ 按截断拒收，误杀代价仅多一次重试）。
+const (
+	summarizeCeilingSmallCap   = 1024    // 小窗式 min(limit/2, ·) 的反向校准封顶（防 verbose 超产，dev 位）
+	summarizeCeilingMid        = 4096    // 中窗固定档（= A3 现行常量，区间下限）
+	summarizeCeilingLarge      = 8192    // 大窗固定档（区间下限；不随被压段线性涨）
+	summarizeCeilingSmallBound = 32768   // 小窗档界：window ≤ 此值走小窗式
+	summarizeCeilingLargeBound = 1048576 // 大窗档界：window ≥ 此值走 8192
+	claudeCeilingFactorNum     = 13      // Claude override 系数 13/10 = 1.3（区间中值；整数算、截断）
+	claudeCeilingFactorDen     = 10
 )
 
 // compactAdmissionDivisor 是 POST 单条消息准入的除数（C5-A1，tail 支卡死的入口治法；
@@ -99,12 +109,50 @@ const (
 // cl100k 计数 > limit/divisor ⇒ 抢闸前拒收。
 const compactAdmissionDivisor = 3
 
-// summarizeBudgetDivisor 是摘要硬预算帽的除数（C5-A3，S 支）：S ≤ limit/2。
-// 校准（2026-10-11，A2/A3 实测）：除数 3 给 S = limit/3，window 4000 下帽 = 1066，
-// 而 A2 实录 S 高达 1221——帽低于模型的自然产出，折叠会假性验货拒收；
-// 除数 2 的守恒：S + tail_max = limit/2 + limit/3 = 5/6·limit < limit（n=0 恒有解，
-// 余 limit/6 给 keep 与估算误差）；256k 窗下 4096 常量仍接管。
+// summarizeBudgetDivisor 是小窗式 min(limit/2, 1024) 的除数（C5-A3 校准值；A7 起由
+// summarizeCeiling 的小窗分支使用）：除数 2 的守恒 S + tail_max = limit/2 + limit/3 = 5/6·limit < limit
+// （n=0 恒有解，余 limit/6 给 keep 与估算误差）；除数 3 在 window 4000 下帽 = 1066，低于
+// A2 实录 S = 1221（模型自然产出），已弃。
 const summarizeBudgetDivisor = 2
+
+// summarizeCeiling 按窗口分档算摘要预算帽（C5-A7；19v6-07 §5 分档表，纯函数，装配期一次）。
+//
+//	window ≤ 0（compact 关）        → 4096（A3 前常量语义；小窗式禁算——min(0,1024)=0 会把帽掐死）
+//	window ≤ 32768（小窗/dev）      → min(limit/2, 1024)——恒有解守恒体（limit/2）＋反向校准封顶
+//	32768 < window < 1048576（中窗）→ 4096；window ≥ 1048576（大窗）→ 8192（均区间下限，不插值）
+//
+// Claude override：ref 厂商段 = anthropic 或 ref 含 claude（大小写不敏感）→ 固定档（中/大）×13/10
+// ——只乘固定档，不乘小窗式（小窗式是恒有解算术本体，乘了破守恒），window=0 的兜底也不乘
+// （compact 关时 summarizer 永不跑，值不生效）。
+// maxOutput > 0（TAKO_MODEL_MAX_OUTPUT）最后硬顶：ceiling = min(ceiling, maxOutput)。
+func summarizeCeiling(window int, modelRef string, maxOutput int) int {
+	var ceiling int
+	switch {
+	case window <= 0:
+		ceiling = summarizeCeilingMid
+	case window <= summarizeCeilingSmallBound:
+		ceiling = min(window*4/5/summarizeBudgetDivisor, summarizeCeilingSmallCap)
+	case window < summarizeCeilingLargeBound:
+		ceiling = summarizeCeilingMid
+	default:
+		ceiling = summarizeCeilingLarge
+	}
+	if window > summarizeCeilingSmallBound && claudeRef(modelRef) {
+		ceiling = ceiling * claudeCeilingFactorNum / claudeCeilingFactorDen
+	}
+	if maxOutput > 0 {
+		ceiling = min(ceiling, maxOutput)
+	}
+	return ceiling
+}
+
+// claudeRef 认 Claude 系模型 ref：厂商段 = anthropic，或 ref 含 claude 子串（大小写不敏感）——
+// 厂商 id 与模型名由用户配置、大小写不可控，先小写化再判。
+func claudeRef(ref string) bool {
+	lower := strings.ToLower(ref)
+	provider, _, _ := strings.Cut(lower, "/")
+	return provider == "anthropic" || strings.Contains(lower, "claude")
+}
 
 // 分级截断的上限（19v6-07 §3「分级截断」，rune 计 + 截断标记）：
 // 工具结果动辄上万 token，不封顶则摘要输入无界；工具参数每 value 封顶保 k=v 行有界。
@@ -158,7 +206,7 @@ func (c cl100kCounter) Count(text string) int {
 // 不变式：AttachRun 必 ∈ DropRunIDs、且是本事件最后折入的原文 run（挂点唯一性，见文件头）。
 type StagedCompaction struct {
 	DropRunIDs []RunID // 被压掉的原文 run + 旧摘要行的 run
-	Summary    string  // 新摘要全文（已过 limit 检查，非空）
+	Summary    string  // 新摘要全文（含 file-ops 块，若有；已过含块收口检查，非空）
 	AttachRun  RunID   // 摘要行挂点（= DropRunIDs 中时序最后的一个）
 }
 
@@ -185,10 +233,18 @@ type runRows struct {
 // 纯函数——summarize 由调用方注入（worker 给「同 ChatStream 另起一次流式调用」），
 // 单测注入假件即可直测循环边界（C3）。
 //
+// C5-A5 钉块：定案处把 file-ops 块（旧块继承 ∪ 本次 drop 提取）钉进摘要末尾——
+// assembled[0] 与 staged.Summary 同源（本轮模型也看得到路径）。三档检查 = **重跑本循环自己的
+// 收口**（含块全量 < limit；2026-10-11 用户拍死口径，弃静态「S+块+tail ≤ 帽」算式：它不含 keep、
+// 且帽与摘要自身预算同值使块无预算、二档无成立空间）：全量钉 → 超则两表各砍 50 重渲染再验 →
+// 仍超 = 折叠失败（errStillOver，C2 已有链）。无操作 = 无块 = 检查不发生（无 file 工具会话零行为变化）。
+//
 // 返回值：新输入（摘要行 + keep + 当前 run 行）与 stagedCompaction；errStillOver = 不调主模型、零写入。
 // 前提：只有超限（countInput(history) > limit）才该进来；counter/summarize 非 nil。
+// fileEffects = 第一方工具 file_effect 声明表（fileops.go），钉块提取的判定入口。
 func foldInput(ctx context.Context, system string, history []ModelMessage, currentRun RunID,
-	limit int, counter TokenCounter, summarize func(context.Context, string) (string, error)) ([]ModelMessage, *StagedCompaction, error) {
+	limit int, counter TokenCounter, summarize func(context.Context, string) (string, error),
+	fileEffects map[string]string) ([]ModelMessage, *StagedCompaction, error) {
 
 	// ---- 分组：history 已按 (run_id, seq) 有序，run_id 是 ULID（字典序 = 时序）。----
 	// 不变量（D1 形态的自然结果）：可见行按 run 统一——被压 run 的行全 compacted（读不出来），
@@ -252,6 +308,25 @@ func foldInput(ctx context.Context, system string, history []ModelMessage, curre
 
 		total := countInput(counter, system, assembled)
 		if total < limit {
+			// C5-A5 钉块（收口口径，2026-10-11 用户拍）：块 = 旧块继承 ∪ 本次 drop 提取，
+			// 钉进发送候选的摘要末尾。三档检查（见函数头注释）在下面就地展开。
+			ops := mergeFileOps(inheritFileOps(oldSummaryTexts), extractFileOps(dropMessages(drop), fileEffects))
+			res := resolveOps(ops)
+			if block := renderFileOpsBlock(res); block != "" {
+				assembled[0].Text = summary + fileOpsBlockSep + block
+				if countInput(counter, system, assembled) >= limit { // 第 1 档：全量钉不过收口
+					// 第 2 档减灾：两张表各砍 50（公平对待、无优先级），重渲染再验
+					cappedRes := resolvedOps{changed: capOps(res.changed), read: capOps(res.read)}
+					capped := renderFileOpsBlock(cappedRes)
+					assembled[0].Text = summary + fileOpsBlockSep + capped
+					if over := countInput(counter, system, assembled); over >= limit {
+						// 第 3 档：仍超 = fold 失败走干净 A（errStillOver 哨兵，C2 已有链）
+						return nil, nil, fmt.Errorf("%w（fileOps 块：全量 %d tok、砍 50 后 %d tok；发送合计 %d tok ≥ limit %d）",
+							errStillOver, counter.Count(block), counter.Count(capped), over, limit)
+					}
+				}
+				summary = assembled[0].Text
+			}
 			stagedCompaction := &StagedCompaction{
 				DropRunIDs: append(append([]RunID{}, oldSummaryRuns...), ids(drop)...),
 				Summary:    summary,
@@ -401,6 +476,15 @@ func ids(groups []runRows) []RunID {
 	return out
 }
 
+// dropMessages 拍平被压 run 组的行（extractFileOps 的输入单位，C5-A5）。
+func dropMessages(drop []runRows) []ModelMessage {
+	var out []ModelMessage
+	for _, g := range drop {
+		out = append(out, g.rows...)
+	}
+	return out
+}
+
 // summarizer 是摘要调用的一条龙（19v6-07 §3「调用/旋钮/验货/失败出口」+ §5「结构化摘要」预算）：
 // 同一 ChatStream 另起一次流式生成（doc/12 §4：一次 Generate 级的动作，不另开 agent），排干取全文，
 // 三层验货过了才算数。worker 只持有它、prepareInput 把 summarize 方法注给 foldInput。
@@ -408,32 +492,27 @@ func ids(groups []runRows) []RunID {
 type summarizer struct {
 	chat            ChatStream
 	temp            float32       // 低温档（0.3，借 WeKnora 经验值）
-	maxTokens       int           // 自设上限 = min(4096, limit/2)——算术主检基线 + 硬预算帽（A3）
+	maxTokens       int           // = summarizeCeiling(window, ref, maxOutput)（A7 分档）——算术主检基线 + 硬预算帽
 	stallFirstToken time.Duration // 首 token 限时（初值 30s 待校准）
 	stallChunkGap   time.Duration // chunk 间隔限时（初值 30s 待校准）
 	stallTotal      time.Duration // 宽松总上限：本质仍是墙钟，仅防无限拖长
 	maxAttempts     int           // 1 + 重试 ≤2
 }
 
-// newSummarizer 给装配期的默认值（19v6-07 §3 旋钮三件套 + §5 预算；dev 校准后回改这里）。
-// limit = compactWindow×4/5（0 = compact 关）：硬帽让 n=0 时 S+tail ≤ 5/6·limit < limit 恒有解
-// （S 支卡死的数学封死；§5 推导 + A3 校准的 limit/2）；256k 窗下 limit/2 ≫ 4096，帽不生效、生产零影响。
-func newSummarizer(chat ChatStream, limit int) *summarizer {
-	s := &summarizer{
+// newSummarizer 给装配期的默认值（19v6-07 §3 旋钮三件套 + §5 分档预算；dev 校准后回改这里）。
+// ceiling = summarizeCeiling(window, modelRef, maxOutput)（C5-A7，装配期一次算好）——
+// 小窗下让 n=0 时 S+tail ≤ 5/6·limit < limit 恒有解（§5 推导 + A3 校准的守恒体）；
+// 中/大窗固定档与两个 override 的取值理由见 summarizeCeiling。
+func newSummarizer(chat ChatStream, ceiling int) *summarizer {
+	return &summarizer{
 		chat:            chat,
 		temp:            summarizeTemp,
-		maxTokens:       summarizeMaxTokens,
+		maxTokens:       ceiling,
 		stallFirstToken: 30 * time.Second,
 		stallChunkGap:   30 * time.Second,
 		stallTotal:      10 * time.Minute,
 		maxAttempts:     summarizeMaxAttempts,
 	}
-	if limit > 0 {
-		if capped := limit / summarizeBudgetDivisor; capped < s.maxTokens {
-			s.maxTokens = capped
-		}
-	}
-	return s
 }
 
 // summarize 对一份渲染输入产一份过验货的摘要。失败出口 = A 的 family（19v6-07 §3）：

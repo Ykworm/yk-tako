@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +30,19 @@ const (
 // defaultPGDSN 指向 dev 的独立 PG 实例（dev.sh 自举的一半；双 fail fast：PG 不在引擎起不来）。
 const defaultPGDSN = "host=127.0.0.1 port=5433 dbname=tako sslmode=disable"
 
+// modelRegistryResolver 把 config.ModelRegistry 适配成 runengine.ModelResolver（T3-1b）：
+// 接口定义在消费侧（runengine 不 import config），适配收在 main——config 的 *ChatModel
+// 摊平成 runengine.ModelInstance（协议名从强类型 ProtocolName 转字符串，跨过包边界即归一为原语）。
+type modelRegistryResolver struct{ r *config.ModelRegistry }
+
+func (a modelRegistryResolver) Get(ctx context.Context, ref string) (runengine.ModelInstance, error) {
+	m, err := a.r.Get(ctx, ref)
+	if err != nil {
+		return runengine.ModelInstance{}, err
+	}
+	return runengine.ModelInstance{Chat: m.Chat, Ref: m.Ref, Protocol: string(m.Protocol)}, nil
+}
+
 // defaultCompactWindow 是上下文压缩的窗口 token 数（C 系列；doc/12 §2：查不到就用 256000）。
 // 触发阈值 limit = window × 4/5（doc/12 §9）；0 = 关压缩（验收对照跑法）。
 const defaultCompactWindow = 256000
@@ -47,6 +61,23 @@ func durationEnv(key string, fallback time.Duration) time.Duration {
 	return d
 }
 
+// intEnv 取 .env/进程环境里的非负整数变量（C5-A7 的 TAKO_MODEL_MAX_OUTPUT 约定）：
+// 未设置回落 fallback；非整数或负值 = 启动即退（fail fast 一贯式，仿 durationEnv）。
+func intEnv(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		log.Fatalf("%s=%q 不是合法整数（正整数 tok；0 = 不顶）：%v", key, raw, err)
+	}
+	if n < 0 {
+		log.Fatalf("%s=%d 不能为负（0 = 不顶）", key, n)
+	}
+	return n
+}
+
 func main() {
 	// 先读 .env 再注册旗标：-lease-ttl/-lease-renew 的默认值取自 TAKO_LEASE_TTL/TAKO_LEASE_RENEW。
 	// Open() 内那次调用照旧（godotenv 不覆盖已设变量、可重复调），这里只是把它提前一步。
@@ -62,6 +93,8 @@ func main() {
 	compactWindow := flag.Int("compact-window", defaultCompactWindow, "context window in tokens for compaction; limit = window * 4/5; 0 disables")
 	agentsDir := flag.String("agents-dir", "agents", "directory of sub-agent specs (*.md + YAML frontmatter); scanned at each run start (relative to CWD)")
 	workspace := flag.String("workspace", "./workspace", "workspace root for first-party file tools; created at startup, tools are confined to it")
+	subagentConcurrency := flag.Int("subagent-concurrency", 8, "max concurrent subagent delegations (process-wide semaphore; must be >= 1)")
+	subagentReturnCap := flag.Int("subagent-return-cap", 51200, "max bytes of a subagent's return text handed back to the parent; excess is truncated with a notice (<=0 disables)")
 	flag.Parse()
 
 	// 必须 leaseRenew 严格小于 leaseTTL：
@@ -72,6 +105,10 @@ func main() {
 	// .env 的 TAKO_LEASE_* 是新增的配置面，手误把两个值输反是常见坑，fail fast 起不来比跑起来自毁好。
 	if *leaseRenew >= *leaseTTL {
 		log.Fatalf("lease-renew %s ≥ lease-ttl %s：必须严格小于（默认 30s/10s = 2 次漏续余量）", *leaseRenew, *leaseTTL)
+	}
+	// 委派并发闸容量 0 = 信号量为空通道：每笔委派都永久等闸（直到 run ctx 取消）——同类手误，启动即退。
+	if *subagentConcurrency < 1 {
+		log.Fatalf("subagent-concurrency %d < 1：并发闸至少要 1 个位（0 = 所有委派永久等闸）", *subagentConcurrency)
 	}
 
 	ctx := context.Background()
@@ -107,9 +144,17 @@ func main() {
 	}
 	log.Printf("workspace %s", wsAbs)
 
+	// C5-A7：摘要预算帽的硬顶（正整数 tok；缺省/0 = 不顶；解析失败/负由 intEnv fail fast）。
+	maxOutput := intEnv("TAKO_MODEL_MAX_OUTPUT", 0)
+
+	// T3-1b：子代理 `model:` 写值档的模型客户端缓存（进程内懒加载，19v6-05 §4）——启动时为空，
+	// 第一条用到某个 ref 的规格进来才建对应客户端；解析失败是逐条拒载（不 fail fast，
+	// 与 TAKO_MODEL 的启动 fail fast 不同：主模型没有可降级对象，子代理规格有）。
+	modelRegistry := config.NewModelRegistry(config.Environ())
+
 	// agent 装配（T1）失败也是启动错误：装配不出来 = 主循环跑不了，fail fast 一贯式。
 	// T3：agentsDir 只是规格目录位置（装载是 run 起手扫盘、失败降级为 log）——目录不存在不算启动错误。
-	worker, err := runengine.NewWorker(store, opened.Chat, runengine.TranslatorFor(string(opened.Protocol)), config.SystemPrompt(), wsAbs, *agentsDir, *leaseRenew, *compactWindow, counter)
+	worker, err := runengine.NewWorker(store, opened.Chat, runengine.TranslatorFor(string(opened.Protocol)), config.SystemPrompt(), wsAbs, *agentsDir, *leaseRenew, *compactWindow, opened.Ref, maxOutput, *subagentConcurrency, *subagentReturnCap, modelRegistryResolver{modelRegistry}, counter)
 	if err != nil {
 		log.Fatalf("agent 装配: %v", err)
 	}
@@ -118,6 +163,7 @@ func main() {
 	} else {
 		log.Printf("compact off (-compact-window 0)")
 	}
+	log.Printf("subagents: concurrency %d, return cap %d B", *subagentConcurrency, *subagentReturnCap)
 	r := runengine.NewRouter(store, *batch, *dev, worker)
 	log.Fatal(r.Run(*engine))
 }

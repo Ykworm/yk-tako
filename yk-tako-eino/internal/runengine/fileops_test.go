@@ -1,9 +1,11 @@
-// fileOps 提取与分类的 fixture 网（C5-A4；每条规则一个用例，与 19v6-07 §5 钉死的规则表一一对应）。
-// 池内暂时没有 file 工具（e2e 活体转正点 = 首个 file 工具那拍），所以 tool_calls JSON 直接造。
+// fileOps 提取、分类与块往返的 fixture 网（C5-A4 提取器 + C5-A5 块；每条规则一个用例，
+// 与 19v6-07 §5 钉死的规则表一一对应）。单测直喂 tool_calls JSON——绕开真工具，
+// 规则表本身即被测物。
 package runengine
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/cloudwego/eino/schema"
@@ -237,7 +239,7 @@ func TestFileOpsShellVarExpansion(t *testing.T) {
 }
 
 // fixture 21 上限与淘汰（三档降级链，用户 2026-10-11 裁定）：常态 resolveOps 不封顶；
-// capOps 是减灾档工具（A5 在 S+块+tail 超帽时调用）——砍最老（先进先出），两表各自独立砍。
+// capOps 是减灾档工具（A5 在含块收口检查不过时调用）——砍最老（先进先出），两表各自独立砍。
 func TestFileOpsCapEvictsOldest(t *testing.T) {
 	registry := map[string]string{"read_file": "read", "write_file": "write"}
 	var msgs []ModelMessage
@@ -287,5 +289,141 @@ func TestFileOpsShellCommandWordOnlyAtSegmentStart(t *testing.T) {
 	for _, cmd := range []string{"echo touch d1", "printf %s cp", "echo cp a b"} {
 		ops := extractFileOps([]ModelMessage{fileCallMsg("r_1", fileCall("bash", fmt.Sprintf(`{"command":%q}`, cmd)))}, nil)
 		assertEntries(t, cmd, ops.written, nil)
+	}
+}
+
+// ---- 块往返（C5-A5）：渲染/解析/合并/淘汰。字节契约 = 19v6-07 §5 样本 ----
+
+// 渲染字节精确钉死：开标记、组头、全角标点条目行、闭标记；改过组在前。
+func TestFileOpsBlockRenderExactBytes(t *testing.T) {
+	got := renderFileOpsBlock(resolvedOps{
+		changed: []fileOpEntry{{path: "/workspace/output/deck.html", tool: "write_file", runID: "r_01"}},
+		read:    []fileOpEntry{{path: "/workspace/spec.md", tool: "read_file", runID: "r_01"}},
+	})
+	want := "<!-- tako:file-ops v1 -->\n" +
+		"改过:\n" +
+		"- /workspace/output/deck.html（write_file，r_01）\n" +
+		"读过:\n" +
+		"- /workspace/spec.md（read_file，r_01）\n" +
+		"<!-- /tako:file-ops -->"
+	if got != want {
+		t.Fatalf("块渲染字节漂移：\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+// 空组整段省略（空槽省略的同款）；两组都空 → 空串 = 无块。
+func TestFileOpsBlockRenderSkipsEmptyGroups(t *testing.T) {
+	onlyChanged := renderFileOpsBlock(resolvedOps{changed: []fileOpEntry{{path: "a", tool: "write_file", runID: "r_1"}}})
+	if strings.Contains(onlyChanged, "读过:") {
+		t.Fatalf("空读组不应出现组头：%q", onlyChanged)
+	}
+	onlyRead := renderFileOpsBlock(resolvedOps{read: []fileOpEntry{{path: "b", tool: "read_file", runID: "r_1"}}})
+	if strings.Contains(onlyRead, "改过:") {
+		t.Fatalf("空改过组不应出现组头：%q", onlyRead)
+	}
+	if got := renderFileOpsBlock(resolvedOps{}); got != "" {
+		t.Fatalf("两组都空应得空串：%q", got)
+	}
+}
+
+// 钉→解析→合并全链往返回收：render 的字节重新 parse，条目三元组原样还原、组不串。
+func TestFileOpsBlockRoundTrip(t *testing.T) {
+	res := resolvedOps{
+		changed: []fileOpEntry{
+			{path: "/w/a.html", tool: "write_file", runID: "r_01"},
+			{path: "/w/b.md", tool: "edit_file", runID: "r_02"},
+		},
+		read: []fileOpEntry{{path: "/w/c.md", tool: "read_file", runID: "r_03"}},
+	}
+	block := renderFileOpsBlock(res)
+	ops := parseFileOpsBlock("摘要正文\n\n" + block)
+	assertEntries(t, "changed→written", ops.written, res.changed)
+	assertEntries(t, "read", ops.read, res.read)
+	assertEntries(t, "edited", ops.edited, nil)
+}
+
+// 路径含「（」时取最后一个开括号：路径本身可能带括号，工具/run 注记里不会。
+func TestFileOpsBlockParsePathWithParen(t *testing.T) {
+	ops := parseFileOpsBlock("<!-- tako:file-ops v1 -->\n改过:\n- /w/我的（草稿）.md（write_file，r_1）\n<!-- /tako:file-ops -->")
+	assertEntries(t, "written", ops.written, []fileOpEntry{{path: "/w/我的（草稿）.md", tool: "write_file", runID: "r_1"}})
+}
+
+// 解析容错：坏行跳过（log），好行保留；分不清桶的散行也跳过、不吞整块。
+func TestFileOpsBlockParseToleratesBadLines(t *testing.T) {
+	text := "<!-- tako:file-ops v1 -->\n" +
+		"改过:\n" +
+		"- /w/good.md（write_file，r_1）\n" +
+		"- 没有全角注记的行\n" +
+		"这是一行散装垃圾\n" +
+		"读过:\n" +
+		"- /w/another.md（read_file，r_2）\n" +
+		"<!-- /tako:file-ops -->"
+	ops := parseFileOpsBlock(text)
+	assertEntries(t, "written", ops.written, []fileOpEntry{{path: "/w/good.md", tool: "write_file", runID: "r_1"}})
+	assertEntries(t, "read", ops.read, []fileOpEntry{{path: "/w/another.md", tool: "read_file", runID: "r_2"}})
+}
+
+// 无块 / 版本位不符（v2 不是 v1 的开标记）/ 缺闭标记（结构失败整块按空 + log）都不炸。
+func TestFileOpsBlockParseMissingOrBroken(t *testing.T) {
+	assertEntries(t, "无块", parseFileOpsBlock("纯散文摘要，没有块").read, nil)
+	assertEntries(t, "v2 不匹配", parseFileOpsBlock("<!-- tako:file-ops v2 -->\n改过:\n- a（w，r）\n").written, nil)
+	broken := "<!-- tako:file-ops v1 -->\n改过:\n- /w/a.md（write_file，r_1）\n（无闭标记）"
+	assertEntries(t, "缺闭标记按空", parseFileOpsBlock(broken).written, nil)
+}
+
+// 取最后一个开标记：模型 echo 进正文的旧块冒充不了继承源（程序钉的块永远在摘要末尾）。
+func TestFileOpsBlockParseTakesLastCopy(t *testing.T) {
+	text := "旧内容里 echo 的伪块：\n<!-- tako:file-ops v1 -->\n改过:\n- /w/fake.md（write_file，r_fake）\n<!-- /tako:file-ops -->\n" +
+		"正文继续。\n\n" +
+		"<!-- tako:file-ops v1 -->\n读过:\n- /w/real.md（read_file，r_9）\n<!-- /tako:file-ops -->"
+	ops := parseFileOpsBlock(text)
+	assertEntries(t, "written", ops.written, nil)
+	assertEntries(t, "read", ops.read, []fileOpEntry{{path: "/w/real.md", tool: "read_file", runID: "r_9"}})
+}
+
+// 合并顺序 = 淘汰顺序：旧条目先进池，新提取排后；跨批同 path 去重交给 resolve。
+func TestFileOpsMergeOldBeforeNew(t *testing.T) {
+	old := fileOps{written: []fileOpEntry{{path: "/w/old.md", tool: "write_file", runID: "r_01"}}}
+	next := fileOps{written: []fileOpEntry{
+		{path: "/w/old.md", tool: "edit_file", runID: "r_02"}, // 跨批重复：去重后保留旧注记
+		{path: "/w/new.md", tool: "write_file", runID: "r_02"},
+	}}
+	res := resolveOps(mergeFileOps(old, next))
+	assertEntries(t, "changed", res.changed, []fileOpEntry{
+		{path: "/w/old.md", tool: "write_file", runID: "r_01"},
+		{path: "/w/new.md", tool: "write_file", runID: "r_02"},
+	})
+}
+
+// inherit 多块按文本序合并（正常一代一块；防御性多块场景同序）。
+func TestFileOpsInheritMultipleBlocks(t *testing.T) {
+	texts := []string{
+		"<!-- tako:file-ops v1 -->\n改过:\n- /w/a.md（write_file，r_1）\n<!-- /tako:file-ops -->",
+		"<!-- tako:file-ops v1 -->\n读过:\n- /w/b.md（read_file，r_2）\n<!-- /tako:file-ops -->",
+	}
+	ops := inheritFileOps(texts)
+	assertEntries(t, "written", ops.written, []fileOpEntry{{path: "/w/a.md", tool: "write_file", runID: "r_1"}})
+	assertEntries(t, "read", ops.read, []fileOpEntry{{path: "/w/b.md", tool: "read_file", runID: "r_2"}})
+}
+
+// 淘汰顺序端到端：旧块（先）∪ 新提取（后）合并 → capOps 砍头时旧条目先走。
+func TestFileOpsInheritThenCapEvictsOldFirst(t *testing.T) {
+	var oldLines strings.Builder
+	oldLines.WriteString("<!-- tako:file-ops v1 -->\n改过:\n")
+	for i := 0; i < 30; i++ {
+		oldLines.WriteString(fmt.Sprintf("- /old%02d（write_file，r_old）\n", i))
+	}
+	oldLines.WriteString("<!-- /tako:file-ops -->")
+	var msgs []ModelMessage
+	for i := 0; i < 30; i++ {
+		msgs = append(msgs, fileCallMsg("r_new", fileCall("write_file", fmt.Sprintf(`{"path":"/new%02d"}`, i))))
+	}
+	res := resolveOps(mergeFileOps(inheritFileOps([]string{oldLines.String()}), extractFileOps(msgs, nil)))
+	capped := capOps(res.changed)
+	if len(capped) != fileOpsTableCap {
+		t.Fatalf("cap 后 %d 条，want %d", len(capped), fileOpsTableCap)
+	}
+	if capped[0].path != "/old10" || capped[len(capped)-1].path != "/new29" {
+		t.Fatalf("淘汰应旧先走：头 %q 尾 %q，want /old10 与 /new29", capped[0].path, capped[len(capped)-1].path)
 	}
 }

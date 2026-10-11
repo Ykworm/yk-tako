@@ -77,6 +77,8 @@ func (RunModelMessage) TableName() string { return "run_model_messages" }
 // 只增不删：「seq N 恒指同一条消息」是客户端对齐游标只前进的地基。
 // T2 加 agent / payload 两列：agent 空 = root（T2 恒空，T3 起子代理行非空）；
 // payload 只有工具扩展行（role=tool_call/tool_result）有，存帧同款结构化负载的 JSON。
+// T3-2 加 model 列：产出该行的模型生效 ref——user 行为空（非模型产物），root 行 = 主 ref，
+// 子代理行 = 该规格的生效 ref（md 改 model 的持久验证面，19v6-05 §6）。
 type RunlogEntry struct {
 	ID        string    `gorm:"primaryKey"` // rl_<ULID>
 	SessionID SessionID `gorm:"not null;uniqueIndex:runlog_entries_session_seq,priority:1"`
@@ -84,6 +86,7 @@ type RunlogEntry struct {
 	RunID     RunID     `gorm:"not null"`
 	Role      string    `gorm:"not null"` // user / assistant / tool_call / tool_result（扩展行随 T2 工具循环）
 	Agent     string    // 产出该行的 agent 名；空 = root
+	Model     string    // 产出该行的模型生效 ref（T3-2）；空 = 非模型产物（user 行）
 	MessageID string    // 仅 user 行（契约：assistant 行无此字段）——可空
 	Text      string    `gorm:"not null"`
 	Payload   string    // 工具扩展行的结构化 JSON（{"name","args"|"output"}）——可空
@@ -189,6 +192,7 @@ func (s *Store) ReadLog(ctx context.Context, sessionID SessionID, from, w int) (
 			RunID:        e.RunID,
 			Role:         e.Role,
 			Agent:        e.Agent,
+			Model:        e.Model,
 			MessageID:    e.MessageID,
 			Text:         e.Text,
 			Payload:      e.Payload,

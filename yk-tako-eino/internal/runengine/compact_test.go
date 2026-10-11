@@ -58,8 +58,9 @@ func neverStream() (*schema.StreamReader[*schema.Message], *schema.StreamWriter[
 }
 
 // testSummarizer 小旋钮的 summarizer（stall 计时缩到毫秒级，不然单测要等 30s）。
+// 帽取中窗常量 4096：验货断言（completion ≥ 帽）在各测试自带的 completion 量级下行为同 A3。
 func testSummarizer(chat ChatStream) *summarizer {
-	s := newSummarizer(chat, 0)
+	s := newSummarizer(chat, summarizeCeilingMid)
 	s.stallFirstToken = 80 * time.Millisecond
 	s.stallChunkGap = 80 * time.Millisecond
 	s.stallTotal = 2 * time.Second
@@ -196,7 +197,7 @@ func TestFoldInputDescendsN(t *testing.T) {
 		[]ModelMessage{userRow("r5", 1, "eeee")},
 	)
 	// n=3: 7+4*3+4=23 ≥ 20 败；n=2: 7+4*2+4=19 < 20 定案。
-	assembled, staged, err := foldInput(context.Background(), "", history, "r5", 20, counter, summarize)
+	assembled, staged, err := foldInput(context.Background(), "", history, "r5", 20, counter, summarize, nil)
 	if err != nil {
 		t.Fatalf("foldInput: %v", err)
 	}
@@ -231,7 +232,7 @@ func TestFoldInputErrStillOver(t *testing.T) {
 		[]ModelMessage{userRow("r2", 1, "eeee")},
 	)
 	// n=0: 摘要 7 + tail 4 = 11 ≥ 5 → errStillOver。
-	_, _, err := foldInput(context.Background(), "", history, "r2", 5, counter, summarize)
+	_, _, err := foldInput(context.Background(), "", history, "r2", 5, counter, summarize, nil)
 	if !errors.Is(err, errStillOver) {
 		t.Fatalf("err=%v，want errStillOver", err)
 	}
@@ -246,9 +247,173 @@ func TestFoldInputSummarizeErrorPropagates(t *testing.T) {
 	boom := errors.New("模型炸了")
 	_, _, err := foldInput(context.Background(), "",
 		historyOf([]ModelMessage{userRow("r1", 1, "aaaa")}, []ModelMessage{userRow("r2", 1, "eeee")}),
-		"r2", 5, counter, func(context.Context, string) (string, error) { return "", boom })
+		"r2", 5, counter, func(context.Context, string) (string, error) { return "", boom }, nil)
 	if !errors.Is(err, boom) {
 		t.Fatalf("err=%v，want 原错误透传", err)
+	}
+}
+
+// ---- C5-A5：钉块与三档收口检查 ----
+
+// pinOnce 跑一次定案必成的 foldInput（limit 足够大、摘要固定 SUMMARY），返回组装输入与 staged。
+func pinOnce(t *testing.T, history []ModelMessage, fileEffects map[string]string) ([]ModelMessage, *StagedCompaction) {
+	t.Helper()
+	counter := fakeCounter{f: func(s string) int { return len([]rune(s)) }}
+	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 100000, counter,
+		func(context.Context, string) (string, error) { return "SUMMARY", nil }, fileEffects)
+	if err != nil {
+		t.Fatalf("foldInput: %v", err)
+	}
+	return assembled, staged
+}
+
+// 钉块全链：drop 里的 write_file 提取 → 块渲染 → 钉进 assembled[0] 与 staged.Summary（同源）。
+func TestFoldInputPinsFileOpsBlock(t *testing.T) {
+	history := historyOf(
+		[]ModelMessage{fileCallMsg("r1", fileCall("write_file", `{"path":"/tmp/a.txt"}`))},
+		[]ModelMessage{userRow("r_cur", 1, "eeee")},
+	)
+	assembled, staged := pinOnce(t, history, firstPartyFileEffects)
+	want := "SUMMARY\n\n<!-- tako:file-ops v1 -->\n改过:\n- /tmp/a.txt（write_file，r1）\n<!-- /tako:file-ops -->"
+	if staged.Summary != want {
+		t.Fatalf("staged.Summary 漂移：\n got %q\nwant %q", staged.Summary, want)
+	}
+	if assembled[0].Text != want {
+		t.Fatalf("发送候选的摘要行应同源钉块：got %q", assembled[0].Text)
+	}
+}
+
+// 无 file 调用 → 无块 → staged.Summary 与无 fileOps 时代逐字节相同（零行为变化）。
+func TestFoldInputNoOpsNoBlock(t *testing.T) {
+	history := historyOf(
+		[]ModelMessage{fileCallMsg("r1", fileCall("get_time", `{"tz":"Asia/Shanghai"}`))},
+		[]ModelMessage{userRow("r_cur", 1, "eeee")},
+	)
+	_, staged := pinOnce(t, history, firstPartyFileEffects)
+	if staged.Summary != "SUMMARY" {
+		t.Fatalf("无 file 调用不应有块：%q", staged.Summary)
+	}
+}
+
+// 收口第 1→2 档：全量 60 条钉入后合计 ≥ limit，砍到 50 条后 < limit 定案（砍最老 /f00–/f09）。
+func TestFoldInputBlockOverLimitCapsTo50(t *testing.T) {
+	calls := make([]schema.ToolCall, 0, 60)
+	for i := 0; i < 60; i++ {
+		calls = append(calls, fileCall("write_file", fmt.Sprintf(`{"path":"/f%02d"}`, i)))
+	}
+	history := historyOf(
+		[]ModelMessage{fileCallMsg("r1", calls...)},
+		[]ModelMessage{userRow("r_cur", 1, "eeee")},
+	)
+	// 行 22 runes ×60 = 1373 块；SUMMARY 7 + sep 2 + tail 4 = 13；limit 1200：
+	// 全量 1386 ≥ 1200 败第 1 档；砍 50 后 1166 < 1200 过第 2 档。
+	counter := fakeCounter{f: func(s string) int { return len([]rune(s)) }}
+	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 1200, counter,
+		func(context.Context, string) (string, error) { return "SUMMARY", nil }, firstPartyFileEffects)
+	if err != nil {
+		t.Fatalf("砍 50 后应收口成功: %v", err)
+	}
+	if got := strings.Count(staged.Summary, "（write_file，r1）"); got != fileOpsTableCap {
+		t.Fatalf("cap 后条目 %d 条，want %d", got, fileOpsTableCap)
+	}
+	if strings.Contains(staged.Summary, "/f00（") || strings.Contains(staged.Summary, "/f09（") {
+		t.Fatalf("应砍最老 /f00–/f09：%q", staged.Summary)
+	}
+	if !strings.Contains(staged.Summary, "/f10（") || !strings.Contains(staged.Summary, "/f59（") {
+		t.Fatalf("应保留 /f10–/f59：%q", staged.Summary)
+	}
+	if assembled[0].Text != staged.Summary {
+		t.Fatalf("发送候选与 staged 应同源（cap 版）")
+	}
+}
+
+// 收口第 3 档：砍 50 后仍 ≥ limit → errStillOver、staged 不产出（干净 A）。
+func TestFoldInputBlockStillOver(t *testing.T) {
+	calls := make([]schema.ToolCall, 0, 60)
+	for i := 0; i < 60; i++ {
+		calls = append(calls, fileCall("write_file", fmt.Sprintf(`{"path":"/f%02d"}`, i)))
+	}
+	history := historyOf(
+		[]ModelMessage{fileCallMsg("r1", calls...)},
+		[]ModelMessage{userRow("r_cur", 1, "eeee")},
+	)
+	counter := fakeCounter{f: func(s string) int { return len([]rune(s)) }}
+	_, staged, err := foldInput(context.Background(), "", history, "r_cur", 1100, counter,
+		func(context.Context, string) (string, error) { return "SUMMARY", nil }, firstPartyFileEffects)
+	if !errors.Is(err, errStillOver) {
+		t.Fatalf("err=%v，want errStillOver（砍 50 后 1166 ≥ 1100）", err)
+	}
+	if staged != nil {
+		t.Fatalf("第 3 档不应 Stage：%+v", staged)
+	}
+	if !strings.Contains(err.Error(), "fileOps 块") {
+		t.Fatalf("错误应点名 fileOps 块档位：%v", err)
+	}
+}
+
+// 继承：旧块条目先进池、新提取排后；同 path 跨批去重保留旧注记；DropRunIDs 含旧摘要 run。
+func TestFoldInputInheritsOldBlock(t *testing.T) {
+	oldSummary := "旧摘要正文\n\n<!-- tako:file-ops v1 -->\n改过:\n- /w/old.md（write_file，r_old）\n<!-- /tako:file-ops -->"
+	history := historyOf(
+		[]ModelMessage{{RunID: "r1", Seq: 0, Role: "user", Text: oldSummary}},
+		[]ModelMessage{
+			userRow("r2", 1, "再改一版"),
+			fileCallMsg("r2",
+				fileCall("write_file", `{"path":"/w/new.txt"}`),
+				fileCall("edit_file", `{"path":"/w/old.md"}`)),
+		},
+		[]ModelMessage{userRow("r_cur", 1, "eeee")},
+	)
+	_, staged := pinOnce(t, history, firstPartyFileEffects)
+	if strings.Count(staged.Summary, "/w/old.md") != 1 {
+		t.Fatalf("同 path 跨批应去重且保留旧注记：%q", staged.Summary)
+	}
+	if !strings.Contains(staged.Summary, "- /w/old.md（write_file，r_old）") {
+		t.Fatalf("旧条目注记应原样继承（旧在先）：%q", staged.Summary)
+	}
+	if !strings.Contains(staged.Summary, "- /w/new.txt（write_file，r2）") {
+		t.Fatalf("新提取应在池中：%q", staged.Summary)
+	}
+	// 旧条目在前、新条目在后：淘汰顺序的池序。
+	if strings.Index(staged.Summary, "/w/old.md") > strings.Index(staged.Summary, "/w/new.txt") {
+		t.Fatalf("旧条目应先于新提取入池：%q", staged.Summary)
+	}
+	if len(staged.DropRunIDs) != 2 || staged.DropRunIDs[0] != "r1" || staged.DropRunIDs[1] != "r2" {
+		t.Fatalf("DropRunIDs 应含旧摘要 run：%+v", staged.DropRunIDs)
+	}
+}
+
+// 旧块缺闭标记（解析失败）→ 按空处理 + log，不拒收；正常摘要照出、不带块。
+func TestFoldInputBrokenOldBlockTreatedEmpty(t *testing.T) {
+	oldSummary := "旧摘要\n<!-- tako:file-ops v1 -->\n改过:\n- /w/a.md（write_file，r_1）" // 无闭标记
+	history := historyOf(
+		[]ModelMessage{{RunID: "r1", Seq: 0, Role: "user", Text: oldSummary}},
+		[]ModelMessage{userRow("r2", 1, "普通消息")},
+		[]ModelMessage{userRow("r_cur", 1, "eeee")},
+	)
+	_, staged := pinOnce(t, history, firstPartyFileEffects)
+	if staged.Summary != "SUMMARY" {
+		t.Fatalf("坏块应整块按空、且无新提取 → 无块：%q", staged.Summary)
+	}
+}
+
+// echo 冒充不了继承源：旧文本里出现两个块时取最后一个（程序钉的块在摘要末尾）。
+func TestFoldInputOldBlockTakesLastCopy(t *testing.T) {
+	oldSummary := "正文开头 echo 了见过的块：\n" +
+		"<!-- tako:file-ops v1 -->\n改过:\n- /w/fake.md（write_file，r_fake）\n<!-- /tako:file-ops -->\n" +
+		"正文继续。\n\n" +
+		"<!-- tako:file-ops v1 -->\n读过:\n- /w/real.md（read_file，r_9）\n<!-- /tako:file-ops -->"
+	history := historyOf(
+		[]ModelMessage{{RunID: "r1", Seq: 0, Role: "user", Text: oldSummary}},
+		[]ModelMessage{userRow("r2", 1, "普通消息")},
+		[]ModelMessage{userRow("r_cur", 1, "eeee")},
+	)
+	_, staged := pinOnce(t, history, firstPartyFileEffects)
+	if strings.Contains(staged.Summary, "/w/fake.md") {
+		t.Fatalf("伪块（非末尾）不该被继承：%q", staged.Summary)
+	}
+	if !strings.Contains(staged.Summary, "- /w/real.md（read_file，r_9）") {
+		t.Fatalf("末尾真块应被继承：%q", staged.Summary)
 	}
 }
 
@@ -257,7 +422,7 @@ func TestFoldInputSummarizeErrorPropagates(t *testing.T) {
 // 算术主检：completion ≥ 自设上限 ⇒ 拒收 + 重试耗尽（验货拒收可重试，代价仅多两次调用）。
 func TestSummarizeRejectsCompletionAtCap(t *testing.T) {
 	chat := &fakeChatStream{handler: func(call int) (*schema.StreamReader[*schema.Message], error) {
-		return streamOf([]string{"一份摘要"}, summarizeMaxTokens, "stop"), nil
+		return streamOf([]string{"一份摘要"}, summarizeCeilingMid, "stop"), nil
 	}}
 	_, err := testSummarizer(chat).summarize(context.Background(), "输入")
 	if err == nil || !strings.Contains(err.Error(), summarizeClassRejected) || !strings.Contains(err.Error(), "重试") {
@@ -515,22 +680,71 @@ func TestSummarizeSendsStructuredPrompt(t *testing.T) {
 	}
 }
 
-// ---- C5-A3：summarizer 硬预算帽（min(4096, limit/3)）----
+// ---- C5-A7：summarizer 预算帽分档（小窗式 / 中窗 / 大窗 + 档界 + 两个 override）----
 
-// 帽的数学：limit 0（compact 关）→ 4096 不帽；小窗按 limit/3；256k 窗 limit/3 ≫ 4096 → 4096 接管（生产零影响）。
-func TestNewSummarizerBudgetCap(t *testing.T) {
+// 五档定点与档界两侧：小窗式 min(limit/2, 1024)、中窗 4096、大窗 8192、window=0 回落中窗常量。
+func TestSummarizeCeilingTiers(t *testing.T) {
 	for _, tc := range []struct {
-		limit int
-		want  int
+		window int
+		want   int
 	}{
-		{0, 4096},      // compact 关
-		{80, 40},       // window 100 的极限 dev 窗
-		{480, 240},     // window 600
-		{3200, 1600},   // window 4000（除数 2 校准：A2 实录 S=1221 须过帽）
-		{204800, 4096}, // 256k 生产窗：limit/2=102400 超 4096，常量接管
+		{0, 4096},       // compact 关：中窗常量（现行 limit>0 不生效时的语义）
+		{100, 40},       // 极限 dev 窗：limit/2 = 40 未被 1024 封顶
+		{600, 240},      // window 600（C2/A3 同窗）：limit/2 = 240
+		{4000, 1024},    // window 4000：limit/2 = 1600 → 1024 封顶（A7 新档）
+		{32768, 1024},   // 小窗档界内侧
+		{32769, 4096},   // 档界外侧 → 中窗
+		{256000, 4096},  // 256k 生产窗
+		{1048575, 4096}, // 大窗档界内侧
+		{1048576, 8192}, // 档界 → 大窗
 	} {
-		if got := newSummarizer(&fakeChatStream{}, tc.limit).maxTokens; got != tc.want {
-			t.Fatalf("limit=%d: maxTokens=%d, want %d", tc.limit, got, tc.want)
+		if got := summarizeCeiling(tc.window, "", 0); got != tc.want {
+			t.Fatalf("window=%d: ceiling=%d, want %d", tc.window, got, tc.want)
+		}
+	}
+}
+
+// Claude override：ref 的 provider 段 = anthropic 或整体含 claude（小写化后）→ 固定档 ×1.3
+// （13/10 整数截断）；只乘固定档——小窗式（含 window=0 回落）是恒有解算术本体，乘了破守恒。
+func TestSummarizeCeilingClaudeOverride(t *testing.T) {
+	for _, tc := range []struct {
+		window int
+		ref    string
+		want   int
+	}{
+		{256000, "anthropic/claude-sonnet-4", 5324}, // provider 段 anthropic（4096×1.3=5324.8→5324）
+		{256000, "MyVendor/CLAUDE-Opus", 5324},      // claude 子串，大小写不敏感
+		{256000, "deepseek/deepseek-chat", 4096},    // 非 claude 不触发
+		{1048576, "anthropic/claude-opus-4", 10649}, // 大窗档 ×1.3（8192×1.3=10649.6→10649）
+		{32769, "anthropic/claude-3", 5324},         // 档界外侧即享乘
+		{32768, "anthropic/claude-3", 1024},         // 小窗档界内侧：小窗式不被乘
+		{4000, "anthropic/claude-3", 1024},          // 小窗式不被乘
+		{0, "anthropic/claude-3", 4096},             // window=0 回落不乘（compact 关，惰性）
+	} {
+		if got := summarizeCeiling(tc.window, tc.ref, 0); got != tc.want {
+			t.Fatalf("window=%d ref=%q: ceiling=%d, want %d", tc.window, tc.ref, got, tc.want)
+		}
+	}
+}
+
+// max_output 硬顶：min(ceiling, 值) 最后生效（乘后也顶）；缺省/0 = 不顶。
+func TestSummarizeCeilingMaxOutput(t *testing.T) {
+	for _, tc := range []struct {
+		window    int
+		ref       string
+		maxOutput int
+		want      int
+	}{
+		{4000, "", 500, 500},                              // 小于帽 → 顶到 500
+		{4000, "", 2048, 1024},                            // 大于帽 → 帽不变
+		{4000, "", 1024, 1024},                            // 等于帽
+		{256000, "", 0, 4096},                             // 0 = 不顶
+		{256000, "anthropic/claude-sonnet-4", 5000, 5000}, // 乘后 5324 → 顶到 5000（硬顶最后生效）
+		{256000, "anthropic/claude-sonnet-4", 5324, 5324}, // 等于乘后帽
+	} {
+		if got := summarizeCeiling(tc.window, tc.ref, tc.maxOutput); got != tc.want {
+			t.Fatalf("window=%d ref=%q maxOutput=%d: ceiling=%d, want %d",
+				tc.window, tc.ref, tc.maxOutput, got, tc.want)
 		}
 	}
 }
@@ -540,7 +754,7 @@ func TestAttemptRendersBudgetIntoPrompt(t *testing.T) {
 	chat := &fakeChatStream{handler: func(call int) (*schema.StreamReader[*schema.Message], error) {
 		return streamOf([]string{"## 会话意图\n验证"}, 10, "stop"), nil
 	}}
-	s := newSummarizer(chat, 480) // 帽 = 240 tok → 字预算 = 192
+	s := newSummarizer(chat, summarizeCeiling(600, "", 0)) // 帽 = 240 tok → 字预算 = 192
 	if _, _, err := s.attempt(context.Background(), "任意输入", 1); err != nil {
 		t.Fatalf("attempt: %v", err)
 	}

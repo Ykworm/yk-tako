@@ -6,6 +6,14 @@
 // 包成 adk.NewAgentTool 后 append 进 runCtx.Tools；ADK 随后把该列表重建进 toolInfos
 // （声明面 model.WithTools）与 toolsNodeConf（执行面 WithToolList）——两处都按本次调用生效。
 // runCtx.Tools 每 run 从冻结基座克隆（chatmodel.go applyBeforeAgent），append 不跨 run 累积。
+//
+// T3-1b：model: 行按 ref 生效（19v6-05 §4 三种写法）——不写 / default|inherit|继承 = 继承主实例，
+// 不进 ModelRegistry；其余 = ref 档，走 ModelResolver（进程内懒加载缓存表，实现归 config.ModelRegistry）。
+// 装配同时产出「agent 名 → {生效 ref, translator}」表（agentModelTable，ctx 携带）：
+// worker 写帧时查它取 model 值、drain 时按它选 translator。
+//
+// T3-3：委派工具出池前过 delegationTool 包壳——并发闸（sem，容量 = -subagent-concurrency）+
+// 回传裁剪（capBytes = -subagent-return-cap）：模型侧回传有界、审计侧全量仍在子代理 runlog。
 package runengine
 
 import (
@@ -16,11 +24,14 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"unicode/utf8"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
+	"github.com/cloudwego/eino/schema"
 	"gopkg.in/yaml.v3"
 )
 
@@ -31,11 +42,12 @@ type AgentSpec struct {
 	Name        string
 	Description string
 	Tools       *[]string
+	Model       string // frontmatter model: 行原文——parse 只认语法，写法分流在装配层（19v6-05 §4）
 	Prompt      string // 正文 = system prompt
 }
 
-// agentSpecFront 是 frontmatter 的 YAML 形状。Model 保留字段是为了区分「写了」与「没写」——
-// 写值在 LoadAgentSpecs 拒载（未实现），缺席 = 继承主 worker 的模型实例。
+// agentSpecFront 是 frontmatter 的 YAML 形状。Model 原样带出：写了/没写、是关键词还是 ref，
+// 都在装配层分流——parse 层不做语义判断（19v6-05 §4）。
 type agentSpecFront struct {
 	Name        string    `yaml:"name"`
 	Description string    `yaml:"description"`
@@ -122,30 +134,170 @@ func parseAgentSpec(raw []byte) (AgentSpec, error) {
 	if f.Description == "" {
 		return AgentSpec{}, fmt.Errorf("缺必填字段 description（模型决定委派与否的唯一入口）")
 	}
-	if strings.TrimSpace(f.Model) != "" {
-		return AgentSpec{}, fmt.Errorf("model 写值未实现（只支持缺席 = 继承主 worker 模型实例）")
-	}
 	return AgentSpec{
 		Name:        f.Name,
 		Description: f.Description,
 		Tools:       f.Tools,
+		Model:       f.Model,
 		Prompt:      strings.TrimSpace(strings.Join(lines[end+1:], "\n")),
 	}, nil
+}
+
+// ModelInstance 是解析器按 ref 交出的成品（T3-1b）：Chat = 客户端实例（子代理 loop 用它发请求）、
+// Ref = 解析产物的规范 ref（帧/行的 model 值取它）、Protocol = 协议名（drain 按它选 translator——
+// 子代理模型可能与主 worker 不同家）。
+type ModelInstance struct {
+	Chat     model.BaseChatModel
+	Ref      string
+	Protocol string
+}
+
+// ModelResolver 按 ref 解析模型实例。实现归 config.ModelRegistry（进程内懒加载缓存表，19v6-05 §4）；
+// 接口定义在 runengine 侧、由 main 装配时适配——runengine 不 import config。
+type ModelResolver interface {
+	Get(ctx context.Context, ref string) (ModelInstance, error)
+}
+
+// isInheritRef 认「显式继承」的三种拼写（19v6-05 §4 写法二）：default / inherit / 继承；
+// 比较前先 trim、ASCII 两词大小写不敏感（「继承」无大小写、原样比）。
+func isInheritRef(ref string) bool {
+	switch strings.ToLower(ref) {
+	case "default", "inherit", "继承":
+		return true
+	}
+	return false
+}
+
+// agentModelEntry 是一个 agent 的模型身份（T3-1b）。ref = 生效 ref（帧/行 model 字段的值）；
+// translate = 该 agent 协议对应的 chunk 翻译器——drain 按它翻译该 agent 的输出流：
+// 厂商差异全在 translator 层，子代理与主 worker 不同家时各用各的（现三家翻译器同读 Content，
+// 某家字段一旦分叉、只改对应那一个）。
+type agentModelEntry struct {
+	ref       string
+	translate Translator
+}
+
+// agentModelTable 是本 run 的「agent 名 → 模型身份」表：BeforeAgent 扫盘装配时逐个写入装载成功的
+// 规格；root（""）条目由 worker 建表时预置（主 ref + 主 translator）。worker 写帧 / drain 时按
+// event.AgentName 查。传递形态 = ctx 携带：填与读同 goroutine——agent.Run 内 getRunFunc →
+// applyBeforeAgent 是**同步**先跑的（eino v0.9.21 chatmodel.go），事件流出时表已齐；锁只是兜底，
+// 防 eino 后续版本把装载挪出同步路径。
+type agentModelTable struct {
+	mu      sync.RWMutex
+	entries map[string]agentModelEntry
+}
+
+func newAgentModelTable(rootRef string, rootTranslate Translator) *agentModelTable {
+	return &agentModelTable{entries: map[string]agentModelEntry{"": {ref: rootRef, translate: rootTranslate}}}
+}
+
+func (t *agentModelTable) set(name string, e agentModelEntry) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.entries[name] = e
+}
+
+// entryFor 按 agent 名取条目（"" = root）；查不到回落 root 条目——子代理事件只可能来自装载成功的
+// 规格（表条目与 AgentTool 同点写入），查不到即装配异常：translator 回落保帧不炸（异常态本身
+// 仍可见于装载日志——该 agent 名不在 loaded 名单里）。
+func (t *agentModelTable) entryFor(agent string) agentModelEntry {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if e, ok := t.entries[agent]; ok {
+		return e
+	}
+	return t.entries[""]
+}
+
+// agentModelTableKey 是 ctx 携带身份表的私有 key 类型（context key 的防撞车惯例）。
+type agentModelTableKey struct{}
+
+func withAgentModelTable(ctx context.Context, t *agentModelTable) context.Context {
+	return context.WithValue(ctx, agentModelTableKey{}, t)
+}
+
+func agentModelTableFrom(ctx context.Context) *agentModelTable {
+	t, _ := ctx.Value(agentModelTableKey{}).(*agentModelTable)
+	return t
 }
 
 // agentSpecHandler 是装载 handler：BeforeAgent 每 Run 扫一次盘，把规格装配成委派工具追加进 runCtx.Tools。
 // 入口快照 base = runCtx.Tools：此刻池里只有基座工具（本 handler 是唯一往池里加委派工具的），
 // 子代理继承父池时取它 = 天然禁嵌套。
+// T3-3 起委派工具出池前过 delegationTool 包壳（并发闸 + 回传裁剪）——sem/returnCap 由 NewWorker 造好注入。
 type agentSpecHandler struct {
 	*adk.BaseChatModelAgentMiddleware
-	dir   string
-	model model.BaseChatModel
+	dir       string
+	model     model.BaseChatModel // 主 worker 实例：写法一/二（不写 / default|inherit|继承）直接用
+	modelRef  string              // 主 ref：继承档的生效 ref（帧 model 字段）
+	translate Translator          // 主 translator：继承档的 drain 分发
+	resolver  ModelResolver       // 写法三（具体 ref）：进程内注册表
+	sem       chan struct{}       // 委派并发闸（容量 = -subagent-concurrency）：全部规格共享一个
+	returnCap int                 // 回传上限（字节；<=0 = 不裁剪）：-subagent-return-cap
 }
 
 // newAgentSpecHandler 组装载 handler。dir 是规格目录（相对 CWD 或绝对路径）；
-// m 是子代理共享的模型实例（字段表：model 缺席 = 继承主 worker 实例）。
-func newAgentSpecHandler(dir string, m model.BaseChatModel) *agentSpecHandler {
-	return &agentSpecHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, dir: dir, model: m}
+// m / mainRef / mainTranslate 是主 worker 的三件套（继承档取用）；r 是模型注册表（ref 档取用）；
+// sem/returnCap 是 T3-3 的预算面（并发闸 + 回传裁剪），装配点 = NewWorker。
+func newAgentSpecHandler(dir string, m model.BaseChatModel, mainRef string, mainTranslate Translator,
+	r ModelResolver, sem chan struct{}, returnCap int) *agentSpecHandler {
+	return &agentSpecHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{},
+		dir: dir, model: m, modelRef: mainRef, translate: mainTranslate, resolver: r, sem: sem, returnCap: returnCap}
+}
+
+// delegationTool 是委派工具的预算包壳（T3-3）：并发闸（sem）+ 回传裁剪（capBytes），
+// 套在 adk.NewAgentTool 的产物外面。它必须实现与 AgentTool 相同的调用面（Info + InvokableRun
+// 带 opts），且把 ctx/args/opts 原样递给 inner——EmitInternalEvents 的子代理事件转发靠 opts 里
+// 携带的 event generator（eino v0.9.21 agent_tool.go 的 getEmitGeneratorAndEnableStreaming 从
+// opts 读它），扣下 opts 等于把子代理的帧全掐掉；cancel 派生（extractAndDeriveAgentToolCancelCtx）
+// 同走 opts，一并原样传。
+type delegationTool struct {
+	inner    tool.BaseTool // *adk.typedAgentTool：Info + InvokableRun
+	sem      chan struct{} // 池级并发闸：容量 = -subagent-concurrency，所有规格共享
+	capBytes int           // 回传上限（字节）；<=0 = 不裁剪
+	name     string        // 规格名（错误话术用）
+}
+
+func (d *delegationTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
+	return d.inner.Info(ctx)
+}
+
+// InvokableRun：取闸（满则等，ctx 取消可中断——不无限吊住父循环）→ 内层照跑 → 回传超帽截断。
+// 内层错误原样上抛（「错误→结果」语义归 wrapToolErrors 体系，不在预算面拍板）。
+func (d *delegationTool) InvokableRun(ctx context.Context, args string, opts ...tool.Option) (string, error) {
+	select {
+	case d.sem <- struct{}{}:
+		defer func() { <-d.sem }()
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	inner, ok := d.inner.(tool.InvokableTool)
+	if !ok {
+		return "", fmt.Errorf("委派工具 %s: 内层不可调用（装配错误）", d.name)
+	}
+	out, err := inner.InvokableRun(ctx, args, opts...)
+	if err != nil {
+		return "", err
+	}
+	return truncateDelegationReturn(out, d.capBytes), nil
+}
+
+// delegationTruncationNotice 是超帽回传的尾缀模板（照 pi：50 KB 上限、UTF-8 安全 + omitted 提示；
+// 全量在子代理 runlog，19v6-05 §4）。%d = 被省略的字节数。
+const delegationTruncationNotice = "[Output truncated: %d bytes omitted. Full output preserved in subagent runlog.]"
+
+// truncateDelegationReturn 把超过 capBytes 的回传截成「UTF-8 完整前缀 + 提示尾缀」。
+// 截点回退到 rune 边界（绝不劈开多字节字符）；N = 总字节 − 保留字节（含尾缀与原文重合部分不算省略——
+// 提示说的是「没进回传的字节数」）。capBytes <= 0 = 不裁剪。
+func truncateDelegationReturn(s string, capBytes int) string {
+	if capBytes <= 0 || len(s) <= capBytes {
+		return s
+	}
+	kept := capBytes
+	for kept > 0 && !utf8.RuneStart(s[kept]) {
+		kept--
+	}
+	return s[:kept] + fmt.Sprintf(delegationTruncationNotice, len(s)-kept)
 }
 
 // BeforeAgent：每 run 起手执行一次，整体流程是：
@@ -178,7 +330,8 @@ func newAgentSpecHandler(dir string, m model.BaseChatModel) *agentSpecHandler {
 //	[AgentTool_A,     [AgentTool_A,
 //	 AgentTool_B]      AgentTool_B]
 //
-// 本函数具体步骤：扫盘 → 三态解析工具池（resolveToolPool）→ 装配子代理 → 包 AgentTool → append runCtx.Tools，
+// 本函数具体步骤：扫盘 → 三态解析工具池（resolveToolPool）→ 三写法解析模型（继承档用主实例 /
+// ref 档查注册表）→ 装配子代理 → 包 AgentTool → append runCtx.Tools + 写身份表（agentModelTable），
 // 最后打一行装载日志（agents: N spec(s): <names>）。
 //
 // 白名单档的名称空间 = base 本身：tools: [a, b] 里的 a、b 其实已经在 base tools 里面——
@@ -191,7 +344,8 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 		log.Printf("agents: 扫盘 %s 失败: %v", h.dir, err)
 		return ctx, runCtx, nil
 	}
-	base := runCtx.Tools // 入口快照：继承档取它（此刻无任何委派工具 = 禁嵌套）
+	table := agentModelTableFrom(ctx) // 本 run 的身份表（worker.Run 建并塞 ctx）；写帧/drain 读它，见 worker.go
+	base := runCtx.Tools              // 入口快照：继承档取它（此刻无任何委派工具 = 禁嵌套）
 	var loaded []string
 	for _, spec := range specs {
 		pool, err := resolveToolPool(ctx, spec, base)
@@ -199,18 +353,35 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 			log.Printf("agents: %s: 拒载: %v", spec.Name, err)
 			continue
 		}
+		// model 三写法分流（19v6-05 §4）：写法一/二（不写 / default|inherit|继承，大小写不敏感）
+		// = 继承主实例，不进注册表；写法三 = ref 档 → ModelResolver 解析，失败拒该条、其余照载。
+		subModel := h.model
+		entry := agentModelEntry{ref: h.modelRef, translate: h.translate}
+		if ref := strings.TrimSpace(spec.Model); ref != "" && !isInheritRef(ref) {
+			inst, err := h.resolver.Get(ctx, ref)
+			if err != nil {
+				log.Printf("agents: %s: 拒载: model %q: %v", spec.Name, ref, err)
+				continue
+			}
+			subModel = inst.Chat
+			entry = agentModelEntry{ref: inst.Ref, translate: TranslatorFor(inst.Protocol)}
+		}
 		sub, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
 			Name:        spec.Name,
 			Description: spec.Description,
 			Instruction: spec.Prompt,
-			Model:       h.model,
+			Model:       subModel,
 			ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: pool}},
 		})
 		if err != nil {
 			log.Printf("agents: %s: 拒载: 子代理装配失败: %v", spec.Name, err)
 			continue
 		}
-		runCtx.Tools = append(runCtx.Tools, adk.NewAgentTool(ctx, sub))
+		// 委派工具出池前过预算包壳（T3-3）：并发闸 + 回传裁剪；Info/调用面透传，声明字节不变。
+		runCtx.Tools = append(runCtx.Tools, &delegationTool{
+			inner: adk.NewAgentTool(ctx, sub), sem: h.sem, capBytes: h.returnCap, name: spec.Name,
+		})
+		table.set(spec.Name, entry)
 		loaded = append(loaded, spec.Name)
 	}
 	if len(loaded) == 0 {
