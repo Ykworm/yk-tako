@@ -921,3 +921,154 @@ func TestEndRunLandsTurnRows(t *testing.T) {
 		t.Error("扩展行 agent 应为 NULL（缺省不写字面空串）")
 	}
 }
+
+// ---- C 系列（compact）存储面回归网（C3 第 1/2/4/5 条；渲染/验货/重试/stall 边界在 compact_test.go）----
+
+// C3-1+2+5：EndRun(complete, staged) 同笔事务——被压行 compacted=true（原文保留）+ 新 seq=0 摘要行
+// （role=user / compacted=false / 三字段形状）一起成；读侧 ModelMessages 只见非 compacted 行。
+func TestEndRunCompleteWithStagedCompaction(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid, r1, r2 := SessionID("s_1"), RunID("r_1"), RunID("r_2")
+	s.mustAcquire(t, sid, r1, "m_1", "run1 用户消息")
+	s.mustDelta(t, ctx, r1, "run1 回答")
+	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", nil, []TurnEntry{{Role: "assistant", Text: "run1 回答"}}); err != nil || !ok {
+		t.Fatalf("EndRun(r1): ok=%v err=%v", ok, err)
+	}
+	s.mustAcquire(t, sid, r2, "m_2", "run2 用户消息")
+
+	staged := &StagedCompaction{DropRunIDs: []RunID{r1}, Summary: "摘要：run1 谈过的事", AttachRun: r1}
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, "complete", staged, []TurnEntry{{Role: "assistant", Text: "run2 回答"}}); err != nil || !ok {
+		t.Fatalf("EndRun(r2, staged): ok=%v err=%v", ok, err)
+	}
+
+	// 被压原文行翻死但保留（审计原料，§0 不动 runlog 的真源划分）。
+	if !s.sqlBool(t, `SELECT bool_and(compacted) FROM run_model_messages WHERE run_id = ? AND seq >= 1`, r1) {
+		t.Error("r1 的原文行应全部 compacted=true（保留不删）")
+	}
+	// 摘要行三字段形状（C3-5）：seq=0 / role=user / compacted=false，挂在 AttachRun。
+	var role string
+	var compacted bool
+	var summary string
+	if err := s.db.Raw(`SELECT role, compacted, text FROM run_model_messages WHERE run_id = ? AND seq = 0`, r1).
+		Row().Scan(&role, &compacted, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if role != "user" || compacted || summary != "摘要：run1 谈过的事" {
+		t.Errorf("摘要行 = {role:%q compacted:%v text:%q}, want user/false/原文", role, compacted, summary)
+	}
+	// 读侧过滤（C3-2）：ModelMessages 只见 seq0 摘要 + r2 的行（r1 原文不可见）。
+	msgs, err := s.ModelMessages(ctx, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 3 || msgs[0].Seq != 0 || msgs[0].Text != "摘要：run1 谈过的事" ||
+		msgs[1].RunID != r2 || msgs[1].Role != "user" || msgs[2].RunID != r2 || msgs[2].Role != "assistant" {
+		t.Fatalf("ModelMessages = %+v, want [seq0 摘要, r2 user, r2 assistant]", msgs)
+	}
+}
+
+// C3-1 后半：EndRun(error, staged) 零写入——staged 只属 complete 分支，error 时既不翻 compacted 也不插 seq0。
+func TestEndRunErrorWithStagedZeroWrite(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid, r1, r2 := SessionID("s_1"), RunID("r_1"), RunID("r_2")
+	s.mustAcquire(t, sid, r1, "m_1", "run1 用户消息")
+	s.mustDelta(t, ctx, r1, "run1 回答")
+	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", nil, []TurnEntry{{Role: "assistant", Text: "run1 回答"}}); err != nil || !ok {
+		t.Fatalf("EndRun(r1): ok=%v err=%v", ok, err)
+	}
+	s.mustAcquire(t, sid, r2, "m_2", "run2 用户消息")
+
+	staged := &StagedCompaction{DropRunIDs: []RunID{r1}, Summary: "不该落库的摘要", AttachRun: r1}
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, "error", staged, nil); err != nil || !ok {
+		t.Fatalf("EndRun(r2, error, staged): ok=%v err=%v", ok, err)
+	}
+	if !s.sqlBool(t, `SELECT bool_and(compacted = false) FROM run_model_messages WHERE session_id = ?`, sid) {
+		t.Error("error 结局：全 session 零 compacted 翻转")
+	}
+	if n := s.count(t, &RunModelMessage{}, "session_id = ? AND seq = 0", sid); n != 0 {
+		t.Errorf("error 结局：seq0 摘要行 %d 行，want 0（零写入家族）", n)
+	}
+	// error 的 run2 只留 user 半（与「error run 只留 user 那半」同形）。
+	if n := s.count(t, &RunModelMessage{}, "session_id = ? AND run_id = ?", sid, r2); n != 1 {
+		t.Errorf("run2 mh 行数 = %d, want 1（只 user 半）", n)
+	}
+}
+
+// C3-4：同一被压段二次压缩不撞 UNIQUE(run_id, seq)——重压合并：旧 seq0 翻死、新 seq0 挂新 run，
+// 任意时刻活摘要（compacted=false 的 seq0）恒 ≤ 1。
+func TestSecondCompactionReattaches(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid := SessionID("s_1")
+	runs := []RunID{"r_1", "r_2", "r_3"}
+	for i, rid := range runs {
+		s.mustAcquire(t, sid, rid, fmt.Sprintf("m_%d", i+1), fmt.Sprintf("run%d 用户消息", i+1))
+		staged := (*StagedCompaction)(nil)
+		if i == 1 {
+			staged = &StagedCompaction{DropRunIDs: []RunID{runs[0]}, Summary: "S1", AttachRun: runs[0]}
+		}
+		if i == 2 {
+			// 第二次压缩：旧摘要所在 run（runs[0]）+ 新被压 run（runs[1]），挂 runs[1]。
+			staged = &StagedCompaction{DropRunIDs: []RunID{runs[0], runs[1]}, Summary: "S2", AttachRun: runs[1]}
+		}
+		if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", staged,
+			[]TurnEntry{{Role: "assistant", Text: fmt.Sprintf("run%d 回答", i+1)}}); err != nil || !ok {
+			t.Fatalf("EndRun(%s, staged=%v): ok=%v err=%v", rid, staged != nil, ok, err)
+		}
+	}
+
+	if !s.sqlBool(t, `SELECT compacted FROM run_model_messages WHERE run_id = ? AND seq = 0`, runs[0]) {
+		t.Error("旧摘要行（r_1 seq0）应翻 compacted=true（死行留档）")
+	}
+	var liveSummary string
+	var liveRun RunID
+	if err := s.db.Raw(`SELECT run_id, text FROM run_model_messages WHERE session_id = ? AND seq = 0 AND compacted = false`, sid).
+		Row().Scan(&liveRun, &liveSummary); err != nil {
+		t.Fatal(err)
+	}
+	if liveRun != runs[1] || liveSummary != "S2" {
+		t.Errorf("活摘要 = {%s %q}, want 挂 r_2 的 S2", liveRun, liveSummary)
+	}
+	if !s.sqlBool(t, `SELECT bool_and(compacted) FROM run_model_messages WHERE run_id = ? AND seq >= 1`, runs[1]) {
+		t.Error("r_2 原文行应全部 compacted=true")
+	}
+	// 读侧：只剩活摘要 + r_3 的行。
+	msgs, err := s.ModelMessages(ctx, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 3 || msgs[0].Seq != 0 || msgs[0].Text != "S2" || msgs[1].RunID != runs[2] || msgs[2].RunID != runs[2] {
+		t.Fatalf("ModelMessages = %+v, want [S2 seq0, r3 user, r3 assistant]", msgs)
+	}
+}
+
+// C3 变异检查锚（挪事务探测器）：闸已放后再 EndRun（带 staged）→ 空转，staged 一笔都不许多写。
+// 若有人把 staged 写挪出「闸在手上」的事务守卫，这条立刻红。
+func TestEndRunGateLostWithStagedNoop(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid, r1, r2 := SessionID("s_1"), RunID("r_1"), RunID("r_2")
+	s.mustAcquire(t, sid, r1, "m_1", "run1 用户消息")
+	s.mustDelta(t, ctx, r1, "run1 回答")
+	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", nil, []TurnEntry{{Role: "assistant", Text: "run1 回答"}}); err != nil || !ok {
+		t.Fatalf("EndRun(r1): ok=%v err=%v", ok, err)
+	}
+	s.mustAcquire(t, sid, r2, "m_2", "run2 用户消息")
+
+	// r2 的闸先被别人放掉（模拟清扫/易主），再带 staged 调 EndRun：必须整笔空转。
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, "error", nil, nil); err != nil || !ok {
+		t.Fatalf("前置 EndRun(r2, error): ok=%v err=%v", ok, err)
+	}
+	staged := &StagedCompaction{DropRunIDs: []RunID{r1, r2}, Summary: "幽灵摘要", AttachRun: r1}
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, "complete", staged, nil); err != nil || ok {
+		t.Fatalf("闸失后 EndRun: ok=%v err=%v, want false/nil（空转）", ok, err)
+	}
+	if n := s.count(t, &RunModelMessage{}, "session_id = ? AND seq = 0", sid); n != 0 {
+		t.Errorf("闸失后写出 seq0 行 %d 笔——staged 写越过了「闸在手上」守卫", n)
+	}
+	if !s.sqlBool(t, `SELECT bool_and(compacted = false) FROM run_model_messages WHERE session_id = ?`, sid) {
+		t.Error("闸失后出现了 compacted 翻转——staged 写越过了「闸在手上」守卫")
+	}
+}

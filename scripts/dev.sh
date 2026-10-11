@@ -270,7 +270,8 @@ fi
 
 run 引擎 '\033[36m' "$repo_root/yk-tako-eino" \
   go run ./cmd/yktako -engine "127.0.0.1:$engine_port" -redis "$redis_addr" \
-  -pg "host=127.0.0.1 port=$pg_port dbname=tako sslmode=disable"
+  -pg "host=127.0.0.1 port=$pg_port dbname=tako sslmode=disable" \
+  -workspace "$repo_root/tmp/workspace"
 run 前端 '\033[35m' "$repo_root/yk-tako-eino/web" \
   npm run dev -- --host 127.0.0.1 --port "$web_port" --strictPort
 

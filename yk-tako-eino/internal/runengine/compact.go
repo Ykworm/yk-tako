@@ -30,11 +30,16 @@ package runengine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"sort"
 	"strings"
+	"time"
 
+	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 	"github.com/pkoukk/tiktoken-go"
 )
@@ -43,16 +48,81 @@ import (
 // 「20 轮只数它前面已经结束的对话」：当前 run 的行不进 keep/drop 划分（v6 里它随 tail 原样带在末尾）。
 const compactKeepRuns = 20
 
-// compactPrompt 是摘要提示词（**只有一份**，doc/12 §6/§9 同款措辞）。
+// compactPrompt 是摘要提示词模板（**只有一份**，C5 起为六槽 markdown 骨架；19v6-07 §5「结构化摘要」）。
 // 独立性：不含任何会话内容，调用方用同一个 ChatStream 另起一次流式生成（不新开 agent）。
+// 骨架三重动机：卡死教训（体积失控要有槽级配给）、散文漂移（无骨架跨合并栏目互吞）、
+// 机械锚点无家（fileOps 挂靠 ## 重要事实）。存量散文摘要的迁移语义 = 首事件整体进
+// ## 其他上下文（prompt 第 3 条与 renderFold 的「此前摘要，请合并进新的摘要」对应，改一处要同步）。
+// 规则 ② 的总预算为 %d 占位符——attempt() 按硬帽（maxTokens×4/5 字/tok，dev 校准）每次调用渲染：
+// 软目标必须与硬帽同源，静态值在硬帽落地后会诱导超帽截断（A3 实测教训）。
 const compactPrompt = `你在为一段较早的对话维护一份长期摘要，供后续轮次继续使用。` +
 	`按这段内容实际在谈的事做摘要，只保留对后续仍然有用的信息。` +
-	`能抽到的才写成这些栏目：已知事实、关键决策、未解决问题、用户偏好；没有的栏目不要编造，直接省略。` +
-	`只输出摘要正文，不要开场白。`
+	"摘要必须用下面六个栏目的 markdown 骨架，栏目标题一字不差、顺序不变：\n" +
+	"## 会话意图\n用户当前任务的核心目标（一段话）。\n" +
+	"## 关键决策\n已做出的决策及理由——理由必须写，后续轮次要靠它判断沿用还是推翻。\n" +
+	"## 重要事实\n具体数字、约束、文件路径、错误信息、暗号类锚点。\n" +
+	"## 待办与下一步\n还没做完的事、下一步动作。\n" +
+	"## 用户偏好\n语言、风格、格式要求。\n" +
+	"## 其他上下文\n装不进上面栏目但对后续有用的信息。\n" +
+	"规则：\n" +
+	"1. 没有内容的栏目直接省略整个标题，不要编造、不要留空标题。\n" +
+	"2. 全文总量控制在 %d 字以内（预算随 compact 窗口缩放，各槽占比约：会话意图一成、关键决策二成半、" +
+	"重要事实二成半、待办与下一步一成半、用户偏好半成、其他上下文吃余额），栏目内自行取舍。\n" +
+	"3. 输入开头若有一份旧摘要（此前摘要，请合并进新的摘要）：它有槽结构就按栏目并入；" +
+	"没有槽结构（纯散文）就整体并进「## 其他上下文」。\n" +
+	"4. 输出必须总是上述骨架中有内容的槽——无论输入里有没有旧摘要、旧摘要有无槽结构，" +
+	"都不允许输出没有槽标题的正文（A2 e2e 实录：模型把无槽旧摘要原样 echo，骨架从此不再愈合）。\n" +
+	"5. 只输出摘要正文（栏目标题 + 内容），不要开场白、不要代码块围栏。"
 
 // errStillOver 是「压到头仍不低于 limit」的哨兵（doc/12 §9 的 ErrStillOver）：
 // 调用方（worker）把它当普通错误处理——不调主模型、status=error、零写入。
 var errStillOver = errors.New("compact: 摘要后仍不低于 limit（不调主模型）")
+
+// errStall 是流式 stall 哨兵（首 token 限时 / chunk 间隔限时 / 宽松总时限到点）：
+// 非重试类失败，直接走失败出口 A（19v6-07 §3「失败出口 = A」）。
+var errStall = errors.New("compact: 摘要流 stall 超时")
+
+// 摘要调用的旋钮三件套 + 失败分类（19v6-07 §3；初值全部标注来源、dev 校准，拒抄常数双重标准）。
+// 这些是 summarize 一条链路的保险丝组：输入无界时重试同一份必然原样失败（截断与重试是绑定关系）。
+const (
+	// summarizeTemp 低温档 0.3（借 WeKnora 经验值）——摘要要稳不要花活。
+	summarizeTemp = 0.3
+	// summarizeMaxTokens 自设上限 = 三层验货算术主检的比对基线（completion ≥ 它 ⇒ 截断拒收）。
+	// 4096 是初值（dev 校准）：正常摘要远低于它，误杀代价仅多一次重试。
+	summarizeMaxTokens = 4096
+	// summarizeMaxAttempts = 1 + 重试 ≤2（19v6-07 §3「重试 ≤2 次」）。
+	summarizeMaxAttempts = 3
+)
+
+// compactAdmissionDivisor 是 POST 单条消息准入的除数（C5-A1，tail 支卡死的入口治法；
+// 19v6-07 §5 结构化摘要条的推导：恒有解要求 S ≤ limit − tail_max）——单条 user 消息
+// cl100k 计数 > limit/divisor ⇒ 抢闸前拒收。
+const compactAdmissionDivisor = 3
+
+// summarizeBudgetDivisor 是摘要硬预算帽的除数（C5-A3，S 支）：S ≤ limit/2。
+// 校准（2026-10-11，A2/A3 实测）：除数 3 给 S = limit/3，window 4000 下帽 = 1066，
+// 而 A2 实录 S 高达 1221——帽低于模型的自然产出，折叠会假性验货拒收；
+// 除数 2 的守恒：S + tail_max = limit/2 + limit/3 = 5/6·limit < limit（n=0 恒有解，
+// 余 limit/6 给 keep 与估算误差）；256k 窗下 4096 常量仍接管。
+const summarizeBudgetDivisor = 2
+
+// 分级截断的上限（19v6-07 §3「分级截断」，rune 计 + 截断标记）：
+// 工具结果动辄上万 token，不封顶则摘要输入无界；工具参数每 value 封顶保 k=v 行有界。
+const (
+	foldToolResultMaxRunes = 2000
+	foldArgValueMaxRunes   = 400
+	foldTruncMarkerFormat  = "…〔截断：原 %d 字符〕"
+)
+
+// 失败原因分类（19v6-07 §3 失败出口 A：分类进引擎日志）。瞬时/验货拒收可重试，
+// 超长拒收/stall 不重试（原样重试必然原样失败 / 快速失败不挂死 run）。
+const (
+	summarizeClassTransient = "瞬时"
+	summarizeClassRejected  = "验货拒收"
+	summarizeClassLength    = "超长拒收"
+	summarizeClassStall     = "stall"
+	summarizeClassOther     = "其他"
+)
 
 // TokenCounter 是长度自测的全部要求：一段文本的 token 数。
 // 装配期给 cl100k（NewCl100kCounter），单测注入假计数器（不触网）。
@@ -201,7 +271,29 @@ func foldInput(ctx context.Context, system string, history []ModelMessage, curre
 
 // renderFold 渲染一次摘要调用的输入：旧摘要（重压时，天然并入）在前，被压段原文按 run 时序在后。
 // 旧线还有一份检索块（RAG）——v6 无 RAG（§10.3 第 7 条），登记为偏离。
+//
+// C2 标注转录（19v6-07 §3「工具环渲染缺口」）：T2 之前的 renderFold 只拍平 role: text，
+// assistant 的 tool_calls 与 tool 行的归属整体失明——变更多次调用归属错乱、变更类工具
+// 「这次写入」等于没发生过。现按 WeKnora serialize.go 全形态转录：
+//
+//	[User]: <text>                                user 行
+//	[Assistant]: <text>                           纯文本 assistant 行（带 tool_calls 的行先吐正文再吐调用）
+//	[Assistant tool calls]: name(k=v,…)           每次调用一行；参数 key 排序（保跨次渲染一致）、每 value 封顶
+//	[Tool result <name>]: <text>                  tool 行；<name> 经前序 assistant 行的 ToolCalls 按 id 解析
+//
+// 分级截断：工具结果 2000 runes、工具参数每 value 400 runes 封顶（截断标记带原长度）。
+// mh 的 tool 行无 ToolName 列（T2 形状）——不为此加列，靠 OpenAI 邻接要求保证按 id 解析得到。
 func renderFold(oldTexts []string, drop []runRows) string {
+	// 第一遍：tool_call_id → 工具名。tool 行的发起 assistant 行必在同 run 内（run 粒度折叠，
+	// OpenAI 邻接要求 assistant 调用行紧跟其 tool 行），先全量建表再渲染，顺序天然满足「前序」。
+	names := make(map[string]string)
+	for _, g := range drop {
+		for _, m := range g.rows {
+			for _, tc := range m.ToolCalls {
+				names[tc.ID] = tc.Function.Name
+			}
+		}
+	}
 	var b strings.Builder
 	if len(oldTexts) > 0 {
 		b.WriteString("（此前摘要，请合并进新的摘要）\n")
@@ -215,13 +307,89 @@ func renderFold(oldTexts []string, drop []runRows) string {
 			b.WriteString("\n")
 		}
 		for _, m := range g.rows {
-			b.WriteString(m.Role)
-			b.WriteString(": ")
-			b.WriteString(m.Text)
-			b.WriteString("\n")
+			renderFoldRow(&b, m, names)
 		}
 	}
 	return b.String()
+}
+
+// renderFoldRow 转录一行（renderFold 的四形态，精确字节被 compact_test 钉住）。
+func renderFoldRow(b *strings.Builder, m ModelMessage, names map[string]string) {
+	switch m.Role {
+	case "assistant":
+		if m.Text != "" {
+			b.WriteString("[Assistant]: ")
+			b.WriteString(m.Text)
+			b.WriteString("\n")
+		}
+		for _, tc := range m.ToolCalls {
+			b.WriteString("[Assistant tool calls]: ")
+			b.WriteString(tc.Function.Name)
+			b.WriteString("(")
+			b.WriteString(renderToolArgs(tc.Function.Arguments))
+			b.WriteString(")\n")
+		}
+		if m.Text == "" && len(m.ToolCalls) == 0 {
+			b.WriteString("[Assistant]: \n")
+		}
+	case "tool":
+		name := names[m.ToolCallID]
+		if name == "" {
+			name = "?"
+		}
+		b.WriteString("[Tool result ")
+		b.WriteString(name)
+		b.WriteString("]: ")
+		b.WriteString(truncateRunes(m.Text, foldToolResultMaxRunes))
+		b.WriteString("\n")
+	default: // user（system 不进 mh 表；未知角色按 User 形态兜底不丢内容）
+		b.WriteString("[User]: ")
+		b.WriteString(m.Text)
+		b.WriteString("\n")
+	}
+}
+
+// renderToolArgs 把模型原始 arguments JSON 渲染成 k=v,…：key 排序（保跨次渲染一致）、
+// 字符串 value 原样、非字符串压成紧凑 JSON、每 value 400 runes 封顶。
+// 坏 JSON（模型给了 garbage）：原样截断兜底——不丢「调用发生过」这个事实。
+func renderToolArgs(args string) string {
+	if strings.TrimSpace(args) == "" {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(args), &m); err != nil {
+		return truncateRunes(args, foldArgValueMaxRunes)
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		v := m[k]
+		sv, ok := v.(string)
+		if !ok {
+			b, err := json.Marshal(v)
+			if err != nil {
+				sv = fmt.Sprintf("%v", v)
+			} else {
+				sv = string(b)
+			}
+		}
+		parts = append(parts, k+"="+truncateRunes(sv, foldArgValueMaxRunes))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// truncateRunes 按 rune 截断（不是 byte——中文一字 3 bytes，按 byte 截会把摘要输入切出半个字）。
+// 超封顶：前 max runes + 截断标记（带原长度，摘要器知道丢了多少）。
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + fmt.Sprintf(foldTruncMarkerFormat, len(r))
 }
 
 // ids 取 run 组的 id 序列。
@@ -233,34 +401,220 @@ func ids(groups []runRows) []RunID {
 	return out
 }
 
-// summarize 用同一个 ChatStream 另起一次流式生成（system = 摘要提示词、user = 渲染文本），
-// 排干取全文（doc/12 §4：压缩是钩子里调用一次摘要模型的 Generate，不另开 agent）。
-// 空摘要 = 错误（拒收，与失败同路；行表形态下空摘要会变成一条空洞的 seq=0 行）。
-func (w *Worker) summarize(ctx context.Context, input string) (string, error) {
-	stream, err := w.chat.Stream(ctx, []*schema.Message{
-		schema.SystemMessage(compactPrompt),
-		schema.UserMessage(input),
-	})
-	if err != nil {
-		return "", err
+// summarizer 是摘要调用的一条龙（19v6-07 §3「调用/旋钮/验货/失败出口」+ §5「结构化摘要」预算）：
+// 同一 ChatStream 另起一次流式生成（doc/12 §4：一次 Generate 级的动作，不另开 agent），排干取全文，
+// 三层验货过了才算数。worker 只持有它、prepareInput 把 summarize 方法注给 foldInput。
+// 字段全是可拨的旋钮（初值见 newSummarizer 的来源标注），单测缩小时钟直接改字段。
+type summarizer struct {
+	chat            ChatStream
+	temp            float32       // 低温档（0.3，借 WeKnora 经验值）
+	maxTokens       int           // 自设上限 = min(4096, limit/2)——算术主检基线 + 硬预算帽（A3）
+	stallFirstToken time.Duration // 首 token 限时（初值 30s 待校准）
+	stallChunkGap   time.Duration // chunk 间隔限时（初值 30s 待校准）
+	stallTotal      time.Duration // 宽松总上限：本质仍是墙钟，仅防无限拖长
+	maxAttempts     int           // 1 + 重试 ≤2
+}
+
+// newSummarizer 给装配期的默认值（19v6-07 §3 旋钮三件套 + §5 预算；dev 校准后回改这里）。
+// limit = compactWindow×4/5（0 = compact 关）：硬帽让 n=0 时 S+tail ≤ 5/6·limit < limit 恒有解
+// （S 支卡死的数学封死；§5 推导 + A3 校准的 limit/2）；256k 窗下 limit/2 ≫ 4096，帽不生效、生产零影响。
+func newSummarizer(chat ChatStream, limit int) *summarizer {
+	s := &summarizer{
+		chat:            chat,
+		temp:            summarizeTemp,
+		maxTokens:       summarizeMaxTokens,
+		stallFirstToken: 30 * time.Second,
+		stallChunkGap:   30 * time.Second,
+		stallTotal:      10 * time.Minute,
+		maxAttempts:     summarizeMaxAttempts,
 	}
-	defer stream.Close()
-	var b strings.Builder
-	for {
-		chunk, err := stream.Recv()
-		if err == io.EOF {
+	if limit > 0 {
+		if capped := limit / summarizeBudgetDivisor; capped < s.maxTokens {
+			s.maxTokens = capped
+		}
+	}
+	return s
+}
+
+// summarize 对一份渲染输入产一份过验货的摘要。失败出口 = A 的 family（19v6-07 §3）：
+// 重试按失败原因分流——瞬时错误 / 验货拒收可重试（同一份输入），超长错误 / stall 不重试；
+// 重试耗尽或非重试类失败，返回带分类的错误，调用方走 C1 现状路径（status=error、零写入）。
+// 每次尝试（成败都算）打 agent_context_compaction 日志行——摘要流量与主推理分离的观测标记。
+func (s *summarizer) summarize(ctx context.Context, input string) (string, error) {
+	var lastClass string
+	var lastErr error
+	for attempt := 1; attempt <= s.maxAttempts; attempt++ {
+		out, class, err := s.attempt(ctx, input, attempt)
+		if err == nil {
+			return out, nil
+		}
+		lastClass, lastErr = class, err
+		log.Printf("compact summarize: agent_context_compaction attempt=%d/%d 失败[%s] budget=%d: %v",
+			attempt, s.maxAttempts, class, s.maxTokens, err)
+		// 非重试类（超长/stall/其他）与 run 已收尾（ctx 取消）：快速出口，不重试。
+		if class != summarizeClassTransient && class != summarizeClassRejected {
 			break
 		}
-		if err != nil {
-			return "", err
-		}
-		if text, ok := w.translate(chunk); ok {
-			b.WriteString(text)
+		if ctx.Err() != nil {
+			break
 		}
 	}
-	out := strings.TrimSpace(b.String())
+	switch lastClass {
+	case summarizeClassTransient, summarizeClassRejected:
+		return "", fmt.Errorf("compact: 摘要失败（%s，重试 %d 次耗尽）: %w", lastClass, s.maxAttempts-1, lastErr)
+	default:
+		return "", fmt.Errorf("compact: 摘要失败（%s）: %w", lastClass, lastErr)
+	}
+}
+
+// attempt 单次摘要调用：建流 → stall 排干 → ConcatMessages 归并 → 三层验货。
+// 返回 (摘要, 失败分类, 错误)：成功时分类为空串。
+func (s *summarizer) attempt(ctx context.Context, input string, attempt int) (string, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.stallTotal)
+	defer cancel()
+	// 字预算随硬帽动态渲染（A3）：静态值（A2 的 1200 字）在硬帽落地后会诱导超帽截断 →
+	// 验货拒收 → 重试耗尽 → 每次折叠都走 A——prompt 软目标必须与硬帽同源。
+	// 换算系数 4/5 字/tok：来源 C2 实测中文摘要 ≈1.18 tok/字，保守取 0.8（dev 校准）。
+	budgetRunes := s.maxTokens * 4 / 5
+	stream, err := s.chat.Stream(ctx, []*schema.Message{
+		schema.SystemMessage(fmt.Sprintf(compactPrompt, budgetRunes)),
+		schema.UserMessage(input),
+	}, model.WithTemperature(s.temp), model.WithMaxTokens(s.maxTokens))
+	if err != nil {
+		return "", classifyStreamErr(err), fmt.Errorf("建流: %w", err)
+	}
+	defer stream.Close()
+	chunks, err := drainStalled(ctx, stream, s.stallFirstToken, s.stallChunkGap)
+	if err != nil {
+		// ctx 总时限到点 = stall 家族（本质墙钟）；其余按错误内容分类。
+		if errors.Is(err, errStall) || errors.Is(err, context.DeadlineExceeded) {
+			return "", summarizeClassStall, err
+		}
+		return "", classifyStreamErr(err), fmt.Errorf("排干: %w", err)
+	}
+	// ConcatMessages 归并：正文拼接、ResponseMeta 取末帧（Usage/FinishReason 在流末帧，
+	// openai 组件恒开 IncludeUsage，claude 组件 messageDelta 同面带——plumbing 实读结论）。
+	merged, err := schema.ConcatMessages(chunks)
+	if err != nil {
+		return "", summarizeClassOther, fmt.Errorf("归并: %w", err)
+	}
+	completion, finish := -1, ""
+	if merged.ResponseMeta != nil {
+		finish = merged.ResponseMeta.FinishReason
+		if merged.ResponseMeta.Usage != nil {
+			completion = merged.ResponseMeta.Usage.CompletionTokens
+		}
+	}
+	if reason := rejectReason(completion, finish, s.maxTokens); reason != "" {
+		return "", summarizeClassRejected, errors.New(reason)
+	}
+	out := strings.TrimSpace(merged.Content)
 	if out == "" {
-		return "", errors.New("compact: 摘要为空，拒收")
+		// 行表形态下空摘要会变成一条空洞的 seq=0 行——拒收（C1 现状语义保留）。
+		return "", summarizeClassRejected, errors.New("摘要为空，拒收")
 	}
-	return out, nil
+	log.Printf("compact summarize: agent_context_compaction attempt=%d/%d 通过 finish=%q completion=%d budget=%d chars=%d",
+		attempt, s.maxAttempts, finish, completion, s.maxTokens, len(out))
+	return out, "", nil
+}
+
+// drainStalled 排干一条摘要流：首 token 限时、之后 chunk 间隔限时（19v6-07 §3「流式 stall 检测为主」）。
+// Recv 在 goroutine 里跑、经 channel 交付——stall 是「等不到下一帧」，不是靠 Recv 自己报。
+// 返回 errStall = 计时器先到（快速失败，不挂死 run）；其余原样透传 Recv 错误。
+func drainStalled(ctx context.Context, stream *schema.StreamReader[*schema.Message],
+	firstToken, chunkGap time.Duration) ([]*schema.Message, error) {
+	type recvResult struct {
+		chunk *schema.Message
+		err   error
+	}
+	ch := make(chan recvResult, 1)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			chunk, err := stream.Recv()
+			select {
+			case ch <- recvResult{chunk: chunk, err: err}:
+			case <-done:
+				return // 调用方已超时退出：带走 goroutine，不泄漏
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	var chunks []*schema.Message
+	timer := time.NewTimer(firstToken)
+	defer timer.Stop()
+	for {
+		select {
+		case r := <-ch:
+			if r.err == io.EOF {
+				return chunks, nil
+			}
+			if r.err != nil {
+				return nil, r.err
+			}
+			chunks = append(chunks, r.chunk)
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(chunkGap)
+		case <-timer.C:
+			if len(chunks) == 0 {
+				return nil, fmt.Errorf("%w（首 token 逾 %s 未至）", errStall, firstToken)
+			}
+			return nil, fmt.Errorf("%w（chunk 间隔逾 %s）", errStall, chunkGap)
+		}
+	}
+}
+
+// rejectReason 三层验货（19v6-07 §3）：返回非空 = 拒收原因。
+//
+//	① 算术主检：completion ≥ 自设上限 ⇒ 截断拒收（厂商/分词器无关，误杀代价仅多一次重试）；
+//	② 字符串辅检：finish_reason（小写后）∈ 截断黑名单拒收——白名单有缺失/变体盲区，只作辅检；
+//	③ 缺失处理：finish_reason 缺失时不误杀——算术检过（或无从检起）即放行。
+func rejectReason(completion int, finish string, maxTokens int) string {
+	if completion >= maxTokens {
+		return fmt.Sprintf("算术主检拒收：completion_tokens=%d ≥ 自设上限 %d，按截断处理", completion, maxTokens)
+	}
+	switch strings.ToLower(finish) {
+	case "length", "max_tokens", "max_output_tokens":
+		return fmt.Sprintf("字符串辅检拒收：finish_reason=%q ∈ 截断黑名单", finish)
+	}
+	return ""
+}
+
+// classifyStreamErr 按错误内容分失败类（19v6-07 §3 重试分流的判定面）：
+// 超长错误（provider 报「太长」）不重试——同一份输入原样重试必然原样失败；
+// 瞬时错误（429/5xx/断连/超时）原样重试。串匹配是 dev 初值（校准点：接溢出修复层时换正则集）。
+func classifyStreamErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return summarizeClassStall // 宽松总时限到点，归 stall 家族
+	}
+	if errors.Is(err, context.Canceled) {
+		return summarizeClassOther // run 收尾导致的取消：不是模型失败，重试无意义
+	}
+	msg := strings.ToLower(err.Error())
+	for _, p := range []string{"too long", "context length", "maximum context", "reduce the length",
+		"request entity too large", "prompt is too long", "exceeds the context", "max_tokens"} {
+		if strings.Contains(msg, p) {
+			return summarizeClassLength
+		}
+	}
+	for _, p := range []string{"429", "too many requests", "rate limit", "status 5", " 500", " 502",
+		" 503", " 504", "internal server error", "bad gateway", "service unavailable",
+		"gateway timeout", "connection reset", "broken pipe", "unexpected eof", "timeout",
+		"temporarily unavailable", "try again later"} {
+		if strings.Contains(msg, p) {
+			return summarizeClassTransient
+		}
+	}
+	return summarizeClassOther
 }

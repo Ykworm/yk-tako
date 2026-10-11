@@ -93,12 +93,13 @@ func einoChunkText(chunk *schema.Message) (string, bool) {
 // 走折叠（compact.go）；0 = 关压缩（counter 为 nil 即可，计数与摘要都不发生）。
 type Worker struct {
 	store         *Store
-	chat          ChatStream // 直连流：只给 compact 摘要用（summarize）
-	agent         adk.Agent  // 主循环：ADK ChatModelAgent（T2 起挂 get_time）
+	sum           *summarizer // compact 摘要：旋钮/stall/重试分流/三层验货一条龙（C2）
+	agent         adk.Agent   // 主循环：ADK ChatModelAgent（T2 起挂 get_time）
 	translate     Translator
 	system        string
 	leaseRenew    time.Duration
 	compactWindow int
+	compactLimit  int // window×4/5（window=0 时 0）：触发线 / 准入线 / 摘要预算帽三处共用，不各自重算
 	counter       TokenCounter
 }
 
@@ -114,11 +115,35 @@ type Worker struct {
 // T3：agentsDir 是子代理规格目录——装载 handler 在每 run 起手扫盘（挂 Handlers 首位），
 // 装配出的委派工具经 runCtx.Tools 进模型声明面；EmitInternalEvents 打开 AgentTool 的内转发
 // （子代理事件由此汇进本 worker 消费的事件流）。
-func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, system, agentsDir string, leaseRenew time.Duration,
+//
+// F1：workspace 是文件工具的作业根（绝对路径，main 启动作 Abs + MkdirAll 后传入）——
+// F 系列文件工具入池即受它约束；池内全部工具经 wrapToolErrors 包成「错误→结果」回注模型
+// （tools.go 的机制说明）。
+func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, system, workspace, agentsDir string, leaseRenew time.Duration,
 	compactWindow int, counter TokenCounter) (*Worker, error) {
+	// file_effect 启动 lint（C5-A4，fileops.go）：F1 起注册表非空（write_file 首条），
+	// lint 从空转变成真检查——此后任何文件工具漏声明 = 启动失败。
+	if err := lintFileEffects(firstPartyFileEffects); err != nil {
+		return nil, err
+	}
 	getTime, err := newGetTimeTool()
 	if err != nil {
 		return nil, err
+	}
+	// 文件工具族入池：构造函数同签名（吃 workspace 根），循环装配——数量与拍号不在注释里
+	// 复述（真清单即下方构造器列表，写数字会腐化）；每把经 wrapToolErrors 包成「错误→结果」
+	// 回注模型（tools.go 的机制说明）。
+	pool := []tool.BaseTool{wrapToolErrors(getTime)}
+	for _, mk := range []func(string) (tool.BaseTool, error){
+		newWriteFileTool, newReadTextFileTool, newReadFileTool, newEditFileTool,
+		newMoveFileTool, newCreateDirectoryTool, newListDirectoryTool,
+		newDirectoryTreeTool, newGetFileInfoTool, newSearchFilesTool, newReadMediaFileTool,
+	} {
+		t, err := mk(workspace)
+		if err != nil {
+			return nil, err
+		}
+		pool = append(pool, wrapToolErrors(t))
 	}
 	agent, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
 		Name:        "yktako",
@@ -126,7 +151,7 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		Model:       chat,
 		ToolsConfig: adk.ToolsConfig{
 			ToolsNodeConfig: compose.ToolsNodeConfig{
-				Tools: []tool.BaseTool{getTime},
+				Tools: pool,
 			},
 			EmitInternalEvents: true,
 		},
@@ -135,8 +160,9 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 	if err != nil {
 		return nil, err
 	}
-	return &Worker{store: store, chat: chat, agent: agent, translate: translate, system: system,
-		leaseRenew: leaseRenew, compactWindow: compactWindow, counter: counter}, nil
+	compactLimit := compactWindow * 4 / 5
+	return &Worker{store: store, sum: newSummarizer(chat, compactLimit), agent: agent, translate: translate, system: system,
+		leaseRenew: leaseRenew, compactWindow: compactWindow, compactLimit: compactLimit, counter: counter}, nil
 }
 
 // Run 是 run 的执行体。**收尾无条件化**：endRun 挂在唯一出口（defer），不散在各级 return 前——
@@ -328,6 +354,21 @@ func (w *Worker) watchdog(ctx context.Context, sessionID SessionID, runID RunID)
 	}
 }
 
+// AdmitText 是 POST 单条消息的准入检查（C5-A1，tail 支）：compact 关闭（window=0）时一切放行；
+// 开启时单条 user 消息计数 > limit/compactAdmissionDivisor ⇒ 不放行，由调用方回 413。
+// 返回 (limit, tokens, ok)：limit = window×4/5（与触发折叠同一 limit，不发明第二个数）；
+// ok=false 时 limit/tokens 供错误体带回去（报清原因，客户端可裁剪重发）。策略本身属 compact
+// 域（19v6-07 §5 的三等分推导），但用的是 Worker 的 window/counter——所以是 Worker 方法、
+// 住在 prepareInput 旁边：同一道「发送前自测」的门，长度检查的两个刻度。
+func (w *Worker) AdmitText(text string) (limit, tokens int, ok bool) {
+	if w.compactWindow == 0 || w.counter == nil {
+		return 0, 0, true
+	}
+	limit = w.compactLimit
+	tokens = w.counter.Count(text)
+	return limit, tokens, tokens <= limit/compactAdmissionDivisor
+}
+
 // prepareInput 组模型侧消息：model_history 全序（user 在 AcquireRun 时已入，含本轮这条）。
 // **不拼 system**（T1 起）：agent 的 Instruction 就是系统提示词，ADK defaultGenModelInput 会在
 // 消息头拼 SystemMessage(instruction)——这里再拼一条，模型输入里 system 会出现两遍。
@@ -343,10 +384,10 @@ func (w *Worker) prepareInput(ctx context.Context, sessionID SessionID, runID Ru
 	}
 	var stagedCompaction *StagedCompaction
 	if w.compactWindow > 0 {
-		limit := w.compactWindow * 4 / 5
+		limit := w.compactLimit
 		if total := countInput(w.counter, w.system, history); total > limit {
 			log.Printf("compact %s/%s: 输入 %d tok > limit %d，进入折叠", sessionID, runID, total, limit)
-			history, stagedCompaction, err = foldInput(ctx, w.system, history, runID, limit, w.counter, w.summarize)
+			history, stagedCompaction, err = foldInput(ctx, w.system, history, runID, limit, w.counter, w.sum.summarize)
 			if err != nil {
 				return nil, nil, err
 			}

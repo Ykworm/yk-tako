@@ -99,6 +99,9 @@ type logResponse struct {
 //	400 {"error":"bad_request"}          ← 请求体不是合法 JSON
 //	404 {"error":"session_not_found"}    ← 只可能出现在「带未知 sessionId」时
 //	409 {"error":"session_busy"}         ← 该会话已有活 run；**什么都没写**，客户端本地排队、本轮收口后补投
+//	413 {"error":"message_too_large","limit":M,"tokens":N}
+//	                                     ← 单条消息超准入线（仅 compact 开启时；limit = window×4/5，
+//	                                       线 = limit/3）；抢闸前拒收，零痕迹，客户端裁剪后可原样重投
 //	500 {"error":"internal"}
 //
 // 服务端在**一笔原子写**里做完（D1 落库后 = 一笔 PG 事务持有跨 Redis 写，planning §8.4）：
@@ -125,6 +128,14 @@ func (s *Server) postRuns(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
 			return
 		}
+	}
+	// 准入（C5-A1，tail 支）：单条消息超 limit/3 → 抢闸前拒收——不烧闸、不落 mh 行、零痕迹，
+	// 客户端可裁剪重发（messageId 复用无妨：幂等只在闸层面，这里根本没到闸）。
+	if limit, tokens, ok := s.worker.AdmitText(req.Text); !ok {
+		// 字段序 = error → limit → tokens（gin.H 经 encoding/json 按 key 字典序输出，三键恰好此序；
+		// 若增删字段需重钉字节序）。
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "message_too_large", "limit": limit, "tokens": tokens})
+		return
 	}
 	runID, err := newRunID()
 	if err != nil {

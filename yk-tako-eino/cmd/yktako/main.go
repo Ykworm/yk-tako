@@ -5,6 +5,7 @@ import (
 	"flag"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -60,6 +61,7 @@ func main() {
 	leaseRenew := flag.Duration("lease-renew", durationEnv("TAKO_LEASE_RENEW", defaultLeaseRenew), "watchdog renew interval (must be < lease-ttl; env TAKO_LEASE_RENEW)")
 	compactWindow := flag.Int("compact-window", defaultCompactWindow, "context window in tokens for compaction; limit = window * 4/5; 0 disables")
 	agentsDir := flag.String("agents-dir", "agents", "directory of sub-agent specs (*.md + YAML frontmatter); scanned at each run start (relative to CWD)")
+	workspace := flag.String("workspace", "./workspace", "workspace root for first-party file tools; created at startup, tools are confined to it")
 	flag.Parse()
 
 	// 必须 leaseRenew 严格小于 leaseTTL：
@@ -94,9 +96,20 @@ func main() {
 			log.Fatalf("compact counter (cl100k): %v", err)
 		}
 	}
+	// workspace（F1）：起点即绝对化——越界判定是纯字符串前缀检查（resolveInWorkspace），
+	// 相对根会让检查结果依赖 CWD 的偶然值；启动 MkdirAll 保证根存在（工具只负责树内创建）。
+	wsAbs, err := filepath.Abs(*workspace)
+	if err != nil {
+		log.Fatalf("workspace %q 绝对化: %v", *workspace, err)
+	}
+	if err := os.MkdirAll(wsAbs, 0o755); err != nil {
+		log.Fatalf("workspace %q 创建: %v", wsAbs, err)
+	}
+	log.Printf("workspace %s", wsAbs)
+
 	// agent 装配（T1）失败也是启动错误：装配不出来 = 主循环跑不了，fail fast 一贯式。
 	// T3：agentsDir 只是规格目录位置（装载是 run 起手扫盘、失败降级为 log）——目录不存在不算启动错误。
-	worker, err := runengine.NewWorker(store, opened.Chat, runengine.TranslatorFor(string(opened.Protocol)), config.SystemPrompt(), *agentsDir, *leaseRenew, *compactWindow, counter)
+	worker, err := runengine.NewWorker(store, opened.Chat, runengine.TranslatorFor(string(opened.Protocol)), config.SystemPrompt(), wsAbs, *agentsDir, *leaseRenew, *compactWindow, counter)
 	if err != nil {
 		log.Fatalf("agent 装配: %v", err)
 	}
