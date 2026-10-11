@@ -3,18 +3,27 @@
 > 本篇是 doc/19-v6 文档集的 **tool loop 篇**：Eino ADK 底座、工具消息的两个投影、sub agent（AgentTool）、
 > 工具目录与 tool_search、观测 Handler 脚手架。
 > **契约字节真源仍是 19v6-01**——本篇涉及的帧新 kind 与 `agent` 字段**已随 T2（2026-10-08，七修）落 19v6-01**；
+> `model` 字段（2026-10-10 纠偏，帧/行同带）**已补 19v6-01，随 T3-1b/T3-2 落地**；
 > 本篇是 tool loop 的**机制裁定真源**。
 > 立项：2026-10-08（用户拍板：循环走 Eino ADK）；执行台账 = `tmp/19-v6/planning.md` §11 + todos「T 系列」。
 
-## 0. 术语（2026-10-08 用户裁）
+## 0. 术语（2026-10-08 用户裁；2026-10-10 补 3 条模型侧术语）
 
-三个词三种形状 / 住处 / 消费者，勿混：
+先看「观测 / 存储」侧三个词，三种形状 / 住处 / 消费者，勿混：
 
 | 词 | 形状 | 住处 | 消费者 | 粒度 |
 |---|---|---|---|---|
 | **Model message** | OpenAI messages（role/content/tool_calls） | 主线程 → `run_model_messages` 表；子代理 → **只在进程内**（AgentTool runner state） | worker 组装模型输入 | 消息 |
-| **runlive** | 帧（`kind` + `agent` + 负载） | Redis `tk:runlive:{runId}` LIST（TTL 300s） | frames API（客户端轮询） | 帧 |
-| **runlog** | 活动行（`role`/`agent`/`text`/`payload`） | PG `runlog_entries` | log API | 消息 |
+| **runlive** | 帧（`kind` + `agent` + `model` + 负载） | Redis `tk:runlive:{runId}` LIST（TTL 300s） | frames API（客户端轮询） | 帧 |
+| **runlog** | 活动行（`role`/`agent`/`model`/`text`/`payload`） | PG `runlog_entries` | log API | 消息 |
+
+再看「模型选型 / 客户端」侧三个词（§4 开始大量用，先钉死定义）：
+
+| 词 | 形状（正向定义） | 住处 | 消费者 | 例子 |
+|---|---|---|---|---|
+| **ref** | 字符串，格式 = `厂商ID / 模型ID`。唯一身份：带厂商命名空间，避免同名模型撞车。 | 不单独存：从环境变量 `TAKO_MODEL` 读、或从子代理 md 的 `model:` 行读 | `ResolveModel` 解析它、Registry 拿它当缓存 key、帧/行里的 `model` 字段存它 | `deepseek/deepseek-v4-flash`、`anthropic/claude-sonnet-4`、`ollama/qwen2.5-coder:14b` |
+| **ChatModel 实例** | 一个具体的 HTTP 客户端：里面装好了 baseURL、API Key、协议（openai/anthropic）、模型 ID。**无状态，不记任何对话**。 | 进程内存（Go struct） | ChatModelAgent / AgentTool 的 loop 用它发 LLM 请求 | 主 worker 启动时 `config.Open()` 返回的那一个；子代理按 ref 新建的那些 |
+| **ModelRegistry（简称 Registry）** | 一张进程内的**懒加载缓存表**：`map[ref]ChatModel实例`。懒加载 = 进程启动时是空的，**第一次用到某个 ref 才解析并建客户端**，之后同样的 ref 直接复用。 | 进程内存（Go struct，带读写锁防并发重复建） | 装配层（BeforeAgent）把子代理规格转成 ChatModelAgent 时用它取实例 | 一条规格写了 `model: anthropic/claude-sonnet-4`，第一次遇到时 Registry 去解析环境变量、建 claude 客户端、存进 map；下一条同样写了这个 ref 的规格直接拿 map 里的，不再重复解析 |
 
 index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型输入侧叫 Model message、观测侧叫帧/runlive」，
 以及两者**永不混写**：子代理的 Model message 不进 mh、帧不进 mh。
@@ -49,6 +58,8 @@ index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型�
   `args` = 模型原始 JSON 字符串，原样透传不重编码）。
 - **每帧带 `agent` 字段**：空 = root，含 start/terminal（2026-10-08 用户裁「任何帧都带 agent 是必然」）。
   命名取 `agent` 不取 `role`——帧 `kind` 与 runlog 行 `role` 已是同位语义，再引 role 两义。
+- **每帧带 `model` 字段**（2026-10-10 纠偏）：生效 ref（`厂商/模型`）——契约已补 19v6-01 §2，随 T3-1b 落地；
+  行侧 `model` 列随 T3-2（§6 已登记，PG 落库）。
 - runlive 帧无 seq：LIST 顺序 = 下标 → frames 响应的 `nextOffset` 游标；`agent` 与之并列携带。
 
 ## 4. sub agent：AgentTool 自组装
@@ -60,24 +71,178 @@ index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型�
   正文 = system prompt；**装载 = run 起手扫盘**（改文件 → 下一条消息生效、run 中途不变；run 内工具集固定、
   子代理 runner 不重扫盘）。理由链：每规格一包 AgentTool ⇒ 工具清单 = 规格名单 ⇒ Eino 工具 schema 定稿于装配点
   （`once.Do`、首次 Run 前冻结）⇒ 要新鲜只能重装配 ⇒ 装载点 = 重装配点 = run 起手。
-  实现两路（每 run 重建主 agent / `BeforeAgent` 换本次工具列表）实施时验证取哪条；随仓 seed 一条 tako 自写规格。
+  实现取 `BeforeAgent` 换本次工具列表（T3-1 源码实读 + 真栈落地）；随仓 seed 一条 tako 自写规格。
 - **字段表（2026-10-09 裁）**：`name`（单字段身份 = AgentTool 工具名 = runlog `agent` 值；文件名不参与语义；
   撞名 → 拒该条 + 显式报错）/ `description`（必填，缺 → 拒该条报错）/ `tools`（三态，见下）/
-  `model`（**缺席 → 继承主 worker 实例**；**写值 → 装载即拒报「未实现」**——「ref → 实例」机械件留给模型注册表 loop）；
+  `model`（写值分**三种写法穷举**，不漏不重，实现落 T3-1b，链路与例子见下）：
+
+  | 写法编号 | 在 agents/*.md 里怎么写 `model:` | 含义 | 行为 | YAML 例子 |
+  |---|---|---|---|---|
+  | 写法一 | **根本不写** `model:` 这一行 | 隐式继承主 worker 的模型 | 直接拿主 worker 启动时建好的那个 ChatModel 实例用，不查注册表、不新建 | （不写这行） |
+  | 写法二 | 写了且去前后空格后（大小写不敏感）**正好等于**三者之一：`default` / `inherit` / `继承` | 显式声明「用主 worker 的模型」 | 与写法一**完全同义**，拿同一个主实例，不进注册表、不新建 | `model: inherit` |
+  | 写法三 | 除了写法一、写法二以外的**任何字符串**（排中律：不是前两种就一定是这种） | 明确指定要用哪个模型 | 字符串必须是 `厂商/模型` 格式（与 `TAKO_MODEL` 完全相同的写法，例：`deepseek/deepseek-v4-flash`）。调用 `ModelRegistry.Get(ctx, ref)`（进程内懒加载缓存表，见下）拿到该 ref 对应的 ChatModel 实例：<br>• 缓存里已有 → 直接复用<br>• 缓存里没有 → 走与 `TAKO_MODEL` 相同的 `ResolveModel` 链（扫环境变量找 Key → 查厂商目录 → 定 baseURL 和协议 → `build` 建客户端），建好后塞进缓存，下次再用<br>• 解析失败（没配这家厂商的 Key、厂商不在目录、格式不对缺模型名等）→ **这条规格不装载**，进程启动日志打一行明确报错，其余规格照常装载 | `model: anthropic/claude-sonnet-4` |
+
   **不加展示字段**（emoji/color 等）。**不设信任门**（T3：规格 = 部署态只读产物；运行时写 = 挂账，真做前先裁真源）；
   管理面（dashboard/API = 文件操作可视壳：列/读/写/删，装 = 复制、卸 = 删）后置独立小拍。
+- **`model` 解析链路（T3-1b 落地；用具体规格走一遍，比抽象箭头易懂）**：
+
+  前置说明（分阶段职责，别混）：
+  - **写规格的人**：在 `agents/*.md` 的 YAML frontmatter 里写 `model:`
+  - **parse 层（`parseAgentSpec`）**：只管拆 YAML 语法，把 `model:` 那一行的字符串**原样拿出来**，**不在这里判断是写法一/二/三**——判断留到装配层做，理由是 parse 只该认语法、不该懂语义
+  - **装配层（BeforeAgent）**：同一个钩子函数里拿刚才原样带出的字符串，按上面三种写法的穷举表**分流**——写法一/二合并走「继承」路，写法三走「查 ModelRegistry」路
+
+  用三条具体规格跑一遍全链路（主 worker 启动时 `TAKO_MODEL=deepseek/deepseek-v4-flash`，主实例已经建好）：
+
+```text
+┌─ 三条具体规格（agents/*.md） ───────────────────────────────────────────────┐
+│                                                                           │
+│  ① researcher.md  ：什么都没写（写法一·隐式继承）                            │
+│  ② writer.md      ：model: inherit（写法二·显式继承）                       │
+│  ③ code-review.md ：model: anthropic/claude-sonnet-4（写法三·指定 ref）    │
+│                                                                           │
+└───────────────────────────────┬───────────────────────────────────────────┘
+                                │
+                                ▼
+             run 起手扫盘（BeforeAgent → LoadAgentSpecs → parseAgentSpec）
+                                │
+                                ▼
+                   parse 只拆语法：model 字符串原样带出
+                   （不判断是继承还是 ref，判断留到下一步）
+                                │
+                                ▼
+              ┌──────── 装配层分流（同一次 BeforeAgent） ────────┐
+              │                                                 │
+              │  ① researcher.md  → 没写 model 这行            │
+              │  ② writer.md      → "inherit"                  │
+              │        │                                         │
+              │        └──► 走「继承分支」                      │
+              │              直接用主 worker 已有的那个         │
+              │              deepseek/deepseek-v4-flash 实例    │
+              │              （不查 Registry、不新建）          │
+              │                                                 │
+              │  ③ code-review.md → "anthropic/claude-sonnet-4"│
+              │        │                                         │
+              │        └──► 走「指定模型分支」                  │
+              │              调 ModelRegistry.Get(ctx, ref)     │
+              │              ref = "anthropic/claude-sonnet-4" │
+              │                    │                            │
+              │                    ├─ 缓存命中（之前有别的      │
+              │                    │    规格也写了这个 ref）    │
+              │                    │    └─► 直接拿 map 里的     │
+              │                    │         ChatModel 实例用   │
+              │                    │                            │
+              │                    └─ 缓存未命中（第一次用）   │
+              │                         │                        │
+              │                         └─► 与 TAKO_MODEL       │
+              │                              走完全相同的链：    │
+              │                              ResolveModel +     │
+              │                              build 建客户端     │
+              │                              → 成功：塞进缓存    │
+              │                                         返回    │
+              │                              → 失败：没配 Key / │
+              │                                         厂商不  │
+              │                                         存在等  │
+              │                                         └─► 这  │
+              │                                             条  │
+              │                                             规  │
+              │                                             格  │
+              │                                             不  │
+              │                                             装  │
+              │                                             载  │
+              │                                             +   │
+              │                                             log │
+              │                                             一  │
+              │                                             行  │
+              └─────────────────────────────────────────────────┘
+                                │
+                                ▼
+              每条成功装载的规格 → ChatModelAgent{Model: 它拿到的实例}
+                                │
+                                ▼
+                         包成 AgentTool → 挂进 runCtx.Tools
+                         （本 run 的工具列表就齐了）
+                                │
+                                ▼
+              同时产出一张「agent 名 → 生效 ref」的小表
+              （例：researcher→deepseek/x，code-review→anthropic/s4）
+              写帧、写 runlog 时，按 agent 名查出 ref，填进 `model` 字段
+              （契约见 19v6-01 §2/§3）
+```
+
+  **ModelRegistry.Get 到底在做什么？（最小伪代码，30 行以内讲明白）**：
+
+  ```go
+  // ModelRegistry 就是进程内一张带懒加载的缓存表。
+  // 注意：这是解释性伪代码，不是产品代码。产品代码细节（double-check、锁粒度等）落地时再抠。
+  type ModelRegistry struct {
+      mu    sync.RWMutex
+      cache map[string]*ChatModel // key = ref，value = 已经建好的 HTTP 客户端
+      env   Env                   // 进程启动时的环境变量快照（Key/BaseURL 都从这里读）
+  }
+
+  func (r *ModelRegistry) Get(ctx context.Context, ref string) (*ChatModel, error) {
+      // 1. 先查缓存：之前有人用过这个 ref → 直接返回
+      r.mu.RLock()
+      if m, ok := r.cache[ref]; ok {
+          r.mu.RUnlock()
+          return m, nil
+      }
+      r.mu.RUnlock()
+
+      // 2. 缓存空 = 第一次用到这个 ref。走与 TAKO_MODEL 完全相同的解析链：
+      //    ResolveModelWithRef(r.env, ref) → 查出厂商、Key、baseURL、协议
+      //    build(ctx, resolved)            → 按协议建对应的 HTTP 客户端（openai / claude）
+      resolved, err := ResolveModelWithRef(r.env, ref)
+      if err != nil {
+          return nil, err // 没配这家的 Key / 厂商不在目录 / ref 格式错 → 上层拒载该规格
+      }
+      chatModel, err := build(ctx, resolved)
+      if err != nil {
+          return nil, err
+      }
+
+      // 3. 塞进缓存。下次同样的 ref 就不用再走解析 + 建客户端了。
+      r.mu.Lock()
+      defer r.mu.Unlock()
+      if m, ok := r.cache[ref]; ok { // double-check：并发下可能别人刚好塞了
+          return m, nil
+      }
+      r.cache[ref] = &ChatModel{Chat: chatModel, Protocol: resolved.Provider.Protocol, Ref: resolved.Ref}
+      return r.cache[ref], nil
+  }
+  ```
+
+  几个**有意这样设计**、不按直觉改的点（别看到进程内就想搬去共享存储）：
+
+  - 「多实例」= 同一张缓存表里可以同时有 deepseek 客户端、claude 客户端、ollama 客户端——只要你在规格里写了不同 ref，第一次用到时就各建各的，互不干扰。
+  - 「晚解析」= 进程启动时 Registry.cache 是空的。你写了 20 条子代理规格，但只有 3 个被真正装载用到 → 只建 3 个客户端。剩下 17 个永远不会浪费内存去建。
+  - **解析链同源**：写法三里那个「ResolveModel + build」和主 worker 启动时 `config.Open()` 调的是**同两个函数**（只是 `ResolveModel` 会抽一个通用版 `ResolveModelWithRef`，主 worker 的 `TAKO_MODEL` 也是拿这个通用版喂环境变量），保证 `TAKO_MODEL=deepseek/x` 和 md 里 `model: deepseek/x` 行为 100% 一致——不会出现「主 worker 能调通、子代理调不通」这种同一个 ref 两种行为的诡异 bug。
+
+- **为什么 ModelRegistry 放「进程内存」，不放 PG/Redis 共享存储？（一张表说清楚判断依据）**
+
+  判断原则来自仓库级硬规则 [AGENTS.md](file:///Users/yuweikang/dev/ykcode/learn/yk-tako/AGENTS.md)：「凡是要长期存在的状态，先问『多副本下它在哪』」——但不是所有东西都叫「长期状态」。四种东西对比一下：
+
+  | 东西 | 本质是什么 | 需要跨副本一致吗？ | 放哪里（v6 现状） | 为什么这么放 |
+  |---|---|---|---|---|
+  | 会话「单 run 跑着」的闸 | 互斥锁：两副本同时抢同一会话会出两份 run、写乱帧序 | ✅ 必须全集群唯一 | PG `runs` 表部分唯一索引（插入失败本身就是 409） | 共享可变状态 = 必须放共享存储。进程内 `chan` 或 mutex 一上多副本就废 |
+  | runlive 帧流 | 生成中帧的实时队列：客户端不管打哪个副本的 frames API 都得看到同一批帧、同一顺序 | ✅ 必须全集群同序 | Redis `tk:runlive:{runId}` LIST（TTL 300s） | 时序队列 = 必须放共享。各副本各写各的，客户端轮询就丢帧乱序了 |
+  | runlog 历史行 | 会话的定稿历史：用户关了浏览器再开，历史必须还在 | ✅ 必须持久、不丢 | PG `runlog_entries` 表 | 持久化数据 = 必须放共享。进程内存里一重启就没了 |
+  | **ChatModel 客户端实例** | 一个无状态的 HTTP 请求发件器：装着 URL + Key + 协议 + 模型 ID，**不记任何对话**，同样的 ref 建 100 个和建 1 个行为字节级一样 | ❌ **不需要一致** | **进程内存（本进程的 ModelRegistry）** | 它是「连接句柄」，不是「数据」：<br>1. 跨进程传不了 HTTP client（里面有连接池、goroutine 私域），物理上就没法塞 Redis<br>2. 多副本各建一份成本可以忽略：扫几十条环境变量（μs 级）+ 分配几个 struct，真金白银的成本是后面几百 ms 的 LLM 请求本身<br>3. 同 ref 解析结果必然一致：所有副本读的同一套环境变量 + 同一套厂商目录，不存在「A 副本解析成功、B 副本解析失败」的可能（除非滚动部署时半更新，那是部署纪律的锅）<br>4. 缓存丢了也没关系：进程一重启、Registry 空了，下次 `Get` 再建就行，不丢任何业务数据——缓存只是「省一次解析」，不是真源 |
+
+  总结成一句话：**数据（要持久、要跨副本一致的）放共享存储；连接句柄（用了就扔、重建成本极低的）放进程内。** ChatModel 客户端是连接句柄，不是数据。
+
 - **Model message = 进程内**：AgentTool 每次调用起独立 runner（独立 compose state），跑完即弃，
   只有最终文本作为 tool result 回主 run。崩溃即丢，符合「run 死、会话活」语义。
-- **runlog 落消息粒度行**：委派 tool_call / 子代理动作行 / 子代理终稿，`agent` 列非空；
+- **runlog 落消息粒度行**：委派 tool_call / 子代理动作行 / 子代理终稿，`agent` 列非空、`model` 列 = 该 agent 生效 ref（PG 落库随 T3-2）；
   历史组装按 root 过滤（`event.AgentName == root`——不过滤会把子代理内部 tool 消息混进主历史）。
-- **runlive 帧流**：子代理帧与主 agent 帧进同一归一层、同一 LIST，每帧带 `agent`。
+- **runlive 帧流**：子代理帧与主 agent 帧进同一归一层、同一 LIST，每帧带 `agent` 与 `model`（生效 ref）。
 - **粒度裁定（2026-10-08）**：runlog 记消息粒度、不记帧——主 agent 的 delta 本就不落历史表，
   子代理同构：**delta 帧只进 runlive，不落 runlog**。
 - **并行**：同一 run 内多 goroutine 各跑独立 state，帧事件全经主 run 的单一 writer（归一层）落库，
   seq 串行分配——**并行不改表**，无共享可变状态。
 - **嵌套**：默认禁止（子代理规格不挂委派工具，pi 同款）；开放时 max=1 且深度持久化防 resume 绕过
   （dsh 默认）——随用例再立。
-- **规格 `tools` 字段（2026-10-09 更新为三态）**：**缺席 → 继承父池**（父池已摘掉委派工具 = 禁嵌套；pi/harness 同款）/
+- **规格 `tools` 字段（2026-10-09 更新为三态）**：**不写 → 继承父池**（父池已摘掉委派工具 = 禁嵌套；pi/harness 同款）/
   **白名单**（按名从父池映射）/ **`[]` 空集**（「不写 vs 写空」用 nil / 空 slice 分开表达）。
   「+search」= 保留名 **`tool_search`** 进列表（用户 2026-10-08 裁「子代理挂 search，当然要」；**实现随 T4 触发拍**）——
   搜索范围 = **自己的池**（统一规则见 §5）。T3 期池内工具**全声明**（无 deferred 机械件，分级随 T4 触发）。
@@ -114,6 +279,7 @@ index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型�
 |---|---|---|---|
 | `run_model_messages` | `tool_calls` TEXT、`tool_call_id` TEXT | T2 ✅ | OpenAI assistant/tool 形状；§8.2 已预告 |
 | `runlog_entries` | `agent` TEXT（空=root）、`payload` TEXT（JSON） | T2 ✅（两列，2026-10-08）/ T3（agent 非空） | payload 单列 TEXT：结构化字段种类差异大、稀疏列展不开 tool_calls 数组；「零 JSONB」原裁针对消息表（§8.6 收口） |
+| `runlog_entries` | `model` TEXT（空 = 非模型产物） | T3-2（2026-10-10 登记） | 与帧同义的生效 ref（`厂商/模型`）：`user` 行空 / root 行 = 主 ref / 子代理行 = 该规格生效 ref——md 改 `model` 的持久验证面（帧是 TTL 的实时视图，本列是永久真源） |
 | `sessions` / `runs` | 不动 | — | fork 的 `forked_from` 列随 T2 树状会话 loop 再加（§7） |
 
 ## 7. 挂账（本 loop 不做）
