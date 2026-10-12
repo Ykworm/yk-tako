@@ -32,7 +32,7 @@ func testPGDSN(db string) string {
 	return fmt.Sprintf("host=127.0.0.1 port=5433 dbname=%s sslmode=disable", db)
 }
 
-// newTestStore 起一套隔离存储：临时 PG 库（AutoMigrate 四表）+ Redis db1（清掉上一轮 tk:* 残留）。
+// newTestStore 起一套隔离存储：临时 PG 库（AutoMigrate 五表）+ Redis db1（清掉上一轮 tk:* 残留）。
 // cleanup（LIFO 无关，本函数内显式排序）：先关 Store 连接、再 DROP 库。
 func newTestStore(t *testing.T, leaseTTL, ttl time.Duration) *Store {
 	t.Helper()
@@ -531,14 +531,19 @@ func TestEndRunAfterGateLostIsNoop(t *testing.T) {
 	}
 }
 
-// 9. Reset 两半都清、且只删自己的东西：PG 四表空、db1 的 tk:* 键清空，而邻居键（非 tk: 前缀）完好——
-// 本机 6390 上真跑着别的键空间，这条不是假想需求。
+// 9. Reset 两半都清、且只删自己的东西：PG 五表空（含 M1 的 notes）、db1 的 tk:* 键清空，
+// 而邻居键（非 tk: 前缀）完好——本机 6390 上真跑着别的键空间，这条不是假想需求。
 func TestResetClearsBothHalvesOnlyOwnPrefix(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t, testLease, testTTL)
 	sid, rid := SessionID("s_1"), RunID("r_1")
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 	s.mustDelta(t, ctx, rid, "world")
+	if err := s.db.Exec(
+		`INSERT INTO notes (id, workspace, kind, content, quote, source_run_id, source_seq, created_at)
+		 VALUES ('n_1', '/ws', 'agent', 'deck 在 output/deck.html', '原话', 'r_1', 1, now())`).Error; err != nil {
+		t.Fatal(err)
+	}
 	if err := s.rdb.Set(ctx, "other:x", "not mine", 0).Err(); err != nil {
 		t.Fatal(err)
 	}
@@ -550,7 +555,7 @@ func TestResetClearsBothHalvesOnlyOwnPrefix(t *testing.T) {
 	if deleted != 2 {
 		t.Errorf("Reset deleted = %d, want 2（runlive + draft 两键）", deleted)
 	}
-	for _, m := range []any{&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}} {
+	for _, m := range []any{&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}, &Note{}} {
 		if got := s.count(t, m, ""); got != 0 {
 			t.Errorf("reset 后 %T 行数 = %d, want 0", m, got)
 		}

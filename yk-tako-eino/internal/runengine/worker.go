@@ -162,6 +162,13 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		}
 		pool = append(pool, wrapToolErrors(t))
 	}
+	// 笔记工具入池（M1，notes.go）：文件工具族之后 append——子代理继承整池时天然拿到它
+	// （researcher 不写 tools 行 = 继承）；写入逻辑全在 writeNote。
+	mem, err := newMemoryTool(store, workspace)
+	if err != nil {
+		return nil, err
+	}
+	pool = append(pool, wrapToolErrors(mem))
 	// 摘要器在 agent 装配前构造（A4，planning 裁定 9）：midfoldHandler 要拿它的 summarize 方法值——
 	// mid-run 折叠与 prepareInput 的 Run fold 共用同一个摘要器、同一顶帽（C5-A7 分档）。
 	compactLimit := compactWindow * 4 / 5
@@ -178,11 +185,14 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 			EmitInternalEvents: true,
 		},
 		Handlers: []adk.ChatModelAgentMiddleware{
-			newAgentSpecHandler(agentsDir, chat, modelRef, translate, resolver,
+			newAgentSpecHandler(agentsDir, store, workspace, chat, modelRef, translate, resolver,
 				make(chan struct{}, subagentConcurrency), subagentReturnCap),
+			// 笔记快照缝（M1，notes.go）：BeforeAgent 渲染快照、每轮模型调用前把 system 重写为
+			// Instruction + 快照段；排在 midfold 之前——midfold 从 state 取 system 计数，与模型实见同源。
+			newNoteSnapshotHandler(store, workspace, system),
 			// mid-run fold 钩子排在装载 handler 之后、观测 handler 之前（19v6-10 §4）：
 			// agentLog 看到的是模型实际所见的折后输入。
-			newMidfoldHandler(system, counter, compactLimit, sum.summarize, firstPartyFileEffects),
+			newMidfoldHandler(counter, compactLimit, sum.summarize, firstPartyFileEffects),
 			NewAgentLogHandler(),
 		},
 	})
@@ -244,6 +254,17 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 		w.watchdog(leaseCtx, sessionID, runID)
 	}()
 	defer func() { cancelLease(); wg.Wait() }()
+
+	// 笔记的 run 身份（M1，notes.go）：本 run user 行的 runlog seq——AcquireRun 已入该行；
+	// 工具写 notes 时以 (run id, seq) 填 source 两列（对质入口：从笔记行找回原话现场）。
+	// 查询失败走 run error（与 prepareInput 的失败形态同款，零写入家族）。
+	userSeq, err := w.store.runlogUserSeq(ctx, sessionID, runID)
+	if err != nil {
+		log.Printf("note source %s/%s: %v", sessionID, runID, err)
+		status = "error"
+		return
+	}
+	ctx = withNoteBox(ctx, newNoteBox(sessionID, runID, userSeq))
 
 	msgs, err := w.prepareInput(ctx, sessionID, runID)
 	if err != nil {

@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/cloudwego/eino/adk"
@@ -150,7 +151,7 @@ func TestAgentSpecModelBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	mainTranslate := claudeChunkText
-	h := newAgentSpecHandler(dir, &fakeModel{}, "main/ref", mainTranslate, resolver, make(chan struct{}, 8), 51200)
+	h := newAgentSpecHandler(dir, newTestStore(t, time.Minute, time.Minute), "/tmp/agents-test-ws", &fakeModel{}, "main/ref", mainTranslate, resolver, make(chan struct{}, 8), 51200)
 
 	ctx := withAgentModelTable(context.Background(), newAgentModelTable("main/ref", mainTranslate))
 	runCtx := &adk.ChatModelAgentContext{Tools: []tool.BaseTool{gt}}

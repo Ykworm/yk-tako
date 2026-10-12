@@ -97,6 +97,9 @@ var firstPartyFileEffects = map[string]string{
 	"get_file_info":    fileEffectRead,
 	"search_files":     fileEffectRead,
 	"read_media_file":  fileEffectRead,
+	// memory（M1）：笔记落 PG notes 表、不碰 workspace 路径——显式表态 none（planning §1-6，
+	// 作者没声明 = 不碰文件的同一表态方式）。
+	"memory": fileEffectNone,
 }
 
 // fileEffectToolNames 是启动 lint 的目录名单（v1 常量表，逐名带出处；精确命中用，不转小写）：

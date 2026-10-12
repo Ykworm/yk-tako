@@ -1,4 +1,4 @@
-// 本文件是存储层的 PG 半：四张表的 GORM model、建表（AutoMigrate），以及纯 PG 的读方法。
+// 本文件是存储层的 PG 半：五张表的 GORM model、建表（AutoMigrate），以及纯 PG 的读方法。
 //
 // 边界（planning §8）：**GORM 只管「行 ↔ struct」**——契约 JSON（Row/Frame 的字段序）由 Go 结构体
 // 渲染，不经 GORM；全设计零 JSONB。表名/列名即 19v6-03 与 planning §8.2 的定稿形态。
@@ -95,11 +95,11 @@ type RunlogEntry struct {
 
 func (RunlogEntry) TableName() string { return "runlog_entries" }
 
-// autoMigrate 从四个 struct 建表（dev 迁移方式，待定项①已裁：AutoMigrate 够用，无迁移文件；
-// 上生产换不换显式迁移归部署面）。两个部分索引（WHERE 条件）优先走 GORM index tag；
+// autoMigrate 从五个 struct 建表（dev 迁移方式，待定项①已裁：AutoMigrate 够用，无迁移文件；
+// 上生产换不换显式迁移归部署面）。部分索引（WHERE 条件）优先走 GORM index tag；
 // 若某版 GORM 表达不全，在这里补 CREATE ... IF NOT EXISTS 兜底——仍是代码内，不引迁移文件。
 func autoMigrate(db *gorm.DB) error {
-	return db.AutoMigrate(&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{})
+	return db.AutoMigrate(&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}, &Note{})
 }
 
 // newRowID 生成行级代理主键：前缀 + ULID（同 s_/r_ 的铸法）。
@@ -164,6 +164,17 @@ func (s *Store) ModelMessages(ctx context.Context, sessionID SessionID) ([]Model
 		})
 	}
 	return out, nil
+}
+
+// runlogUserSeq 返回某 run 的 user 行在 runlog 的 seq（笔记的 source_seq 来源，M1）。
+// AcquireRun 保证每 run 恰一条 user 行；查不到时落 0（违例态，但不必在这条读路径上拦截——
+// 它只喂笔记行的溯源列，不参与任何判定）。
+func (s *Store) runlogUserSeq(ctx context.Context, sessionID SessionID, runID RunID) (int64, error) {
+	var seq int64
+	err := s.db.WithContext(ctx).Model(&RunlogEntry{}).
+		Where("session_id = ? AND run_id = ? AND role = 'user'", sessionID, runID).
+		Select("COALESCE(MAX(seq), 0)").Scan(&seq).Error
+	return seq, err
 }
 
 // ReadLog 返回 session 中 seq > from 的定稿记录（升序，最多 w 条）与 nextOffset（空批 = from）。

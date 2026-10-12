@@ -297,7 +297,7 @@ func queryOffset(c *gin.Context, name string) int {
 }
 
 // devReset 是 dev-only 全局归零（planning §4 脚手架表：长期 dev 工具，只在 dev 装配注册）。
-// D1 后两半都清：PG 四表 TRUNCATE + `tk:*` 键 UNLINK（runs 必须同清——它是闸的落点）。
+// D1 后两半都清：PG 五表 TRUNCATE（M1 起含 notes）+ `tk:*` 键 UNLINK（runs 必须同清——它是闸的落点）。
 func (s *Server) devReset(c *gin.Context) {
 	deleted, err := s.store.Reset(c.Request.Context())
 	if err != nil {

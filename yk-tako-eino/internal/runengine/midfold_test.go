@@ -172,7 +172,7 @@ func TestFoldBoxConcurrentSmoke(t *testing.T) {
 // ---- 钩子出口：断言违例（裁定 7，不 panic、不落 final）----
 
 func TestMidfoldHandlerAssertionErrors(t *testing.T) {
-	handler := newMidfoldHandler("人设", fakeCounter{f: func(string) int { return 0 }}, 100,
+	handler := newMidfoldHandler(fakeCounter{f: func(string) int { return 0 }}, 100,
 		func(context.Context, string) (string, error) { return "", nil }, nil)
 	ctx := withFoldBox(context.Background(), newFoldBox("s_1", "r_1"))
 
@@ -191,7 +191,7 @@ func TestMidfoldHandlerAssertionErrors(t *testing.T) {
 // ---- AfterAgent 取货口 + mhRowsFromFold 重编 ----
 
 func TestAfterAgentFinalAndMhRowsFromFold(t *testing.T) {
-	handler := newMidfoldHandler("人设", fakeCounter{f: func(string) int { return 0 }}, 100, nil, nil)
+	handler := newMidfoldHandler(fakeCounter{f: func(string) int { return 0 }}, 100, nil, nil)
 	box := newFoldBox("s_1", "r_cur")
 	box.setBase([]ModelMessage{{RunID: "r_cur", Seq: 1, Role: "user", Text: "问"}})
 	ctx := withFoldBox(context.Background(), box)
@@ -242,7 +242,7 @@ func TestMidfoldHandlerSecondFoldSameRun(t *testing.T) {
 		sumInputs = append(sumInputs, in)
 		return fmt.Sprintf("S%d", len(sumInputs)), nil
 	}
-	handler := newMidfoldHandler("人设", counter, 150, summarize, nil)
+	handler := newMidfoldHandler(counter, 150, summarize, nil)
 	box := newFoldBox("s_1", "r_cur")
 	box.setBase([]ModelMessage{
 		{RunID: "r_cur", Seq: 0, Role: "user", Text: "S0"},

@@ -1031,6 +1031,7 @@ func TestCompactPromptSixSlotsInOrder(t *testing.T) {
 		"整体并进「## 其他上下文」", // 规则③散文迁移语义
 		"不允许输出没有槽标题的正文",  // 规则④：迁移/echo 时骨架仍必须存在（A2 e2e 防回归）
 		"不要开场白、不要代码块围栏",  // 规则⑤输出纯净
+		"必须按原句保留",        // 规则⑥（M6）：用户说过的规矩按原句进摘要，不改写
 		"理由必须写",          // 关键决策带理由
 	} {
 		if !strings.Contains(compactPrompt, rule) {

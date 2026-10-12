@@ -217,22 +217,22 @@ func droppedRunUnits(before, after []ModelMessage, currentRun RunID) int {
 var _ adk.ChatModelAgentMiddleware = (*midfoldHandler)(nil)
 
 // midfoldHandler 是 mid-run fold 的钩子：每次模型调用前对当前 state 自测长度、超线走同一条
-// 折叠链；成功终态时把折后 state 存进容器供 worker 落库。挂载次序 = agentSpecHandler 之后、
-// agentLog 之前（19v6-10 §4：日志看到的是模型实际所见的折后输入）。子代理内部不挂（§10）。
+// 折叠链；成功终态时把折后 state 存进容器供 worker 落库。挂载次序 = agentSpecHandler /
+// noteSnapshotHandler 之后、agentLog 之前（19v6-10 §4：日志看到的是模型实际所见的折后输入）。
+// 子代理内部不挂（§10）。计数/折叠用的 system 从 state 首条取（M1 起）——快照 handler 已把
+// 快照段拼进它，数到的就是模型实见的（不再用构造期形参，「单一真源全从 state 读」）。
 type midfoldHandler struct {
 	*adk.BaseChatModelAgentMiddleware
-	system      string // = worker 的 system（Instruction）：countInput 的 system 形参与 prepareInput 同源
-	limit       int    // = compactLimit（window×4/5）；<= 0 = 折叠休眠（BeforeModelRewriteState 直通）
+	limit       int // = compactLimit（window×4/5）；<= 0 = 折叠休眠（BeforeModelRewriteState 直通）
 	counter     TokenCounter
 	summarize   func(context.Context, string) (string, error) // = summarizer.summarize（同一条链同一个摘要器）
-	fileEffects map[string]string                              // = firstPartyFileEffects（钉块提取的判定入口）
+	fileEffects map[string]string                             // = firstPartyFileEffects（钉块提取的判定入口）
 }
 
-func newMidfoldHandler(system string, counter TokenCounter, limit int,
+func newMidfoldHandler(counter TokenCounter, limit int,
 	summarize func(context.Context, string) (string, error), fileEffects map[string]string) *midfoldHandler {
 	return &midfoldHandler{
 		BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{},
-		system:                       system,
 		limit:                        limit,
 		counter:                      counter,
 		summarize:                    summarize,
@@ -249,16 +249,16 @@ func (h *midfoldHandler) BeforeModelRewriteState(ctx context.Context, state *adk
 		return ctx, state, nil
 	}
 	base := box.baseRows()
-	_, history, err := convertState(base, box.run, state.Messages)
+	sys, history, err := convertState(base, box.run, state.Messages)
 	if err != nil {
 		return ctx, state, err
 	}
-	total := countInput(h.counter, h.system, history)
+	total := countInput(h.counter, sys, history)
 	if total <= h.limit {
 		return ctx, state, nil
 	}
 	log.Printf("compact mid-run %s/%s: 输入 %d tok > limit %d，进入折叠", box.session, box.run, total, h.limit)
-	folded, staged, err := foldInput(ctx, h.system, history, box.run, h.limit, h.counter, h.summarize, h.fileEffects)
+	folded, staged, err := foldInput(ctx, sys, history, box.run, h.limit, h.counter, h.summarize, h.fileEffects)
 	if err != nil {
 		return ctx, state, err
 	}

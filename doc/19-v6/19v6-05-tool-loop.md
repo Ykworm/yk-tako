@@ -250,6 +250,15 @@ index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型�
   - **并发**：上限 = **配置项（默认 8）**（选择归 human 写配置、代码只做机械件）；pi 为硬编码常量（单批 8 / 同时 4），tako 无「单批」概念，只设「同时」一个旋钮。
   - **超时**：**不设总时限**、不另立计时器；要掐走将来的「取消」面（abort 级联；与 T1 遗留「abandon 不断流」是同一个待做面）。pi 实读（2026-10-09）：两套子代理实现均无计时器，唯一 kill 路径都是 abort 传播；时间上限只加在有界操作上（per-request / 单条命令）。
   - **回传裁剪**：终稿回传超 **50 KB 字节**即截（UTF-8 安全 + omitted 提示，照 pi）；全量在子代理自己的 runlog 行（tako 无 pi 的 tool details 通道）。
+- **T3 落地实施口径（2026-10-11 落地；验收脚本 = 19v6-04 用例 7）**：
+  - **子代理终稿行（runlog assistant 行）**= 该 agent **全部轮次正文累计**（工具轮前导语 + 末轮正文）——遇它无 `tool_calls` 的末轮落一行（agent=名、model=其生效 ref）并清空暂存（同 agent 二次委派不串轮）；root 终稿仍是 draft（Σ root delta，收口锚不变）。
+  - **回传给父 run 的文本** = AgentTool 的返回值 = 子代理**末轮消息正文**（多轮时为其末段：不含工具轮前导语）；**先裁后落**——mh tool 行 / runlog 委派 `tool_result` 行 / 帧侧 `tool_result.output` 三处是同一份**已裁剪文本**（逐字节相等）；全量只在子代理终稿行。
+  - **截断尾缀原文**（delegationTool，代码 `agents.go`；照 pi）：
+    `[Output truncated: %d bytes omitted. Full output preserved in subagent runlog.]`，N = 总字节 − 保留字节；
+    截点回退到 UTF-8 rune 边界（绝不劈开多字节字符，保留段最多比帽少 3 字节）；`cap ≤ 0` = 不裁剪。
+    尾缀里的「subagent runlog」= 同一 log 端点上该 agent 的行（无新端点；客户端按行内 `agent` 字段跳转）。
+  - **两个旋钮（main 旗标；选择归 human 写配置）**：`-subagent-concurrency`（默认 8；进程级信号量、全部规格共享；<1 = 启动即拒——0 = 所有委派永久等闸）+ `-subagent-return-cap`（默认 51200 B）；启动日志 `subagents: concurrency N, return cap M B`。
+  - **随仓 seed 规格** `yk-tako-eino/agents/researcher.md`（开箱可跑 + 格式参照）：不写 `tools` / 不写 `model` = 两个继承档（继承父池 / 继承主实例）的活样例。
 - 挂账：continuable/后台子代理（dsh send_message/jobs）、出进程 provider（acp/codex/claude-code）、
   **子代理目录的运行时安装**（Octop catalog/install）、**子代理运行中途改自己的工具集**
   （Eino `BeforeAgent` 可改、用例未逼出）——后两条 2026-10-08 用户裁「先别搞，记下来」。

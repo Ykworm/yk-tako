@@ -225,9 +225,13 @@ func agentModelTableFrom(ctx context.Context) *agentModelTable {
 // 入口快照 base = runCtx.Tools：此刻池里只有基座工具（本 handler 是唯一往池里加委派工具的），
 // 子代理继承父池时取它 = 天然禁嵌套。
 // T3-3 起委派工具出池前过 delegationTool 包壳（并发闸 + 回传裁剪）——sem/returnCap 由 NewWorker 造好注入。
+// M5 起规格正文后接笔记快照段（Instruction = spec.Prompt + "\n\n" + 快照段，与主代理同一份，
+// 见 BeforeAgent 顶部的读一次说明）。
 type agentSpecHandler struct {
 	*adk.BaseChatModelAgentMiddleware
 	dir       string
+	store     *Store              // 笔记快照读口（M5；listLiveNotes）
+	workspace string              // 笔记分区键（workspace 根 Abs）
 	model     model.BaseChatModel // 主 worker 实例：写法一/二（不写 / default|inherit|继承）直接用
 	modelRef  string              // 主 ref：继承档的生效 ref（帧 model 字段）
 	translate Translator          // 主 translator：继承档的 drain 分发
@@ -237,12 +241,14 @@ type agentSpecHandler struct {
 }
 
 // newAgentSpecHandler 组装载 handler。dir 是规格目录（相对 CWD 或绝对路径）；
-// m / mainRef / mainTranslate 是主 worker 的三件套（继承档取用）；r 是模型注册表（ref 档取用）；
-// sem/returnCap 是 T3-3 的预算面（并发闸 + 回传裁剪），装配点 = NewWorker。
-func newAgentSpecHandler(dir string, m model.BaseChatModel, mainRef string, mainTranslate Translator,
+// store/workspace 是笔记快照读口（M5）；m / mainRef / mainTranslate 是主 worker 的三件套
+// （继承档取用）；r 是模型注册表（ref 档取用）；sem/returnCap 是 T3-3 的预算面
+// （并发闸 + 回传裁剪），装配点 = NewWorker。
+func newAgentSpecHandler(dir string, store *Store, workspace string, m model.BaseChatModel, mainRef string, mainTranslate Translator,
 	r ModelResolver, sem chan struct{}, returnCap int) *agentSpecHandler {
 	return &agentSpecHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{},
-		dir: dir, model: m, modelRef: mainRef, translate: mainTranslate, resolver: r, sem: sem, returnCap: returnCap}
+		dir: dir, store: store, workspace: workspace, model: m, modelRef: mainRef, translate: mainTranslate,
+		resolver: r, sem: sem, returnCap: returnCap}
 }
 
 // delegationTool 是委派工具的预算包壳（T3-3）：并发闸（sem）+ 回传裁剪（capBytes），
@@ -330,19 +336,31 @@ func truncateDelegationReturn(s string, capBytes int) string {
 //	[AgentTool_A,     [AgentTool_A,
 //	 AgentTool_B]      AgentTool_B]
 //
-// 本函数具体步骤：扫盘 → 三态解析工具池（resolveToolPool）→ 三写法解析模型（继承档用主实例 /
-// ref 档查注册表）→ 装配子代理 → 包 AgentTool → append runCtx.Tools + 写身份表（agentModelTable），
-// 最后打一行装载日志（agents: N spec(s): <names>）。
+// 本函数具体步骤：扫盘 → 读笔记快照（M5）→ 三态解析工具池（resolveToolPool）→ 三写法解析模型
+// （继承档用主实例 / ref 档查注册表）→ 装配子代理（Instruction = 规格正文 + 快照段）→
+// 包 AgentTool → append runCtx.Tools + 写身份表（agentModelTable），最后打装载日志与逐条 system 日志。
 //
 // 白名单档的名称空间 = base 本身：tools: [a, b] 里的 a、b 其实已经在 base tools 里面——
 // resolveToolPool 只按名从 base 挑子集（挑不到 = 拒该条并列出可选名单），只收窄、不扩容。
 //
-// 本 handler 不改 instruction、不返回错误：装载面全部降级为 log 拒该条——run 本身照跑（最差 = 无委派工具）。
+// 装载面错误（坏规格 / 解析失败 / 装配失败）全部降级为 log 拒该条——run 本身照跑（最差 = 无委派工具）。
+// 唯一不降级的 = 笔记快照读库失败走 error：笔记层不可信不静默，与主代理 noteSnapshotHandler 同政策
+// （链上紧随其后、对同一次读的失败同判，所以持久故障下 run 必死、瞬时故障下最多差这一场装载）。
 func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelAgentContext) (context.Context, *adk.ChatModelAgentContext, error) {
 	specs, err := LoadAgentSpecs(h.dir)
 	if err != nil {
 		log.Printf("agents: 扫盘 %s 失败: %v", h.dir, err)
 		return ctx, runCtx, nil
+	}
+	// 笔记快照（M5，planning §5 子代理快照缝）：装载时点 = run 起手，此刻读一次未替代行、渲染
+	// 快照段，全部规格共用同一份（run 内冻结语义与主代理相同——工具写库不回写，下一场才可见）。
+	snap := ""
+	if len(specs) > 0 {
+		entries, err := h.store.listLiveNotes(ctx, h.workspace)
+		if err != nil {
+			return ctx, runCtx, fmt.Errorf("agents: 笔记快照读库失败: %w", err)
+		}
+		snap = renderNotesSnapshot(entries)
 	}
 	table := agentModelTableFrom(ctx) // 本 run 的身份表（worker.Run 建并塞 ctx）；写帧/drain 读它，见 worker.go
 	base := runCtx.Tools              // 入口快照：继承档取它（此刻无任何委派工具 = 禁嵌套）
@@ -366,10 +384,11 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 			subModel = inst.Chat
 			entry = agentModelEntry{ref: inst.Ref, translate: TranslatorFor(inst.Protocol)}
 		}
+		instruction := spec.Prompt + "\n\n" + snap
 		sub, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
 			Name:        spec.Name,
 			Description: spec.Description,
-			Instruction: spec.Prompt,
+			Instruction: instruction,
 			Model:       subModel,
 			ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: pool}},
 		})
@@ -377,6 +396,9 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 			log.Printf("agents: %s: 拒载: 子代理装配失败: %v", spec.Name, err)
 			continue
 		}
+		// 子代理 system 全文日志（M5 观测面，转正点 planning §7）：装载时打拼接后 Instruction——
+		// 快照句在规格正文之后的活体证据就靠它。
+		log.Printf("agent system %s:\n%s", spec.Name, instruction)
 		// 委派工具出池前过预算包壳（T3-3）：并发闸 + 回传裁剪；Info/调用面透传，声明字节不变。
 		runCtx.Tools = append(runCtx.Tools, &delegationTool{
 			inner: adk.NewAgentTool(ctx, sub), sem: h.sem, capBytes: h.returnCap, name: spec.Name,

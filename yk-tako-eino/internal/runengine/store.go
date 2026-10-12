@@ -1,5 +1,5 @@
 // 本文件是存储层的装配与跨存储方法：Store 握住两半——PG（sessions / runs / run_model_messages /
-// runlog_entries，见 pgstore.go）与 Redis（tk:runlive / tk:draft，见 redisstore.go）。
+// runlog_entries / notes，见 pgstore.go 与 notes.go）与 Redis（tk:runlive / tk:draft，见 redisstore.go）。
 // 只有四个方法要同时动两半：AcquireRun / EndRun / RenewLease / Reset（planning §8.4 事务映射）。
 //
 // 跨存储排序的两条已裁边界（§8.4，2026-10-07）：
@@ -46,7 +46,7 @@ type Store struct {
 }
 
 // OpenStore 建起两半并各自探活（main 的 fail fast：任一半不可达 = 引擎起不来，
-// 与 config.MustOpen 同一处置——不留半个只能回 500 的进程），然后 AutoMigrate 建四表。
+// 与 config.MustOpen 同一处置——不留半个只能回 500 的进程），然后 AutoMigrate 建五表。
 // redisAddr 支持 `host:port` 或 `redis://host:port/N`（后者给测试用独立 DB index）。
 func OpenStore(ctx context.Context, redisAddr, pgDSN string, ttl, leaseTTL time.Duration) (*Store, error) {
 	rdb, err := openRedis(redisAddr)
@@ -456,13 +456,14 @@ func (s *Store) RenewLease(ctx context.Context, sessionID SessionID, runID RunID
 	return true, nil
 }
 
-// Reset 全局归零（dev-only 端点 /api/dev/reset 的底座，§8.4）：PG 四表 TRUNCATE + `SCAN tk:*` + UNLINK，
+// Reset 全局归零（dev-only 端点 /api/dev/reset 的底座，§8.4）：PG 五表 TRUNCATE + `SCAN tk:*` + UNLINK，
 // 返回 Redis 删除**键数**（响应字节与旧形态一致）。
-// 四表同清：`runs` 必须清——它是闸的落点，漏清则幽灵 running 行永久残留
-// （清扫只在新 POST 时按 session_id 触发，旧 session 已 404，再没人替它扫）。
+// 五表同清：`runs` 必须清——它是闸的落点，漏清则幽灵 running 行永久残留
+// （清扫只在新 POST 时按 session_id 触发，旧 session 已 404，再没人替它扫）；
+// `notes` 是笔记层（M1）的库内状态，同属「引擎自己的东西」，全局归零一并清。
 func (s *Store) Reset(ctx context.Context) (deleted int, err error) {
 	if err := s.db.WithContext(ctx).Exec(
-		`TRUNCATE TABLE sessions, runs, run_model_messages, runlog_entries`).Error; err != nil {
+		`TRUNCATE TABLE sessions, runs, run_model_messages, runlog_entries, notes`).Error; err != nil {
 		return 0, err
 	}
 	var cursor uint64
