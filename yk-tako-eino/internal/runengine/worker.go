@@ -170,6 +170,13 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		return nil, err
 	}
 	pool = append(pool, wrapToolErrors(mem))
+	// 历史查找工具入池（H1，doc/21）：memory 之后 append——身份从 ctx 的 noteBox 取
+	// （session/run），只读 runlog_entries（工具参数里没有会话号）。
+	sh, err := newSearchHistoryTool(store)
+	if err != nil {
+		return nil, err
+	}
+	pool = append(pool, wrapToolErrors(sh))
 	// 摘要器在 agent 装配前构造（A4，planning 裁定 9）：midfoldHandler 要拿它的 summarize 方法值——
 	// mid-run 折叠与 prepareInput 的 Run fold 共用同一个摘要器、同一顶帽（C5-A7 分档）。
 	compactLimit := compactWindow * 4 / 5
