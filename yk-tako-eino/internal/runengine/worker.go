@@ -28,6 +28,7 @@ import (
 	"context"
 	"io"
 	"log"
+	"strconv"
 	"sync"
 	"time"
 
@@ -286,6 +287,16 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 			break
 		}
 		if event.Err != nil {
+			// 检出①（A1，19v6-09 §4）：provider 拒收「太长」时把估算 C 与窗真值 W' 喊进日志——
+			// 纯观测，出口一行不动（run 仍 status=error、零写入）；救援（谓词/强折/重跑）是 A2。
+			// 子代理 / 中途拒收也打（不救但留观测，planning 裁定 2）；C = run 起手放行估算。
+			if w.compactWindow > 0 && IsOverflowError(event.Err) {
+				window := "未知"
+				if n, ok := extractWindow(event.Err); ok {
+					window = strconv.Itoa(n)
+				}
+				log.Printf("overflow: provider 拒收（估算 %d tok；真值 %s）", box.countBase(), window)
+			}
 			log.Printf("agent %s/%s: %v", sessionID, runID, event.Err)
 			status = "error"
 			return
@@ -472,7 +483,13 @@ func (w *Worker) prepareInput(ctx context.Context, sessionID SessionID, runID Ru
 	var staged *StagedCompaction
 	if w.compactWindow > 0 {
 		limit := w.compactLimit
-		if total := countInput(w.counter, w.system, history); total > limit {
+		// 放行估算 C 恒算并入容器（A1，planning 裁定 3）：detect 行 / rescue 行 / D4 的 limit'
+		// 三处消费同一个数——C 跟「产出全进容器」同一条路（box.setBase 的先例），不恢复返回值传递。
+		total := countInput(w.counter, w.system, history)
+		if box := foldBoxFrom(ctx); box != nil {
+			box.setBaseCount(total)
+		}
+		if total > limit {
 			log.Printf("compact %s/%s: 输入 %d tok > limit %d，进入折叠", sessionID, runID, total, limit)
 			history, staged, err = foldInput(ctx, w.system, history, runID, limit, w.counter, w.sum.summarize, firstPartyFileEffects)
 			if err != nil {

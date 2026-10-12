@@ -43,12 +43,13 @@ import (
 // 钩子跑在 ADK 内部 goroutine，RWMutex 兜底——正常时序下无竞态（AfterAgent 完成 → run 函数
 // 返回 → generator.Close() → worker 的 it.Next() 返 false，channel close 给了 happens-before）。
 type foldBox struct {
-	mu      sync.RWMutex
-	session SessionID
-	run     RunID
-	base    []ModelMessage     // 「system 与当前 run 新轮次之外」的基点（mh 形状，含 RunID/Seq）
-	staged  []StagedCompaction // 折叠指令列表：Run fold 打头、mid-run 各次追加（EndRun 吃列表）
-	final   []ModelMessage     // 终态 mh 投影：仅 AfterAgent（成功终态）填——error / 取消不填
+	mu        sync.RWMutex
+	session   SessionID
+	run       RunID
+	base      []ModelMessage     // 「system 与当前 run 新轮次之外」的基点（mh 形状，含 RunID/Seq）
+	baseCount int                // run 起手放行估算（A1：prepareInput 的 countInput 结果——detect 行消费；A2/A3 的 D4 续用）
+	staged    []StagedCompaction // 折叠指令列表：Run fold 打头、mid-run 各次追加（EndRun 吃列表）
+	final     []ModelMessage     // 终态 mh 投影：仅 AfterAgent（成功终态）填——error / 取消不填
 }
 
 func newFoldBox(session SessionID, run RunID) *foldBox {
@@ -65,6 +66,18 @@ func (b *foldBox) baseRows() []ModelMessage {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.base
+}
+
+func (b *foldBox) setBaseCount(n int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.baseCount = n
+}
+
+func (b *foldBox) countBase() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.baseCount
 }
 
 func (b *foldBox) appendStaged(sc StagedCompaction) {
