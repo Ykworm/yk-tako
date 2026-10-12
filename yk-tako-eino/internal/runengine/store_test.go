@@ -313,7 +313,7 @@ func TestEndRunCompleteFinalizes(t *testing.T) {
 
 	// T2 起 mh 的 assistant 半来自 worker 累积的 turn（不再由 EndRun 从 draft 合成）：测试给合成 turn 走同一路。
 	turn := []TurnEntry{{Role: "assistant", Text: "Hello, world"}}
-	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, turn)
+	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, mhRowsFromTurn(rid, turn), turn)
 	if err != nil || !ok {
 		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
 	}
@@ -360,7 +360,7 @@ func TestReadFramesGoneAfterTTL(t *testing.T) {
 	s := newTestStore(t, testLease, 2*time.Second)
 	sid, rid := SessionID("s_1"), RunID("r_1")
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
-	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil, nil); err != nil || !ok {
 		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
 	}
 
@@ -402,7 +402,7 @@ func TestStoredShapeCarriesNoOffset(t *testing.T) {
 	sid, rid := SessionID("s_1"), RunID("r_1")
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 	s.mustDelta(t, ctx, rid, "world")
-	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil, nil); err != nil || !ok {
 		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
 	}
 
@@ -441,7 +441,7 @@ func TestBatchWindowCapsBothEndpoints(t *testing.T) {
 	for _, rid := range []RunID{"r_1", "r_2"} {
 		s.mustAcquire(t, sid, rid, "m_u", "q")
 		s.mustDelta(t, ctx, rid, "a")
-		if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil); err != nil || !ok {
+		if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil, nil); err != nil || !ok {
 			t.Fatalf("EndRun %s: ok=%v err=%v", rid, ok, err)
 		}
 	}
@@ -481,7 +481,7 @@ func TestBatchWindowCapsBothEndpoints(t *testing.T) {
 	// 同一条规则也管 runlive：start+2 delta+terminal = 4 帧，W=1 时每批一帧。
 	s.mustDelta(t, ctx, rid3, "d1")
 	s.mustDelta(t, ctx, rid3, "d2")
-	if _, _, ok, err := s.EndRun(ctx, sid, rid3, "complete", nil, nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid3, "complete", nil, nil, nil); err != nil || !ok {
 		t.Fatalf("EndRun %s: ok=%v err=%v", rid3, ok, err)
 	}
 	for _, c := range []struct {
@@ -511,12 +511,12 @@ func TestEndRunAfterGateLostIsNoop(t *testing.T) {
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 	s.mustDelta(t, ctx, rid, "world")
 
-	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil, nil); err != nil || !ok {
 		t.Fatalf("首次 EndRun: ok=%v err=%v", ok, err)
 	}
 	before := s.count(t, &RunlogEntry{}, "session_id = ?", sid)
 
-	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil)
+	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -792,7 +792,7 @@ func TestEndRunRefusesExpiredGate(t *testing.T) {
 		return n == 0 && s.sqlBool(t, `SELECT lease_until < now() FROM runs WHERE id = ?`, rid)
 	})
 
-	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil)
+	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -819,7 +819,7 @@ func TestEndRunErrorKeepsLogUntouched(t *testing.T) {
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 	s.mustDelta(t, ctx, rid, "partial...")
 
-	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "error", nil, nil)
+	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "error", nil, nil, nil)
 	if err != nil || !ok {
 		t.Fatalf("EndRun(error): ok=%v err=%v", ok, err)
 	}
@@ -866,7 +866,7 @@ func TestEndRunLandsTurnRows(t *testing.T) {
 		{Role: "tool", Text: "2026-10-08 15:04:05 +0800 CST", ToolCallID: "call_1", ToolName: "get_time"},
 		{Role: "assistant", Text: "，现在是 15:04"},
 	}
-	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, turn); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, mhRowsFromTurn(rid, turn), turn); err != nil || !ok {
 		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
 	}
 
@@ -953,7 +953,7 @@ func TestEndRunLandsDelegationRows(t *testing.T) {
 		{Role: "tool", Agent: "", Text: "现在是 15:04。", ToolCallID: "call_1", ToolName: "researcher", Model: mainRef},
 		{Role: "assistant", Agent: "", Text: "已经查完：15:04", Model: mainRef},
 	}
-	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, turn); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, mhRowsFromTurn(rid, turn), turn); err != nil || !ok {
 		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
 	}
 
@@ -1039,13 +1039,15 @@ func TestEndRunCompleteWithStagedCompaction(t *testing.T) {
 	sid, r1, r2 := SessionID("s_1"), RunID("r_1"), RunID("r_2")
 	s.mustAcquire(t, sid, r1, "m_1", "run1 用户消息")
 	s.mustDelta(t, ctx, r1, "run1 回答")
-	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", nil, []TurnEntry{{Role: "assistant", Text: "run1 回答"}}); err != nil || !ok {
+	turn1 := []TurnEntry{{Role: "assistant", Text: "run1 回答"}}
+	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", nil, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
 		t.Fatalf("EndRun(r1): ok=%v err=%v", ok, err)
 	}
 	s.mustAcquire(t, sid, r2, "m_2", "run2 用户消息")
 
-	staged := &StagedCompaction{DropRunIDs: []RunID{r1}, Summary: "摘要：run1 谈过的事", AttachRun: r1}
-	if _, _, ok, err := s.EndRun(ctx, sid, r2, "complete", staged, []TurnEntry{{Role: "assistant", Text: "run2 回答"}}); err != nil || !ok {
+	staged := []StagedCompaction{{DropRunIDs: []RunID{r1}, Summary: "摘要：run1 谈过的事", AttachRun: r1}}
+	turn2 := []TurnEntry{{Role: "assistant", Text: "run2 回答"}}
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, "complete", staged, mhRowsFromTurn(r2, turn2), turn2); err != nil || !ok {
 		t.Fatalf("EndRun(r2, staged): ok=%v err=%v", ok, err)
 	}
 
@@ -1082,13 +1084,14 @@ func TestEndRunErrorWithStagedZeroWrite(t *testing.T) {
 	sid, r1, r2 := SessionID("s_1"), RunID("r_1"), RunID("r_2")
 	s.mustAcquire(t, sid, r1, "m_1", "run1 用户消息")
 	s.mustDelta(t, ctx, r1, "run1 回答")
-	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", nil, []TurnEntry{{Role: "assistant", Text: "run1 回答"}}); err != nil || !ok {
+	turn1 := []TurnEntry{{Role: "assistant", Text: "run1 回答"}}
+	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", nil, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
 		t.Fatalf("EndRun(r1): ok=%v err=%v", ok, err)
 	}
 	s.mustAcquire(t, sid, r2, "m_2", "run2 用户消息")
 
-	staged := &StagedCompaction{DropRunIDs: []RunID{r1}, Summary: "不该落库的摘要", AttachRun: r1}
-	if _, _, ok, err := s.EndRun(ctx, sid, r2, "error", staged, nil); err != nil || !ok {
+	staged := []StagedCompaction{{DropRunIDs: []RunID{r1}, Summary: "不该落库的摘要", AttachRun: r1}}
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, "error", staged, nil, nil); err != nil || !ok {
 		t.Fatalf("EndRun(r2, error, staged): ok=%v err=%v", ok, err)
 	}
 	if !s.sqlBool(t, `SELECT bool_and(compacted = false) FROM run_model_messages WHERE session_id = ?`, sid) {
@@ -1112,17 +1115,17 @@ func TestSecondCompactionReattaches(t *testing.T) {
 	runs := []RunID{"r_1", "r_2", "r_3"}
 	for i, rid := range runs {
 		s.mustAcquire(t, sid, rid, fmt.Sprintf("m_%d", i+1), fmt.Sprintf("run%d 用户消息", i+1))
-		staged := (*StagedCompaction)(nil)
+		var staged []StagedCompaction
 		if i == 1 {
-			staged = &StagedCompaction{DropRunIDs: []RunID{runs[0]}, Summary: "S1", AttachRun: runs[0]}
+			staged = []StagedCompaction{{DropRunIDs: []RunID{runs[0]}, Summary: "S1", AttachRun: runs[0]}}
 		}
 		if i == 2 {
 			// 第二次压缩：旧摘要所在 run（runs[0]）+ 新被压 run（runs[1]），挂 runs[1]。
-			staged = &StagedCompaction{DropRunIDs: []RunID{runs[0], runs[1]}, Summary: "S2", AttachRun: runs[1]}
+			staged = []StagedCompaction{{DropRunIDs: []RunID{runs[0], runs[1]}, Summary: "S2", AttachRun: runs[1]}}
 		}
-		if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", staged,
-			[]TurnEntry{{Role: "assistant", Text: fmt.Sprintf("run%d 回答", i+1)}}); err != nil || !ok {
-			t.Fatalf("EndRun(%s, staged=%v): ok=%v err=%v", rid, staged != nil, ok, err)
+		turn := []TurnEntry{{Role: "assistant", Text: fmt.Sprintf("run%d 回答", i+1)}}
+		if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", staged, mhRowsFromTurn(rid, turn), turn); err != nil || !ok {
+			t.Fatalf("EndRun(%s, staged=%d): ok=%v err=%v", rid, len(staged), ok, err)
 		}
 	}
 
@@ -1151,6 +1154,142 @@ func TestSecondCompactionReattaches(t *testing.T) {
 	}
 }
 
+// A3-1：同槽换代（UPSERT）——一轮 run 的 staged 先把摘要挂自己（mid-run 折自己的形态），
+// 后续 run 的折叠再整体折入该 run（AttachRun 又是它）→ 挂点槽换代：id 不动、text 焕新、恒一行。
+func TestEndRunSameSlotUpsert(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid, r1, r2 := SessionID("s_1"), RunID("r_1"), RunID("r_2")
+
+	// r_1 收尾时已经历一次 mid-run 折叠（挂自己）：seq0=S1 + 原文行（seq2..）活着。
+	s.mustAcquire(t, sid, r1, "m_1", "run1 用户消息")
+	turn1 := []TurnEntry{{Role: "assistant", Text: "run1 回答"}}
+	staged1 := []StagedCompaction{{Summary: "S1", AttachRun: r1}}
+	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", staged1, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
+		t.Fatalf("EndRun(r1): ok=%v err=%v", ok, err)
+	}
+	var id1 string
+	if err := s.db.Raw(`SELECT id FROM run_model_messages WHERE run_id = ? AND seq = 0`, r1).Row().Scan(&id1); err != nil {
+		t.Fatalf("r_1 seq0 应存在: %v", err)
+	}
+
+	// r_2 的折叠整体折入 r_1（AttachRun 又是 r_1）→ 旧摘要槽换代（先翻死、再焕新）。
+	s.mustAcquire(t, sid, r2, "m_2", "run2 用户消息")
+	staged2 := []StagedCompaction{{DropRunIDs: []RunID{r1}, Summary: "S2", AttachRun: r1}}
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, "complete", staged2, nil, nil); err != nil || !ok {
+		t.Fatalf("EndRun(r2, staged): ok=%v err=%v", ok, err)
+	}
+
+	// 断言：同一行（id 不变）、text 换代、翻回可见；r_1 原文行全翻死；全 session 活 seq0 恒 1。
+	var id2, text string
+	var compacted bool
+	if err := s.db.Raw(`SELECT id, text, compacted FROM run_model_messages WHERE run_id = ? AND seq = 0`, r1).
+		Row().Scan(&id2, &text, &compacted); err != nil {
+		t.Fatal(err)
+	}
+	if id2 != id1 {
+		t.Errorf("seq0 id = %s, want %s（换代不换行）", id2, id1)
+	}
+	if text != "S2" {
+		t.Errorf("seq0 text = %q, want S2（换代）", text)
+	}
+	if compacted {
+		t.Error("换代后的 seq0 应 compacted=false（焕新可见）")
+	}
+	if !s.sqlBool(t, `SELECT bool_and(compacted) FROM run_model_messages WHERE run_id = ? AND seq >= 1`, r1) {
+		t.Error("r_1 原文行应全部 compacted=true（整翻已覆盖挂点 run）")
+	}
+	if n := s.count(t, &RunModelMessage{}, "session_id = ? AND seq = 0 AND compacted = false", sid); n != 1 {
+		t.Errorf("活 seq0 = %d 行, want 1", n)
+	}
+}
+
+// A3-2：keep 区活摘要 run 只翻 seq=0——原文行还活着的旧摘要 run 进 MergedSummaryRunIDs 时，
+// 只退役它的 seq0（旧摘要），保留的原文行一行不动；新摘要挂别处。
+func TestEndRunMergedSummaryFlipsSeq0Only(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid, r1, r2 := SessionID("s_1"), RunID("r_1"), RunID("r_2")
+
+	// r_1：seq0=S1 活 + 原文行（seq2）活——mid-run 折过自己、保留轮次还在的形态。
+	s.mustAcquire(t, sid, r1, "m_1", "run1 用户消息")
+	turn1 := []TurnEntry{{Role: "assistant", Text: "run1 回答"}}
+	staged1 := []StagedCompaction{{Summary: "S1", AttachRun: r1}}
+	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", staged1, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
+		t.Fatalf("EndRun(r1): ok=%v err=%v", ok, err)
+	}
+
+	// r_2 的折叠把 r_1 放进保留区（MergedSummaryRunIDs）、挂点别处（r_2 自己）。
+	s.mustAcquire(t, sid, r2, "m_2", "run2 用户消息")
+	staged2 := []StagedCompaction{{MergedSummaryRunIDs: []RunID{r1}, Summary: "S2", AttachRun: r2}}
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, "complete", staged2, nil, nil); err != nil || !ok {
+		t.Fatalf("EndRun(r2, staged): ok=%v err=%v", ok, err)
+	}
+
+	// r_1 seq0 退役；r_1 原文行保留活；r_2 seq0 = S2。
+	if !s.sqlBool(t, `SELECT compacted FROM run_model_messages WHERE run_id = ? AND seq = 0`, r1) {
+		t.Error("r_1 旧摘要（seq0）应翻 compacted=true（只翻 seq0）")
+	}
+	if !s.sqlBool(t, `SELECT bool_and(compacted = false) FROM run_model_messages WHERE run_id = ? AND seq >= 1`, r1) {
+		t.Error("r_1 保留原文行应仍 compacted=false（keep 区不丢行）")
+	}
+	var text string
+	if err := s.db.Raw(`SELECT text FROM run_model_messages WHERE run_id = ? AND seq = 0 AND compacted = false`, r2).Row().Scan(&text); err != nil {
+		t.Fatal(err)
+	}
+	if text != "S2" {
+		t.Errorf("新摘要挂 r_2 seq0 = %q, want S2", text)
+	}
+}
+
+// A3-3：staged 列表——一轮 run 两次折叠（Run fold 折 r_1 + mid-run 折 r_2）一次交 EndRun：
+// 翻转 = 全列表并集（两笔 DropRunIDs 都翻）；摘要只落最后一份（挂 r_1 的第一份被弃、从未落库）。
+func TestEndRunStagedListLandsLastSummary(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid := SessionID("s_1")
+	r1, r2, r3 := RunID("r_1"), RunID("r_2"), RunID("r_3")
+
+	s.mustAcquire(t, sid, r1, "m_1", "run1 用户消息")
+	turn1 := []TurnEntry{{Role: "assistant", Text: "run1 回答"}}
+	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", nil, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
+		t.Fatalf("EndRun(r1): ok=%v err=%v", ok, err)
+	}
+	s.mustAcquire(t, sid, r2, "m_2", "run2 用户消息")
+	turn2 := []TurnEntry{{Role: "assistant", Text: "run2 回答"}}
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, "complete", nil, mhRowsFromTurn(r2, turn2), turn2); err != nil || !ok {
+		t.Fatalf("EndRun(r2): ok=%v err=%v", ok, err)
+	}
+
+	s.mustAcquire(t, sid, r3, "m_3", "run3 用户消息")
+	staged := []StagedCompaction{
+		{DropRunIDs: []RunID{r1}, Summary: "S1", AttachRun: r1},
+		{DropRunIDs: []RunID{r2}, Summary: "S2", AttachRun: r2},
+	}
+	if _, _, ok, err := s.EndRun(ctx, sid, r3, "complete", staged, nil, nil); err != nil || !ok {
+		t.Fatalf("EndRun(r3, staged 列表): ok=%v err=%v", ok, err)
+	}
+
+	// 并集翻转：两笔 DropRunIDs 的 run 原文行都翻死。
+	if !s.sqlBool(t, `SELECT bool_and(compacted) FROM run_model_messages WHERE run_id IN (?, ?) AND seq >= 1`, r1, r2) {
+		t.Error("两笔 DropRunIDs 的原文行应全翻 compacted=true（并集）")
+	}
+	// 只落最后一份：第一份摘要（挂 r_1）从未落库。
+	if n := s.count(t, &RunModelMessage{}, "run_id = ? AND seq = 0", r1); n != 0 {
+		t.Errorf("r_1 seq0 %d 行——第一份摘要应被弃（从未落库）", n)
+	}
+	var text string
+	if err := s.db.Raw(`SELECT text FROM run_model_messages WHERE run_id = ? AND seq = 0 AND compacted = false`, r2).Row().Scan(&text); err != nil {
+		t.Fatal(err)
+	}
+	if text != "S2" {
+		t.Errorf("r_2 seq0 = %q, want S2（最后一份）", text)
+	}
+	if n := s.count(t, &RunModelMessage{}, "session_id = ? AND seq = 0 AND compacted = false", sid); n != 1 {
+		t.Errorf("活 seq0 = %d 行, want 1", n)
+	}
+}
+
 // C3 变异检查锚（挪事务探测器）：闸已放后再 EndRun（带 staged）→ 空转，staged 一笔都不许多写。
 // 若有人把 staged 写挪出「闸在手上」的事务守卫，这条立刻红。
 func TestEndRunGateLostWithStagedNoop(t *testing.T) {
@@ -1159,17 +1298,18 @@ func TestEndRunGateLostWithStagedNoop(t *testing.T) {
 	sid, r1, r2 := SessionID("s_1"), RunID("r_1"), RunID("r_2")
 	s.mustAcquire(t, sid, r1, "m_1", "run1 用户消息")
 	s.mustDelta(t, ctx, r1, "run1 回答")
-	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", nil, []TurnEntry{{Role: "assistant", Text: "run1 回答"}}); err != nil || !ok {
+	turn1 := []TurnEntry{{Role: "assistant", Text: "run1 回答"}}
+	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", nil, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
 		t.Fatalf("EndRun(r1): ok=%v err=%v", ok, err)
 	}
 	s.mustAcquire(t, sid, r2, "m_2", "run2 用户消息")
 
 	// r2 的闸先被别人放掉（模拟清扫/易主），再带 staged 调 EndRun：必须整笔空转。
-	if _, _, ok, err := s.EndRun(ctx, sid, r2, "error", nil, nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, "error", nil, nil, nil); err != nil || !ok {
 		t.Fatalf("前置 EndRun(r2, error): ok=%v err=%v", ok, err)
 	}
-	staged := &StagedCompaction{DropRunIDs: []RunID{r1, r2}, Summary: "幽灵摘要", AttachRun: r1}
-	if _, _, ok, err := s.EndRun(ctx, sid, r2, "complete", staged, nil); err != nil || ok {
+	staged := []StagedCompaction{{DropRunIDs: []RunID{r1, r2}, Summary: "幽灵摘要", AttachRun: r1}}
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, "complete", staged, nil, nil); err != nil || ok {
 		t.Fatalf("闸失后 EndRun: ok=%v err=%v, want false/nil（空转）", ok, err)
 	}
 	if n := s.count(t, &RunModelMessage{}, "session_id = ? AND seq = 0", sid); n != 0 {

@@ -9,6 +9,8 @@
 // T1 起主循环跑在 Eino ADK 上（adk.NewChatModelAgent；T2 起挂 get_time 工具）：Run 消费 agent 事件流、
 // 把模型输出 chunk 交给同一个 Translator 翻成 delta 帧——归一层语义不变，换的只是载体
 // （手写 Stream→Recv 循环 → agent.Run 的事件迭代）。compact 摘要仍直连模型、不另开 agent（doc/12 §4）。
+// A4 起折叠链挂进「每次模型调用前」（midfoldHandler，midfold.go）：run 中途超线即折——本文件的
+// 职责随之多一件：建 foldBox 塞 ctx、prepareInput 填 base、defer 从容器取 staged 与折后行落库。
 //
 // T2 的工具环（帧契约见 19v6-01 §2）：流式模型事件排干后拿到合并全文（ConcatMessages），
 // 其中 ToolCalls 逐条压 tool_call 帧；非流式 Role=Tool 事件 = 工具结果（ADK 的 typedToolInvokeEvent），
@@ -160,6 +162,11 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		}
 		pool = append(pool, wrapToolErrors(t))
 	}
+	// 摘要器在 agent 装配前构造（A4，planning 裁定 9）：midfoldHandler 要拿它的 summarize 方法值——
+	// mid-run 折叠与 prepareInput 的 Run fold 共用同一个摘要器、同一顶帽（C5-A7 分档）。
+	compactLimit := compactWindow * 4 / 5
+	ceiling := summarizeCeiling(compactWindow, modelRef, maxOutput)
+	sum := newSummarizer(chat, ceiling)
 	agent, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
 		Name:        "yktako",
 		Instruction: system,
@@ -170,15 +177,19 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 			},
 			EmitInternalEvents: true,
 		},
-		Handlers: []adk.ChatModelAgentMiddleware{newAgentSpecHandler(agentsDir, chat, modelRef, translate, resolver,
-			make(chan struct{}, subagentConcurrency), subagentReturnCap), NewAgentLogHandler()},
+		Handlers: []adk.ChatModelAgentMiddleware{
+			newAgentSpecHandler(agentsDir, chat, modelRef, translate, resolver,
+				make(chan struct{}, subagentConcurrency), subagentReturnCap),
+			// mid-run fold 钩子排在装载 handler 之后、观测 handler 之前（19v6-10 §4）：
+			// agentLog 看到的是模型实际所见的折后输入。
+			newMidfoldHandler(system, counter, compactLimit, sum.summarize, firstPartyFileEffects),
+			NewAgentLogHandler(),
+		},
 	})
 	if err != nil {
 		return nil, err
 	}
-	compactLimit := compactWindow * 4 / 5
-	ceiling := summarizeCeiling(compactWindow, modelRef, maxOutput)
-	return &Worker{store: store, sum: newSummarizer(chat, ceiling), agent: agent, translate: translate, system: system,
+	return &Worker{store: store, sum: sum, agent: agent, translate: translate, system: system,
 		rootRef: modelRef, leaseRenew: leaseRenew, compactWindow: compactWindow, compactLimit: compactLimit, counter: counter}, nil
 }
 
@@ -186,7 +197,8 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 // 超时 / 429 / 连接断（agent 事件报错 / 输出流中途断）都走同一出口放闸，worker 自己收的尾（新 A3 用例 6 在真源侧的延续）。
 // status 唯一的活变量：默认 complete，任何错误出口置 error。
 //
-// compact（C 系列）：prepareInput 只在**发送前**把折叠 Stage 在内存（stagedCompaction）；
+// compact（C 系列；A4 起含 mid-run）：prepareInput 在发送前把 Run fold Stage 进容器（foldBox），
+// mid-run 各次折叠由钩子在模型调用前追加——一轮 run 可有多次：Run fold 打头、mid-run 各次续接；
 // 落库靠 defer 的 EndRun——仅 status=complete 且闸在手上才并入同一笔事务。error / 闸失 / 进程死 = 零写入。
 //
 // **watchdog 生命周期严格在 EndRun 之前结束**（A7）：defer 是 LIFO，EndRun 先注册故最后跑；
@@ -195,13 +207,25 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 // 它同时保证「最后一次续约」早于放闸，语义最干净）。
 func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 	status := "complete"
-	var stagedCompaction *StagedCompaction
+	// run 级折叠容器（A4，planning 裁定 4）：塞进 ctx 供 midfoldHandler 读写；prepareInput 填
+	// base 与 Run fold 的 staged，defer 从这里取货落库。
+	box := newFoldBox(sessionID, runID)
+	ctx = withFoldBox(ctx, box)
 	// turn 是本 run 模型侧消息的全序（T2）：流式事件合并全文（assistant 轮，带 tool_calls）与
 	// 工具结果事件（tool 轮）按事件序累积，defer 交给 EndRun——complete 才落库，error/闸失零写入。
 	// T3-2 起子代理条目也在列（带 Agent 归属）：分拣归 EndRun 的两个投影，worker 只负责记全。
 	var turn []TurnEntry
 	defer func() {
-		_, _, ok, err := w.store.EndRun(ctx, sessionID, runID, status, stagedCompaction, turn)
+		// mh 写入源 = 折后 state 派生（A4）：RunID==currentRun 且 Seq≥2 的行、按位置从 2 连续
+		// 重编（mid-fold 折走单位留下的 seq 空洞在此闭合）。final 为空 = 不可达态（成功终态
+		// AfterAgent 恒已填），一行守卫兜回 turn 派生——error/取消本就不落库，兜底值不上账。
+		var mhRows []ModelMessage
+		if final := box.finalRows(); final != nil {
+			mhRows = mhRowsFromFold(runID, final)
+		} else {
+			mhRows = mhRowsFromTurn(runID, turn)
+		}
+		_, _, ok, err := w.store.EndRun(ctx, sessionID, runID, status, box.stagedList(), mhRows, turn)
 		switch {
 		case err != nil:
 			// 收尾失败仍留痕。D1 后有两个方向：DB 半败 = 闸没放（租约到点自蒸、会话自动解锁，不再永久锁死）；
@@ -221,14 +245,13 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 	}()
 	defer func() { cancelLease(); wg.Wait() }()
 
-	msgs, staged, err := w.prepareInput(ctx, sessionID, runID)
+	msgs, err := w.prepareInput(ctx, sessionID, runID)
 	if err != nil {
-		// compact 的 errStillOver 也走这里：不调主模型、status=error、stagedCompaction 保持 nil（零写入）。
+		// compact 的 errStillOver 也走这里：不调主模型、status=error、staged 零写入（闸放、无库写）。
 		log.Printf("prepareInput %s/%s: %v", sessionID, runID, err)
 		status = "error"
 		return
 	}
-	stagedCompaction = staged
 	// T1：主循环 = ADK agent 事件流。正文 chunk 经同一 Translator 翻成 delta 帧（归一层语义不变，换的只是载体）。
 	// T2：工具环两态事件——流式（模型输出，含 tool_calls）与非流式（工具结果，Role=Tool）。
 	// T3-1b：身份表先落 root 条目（主 ref + 主 translator），塞 ctx 给装载 handler 填子代理条目
@@ -304,6 +327,24 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 			}
 		}
 	}
+}
+
+// mhRowsFromTurn 把 turn 派生为 mh 写入行（A3，planning 裁定 3）：root 条目（Agent 空）逐条映射、
+// Seq 从 2 连续排（user 占 1，被跳过的子代理条目不占号）——与旧 EndRun 内联循环逐字节等价。
+// 转换知识归 worker：存储层只做机械搬运（m.Seq / m.Role / m.Text / 两列组装）。
+// A4 起 mhRows 主源是折后 state 派生（mhRowsFromFold）；本函数留作 final 缺失（不可达态）的兜底。
+func mhRowsFromTurn(runID RunID, turn []TurnEntry) []ModelMessage {
+	rows := make([]ModelMessage, 0, len(turn))
+	seq := 2
+	for _, e := range turn {
+		if e.Agent != "" {
+			continue
+		}
+		rows = append(rows, ModelMessage{RunID: runID, Seq: seq, Role: e.Role, Text: e.Text,
+			ToolCalls: e.ToolCalls, ToolCallID: e.ToolCallID})
+		seq++
+	}
+	return rows
 }
 
 // drain 排干一条模型输出流：chunk → Translator → delta 帧；EOF 时把全部 chunk 合并成完整消息返回
@@ -397,42 +438,35 @@ func (w *Worker) AdmitText(text string) (limit, tokens int, ok bool) {
 // 消息头拼 SystemMessage(instruction)——这里再拼一条，模型输入里 system 会出现两遍。
 // 读 model_history 而非 runlog——前者记「模型现在该看到什么」，后者记「产出了什么」（19v6-03「真源划分」）。
 //
-// compact 挂钩（C 系列）：只在本函数里做长度自测——快速路（≤ limit）原样送、行为与压缩前零差异；
-// 超限走 foldInput（compact.go）折出候选输入与 stagedCompaction，由 Run 透传给 defer 的 EndRun 落库。
-// 本函数不写任何存储：折叠失败（Summarize 失败 / errStillOver）直接返回错误，Run 置 status=error。
-func (w *Worker) prepareInput(ctx context.Context, sessionID SessionID, runID RunID) ([]*schema.Message, *StagedCompaction, error) {
+// compact 挂钩（C 系列）：只在本函数里做 Run fold 的长度自测——快速路（≤ limit）原样送、行为与
+// 压缩前零差异；超限走 foldInput（compact.go）折出候选输入与 stagedCompaction。A4 起两样产出都
+// 进 run 级容器（foldBox）：staged 打头进 staged 列表、折算行成为钩子的坐标基点（base）——
+// 钩子此后在每次模型调用前对同一个 base 续折（midfold.go）。本函数不写任何存储：折叠失败
+// （Summarize 失败 / errStillOver）直接返回错误，Run 置 status=error、零写入。
+func (w *Worker) prepareInput(ctx context.Context, sessionID SessionID, runID RunID) ([]*schema.Message, error) {
 	history, err := w.store.ModelMessages(ctx, sessionID)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	var stagedCompaction *StagedCompaction
+	var staged *StagedCompaction
 	if w.compactWindow > 0 {
 		limit := w.compactLimit
 		if total := countInput(w.counter, w.system, history); total > limit {
 			log.Printf("compact %s/%s: 输入 %d tok > limit %d，进入折叠", sessionID, runID, total, limit)
-			history, stagedCompaction, err = foldInput(ctx, w.system, history, runID, limit, w.counter, w.sum.summarize, firstPartyFileEffects)
+			history, staged, err = foldInput(ctx, w.system, history, runID, limit, w.counter, w.sum.summarize, firstPartyFileEffects)
 			if err != nil {
-				return nil, nil, err
+				return nil, err
 			}
 			log.Printf("compact %s/%s: 压 %d 个 run，摘要 %d tok，挂 %s；发送输入 %d tok < limit %d",
-				sessionID, runID, len(stagedCompaction.DropRunIDs), w.counter.Count(stagedCompaction.Summary),
-				stagedCompaction.AttachRun, countInput(w.counter, w.system, history), limit)
+				sessionID, runID, len(staged.DropRunIDs), w.counter.Count(staged.Summary),
+				staged.AttachRun, countInput(w.counter, w.system, history), limit)
 		}
 	}
-	msgs := make([]*schema.Message, 0, len(history))
-	for _, h := range history {
-		switch h.Role {
-		case "assistant":
-			// ToolCalls 回放（T2）：带 tool_calls 的 assistant 行原样还给模型（OpenAI 协议要求
-			// 其后紧跟对应的 tool 行）；老行无 tool_calls，nil 即原样。
-			msgs = append(msgs, schema.AssistantMessage(h.Text, h.ToolCalls))
-		case "tool":
-			// tool 行回放（T2）：结果文本 + 回指的 tool_call_id——带上会话再投时，
-			// 模型凭这里看到上一轮的工具结果（19v6-01 §3 的 mh 真源划分）。
-			msgs = append(msgs, schema.ToolMessage(h.Text, h.ToolCallID))
-		default:
-			msgs = append(msgs, schema.UserMessage(h.Text))
+	if box := foldBoxFrom(ctx); box != nil {
+		if staged != nil {
+			box.appendStaged(*staged)
 		}
+		box.setBase(history)
 	}
-	return msgs, stagedCompaction, nil
+	return toSchemaMessages(history), nil
 }

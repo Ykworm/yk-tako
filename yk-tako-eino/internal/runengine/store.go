@@ -188,14 +188,23 @@ type toolResultPayload struct {
 // EndRun 是 run 侧动作的唯一入口（doc/19-v6 index 概念表「run 结束」；§8.4 endRun 行）：
 // **同一笔 PG 事务**「放闸 + 定稿」——UPDATE runs 落终态（放闸 = 没有独立解锁动作）与 complete 的
 // mh/runlog 消息行同事务，「mh 与闸同事务」就此从措辞变成事务边界（D 系列的立项理由之二）。
-// staged（可 nil）是发送前 Stage 的折叠产物（C 系列）：**仅 complete 分支**并入同一笔事务——
-// 被压 run 原文行 compacted=true（保留不删）+ 新 seq=0 摘要行；error / 闸失 = 零写入，
-// 下一轮从原文重压（「原文从未被动过」，§10.4 落库时机的全部含义）。
-// turn 是 worker 累积的模型侧消息全序（T2），T3-2 起含子代理条目（Agent 归属）：complete 分支
-// 按两个投影分拣——mh 只装 root 条目（seq 接 user 的 1 往下连续排、跳过子代理），runlog 全量
-// （扩展行 + 各 agent 的终稿行，agent/model 两列随行）；root 终稿 assistant 行仍以 draft 为准
-// （= 全 run delta 累计，收口替换的锚）。**error / 闸失 = turn 零写入**——与「error 结局只留
-// user 那一半」的既有形状一致。
+//
+// staged（列表，空 ≡ 旧 nil）是发送前 Stage 的折叠产物（C 系列；mid-run 泛化后一轮 run 可有
+// 多笔：Run fold 打头、mid-run 各次追加，19v6-10 §5）：**仅 complete 分支**并入同一笔事务——
+//   - 并集翻转：所有 entry 的 DropRunIDs 并集整 run 翻死（原文保留不删）；所有 entry 的
+//     MergedSummaryRunIDs 并集**只翻 seq=0**（keep 区活摘要 run：原文行还活着，只退役旧摘要）；
+//   - 只落最后一份摘要：写 staged[len-1].Summary 到其 AttachRun 的 seq=0 槽——INSERT → UPSERT
+//     （同槽换代：被折过的 run 再被折入时挂点撞自己上一次的摘要行，换 text 不换行）。
+//
+// 翻转先于摘要写（换代点：先翻死旧行、再焕新）。error / 闸失 = 零写入，下一轮从原文重压
+// （「原文从未被动过」，§10.4 落库时机的全部含义）。
+//
+// mhRows 是 mh 表的写入源（planning 裁定 3）：Seq 由生产方赋值（A4 前 = 从 turn 派生的 root 行
+// seq 2,3,4…；A4 起 = 折后 state 派生），本函数直接写 m.Seq——存储层不理解 system 丢弃 /
+// 当前 run 标签 / seq 规则那套转换知识，转换归 worker。runlog 仍吃全量 turn（T2；T3-2 起含子
+// 代理条目）：complete 分支两投影分拣——runlog 扩展行 + 各 agent 的终稿行，agent/model 两列随行；
+// root 终稿 assistant 行仍以 draft 为准（= 全 run delta 累计，收口替换的锚）。**error / 闸失 =
+// turn 零写入**——与「error 结局只留 user 那一半」的既有形状一致。
 //
 // 守卫 = 统一谓词「闸在手上」（status='running' AND lease_until > now()，与读侧同式）：
 // 影响 0 行 = 本 run 不归自己了（已放 / 已被清扫 / 租约已过）→ 空转（false, nil）。
@@ -204,7 +213,7 @@ type toolResultPayload struct {
 // Redis 半在 commit 后：压 terminal + EXPIRE ttl + 删 draft。失败不补偿（§8.4）：闸确实放了（ok=true），
 // runlive 到 TTL 收敛成 gone、客户端从 log 拿全文——B1 冗余收口兜住。
 func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, status string,
-	staged *StagedCompaction, turn []TurnEntry) (eventOffset, runlogOffset int, ok bool, err error) {
+	staged []StagedCompaction, mhRows []ModelMessage, turn []TurnEntry) (eventOffset, runlogOffset int, ok bool, err error) {
 	var draft string
 	if status == "complete" {
 		// 定稿文本的真源在 draft（只有 Redis 有）；本 run 的 worker 已停止产出，无并发追加。
@@ -228,55 +237,78 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 		}
 		if status == "complete" {
 			// 压缩落库先于定稿写（同笔事务，顺序无约束）：两写要么随本笔全成，要么整笔回滚。
-			// UPDATE 用 compacted = false 条件——幂等半写防护：只压还可见的行（重复 run_id 天然去重）。
-			if staged != nil {
-				drop := make([]string, 0, len(staged.DropRunIDs))
-				for _, id := range staged.DropRunIDs {
-					drop = append(drop, string(id))
-				}
-				if len(drop) > 0 {
-					if err := tx.Model(&RunModelMessage{}).
-						Where("session_id = ? AND compacted = false AND run_id IN ?", sessionID, drop).
-						Update("compacted", true).Error; err != nil {
-						return err
+			// 并集翻转（19v6-10 §5）：两集合先各自并集、各一条 UPDATE——
+			//   drop 集整 run 翻死（原文保留）；merged 集只翻 seq=0（keep 区活摘要 run 退役旧摘要、
+			//   原文行留着，保留区才不丢）；
+			// UPDATE 带 compacted = false 条件——幂等半写防护：只压还可见的行（重复 run_id 天然去重）。
+			// 翻转先于摘要写：挂点槽若已有旧摘要（同槽换代），先被翻死、再被 UPSERT 焕新。
+			var dropIDs, mergedIDs []string
+			seenDrop := map[RunID]bool{}
+			seenMerged := map[RunID]bool{}
+			for _, sc := range staged {
+				for _, id := range sc.DropRunIDs {
+					if !seenDrop[id] {
+						seenDrop[id] = true
+						dropIDs = append(dropIDs, string(id))
 					}
 				}
+				for _, id := range sc.MergedSummaryRunIDs {
+					if !seenDrop[id] && !seenMerged[id] {
+						seenMerged[id] = true
+						mergedIDs = append(mergedIDs, string(id))
+					}
+				}
+			}
+			if len(dropIDs) > 0 {
+				if err := tx.Model(&RunModelMessage{}).
+					Where("session_id = ? AND compacted = false AND run_id IN ?", sessionID, dropIDs).
+					Update("compacted", true).Error; err != nil {
+					return err
+				}
+			}
+			if len(mergedIDs) > 0 {
+				if err := tx.Model(&RunModelMessage{}).
+					Where("session_id = ? AND compacted = false AND run_id IN ? AND seq = 0", sessionID, mergedIDs).
+					Update("compacted", true).Error; err != nil {
+					return err
+				}
+			}
+			if len(staged) > 0 {
+				last := staged[len(staged)-1]
 				msgID, err := newRowID("msg_")
 				if err != nil {
 					return err
 				}
 				// 摘要行：seq=0 / role='user'（输入侧 default 分支映射成 UserMessage，§10.3 第 2 条）/
-				// compacted=false（它就是要被读回模型输入的那条）。挂点撞 UNIQUE(run_id, seq) = 整笔失败，
-				// 是「挂点唯一性」不变式的最后一道机器守卫。
+				// compacted=false（它就是要被读回模型输入的那条）。只落最后一份（前面的摘要被后续
+				// 折叠整体吸收，从未落库）。UPSERT（19v6-10 §5 SQL 逐字）：挂点槽撞自己上一次的
+				// seq0 行 = 同槽换代——换 text、翻回可见，id 不动（行还是那行）；
+				// 槽空（Run fold 常态）= INSERT 原样生效。
 				if err := tx.Exec(
 					`INSERT INTO run_model_messages (id, session_id, run_id, seq, role, text, compacted, created_at)
-					 VALUES (?, ?, ?, 0, 'user', ?, false, now())`,
-					msgID, sessionID, staged.AttachRun, staged.Summary).Error; err != nil {
+					 VALUES (?, ?, ?, 0, 'user', ?, false, now())
+					 ON CONFLICT (run_id, seq) DO UPDATE SET text = EXCLUDED.text, compacted = false`,
+					msgID, sessionID, last.AttachRun, last.Summary).Error; err != nil {
 					return err
 				}
 			}
-			// 本 run 的模型侧消息逐轮落 mh（seq 从 user 的 1 往下排）：assistant 轮带 tool_calls、
-			// tool 轮带 tool_call_id——下一轮 prepareInput 就按这两列重建 OpenAI 工具消息。
-			// T3-2：mh 只装 root 条目（子代理中间过程不进模型输入，19v6-05 §4 三投影）——
-			// seq 用显式计数器保持连续，被跳过的子代理条目不占号。
+			// 本 run 的模型侧消息逐轮落 mh（写入源 = mhRows，Seq 由生产方赋值）：assistant 轮带
+			// tool_calls、tool 轮带 tool_call_id——下一轮 prepareInput 就按这两列重建 OpenAI 工具消息。
 			// 两列「缺席即 NULL」（与 message_id 同约定）：assistant 轮的 tool_call_id、tool 轮的
 			// tool_calls、无调用的终轮两列，一律不写字面空串。
-			// turn 末项 = 终轮 assistant：正文 = 终轮本体（工具轮前导语各在自己那轮里，不重复）。
-			mhSeq := 2
-			for _, e := range turn {
-				if e.Agent != "" {
-					continue
-				}
+			// 旧「遍历 turn 跳子代理」的 root-only 分拣已上移 worker（planning 裁定 3：转换知识不进
+			// 存储层）——mhRows 已全是本 run 该进模型输入的行，此处只做机械搬运。
+			for _, m := range mhRows {
 				var callsSQL, callIDSQL any // nil = NULL
-				if len(e.ToolCalls) > 0 {
-					b, err := json.Marshal(e.ToolCalls)
+				if len(m.ToolCalls) > 0 {
+					b, err := json.Marshal(m.ToolCalls)
 					if err != nil {
 						return err
 					}
 					callsSQL = string(b)
 				}
-				if e.ToolCallID != "" {
-					callIDSQL = e.ToolCallID
+				if m.ToolCallID != "" {
+					callIDSQL = m.ToolCallID
 				}
 				msgID, err := newRowID("msg_")
 				if err != nil {
@@ -285,10 +317,9 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 				if err := tx.Exec(
 					`INSERT INTO run_model_messages (id, session_id, run_id, seq, role, text, tool_calls, tool_call_id, compacted, created_at)
 					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, false, now())`,
-					msgID, sessionID, runID, mhSeq, e.Role, e.Text, callsSQL, callIDSQL).Error; err != nil {
+					msgID, sessionID, runID, m.Seq, m.Role, m.Text, callsSQL, callIDSQL).Error; err != nil {
 					return err
 				}
-				mhSeq++
 			}
 			// runlog 全量行（T3-2，消息粒度）：root 与子代理都写——tool 条目 → tool_result 行；
 			// assistant 条目 → tool_call 行 + 文本进该 agent 的暂存。子代理遇无 tool_calls 的末轮 =

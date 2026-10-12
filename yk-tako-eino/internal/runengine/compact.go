@@ -10,9 +10,13 @@
 // doc/12 → v6 的逐条映射（§10.4，偏离全部登记）：
 //   - 单位：旧「轮」= 新 run；「已完成」= 非当前 run 的行（error run 只留 user 半，照压）。
 //   - 快速路（日常零变化）：CountMessages(系统 + 全量非 compacted 行) ≤ limit → 原样送模型。
-//   - 超限进循环：n 从 20 起降（keep = 最近 n 个已完成 run，drop = 其余；drop 空 → n--）；
+//   - 计数基数（D3，19v6-10 §6）：text + tool_calls JSON 序列化（工具 schema 声明不计）。
+//   - 超限进循环（phase 1）：n 从 20 起降（keep = 最近 n 个已完成 run，drop = 其余；drop 空 → n--）；
 //     每档 Summarize(旧摘要 + 渲染 drop) → 拼装 [摘要行] + [keep 行] + [当前 run 行] →
 //     CountMessages < limit 则用它作本轮输入、stagedCompaction 挂收尾；否则 n--。
+//   - phase 2（mid-run 泛化，19v6-10 §7/§8）：phase 1 折尽（n=0 档判过）仍超 → 收缩当前 run 的
+//     交换单位后缀（user 行钉死、一次吐一个最老单位），真止条件同「组装计数 < limit」；当前 run
+//     无单位（Run fold 形态）时 phase 2 不进场，出口与现状逐字节相同。
 //   - n=0：drop = 全部已完成原文 run（旧摘要行天然并入）；仍超限 → errStillOver：
 //     **不调主模型、status=error**（页面上这一轮是错误，无助手回复——现役 error 路径原样）。
 //   - 落库时机（承 D1 事务边界）：发送前只 Stage 在内存；EndRun 仅 complete 分支把
@@ -22,10 +26,11 @@
 //     无 Usage 基数（v6 无 Usage 列，全量 BPE）；窗口查找链不搬（旗标即源，§10.3 第 9 条）；
 //     旧线把摘要压进本轮 user_message——v6 不复刻（摘要独立成 seq=0 行）。
 //
-// 摘要行挂点的不变量（§10.3 第 6 条读法 A 的机械半边）：`UNIQUE(run_id, seq)` 逼着摘要行
-// 只能挂在**本事件最后折入的原文 run**——旧摘要所在 run 的 seq=0 槽被旧行永久占着（行在库就在，
-// compacted=true 不释放唯一约束），挂回去必撞。所以折叠集合永远含 ≥1 个新原文 run；
-// 无可折原文（rawRuns 空）时连「只再压摘要本身」都做不了（没有落点），直接 errStillOver。
+// 摘要行挂点的不变量（§10.3 第 6 条读法 A 的机械半边，mid-run 泛化后）：`UNIQUE(run_id, seq)`
+// 逼着摘要行只能挂在**本事件最后折入原料所在的 run**——旧摘要所在 run 的 seq=0 槽被旧行占着
+// （行在库就在，compacted=true 不释放唯一约束）。折过当前 run 单位时挂点 = 当前 run，槽已被
+// 本 run 上一次折叠的摘要占着 → 同槽换代（UPSERT，19v6-10 §5）；只折老 run 时挂点槽恒空，
+// UPSERT ≡ INSERT（Run fold 逐字节不变）。
 package runengine
 
 import (
@@ -45,8 +50,14 @@ import (
 )
 
 // compactKeepRuns 是循环起点 n（doc/12 §5「从 20 轮开始留」）。
-// 「20 轮只数它前面已经结束的对话」：当前 run 的行不进 keep/drop 划分（v6 里它随 tail 原样带在末尾）。
+// 「20 轮只数它前面已经结束的对话」；当前 run 的行不进 n 的 keep/drop 划分——user 行钉死、
+// 其余按交换单位走 phase 2 后缀收缩（19v6-10 §7/§8）。
 const compactKeepRuns = 20
+
+// maxUnitFoldAttempts 是 phase 2「当前 run 单位后缀收缩」的尝试封顶（19v6-10 §8「封顶约 20 次
+// 尝试」）：一次吐一个最老单位进 drop、每档一次 summarize + 组装计数；耗尽 = errStillOver。
+// 真止条件是「组装计数 < limit」，本常量只兜底病态输入（单位数远超任何真实轮次）。
+const maxUnitFoldAttempts = 20
 
 // compactPrompt 是摘要提示词模板（**只有一份**，C5 起为六槽 markdown 骨架；19v6-07 §5「结构化摘要」）。
 // 独立性：不含任何会话内容，调用方用同一个 ChatStream 另起一次流式生成（不新开 agent）。
@@ -201,16 +212,23 @@ func (c cl100kCounter) Count(text string) int {
 	return len(c.enc.EncodeOrdinary(text))
 }
 
-// StagedCompaction 是一次折叠（发送前 Stage 的产物）的落库指令，EndRun(complete) 依它写两笔：
-// 被压 run 的原文行 compacted=true（保留不删）+ 新的 seq=0 摘要行。
-// 不变式：AttachRun 必 ∈ DropRunIDs、且是本事件最后折入的原文 run（挂点唯一性，见文件头）。
+// StagedCompaction 是一次折叠（发送前 Stage 的产物）的落库指令；EndRun(complete) 吃**列表**
+// （一轮 run 可有多次折叠：Run fold 打头、mid-run 各次追加，19v6-10 §5）——
+// 所有 entry 的 DropRunIDs 并集整翻 + MergedSummaryRunIDs 并集只翻 seq=0 + 只落最后一份摘要。
+// 不变式：AttachRun 是本事件最后折入原料所在的 run（挂点唯一性，见文件头）——只折过老 run 时
+// ∈ DropRunIDs；折过当前 run 的单位时 = 当前 run（同槽换代的落点，19v6-10 §5）。
 type StagedCompaction struct {
-	DropRunIDs []RunID // 被压掉的原文 run + 旧摘要行的 run
-	Summary    string  // 新摘要全文（含 file-ops 块，若有；已过含块收口检查，非空）
-	AttachRun  RunID   // 摘要行挂点（= DropRunIDs 中时序最后的一个）
+	DropRunIDs          []RunID // 整 run 翻死：drop 区原文 run + 死摘要 run（无存活原文行）
+	MergedSummaryRunIDs []RunID // 只翻 seq=0：keep 区里仍有存活原文行的旧摘要 run（19v6-10 §10）
+	Summary             string  // 新摘要全文（含 file-ops 块，若有；已过含块收口检查，非空）
+	AttachRun           RunID   // 摘要行挂点（= 本事件最后折入原料所在的 run）
 }
 
-// countInput 数「将要发送的这一份」：系统消息（若有）+ 所有行文本（doc/12 §3：数消息本身）。
+// countInput 数「将要发送的这一份」：系统消息（若有）+ 每行 text + 每行 tool_calls JSON
+// （D3 基数口径，19v6-10 §6）。工具参数是工具环时代的真实体积大头——write_file 一次调用
+// 可以把整份文件塞进 arguments，旧口径（只数 text）对这类行全盲。tool_calls 的序列化
+// 与 mh 的 tool_calls 列同源（json.Marshal([]schema.ToolCall)）——量级口径，不要求与
+// 落库字节逐字节相等。工具 schema 声明不计（登记项，19v6-10 §6）。
 func countInput(counter TokenCounter, system string, msgs []ModelMessage) int {
 	n := 0
 	if system != "" {
@@ -218,18 +236,125 @@ func countInput(counter TokenCounter, system string, msgs []ModelMessage) int {
 	}
 	for _, m := range msgs {
 		n += counter.Count(m.Text)
+		if len(m.ToolCalls) > 0 {
+			if b, err := json.Marshal(m.ToolCalls); err == nil {
+				n += counter.Count(string(b))
+			}
+			// marshal 失败不回退、不计——ToolCall 全字段是字符串，实际到不了这个分支；
+			// 真到了也只是低估（与旧口径同形），不炸折叠链。
+		}
 	}
 	return n
 }
 
-// runRows 是分组后的一个已完成 run：id + 其可见原文行（seq≥1）。
+// runRows 是分组后的一个 run（或当前 run 的一个交换单位）：id + 行。
+// 老 run = 整 run 一组；当前 run 的单位分组复用本类型（id = 当前 run）。
 type runRows struct {
 	id   RunID
 	rows []ModelMessage
 }
 
-// foldInput 是超限后的折叠主循环（doc/12 §9 的逐条 v6 映射，见文件头）：
-// 对每个 n 档调一次 summarize（旧摘要 + drop 渲染），拼装候选输入；count < limit 即定案。
+// currentRunUnits 是当前 run 分组的结果：user 行（钉死）+ 交换单位序列。
+type currentRunUnitsResult struct {
+	userRow *ModelMessage
+	units   []runRows
+}
+
+// currentRunUnits 把当前 run 的可见行切成「user 行 + 交换单位」（19v6-10 §7 三件套①）：
+// assistant(tool_calls) 行 + 它名下的全部 tool 行 = 一次工具往返；无 tool_calls 的 assistant
+// 行（终稿）独立成一个单位；user 行不是单位（钉死）；当前 run 的 seq=0 行（本 run 上一次
+// mid-run fold 的活摘要）不属于任何单位——由调用方并入 oldSummaryTexts。
+// role 回扩（三件套②）的构造性版本：单位只能以 assistant 行开头，tool 行只作为续行被收进
+// 发起它的单位；孤儿 tool（无发起行 / 发起行被折走）没有合法落点 = 错误。
+func currentRunUnits(rows []ModelMessage) (currentRunUnitsResult, error) {
+	var res currentRunUnitsResult
+	for _, m := range rows {
+		if m.Seq == 0 {
+			continue // 本 run 上次折叠的摘要行：归调用方并入 oldSummaryTexts
+		}
+		if m.Role == "user" && res.userRow == nil {
+			row := m
+			res.userRow = &row
+			continue
+		}
+		if m.Role == "tool" {
+			// tool 行只作为续行被收进上一个单位（发起行必比它早）。
+			if len(res.units) == 0 {
+				return res, errors.New("compact: 当前 run 出现孤儿 tool 行（无发起单位）")
+			}
+			res.units[len(res.units)-1].rows = append(res.units[len(res.units)-1].rows, m)
+			continue
+		}
+		res.units = append(res.units, runRows{id: m.RunID, rows: []ModelMessage{m}})
+	}
+	return res, nil
+}
+
+// assembleInput 拼一个折叠候选：新摘要行 + keep 老 run 行 + user 行（钉死，恒在）+ 剩余单位行。
+// 顺序即发送序：keep 在全量可见区维持原相对位置，user 恒在保留区首位（19v6-10 §8 state 重写形状）。
+func assembleInput(summary string, keep []runRows, userRow *ModelMessage, units []runRows) []ModelMessage {
+	assembled := make([]ModelMessage, 0, 1+len(keep)+1)
+	assembled = append(assembled, ModelMessage{Role: "user", Text: summary})
+	for _, g := range keep {
+		assembled = append(assembled, g.rows...)
+	}
+	assembled = append(assembled, *userRow)
+	for _, u := range units {
+		assembled = append(assembled, u.rows...)
+	}
+	return assembled
+}
+
+// buildStaged 从本事件折入的原料构造落库指令（翻转三分类，planning 裁定 1/5）：
+//   - DropRunIDs（整 run 翻死）= drop 里折入的原文 run ＋ 死摘要 run——旧摘要所在 run 在本事件后
+//     无存活原文行：Run fold 时代摘要 run 恒是此形态（旧行为逐字节接住）；mid-run 时代 =
+//     该 run 的原文行更早在别的折叠里被折走、本次只继承了它的摘要；
+//   - MergedSummaryRunIDs（只翻 seq=0）= 活摘要 run 里**保留区仍有原文行**的（19v6-10 §10）：
+//     摘要被合并进新摘要，原文行还在 keep 区活着，整翻会连保留行一起丢；
+//   - 当前 run：永不入两个翻转集（mid-run 的摘要换代由 A3 的 UPSERT 接住，19v6-10 §5）。
+//
+// AttachRun = 本事件最后折入原料所在的 run：折过当前 run 单位 = 当前 run（同槽换代落点）；
+// 只折老 run = 最后一个被折老 run（与 Run fold 同）。
+func buildStaged(oldSummaryRuns []RunID, rawRuns, drop []runRows, currentRun RunID, summary string) *StagedCompaction {
+	rawAlive := make(map[RunID]bool, len(rawRuns))
+	for _, g := range rawRuns {
+		rawAlive[g.id] = true
+	}
+	dropSet := make(map[RunID]bool, len(drop))
+	for _, g := range drop {
+		dropSet[g.id] = true
+	}
+	var dropIDs, merged []RunID
+	seen := map[RunID]bool{}
+	for _, id := range oldSummaryRuns {
+		if seen[id] || dropSet[id] {
+			continue // 已归类 / 原文行已折入（整翻由下面的 drop 循环覆盖，不重复加）
+		}
+		seen[id] = true
+		if rawAlive[id] {
+			merged = append(merged, id)
+			continue
+		}
+		dropIDs = append(dropIDs, id) // 死摘要 run：整 run 翻死
+	}
+	for _, g := range drop {
+		if g.id == currentRun || seen[g.id] {
+			continue // 当前 run 不进翻转集（§5 由 UPSERT 接住）；已归类的去重
+		}
+		seen[g.id] = true
+		dropIDs = append(dropIDs, g.id)
+	}
+	return &StagedCompaction{
+		DropRunIDs:          dropIDs,
+		MergedSummaryRunIDs: merged,
+		Summary:             summary,
+		AttachRun:           drop[len(drop)-1].id,
+	}
+}
+
+// foldInput 是超限后的折叠主循环（doc/12 §9 的逐条 v6 映射，见文件头）：先折老 run（phase 1，
+// n 从 20 降到 0），仍超再收缩当前 run 的交换单位后缀（phase 2，一次吐一个最老单位）；每档
+// 调一次 summarize（旧摘要 + drop 渲染）、拼装候选输入，组装计数 < limit 即定案。
 // 纯函数——summarize 由调用方注入（worker 给「同 ChatStream 另起一次流式调用」），
 // 单测注入假件即可直测循环边界（C3）。
 //
@@ -247,12 +372,13 @@ func foldInput(ctx context.Context, system string, history []ModelMessage, curre
 	fileEffects map[string]string) ([]ModelMessage, *StagedCompaction, error) {
 
 	// ---- 分组：history 已按 (run_id, seq) 有序，run_id 是 ULID（字典序 = 时序）。----
-	// 不变量（D1 形态的自然结果）：可见行按 run 统一——被压 run 的行全 compacted（读不出来），
-	// 未压 run 的行全可见；seq=0（若有）必是该 run 唯一可见行。
-	var rawRuns []runRows      // 有可见原文行的已完成 run（按 run 时序）
-	var tail []ModelMessage    // 当前 run 的行（发送时原样带在末尾，不进折叠）
-	var oldSummaryRuns []RunID // 旧摘要行（seq=0 可见行）所在 run —— 重压时并入
+	// 旧不变量「seq=0 必是该 run 唯一可见行」在 mid-run（A4 起）已死：被折过的 run 可以同时有
+	// 活摘要行（seq=0）与保留的原文行（seq≥2）。分组按此语义收口：
+	var rawRuns []runRows      // 老 run：有可见原文行的已完成 run（按 run 时序，整 run 粒度）
+	var oldSummaryRuns []RunID // 旧摘要行（可见 seq=0）所在 run —— 重压时并入、翻死去重靠它们
 	var oldSummaryTexts []string
+	var userRow *ModelMessage // 当前 run 的 user 行（seq=1，钉死：永不进 drop）
+	var units []runRows       // 当前 run 的交换单位（assistant(tc)+其 tool 行 / assistant 终稿行）
 	for i := 0; i < len(history); {
 		id := history[i].RunID
 		j := i
@@ -262,7 +388,18 @@ func foldInput(ctx context.Context, system string, history []ModelMessage, curre
 		rows := history[i:j]
 		i = j
 		if id == currentRun {
-			tail = append(tail, rows...)
+			for _, m := range rows {
+				if m.Seq == 0 {
+					// 本 run 上一次 mid-run fold 的活摘要：只并入 oldSummaryTexts（被合并进新摘要）、
+					// 永不进任何翻转集——换代由 A3 的 UPSERT 接住它的 seq0 槽（19v6-10 §5）。
+					oldSummaryTexts = append(oldSummaryTexts, m.Text)
+				}
+			}
+			u, err := currentRunUnits(rows)
+			if err != nil {
+				return nil, nil, err
+			}
+			userRow, units = u.userRow, u.units
 			continue
 		}
 		var raws []ModelMessage
@@ -278,70 +415,125 @@ func foldInput(ctx context.Context, system string, history []ModelMessage, curre
 			rawRuns = append(rawRuns, runRows{id: id, rows: raws})
 		}
 	}
+	if userRow == nil {
+		// 当前 run 没有 user 行 = 调用方没把本轮这条带上（history 的真源是 mh 表，seq=1 恒在）。
+		return nil, nil, errors.New("compact: 当前 run 的 user 行不在输入里（history 分组异常）")
+	}
+	// 三件套断言（planning 裁定 7）：每个单位恒以非 tool 行开头（role 回扩的构造性版本）——
+	// 以 tool 行开头的单位 = 孤儿 tool（发起行不在或切错），违例 = 内部编程错误，返回错误不 panic。
+	for _, u := range units {
+		if u.rows[0].Role == "tool" {
+			return nil, nil, errors.New("compact: 交换单位以 tool 行开头（配对回扩违例）")
+		}
+	}
 
-	// ---- n 从 20 降序（doc/12 §9 loop；drop 空 → n--）。 ----
+	// ---- 一档折叠 = summarize（旧摘要 + 本档 drop 渲染）→ 组装 → 含块收口（C5-A5 三档）。 ----
+	type foldTrial struct {
+		assembled []ModelMessage    // 收敛时的最终输入（含钉块）；未收敛时未填
+		staged    *StagedCompaction // 收敛（组装 < limit 且块收口过）时非 nil
+		foldText  string
+		summary   string // 本档摘要；未收敛 = 原始产出（带数字死因用）
+		total     int    // 本档组装计数
+	}
+	tryFold := func(drop, keep, rest []runRows) (foldTrial, error) {
+		var t foldTrial
+		t.foldText = renderFold(oldSummaryTexts, drop)
+		summary, err := summarize(ctx, t.foldText)
+		if err != nil {
+			return t, err // Summarize 失败：不 Stage、不发（doc/12 §9）
+		}
+		t.summary = summary
+		assembled := assembleInput(summary, keep, userRow, rest)
+		// 保留区首行非 tool（裁定 7 第 2 条；结构上恒真，违例 = 切错/分组异常，返回错误不 panic）。
+		if len(assembled) > 1 && assembled[1].Role == "tool" {
+			return t, errors.New("compact: 保留区首行是 tool（配对回扩违例）")
+		}
+		t.total = countInput(counter, system, assembled)
+		if t.total >= limit {
+			return t, nil // 未收敛：调用方按阶段推进下一档
+		}
+		// C5-A5 钉块（收口口径，2026-10-11 用户拍）：块 = 旧块继承 ∪ 本次 drop 提取，
+		// 钉进发送候选的摘要末尾。三档检查（见函数头注释）在下面就地展开。
+		ops := mergeFileOps(inheritFileOps(oldSummaryTexts), extractFileOps(dropMessages(drop), fileEffects))
+		res := resolveOps(ops)
+		if block := renderFileOpsBlock(res); block != "" {
+			assembled[0].Text = summary + fileOpsBlockSep + block
+			if countInput(counter, system, assembled) >= limit { // 第 1 档：全量钉不过收口
+				// 第 2 档减灾：两张表各砍 50（公平对待、无优先级），重渲染再验
+				cappedRes := resolvedOps{changed: capOps(res.changed), read: capOps(res.read)}
+				capped := renderFileOpsBlock(cappedRes)
+				assembled[0].Text = summary + fileOpsBlockSep + capped
+				if over := countInput(counter, system, assembled); over >= limit {
+					// 第 3 档：仍超 = fold 失败走干净 A（errStillOver 哨兵，C2 已有链）
+					return t, fmt.Errorf("%w（fileOps 块：全量 %d tok、砍 50 后 %d tok；发送合计 %d tok ≥ limit %d）",
+						errStillOver, counter.Count(block), counter.Count(capped), over, limit)
+				}
+			}
+			summary = assembled[0].Text
+		}
+		t.summary = summary
+		t.assembled = assembled
+		t.staged = buildStaged(oldSummaryRuns, rawRuns, drop, currentRun, summary)
+		return t, nil
+	}
+
+	// ---- phase 1：老 run 整折，n 从 20 降序（doc/12 §9 loop 原样：drop 空档 n--；n=0 档 =
+	// 全部老 run 一折）。当前 run 无单位（Run fold 形态）时出口与现状逐字节同；有单位且
+	// 老 run 折尽仍超 → 交 phase 2。 ----
 	n := compactKeepRuns
 	for {
 		dropCount := len(rawRuns) - min(n, len(rawRuns))
 		if dropCount == 0 {
 			if n == 0 {
-				return nil, nil, errStillOver // 无原文可折（rawRuns 空）且 n 已到 0
+				break // 老 run 折尽（rawRuns 空）：进 phase 2
 			}
 			n--
 			continue
 		}
 		drop := rawRuns[:dropCount]
-		keep := rawRuns[dropCount:]
-
-		foldText := renderFold(oldSummaryTexts, drop)
-		summary, err := summarize(ctx, foldText)
+		t, err := tryFold(drop, rawRuns[dropCount:], units)
 		if err != nil {
-			return nil, nil, err // Summarize 失败：不 Stage、不发（doc/12 §9）
+			return nil, nil, err
 		}
-
-		assembled := make([]ModelMessage, 0, len(history)+1)
-		assembled = append(assembled, ModelMessage{Role: "user", Text: summary})
-		for _, g := range keep {
-			assembled = append(assembled, g.rows...)
-		}
-		assembled = append(assembled, tail...)
-
-		total := countInput(counter, system, assembled)
-		if total < limit {
-			// C5-A5 钉块（收口口径，2026-10-11 用户拍）：块 = 旧块继承 ∪ 本次 drop 提取，
-			// 钉进发送候选的摘要末尾。三档检查（见函数头注释）在下面就地展开。
-			ops := mergeFileOps(inheritFileOps(oldSummaryTexts), extractFileOps(dropMessages(drop), fileEffects))
-			res := resolveOps(ops)
-			if block := renderFileOpsBlock(res); block != "" {
-				assembled[0].Text = summary + fileOpsBlockSep + block
-				if countInput(counter, system, assembled) >= limit { // 第 1 档：全量钉不过收口
-					// 第 2 档减灾：两张表各砍 50（公平对待、无优先级），重渲染再验
-					cappedRes := resolvedOps{changed: capOps(res.changed), read: capOps(res.read)}
-					capped := renderFileOpsBlock(cappedRes)
-					assembled[0].Text = summary + fileOpsBlockSep + capped
-					if over := countInput(counter, system, assembled); over >= limit {
-						// 第 3 档：仍超 = fold 失败走干净 A（errStillOver 哨兵，C2 已有链）
-						return nil, nil, fmt.Errorf("%w（fileOps 块：全量 %d tok、砍 50 后 %d tok；发送合计 %d tok ≥ limit %d）",
-							errStillOver, counter.Count(block), counter.Count(capped), over, limit)
-					}
-				}
-				summary = assembled[0].Text
-			}
-			stagedCompaction := &StagedCompaction{
-				DropRunIDs: append(append([]RunID{}, oldSummaryRuns...), ids(drop)...),
-				Summary:    summary,
-				AttachRun:  drop[len(drop)-1].id, // 挂点 = 本事件最后折入的原文 run（唯一不撞 UNIQUE 的选择）
-			}
-			return assembled, stagedCompaction, nil
+		if t.staged != nil {
+			return t.assembled, t.staged, nil
 		}
 		if n == 0 {
-			// 摘要本身仍不低于 limit（doc/12 §9）。带数字死因：限值是量级、摘要长度看模型，
-			// 没有这几个数就没法判断「差多少才能过」。
-			return nil, nil, fmt.Errorf("%w（折叠 %d 个 run 共 %d tok → 摘要 %d tok；发送合计 %d tok ≥ limit %d）",
-				errStillOver, dropCount, counter.Count(foldText), counter.Count(summary), total, limit)
+			if len(units) == 0 {
+				// 全部老 run 折尽仍超（doc/12 §9）。带数字死因：限值是量级、摘要长度看模型，
+				// 没有这几个数就没法判断「差多少才能过」。
+				return nil, nil, fmt.Errorf("%w（折叠 %d 个 run 共 %d tok → 摘要 %d tok；发送合计 %d tok ≥ limit %d）",
+					errStillOver, len(drop), counter.Count(t.foldText), counter.Count(t.summary), t.total, limit)
+			}
+			break // 有单位：进 phase 2
 		}
 		n--
 	}
+
+	// ---- phase 2：当前 run 的交换单位后缀收缩（19v6-10 §8）——一次吐一个最老单位进 drop，
+	// 每档 summarize + 组装计数；真止条件 = 组装计数 < limit；尝试封顶 maxUnitFoldAttempts
+	// 只兜底病态单位数（后缀预算 limit/3 是终止性论证，裁定 8）。 ----
+	dropUnits := 0
+	var last foldTrial
+	for len(units) > 0 && dropUnits < maxUnitFoldAttempts {
+		dropUnits++
+		drop := append(append([]runRows{}, rawRuns...), units[:dropUnits]...)
+		t, err := tryFold(drop, nil, units[dropUnits:])
+		if err != nil {
+			return nil, nil, err
+		}
+		if t.staged != nil {
+			return t.assembled, t.staged, nil
+		}
+		last = t
+	}
+	if len(units) == 0 {
+		// 无原料可折（老 run 空、当前 run 只剩 user 行）：原出口逐字节。
+		return nil, nil, errStillOver
+	}
+	// 单位折尽（≤ 封顶）或尝试封顶（> 封顶）仍超：诊断带数字。
+	return nil, nil, fmt.Errorf("%w（当前 run %d 个单位折 %d 个仍超（老 run %d 个）；发送合计 %d tok ≥ limit %d）",
+		errStillOver, len(units), dropUnits, len(rawRuns), last.total, limit)
 }
 
 // renderFold 渲染一次摘要调用的输入：旧摘要（重压时，天然并入）在前，被压段原文按 run 时序在后。
@@ -467,16 +659,8 @@ func truncateRunes(s string, max int) string {
 	return string(r[:max]) + fmt.Sprintf(foldTruncMarkerFormat, len(r))
 }
 
-// ids 取 run 组的 id 序列。
-func ids(groups []runRows) []RunID {
-	out := make([]RunID, 0, len(groups))
-	for _, g := range groups {
-		out = append(out, g.id)
-	}
-	return out
-}
-
-// dropMessages 拍平被压 run 组的行（extractFileOps 的输入单位，C5-A5）。
+// dropMessages 拍平被压 run 组 / 单位的行（renderFold 之外的两种摊平口径之一：
+// extractFileOps 的输入单位，C5-A5）。
 func dropMessages(drop []runRows) []ModelMessage {
 	var out []ModelMessage
 	for _, g := range drop {

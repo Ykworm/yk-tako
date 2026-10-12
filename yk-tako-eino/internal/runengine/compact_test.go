@@ -5,6 +5,7 @@ package runengine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -71,6 +72,60 @@ func testSummarizer(chat ChatStream) *summarizer {
 type fakeCounter struct{ f func(string) int }
 
 func (c fakeCounter) Count(text string) int { return c.f(text) }
+
+// ---- countInput：D3 基数扩展（19v6-10 §14 第 1 拍）----
+
+// oldCountInput 是基数扩展前的旧口径（只数 text），作为「逐字节不变」对照的活参照。
+func oldCountInput(counter TokenCounter, system string, msgs []ModelMessage) int {
+	n := 0
+	if system != "" {
+		n += counter.Count(system)
+	}
+	for _, m := range msgs {
+		n += counter.Count(m.Text)
+	}
+	return n
+}
+
+// 带大 tool_calls 的行让计数跨线：同一个 fakeCounter 下，text-only 不跨线、含 tc 的行跨线；
+// 被数的 tc 序列化形状 == json.Marshal([]schema.ToolCall)（与 mh 列同源）。
+func TestCountInputIncludesToolCalls(t *testing.T) {
+	counter := fakeCounter{f: func(s string) int { return len([]rune(s)) }}
+	calls := []schema.ToolCall{
+		{ID: "call_big", Type: "function", Function: schema.FunctionCall{
+			Name:      "write_file",
+			Arguments: `{"path":"big.txt","content":"` + strings.Repeat("上下文溢出测试", 200) + `"}`,
+		}},
+	}
+	row := ModelMessage{RunID: "r1", Seq: 2, Role: "assistant", Text: "写大文件", ToolCalls: calls}
+
+	const limit = 200 // 行数：text(4 rune) 远低于 limit，text+tc 序列化必超
+	if got := countInput(counter, "", []ModelMessage{{Text: row.Text}}); got >= limit {
+		t.Fatalf("text-only 计数 %d ≥ limit %d——对照面不成立", got, limit)
+	}
+	got := countInput(counter, "", []ModelMessage{row})
+	if got <= limit {
+		t.Fatalf("含 tool_calls 行计数 %d ≤ limit %d，基数扩展未生效", got, limit)
+	}
+	if b, err := json.Marshal(calls); err != nil {
+		t.Fatalf("marshal: %v", err)
+	} else if want := len([]rune(row.Text)) + len([]rune(string(b))); got != want {
+		t.Fatalf("计数 %d ≠ text+tc 序列化长度 %d——被数的序列化形状漂了", got, want)
+	}
+}
+
+// 不带 ToolCalls 的行：扩展前后逐字节同值（既有 fixture 零改动的前提）。
+func TestCountInputNoToolCallsUnchanged(t *testing.T) {
+	counter := fakeCounter{f: func(s string) int { return len([]rune(s)) + 1 }}
+	msgs := []ModelMessage{
+		{RunID: "r1", Seq: 1, Role: "user", Text: "aaaa"},
+		{RunID: "r1", Seq: 2, Role: "assistant", Text: "bbbb"},
+		{RunID: "r2", Seq: 1, Role: "tool", Text: "cccc"}, // tool 行也不带 ToolCalls
+	}
+	if got, want := countInput(counter, "sys", msgs), oldCountInput(counter, "sys", msgs); got != want {
+		t.Fatalf("无 tc 行计数漂移：got %d want %d", got, want)
+	}
+}
 
 // ---- renderFold：标注转录的精确字节（验收 ② / C3 第 6 条）----
 
@@ -414,6 +469,329 @@ func TestFoldInputOldBlockTakesLastCopy(t *testing.T) {
 	}
 	if !strings.Contains(staged.Summary, "- /w/real.md（read_file，r_9）") {
 		t.Fatalf("末尾真块应被继承：%q", staged.Summary)
+	}
+}
+
+// ---- foldInput：mid-run 泛化（19v6-10 §7/§8；A2 七条 fixture）----
+
+// midCall 造一条带指定 id 的工具调用（一条 assistant 行里多调用时区分 id；fileCall 固定 call_1）。
+func midCall(id, name, args string) schema.ToolCall {
+	return schema.ToolCall{ID: id, Function: schema.FunctionCall{Name: name, Arguments: args}}
+}
+
+// ① 单位切分：assistant(tc)+其全部 tool 行 = 一个单位、终稿行自成一单位；后缀收缩以整单位推进
+// （切点在单位边界——两档 foldText 精确字节：第一档整单位一，第二档 = 单位一 + 单位二）。
+func TestFoldInputUnitSplitBySuffix(t *testing.T) {
+	var inputs []string
+	summarize := func(_ context.Context, in string) (string, error) {
+		inputs = append(inputs, in)
+		return "SUMMARY", nil
+	}
+	// 标记计数：T2 所在行计数 100——第一档组装（still 含 u2）≥ 50 败，第二档（只剩 u3）< 50 成。
+	counter := fakeCounter{f: func(s string) int {
+		if strings.Contains(s, "T2") {
+			return 100
+		}
+		return 1
+	}}
+	history := historyOf([]ModelMessage{
+		userRow("r_cur", 1, "eeee"),
+		{RunID: "r_cur", Seq: 2, Role: "assistant", ToolCalls: []schema.ToolCall{
+			midCall("c1", "get_time", `{"tz":"Asia/Shanghai"}`),
+			midCall("c2", "get_time", `{"tz":"Asia/Shanghai"}`),
+		}},
+		{RunID: "r_cur", Seq: 3, Role: "tool", Text: "T1a", ToolCallID: "c1"},
+		{RunID: "r_cur", Seq: 4, Role: "tool", Text: "T1b", ToolCallID: "c2"},
+		{RunID: "r_cur", Seq: 5, Role: "assistant", ToolCalls: []schema.ToolCall{
+			midCall("c3", "get_time", `{"tz":"Asia/Shanghai"}`),
+		}},
+		{RunID: "r_cur", Seq: 6, Role: "tool", Text: "T2", ToolCallID: "c3"},
+		{RunID: "r_cur", Seq: 7, Role: "assistant", Text: "收工"},
+	})
+	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 50, counter, summarize, nil)
+	if err != nil {
+		t.Fatalf("foldInput: %v", err)
+	}
+	if len(inputs) != 2 {
+		t.Fatalf("档数 %d，want 2（单位一败 → 单位一+二成）", len(inputs))
+	}
+	unit1 := "[Assistant tool calls]: get_time(tz=Asia/Shanghai)\n" +
+		"[Assistant tool calls]: get_time(tz=Asia/Shanghai)\n" +
+		"[Tool result get_time]: T1a\n" +
+		"[Tool result get_time]: T1b\n"
+	if inputs[0] != unit1 {
+		t.Fatalf("第一档 foldText 应是整单位一（两 tool 行随发起行、u2 不进场）：\n got %q\nwant %q", inputs[0], unit1)
+	}
+	unit1plus2 := unit1 + "\n" + "[Assistant tool calls]: get_time(tz=Asia/Shanghai)\n[Tool result get_time]: T2\n"
+	if inputs[1] != unit1plus2 {
+		t.Fatalf("第二档 foldText 应是单位一+单位二（drop 是前缀）：\n got %q\nwant %q", inputs[1], unit1plus2)
+	}
+	// 收敛档：剩 [摘要, user, 终稿行]；u1/u2 的行不残留。
+	wantLeft := historyOf(
+		[]ModelMessage{{Role: "user", Text: "SUMMARY"}},
+		[]ModelMessage{userRow("r_cur", 1, "eeee")},
+		[]ModelMessage{{RunID: "r_cur", Seq: 7, Role: "assistant", Text: "收工"}},
+	)
+	if fmt.Sprint(assembled) != fmt.Sprint(wantLeft) {
+		t.Fatalf("assembled 布局漂移:\n got %v\nwant %v", assembled, wantLeft)
+	}
+	if staged.AttachRun != "r_cur" || len(staged.DropRunIDs) != 0 || len(staged.MergedSummaryRunIDs) != 0 {
+		t.Fatalf("折当前 run 单位：挂点=当前 run、两个翻转集都空（当前 run 永不入集）: %+v", staged)
+	}
+}
+
+// ② user 钉死：任意 drop/keep 形态下 user 行恒在保留区首位、永不进 foldText 的 drop 侧；
+// 折光全部单位后 assembled 仍 = [摘要, user]。
+func TestFoldInputUserPinned(t *testing.T) {
+	var inputs []string
+	summarize := func(_ context.Context, in string) (string, error) {
+		inputs = append(inputs, in)
+		return "SUMMARY", nil
+	}
+	// 标记计数：U1T 行 10——第一档（含单位）14 ≥ 5 败；第二档（只剩 user）2 < 5 成。
+	counter := fakeCounter{f: func(s string) int {
+		if strings.Contains(s, "U1T") {
+			return 10
+		}
+		return 1
+	}}
+	history := historyOf(
+		[]ModelMessage{userRow("r1", 1, "旧消息")},
+		[]ModelMessage{
+			userRow("r_cur", 1, "钉死的原话"),
+			{RunID: "r_cur", Seq: 2, Role: "assistant", ToolCalls: []schema.ToolCall{
+				midCall("c1", "get_time", `{"tz":"Asia/Shanghai"}`),
+			}},
+			{RunID: "r_cur", Seq: 3, Role: "tool", Text: "U1T", ToolCallID: "c1"},
+		},
+	)
+	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 5, counter, summarize, nil)
+	if err != nil {
+		t.Fatalf("foldInput: %v", err)
+	}
+	if len(inputs) != 2 {
+		t.Fatalf("档数 %d，want 2", len(inputs))
+	}
+	for i, in := range inputs {
+		if strings.Contains(in, "钉死的原话") {
+			t.Fatalf("第 %d 档 foldText 含当前 run 的 user 行原文（user 必须钉死）：%q", i+1, in)
+		}
+	}
+	if !strings.Contains(inputs[1], "U1T") {
+		t.Fatalf("第二档应把最老单位折入：%q", inputs[1])
+	}
+	if len(assembled) != 2 || assembled[0].Text != "SUMMARY" || assembled[1].Text != "钉死的原话" {
+		t.Fatalf("全部单位折走后 assembled 应= [摘要, user]：%v", assembled)
+	}
+	if staged.AttachRun != "r_cur" || len(staged.DropRunIDs) != 1 || staged.DropRunIDs[0] != "r1" || len(staged.MergedSummaryRunIDs) != 0 {
+		t.Fatalf("staged 形状漂移: %+v", staged)
+	}
+}
+
+// ③ phase 1 优先：有老 run 可折时先整折老 run——当前 run 的全部单位原样留，首档即定案
+// assembled = [摘要] + [keep 老 run] + [user] + [全部单位]。
+func TestFoldInputPhase1FoldsOldRunsFirst(t *testing.T) {
+	calls := 0
+	summarize := func(_ context.Context, in string) (string, error) {
+		calls++
+		if in != "[User]: aaaa\n" {
+			t.Fatalf("首档（唯一档）foldText 应只含被折的最老 run：%q", in)
+		}
+		return "SUMMARY", nil
+	}
+	counter := fakeCounter{f: func(s string) int { return len([]rune(s)) }}
+	history := historyOf(
+		[]ModelMessage{userRow("r1", 1, "aaaa")},
+		[]ModelMessage{userRow("r2", 1, "bbbb")},
+		[]ModelMessage{
+			userRow("r_cur", 1, "eeee"),
+			{RunID: "r_cur", Seq: 2, Role: "assistant", ToolCalls: []schema.ToolCall{
+				midCall("c1", "get_time", `{"tz":"Asia/Shanghai"}`),
+			}},
+			{RunID: "r_cur", Seq: 3, Role: "tool", Text: "T1a", ToolCallID: "c1"},
+			{RunID: "r_cur", Seq: 4, Role: "assistant", Text: "收工"},
+		},
+	)
+	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 100000, counter, summarize, nil)
+	if err != nil {
+		t.Fatalf("foldInput: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("summarize 调用 %d 次，want 1（n=1 档即收敛：只折 r1、单位一个不动）", calls)
+	}
+	want := historyOf(
+		[]ModelMessage{{Role: "user", Text: "SUMMARY"}},
+		[]ModelMessage{userRow("r2", 1, "bbbb")},
+		[]ModelMessage{userRow("r_cur", 1, "eeee")},
+		[]ModelMessage{
+			{RunID: "r_cur", Seq: 2, Role: "assistant", ToolCalls: []schema.ToolCall{
+				midCall("c1", "get_time", `{"tz":"Asia/Shanghai"}`),
+			}},
+			{RunID: "r_cur", Seq: 3, Role: "tool", Text: "T1a", ToolCallID: "c1"},
+			{RunID: "r_cur", Seq: 4, Role: "assistant", Text: "收工"},
+		},
+	)
+	if fmt.Sprint(assembled) != fmt.Sprint(want) {
+		t.Fatalf("assembled 布局漂移:\n got %v\nwant %v", assembled, want)
+	}
+	if staged.AttachRun != "r1" || len(staged.DropRunIDs) != 1 || staged.DropRunIDs[0] != "r1" {
+		t.Fatalf("只折老 run 时挂点/集合同 Run fold: %+v", staged)
+	}
+}
+
+// ④ phase 1→2 衔接：老 run 折尽仍超 → 收缩单位；phase 2 每档 drop = 全部老 run + 单位前缀（前缀跨段），
+// 挂点 = 当前 run，当前 run 不进翻转集。
+func TestFoldInputPhase2AfterRawsExhausted(t *testing.T) {
+	var inputs []string
+	summarize := func(_ context.Context, in string) (string, error) {
+		inputs = append(inputs, in)
+		return "SUMMARY", nil
+	}
+	// 标记计数：M1T 行 10——n=0 档（含单位一）15 ≥ 5 败；phase 2（折掉单位一）3 < 5 成。
+	counter := fakeCounter{f: func(s string) int {
+		if strings.Contains(s, "M1T") {
+			return 10
+		}
+		return 1
+	}}
+	history := historyOf(
+		[]ModelMessage{userRow("r1", 1, "aaaa")},
+		[]ModelMessage{
+			userRow("r_cur", 1, "eeee"),
+			{RunID: "r_cur", Seq: 2, Role: "assistant", ToolCalls: []schema.ToolCall{
+				midCall("c1", "get_time", `{"tz":"Asia/Shanghai"}`),
+			}},
+			{RunID: "r_cur", Seq: 3, Role: "tool", Text: "M1T", ToolCallID: "c1"},
+			{RunID: "r_cur", Seq: 4, Role: "assistant", Text: "BBBB2"},
+		},
+	)
+	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 5, counter, summarize, nil)
+	if err != nil {
+		t.Fatalf("foldInput: %v", err)
+	}
+	if len(inputs) != 2 {
+		t.Fatalf("档数 %d，want 2（n=0 档败 → phase 2 首档成）", len(inputs))
+	}
+	if inputs[0] != "[User]: aaaa\n" {
+		t.Fatalf("phase 1 末档 foldText 应只含全部老 run：%q", inputs[0])
+	}
+	// phase 2 档 drop = 全部老 run + 单位前缀：前缀跨段（r1 之后紧跟单位一，组间空行分隔）。
+	wantIn2 := "[User]: aaaa\n" + "\n" +
+		"[Assistant tool calls]: get_time(tz=Asia/Shanghai)\n" +
+		"[Tool result get_time]: M1T\n"
+	if inputs[1] != wantIn2 {
+		t.Fatalf("phase 2 foldText 漂移（drop 应=老 run+单位前缀）:\n got %q\nwant %q", inputs[1], wantIn2)
+	}
+	want := historyOf(
+		[]ModelMessage{{Role: "user", Text: "SUMMARY"}},
+		[]ModelMessage{userRow("r_cur", 1, "eeee")},
+		[]ModelMessage{{RunID: "r_cur", Seq: 4, Role: "assistant", Text: "BBBB2"}},
+	)
+	if fmt.Sprint(assembled) != fmt.Sprint(want) {
+		t.Fatalf("assembled 布局漂移:\n got %v\nwant %v", assembled, want)
+	}
+	if staged.AttachRun != "r_cur" || len(staged.DropRunIDs) != 1 || staged.DropRunIDs[0] != "r1" || len(staged.MergedSummaryRunIDs) != 0 {
+		t.Fatalf("staged 形状漂移（当前 run 不入集、挂点=当前 run）: %+v", staged)
+	}
+}
+
+// ⑤ 断言违例出口：孤儿 tool 行（无发起行）→ 返回错误（不 panic、不 Stage）。
+func TestFoldInputOrphanToolError(t *testing.T) {
+	history := historyOf([]ModelMessage{
+		userRow("r_cur", 1, "eeee"),
+		{RunID: "r_cur", Seq: 2, Role: "tool", Text: "孤儿结果", ToolCallID: "c_x"},
+	})
+	_, staged, err := foldInput(context.Background(), "", history, "r_cur", 5,
+		fakeCounter{f: func(s string) int { return len([]rune(s)) }},
+		func(context.Context, string) (string, error) { return "SUMMARY", nil }, nil)
+	if err == nil || !strings.Contains(err.Error(), "孤儿") {
+		t.Fatalf("err=%v，want 孤儿 tool 违例错误", err)
+	}
+	if staged != nil {
+		t.Fatalf("违例不应 Stage：%+v", staged)
+	}
+}
+
+// ⑥ 终止性：单位多 + 计数恒超 → phase 2 尝试封顶后 errStillOver（诊断带数字），不无限循环。
+func TestFoldInputPhase2CapExhausted(t *testing.T) {
+	calls := 0
+	summarize := func(_ context.Context, in string) (string, error) {
+		calls++
+		return "SUMMARY", nil
+	}
+	counter := fakeCounter{f: func(string) int { return 1_000_000 }}
+	rows := []ModelMessage{userRow("r_cur", 1, "eeee")}
+	for i := 0; i < 25; i++ {
+		rows = append(rows, ModelMessage{RunID: "r_cur", Seq: 2 + i, Role: "assistant", Text: fmt.Sprintf("m%02d", i)})
+	}
+	_, staged, err := foldInput(context.Background(), "", rows, "r_cur", 100, counter, summarize, nil)
+	if !errors.Is(err, errStillOver) {
+		t.Fatalf("err=%v，want errStillOver", err)
+	}
+	if calls != maxUnitFoldAttempts {
+		t.Fatalf("summarize 调用 %d 次，want 封顶 %d 次", calls, maxUnitFoldAttempts)
+	}
+	if staged != nil {
+		t.Fatalf("封顶耗尽不应 Stage：%+v", staged)
+	}
+	if !strings.Contains(err.Error(), "当前 run 25 个单位折 20 个仍超") || !strings.Contains(err.Error(), "limit 100") {
+		t.Fatalf("死因应带诊断数字：%v", err)
+	}
+}
+
+// ⑦ 翻转分类：活摘要 run 落 keep → MergedSummaryRunIDs；死摘要 run → DropRunIDs；
+// 当前 run 的在状态 seq0 只并入 summarize 输入（oldTexts）、两个翻转集与 assembled 可见区都不出现。
+func TestFoldInputFlipClassification(t *testing.T) {
+	var inputs []string
+	summarize := func(_ context.Context, in string) (string, error) {
+		inputs = append(inputs, in)
+		return "SUMMARY", nil
+	}
+	counter := fakeCounter{f: func(s string) int { return len([]rune(s)) }}
+	history := historyOf(
+		[]ModelMessage{userRow("r0", 1, "u0"), {RunID: "r0", Seq: 2, Role: "assistant", Text: "a0"}},
+		[]ModelMessage{{RunID: "r1", Seq: 0, Role: "user", Text: "死旧摘要"}},
+		[]ModelMessage{
+			{RunID: "r2", Seq: 0, Role: "user", Text: "活旧摘要"},
+			userRow("r2", 1, "u2"),
+			{RunID: "r2", Seq: 2, Role: "assistant", Text: "a2"},
+		},
+		[]ModelMessage{userRow("r3", 1, "u3"), {RunID: "r3", Seq: 2, Role: "assistant", Text: "a3"}},
+		[]ModelMessage{
+			{RunID: "r_cur", Seq: 0, Role: "user", Text: "本run前代摘要"},
+			userRow("r_cur", 1, "eeee"),
+		},
+	)
+	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 100000, counter, summarize, nil)
+	if err != nil {
+		t.Fatalf("foldInput: %v", err)
+	}
+	if len(inputs) != 1 {
+		t.Fatalf("档数 %d，want 1（n=2 档即收敛：只折 r0）", len(inputs))
+	}
+	for _, want := range []string{"死旧摘要", "活旧摘要", "本run前代摘要"} {
+		if !strings.Contains(inputs[0], want) {
+			t.Fatalf("三份旧摘要都应并入 summarize 输入（当前 run 的 seq0 同走 oldTexts）：%q 缺 %q", inputs[0], want)
+		}
+	}
+	if got, want := fmt.Sprint(staged.MergedSummaryRunIDs), fmt.Sprint([]RunID{"r2"}); got != want {
+		t.Fatalf("活摘要 run（keep 区有原文行）应只翻 seq0：got %s want %s", got, want)
+	}
+	if got, want := fmt.Sprint(staged.DropRunIDs), fmt.Sprint([]RunID{"r1", "r0"}); got != want {
+		t.Fatalf("死摘要 run + drop 区 run 应整翻（旧摘要 run 先、无重复项）：got %s want %s", got, want)
+	}
+	for _, id := range append(append([]RunID{}, staged.DropRunIDs...), staged.MergedSummaryRunIDs...) {
+		if id == "r_cur" {
+			t.Fatalf("当前 run 永不入翻转集：%+v", staged)
+		}
+	}
+	for _, m := range assembled {
+		if m.Text == "本run前代摘要" {
+			t.Fatalf("当前 run 的旧 seq0 不进 assembled 可见区（随摘要合并）：%v", assembled)
+		}
+	}
+	if staged.AttachRun != "r0" {
+		t.Fatalf("挂点应=最后折入的老 run：%+v", staged)
 	}
 }
 
