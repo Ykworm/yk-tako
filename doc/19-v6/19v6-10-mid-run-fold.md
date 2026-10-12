@@ -1,5 +1,7 @@
 # 19v6-10 · mid-run fold（run 中途压缩 · 立项方案）
 
+> **验收：2026-10-12 用户判定 A5 完成。** 第 7 项的活体话本退役，保留区只翻 seq=0 的规则继续由 `store_test` 的合成行覆盖。第 9 项以同一份程序上、没有折叠的四端点形状为准，`d1-*` 里没有 `model` 的旧字节不再当对照。第 10 项以巨大 `write_file` 参数在同一次 run 里顶过 3200、并打出 `compact mid-run` 为准；「大参数留到下一掷才折」不再当通过条件。摘要帽 1024 三次拒收导致整折失败，记在文末实施偏离里，不挡住这一拍。证据与逐项记录见文末「验收回填」。
+
 > **立项：2026-10-11（用户裁「现在就要立项…我是让你出方案的」）**。本篇取代原需求登记，
 > 把立项要裁的三件事 + 三件套不变量闸门全部裁掉；19v6-07 §5 的同名条目以本篇为准。
 > 施工前的事实依据 = runengine 压缩链全量实读（worker/compact/pgstore + eino v0.9.21
@@ -476,3 +478,24 @@ n 降档 + errStillOver 已覆盖。mid-run fold 落地不改变这个判断：f
 
 每拍验收 = 对应话本的 curl + 期望字节/日志行；第一拍能 curl 到的是「带大参数 write_file
 的会话触发线变化」（日志断言）。
+
+## 验收回填（2026-10-12）
+
+五条施工面都已落在 `yk-tako-eino/internal/runengine`。第 1 条 `countInput` 把 `tool_calls` 的 JSON 算进长度。第 2 条 `foldInput` 能按老 run 整段和当前 run 的交换单位混合折叠，摘要撞上已有的 seq0 时走 UPSERT。第 3 条 `midfold.go` 在每次模型调用前计数并重写 state，system 行留在队首。第 4 条 `EndRun` 只在 `complete` 时把最后一份摘要写入挂点，并按 drop、merged 两套粒度翻转。第 5 条是第 13 节的十项验收，结果如下。证据在 `tmp/19-v6/evidence-midrun/`。
+
+1. 压缩发生、暗号存活、库形态沿用已落档的 `A5-01-*`、`A5-02-*`。本轮没有重跑。
+2. 配对不破和 system 钉首的活体证据在上述原件里：折叠之后的模型调用没有 provider 400，`run_model_messages` 没有 system 行。单位边界、保留区不以 tool 行开头、user 行钉在保留区首位，以及重写后的 system 行逐字节不变，由 `TestFoldInput*` 钉住。
+3. 同槽换代在新会话 `s_01M4PZ8SQJ046Y49XX5R8EYX8P` 上打成。`r_01M4PZ8SQJY4G954MDA5D9W5EV` 的 seq0 仍是 `msg_01M4PZ93VYBH9FWCBNEE2DQNGD`，`tlen` 从 405 换成 1220，`compacted=f`；seq1 到 seq6 变为 `compacted=t`。后一掷 `r_01M4PZGSV0SJE5HG02GPXGZTCE` 为 `complete`。日志是「压 1 单位（含当前 run 0 轮）」，挂点留在原来那个 run。原来那条会话里的 (b) 形 run 没有换代，原因见下面的偏离。
+4. keep 区保留行按第 13 节的原话本实跑造不出来。一个 (b) 形 run（seq0 和原文行并存）只能由它自己那次 mid-run 折叠产生。产生它的那一次折叠已经把更老的 raw run 折完，所以它自己就是最老的存活 raw。下一轮 phase 1 从最老开始丢，它进入 `DropRunIDs`，挂点又是它自己，走同槽换代，不会留在 keep 区、只把 seq0 翻死。`store_test` 里的合成行仍然覆盖这条代码路径。
+5. 零写入有两处活体。`A4-m2-kill-*` 是 `kill -9`。error 结局只留下 `AcquireRun` 时写入的 user 行，折叠结果不落库。本轮第 10 项的 `r_01M4Q1WX2ZTW0QN5BC42WHBZ4R` 又复现了一次：某次摘要三次顶到 1024 之后 run 为 error，`run_model_messages` 只剩 `text_len=55` 的 user 行。
+6. 四端点用 `m_d1` 复跑，会话 `s_01M4Q1W4ER7G0PFT4XDXYV9B78`，`complete`，日志没有折叠行。POST 返回 202，字段序是 `sessionId`、`runId`、`messageId`。session 是 `liveRunId=""`、`runlogOffset=2`。frames 是 start、39 条 delta、terminal `complete`，条数和基线一样。log 是 user 加 assistant 两行。相对 `tmp/19-v6/compact/evidence-a5/d1-*`，每一帧和每一行都多了 `model`。这是 T3-1b 把 `model` 定为恒在字段，结构体上没有 `omitempty`，不是折叠加上的。基线那次的 window 是 3000，这次是 4000。纯文本不触折叠，window 不改变这四个响应的形状。
+7. 触发线用 `write_file` 把「上下文溢出测试」写入 `big.txt`。user 行只有 55 字。第一次写完，下一次进模型前的计数是 3801 tok，超过 3200，日志打出 `compact mid-run` 的「进入折叠」。后面几次写入的参数最大到 100386 字节，计数到过 52095 tok。对照是上面的纯文本会话，没有折叠行。过线的体积来自 `tool_calls`，不是正文。
+
+实施偏离：
+
+- 第 13 节第 7 项要求被 mid-run 折过的 run 落在 keep 区。上面第 4 点说明这条路径在实跑里走不到。代码路径用测试里的合成行保住。
+- 摘要器硬帽是 1024。输出顶到这个数就当截断拒收，三次拒收则整次折叠失败，run 变 error。原料是一份很长的旧摘要时，大约一半次数会顶帽。第 10 项的 run 就是在后续某次折叠上这样结束的，库里因此没有留下那条巨大的 `tool_calls` 行。
+- 第 10 项话本原来的预期是：第一个 run 完整留下 seq2 的 `tool_calls`（至少 9k 字节），第二个 run 起手才折叠。现在每次模型调用前都会计数，巨大的 `write_file` 参数在第一个 run 内部就过线并被折掉。模型看不见已经写完，就继续写，直到某次摘要顶帽，run 以 error 结束。「继续」没有发出去。workspace 是 `/tmp/midrun-b`，不是 A1 台账里的 `/tmp/midrun-a1`。`big.txt` 已经写在磁盘上，error 不回滚工具已经做成的文件。
+- 第 6 项没有打在 `s_01M4P28DHQD8F7Z50S9JAFZEWS` 上。那条会话里还活着的 user 行点名了别的文件，模型把它们和目标文件一起读，当前这一轮大到只丢掉最老的 run 也压不回 3200 以下。换成一个只有重复句的新会话之后，同槽换代的库断言成立。
+
+用户判定（2026-10-12）：A5 完成。上面四条偏离留档，不再作为未通过项。第 7 项不再要求活体造出 keep 区保留行。第 9 项不再要求和 `d1-*` 逐字节相同。第 10 项不再要求第一掷把巨大 `tool_calls` 留在库里、第二掷起手才折。
