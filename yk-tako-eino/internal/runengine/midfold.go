@@ -17,7 +17,8 @@
 //     ToolInfos 不为所动（它是模型声明面，归别的 handler/装配面）。
 //
 // 没有新折叠算法：foldInput / countInput / renderFold 三个签名不动（planning 裁定 2），
-// 本文件只做三件事——state ⇄ mh 形状的转换、容器读写、两行日志（格式钉死在 planning 裁定 6）。
+// 本文件对折叠链只做三件事——state ⇄ mh 形状的转换、容器读写、折叠日志（格式钉死在 planning 裁定 6）；
+// doc/24 之后多了第四件：发出前滤思考 + 有账单时的长度估算（下面两段，同样不动折叠算法本体）。
 //
 // 落库路径不变（PG 一个字不动）：本文件只把折后 state 存进容器；唯一写点仍是 EndRun——
 // worker 的 defer 从容器读 staged 列表与折后行（mhRowsFromFold）、complete 才落。
@@ -25,6 +26,15 @@
 //
 // 断言违例（system 非首 / 三件套）返回错误、不 panic（planning 裁定 7）：ADK 把 handler 错误
 // 透传成 run error（eino v0.9.21 实读：graph 节点错误 → generator 的 Err 事件），run 走干净 A。
+//
+// doc/24 两件事（滤思考 + Usage 基线触发，位点都在 BeforeModelRewriteState）：
+//   - 滤思考：模型上一枪的 ReasoningContent 会被组件原样重发进下一次请求，而 countInput 数不到它
+//     （mh 形状没这个字段）→ 自测偏小被放行、厂商按真实长度拒收。每次放行前清空 state 里
+//     assistant 行的 ReasoningContent，请求与自测在这一维对齐。
+//   - Usage 基线触发：上一枪的回执（ResponseMeta.Usage）粘在产生它的 assistant 消息上，有它时
+//     「即将发出的这一份」= PromptTokens + 可见输出 + 锚点之后新行的自测，省掉整份历史的重数。
+//     账单只在原始 schema.Message 上读得到（convertState / toSchemaMessages 都丢它），
+//     所以锚点必须在转换前找——折完那一次自然退回全量自测，不需要额外的清锚点开关。
 package runengine
 
 import (
@@ -245,6 +255,67 @@ func droppedRunUnits(before, after []ModelMessage, currentRun RunID) int {
 // 编译期锚：接口一缺，编译不过（其余七方法由 Base 兜底）。
 var _ adk.ChatModelAgentMiddleware = (*midfoldHandler)(nil)
 
+// stripReasoning 清空 state 里所有 assistant 行的 ReasoningContent（doc/24 §3 主裁决）。
+// 原地改：state 装的是指针，改完 ADK 拼请求时读到的就是空字段——上一枪的思考不再重发。
+// 必须在用量估算之后调用：估算的减项读的就是这个字段，滤完再从空字段估只能得 0。
+// 折过的那一路不需要它（toSchemaMessages 重建的行本来就不带思考）；没折的直通路径必须它。
+func stripReasoning(msgs []*schema.Message) {
+	for _, m := range msgs {
+		if m.Role == schema.Assistant && m.ReasoningContent != "" {
+			m.ReasoningContent = ""
+		}
+	}
+}
+
+// usageEstimate 是「账单基线 + delta」四个读数（活体日志与单测都看分项，不看合计一个数）。
+type usageEstimate struct {
+	baseline int // 锚点那一次请求的输入侧账单（system、历史、schema 都在里面）
+	visible  int // 那一次的输出账单减掉思考；<0 置 0
+	delta    int // 锚点之后的新行（尚未发出去的 tool 结果等）自测长度
+	total    int // 三者之和，即「即将发出的这一份」的估算长度
+}
+
+// usageBasedInput 在原始 state.Messages 上按 doc/24 §5 的公式估算下一次请求的输入长度。
+// 锚点 = 从队尾往前最后一条 role 为 assistant 且 Usage 三个整数不全为 0 的消息；找不到（本场
+// 第一枪、刚折完、厂商没给账单）返回 false，调用方退回全量 countInput（doc/24 §6）。
+// 锚点自己的正文 / tool_calls 由 visible 代表，不进 delta——算两遍会偏大、早折。
+// system 与工具 schema 声明都不另加：前者已在账单里，后者有意不进触发（doc/24 §7）。
+func usageBasedInput(counter TokenCounter, currentRun RunID, msgs []*schema.Message) (usageEstimate, bool) {
+	idx := -1
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := msgs[i]
+		if m.Role != schema.Assistant || m.ResponseMeta == nil || m.ResponseMeta.Usage == nil {
+			continue
+		}
+		u := m.ResponseMeta.Usage
+		if u.PromptTokens != 0 || u.CompletionTokens != 0 || u.TotalTokens != 0 {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return usageEstimate{}, false
+	}
+	u := msgs[idx].ResponseMeta.Usage
+	// 思考的减项：厂商给了明细就用它，否则在滤之前对原文做一次同词表的估算。
+	reasoning := u.CompletionTokensDetails.ReasoningTokens
+	if reasoning <= 0 {
+		reasoning = counter.Count(msgs[idx].ReasoningContent)
+	}
+	visible := u.CompletionTokens - reasoning
+	if visible < 0 {
+		visible = 0
+	}
+	rows := make([]ModelMessage, 0, len(msgs)-idx-1)
+	for _, m := range msgs[idx+1:] {
+		// seq 传占位 0：这些行只进 countInput 数长度，不落库、不参与坐标推导。
+		rows = append(rows, newRowFromMessage(currentRun, 0, m))
+	}
+	delta := countInput(counter, "", rows)
+	return usageEstimate{baseline: u.PromptTokens, visible: visible, delta: delta,
+		total: u.PromptTokens + visible + delta}, true
+}
+
 // midfoldHandler 是 mid-run fold 的钩子：每次模型调用前对当前 state 自测长度、超线走同一条
 // 折叠链；成功终态时把折后 state 存进容器供 worker 落库。挂载次序 = agentSpecHandler /
 // noteSnapshotHandler 之后、agentLog 之前（19v6-10 §4：日志看到的是模型实际所见的折后输入）。
@@ -252,7 +323,7 @@ var _ adk.ChatModelAgentMiddleware = (*midfoldHandler)(nil)
 // 快照段拼进它，数到的就是模型实见的（不再用构造期形参，「单一真源全从 state 读」）。
 type midfoldHandler struct {
 	*adk.BaseChatModelAgentMiddleware
-	limit       int // = compactLimit（compactLimitFor(window)）；<= 0 = 折叠休眠（BeforeModelRewriteState 直通）
+	limit       int // = compactLimit（compactLimitFor(window)）；<= 0 = 折叠休眠（只滤思考、不自测不折）
 	counter     TokenCounter
 	summarize   func(context.Context, string) (string, error) // = summarizer.summarize（同一条链同一个摘要器）
 	fileEffects map[string]string                             // = firstPartyFileEffects（钉块提取的判定入口）
@@ -270,11 +341,18 @@ func newMidfoldHandler(counter TokenCounter, limit int,
 }
 
 // BeforeModelRewriteState：每次模型调用前到场。休眠门（limit<=0 或 counter 缺）= 直通；
-// 否则转换 → countInput（A1 基数）→ 超线折 → 重写 state（ToolInfos 不动）→ 容器同步 → 两行日志。
+// 否则转换 → 长度自测（有账单走 usageBasedInput，无账单走 countInput，doc/24 §5/§6）→ 超线折
+// → 重写 state（ToolInfos 不动）→ 容器同步 → 日志。放行前恒清空 state 上的思考（doc/24 §3）：
+// 顺序是「先估（还要读 ReasoningContent 做减项）→ 再折 → 最后滤」，滤早了减项只能估成 0。
 // 折叠失败（errStillOver / 摘要失败）与断言违例都返回错误：run 走 status=error、零写入（裁定 7）。
 func (h *midfoldHandler) BeforeModelRewriteState(ctx context.Context, state *adk.ChatModelAgentState, mc *adk.ModelContext) (context.Context, *adk.ChatModelAgentState, error) {
 	box := foldBoxFrom(ctx)
-	if box == nil || h.limit <= 0 || h.counter == nil {
+	if box == nil {
+		return ctx, state, nil
+	}
+	// 滤思考与折叠休眠无关：limit<=0 / counter 缺时不再重发上一枪思考，仍然是对请求形状的正确修法。
+	if h.limit <= 0 || h.counter == nil {
+		stripReasoning(state.Messages)
 		return ctx, state, nil
 	}
 	base := box.baseRows()
@@ -282,8 +360,19 @@ func (h *midfoldHandler) BeforeModelRewriteState(ctx context.Context, state *adk
 	if err != nil {
 		return ctx, state, err
 	}
-	total := countInput(h.counter, sys, history)
+	var total int
+	if est, ok := usageBasedInput(h.counter, box.run, state.Messages); ok {
+		// 账单在读的地方（原始 state）只数锚点之后的新行，整份历史不再重数一次。
+		// 对照用的全量自测不在这里算：每轮都算一遍等于没省，doc/24 §10 的收益正是跳过整份重数；
+		// 两条口径同量级由单测钉（midfold_test TestUsageBasedInput）。
+		total = est.total
+		log.Printf("compact usage %s/%s: 基线 %d + 可见输出 %d + 新增 %d = %d tok，limit %d",
+			box.session, box.run, est.baseline, est.visible, est.delta, total, h.limit)
+	} else {
+		total = countInput(h.counter, sys, history)
+	}
 	if total <= h.limit {
+		stripReasoning(state.Messages)
 		return ctx, state, nil
 	}
 	log.Printf("compact mid-run %s/%s: 输入 %d tok > limit %d，进入折叠", box.session, box.run, total, h.limit)

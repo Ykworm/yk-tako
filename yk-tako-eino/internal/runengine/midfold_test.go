@@ -308,3 +308,191 @@ func TestMidfoldHandlerSecondFoldSameRun(t *testing.T) {
 		{RunID: "r_cur", Seq: 2, Role: "assistant", Text: "终稿"},
 	})
 }
+
+// ---- doc/24 ①：账单基线 + delta 的公式（纯函数表测）----
+
+// runest 造一条带回执的思考回复：正文 content、思考 reasoning（长度 = 10 个「思」时估算给 10）、
+// 账单三个数（p/c/r = PromptTokens / CompletionTokens / ReasoningTokens，r<0 表示厂商不给明细）。
+func runest(content, reasoning string, p, c, r int) *schema.Message {
+	m := schema.AssistantMessage(content, nil)
+	m.ReasoningContent = reasoning
+	u := &schema.TokenUsage{PromptTokens: p, CompletionTokens: c}
+	if r >= 0 {
+		u.CompletionTokensDetails.ReasoningTokens = r
+	}
+	m.ResponseMeta = &schema.ResponseMeta{FinishReason: "stop", Usage: u}
+	return m
+}
+
+// 公式四条：厂商明细优先于自测（1000+（50−30）+1）、无明细时滤前估思考、可见输出减成负数置 0、
+// 锚点取队尾方向第一条有账单的 assistant（更前有账单的旧行不进 delta、锚点自身正文只由账单代表一次）。
+func TestUsageBasedInputFormula(t *testing.T) {
+	runeCount := fakeCounter{f: func(s string) int { return len([]rune(s)) }}
+	thinking := strings.Repeat("思", 10) // 自测口径下 10 tok
+	newRows := func(anchor *schema.Message) []*schema.Message {
+		return []*schema.Message{schema.SystemMessage("人设"), schema.UserMessage("问"), anchor,
+			schema.ToolMessage("果", "c1")}
+	}
+
+	t.Run("厂商 ReasoningTokens 优先", func(t *testing.T) {
+		est, ok := usageBasedInput(runeCount, "r_cur", newRows(runest("答复", thinking, 1000, 50, 30)))
+		if !ok {
+			t.Fatalf("有账单应成立")
+		}
+		// 锚点正文「答复」(2) 与思考 (10) 都不进 delta：锚点自身由 visible=20 代表一次。
+		if est != (usageEstimate{baseline: 1000, visible: 20, delta: 1, total: 1021}) {
+			t.Fatalf("est = %+v, want {1000 20 1 1021}", est)
+		}
+		// 变体一（思考算进 delta＝不减 ReasoningTokens）与变体二（锚点正文再数一遍）都必须更大。
+		if dbl := est.baseline + 50 + est.delta; est.total >= dbl {
+			t.Fatalf("思考减项未生效：est.total %d, 变体 %d", est.total, dbl)
+		}
+		if dbl := est.total + runeCount.Count("答复"); est.total >= dbl {
+			t.Fatalf("锚点正文被算两遍：est.total %d, 变体 %d", est.total, dbl)
+		}
+	})
+
+	t.Run("无明细时滤前自测思考", func(t *testing.T) {
+		est, ok := usageBasedInput(runeCount, "r_cur", newRows(runest("答复", thinking, 1000, 50, -1)))
+		if !ok || est.visible != 40 || est.total != 1041 {
+			t.Fatalf("est = %+v ok=%v, want visible 40、total 1041（思考按 10 tok 减）", est, ok)
+		}
+	})
+
+	t.Run("思考大于输出时置零", func(t *testing.T) {
+		est, ok := usageBasedInput(runeCount, "r_cur", newRows(runest("答复", thinking, 1000, 5, 30)))
+		if !ok || est.visible != 0 || est.total != 1001 {
+			t.Fatalf("est = %+v ok=%v, want visible 0、total 1001", est, ok)
+		}
+	})
+
+	t.Run("锚点取最近一条有账单的 assistant", func(t *testing.T) {
+		msgs := []*schema.Message{schema.SystemMessage("人设"), schema.UserMessage("问"),
+			runest("旧答", "", 9000, 9000, -1), schema.ToolMessage("旧果", "c1"),
+			runest("新答", "", 100, 0, -1), schema.ToolMessage("果", "c2")}
+		est, ok := usageBasedInput(runeCount, "r_cur", msgs)
+		if !ok || est != (usageEstimate{baseline: 100, visible: 0, delta: 1, total: 101}) {
+			t.Fatalf("est = %+v ok=%v, want 以最后一条有账单的锚点起算 {100 0 1 101}", est, ok)
+		}
+	})
+
+	t.Run("无账单不进公式", func(t *testing.T) {
+		msgs := []*schema.Message{schema.SystemMessage("人设"), schema.UserMessage("问"),
+			schema.AssistantMessage("答", nil), schema.ToolMessage("果", "c1")}
+		if est, ok := usageBasedInput(runeCount, "r_cur", msgs); ok {
+			t.Fatalf("无账单应回退全量自测，got %+v", est)
+		}
+		// 全零账单 = 厂商给了个空壳，同义于没有账单。
+		if _, ok := usageBasedInput(runeCount, "r_cur", newRows(runest("答", "", 0, 0, -1))); ok {
+			t.Fatalf("三个整数全 0 的账单不应当锚点")
+		}
+	})
+
+	// 折完那一次：toSchemaMessages 不拷贝 ResponseMeta → 锚点自然消失、退回全量自测（doc/24 §6）。
+	t.Run("重写后账单消失", func(t *testing.T) {
+		rewritten := toSchemaMessages([]ModelMessage{
+			{RunID: "r_cur", Seq: 0, Role: "user", Text: "摘要"},
+			{RunID: "r_cur", Seq: 1, Role: "user", Text: "问"},
+			{RunID: "r_cur", Seq: 2, Role: "assistant", Text: "答复"},
+		})
+		if est, ok := usageBasedInput(runeCount, "r_cur", append([]*schema.Message{schema.SystemMessage("人设")}, rewritten...)); ok {
+			t.Fatalf("折后不应再找到锚点，got %+v", est)
+		}
+	})
+}
+
+// ---- doc/24 ②：钩子接线——有账单时以公式为准（同料全量口径要折、公式不折），放行前滤思考 ----
+
+// bigCounter 脚本化：BIG 前缀 200 tok，其余 0（沿用本文件既有惯例）。
+func bigCounter() fakeCounter {
+	return fakeCounter{f: func(s string) int {
+		if strings.HasPrefix(s, "BIG") {
+			return 200
+		}
+		return 0
+	}}
+}
+
+// 同一份 state：基点里一条 BIG 老行让全量口径（200）越线，而锚点账单说这一份只有 10 tok。
+// 有账单 → 放行、一次都不摘要、思考被滤空；把账单抹掉 → 按全量口径进折叠链（对照）。
+func TestMidfoldUsageBaselineDecidesAndStripsReasoning(t *testing.T) {
+	build := func(withUsage bool) *adk.ChatModelAgentState {
+		anchor := schema.AssistantMessage("答", nil)
+		anchor.ReasoningContent = strings.Repeat("思", 10)
+		if withUsage {
+			anchor.ResponseMeta = &schema.ResponseMeta{Usage: &schema.TokenUsage{PromptTokens: 10}}
+		}
+		return &adk.ChatModelAgentState{Messages: []*schema.Message{
+			schema.SystemMessage("人设"),
+			schema.UserMessage("BIG_老摘要"),
+			schema.UserMessage("问"),
+			anchor,
+			schema.ToolMessage("果", "c1"),
+		}}
+	}
+	newHandler := func(summarize func(context.Context, string) (string, error)) (*midfoldHandler, *foldBox) {
+		box := newFoldBox("s_1", "r_cur")
+		box.setBase([]ModelMessage{
+			{RunID: "r_cur", Seq: 0, Role: "user", Text: "BIG_老摘要"},
+			{RunID: "r_cur", Seq: 1, Role: "user", Text: "问"},
+		})
+		return newMidfoldHandler(bigCounter(), 150, summarize, nil), box
+	}
+
+	t.Run("有账单：公式放行，全量口径本会折", func(t *testing.T) {
+		var sums int
+		handler, box := newHandler(func(context.Context, string) (string, error) {
+			sums++
+			return "S", nil
+		})
+		state := build(true)
+		ctx := withFoldBox(context.Background(), box)
+		if _, _, err := handler.BeforeModelRewriteState(ctx, state, nil); err != nil {
+			t.Fatalf("BeforeModelRewriteState: %v", err)
+		}
+		if sums != 0 || len(box.stagedList()) != 0 {
+			t.Fatalf("账单口径 10 tok ≤ limit 150 不该折：sums=%d staged=%d", sums, len(box.stagedList()))
+		}
+		if got := box.baseRows(); len(got) != 2 {
+			t.Fatalf("基点不该换代：%+v", got)
+		}
+		if rc := state.Messages[3].ReasoningContent; rc != "" {
+			t.Fatalf("放行前未滤思考：%q", rc)
+		}
+	})
+
+	t.Run("无账单：同一份料按全量口径折", func(t *testing.T) {
+		var sums int
+		handler, box := newHandler(func(context.Context, string) (string, error) {
+			sums++
+			return "S", nil
+		})
+		state := build(false)
+		ctx := withFoldBox(context.Background(), box)
+		if _, _, err := handler.BeforeModelRewriteState(ctx, state, nil); err != nil {
+			t.Fatalf("BeforeModelRewriteState: %v", err)
+		}
+		if sums == 0 {
+			t.Fatalf("全量口径 200 tok > limit 150 该折，一次都没摘要")
+		}
+		for _, m := range state.Messages {
+			if m.ReasoningContent != "" {
+				t.Fatalf("折后仍带思考：%q", m.ReasoningContent)
+			}
+		}
+	})
+
+	t.Run("折叠休眠也滤思考", func(t *testing.T) {
+		handler, box := newHandler(nil)
+		handler.limit = 0 // window=0：不折叠、不自测，但上一枪思考同样不再重发
+		state := build(true)
+		ctx := withFoldBox(context.Background(), box)
+		if _, _, err := handler.BeforeModelRewriteState(ctx, state, nil); err != nil {
+			t.Fatalf("BeforeModelRewriteState: %v", err)
+		}
+		if state.Messages[3].Content != "答" || state.Messages[3].ReasoningContent != "" {
+			t.Fatalf("休眠门下应只滤思考：content=%q reasoning=%q",
+				state.Messages[3].Content, state.Messages[3].ReasoningContent)
+		}
+	})
+}

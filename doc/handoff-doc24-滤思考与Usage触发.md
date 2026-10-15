@@ -188,7 +188,7 @@ total = countInput(system, 全部可见历史)
    在 `BeforeModelRewriteState` 放行前清空 ReasoningContent。单测/断言：发出前锚点 assistant 字段为空。活体：思考模型二次调用不带上一枪思考（组件或抓包）。
 
 3. **Usage 公式（需求 2）**  
-   锚点查找 + `next_input` + 无账单回退。超限仍进现有 `foldInput`。日志建议：`compact usage` 打 baseline / delta / total，旁注全量自测；`window = 0` 时不出现。
+   锚点查找 + `next_input` + 无账单回退。超限仍进现有 `foldInput`。日志建议：`compact usage` 打 baseline / delta / total；旁注全量自测**不每轮算**（2026-10-15 用户裁，理由与替代见 `doc/24` §9）；`window = 0` 时不出现。
 
 4. **单测钉死（见下节）**
 
@@ -211,7 +211,7 @@ total = countInput(system, 全部可见历史)
 
 ### 活体
 
-- 第二次调用前可打 `compact usage`（baseline / delta / total / 旁注全量自测）。
+- 第二次调用前可打 `compact usage`（baseline / delta / total）。旁注全量自测不每轮算（2026-10-15 用户裁：每轮重算等于把要省的整份重数跑回去；同量级对照由单测 `TestUsageBasedInputFormula` 钉，厂商报数失真由溢出层兜底）。
 - `window = 0` 时不出现折叠/usage 触发日志。
 - 四端点路径与字段面与改前同形。
 
