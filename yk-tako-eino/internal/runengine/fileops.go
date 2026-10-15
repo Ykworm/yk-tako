@@ -107,6 +107,9 @@ var firstPartyFileEffects = map[string]string{
 	// bash（doc/17 §3）：command 字段由 ③ shell 写意图表扫写路径——登记 write 这条链才通
 	// （登记 none/留空在 classifyToolCall 提前返回，command 不被扫，折叠丢写路径）。
 	"bash": fileEffectWrite,
+	// web_search（doc/22 §3）：不碰 workspace 里的路径——显式 none，提取路径时不拿 query 字符串
+	// 里的内容猜（结果只活在本次 tool_result 里，链接不进 fileOps）。
+	"web_search": fileEffectNone,
 }
 
 // fileEffectToolNames 是启动 lint 的目录名单（v1 常量表，逐名带出处；精确命中用，不转小写）：

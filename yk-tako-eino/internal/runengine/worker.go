@@ -190,6 +190,13 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		return nil, err
 	}
 	pool = append(pool, wrapToolErrors(sh))
+	// 网络搜索工具入池（doc/22）：search_history 之后 append（doc/22 §3「排在 search_history
+	// 后面」）；选择器在 websearch.go，按调用方 ctx 标记取生效 ref 的厂商 id。
+	ws, err := newWebSearchTool()
+	if err != nil {
+		return nil, err
+	}
+	pool = append(pool, wrapToolErrors(ws))
 	// 摘要器在 agent 装配前构造（A4，planning 裁定 9）：midfoldHandler 要拿它的 summarize 方法值——
 	// mid-run 折叠与 prepareInput 的 Run fold 共用同一个摘要器、同一顶帽（C5-A7 分档）。
 	compactLimit := CompactLimitFor(compactWindow)
@@ -206,6 +213,9 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 			EmitInternalEvents: true,
 		},
 		Handlers: []adk.ChatModelAgentMiddleware{
+			// 调用方身份标记（doc/22 §4）：root 挂 ""（与 agentModelTable 的 root key 一致），
+			// 放链首 = 日志里它先于其余 handler 出现；BeforeAgent 之间互不读写，位置无语义。
+			&callerStampMiddleware{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, name: ""},
 			newAgentSpecHandler(agentsDir, store, workspace, chat, modelRef, translate, resolver,
 				make(chan struct{}, subagentConcurrency), subagentReturnCap),
 			// 笔记快照缝（M1，notes.go）：BeforeAgent 渲染快照、每轮模型调用前把 system 重写为

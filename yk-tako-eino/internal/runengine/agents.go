@@ -209,6 +209,15 @@ func (t *agentModelTable) entryFor(agent string) agentModelEntry {
 	return t.entries[""]
 }
 
+// lookupStrict 按 agent 名取生效 ref，查不到不回落（ok=false）——web_search 的严格读
+// （doc/22 §4）：表坏时走 entryFor 的回落会把子代理的搜索静默打去主模型厂商。
+func (t *agentModelTable) lookupStrict(agent string) (string, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	e, ok := t.entries[agent]
+	return e.ref, ok
+}
+
 // agentModelTableKey 是 ctx 携带身份表的私有 key 类型（context key 的防撞车惯例）。
 type agentModelTableKey struct{}
 
@@ -391,6 +400,11 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 			Instruction: instruction,
 			Model:       subModel,
 			ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: pool}},
+			// 调用方身份标记（doc/22 §4）：web_search 按它查 agentModelTable 取该子代理自己的
+			// 生效 ref——不挂标记工具只能报错，挂主 ref 会把子代理的搜索打错厂商。
+			Handlers: []adk.ChatModelAgentMiddleware{&callerStampMiddleware{
+				BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, name: spec.Name,
+			}},
 		})
 		if err != nil {
 			log.Printf("agents: %s: 拒载: 子代理装配失败: %v", spec.Name, err)
