@@ -30,6 +30,7 @@ export type PostRunsResponse = {
 export type SessionStatus = {
   liveRunId: RunID
   runlogOffset: number
+  lastRunStatus: string
 }
 
 export type FramesResponse = {

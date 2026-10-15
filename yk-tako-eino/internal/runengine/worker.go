@@ -109,6 +109,10 @@ type Worker struct {
 	compactWindow int
 	compactLimit  int // = compactLimitFor(window)（window=0 时 0）：触发线 / 准入线两处共用，不各自重算；摘要预算帽自 A7 起归 summarizeCeiling 分档
 	counter       TokenCounter
+	// runCancels 是手动停止（doc/17 §4）的进程内取消注册表：runID → cancelFunc。
+	// stop 端点赢竞态后查它，命中（本进程在跑这场 run）即 cancel、不等续约 tick；
+	// 跨副本传播走 watchdog：续约 CAS 0 行 → 查它 cancel（最坏一个续约间隔）。
+	runCancels sync.Map
 }
 
 // NewWorker 组一个 worker。chat 是两处模型的共同底座（model.BaseChatModel，
@@ -164,6 +168,13 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		}
 		pool = append(pool, wrapToolErrors(t))
 	}
+	// bash 执行工具入池（doc/17 §3）：11 个文件工具后、memory 前——批量活先写脚本再跑；
+	// 作业根 workspace（相对路径在 workspace 内解析），32 KB 帽 / 环境白名单在 bash.go（无自动超时，2026-10-15 用户裁）。
+	bash, err := newBashTool(workspace)
+	if err != nil {
+		return nil, err
+	}
+	pool = append(pool, wrapToolErrors(bash))
 	// 笔记工具入池（M1，notes.go）：文件工具族之后 append——子代理继承整池时天然拿到它
 	// （researcher 不写 tools 行 = 继承）；写入逻辑全在 writeNote。
 	mem, err := newMemoryTool(store, workspace)
@@ -234,6 +245,12 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 // 它同时保证「最后一次续约」早于放闸，语义最干净）。
 func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 	status := "complete"
+	// 手动停止（doc/17 §4）：run ctx 包一层可取消并注册——stop 端点 / watchdog 判死都经
+	// 注册表 cancel 这一个把柄，模型流与工具（子代理调用在 ctx.Done 上返回）随取消 unwind。
+	ctx, cancelRun := context.WithCancel(ctx)
+	w.runCancels.Store(runID, cancelRun)
+	defer w.runCancels.Delete(runID)
+	defer cancelRun()
 	// run 级折叠容器（A4，planning 裁定 4）：塞进 ctx 供 midfoldHandler 读写；prepareInput 填
 	// base 与 Run fold 的 staged，defer 从这里取货落库。
 	box := newFoldBox(sessionID, runID)
@@ -252,7 +269,9 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 		} else {
 			mhRows = mhRowsFromTurn(runID, turn)
 		}
-		_, _, ok, err := w.store.EndRun(ctx, sessionID, runID, status, box.stagedList(), mhRows, turn)
+		// WithoutCancel（doc/17 §4 D4）：stop 判死后本 ctx 已取消，但 stopped 收尾还要写
+		// 已配对工具行——收尾的 PG/Redis 调用不能吃取消；foldBox 等 ctx 值仍要带上。
+		_, _, ok, err := w.store.EndRun(context.WithoutCancel(ctx), sessionID, runID, status, box.stagedList(), mhRows, turn)
 		switch {
 		case err != nil:
 			// 收尾失败仍留痕。D1 后有两个方向：DB 半败 = 闸没放（租约到点自蒸、会话自动解锁，不再永久锁死）；
@@ -556,9 +575,9 @@ func (w *Worker) drain(ctx context.Context, runID RunID, agent string, entry age
 }
 
 // watchdog 在生成期间每 leaseRenew 续约一次闸的租约（A7）。续约 no-op（PG 守卫 UPDATE 影响 0 行：
-// 闸已易主 / 已放 / 已到期）= 本 run 被判死 → **记日志、退出 watchdog，但不主动杀 LLM 流**（dev 默认）：
-// 主循环的 AppendDelta 会因 draft 蒸发自然停写（返 !live）、EndRun 被守卫挡住空转，
-// 都是现役既有语义，不用新代码去中断流。
+// 闸已易主 / 已放 / 已到期）= 本 run 被判死 → 记日志、cancel 本场 run（doc/17 §4 手动停止：
+// stop 端点翻 stopped 后由此传播取消；自然过期同样掐流——2026-10-15 用户拍，原「不杀流」语义废）。
+// 主循环的 AppendDelta 还会因 draft 蒸发自然停写（返 !live）、EndRun 被守卫挡住走 stopped 分支。
 // ctx 由 Run 在退出前 cancel，watchdog 随即返回；wg.Wait() 保证它完全退出后 EndRun 才跑。
 func (w *Worker) watchdog(ctx context.Context, sessionID SessionID, runID RunID) {
 	t := time.NewTicker(w.leaseRenew)
@@ -577,7 +596,13 @@ func (w *Worker) watchdog(ctx context.Context, sessionID SessionID, runID RunID)
 				continue
 			}
 			if !ok {
-				log.Printf("lease renew %s/%s: 闸已不属于本 run，停止续约（本 run 判死）", sessionID, runID)
+				// 续约 CAS 0 行（doc/17 §4，2026-10-15 用户拍「採」）：闸已不属于本 run——
+				// 被 stop 端点翻了 stopped，或租约自然死亡。两种都 cancel 本场 run：
+				// stop 的契约是真断流；自然过期不掐只会让模型流白挂着烧 token（原「不杀流」语义废）。
+				log.Printf("lease renew %s/%s: 闸已不属于本 run，cancel 本场 run（本 run 判死）", sessionID, runID)
+				if c, hit := w.runCancels.Load(runID); hit {
+					c.(context.CancelFunc)()
+				}
 				return
 			}
 		}

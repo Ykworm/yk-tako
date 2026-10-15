@@ -85,6 +85,12 @@ async function onScroll() {
             </svg>
             会话忙，排队待发
           </p>
+          <p v-if="b.state === 'stopped'" class="stopped-note">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+              <rect x="4.4" y="4.4" width="7.2" height="7.2" rx="1.4" />
+            </svg>
+            已停止，未进历史
+          </p>
           <p v-if="b.state === 'error'" class="err-note">
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
               <circle cx="8" cy="8" r="6.2" /><path d="M8 5v3.6M8 11h.01" />
@@ -361,6 +367,19 @@ header h1 {
   opacity: 0.85;
 }
 .err-note svg {
+  width: 0.8rem;
+  height: 0.8rem;
+  flex: none;
+}
+.stopped-note {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.72rem;
+  margin-top: 0.4rem !important;
+  color: #6e6e7a;
+}
+.stopped-note svg {
   width: 0.8rem;
   height: 0.8rem;
   flex: none;

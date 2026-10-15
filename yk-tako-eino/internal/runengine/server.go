@@ -41,6 +41,7 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker) *gin.Eng
 	s := &Server{store: store, w: batchWindow, worker: worker}
 	r := gin.Default()
 	r.POST("/api/runs", s.postRuns)
+	r.POST("/api/runs/:runId/stop", s.stopRun)
 	r.GET("/api/sessions/:id", s.getSession)
 	r.GET("/api/runs/:runId/frames", s.getFrames)
 	r.GET("/api/sessions/:id/log", s.getSessionLog)
@@ -64,8 +65,9 @@ type postRunsResponse struct {
 }
 
 type sessionResponse struct {
-	LiveRunID    RunID `json:"liveRunId"`
-	RunlogOffset int   `json:"runlogOffset"`
+	LiveRunID     RunID  `json:"liveRunId"`
+	RunlogOffset  int    `json:"runlogOffset"`
+	LastRunStatus string `json:"lastRunStatus"` // doc/17 §4：最新一场 run 的终态，"" = 无 run；stopped 收口靠它
 }
 
 // 字段序 = 19v6-01 §2/§3 期望字节序。
@@ -164,6 +166,31 @@ func (s *Server) postRuns(c *gin.Context) {
 	c.JSON(http.StatusAccepted, postRunsResponse{SessionID: sessionID, RunID: runID, MessageID: req.MessageID})
 }
 
+// stopRun（doc/17 §4 手动停止）：POST /api/runs/{runId}/stop。
+// 竞态裁决在条件 UPDATE（Store.StopRun）：1 行 = 停止赢过正常收尾，翻 stopped；0 行 = 已是
+// 终态，读回现值原样返回；行不存在 = 404。赢了之后查 worker 的取消注册表：本进程在跑这场
+// run 就立刻 cancel（秒级断流）；打到别的副本时由跑着那侧的 watchdog 在下一个续约 tick
+// （dev 10s）看见续约 CAS 0 再 cancel——本端点不为此另做通知。terminal 帧由 worker 收尾侧压
+// （EndRun stopped 分支），这里不压帧、不动 Redis。
+func (s *Server) stopRun(c *gin.Context) {
+	runID := RunID(c.Param("runId"))
+	status, found, err := s.store.StopRun(c.Request.Context(), runID)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": "run_not_found"})
+		return
+	}
+	if status == "stopped" {
+		if cf, hit := s.worker.runCancels.Load(runID); hit {
+			cf.(context.CancelFunc)()
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"status": status})
+}
+
 // getSession（19v6-01 §4）= 会话状态查询，reconcile 的**第一步**（refresh / 新 tab 都从它进）。
 //
 //	GET /api/sessions/s_01
@@ -182,7 +209,7 @@ func (s *Server) postRuns(c *gin.Context) {
 // 「读到活 run 却配了旧高水位」在这条语句里不可能出现。闸的判活即租约谓词
 // `status='running' AND lease_until > now()`：租约已过的死行**读侧即回收**，不等清扫。
 func (s *Server) getSession(c *gin.Context) {
-	liveRunID, runlogOffset, exists, err := s.store.SessionStatus(c.Request.Context(), SessionID(c.Param("id")))
+	liveRunID, runlogOffset, lastStatus, exists, err := s.store.SessionStatus(c.Request.Context(), SessionID(c.Param("id")))
 	if err != nil {
 		internal(c, err)
 		return
@@ -191,7 +218,7 @@ func (s *Server) getSession(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
 		return
 	}
-	c.JSON(http.StatusOK, sessionResponse{LiveRunID: liveRunID, RunlogOffset: runlogOffset})
+	c.JSON(http.StatusOK, sessionResponse{LiveRunID: liveRunID, RunlogOffset: runlogOffset, LastRunStatus: lastStatus})
 }
 
 // getFrames（19v6-01 §2）= 拉某场 run **正在生成**的帧序列（Redis LIST `runlive:{runId}`）。

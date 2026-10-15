@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudwego/eino/schema"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/postgres"
@@ -224,7 +225,48 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 		draft = v
 	}
 	var nextSeq int64
+	// stopped 收尾标记（doc/17 §4，2026-10-15 用户点头 A1）：守卫 0 行不再一律空转——
+	// 行已被 stop 端点翻成 stopped 时，走 stopped 收尾（只写已配对工具行），terminal 以库为准。
+	stopped := false
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 两类工具行的 INSERT 构造（complete 与 stopped 两分支共用同一条 SQL，字段序一致）：
+		// seq 取会话内 MAX+1（与会话其他写行同式）。
+		insertToolResult := func(e TurnEntry) error {
+			payload, err := json.Marshal(toolResultPayload{Name: e.ToolName, Output: e.Text})
+			if err != nil {
+				return err
+			}
+			logID, err := newRowID("rl_")
+			if err != nil {
+				return err
+			}
+			return tx.Exec(
+				`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, payload, created_at)
+				 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
+				         ?, 'tool_result', ?, ?, NULL, ?, ?, now())`,
+				logID, sessionID, sessionID, runID, nullable(e.Agent), nullable(e.Model), e.Text, string(payload)).Error
+		}
+		insertToolCalls := func(e TurnEntry, calls []schema.ToolCall) error {
+			agentSQL, modelSQL := nullable(e.Agent), nullable(e.Model)
+			for _, tc := range calls {
+				payload, err := json.Marshal(toolCallPayload{Name: tc.Function.Name, Args: tc.Function.Arguments})
+				if err != nil {
+					return err
+				}
+				logID, err := newRowID("rl_")
+				if err != nil {
+					return err
+				}
+				if err := tx.Exec(
+					`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, payload, created_at)
+					 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
+					         ?, 'tool_call', ?, ?, NULL, ?, ?, now())`,
+					logID, sessionID, sessionID, runID, agentSQL, modelSQL, tc.Function.Name+"("+tc.Function.Arguments+")", string(payload)).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 		res := tx.Exec(
 			`UPDATE runs SET status = ?, finished_at = now(), lease_until = NULL
 			 WHERE id = ? AND session_id = ? AND status = 'running' AND lease_until > now()`,
@@ -233,7 +275,50 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
-			return errGateLost
+			// 守卫 0 行补读现状（doc/17 §4）：stop 端点的 UPDATE 只带 status='running' 条件，
+			// 不查租约——它赢了竞态后本守卫必然 0 行。此时收尾归 stopped：历史只写已配对工具行。
+			var cur string
+			if err := tx.Raw(`SELECT status FROM runs WHERE id = ? AND session_id = ?`,
+				runID, sessionID).Scan(&cur).Error; err != nil {
+				return err
+			}
+			if cur != "stopped" {
+				return errGateLost
+			}
+			stopped = true
+			// stopped 收尾：不写 assistant 行（root 终稿与子代理终稿都不写——不假装说完）、
+			// 不写 mh、不翻转 compacted；半截未返回的调用不补假结果——tool_call 只在 turn 里有
+			// 同 id 回指的 tool 行时才落（配对判据），被杀在途的调用留给 frames 里的现场。
+			answ := map[string]bool{}
+			for _, e := range turn {
+				if e.Role == "tool" && e.ToolCallID != "" {
+					answ[e.ToolCallID] = true
+				}
+			}
+			for _, e := range turn {
+				if e.Role == "tool" {
+					if err := insertToolResult(e); err != nil {
+						return err
+					}
+					continue
+				}
+				var calls []schema.ToolCall
+				for _, tc := range e.ToolCalls {
+					if answ[tc.ID] {
+						calls = append(calls, tc)
+					}
+				}
+				if err := insertToolCalls(e, calls); err != nil {
+					return err
+				}
+			}
+			// runlogOffset 仍返回当前高水位（与下方非 complete 分支同式）。
+			if err := tx.Raw(
+				`SELECT COALESCE(MAX(seq), 0) FROM runlog_entries WHERE session_id = ?`,
+				sessionID).Scan(&nextSeq).Error; err != nil {
+				return err
+			}
+			return nil
 		}
 		if status == "complete" {
 			// 压缩落库先于定稿写（同笔事务，顺序无约束）：两写要么随本笔全成，要么整笔回滚。
@@ -329,21 +414,8 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 			// 与 assistant 定稿行同笔：要么整轮可见，要么整笔没写。
 			pending := map[string]string{} // agent 名 → 该 agent 已出的 assistant 文本累计（root 键 = ""）
 			for _, e := range turn {
-				agentSQL, modelSQL := nullable(e.Agent), nullable(e.Model)
 				if e.Role == "tool" {
-					payload, err := json.Marshal(toolResultPayload{Name: e.ToolName, Output: e.Text})
-					if err != nil {
-						return err
-					}
-					logID, err := newRowID("rl_")
-					if err != nil {
-						return err
-					}
-					if err := tx.Exec(
-						`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, payload, created_at)
-						 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
-						         ?, 'tool_result', ?, ?, NULL, ?, ?, now())`,
-						logID, sessionID, sessionID, runID, agentSQL, modelSQL, e.Text, string(payload)).Error; err != nil {
+					if err := insertToolResult(e); err != nil {
 						return err
 					}
 					continue
@@ -358,28 +430,14 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 						`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, created_at)
 						 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
 						         ?, 'assistant', ?, ?, NULL, ?, now())`,
-						logID, sessionID, sessionID, runID, agentSQL, modelSQL, pending[e.Agent]).Error; err != nil {
+						logID, sessionID, sessionID, runID, nullable(e.Agent), nullable(e.Model), pending[e.Agent]).Error; err != nil {
 						return err
 					}
 					pending[e.Agent] = ""
 					continue
 				}
-				for _, tc := range e.ToolCalls {
-					payload, err := json.Marshal(toolCallPayload{Name: tc.Function.Name, Args: tc.Function.Arguments})
-					if err != nil {
-						return err
-					}
-					logID, err := newRowID("rl_")
-					if err != nil {
-						return err
-					}
-					if err := tx.Exec(
-						`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, payload, created_at)
-						 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
-						         ?, 'tool_call', ?, ?, NULL, ?, ?, now())`,
-						logID, sessionID, sessionID, runID, agentSQL, modelSQL, tc.Function.Name+"("+tc.Function.Arguments+")", string(payload)).Error; err != nil {
-						return err
-					}
+				if err := insertToolCalls(e, e.ToolCalls); err != nil {
+					return err
 				}
 			}
 			// root 模型生效 ref（终稿行的 model 值）：取自 root 条目的 Model（T3-1b 起每条都带；
@@ -422,12 +480,42 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 		}
 		return 0, 0, false, err
 	}
+	// stopped 收尾 terminal 以库为准（doc/17 §4）：worker 侧事件循环因取消走 error 出口，
+	// status 形参会带着 "error" 进来——帧不许说谎，stopped 就是 stopped。
+	if stopped {
+		status = "stopped"
+	}
 	terminalJSON, err := json.Marshal(Frame{Kind: "terminal", Status: status})
 	if err != nil {
 		return 0, int(nextSeq), true, err
 	}
 	eventOffset, err = s.runliveFinish(ctx, runID, string(terminalJSON))
 	return eventOffset, int(nextSeq), true, err
+}
+
+// StopRun 是手动停止的 PG 半（doc/17 §4）：条件 UPDATE `status='running'`——影响 1 行 =
+// 这次停止赢过了正常收尾的竞态（与 EndRun 守卫同抢这一行，SQL 序列化保证只有一个赢家）；
+// 0 行 = 已是 complete/error/stopped，读回当前状态原样返回不改写。行不存在 = 未找到。
+// 只翻行，不压 terminal 帧、不动 Redis——收尾归 worker 的 EndRun stopped 分支（一个出口）。
+func (s *Store) StopRun(ctx context.Context, runID RunID) (status string, found bool, err error) {
+	res := s.db.WithContext(ctx).Exec(
+		`UPDATE runs SET status = 'stopped', finished_at = now(), lease_until = NULL
+		 WHERE id = ? AND status = 'running'`, runID)
+	if res.Error != nil {
+		return "", false, res.Error
+	}
+	if res.RowsAffected == 1 {
+		return "stopped", true, nil
+	}
+	var cur string
+	if err := s.db.WithContext(ctx).Raw(`SELECT status FROM runs WHERE id = ?`, runID).
+		Scan(&cur).Error; err != nil {
+		return "", false, err
+	}
+	if cur == "" {
+		return "", false, nil
+	}
+	return cur, true, nil
 }
 
 // RenewLease 由 worker watchdog 在生成期间定期调用（§8.3）：PG 半是 CAS 本体——

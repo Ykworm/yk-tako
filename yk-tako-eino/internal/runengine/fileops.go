@@ -104,6 +104,9 @@ var firstPartyFileEffects = map[string]string{
 	// 写进 workspace 的 .tako/search/（H3「截断落盘」）——声明 write。提取程序只扫调用参数、
 	// 落盘路径程序生成不在参数里，不钉摘要块（接受现状，planning §5）。
 	"search_history": fileEffectWrite,
+	// bash（doc/17 §3）：command 字段由 ③ shell 写意图表扫写路径——登记 write 这条链才通
+	// （登记 none/留空在 classifyToolCall 提前返回，command 不被扫，折叠丢写路径）。
+	"bash": fileEffectWrite,
 }
 
 // fileEffectToolNames 是启动 lint 的目录名单（v1 常量表，逐名带出处；精确命中用，不转小写）：
@@ -125,6 +128,7 @@ var fileEffectToolNames = map[string]bool{
 	"get_file_info":    true,
 	"search_files":     true,
 	"read_file":        true,
+	"bash":             true,
 }
 
 // lintFileEffects 是装配期的启动 lint（NewWorker 调一次，不在提取热路径）：注册表中工具名

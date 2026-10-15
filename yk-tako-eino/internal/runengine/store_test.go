@@ -233,7 +233,7 @@ func TestAcquireRunGateBlocksSecondRun(t *testing.T) {
 	s.mustGone(t, ctx, keyRunlive(r2))
 	s.mustGone(t, ctx, keyDraft(r2))
 	// 闸落点 = runs 活行。
-	live, _, _, err := s.SessionStatus(ctx, sid)
+	live, _, _, _, err := s.SessionStatus(ctx, sid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -572,7 +572,7 @@ func TestResetClearsBothHalvesOnlyOwnPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, exists, err := s.SessionStatus(ctx, sid); err != nil || exists {
+	if _, _, _, exists, err := s.SessionStatus(ctx, sid); err != nil || exists {
 		t.Errorf("reset 后 session 应不存在: exists=%v err=%v", exists, err)
 	}
 }
@@ -631,7 +631,7 @@ func TestGateLeaseLifecycle(t *testing.T) {
 	waitCond(t, "lease 过期（读侧判死）", 8*time.Second, func() bool {
 		return s.sqlBool(t, `SELECT lease_until < now() FROM runs WHERE id = ?`, rid)
 	})
-	live, runlogOffset, exists, err := s.SessionStatus(ctx, sid)
+	live, runlogOffset, _, exists, err := s.SessionStatus(ctx, sid)
 	if err != nil || !exists {
 		t.Fatalf("SessionStatus: exists=%v err=%v", exists, err)
 	}
@@ -657,7 +657,7 @@ func TestGateLeaseLifecycle(t *testing.T) {
 	if !s.sqlBool(t, `SELECT (status = 'error' AND finished_at IS NOT NULL AND lease_until IS NULL) FROM runs WHERE id = ?`, rid) {
 		t.Error("死行应被清扫成 error（finished_at 非空、lease_until 清空）")
 	}
-	if live, _, _, err := s.SessionStatus(ctx, sid); err != nil || live != r2 {
+	if live, _, _, _, err := s.SessionStatus(ctx, sid); err != nil || live != r2 {
 		t.Errorf("重抢后 liveRunId = %q, want %q (err=%v)", live, r2, err)
 	}
 }
@@ -751,7 +751,7 @@ func TestRenewLeaseRefusesExpiredGate(t *testing.T) {
 	if ok {
 		t.Fatal("lease 已过，续约应拒（过期不可复活）")
 	}
-	if live, _, _, err := s.SessionStatus(ctx, sid); err != nil || live != "" {
+	if live, _, _, _, err := s.SessionStatus(ctx, sid); err != nil || live != "" {
 		t.Errorf("过期后 liveRunId = %q, want \"\" (err=%v)", live, err)
 	}
 }

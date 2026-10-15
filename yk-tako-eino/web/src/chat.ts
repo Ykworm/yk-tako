@@ -15,7 +15,7 @@ export type Bubble = {
   runId: RunID | null
   role: 'user' | 'assistant'
   text: string
-  state: 'queued' | 'streaming' | 'offline' | 'done' | 'error'
+  state: 'queued' | 'streaming' | 'offline' | 'done' | 'error' | 'stopped'
 }
 
 // 一条待投投递 = 已渲染的 user 气泡 + 它那条 assistant 气泡 + 请求前就定下的 messageId
@@ -222,20 +222,37 @@ export function useChat() {
   // 收口（doc/19-v6 index 概念表「收口」）：定稿后权威内容以 runlog 为准，按 run 整条替换半截气泡；
   // 拉 log 经过的别人的定稿行顺带补渲染（drainLog）。
   // error 终态不进 runlog（新 A6 已裁）——不拉 log，气泡转错误态。
+  // stopped 终态（doc/17 §4）同样不进 runlog——保留已流出的字、标停止、不拉 log 不转错误。
   async function closeOut(runId: RunID, assistant: Bubble, terminalStatus: string | null) {
     if (terminalStatus === 'error') {
       assistant.state = 'error'
+      return
+    }
+    if (terminalStatus === 'stopped') {
+      // 半截文本原样保留（不替换）：没有定稿行可拉，人看见的就是停那一刻已流出的内容。
+      assistant.state = 'stopped'
       return
     }
     const row = await drainLog(runId, assistant)
     if (row) {
       assistant.text = row.text
       assistant.state = 'done'
-    } else {
-      // 闸已空 / 帧已 gone 却没有定稿行 = 那场早已 error 清走（或 run 被 reset 打断）：
-      // 半截文本留着，状态转错误——权威历史里没有它。
-      assistant.state = 'error'
+      return
     }
+    // 没有定稿行：error 收尾与 stopped 收尾在 log 里长得一样（都没有 assistant 行）——
+    // 查 getSession 的 lastRunStatus 分辨「已停止」与「失败」，猜不出来才转错误。
+    const sid = sessionId.value
+    if (sid) {
+      try {
+        if ((await getSession(sid)).lastRunStatus === 'stopped') {
+          assistant.state = 'stopped'
+          return
+        }
+      } catch {
+        // 引擎不可达：按失败收口（原语义），不为此加重试
+      }
+    }
+    assistant.state = 'error'
   }
 
   // 从对齐游标续拉 log 直到追平（空批 = 追平），这正是 19v6-02 第 4 步的「回第 2 步拉一次 log」：

@@ -6,7 +6,11 @@
 >
 > 定案前不改 `doc/16` 的索引。
 >
+> **前提修订（2026-10-15）**：§1「`researcher.md` 写上不含 `bash` 的白名单之后」与 §6 同款表述，前提已作废——doc/17 §3.1 于 2026-10-12 用户拍定 researcher 不写名单、纯继承父池，bash 进池后 researcher 也会拿到命令执行。本篇产物（§2 全文、§3 七项白名单、§6 验收）不受影响：coder 的隔离价值改为两条——显式白名单挡掉 `search_history`（纯继承的 researcher 挡不住这条），description 把批量代码活与调研分工钉开。原文保留备查。
+>
 > `doc/17` 第 3.1 节把 `agents/coder.md` 写成 bash 之后的新文件，并给过六项名单。本篇取代那六项。施工仍排在 bash 已经进父池之后。
+>
+> **施工状态（2026-10-15）：已落地**。§2 全文逐字落盘（`yk-tako-eino/agents/coder.md`，tools 七项照 §3）+ §6 剧本一、剧本二活体全过（台账 `tmp/23-coder规格/`）：frames 出 `agent=coder` 的 write_file/bash、终稿只交路径与结论、无 search_history/web_search；笔记面——`agent system coder:` 行含 `output/agg.txt`、write_file 参数即该路径、无第二条结果文件。零 Go 改动（仅 filetools_test 注册表条目数断言随 bash 进池 13→14）。
 
 ## 1. 要解决的那一次委派
 

@@ -120,21 +120,25 @@ func (s *Store) Exists(ctx context.Context, sessionID SessionID) (bool, error) {
 	return n > 0, nil
 }
 
-// SessionStatus 返回状态查询三要素（19v6-01 §4）：活 run id（"" = 闲着）、runlog 高水位、是否已登记。
+// SessionStatus 返回状态查询四要素（19v6-01 §4 三要素 + doc/17 §4 手动停止加的 lastRunStatus）：
+// 活 run id（"" = 闲着）、runlog 高水位、是否已登记、该会话最新一场 run 的终态（无 run = ""）。
 // 单条 SQL 子查询取一致快照（原 MULTI 的等价物，预登记裁定）。liveRunId 读侧即回收：
 // lease 已过的死行当场不再算活，不等清扫（清扫只为放行新 run，planning §8.3）。
-func (s *Store) SessionStatus(ctx context.Context, sessionID SessionID) (liveRunID RunID, runlogOffset int, exists bool, err error) {
+// lastRunStatus 是 closeOut 无 terminal 帧路径（刷新 / 掉线重连）判断「停过没」的依据——
+// stopped 不写 assistant 行，只看 log 会把「已停止」猜成「失败」。
+func (s *Store) SessionStatus(ctx context.Context, sessionID SessionID) (liveRunID RunID, runlogOffset int, lastStatus string, exists bool, err error) {
 	var live string
 	var hw int64
 	err = s.db.WithContext(ctx).Raw(`
 SELECT EXISTS (SELECT 1 FROM sessions WHERE id = ?),
        COALESCE((SELECT id FROM runs WHERE session_id = ? AND status = 'running' AND lease_until > now() LIMIT 1), ''),
-       COALESCE((SELECT MAX(seq) FROM runlog_entries WHERE session_id = ?), 0)`,
-		sessionID, sessionID, sessionID).Row().Scan(&exists, &live, &hw)
+       COALESCE((SELECT MAX(seq) FROM runlog_entries WHERE session_id = ?), 0),
+       COALESCE((SELECT status FROM runs WHERE session_id = ? ORDER BY created_at DESC LIMIT 1), '')`,
+		sessionID, sessionID, sessionID, sessionID).Row().Scan(&exists, &live, &hw, &lastStatus)
 	if err != nil {
-		return "", 0, false, err
+		return "", 0, "", false, err
 	}
-	return RunID(live), int(hw), exists, nil
+	return RunID(live), int(hw), lastStatus, exists, nil
 }
 
 // ModelMessages 返回 session 的模型侧消息全序（worker 组装本次生成的输入）——单表、双列过滤，无 JOIN。
