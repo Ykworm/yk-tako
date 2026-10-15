@@ -6,6 +6,8 @@ package runengine
 import (
 	"errors"
 	"testing"
+
+	"github.com/cloudwego/eino/schema"
 )
 
 func TestIsOverflowError(t *testing.T) {
@@ -83,6 +85,10 @@ func TestExtractWindow(t *testing.T) {
 		{"deepseek-live", `error, status code: 400, status: 400 Bad Request, message: This model's maximum context length is 1048576 tokens. However, you requested 1400065 tokens (1400049 in the messages, 16 in the completion). Please reduce the length of the messages or completion. (request_id: 4dc741ce-a82b-40ff-890f-ce623e6986b8)`, 1048576, true},
 		// 十六进制串混入的独立守卫（无 request_id 全句时同样成立）
 		{"hex-id-junk", "request_id: ce623e6986b8, maximum context length is 65536 tokens", 65536, true},
+		// 活体击穿案例（A2 首次跑原件，2026-10-12，逐字节 = a2-engine-run1-extractwindow-bug.log）：
+		// request_id 是带连字符的 UUID，中段 `4657` 首尾都是连字符、曾被放行当窗 → D4 落 limit' 3725
+		// → 强折 errStillOver。连字符并入嵌入判定后取 1048576（uuid 数字段整体挡住）。
+		{"deepseek-uuid", `error, status code: 400, status: 400 Bad Request, message: This model's maximum context length is 1048576 tokens. However, you requested 1227956 tokens (1227956 in the messages, 0 in the completion). Please reduce the length of the messages or completion. (request_id: 79123942-4657-426c-b4ce-0f56772e5888)`, 1048576, true},
 		// Claude 形状（eino claude 组件包壳里 provider 原文）：两数取小=窗
 		{"claude-shape", "prompt is too long: 209775 tokens > 200000 maximum", 200000, true},
 		// 单候选 = 它就是真值
@@ -100,5 +106,99 @@ func TestExtractWindow(t *testing.T) {
 	}
 	if _, ok := extractWindow(nil); ok {
 		t.Error("extractWindow(nil) ok = true, want false")
+	}
+}
+
+// TestRescueWorthy：救援谓词四条件逐条翻面（A2 四要素第 5 条）——全真才救，任一为假不救。
+func TestRescueWorthy(t *testing.T) {
+	cases := []struct {
+		name      string
+		overflow  bool
+		agent     string
+		frames    int
+		recovered bool
+		want      bool
+	}{
+		{"four-true", true, "", 0, false, true},
+		{"not-overflow", false, "", 0, false, false},
+		{"subagent", true, "researcher", 0, false, false},
+		{"has-frames", true, "", 3, false, false},
+		{"gate-spent-zero-frames", true, "", 0, true, false},
+	}
+	for _, c := range cases {
+		if got := rescueWorthy(c.overflow, c.agent, c.frames, c.recovered); got != c.want {
+			t.Errorf("%s: rescueWorthy(%v, %q, %d, %v) = %v, want %v",
+				c.name, c.overflow, c.agent, c.frames, c.recovered, got, c.want)
+		}
+	}
+}
+
+// TestRescueLimit：D4 目标线两路（有真值取更紧 / 提不出盲降）+ 真值更松时 C_rej 一路赢
+// （两把尺子来源不同：C_rej 是 cl100k 估算、window 是 provider 真值——谁小谁是更紧者）。
+func TestRescueLimit(t *testing.T) {
+	cases := []struct {
+		name      string
+		cRej      int
+		window    int
+		hasWindow bool
+		want      int
+	}{
+		// 活体场景数：C_rej≈263 万（cl100k）、真值 1048576 → min(838860, 2104000) = 838860
+		{"window-tighter", 2630000, 1048576, true, 838860},
+		// 真值比被拒估算还松（错估方向相反）：C_rej×4/5 是更紧者
+		{"cRej-tighter", 100000, 1048576, true, 80000},
+		// 提不出真值（extractWindow ok=false）：C_rej×4/5 盲降一档
+		{"blind", 2630000, 0, false, 2104000},
+	}
+	for _, c := range cases {
+		if got := rescueLimit(c.cRej, c.window, c.hasWindow); got != c.want {
+			t.Errorf("%s: rescueLimit(%d, %d, %v) = %d, want %d",
+				c.name, c.cRej, c.window, c.hasWindow, got, c.want)
+		}
+	}
+}
+
+// TestDetectTruncation：检出②两子检 (a)/(b) 的边界与负路径（A3 四要素第 4 条；doc §5/§12②）——
+// 默认输出帽的 length（completion 贴默认上限、P 远小于窗）必须不命中：(c) 缺席期间它是主要误报面。
+func TestDetectTruncation(t *testing.T) {
+	usage := func(p, c int) *schema.TokenUsage { return &schema.TokenUsage{PromptTokens: p, CompletionTokens: c} }
+	cases := []struct {
+		name   string
+		meta   *schema.ResponseMeta
+		window int
+		want   bool
+		subB   bool
+		prompt int
+	}{
+		// (a)：实数 P > 窗——provider 静默收下超窗输入、usage 里报实数（z.ai 形态）
+		{"a-hit", &schema.ResponseMeta{FinishReason: "stop", Usage: usage(4123, 120)}, 4000, true, false, 4123},
+		// (a) 边界：P == 窗不吃（> 是严格）；且 length/0 也不救（走 (b) 判、P 不够贴窗）
+		{"a-boundary-equal", &schema.ResponseMeta{FinishReason: "stop", Usage: usage(4000, 50)}, 4000, false, false, 0},
+		// (a) 先于 (b)：P 已超窗 —— (a) 命中，不附掐头形状
+		{"a-before-b", &schema.ResponseMeta{FinishReason: "length", Usage: usage(4100, 0)}, 4000, true, false, 4100},
+		// (b)：length + completion==0 + P ≥ 99%·窗（MiMo 形态）；边界含 P==99%·窗，差 1 不吃
+		{"b-hit", &schema.ResponseMeta{FinishReason: "length", Usage: usage(3960, 0)}, 4000, true, true, 3960},
+		{"b-boundary-off-by-one", &schema.ResponseMeta{FinishReason: "length", Usage: usage(3959, 0)}, 4000, false, false, 0},
+		// (b) 要求 completion==0：贴窗但产出了字 = (c) 的面（缺席），不命中
+		{"b-needs-zero-completion", &schema.ResponseMeta{FinishReason: "length", Usage: usage(3980, 5)}, 4000, false, false, 0},
+		// 负路径①（doc §12②）：provider 默认输出帽的 length——completion 贴默认上限（DeepSeek 4096）、
+		// P 远小于窗，不命中（(c) 若在场这条会被误折，正是它缺席的代价上界）
+		{"default-output-cap", &schema.ResponseMeta{FinishReason: "length", Usage: usage(1000, 4096)}, 1048576, false, false, 0},
+		// 负路径②：length + completion==0 但 P 不够贴窗（模型自己空输出）——不命中
+		{"empty-output-far-below", &schema.ResponseMeta{FinishReason: "length", Usage: usage(100, 0)}, 4000, false, false, 0},
+		// 本层关（window=0）+ usage 缺失（无从检起，沉默盲区不误报）
+		{"window-off", &schema.ResponseMeta{FinishReason: "stop", Usage: usage(99999, 1)}, 0, false, false, 0},
+		{"no-meta", nil, 4000, false, false, 0},
+		{"no-usage", &schema.ResponseMeta{FinishReason: "length"}, 4000, false, false, 0},
+	}
+	for _, c := range cases {
+		got := detectTruncation(c.meta, c.window)
+		if (got != nil) != c.want {
+			t.Errorf("%s: detectTruncation(...) = %+v, want hit=%v", c.name, got, c.want)
+			continue
+		}
+		if got != nil && (got.subB != c.subB || got.prompt != c.prompt) {
+			t.Errorf("%s: detectTruncation(...) = %+v, want subB=%v prompt=%d", c.name, got, c.subB, c.prompt)
+		}
 	}
 }

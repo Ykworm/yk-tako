@@ -128,10 +128,25 @@ const compactAdmissionDivisor = 3
 // A2 实录 S = 1221（模型自然产出），已弃。
 const summarizeBudgetDivisor = 2
 
+// CompactLimitFor 是触发线 / 准入线 / 摘要预算的共同底数**唯一算式**（三期重裁，19v6-09 §9：
+// 文中作 compactLimitFor）：limit = window − reserve，reserve = min(window/5, 16384)。预留从
+// 「×4/5（响应空间 + 估算误差垫）」重裁为固定档——误差垫职能随溢出修复层一期落地移交兜底层，
+// 16384 = WeKnora settings.go 固定 16k（回复大小不随窗口缩放）。window = 81920 处两算法相交
+// （81920/5 = 16384），之下退化为 ×4/5：dev 小窗测试零变化（600 窗 → limit 480 两式同值），
+// 不留新魔法边界。256k 窗：limit 204800 → 239616，吃回 34816 ≈ 35k。window ≤ 0（compact 关）= 0。
+// 导出供 main 的启动日志显示生效 limit（worker 装配与 summarizeCeiling 两处内部调用）。
+func CompactLimitFor(window int) int {
+	if window <= 0 {
+		return 0
+	}
+	return window - min(window/5, 16384)
+}
+
 // summarizeCeiling 按窗口分档算摘要预算帽（C5-A7；19v6-07 §5 分档表，纯函数，装配期一次）。
 //
 //	window ≤ 0（compact 关）        → 4096（A3 前常量语义；小窗式禁算——min(0,1024)=0 会把帽掐死）
-//	window ≤ 32768（小窗/dev）      → min(limit/2, 1024)——恒有解守恒体（limit/2）＋反向校准封顶
+//	window ≤ 32768（小窗/dev）      → min(limit/2, 1024)——恒有解守恒体（limit/2）＋反向校准封顶；
+//	                                  limit 经 compactLimitFor（三期起；32768 ≤ 81920 恒走 ×4/5 支，逐值不变）
 //	32768 < window < 1048576（中窗）→ 4096；window ≥ 1048576（大窗）→ 8192（均区间下限，不插值）
 //
 // Claude override：ref 厂商段 = anthropic 或 ref 含 claude（大小写不敏感）→ 固定档（中/大）×13/10
@@ -144,7 +159,7 @@ func summarizeCeiling(window int, modelRef string, maxOutput int) int {
 	case window <= 0:
 		ceiling = summarizeCeilingMid
 	case window <= summarizeCeilingSmallBound:
-		ceiling = min(window*4/5/summarizeBudgetDivisor, summarizeCeilingSmallCap)
+		ceiling = min(CompactLimitFor(window)/summarizeBudgetDivisor, summarizeCeilingSmallCap)
 	case window < summarizeCeilingLargeBound:
 		ceiling = summarizeCeilingMid
 	default:
@@ -367,7 +382,8 @@ func buildStaged(oldSummaryRuns []RunID, rawRuns, drop []runRows, currentRun Run
 // 仍超 = 折叠失败（errStillOver，C2 已有链）。无操作 = 无块 = 检查不发生（无 file 工具会话零行为变化）。
 //
 // 返回值：新输入（摘要行 + keep + 当前 run 行）与 stagedCompaction；errStillOver = 不调主模型、零写入。
-// 前提：只有超限（countInput(history) > limit）才该进来；counter/summarize 非 nil。
+// 前提（A2 扩写）：超限（countInput(history) > limit）**或本层强制**（溢出救援：被拒输入 +
+// D4 现算的 limit'，只见于 rescueOverflow）才该进来；counter/summarize 非 nil。
 // fileEffects = 第一方工具 file_effect 声明表（fileops.go），钉块提取的判定入口。
 func foldInput(ctx context.Context, system string, history []ModelMessage, currentRun RunID,
 	limit int, counter TokenCounter, summarize func(context.Context, string) (string, error),

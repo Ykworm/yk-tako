@@ -50,6 +50,7 @@ type foldBox struct {
 	baseCount int                // run 起手放行估算（A1：prepareInput 的 countInput 结果——detect 行消费；A2/A3 的 D4 续用）
 	staged    []StagedCompaction // 折叠指令列表：Run fold 打头、mid-run 各次追加（EndRun 吃列表）
 	final     []ModelMessage     // 终态 mh 投影：仅 AfterAgent（成功终态）填——error / 取消不填
+	frames    int                // 已发帧计数（B1 从 worker 局部收编，D12）：A2 零帧判据 + guard 让其位的同源读数
 }
 
 func newFoldBox(session SessionID, run RunID) *foldBox {
@@ -102,6 +103,21 @@ func (b *foldBox) finalRows() []ModelMessage {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.final
+}
+
+// addFrames / frameCount 是帧计数的唯一读写口（B1，D12）：worker 发帧后 +1、A2 谓词与
+// overflow guard 同源读。收编理由 = guard 跑在模型调用点（middleware 层），worker 的局部
+// 变量在它视野外，而「零帧让位」判据必须两侧看同一个数。
+func (b *foldBox) addFrames(n int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.frames += n
+}
+
+func (b *foldBox) frameCount() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.frames
 }
 
 // foldBoxKey 是 ctx 携带折叠容器的私有 key 类型（防撞车惯例同 agentModelTableKey）。
@@ -236,7 +252,7 @@ var _ adk.ChatModelAgentMiddleware = (*midfoldHandler)(nil)
 // 快照段拼进它，数到的就是模型实见的（不再用构造期形参，「单一真源全从 state 读」）。
 type midfoldHandler struct {
 	*adk.BaseChatModelAgentMiddleware
-	limit       int // = compactLimit（window×4/5）；<= 0 = 折叠休眠（BeforeModelRewriteState 直通）
+	limit       int // = compactLimit（compactLimitFor(window)）；<= 0 = 折叠休眠（BeforeModelRewriteState 直通）
 	counter     TokenCounter
 	summarize   func(context.Context, string) (string, error) // = summarizer.summarize（同一条链同一个摘要器）
 	fileEffects map[string]string                             // = firstPartyFileEffects（钉块提取的判定入口）

@@ -20,12 +20,16 @@
 // 两家（doc §4 原话：其余 22 条照抄，不逐一搭环境）。
 //
 // A1 只做观测接线（worker event.Err 分支的 detect 行，行为零变化：run 仍 status=error、
-// 零写入）；救援机械件（谓词/强折/重跑）是 A2。
+// 零写入）；A2 起本文件多两个纯函数——救援谓词 rescueWorthy 与 D4 目标线 rescueLimit，
+// 强折/重跑链在 worker.go（rescueOverflow）；A3 起多第三个——截断谓词 detectTruncation
+// （检出②：(a)(b) 两子检），强折意图与 run 末落库在 worker.go（runEndFold）。
 package runengine
 
 import (
 	"regexp"
 	"strconv"
+
+	"github.com/cloudwego/eino/schema"
 )
 
 // overflowPatterns 是「太长」命中表（24 条，照抄 WeKnora，一条不改；(?i) 不分大小写）。
@@ -97,15 +101,20 @@ var windowNumberPattern = regexp.MustCompile(`\d+`)
 // 拿原 limit 当验收线 = 用谎言校对谎言）。
 //
 // 规则（2026-10-12 活体校准修订，证据 = tmp/19-v6/evidence-overflow/a1-provider-probe.md）：
-// 独立整数（两侧不紧邻字母/数字/下划线，防 request_id 十六进制串混入）里 **≥1024 的取最小**。
+// 独立整数（两侧不紧邻字母/数字/下划线/连字符，防 request_id 十六进制串混入）里 **≥1024 的取最小**。
 // 报文形状恒是「maximum … is W。you requested P（P1 in the messages, P2 in the completion）」——
 // W 是被超过的上限，P 及其分解都不小于 W → 最小者即窗。live 实录（DeepSeek，2026-10-12）：
 // `maximum context length is 1048576 tokens. However, you requested 1400065 tokens
 // (1400049 in the messages, 16 in the completion)` → 取 1048576。
 // doc §6 的原文规则（「不超过被拒估算 C_rej 的最大整数」）在真栈上不成立：cl100k 对本栈
 // DeepSeek 分词器高估一倍余，C_rej 比报文里所有数都大，该规则取到 1400065（= 被拒量）而非窗。
-// 已知弱侧：报错若携带比窗更小的分解数，会取到分解数——保守方向（D4 折更狠，安全侧），
-// 错偏由 D4 的 min 与盲降出口兜底；提不出 = ok false（调用方盲降一档，D4 后半句）。
+// 连字符进嵌入判定是 A2 活体的追加修订（2026-10-12）：DeepSeek 的 request_id 是带连字符的
+// UUID（`79123942-4657-426c-…`），其中段 `4657` 首尾都是连字符、旧判定放行 → 被当成窗 →
+// D4 落 limit' 3725 → 强折 errStillOver、救援夭折（A2 首次跑原件见 a2-engine.log）；
+// 连字符同属「分段的一部分」，与字母/数字/下划线同族。
+// 已知弱侧：报错若携带比窗更小的**真分解数**，仍会取到它——保守方向（D4 折更狠），但过紧会
+// 让强折够不着（errStillOver，救援失败走干净 error）；错偏由 D4 的 min 与盲降出口兜底。
+// 提不出 = ok false（调用方盲降一档，D4 后半句）。
 func extractWindow(err error) (int, bool) {
 	if err == nil {
 		return 0, false
@@ -128,12 +137,70 @@ func extractWindow(err error) (int, bool) {
 }
 
 // isEmbeddedNumber 判 msg[idx] 处是否让相邻数字串算不上独立数（越过边界 = 不算）。
-// 字母/数字/下划线都算「同属一个大 token」——request_id 的十六进制串（`ce623e6986b8` 里的
-// 6986）由此被挡在候补之外。
+// 字母/数字/下划线/连字符都算「同属一个大 token」——request_id 的十六进制串（`ce623e6986b8`
+// 里的 6986）与带连字符 UUID（`79123942-4657-426c-…` 里的 4657，A2 活体击穿案例）由此被
+// 挡在候补之外。
 func isEmbeddedNumber(msg string, idx int) bool {
 	if idx < 0 || idx >= len(msg) {
 		return false
 	}
 	c := msg[idx]
-	return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_'
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_' || c == '-'
+}
+
+// rescueWorthy 是①救援谓词（doc §6 四条件同真才救）。overflow 由调用方算好传入
+// （IsOverflowError 的结果——同一事件判两遍无意义）。四条各自的边：
+//   - IsOverflowError：不是「太长」就是普通失败，与救援无关；
+//   - agent == ""：只救主线程——子代理拒收登记不救（doc §11 的边界）；
+//   - framesSent == 0：零帧谓词。重跑 = 整条 agent.Run 从头再来，零帧时它才干净：
+//     任何 delta/tool 帧已进 runlive（append-only 撤不回，重跑 = 客户端看到双份），
+//     且工具已执行（写工具重跑 = 副作用两遍）。有帧后的中途拒收是二期的面（doc §8）；
+//   - !recovered：一次性闸（D5）——本 run 救过一次就不再救，重试再拒走干净 error，不死循环。
+func rescueWorthy(overflow bool, agent string, framesSent int, recovered bool) bool {
+	return overflow && agent == "" && framesSent == 0 && !recovered
+}
+
+// rescueLimit 算 D4 强折目标线（doc §6）：limit' = min(真值×4/5, C_rej×4/5)——能提出窗真值
+// 时取更紧者（两把尺子各自留 1/5 headroom）；提不出 = C_rej×4/5 盲降一档（单发兜底，不是收敛循环）。
+// 为什么原 limit 不能用：被拒本身已证明「真窗 < 被拒量」，拿原 limit 当验收线 = 用谎言校对谎言
+// （戏二里 limit 正是错的那个数）。C_rej = run 起手放行估算（foldBox.baseCount，planning 裁定 3）。
+func rescueLimit(cRej, window int, hasWindow bool) int {
+	limit := cRej * 4 / 5
+	if hasWindow && window*4/5 < limit {
+		limit = window * 4 / 5
+	}
+	return limit
+}
+
+// truncationHit 是检出②的一次命中（doc §5 子检 (a)/(b)）：prompt = provider 实数 P（进日志——
+// 估算 C 与实数 P 的偏差是运营商修窗标的唯一观测面）；subB = (b) 子检命中（超窗行附掐头形状）。
+type truncationHit struct {
+	prompt int
+	subB   bool
+}
+
+// detectTruncation 判一次**成功**的模型回复是否被窗口截断（doc §5 两子检；window = 操作者声明的
+// 窗，<=0 = 本层关）。命中 = 会话该收缩了（调用方记强折意图 + 打超窗行），本答不救（doc §7）。
+//
+//	(a) prompt_tokens > window——provider 静默收下超窗输入、usage 里报了实数（z.ai 形态）：
+//	    「窗标填小 / 分词器偏差 / schema 没数进去」三类系统性错估的首个观测点；
+//	(b) finish_reason=length ∧ completion==0 ∧ prompt ≥ 99%·window——输入被掐到填满窗口、
+//	    一个字没生成（MiMo 形态）。
+//
+// (c)（0 < completion < 自请预算）缺席（doc §5 登记）：主循环不发 max_tokens、没有「自请预算」
+// 可比对——不配预算时 provider 默认输出帽也报 length（DeepSeek 默认 4096），无预算判定会把
+// 每次正常长回答误判成溢出（fixtures 钉死这条负路径）。
+// usage 缺失（meta / Usage 为 nil）= 无从检起：沉默盲区、不误报（doc §5 诚实登记）。
+func detectTruncation(meta *schema.ResponseMeta, window int) *truncationHit {
+	if window <= 0 || meta == nil || meta.Usage == nil {
+		return nil
+	}
+	p := meta.Usage.PromptTokens
+	if p > window {
+		return &truncationHit{prompt: p}
+	}
+	if meta.FinishReason == "length" && meta.Usage.CompletionTokens == 0 && p*100 >= window*99 {
+		return &truncationHit{prompt: p, subB: true}
+	}
+	return nil
 }

@@ -17,3 +17,5 @@ model-windows.json
 .media-cache/
 # 执行台账（planning.md / todos.md），用户验收完即清理，不进版本库
 tmp/
+# 运行时数据（-workspace 根：hist / notes / .tako 落盘，进程写、可重建）
+yk-tako-eino/workspace/

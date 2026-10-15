@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -64,53 +63,30 @@ const (
 	noteFailQuoteLong  = "quote_long"
 	noteFailOverCap    = "over_cap"
 	noteFailLocate     = "locate"
-	noteFailInject     = "inject"
+	noteFailInvisible  = "invisible"
 )
 
-// ── 注入检查（doc/17 §7 四件之 3）────────────────────────────────────────────
+// ── 不可见字符检查（doc/17 §7 四件之 3；2026-10-15 十七修：句式词表裁除，只留本档）───────
 //
-// 病灶：笔记会进以后每一场的系统提示——一句被当成规矩写下的注入，从下一场起永久排在系统提示里
-// （普通注入随 run 死，这个跨 run 永生，且每场模型原样读到）。所以写入时拒、存量毒行渲染占位。
+// 病灶：笔记会进以后每一场的系统提示——一行夹带零宽 / bidi 控制字符的话，人审稿面看不见，
+// 却随笔记永久排在系统提示里、每场模型原样读到（人审以为记的是句人话）。所以写入时拒、
+// 存量毒行渲染占位。
 //
-// 词表行为照抄 Hermes `tools/threat_patterns.py` 的 strict 一档（动工时实读），只搬三类核心式样
-// ——忽略既有系统提示 / 套出系统提示 / 把密钥外传——加隐形字符检查；不搬整个文件：NFKC 归一化
-// （防全角 ｃａｔ 同形字绕过；需要 x/text 依赖）与 skills/ssh/config 改写类式样不属笔记面，省略。
-// 规则序与 Hermes 的 findings 序一致（隐形字符先判），命中取首个。
-const noteThreatFiller = `(?:[\p{L}\p{N}_]+\s+){0,8}` // Hermes _FILLER 的 Go 等价（\w 要吃中文 filler）
-
-// noteThreatRules 是 (id, 正则) 表；正则为 Go RE2，翻译自 Hermes 同名 pattern_id（(?i) 同 IGNORECASE）。
-// Hermes 的 `[^\n]{0,2048}` 窗口在 Go 里放成 `[^\n]*`（RE2 线性时间无回溯，界 2048 是给 Python 的；
-// 笔记本身有 2200 字帽，语义窗口等价）。
-var noteThreatRules = []struct {
-	id string
-	re *regexp.Regexp
-}{
-	{"prompt_injection", regexp.MustCompile(`(?i)ignore\s+` + noteThreatFiller + `(previous|all|above|prior)\s+` + noteThreatFiller + `instructions`)},
-	{"sys_prompt_override", regexp.MustCompile(`(?i)system\s+prompt\s+override`)},
-	{"disregard_rules", regexp.MustCompile(`(?i)disregard\s+` + noteThreatFiller + `(your|all|any)\s+` + noteThreatFiller + `(instructions|rules|guidelines)`)},
-	{"bypass_restrictions", regexp.MustCompile(`(?i)act\s+as\s+(if|though)\s+` + noteThreatFiller + `you\s+` + noteThreatFiller + `(have\s+no|don't\s+have)\s+` + noteThreatFiller + `(restrictions|limits|rules)`)},
-	{"leak_system_prompt", regexp.MustCompile(`(?i)output\s+` + noteThreatFiller + `(system|initial)\s+prompt`)},
-	{"remove_filters", regexp.MustCompile(`(?i)(respond|answer|reply)\s+without\s+` + noteThreatFiller + `(restrictions|limitations|filters|safety)`)},
-	{"exfil_curl", regexp.MustCompile(`(?i)curl\s+[^\n]*\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)S?\b`)},
-	{"exfil_wget", regexp.MustCompile(`(?i)wget\s+[^\n]*\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)S?\b`)},
-	{"read_secrets", regexp.MustCompile(`(?i)cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)`)},
-	{"send_to_url", regexp.MustCompile(`(?i)(send|post|upload|transmit)\s+[^\n]*\s+(to|at)\s+https?://`)},
-	{"context_exfil", regexp.MustCompile(`(?i)(include|output|print|share)\s+` + noteThreatFiller + `(conversation|chat\s+history|previous\s+messages|full\s+context|entire\s+context)`)},
-}
-
-// noteInvisibleRunes = Hermes INVISIBLE_CHARS：零宽 / 双向控制字符（隐藏指令的载体）。
+// 为什么只剩这一档（19v6-90 十七次修订，用户 2026-10-15 裁定）：原句式神词表
+// （Hermes threat_patterns.py strict 档 11 条）经真码探针逐条实测后裁除——纯中文写法
+// （「禁用 system prompt」）一条不命中，锚词换中文、写全角都能绕，命中面只剩「句子里恰好
+// 用了英文锚词」的窄缝，类别的清单列不尽；隐形字符清单有限、能枚举尽、与语言无关——拦的是
+// 「能不能藏」不是「说了什么」；正经用途少（组合 emoji 的 ZWJ、波斯语 ZWNJ），误伤面小、
+// 拒写时当场报码点（调用方可见、可改）。
 const noteInvisibleRunes = "\u200b\u200c\u200d\u2060\u2062\u2063\u2064\ufeff\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
 
-// scanNoteThreat 扫一段文字，返回首个命中 id（空串 = 无命中）。
-func scanNoteThreat(text string) string {
+// scanNoteInvisible 扫一段文字里的隐形字符（noteInvisibleRunes 17 码点），返回命中说明
+// （"invisible_unicode_U+XXXX"——拒写文案与占位文案照报，调用方/用户当场看见是哪个码点；
+// 空串 = 无命中）。
+func scanNoteInvisible(text string) string {
 	for _, r := range text {
 		if strings.ContainsRune(noteInvisibleRunes, r) {
 			return fmt.Sprintf("invisible_unicode_U+%04X", r)
-		}
-	}
-	for _, rule := range noteThreatRules {
-		if rule.re.MatchString(text) {
-			return rule.id
 		}
 	}
 	return ""
@@ -120,7 +96,7 @@ func scanNoteThreat(text string) string {
 // 快照打占位、工具结果清单留原文（Hermes 同款两端策略，实读确认：清单里删掉原文 = 静默藏起攻击，
 // 谁也删不掉它；原文只在模型主动调 memory 的那一轮经工具结果进对话，不进跨 run 的系统提示）。
 func noteBlockPlaceholder(id string) string {
-	return fmt.Sprintf("[BLOCKED: 此条笔记命中注入检查（%s），不进入系统提示；请用 memory 的 remove 删掉它。]", id)
+	return fmt.Sprintf("[BLOCKED: 此条笔记含人眼不可见字符（%s），不进入系统提示；请用 memory 的 remove 删掉它。]", id)
 }
 
 // Note = `notes` 表（planning §4 DDL）：按 workspace 分区的一行笔记。
@@ -199,8 +175,8 @@ type noteWriteResult struct {
 	locateHits  int    // 定位结果：-1 未带 old_content；0 无命中；>1 多行命中；1 唯一命中
 	oldRunes    int    // replace 中被替代行的 rune 数（超帽原因句带数字）
 	projRunes   int    // replace 超帽时的替换后合计（同上）
-	threatField string // 注入检查拒写时：content / quote
-	threatID    string // 注入检查拒写时：命中的规则 id
+	invisibleField string // 不可见字符拒写时：content / quote
+	invisibleID    string // 不可见字符拒写时：命中的码点（invisible_unicode_U+XXXX）
 }
 
 // writeNote 是笔记的唯一写入函数（doc/17 §7 四件之 4）：BEGIN → 取 workspace 级 advisory xact 锁
@@ -233,13 +209,13 @@ func (s *Store) writeNote(ctx context.Context, workspace string, sourceRunID Run
 		}
 		res.entries, res.sums = entries, sums
 		res.fail, res.itemRunes, res.quoteRunes = validateNoteWrite(in)
-		// 注入检查在字段校验之后、写库动作之前（content 与 quote 都查——两者都会进系统提示侧；
-		// remove 不写文字，跳过）。
+		// 不可见字符检查在字段校验之后、写库动作之前（content 与 quote 都查——两者都会进
+		// 系统提示侧；remove 不写文字，跳过）。
 		if res.fail == "" && action != "remove" {
-			if id := scanNoteThreat(content); id != "" {
-				res.fail, res.threatField, res.threatID = noteFailInject, "content", id
-			} else if id := scanNoteThreat(quote); id != "" {
-				res.fail, res.threatField, res.threatID = noteFailInject, "quote", id
+			if id := scanNoteInvisible(content); id != "" {
+				res.fail, res.invisibleField, res.invisibleID = noteFailInvisible, "content", id
+			} else if id := scanNoteInvisible(quote); id != "" {
+				res.fail, res.invisibleField, res.invisibleID = noteFailInvisible, "quote", id
 			}
 		}
 		if res.fail != "" {
@@ -405,14 +381,14 @@ func renderNoteEntry(e noteEntry) string {
 	return "- " + e.Content + "\n  原话：「" + e.Quote + "」"
 }
 
-// renderNoteEntryForPrompt 是快照路径的一条渲染：content 或 quote 任一命中注入检查即占位
+// renderNoteEntryForPrompt 是快照路径的一条渲染：content 或 quote 任一会命中不可见字符检查即占位
 // （原文不进跨 run 的系统提示；工具结果清单走 renderNoteEntry 原文照出，模型才拿得到
 // old_content 把它 remove 掉）。
 func renderNoteEntryForPrompt(e noteEntry) string {
-	if id := scanNoteThreat(e.Content); id != "" {
+	if id := scanNoteInvisible(e.Content); id != "" {
 		return "- " + noteBlockPlaceholder(id)
 	}
-	if id := scanNoteThreat(e.Quote); id != "" {
+	if id := scanNoteInvisible(e.Quote); id != "" {
 		return "- " + noteBlockPlaceholder(id)
 	}
 	return renderNoteEntry(e)
@@ -530,9 +506,9 @@ func noteFailText(res noteWriteResult) string {
 		default:
 			return fmt.Sprintf("错误：old_content 命中 %d 条有效条目，无法确定是哪条——先核对清单，把要改/删的那条改成唯一命中。", res.locateHits)
 		}
-	case noteFailInject:
-		return fmt.Sprintf("错误：%s 命中注入检查（%s）——笔记会进以后每一场的系统提示，注入与密钥外传类句子拒写。",
-			res.threatField, res.threatID)
+	case noteFailInvisible:
+		return fmt.Sprintf("错误：%s 含人眼不可见字符（%s）——零宽 / bidi 控制符在页面上看不见、会随笔记进以后每一场的系统提示；删掉该字符或用可见写法再记。",
+			res.invisibleField, res.invisibleID)
 	case noteFailOverCap:
 		if res.op == "replace" {
 			return fmt.Sprintf("错误：%s 类替换后 %d/%d 字（新条目 %d 字，被替换的旧条目 %d 字）——还得先删掉别的旧条目。",
@@ -555,6 +531,7 @@ type noteBox struct {
 	userSeq int64  // 本 run user 行的 runlog seq（source_seq）
 	snap    string // 渲染后的快照段：run 起手填一次，run 内冻结
 	fails   int    // 本 run 写入失败次数（只由 tickFailure 增；随 run 死）
+	spills  int    // 本 run 截断落盘计数器（只由 tickSpill 增；文件名顺编用，随 run 死）
 }
 
 func newNoteBox(session SessionID, run RunID, userSeq int64) *noteBox {
@@ -571,6 +548,15 @@ func (b *noteBox) tickFailure() string {
 		return ""
 	}
 	return memoryStopAdvice(b.fails)
+}
+
+// tickSpill 记一次截断落盘、返回本 run 内的顺编号（从 1 起）。主代理与子代理共用同一份
+// noteBox（ctx 流到整棵执行树）= 同序列顺编、天然不撞（doc/21 §3.2「截断落盘」）。
+func (b *noteBox) tickSpill() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.spills++
+	return b.spills
 }
 
 func (b *noteBox) setSnapshot(s string) {

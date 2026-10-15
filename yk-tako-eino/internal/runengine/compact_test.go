@@ -994,9 +994,9 @@ func TestAdmitTextDisabledWhenWindowOff(t *testing.T) {
 	}
 }
 
-// window×4/5 的整数关系照另一条线重验（防除数与乘数改了一边）。
+// limit 的整数关系照另一条线重验（防除数与乘数改了一边）：limit = CompactLimitFor(window)、线 = limit/3。
 func TestAdmitTextLimitFollowsWindow(t *testing.T) {
-	w := &Worker{compactWindow: 100, compactLimit: 80, counter: fakeCounter{f: func(s string) int { return len([]rune(s)) }}}
+	w := &Worker{compactWindow: 100, compactLimit: CompactLimitFor(100), counter: fakeCounter{f: func(s string) int { return len([]rune(s)) }}}
 	// limit = 80，线 = 80/3 = 26。
 	if _, _, ok := w.AdmitText(strings.Repeat("x", 26)); !ok {
 		t.Fatal("26 tok 应放行（恰好在线）")
@@ -1060,6 +1060,29 @@ func TestSummarizeSendsStructuredPrompt(t *testing.T) {
 }
 
 // ---- C5-A7：summarizer 预算帽分档（小窗式 / 中窗 / 大窗 + 档界 + 两个 override）----
+
+// 三期重裁（19v6-09 §9）逐锚：limit = window − min(window/5, 16384)。
+// 81920 交点两侧都钉：交点处两式同值（65536）、交点之上 reserve 恒 16384（吃回窗口）、
+// 之下退化为 ×4/5（dev 小窗逐值不变：600 → 480）。
+func TestCompactLimitFor(t *testing.T) {
+	for _, tc := range []struct {
+		window int
+		want   int
+	}{
+		{0, 0},             // compact 关
+		{100, 80},          // 小窗 ×4/5 支
+		{600, 480},         // dev 小窗零变化（C2/A3 同窗）
+		{21000, 16800},     // A4 活体场窗：与旧式同值
+		{81920, 65536},     // 交点：两式同值（81920/5 = 16384）
+		{100000, 83616},    // 交点之上：reserve 封顶 16384（旧式 80000）
+		{256000, 239616},   // 生产窗：吃回 34816 ≈ 35k（旧式 204800）
+		{1048576, 1032192}, // 大窗：reserve 仍 16384
+	} {
+		if got := CompactLimitFor(tc.window); got != tc.want {
+			t.Fatalf("window=%d: CompactLimitFor=%d, want %d", tc.window, got, tc.want)
+		}
+	}
+}
 
 // 五档定点与档界两侧：小窗式 min(limit/2, 1024)、中窗 4096、大窗 8192、window=0 回落中窗常量。
 func TestSummarizeCeilingTiers(t *testing.T) {

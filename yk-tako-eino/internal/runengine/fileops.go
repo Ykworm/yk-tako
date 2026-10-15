@@ -100,8 +100,10 @@ var firstPartyFileEffects = map[string]string{
 	// memory（M1）：笔记落 PG notes 表、不碰 workspace 路径——显式表态 none（planning §1-6，
 	// 作者没声明 = 不碰文件的同一表态方式）。
 	"memory": fileEffectNone,
-	// search_history（H1，doc/21 §3）：只读 PG 的 runlog_entries、不碰 workspace 路径——显式表态 none。
-	"search_history": fileEffectNone,
+	// search_history（H1、H3，doc/21 §3）：读 runlog_entries 只读不写；截断发生时把完整结果
+	// 写进 workspace 的 .tako/search/（H3「截断落盘」）——声明 write。提取程序只扫调用参数、
+	// 落盘路径程序生成不在参数里，不钉摘要块（接受现状，planning §5）。
+	"search_history": fileEffectWrite,
 }
 
 // fileEffectToolNames 是启动 lint 的目录名单（v1 常量表，逐名带出处；精确命中用，不转小写）：

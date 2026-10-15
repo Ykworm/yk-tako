@@ -100,7 +100,7 @@ type logResponse struct {
 //	404 {"error":"session_not_found"}    ← 只可能出现在「带未知 sessionId」时
 //	409 {"error":"session_busy"}         ← 该会话已有活 run；**什么都没写**，客户端本地排队、本轮收口后补投
 //	413 {"error":"message_too_large","limit":M,"tokens":N}
-//	                                     ← 单条消息超准入线（仅 compact 开启时；limit = window×4/5，
+//	                                     ← 单条消息超准入线（仅 compact 开启时；limit = compactLimitFor(window)，
 //	                                       线 = limit/3）；抢闸前拒收，零痕迹，客户端裁剪后可原样重投
 //	500 {"error":"internal"}
 //

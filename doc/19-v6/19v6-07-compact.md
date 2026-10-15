@@ -6,6 +6,8 @@
 > （C2 摘要调用规格 / C3 回归网 + 变异检查 / C4 doc 回填，实测记录在 tmp 台账「C 系列」节——
 > 台账验收后即清理，不并入本文）；**§5 两条登记的 C5 施工面亦已于 2026-10-11 落地**
 > （结构化摘要 + 预算分档 + POST 准入 + fileOps 块，A1–A7，实测在 tmp 台账「C5」节）。
+> **§1 的 limit 预留已于 2026-10-12 三期重裁**：limit = window − min(window/5, 16384)（19v6-09
+> §9 落地；原 ×4/5 条已翻案，差分与数值实测在 tmp 台账溢出节）。
 > 设计渊源：算法取 `doc/12` §9，落点按 v6 前提重推（doc/12 的旧线载体——钩子 / `run_archive` /
 > `event_log` / `compact_rag`——v6 均无对应物）；2026-10-10 吸收 WeKnora
 > `internal/agent/compaction` 全包实读的借鉴（出处为历史注记，内容本体在 §3/§5 自含）。
@@ -30,7 +32,7 @@ POST → 抢闸 → goroutine Run(ctx)
   ▼
 prepareInput：
   读 mh 全序（user 行在 AcquireRun 时已入）→ countInput（system + 所有行文本，cl100k）
-  │ ≤ window×4/5 ──────────► 快速路：原样送 ADK 主循环（零行为差异）
+  │ ≤ limit（= window − min(window/5, 16384)）─► 快速路：原样送 ADK 主循环（零行为差异）
   ▼ 超限
 foldInput：run 粒度分组 → 旧摘要 seq=0 行并入 renderFold（「此前摘要，请合并进新的摘要」）
   → n 从 20 降，每档 summarize 一次：
@@ -59,16 +61,20 @@ defer EndRun（唯一出口）：complete → 同一笔 PG 事务
   （内存累积、EndRun 才落库），Run fold 的原料是 mh 表、够不着起手后的增长，这正是 mid-run fold 要补的洞。
 - **摘要行 role = `user`**：输入组装侧零改动（worker 的 default 分支已把 user 行映射成
   UserMessage）；system 插会话中段部分厂商不容；旧线同选（带标记的用户消息）。
-- **limit = window × 4/5**（`-compact-window`，默认 256000；0 = 关）。预留 1/5 承担**双职能**：
-  「响应空间」+「估算误差安全垫」（cl100k 对非 OpenAI 分词器是近似值；相邻两次检查之间可能插入
-  巨型工具结果）。2026-10-10 裁定：**维持比例不动**——WeKnora 的固定 16k 以其有溢出修复层为
-  前提，**预留与修复层互为替代**；v6 修复层（§5）落地后再重裁为固定预留、吃回窗口（256k 窗下
-  约 35k）。
+- **limit = window − min(window/5, 16384)**（`-compact-window`，默认 256000；0 = 关）。
+  **2026-10-12 三期重裁落地**（闸门 = 溢出修复层一期在真 provider 上真兜住过，19v6-09 §9）：
+  原 ×4/5 = 「响应空间 + 估算误差垫」双职能（cl100k 对非 OpenAI 分词器是近似值、两次检查之间
+  可能插进巨型工具结果）；误差垫职能 2026-10-12 起由溢出修复层兜底承接，预留改为固定档——
+  16384 = WeKnora settings.go 固定 16k（回复大小不随窗口缩放）。min 的连续档：window = 81920
+  处两式相交（81920/5 = 16384），之下退化为 ×4/5（dev 小窗 600 → limit 480 逐值不变，不留新
+  魔法边界）；256k 窗 limit 204800 → 239616，**吃回 34816 ≈ 35k**。原 2026-10-10「维持比例不动」
+  裁定的前提（修复层缺位）已消失，据此翻案。
 - **计数 = cl100k 全量 BPE**（doc/12 §3 口径，编码固定不按模型再配；`TokenCounter` 接口注入，
   装配期取词表失败即 fail fast；单测注入假计数器不触网）。**偏离登记**：不落「上条 assistant
-  Usage 做基数」（v6 无 Usage 列）。**复审项**：tool loop 时代若出现 per-round 检查，Usage 基线 +
-  delta 计数（WeKnora estimator.go 形态）是替代全量 BPE 的候选，并与「工具 schema 是否计入触发」
-  二选一绑定裁决（WeKnora 战例：232 个 MCP schema ≈ 105k token 计进触发会让压缩后仍显示超限）。
+  Usage 做基数」（v6 无 Usage 列）。**复审项**（讨论稿 `doc/24-用量计数.md`，2026-10-15 改口径、未点头）：
+  场内下一 Turn 发出前滤掉 `ReasoningContent`；有上一笔 Usage 时可用
+  `PromptTokens + (CompletionTokens − 思考估) + 锚点后新行` 作 mid-run 触发候选；工具 schema
+  仍不计入触发；无账单时仍全量 `countInput`。点头前本条的计数裁定不动。
 
 ## §2 折叠算法（foldInput，compact.go）
 
@@ -180,11 +186,12 @@ defer EndRun（唯一出口）：complete → 同一笔 PG 事务
   截断**的响应（finish_reason=length 且 completion 小于自请预算 ⇒ 是自己的上限而不是窗口掐的
   才正常，反之即被窗口截断；或 prompt_tokens > window）。触发后**不信任任何估算**（被拒本身就
   是估算不可信的证据）→ 强制压缩 → **只重试一次**（overflowRecovered 标志防死循环）。价值：v6
-  计数若在安全方向错了，现状就是纯死；此层落地后 §1 的 ×4/5 重裁为固定预留、吃回窗口。
+  计数若在安全方向错了，现状就是纯死；此层落地后 §1 的 ×4/5 已重裁为固定预留、吃回窗口
+  （2026-10-12 三期落地，见 §1）。
 - **trimToolResults 式「压后仍超」最后手段**（借 WeKnora observe.go，2026-10-11 登记）：
   压缩已发生仍超阈时，工具结果总预算 = window/5（clamp [8192, 32768]）——全部工具结果先换
   marker（原字节数记账），预算内从最新往回还原文本，放不下的给 1/4 头 + 3/4 尾预览夹；
-  copy-on-write 不动留档原文。v6 现状对此只有 ×4/5 预留 + errStillOver（整轮 error），中间
+  copy-on-write 不动留档原文。v6 现状对此只有预留 + errStillOver（整轮 error），中间
   没有「既不 error 也能发出去」的层；与溢出修复层同宗（都是「估算错了之后还能活」）——
   **已随 19v6-09 同立项，裁定 = 落二期**（理由见其 §8 有效域登记：Run fold 的 n=0 候选
   无工具行，trim 恒空转；真主场是 mid-run 候选与救援候选）。**实证（2026-10-11 C2 验收实录，deepseek-flash）**：摘要体积 ≈ 输入 0.7× 的模型

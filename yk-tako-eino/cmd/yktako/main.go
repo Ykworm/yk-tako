@@ -44,7 +44,7 @@ func (a modelRegistryResolver) Get(ctx context.Context, ref string) (runengine.M
 }
 
 // defaultCompactWindow 是上下文压缩的窗口 token 数（C 系列；doc/12 §2：查不到就用 256000）。
-// 触发阈值 limit = window × 4/5（doc/12 §9）；0 = 关压缩（验收对照跑法）。
+// 触发阈值 limit = window − min(window/5, 16384)（三期重裁，19v6-09 §9）；0 = 关压缩（验收对照跑法）。
 const defaultCompactWindow = 256000
 
 // durationEnv 取 .env/进程环境里的时长变量（TAKO_LEASE_* 约定同 TAKO_MODEL；进程环境非空时 godotenv 不覆盖它），
@@ -90,7 +90,7 @@ func main() {
 	pgDSN := flag.String("pg", defaultPGDSN, "postgres DSN (sessions/runs/run_model_messages/runlog_entries)")
 	leaseTTL := flag.Duration("lease-ttl", durationEnv("TAKO_LEASE_TTL", defaultLeaseTTL), "gate lease TTL; watchdog keeps renewing it during generation (env TAKO_LEASE_TTL)")
 	leaseRenew := flag.Duration("lease-renew", durationEnv("TAKO_LEASE_RENEW", defaultLeaseRenew), "watchdog renew interval (must be < lease-ttl; env TAKO_LEASE_RENEW)")
-	compactWindow := flag.Int("compact-window", defaultCompactWindow, "context window in tokens for compaction; limit = window * 4/5; 0 disables")
+	compactWindow := flag.Int("compact-window", defaultCompactWindow, "context window in tokens for compaction; limit = window - min(window/5, 16384); 0 disables")
 	agentsDir := flag.String("agents-dir", "agents", "directory of sub-agent specs (*.md + YAML frontmatter); scanned at each run start (relative to CWD)")
 	workspace := flag.String("workspace", "./workspace", "workspace root for first-party file tools; created at startup, tools are confined to it")
 	subagentConcurrency := flag.Int("subagent-concurrency", 8, "max concurrent subagent delegations (process-wide semaphore; must be >= 1)")
@@ -159,7 +159,7 @@ func main() {
 		log.Fatalf("agent 装配: %v", err)
 	}
 	if *compactWindow > 0 {
-		log.Printf("compact window %d tok (limit %d)", *compactWindow, *compactWindow*4/5)
+		log.Printf("compact window %d tok (limit %d)", *compactWindow, runengine.CompactLimitFor(*compactWindow))
 	} else {
 		log.Printf("compact off (-compact-window 0)")
 	}

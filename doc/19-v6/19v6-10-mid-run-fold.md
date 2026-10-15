@@ -50,7 +50,8 @@ assistant(tool_calls) 行**，中间插任何消息都拒收——本篇 §7 的
 一并收编（「此前摘要，请合并进新的摘要」）。
 
 **countInput**：压缩的长度自测——`system 提示词 + 每行文本` 过 cl100k 分词器求和，
-跟 `limit = window×4/5` 比。触发线、POST 准入线、摘要预算帽三处共用这一个 limit。
+跟 `limit = window − min(window/5, 16384)` 比（三期重裁后；其前为 `window×4/5`）。
+触发线、POST 准入线、摘要预算帽三处共用这一个 limit。
 **现口径的洞**：只数 `text` 列，`tool_calls` 的 JSON 一个字不计——而工具参数才是工具环
 时代的真实体积大头（`write_file` 一次调用可以把整份文件内容塞进参数）。本篇 §6 补。
 
@@ -234,7 +235,8 @@ tool_calls 进基数是**补洞**：今天 `write_file` 把整份文件内容写
 **schema 不计**：厂商每次调用重发的工具声明清单不进触发。v6 当前目录小（11 个文件
 工具 + 少量基础工具），计入只是把 limit 平移；WeKnora 战例（232 个 MCP schema ≈ 10 万
 token）那是目录大潮时的重裁项，随 MCP 工具 loop 立项一并复议（19v6-07 §1 复审项原文
-挂着，本条不提前消费）。
+挂着，本条不提前消费）。讨论稿在 `doc/24-用量计数.md`（2026-10-15）：声明仍然不进触发；
+场内滤掉思考重发；有账单时可用 Usage 基线加 delta，无账单仍全量 `countInput`。
 
 **频率**：每轮全量（§4 的账）。实现可带「state 未变则跳过」短路，属优化不改裁定。
 
@@ -278,8 +280,9 @@ run 以 error 收场——而且这个错是折叠自造的，原文毫无问题
 
 **共享的（同一函数同一语义，一行不改）**——两个 fold 共用 C 系列已验收的整条链：
 
-- **计数**：countInput（cl100k）与同一个 limit（window×4/5，触发线/准入/摘要帽三处
-  共用）；D3 的基数扩展（text + tool_calls JSON）写进这一个函数，两个 fold 同步生效。
+- **计数**：countInput（cl100k）与同一个 limit（window − min(window/5, 16384)，
+  触发线/准入/摘要帽三处共用）；D3 的基数扩展（text + tool_calls JSON）写进这一个
+  函数，两个 fold 同步生效。
   mid-run 侧的原料是 `[]*schema.Message`：**转换层先行**（切出 system 首条、其余行转
   mh 行形状，见下「原料转换层」），再过同一个 countInput——函数签名不动，system 走
   它已有的 system 形参。

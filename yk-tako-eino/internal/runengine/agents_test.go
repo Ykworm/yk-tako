@@ -102,6 +102,80 @@ func TestResolveToolPool(t *testing.T) {
 	}
 }
 
+// TestSubagentPoolKeepsRealSearchHistory 钉 H4（「拒绝壳」裁定已推翻，见 tmp/21-历史查找 planning §8）：
+// 子代理池里的 search_history 就是父池里那一个真工具——继承路（tools 缺席 = Tools 指针 nil，researcher
+// 的现状）与白名单路（tools: [search_history]）两路都只做「原对象搬运」，不换壳。真工具的判据两条：
+// 同一性（池内元素与父池对象是同一个接口值）+ 行为（挂上 noteBox 真查临时库，出真命中不是拒绝句）。
+// 哪天有人把壳塞回来（同名同声明的替代实现），第一条断言就红。
+func TestSubagentPoolKeepsRealSearchHistory(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t, time.Minute, time.Minute)
+
+	// 造一行「上一场已提交」的历史：词模式真实查询的靶（属于 s_h4、不属于本场 r_cur）。
+	rowID, err := newRowID("rl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.WithContext(ctx).Create(&RunlogEntry{
+		ID: rowID, SessionID: "s_h4", Seq: 1, RunID: "r_prev", Role: "user",
+		Text: "上一场留下的错误码 E_DECK_17。", CreatedAt: time.Now(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	sh, err := newSearchHistoryTool(store, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gt, err := newGetTimeTool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := []tool.BaseTool{gt, sh}
+
+	inherit, err := resolveToolPool(ctx, AgentSpec{Name: "researcher"}, base)
+	if err != nil || len(inherit) != 2 || inherit[1] != sh {
+		t.Fatalf("继承路应原样带出父池两件（search_history 同对象）: %v %v", inherit, err)
+	}
+	whitelist := []string{"search_history"}
+	listed, err := resolveToolPool(ctx, AgentSpec{Name: "researcher", Tools: &whitelist}, base)
+	if err != nil || len(listed) != 1 || listed[0] != sh {
+		t.Fatalf("白名单路应只挑出 search_history 且同对象: %v %v", listed, err)
+	}
+
+	for route, pool := range map[string][]tool.BaseTool{"继承路": inherit, "白名单路": listed} {
+		var got tool.BaseTool
+		for _, tl := range pool {
+			info, err := tl.Info(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Name == "search_history" {
+				got = tl
+			}
+		}
+		if got == nil {
+			t.Fatalf("%s: 池内应有 search_history，实得 %d 件", route, len(pool))
+		}
+		if got != sh {
+			t.Fatalf("%s: 池内 search_history 与父池不是同一对象（被换成了替代实现）", route)
+		}
+		inv, ok := got.(tool.InvokableTool)
+		if !ok {
+			t.Fatalf("%s: search_history 应实现 InvokableTool（真工具），实得 %T", route, got)
+		}
+		out, err := inv.InvokableRun(withNoteBox(ctx, newNoteBox("s_h4", "r_cur", 0)), `{"query":"E_DECK_17"}`)
+		if err != nil {
+			t.Fatalf("%s: 真查应成功，实得错误: %v", route, err)
+		}
+		for _, want := range []string{"命中 1 条", "seq=1", "E_DECK_17"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("%s: 应出真实命中（不是拒绝句），缺 %q：%q", route, want, out)
+			}
+		}
+	}
+}
+
 // fakeModel 是够装进 ChatModelAgent 的空壳（构造只查非 nil，不调方法）。
 type fakeModel struct{}
 

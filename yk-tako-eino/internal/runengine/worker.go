@@ -26,6 +26,7 @@ package runengine
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"strconv"
@@ -95,7 +96,7 @@ func einoChunkText(chunk *schema.Message) (string, bool) {
 // 一个 run 一次 Run 调用；由 POST handler 在抢闸成功后以 goroutine 启动。
 // leaseRenew 是 watchdog 续约间隔（A7）：生成期间每 leaseRenew 把闸的租约（runs.lease_until + 两键 TTL）续回，
 // 进程死了没人续 → 活行按 lease 判死、两键 TTL 到期蒸发，会话自动解锁。
-// compactWindow / counter 是长度自测（C 系列）：window > 0 时发送前数 token，超 limit = window × 4/5
+// compactWindow / counter 是长度自测（C 系列）：window > 0 时发送前数 token，超 limit = compactLimitFor(window)
 // 走折叠（compact.go）；0 = 关压缩（counter 为 nil 即可，计数与摘要都不发生）。
 type Worker struct {
 	store         *Store
@@ -106,7 +107,7 @@ type Worker struct {
 	rootRef       string // 主模型生效 ref（T3-1b，= config.ChatModel.Ref）：root 帧的 model 值 + 身份表 root 条目
 	leaseRenew    time.Duration
 	compactWindow int
-	compactLimit  int // window×4/5（window=0 时 0）：触发线 / 准入线两处共用，不各自重算；摘要预算帽自 A7 起归 summarizeCeiling 分档
+	compactLimit  int // = compactLimitFor(window)（window=0 时 0）：触发线 / 准入线两处共用，不各自重算；摘要预算帽自 A7 起归 summarizeCeiling 分档
 	counter       TokenCounter
 }
 
@@ -171,15 +172,16 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 	}
 	pool = append(pool, wrapToolErrors(mem))
 	// 历史查找工具入池（H1，doc/21）：memory 之后 append——身份从 ctx 的 noteBox 取
-	// （session/run），只读 runlog_entries（工具参数里没有会话号）。
-	sh, err := newSearchHistoryTool(store)
+	// （session/run），只读 runlog_entries（工具参数里没有会话号）；H3 起吃 workspace 根
+	// （截断落盘写 <workspace>/.tako/search/）。
+	sh, err := newSearchHistoryTool(store, workspace)
 	if err != nil {
 		return nil, err
 	}
 	pool = append(pool, wrapToolErrors(sh))
 	// 摘要器在 agent 装配前构造（A4，planning 裁定 9）：midfoldHandler 要拿它的 summarize 方法值——
 	// mid-run 折叠与 prepareInput 的 Run fold 共用同一个摘要器、同一顶帽（C5-A7 分档）。
-	compactLimit := compactWindow * 4 / 5
+	compactLimit := CompactLimitFor(compactWindow)
 	ceiling := summarizeCeiling(compactWindow, modelRef, maxOutput)
 	sum := newSummarizer(chat, ceiling)
 	agent, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
@@ -202,6 +204,10 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 			// agentLog 看到的是模型实际所见的折后输入。
 			newMidfoldHandler(counter, compactLimit, sum.summarize, firstPartyFileEffects),
 			NewAgentLogHandler(),
+			// 溢出 guard（B1，D13）：链尾 = 最内 user wrapper——模型调用错误冒泡最先到它
+			// （wrappers.go:1129 逆序包裹、first registered = outermost）。本拍只观测：命中
+			// 「中途拒收」（溢出 ∧ 有帧）打一行、错误原样上抛，一期/三期全部形状零变化。
+			newOverflowGuard(compactWindow),
 		},
 	})
 	if err != nil {
@@ -218,6 +224,9 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 // compact（C 系列；A4 起含 mid-run）：prepareInput 在发送前把 Run fold Stage 进容器（foldBox），
 // mid-run 各次折叠由钩子在模型调用前追加——一轮 run 可有多次：Run fold 打头、mid-run 各次续接；
 // 落库靠 defer 的 EndRun——仅 status=complete 且闸在手上才并入同一笔事务。error / 闸失 / 进程死 = 零写入。
+//
+// A3（检出②）从两端各进一件：消费侧对每次 root 模型回复做截断子检（超窗行 + 强折意图），
+// run 尾部对 mh 强折一次备下轮——②强折失败不杀 run（答案已在手），与①失败走 error 的不对称见 doc §7。
 //
 // **watchdog 生命周期严格在 EndRun 之前结束**（A7）：defer 是 LIFO，EndRun 先注册故最后跑；
 // 停 watchdog 的 defer 后注册故先跑，且 `wg.Wait()` 确保续约 goroutine 完全退出——否则续约会把 runlive
@@ -285,87 +294,201 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 	// T2：工具环两态事件——流式（模型输出，含 tool_calls）与非流式（工具结果，Role=Tool）。
 	// T3-1b：身份表先落 root 条目（主 ref + 主 translator），塞 ctx 给装载 handler 填子代理条目
 	// （handler 先于事件消费到场：agent.Run 内部同步跑完 BeforeAgent 才开事件 goroutine）。
+	// A2（doc §6 / planning 裁定 8）：agent.Run + 事件消费整体包进外层循环——零帧拒收时强折一次、
+	// 同 ctx 再调一次 agent.Run（watchdog 同闸同租约，无新生命周期）；谓词未命中 / 重试再拒
+	// 照走同一段 error 出口（出口不复制）。
 	table := newAgentModelTable(w.rootRef, w.translate)
 	ctx = withAgentModelTable(ctx, table)
-	it := w.agent.Run(ctx, &adk.AgentInput{Messages: msgs, EnableStreaming: true})
+	// 救援状态（planning 裁定 7/8）：帧计数与一次性闸都是 per-run，重跑不重置——
+	// 重试再拒时谓词读同一份（此时计数或闸已花，救援路径必然出不去）。
+	// 帧计数自 B1 起收编 foldBox（D12：guard 在模型调用点，worker 局部变量在它视野外）——
+	// 计数唯一真源 = box.frameCount()，worker 谓词与 guard 让位判据同源读。
+	// pendingForceFold 是检出②（A3）的强折意图：>0 = 本 run 检测到截断、run 末强折的目标线
+	// 基数（run 起手放行估算 C，doc §7）；写入发生在事件流排完后（Run 尾部）。
+	overflowRecovered := false
+	pendingForceFold := 0
 	for {
-		event, ok := it.Next()
-		if !ok {
-			break
-		}
-		if event.Err != nil {
-			// 检出①（A1，19v6-09 §4）：provider 拒收「太长」时把估算 C 与窗真值 W' 喊进日志——
-			// 纯观测，出口一行不动（run 仍 status=error、零写入）；救援（谓词/强折/重跑）是 A2。
-			// 子代理 / 中途拒收也打（不救但留观测，planning 裁定 2）；C = run 起手放行估算。
-			if w.compactWindow > 0 && IsOverflowError(event.Err) {
-				window := "未知"
-				if n, ok := extractWindow(event.Err); ok {
-					window = strconv.Itoa(n)
-				}
-				log.Printf("overflow: provider 拒收（估算 %d tok；真值 %s）", box.countBase(), window)
+		it := w.agent.Run(ctx, &adk.AgentInput{Messages: msgs, EnableStreaming: true})
+		retry := false
+		for {
+			event, ok := it.Next()
+			if !ok {
+				break
 			}
-			log.Printf("agent %s/%s: %v", sessionID, runID, event.Err)
-			status = "error"
-			return
-		}
-		if event.Output == nil || event.Output.MessageOutput == nil {
-			continue
-		}
-		mo := event.Output.MessageOutput
-		agent := event.AgentName       // T3 路由："" = root / 非空 = 子代理（转发事件）
-		entry := table.entryFor(agent) // T3-1b：该事件的模型身份（写帧的 model 值 + drain 的 translator）
-		if !mo.IsStreaming {
-			// 非流式事件 = 工具结果（ADK typedToolInvokeEvent：Message 已成形、Role=Tool）。一次调用一条
-			// tool_result 帧（非流式，19v6-01 §2）；同时进 turn（mh tool 行 + runlog 扩展行）。
-			if mo.Role == schema.Tool {
-				out, callID, name := "", "", mo.ToolName
-				if mo.Message != nil {
-					out = mo.Message.Content
-					callID = mo.Message.ToolCallID
-					if name == "" {
-						name = mo.Message.ToolName
+			if event.Err != nil {
+				overflow := w.compactWindow > 0 && IsOverflowError(event.Err)
+				if rescueWorthy(overflow, event.AgentName, box.frameCount(), overflowRecovered) {
+					// 救援命中（doc §6）：闸先花（D5——无论强折成败，本 run 不再有第二次救援），
+					// 强折 mh 原文 + foldBox 同步，折成即换消息重跑；折不成记分类、原始错误照走。
+					overflowRecovered = true
+					next, rerr := w.rescueOverflow(ctx, box, event.Err)
+					if rerr == nil {
+						msgs = next
+						retry = true
+						break
+					}
+					log.Printf("overflow rescue %s/%s: %v", sessionID, runID, rerr)
+				} else if overflow {
+					// 谓词未命中而 ① 命中 → detect 行原样（A1：中途/子代理/闸花都打，不救但留观测）；
+					// 闸花附一句（planning 裁定 2——「重试再拒」在日志里的可读证据）。
+					window := "未知"
+					if n, ok := extractWindow(event.Err); ok {
+						window = strconv.Itoa(n)
+					}
+					log.Printf("overflow: provider 拒收（估算 %d tok；真值 %s）", box.countBase(), window)
+					if overflowRecovered {
+						log.Printf("overflow: 已救过不再救")
 					}
 				}
-				// T3-2：子代理条目也收（root 的委派回传事件 agent 为空——它属于 root 的循环）。
-				turn = append(turn, TurnEntry{Role: "tool", Agent: agent, Text: out, ToolCallID: callID, ToolName: name, Model: entry.ref})
-				live, err := w.store.AppendFrame(ctx, runID, Frame{Kind: "tool_result", Agent: agent, Model: entry.ref, Name: name, Output: out})
+				log.Printf("agent %s/%s: %v", sessionID, runID, event.Err)
+				status = "error"
+				return
+			}
+			if event.Output == nil || event.Output.MessageOutput == nil {
+				continue
+			}
+			mo := event.Output.MessageOutput
+			agent := event.AgentName       // T3 路由："" = root / 非空 = 子代理（转发事件）
+			entry := table.entryFor(agent) // T3-1b：该事件的模型身份（写帧的 model 值 + drain 的 translator）
+			if !mo.IsStreaming {
+				// 非流式事件 = 工具结果（ADK typedToolInvokeEvent：Message 已成形、Role=Tool）。一次调用一条
+				// tool_result 帧（非流式，19v6-01 §2）；同时进 turn（mh tool 行 + runlog 扩展行）。
+				if mo.Role == schema.Tool {
+					out, callID, name := "", "", mo.ToolName
+					if mo.Message != nil {
+						out = mo.Message.Content
+						callID = mo.Message.ToolCallID
+						if name == "" {
+							name = mo.Message.ToolName
+						}
+					}
+					// T3-2：子代理条目也收（root 的委派回传事件 agent 为空——它属于 root 的循环）。
+					turn = append(turn, TurnEntry{Role: "tool", Agent: agent, Text: out, ToolCallID: callID, ToolName: name, Model: entry.ref})
+					live, err := w.store.AppendFrame(ctx, runID, Frame{Kind: "tool_result", Agent: agent, Model: entry.ref, Name: name, Output: out})
+					if err != nil {
+						log.Printf("frame %s/%s: %v", sessionID, runID, err)
+						status = "error"
+						return
+					}
+					if !live {
+						return // 同 drain 的判死出口：run 已没了，该收摊
+					}
+					box.addFrames(1) // A2 帧计数（裁定 7：不分 root/子代理——有帧后重跑同样造成帧重复；B1 收编进 box）
+				}
+				continue
+			}
+			merged, live, err := w.drain(ctx, runID, agent, entry, mo.MessageStream, box)
+			if err != nil {
+				log.Printf("stream %s/%s: %v", sessionID, runID, err)
+				status = "error"
+				return
+			}
+			if !live {
+				// run 已被判死（draft 随租约到期蒸发）/ 被 reset 清掉 / 闸已不在：停止推流。
+				// defer 的 EndRun 拿不到闸自然空转。
+				return
+			}
+			// A3 检出②（doc §5/§7；只检主线程——折的是 mh/foldBox 这些 root 的量，子代理不救，§11）：
+			// 成功但被窗口截断。merged 的 ResponseMeta 带着 FinishReason 与 Usage（openai 组件恒开
+			// IncludeUsage、claude messageDelta 同面带，C2 plumbing 实读）。超窗行恒打（观测面：
+			// 实数 P 与估算 C 的偏差供运营商修窗标）；强折意图只记一次（闸与①共用，D5——命中即
+			// 花掉，一次 run 一个强折动作）。本答不救（D7）：帧面 append-only 撤不回，半截答案原样
+			// 留给用户，run 正常 complete——救的是会话（run 尾部强折落库，见函数末）。
+			if agent == "" {
+				if hit := detectTruncation(merged.ResponseMeta, w.compactWindow); hit != nil {
+					suffix := ""
+					if hit.subB {
+						suffix = "；finish_reason=length, completion=0"
+					}
+					log.Printf("overflow: 实数超窗：prompt_tokens %d > window %d（估算 %d tok；偏差 %d）%s",
+						hit.prompt, w.compactWindow, box.countBase(), hit.prompt-box.countBase(), suffix)
+					if !overflowRecovered {
+						overflowRecovered = true
+						pendingForceFold = box.countBase()
+					}
+				}
+			}
+			// 本轮合并全文进 turn（assistant 轮，root 与子代理都收——T3-2 起按 Agent 分拣归 EndRun）；
+			// ToolCalls 逐条压 tool_call 帧，args 取模型原始 JSON 原文。
+			turn = append(turn, TurnEntry{Role: "assistant", Agent: agent, Text: merged.Content, ToolCalls: merged.ToolCalls, Model: entry.ref})
+			for _, tc := range merged.ToolCalls {
+				live, err := w.store.AppendFrame(ctx, runID, Frame{Kind: "tool_call", Agent: agent, Model: entry.ref, Name: tc.Function.Name, Args: tc.Function.Arguments})
 				if err != nil {
 					log.Printf("frame %s/%s: %v", sessionID, runID, err)
 					status = "error"
 					return
 				}
 				if !live {
-					return // 同 drain 的判死出口：run 已没了，该收摊
+					return
 				}
+				box.addFrames(1)
 			}
-			continue
 		}
-		merged, live, err := w.drain(ctx, runID, agent, entry, mo.MessageStream)
-		if err != nil {
-			log.Printf("stream %s/%s: %v", sessionID, runID, err)
-			status = "error"
-			return
-		}
-		if !live {
-			// run 已被判死（draft 随租约到期蒸发）/ 被 reset 清掉 / 闸已不在：停止推流。
-			// defer 的 EndRun 拿不到闸自然空转。
-			return
-		}
-		// 本轮合并全文进 turn（assistant 轮，root 与子代理都收——T3-2 起按 Agent 分拣归 EndRun）；
-		// ToolCalls 逐条压 tool_call 帧，args 取模型原始 JSON 原文。
-		turn = append(turn, TurnEntry{Role: "assistant", Agent: agent, Text: merged.Content, ToolCalls: merged.ToolCalls, Model: entry.ref})
-		for _, tc := range merged.ToolCalls {
-			live, err := w.store.AppendFrame(ctx, runID, Frame{Kind: "tool_call", Agent: agent, Model: entry.ref, Name: tc.Function.Name, Args: tc.Function.Arguments})
-			if err != nil {
-				log.Printf("frame %s/%s: %v", sessionID, runID, err)
-				status = "error"
-				return
-			}
-			if !live {
-				return
-			}
+		if !retry {
+			break
 		}
 	}
+	// A3 run 末强折（doc §7）：②命中过 → 对 mh 强折一次备下轮。失败**不杀 run**——答案已在手
+	// （doc §7 的不对称分界：与①强折失败走 error 相对），日志登记了事。折产物进容器，随 defer
+	// 的 EndRun 同笔事务落库——少了这一步，省下的只是本 run 的内存、下条消息重演（D6 另一半）。
+	if pendingForceFold > 0 && status == "complete" {
+		if err := w.runEndFold(ctx, box, pendingForceFold); err != nil {
+			log.Printf("overflow 末折 %s/%s: %v", sessionID, runID, err)
+		}
+	}
+}
+
+// runEndFold 是 A3 检出②的强折段（doc §7）：重读 mh 原文（裁定 5 同款：不沿用本地变量）→
+// foldInput 强制进入（limit' = C×4/5，D4 一族——被掐只证明「该折了」，没有真值可校准；
+// C 低估 = 折更深 = 安全方向）→ 摘要行打戳 + foldBox 同步（裁定 6 同款路径）→ 末折行。
+// 折的都是老 run（当前 run 的 assistant/tool 行还没进 mh，phase 2 天然空转）——产物靠 EndRun
+// 的并集翻转 + 同槽 UPSERT 落库；失败（errStillOver / summarize 败）由调用方记日志、不杀 run。
+func (w *Worker) runEndFold(ctx context.Context, box *foldBox, c int) error {
+	history, err := w.store.ModelMessages(ctx, box.session)
+	if err != nil {
+		return fmt.Errorf("重读 mh: %w", err)
+	}
+	folded, staged, err := foldInput(ctx, w.system, history, box.run, c*4/5, w.counter, w.sum.summarize, firstPartyFileEffects)
+	if err != nil {
+		return fmt.Errorf("强折: %w", err)
+	}
+	folded[0].RunID = staged.AttachRun
+	folded[0].Seq = 0
+	box.setBase(folded)
+	box.appendStaged(*staged)
+	log.Printf("overflow 末折: 强折 %d 个 run，摘要 %d tok；备下轮",
+		len(staged.DropRunIDs)+len(staged.MergedSummaryRunIDs), w.counter.Count(staged.Summary))
+	return nil
+}
+
+// rescueOverflow 是 A2 救援的强折段（doc §6；谓词与一次性闸在调用方）：重读 mh 可见行（裁定 5：
+// 原料要原文，不沿用 prepareInput 本地变量）→ D4 目标线（rescueLimit）→ foldInput 强制进入 →
+// 摘要行打戳（AttachRun, seq0——同 midfold 的同步路径，裁定 6）→ foldBox 同步（base=折算行 +
+// staged 追加）→ rescue 行（格式钉死，裁定 2）→ 返回重跑用的消息。
+// 返回错误 = 重读失败 / 强折失败（含 errStillOver 与 summarize 失败）：调用方记分类、原始错误
+// 走既有 error 出口——强折产物不落库（零写入家族，doc §10「不发明第四态」）。
+func (w *Worker) rescueOverflow(ctx context.Context, box *foldBox, cause error) ([]*schema.Message, error) {
+	history, err := w.store.ModelMessages(ctx, box.session)
+	if err != nil {
+		return nil, fmt.Errorf("重读 mh: %w", err)
+	}
+	window, hasWindow := extractWindow(cause)
+	limit := rescueLimit(box.countBase(), window, hasWindow)
+	folded, staged, err := foldInput(ctx, w.system, history, box.run, limit, w.counter, w.sum.summarize, firstPartyFileEffects)
+	if err != nil {
+		return nil, fmt.Errorf("强折: %w", err)
+	}
+	folded[0].RunID = staged.AttachRun
+	folded[0].Seq = 0
+	box.setBase(folded)
+	box.appendStaged(*staged)
+	truth := "盲降"
+	if hasWindow {
+		truth = "真值 " + strconv.Itoa(window)
+	}
+	log.Printf("overflow rescue: provider 拒收（估算 %d tok；%s）；强折 %d 个 run，摘要 %d tok；重试",
+		box.countBase(), truth, len(staged.DropRunIDs)+len(staged.MergedSummaryRunIDs), w.counter.Count(staged.Summary))
+	return toSchemaMessages(folded), nil
 }
 
 // mhRowsFromTurn 把 turn 派生为 mh 写入行（A3，planning 裁定 3）：root 条目（Agent 空）逐条映射、
@@ -392,9 +515,12 @@ func mhRowsFromTurn(runID RunID, turn []TurnEntry) []ModelMessage {
 // （delta 帧带 agent，**不 APPEND draft**——收口锚「Σ root delta」不被子代理文本污染）。
 // T3-1b：drain 的 translator 与 model 值都取自 entry（该 agent 的模型身份）——继承档 = 主 translator/主 ref，
 // 写值档 = 按该模型协议选的 translator / 其生效 ref；root 与子代理共用同一条排干逻辑。
+// A2：帧计数（裁定 7：AppendDelta/AppendFrame 成功次数总和，不分 root/子代理）——救援谓词的
+// 零帧判据；只有 err==nil && live 才 +1（判死/失败没写进 runlive，不算发过帧）。B1 起计数
+// 收编 foldBox（D12）——guard 与 worker 读同一个数。
 // 返回 live=false = run 已判死（该收摊，不是错误）；err != nil = 错误结局。
 // close 责任也在本函数：事件流的另一副本由 agent 内部排干，早退不关会把两边一起吊住。
-func (w *Worker) drain(ctx context.Context, runID RunID, agent string, entry agentModelEntry, stream *schema.StreamReader[*schema.Message]) (*schema.Message, bool, error) {
+func (w *Worker) drain(ctx context.Context, runID RunID, agent string, entry agentModelEntry, stream *schema.StreamReader[*schema.Message], box *foldBox) (*schema.Message, bool, error) {
 	defer stream.Close()
 	var chunks []*schema.Message
 	for {
@@ -424,6 +550,7 @@ func (w *Worker) drain(ctx context.Context, runID RunID, agent string, entry age
 			if !live {
 				return nil, false, nil
 			}
+			box.addFrames(1)
 		}
 	}
 }
@@ -459,7 +586,7 @@ func (w *Worker) watchdog(ctx context.Context, sessionID SessionID, runID RunID)
 
 // AdmitText 是 POST 单条消息的准入检查（C5-A1，tail 支）：compact 关闭（window=0）时一切放行；
 // 开启时单条 user 消息计数 > limit/compactAdmissionDivisor ⇒ 不放行，由调用方回 413。
-// 返回 (limit, tokens, ok)：limit = window×4/5（与触发折叠同一 limit，不发明第二个数）；
+// 返回 (limit, tokens, ok)：limit = compactLimitFor(window)（与触发折叠同一 limit，不发明第二个数）；
 // ok=false 时 limit/tokens 供错误体带回去（报清原因，客户端可裁剪重发）。策略本身属 compact
 // 域（19v6-07 §5 的三等分推导），但用的是 Worker 的 window/counter——所以是 Worker 方法、
 // 住在 prepareInput 旁边：同一道「发送前自测」的门，长度检查的两个刻度。

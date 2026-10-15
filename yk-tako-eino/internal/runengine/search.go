@@ -14,7 +14,9 @@
 // 答用户。片段只进当轮工具结果，下一场的系统提示不因此变长。
 //
 // 有界性（doc/21 §3.2）：片段化 + 4000 字总帽不是锦上添花——没有它们，一次查询把刚折掉的
-// 正文原样灌回窗口，下一轮又触发折叠，这把工具就变成折叠的抽水机。
+// 正文原样灌回窗口，下一轮又触发折叠，这把工具就变成折叠的抽水机。截断落盘（H3，同节）：
+// 真丢行时把摘帽全文写进 <workspace>/.tako/search/<runId>_<n>.md、内联只加一行路径——
+// 帽保体积、文件保信息；写失败静默退化为纯截断，不炸 run。
 //
 // 数据边界（doc/21 §3）：历史唯一真源 = runlog_entries，工具只读它（不写、也不读
 // run_model_messages）。它解决的是「下一场来问」：本场中途刚被折掉、还没提交的那段拿不到。
@@ -28,6 +30,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -101,7 +105,8 @@ type searchHistoryInput struct {
 // 业务校验（词三句 / roles 非法）与空结果都是普通结果文本（planning L8 顺序：空 → 超 8 词 →
 // 有词超 200 字 → roles → 查库）；around_seq > 0 时跳过词与 roles 的全部校验（含空 query），
 // 直接窗口模式（doc/21 §3.3）。底座故障（DB 断）上抛给包装层兜底。
-func newSearchHistoryTool(store *Store) (tool.BaseTool, error) {
+// workspace 是截断落盘的作业根（H3，doc/21 §3.2「截断落盘」）：两模式出口共用同一落盘助手。
+func newSearchHistoryTool(store *Store, workspace string) (tool.BaseTool, error) {
 	return utils.InferTool("search_history", searchHistoryDesc, func(ctx context.Context, in searchHistoryInput) (string, error) {
 		box := noteBoxFrom(ctx)
 		if box == nil {
@@ -126,7 +131,8 @@ func newSearchHistoryTool(store *Store) (tool.BaseTool, error) {
 			if err != nil {
 				return "", err
 			}
-			return renderSearchWindow(rows, in.AroundSeq, window), nil
+			inline, full, truncated := renderSearchWindow(rows, in.AroundSeq, window)
+			return spillIfTruncated(inline, full, truncated, workspace, box), nil
 		}
 		words := strings.Fields(in.Query)
 		switch {
@@ -159,8 +165,50 @@ func newSearchHistoryTool(store *Store) (tool.BaseTool, error) {
 		if err != nil {
 			return "", err
 		}
-		return renderSearchHits(hits, words[0]), nil
+		inline, full, truncated := renderSearchHits(hits, words[0])
+		return spillIfTruncated(inline, full, truncated, workspace, box), nil
 	})
+}
+
+// spillIfTruncated 是截断落盘出口（H3，doc/21 §3.2）：真丢行时把摘帽全文写进
+// <workspace>/.tako/search/<runId>_<n>.md，内联结果在「其余命中已截断。」之后加一行路径；
+// 写失败静默退化（不加路径行，其余字节与落盘机制存在前相同）。无截断 = 原样返回，不碰文件系统。
+func spillIfTruncated(inline, full string, truncated bool, workspace string, box *noteBox) string {
+	if !truncated {
+		return inline
+	}
+	rel, ok := spillSearchResult(workspace, box, full)
+	if !ok {
+		return inline
+	}
+	return inline + "\n完整结果已写入 " + rel + "。"
+}
+
+// spillSearchResult 把完整渲染写进 <workspace>/.tako/search/<runId>_<n>.md（n = noteBox 每 run
+// 计数器顺编；主/子代理共用同一份 noteBox = 同序列天然不撞）。一次一写：O_EXCL 撞名即视为写失败；
+// 路径闸复用 resolveInWorkspace，MkdirAll / 打开 / 写入任一步失败都返回 ok=false
+// （doc/21 §3.2：写失败不报错，退化为纯截断行为）。
+func spillSearchResult(workspace string, box *noteBox, full string) (string, bool) {
+	rel := fmt.Sprintf(".tako/search/%s_%d.md", box.run, box.tickSpill())
+	fullPath, err := resolveInWorkspace(workspace, rel)
+	if err != nil {
+		return "", false
+	}
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+		return "", false
+	}
+	f, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return "", false
+	}
+	if _, err := f.WriteString(full); err != nil {
+		f.Close()
+		return "", false
+	}
+	if err := f.Close(); err != nil {
+		return "", false
+	}
+	return rel, true
 }
 
 // parseSearchRoles 解析 roles 参数：空 = 默认三档；按逗号拆、逐项去空白，任一项不在四个
@@ -244,31 +292,42 @@ func runeIndexFold(hay []rune, needle string) int {
 
 // renderSearchHits 渲染词模式结果（doc/21 §3.2 样本）：首行「命中 N 条。范围：…」+ `---` 分隔的
 // 命中块（新到旧；头行 seq/role/agent，agent 空 = 主代理、等号后留空）+ 片段。
+// N 恒为全量命中数（= 喂入块总数），截断丢块不改写——内联首行与落盘文件首行一致，
+// 「其余命中已截断。」的「其余」才有先行词（H5 裁定，doc/21 §3.2）。
 // 全部命中块拼接串超 searchResultCap（L4：只计块拼接串，首行总结与截断行不计）→ 从末位
 // （最旧）整块丢起，末尾加「其余命中已截断。」——一次工具结果不能把刚折掉的正文原样灌回窗口。
 // 0 条 = 整段结果就是「没有命中。」。
-func renderSearchHits(hits []RunlogEntry, firstWord string) string {
+// H3（doc/21 §3.2「截断落盘」）：真丢行时另出一份 full = 摘帽全文（同一份渲染含全部块、
+// 不含截断标记行），交调用方落盘；无截断时 full 为空串、inline 与落盘机制存在前逐字节相同。
+func renderSearchHits(hits []RunlogEntry, firstWord string) (inline, full string, truncated bool) {
 	if len(hits) == 0 {
-		return searchNoHitText
+		return searchNoHitText, "", false
 	}
 	blocks := make([]string, len(hits))
 	for i, h := range hits {
 		blocks[i] = fmt.Sprintf("seq=%d role=%s agent=%s\n%s", h.Seq, h.Role, h.Agent, searchSnippet(h.Text, firstWord))
 	}
 	// 单块永不超过帽（片段有界在上游保证），len>1 的守卫防病态输入产出空结果。
-	truncated := false
-	for len(blocks) > 1 && utf8.RuneCountInString(strings.Join(blocks, "\n---\n")) > searchResultCap {
-		blocks = blocks[:len(blocks)-1]
+	kept := len(blocks)
+	for kept > 1 && utf8.RuneCountInString(strings.Join(blocks[:kept], "\n---\n")) > searchResultCap {
+		kept--
 		truncated = true
 	}
+	inline = renderHitBlocks(blocks[:kept], len(blocks))
+	if !truncated {
+		return inline, "", false
+	}
+	return inline + "\n" + searchTruncatedText, renderHitBlocks(blocks, len(blocks)), true
+}
+
+// renderHitBlocks 拼词模式「首行 + 块体」——inline 与落盘全文共用同一份渲染，
+// 差别 = 喂进来的块集合与计数；计数恒为全集块数（截断的 inline 也报全量数）。
+func renderHitBlocks(blocks []string, total int) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "命中 %d 条。范围：本会话里本场 run 之前已提交的行。", len(blocks))
+	fmt.Fprintf(&b, "命中 %d 条。范围：本会话里本场 run 之前已提交的行。", total)
 	for _, blk := range blocks {
 		b.WriteString("\n---\n")
 		b.WriteString(blk)
-	}
-	if truncated {
-		b.WriteString("\n" + searchTruncatedText)
 	}
 	return b.String()
 }
@@ -289,9 +348,10 @@ func windowLine(text string) string {
 // 总帽 searchResultCap（L4 同口径：只计块拼接串）→ 从离 around_seq 最远的行丢起（L5：
 // 距离相同先丢 seq 较大者，确定性序），末尾加「其余命中已截断。」。
 // rows 为空是理论不可达（存在性前置已保证 seq=N 自己落在窗口里）——按负路径兜底。
-func renderSearchWindow(rows []RunlogEntry, aroundSeq int64, window int) string {
+// H3 同 renderSearchHits：真丢行时另出 full = 完整窗口（含被丢行、不含截断标记行）供落盘。
+func renderSearchWindow(rows []RunlogEntry, aroundSeq int64, window int) (inline, full string, truncated bool) {
 	if len(rows) == 0 {
-		return searchNoSeqText(aroundSeq)
+		return searchNoSeqText(aroundSeq), "", false
 	}
 	blocks := make([]string, len(rows))
 	drops := make([]int, len(rows))
@@ -319,7 +379,7 @@ func renderSearchWindow(rows []RunlogEntry, aroundSeq int64, window int) string 
 		}
 		return strings.Join(parts, "\n---\n")
 	}
-	live, truncated := len(rows), false
+	live := len(rows)
 	for _, d := range drops {
 		if live <= 1 || utf8.RuneCountInString(joinKept()) <= searchResultCap {
 			break
@@ -328,6 +388,20 @@ func renderSearchWindow(rows []RunlogEntry, aroundSeq int64, window int) string 
 		live--
 		truncated = true
 	}
+	inline = renderWindowBlocks(blocks, kept, aroundSeq, window)
+	if !truncated {
+		return inline, "", false
+	}
+	all := make([]bool, len(rows))
+	for i := range all {
+		all[i] = true
+	}
+	return inline + "\n" + searchTruncatedText, renderWindowBlocks(blocks, all, aroundSeq, window), true
+}
+
+// renderWindowBlocks 拼窗口模式「首行 + 块体」——inline 与落盘全文共用同一份渲染，
+// 差别只是 kept 过滤（摘帽全文 = 全量行）。
+func renderWindowBlocks(blocks []string, kept []bool, aroundSeq int64, window int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "seq=%d 的窗口，前后各 %d 行。", aroundSeq, window)
 	for i, blk := range blocks {
@@ -336,9 +410,6 @@ func renderSearchWindow(rows []RunlogEntry, aroundSeq int64, window int) string 
 		}
 		b.WriteString("\n---\n")
 		b.WriteString(blk)
-	}
-	if truncated {
-		b.WriteString("\n" + searchTruncatedText)
 	}
 	return b.String()
 }
