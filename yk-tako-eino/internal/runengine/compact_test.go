@@ -252,7 +252,7 @@ func TestFoldInputDescendsN(t *testing.T) {
 		[]ModelMessage{userRow("r5", 1, "eeee")},
 	)
 	// n=3: 7+4*3+4=23 ≥ 20 败；n=2: 7+4*2+4=19 < 20 定案。
-	assembled, staged, err := foldInput(context.Background(), "", history, "r5", 20, counter, summarize, nil)
+	assembled, staged, err := foldInput(context.Background(), "", history, "r5", 20, 0, counter, summarize, nil)
 	if err != nil {
 		t.Fatalf("foldInput: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestFoldInputErrStillOver(t *testing.T) {
 		[]ModelMessage{userRow("r2", 1, "eeee")},
 	)
 	// n=0: 摘要 7 + tail 4 = 11 ≥ 5 → errStillOver。
-	_, _, err := foldInput(context.Background(), "", history, "r2", 5, counter, summarize, nil)
+	_, _, err := foldInput(context.Background(), "", history, "r2", 5, 0, counter, summarize, nil)
 	if !errors.Is(err, errStillOver) {
 		t.Fatalf("err=%v，want errStillOver", err)
 	}
@@ -302,7 +302,7 @@ func TestFoldInputSummarizeErrorPropagates(t *testing.T) {
 	boom := errors.New("模型炸了")
 	_, _, err := foldInput(context.Background(), "",
 		historyOf([]ModelMessage{userRow("r1", 1, "aaaa")}, []ModelMessage{userRow("r2", 1, "eeee")}),
-		"r2", 5, counter, func(context.Context, string) (string, error) { return "", boom }, nil)
+		"r2", 5, 0, counter, func(context.Context, string) (string, error) { return "", boom }, nil)
 	if !errors.Is(err, boom) {
 		t.Fatalf("err=%v，want 原错误透传", err)
 	}
@@ -314,7 +314,7 @@ func TestFoldInputSummarizeErrorPropagates(t *testing.T) {
 func pinOnce(t *testing.T, history []ModelMessage, fileEffects map[string]string) ([]ModelMessage, *StagedCompaction) {
 	t.Helper()
 	counter := fakeCounter{f: func(s string) int { return len([]rune(s)) }}
-	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 100000, counter,
+	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 100000, 0, counter,
 		func(context.Context, string) (string, error) { return "SUMMARY", nil }, fileEffects)
 	if err != nil {
 		t.Fatalf("foldInput: %v", err)
@@ -363,7 +363,7 @@ func TestFoldInputBlockOverLimitCapsTo50(t *testing.T) {
 	// 行 22 runes ×60 = 1373 块；SUMMARY 7 + sep 2 + tail 4 = 13；limit 1200：
 	// 全量 1386 ≥ 1200 败第 1 档；砍 50 后 1166 < 1200 过第 2 档。
 	counter := fakeCounter{f: func(s string) int { return len([]rune(s)) }}
-	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 1200, counter,
+	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 1200, 0, counter,
 		func(context.Context, string) (string, error) { return "SUMMARY", nil }, firstPartyFileEffects)
 	if err != nil {
 		t.Fatalf("砍 50 后应收口成功: %v", err)
@@ -393,7 +393,7 @@ func TestFoldInputBlockStillOver(t *testing.T) {
 		[]ModelMessage{userRow("r_cur", 1, "eeee")},
 	)
 	counter := fakeCounter{f: func(s string) int { return len([]rune(s)) }}
-	_, staged, err := foldInput(context.Background(), "", history, "r_cur", 1100, counter,
+	_, staged, err := foldInput(context.Background(), "", history, "r_cur", 1100, 0, counter,
 		func(context.Context, string) (string, error) { return "SUMMARY", nil }, firstPartyFileEffects)
 	if !errors.Is(err, errStillOver) {
 		t.Fatalf("err=%v，want errStillOver（砍 50 后 1166 ≥ 1100）", err)
@@ -508,7 +508,7 @@ func TestFoldInputUnitSplitBySuffix(t *testing.T) {
 		{RunID: "r_cur", Seq: 6, Role: "tool", Text: "T2", ToolCallID: "c3"},
 		{RunID: "r_cur", Seq: 7, Role: "assistant", Text: "收工"},
 	})
-	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 50, counter, summarize, nil)
+	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 50, 0, counter, summarize, nil)
 	if err != nil {
 		t.Fatalf("foldInput: %v", err)
 	}
@@ -565,7 +565,7 @@ func TestFoldInputUserPinned(t *testing.T) {
 			{RunID: "r_cur", Seq: 3, Role: "tool", Text: "U1T", ToolCallID: "c1"},
 		},
 	)
-	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 5, counter, summarize, nil)
+	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 5, 0, counter, summarize, nil)
 	if err != nil {
 		t.Fatalf("foldInput: %v", err)
 	}
@@ -612,7 +612,7 @@ func TestFoldInputPhase1FoldsOldRunsFirst(t *testing.T) {
 			{RunID: "r_cur", Seq: 4, Role: "assistant", Text: "收工"},
 		},
 	)
-	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 100000, counter, summarize, nil)
+	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 100000, 0, counter, summarize, nil)
 	if err != nil {
 		t.Fatalf("foldInput: %v", err)
 	}
@@ -665,7 +665,7 @@ func TestFoldInputPhase2AfterRawsExhausted(t *testing.T) {
 			{RunID: "r_cur", Seq: 4, Role: "assistant", Text: "BBBB2"},
 		},
 	)
-	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 5, counter, summarize, nil)
+	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 5, 0, counter, summarize, nil)
 	if err != nil {
 		t.Fatalf("foldInput: %v", err)
 	}
@@ -701,7 +701,7 @@ func TestFoldInputOrphanToolError(t *testing.T) {
 		userRow("r_cur", 1, "eeee"),
 		{RunID: "r_cur", Seq: 2, Role: "tool", Text: "孤儿结果", ToolCallID: "c_x"},
 	})
-	_, staged, err := foldInput(context.Background(), "", history, "r_cur", 5,
+	_, staged, err := foldInput(context.Background(), "", history, "r_cur", 5, 0,
 		fakeCounter{f: func(s string) int { return len([]rune(s)) }},
 		func(context.Context, string) (string, error) { return "SUMMARY", nil }, nil)
 	if err == nil || !strings.Contains(err.Error(), "孤儿") {
@@ -724,7 +724,7 @@ func TestFoldInputPhase2CapExhausted(t *testing.T) {
 	for i := 0; i < 25; i++ {
 		rows = append(rows, ModelMessage{RunID: "r_cur", Seq: 2 + i, Role: "assistant", Text: fmt.Sprintf("m%02d", i)})
 	}
-	_, staged, err := foldInput(context.Background(), "", rows, "r_cur", 100, counter, summarize, nil)
+	_, staged, err := foldInput(context.Background(), "", rows, "r_cur", 100, 0, counter, summarize, nil)
 	if !errors.Is(err, errStillOver) {
 		t.Fatalf("err=%v，want errStillOver", err)
 	}
@@ -736,6 +736,200 @@ func TestFoldInputPhase2CapExhausted(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "当前 run 25 个单位折 20 个仍超") || !strings.Contains(err.Error(), "limit 100") {
 		t.Fatalf("死因应带诊断数字：%v", err)
+	}
+}
+
+// ---- B4：trim 兜底（19v6-09 §8 规则四件；预算 clamp / 还原顺序 / 预览夹比例 / copy-on-write / 循环守卫 / 出口接线）----
+
+// 预算 clamp 两端：window/5 落 [8192, 32768]；0（盲降未知窗）取下界。
+func TestToolTrimBudgetClamp(t *testing.T) {
+	cases := []struct{ window, want int }{
+		{0, trimBudgetMin},        // 盲降：窗未知取下界，裁得深是安全方向
+		{20000, trimBudgetMin},    // 4000 → 下界
+		{40960, trimBudgetMin},    // 8192 = 下界（临界）
+		{163840, trimBudgetMax},   // 32768 = 上界（临界）
+		{1048576, trimBudgetMax},  // 209715 → 上界
+	}
+	for _, c := range cases {
+		if got := toolTrimBudget(c.window); got != c.want {
+			t.Fatalf("toolTrimBudget(%d) = %d，want %d", c.window, got, c.want)
+		}
+	}
+}
+
+// 还原顺序 + 预览夹比例 + 原字节数 marker：4 条各 10000 runes、预算 32768（window 163840）——
+// 最新三条整条还原（r=3），最老一条装不下 → 1/4 头 + 3/4 尾预览夹（p=1），比例与格式逐字节钉住。
+func TestTrimCandidateRestoreNewestFirst(t *testing.T) {
+	counter := fakeCounter{f: func(s string) int { return len([]rune(s)) }}
+	big := strings.Repeat("a", 10000)
+	candidate := []ModelMessage{
+		{Role: "tool", Text: big, ToolCallID: "c0"},
+		{Role: "tool", Text: big, ToolCallID: "c1"},
+		{Role: "tool", Text: big, ToolCallID: "c2"},
+		{Role: "tool", Text: big, ToolCallID: "c3"},
+	}
+	out, restored, previewed, fired := trimCandidate(counter, 163840, candidate)
+	if !fired || restored != 3 || previewed != 1 {
+		t.Fatalf("fired=%v restored=%d previewed=%d，want true/3/1（最新三条还原、最老一条夹）", fired, restored, previewed)
+	}
+	// 账：marker 后余 32768−4mc；三条各还 (10000−mc) → 剩 2768−mc；夹的 maxCost = mc+剩 = 2768。
+	mc := len([]rune(fmt.Sprintf(trimMarkerFormat, len(big))))
+	keep := 2768 - 12 - mc // 固定件 12 = "\n\n" + "\n" + mid(8) + "\n"
+	if keep <= 0 || keep >= len(big) {
+		t.Fatalf("测试账算错：keep=%d", keep)
+	}
+	head, tail := keep/4, keep-keep/4
+	want := fmt.Sprintf(trimMarkerFormat, len(big)) + "\n\n" + big[:head] + "\n" + trimPreviewMidMark + "\n" + big[len(big)-tail:]
+	if out[0].Text != want {
+		t.Fatalf("预览夹格式/比例漂移：\n got %q\nwant %q", out[0].Text, want)
+	}
+	if out[1].Text != big || out[2].Text != big || out[3].Text != big {
+		t.Fatalf("更新的三条应整条还原")
+	}
+	if candidate[0].Text != big || candidate[3].Text != big {
+		t.Fatalf("入参候选被改写（copy-on-write 违例）")
+	}
+}
+
+// copy-on-write + 两个 no-op 形：动手时入参一字节不动、返回行与入参行不共享改写面；
+// 无工具行 / 未超预算 = 原候选原样（ok=false）。
+func TestTrimCandidateCopyOnWrite(t *testing.T) {
+	counter := fakeCounter{f: func(s string) int { return len([]rune(s)) }}
+	original := strings.Repeat("b", 9000)
+	candidate := []ModelMessage{{Role: "tool", Text: original, ToolCallID: "c1"}}
+	out, restored, previewed, fired := trimCandidate(counter, 40960, candidate) // 预算 8192 < 9000
+	if !fired || restored != 0 || previewed != 1 {
+		t.Fatalf("单条超预算应夹：fired=%v r=%d p=%d", fired, restored, previewed)
+	}
+	if candidate[0].Text != original {
+		t.Fatalf("入参被改写：%q", candidate[0].Text)
+	}
+	out[0].Text = "改写拷贝"
+	if candidate[0].Text != original {
+		t.Fatalf("返回行与入参共享改写面（copy-on-write 违例）")
+	}
+
+	noTool := []ModelMessage{{Role: "user", Text: original}}
+	if _, r, p, ok := trimCandidate(counter, 40960, noTool); ok || r != 0 || p != 0 {
+		t.Fatalf("无工具行应不动手：ok=%v r=%d p=%d", ok, r, p)
+	}
+	small := []ModelMessage{{Role: "tool", Text: "小果", ToolCallID: "c1"}}
+	out2, _, _, ok2 := trimCandidate(counter, 163840, small) // Σ=2 ≤ 32768
+	if ok2 || out2[0].Text != "小果" {
+		t.Fatalf("未超预算应原样：ok=%v text=%q", ok2, out2[0].Text)
+	}
+}
+
+// 循环守卫（B4 修）：单位数 3 < 封顶 20、组装恒超——「折尽」收口成带数字的 errStillOver，
+// 不再让 dropUnits 越界一步 panic。
+func TestFoldInputPhase2FoldToEmptyNoPanic(t *testing.T) {
+	calls := 0
+	summarize := func(_ context.Context, in string) (string, error) {
+		calls++
+		return "SUMMARY", nil
+	}
+	counter := fakeCounter{f: func(string) int { return 1_000_000 }}
+	rows := []ModelMessage{userRow("r_cur", 1, "eeee")}
+	for i := 0; i < 3; i++ {
+		rows = append(rows, ModelMessage{RunID: "r_cur", Seq: 2 + i, Role: "assistant", Text: fmt.Sprintf("m%02d", i)})
+	}
+	_, staged, err := foldInput(context.Background(), "", rows, "r_cur", 100, 0, counter, summarize, nil)
+	if !errors.Is(err, errStillOver) {
+		t.Fatalf("err=%v，want errStillOver（折尽仍超）", err)
+	}
+	if calls != 3 {
+		t.Fatalf("summarize 调用 %d 次，want 3（折尽即收口）", calls)
+	}
+	if staged != nil {
+		t.Fatalf("折尽仍超不应 Stage：%+v", staged)
+	}
+	if !strings.Contains(err.Error(), "当前 run 3 个单位折 3 个仍超") {
+		t.Fatalf("死因应带诊断数字：%v", err)
+	}
+}
+
+// 出口接线（B4 主场景）：21 单位（20 小轮 + 1 肥读）、phase 2 封顶仍超 → trim 肥工具结果 →
+// 重验过关 → 定案（staged + 裁剪候选），日志行格式钉死；历史原文行一字节不动。
+func TestFoldInputTrimRescuesCapExit(t *testing.T) {
+	buf := captureLog(t)
+	calls := 0
+	summarize := func(_ context.Context, in string) (string, error) {
+		calls++
+		return "SUMMARY", nil
+	}
+	counter := fakeCounter{f: func(s string) int { return len([]rune(s)) }}
+	fat := strings.Repeat("a", 30000)
+	rows := []ModelMessage{userRow("r_cur", 1, "eeee")}
+	for i := 0; i < 20; i++ {
+		rows = append(rows, ModelMessage{RunID: "r_cur", Seq: 2 + i, Role: "assistant", Text: fmt.Sprintf("m%02d", i)})
+	}
+	rows = append(rows,
+		ModelMessage{RunID: "r_cur", Seq: 22, Role: "assistant", ToolCalls: []schema.ToolCall{midCall("c1", "read_text_file", `{"path":"/a.txt"}`)}},
+		ModelMessage{RunID: "r_cur", Seq: 23, Role: "tool", Text: fat, ToolCallID: "c1"},
+	)
+	// limit 24000：20 档全部 ≥ limit（肥读恒在 rest）→ 封顶出口；window 40960 → trim 预算 8192。
+	assembled, staged, err := foldInput(context.Background(), "", rows, "r_cur", 24000, 40960, counter, summarize, nil)
+	if err != nil {
+		t.Fatalf("trim 应救回：%v", err)
+	}
+	if calls != maxUnitFoldAttempts {
+		t.Fatalf("summarize 调用 %d 次，want 封顶 %d 次", calls, maxUnitFoldAttempts)
+	}
+	if staged == nil || staged.AttachRun != "r_cur" || len(staged.DropRunIDs) != 0 || len(staged.MergedSummaryRunIDs) != 0 {
+		t.Fatalf("定案 staged 形状漂移（当前 run 不入翻转集）：%+v", staged)
+	}
+	if staged.Summary != "SUMMARY" {
+		t.Fatalf("无 file 调用不应有块：%q", staged.Summary)
+	}
+	if len(assembled) != 4 || assembled[0].Text != "SUMMARY" || assembled[1].Text != "eeee" {
+		t.Fatalf("定案候选形状漂移：%+v", assembled)
+	}
+	// 夹的账：预算 8192 → maxCost = 8192；keep = 8192 − 12 − mc。
+	mc := len([]rune(fmt.Sprintf(trimMarkerFormat, len(fat))))
+	keep := 8192 - 12 - mc
+	head, tail := keep/4, keep-keep/4
+	want := fmt.Sprintf(trimMarkerFormat, len(fat)) + "\n\n" + fat[:head] + "\n" + trimPreviewMidMark + "\n" + fat[len(fat)-tail:]
+	if assembled[3].Text != want {
+		t.Fatalf("肥工具结果应按预览夹定案：\n got %q\n want %q", assembled[3].Text, want)
+	}
+	if rows[22].Text != fat {
+		t.Fatalf("历史原文行被改写（留档原文应一字节不动）")
+	}
+	if !strings.Contains(buf.String(), "compact trim: 候选仍超线，trim 工具结果（预算 8192 tok，还原 0 条，夹 1 条）") {
+		t.Fatalf("trim 日志行漂移：%q", buf.String())
+	}
+}
+
+// 出口接线负路径：trim 动手但仍 ≥ limit → 原样 errStillOver（数字 = trim 后的最终计数），不 Stage。
+func TestFoldInputTrimStillOver(t *testing.T) {
+	buf := captureLog(t)
+	calls := 0
+	summarize := func(_ context.Context, in string) (string, error) {
+		calls++
+		return "SUMMARY", nil
+	}
+	counter := fakeCounter{f: func(s string) int { return len([]rune(s)) }}
+	rows := []ModelMessage{userRow("r_cur", 1, "eeee")}
+	for i := 0; i < 20; i++ {
+		rows = append(rows, ModelMessage{RunID: "r_cur", Seq: 2 + i, Role: "assistant", Text: fmt.Sprintf("m%02d", i)})
+	}
+	rows = append(rows,
+		ModelMessage{RunID: "r_cur", Seq: 22, Role: "assistant", ToolCalls: []schema.ToolCall{midCall("c1", "read_text_file", `{"path":"/a.txt"}`)}},
+		ModelMessage{RunID: "r_cur", Seq: 23, Role: "tool", Text: strings.Repeat("a", 30000), ToolCallID: "c1"},
+	)
+	// limit 6000 < trim 后地板（约 8200）→ 救不回；错误数字 = 最终尝试（trim 后）的计数。
+	_, staged, err := foldInput(context.Background(), "", rows, "r_cur", 6000, 40960, counter, summarize, nil)
+	if !errors.Is(err, errStillOver) {
+		t.Fatalf("err=%v，want errStillOver", err)
+	}
+	if staged != nil {
+		t.Fatalf("救不回不应 Stage：%+v", staged)
+	}
+	if !strings.Contains(err.Error(), "当前 run 21 个单位折 20 个仍超") || !strings.Contains(err.Error(), "≥ limit 6000") {
+		t.Fatalf("死因应带诊断数字：%v", err)
+	}
+	if !strings.Contains(buf.String(), "compact trim: 候选仍超线") {
+		t.Fatalf("trim 动手应有日志行：%q", buf.String())
 	}
 }
 
@@ -762,7 +956,7 @@ func TestFoldInputFlipClassification(t *testing.T) {
 			userRow("r_cur", 1, "eeee"),
 		},
 	)
-	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 100000, counter, summarize, nil)
+	assembled, staged, err := foldInput(context.Background(), "", history, "r_cur", 100000, 0, counter, summarize, nil)
 	if err != nil {
 		t.Fatalf("foldInput: %v", err)
 	}

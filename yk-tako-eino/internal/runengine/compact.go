@@ -381,12 +381,18 @@ func buildStaged(oldSummaryRuns []RunID, rawRuns, drop []runRows, currentRun Run
 // 且帽与摘要自身预算同值使块无预算、二档无成立空间）：全量钉 → 超则两表各砍 50 重渲染再验 →
 // 仍超 = 折叠失败（errStillOver，C2 已有链）。无操作 = 无块 = 检查不发生（无 file 工具会话零行为变化）。
 //
+// B4 trim 兜底（19v6-09 §8「压后仍超的最后手段」）：定案循环折尽仍超（n=0 / 单位折尽或封顶）
+// 时先 trim 候选——候选里的工具结果总量超预算（window/5，clamp [8192, 32768]）就压到预算内再
+// 验一次；过关即定案（trim 只动本次候选的拷贝，留档原文一个字节不动）。折叠恒优先于瘦身，
+// trim 只在下不来台时出场。window 由调用方给（midfold/worker 给声明窗；救援链给 extractWindow
+// 真值、盲降给 0）；window ≤ 0 时预算取下界 8192——裁得深是安全方向，裁后仍超走既有 errStillOver。
+//
 // 返回值：新输入（摘要行 + keep + 当前 run 行）与 stagedCompaction；errStillOver = 不调主模型、零写入。
 // 前提（A2 扩写）：超限（countInput(history) > limit）**或本层强制**（溢出救援：被拒输入 +
 // D4 现算的 limit'，只见于 rescueOverflow）才该进来；counter/summarize 非 nil。
 // fileEffects = 第一方工具 file_effect 声明表（fileops.go），钉块提取的判定入口。
 func foldInput(ctx context.Context, system string, history []ModelMessage, currentRun RunID,
-	limit int, counter TokenCounter, summarize func(context.Context, string) (string, error),
+	limit, window int, counter TokenCounter, summarize func(context.Context, string) (string, error),
 	fileEffects map[string]string) ([]ModelMessage, *StagedCompaction, error) {
 
 	// ---- 分组：history 已按 (run_id, seq) 有序，run_id 是 ULID（字典序 = 时序）。----
@@ -447,11 +453,38 @@ func foldInput(ctx context.Context, system string, history []ModelMessage, curre
 
 	// ---- 一档折叠 = summarize（旧摘要 + 本档 drop 渲染）→ 组装 → 含块收口（C5-A5 三档）。 ----
 	type foldTrial struct {
-		assembled []ModelMessage    // 收敛时的最终输入（含钉块）；未收敛时未填
+		assembled []ModelMessage    // 本档最终候选（收敛 = 含钉块；未收敛 = 组装原形——B4 trim 兜底的原料）
 		staged    *StagedCompaction // 收敛（组装 < limit 且块收口过）时非 nil
 		foldText  string
-		summary   string // 本档摘要；未收敛 = 原始产出（带数字死因用）
+		summary   string // 本档摘要；未收敛 = 原始产出（带数字死因用）；收敛 = 含钉块全文
 		total     int    // 本档组装计数
+	}
+	// converge 是「已 < limit 的候选」的公共收口（B4 起 tryFold 与 trim 兜底共用同一条尾巴）：
+	// C5-A5 钉块（收口口径，2026-10-11 用户拍：块 = 旧块继承 ∪ 本次 drop 提取，钉进发送候选的
+	// 摘要末尾；三档检查见函数头）→ 定案 t（summary/assembled/staged，组装行与落库摘要同源）。
+	// 返回 errStillOver = 块收口失败（第 3 档），调用方按既有折叠失败链出口。
+	converge := func(t *foldTrial, drop []runRows, assembled []ModelMessage, summary string) error {
+		ops := mergeFileOps(inheritFileOps(oldSummaryTexts), extractFileOps(dropMessages(drop), fileEffects))
+		res := resolveOps(ops)
+		if block := renderFileOpsBlock(res); block != "" {
+			assembled[0].Text = summary + fileOpsBlockSep + block
+			if countInput(counter, system, assembled) >= limit { // 第 1 档：全量钉不过收口
+				// 第 2 档减灾：两张表各砍 50（公平对待、无优先级），重渲染再验
+				cappedRes := resolvedOps{changed: capOps(res.changed), read: capOps(res.read)}
+				capped := renderFileOpsBlock(cappedRes)
+				assembled[0].Text = summary + fileOpsBlockSep + capped
+				if over := countInput(counter, system, assembled); over >= limit {
+					// 第 3 档：仍超 = fold 失败走干净 A（errStillOver 哨兵，C2 已有链）
+					return fmt.Errorf("%w（fileOps 块：全量 %d tok、砍 50 后 %d tok；发送合计 %d tok ≥ limit %d）",
+						errStillOver, counter.Count(block), counter.Count(capped), over, limit)
+				}
+			}
+			summary = assembled[0].Text
+		}
+		t.summary = summary
+		t.assembled = assembled
+		t.staged = buildStaged(oldSummaryRuns, rawRuns, drop, currentRun, summary)
+		return nil
 	}
 	tryFold := func(drop, keep, rest []runRows) (foldTrial, error) {
 		var t foldTrial
@@ -468,30 +501,12 @@ func foldInput(ctx context.Context, system string, history []ModelMessage, curre
 		}
 		t.total = countInput(counter, system, assembled)
 		if t.total >= limit {
+			t.assembled = assembled // B4：未收敛也留本档候选——trim 兜底（循环出口处）的原料
 			return t, nil // 未收敛：调用方按阶段推进下一档
 		}
-		// C5-A5 钉块（收口口径，2026-10-11 用户拍）：块 = 旧块继承 ∪ 本次 drop 提取，
-		// 钉进发送候选的摘要末尾。三档检查（见函数头注释）在下面就地展开。
-		ops := mergeFileOps(inheritFileOps(oldSummaryTexts), extractFileOps(dropMessages(drop), fileEffects))
-		res := resolveOps(ops)
-		if block := renderFileOpsBlock(res); block != "" {
-			assembled[0].Text = summary + fileOpsBlockSep + block
-			if countInput(counter, system, assembled) >= limit { // 第 1 档：全量钉不过收口
-				// 第 2 档减灾：两张表各砍 50（公平对待、无优先级），重渲染再验
-				cappedRes := resolvedOps{changed: capOps(res.changed), read: capOps(res.read)}
-				capped := renderFileOpsBlock(cappedRes)
-				assembled[0].Text = summary + fileOpsBlockSep + capped
-				if over := countInput(counter, system, assembled); over >= limit {
-					// 第 3 档：仍超 = fold 失败走干净 A（errStillOver 哨兵，C2 已有链）
-					return t, fmt.Errorf("%w（fileOps 块：全量 %d tok、砍 50 后 %d tok；发送合计 %d tok ≥ limit %d）",
-						errStillOver, counter.Count(block), counter.Count(capped), over, limit)
-				}
-			}
-			summary = assembled[0].Text
+		if err := converge(&t, drop, assembled, summary); err != nil {
+			return t, err
 		}
-		t.summary = summary
-		t.assembled = assembled
-		t.staged = buildStaged(oldSummaryRuns, rawRuns, drop, currentRun, summary)
 		return t, nil
 	}
 
@@ -520,6 +535,14 @@ func foldInput(ctx context.Context, system string, history []ModelMessage, curre
 			if len(units) == 0 {
 				// 全部老 run 折尽仍超（doc/12 §9）。带数字死因：限值是量级、摘要长度看模型，
 				// 没有这几个数就没法判断「差多少才能过」。
+				// B4（19v6-09 §8）：折叠已到极限，最后一手 = trim 候选（工具结果瘦身）——过关即定案。
+				t.assembled, t.total = trimTrial(counter, window, t.assembled, system)
+				if t.total < limit {
+					if err := converge(&t, drop, t.assembled, t.summary); err != nil {
+						return nil, nil, err
+					}
+					return t.assembled, t.staged, nil
+				}
 				return nil, nil, fmt.Errorf("%w（折叠 %d 个 run 共 %d tok → 摘要 %d tok；发送合计 %d tok ≥ limit %d）",
 					errStillOver, len(drop), counter.Count(t.foldText), counter.Count(t.summary), t.total, limit)
 			}
@@ -530,10 +553,12 @@ func foldInput(ctx context.Context, system string, history []ModelMessage, curre
 
 	// ---- phase 2：当前 run 的交换单位后缀收缩（19v6-10 §8）——一次吐一个最老单位进 drop，
 	// 每档 summarize + 组装计数；真止条件 = 组装计数 < limit；尝试封顶 maxUnitFoldAttempts
-	// 只兜底病态单位数（后缀预算 limit/3 是终止性论证，裁定 8）。 ----
+	// 只兜底病态单位数（后缀预算 limit/3 是终止性论证，裁定 8）。
+	// B4 守卫修正：条件带 dropUnits < len(units)——单位数 < 封顶时「折尽」也收口（旧条件
+	// len(units) > 0 在恒超 + 少单位下会让 dropUnits 越界一步、units[dropUnits:] panic）。
 	dropUnits := 0
 	var last foldTrial
-	for len(units) > 0 && dropUnits < maxUnitFoldAttempts {
+	for dropUnits < len(units) && dropUnits < maxUnitFoldAttempts {
 		dropUnits++
 		drop := append(append([]runRows{}, rawRuns...), units[:dropUnits]...)
 		t, err := tryFold(drop, nil, units[dropUnits:])
@@ -549,9 +574,137 @@ func foldInput(ctx context.Context, system string, history []ModelMessage, curre
 		// 无原料可折（老 run 空、当前 run 只剩 user 行）：原出口逐字节。
 		return nil, nil, errStillOver
 	}
-	// 单位折尽（≤ 封顶）或尝试封顶（> 封顶）仍超：诊断带数字。
+	// 单位折尽（≤ 封顶）或尝试封顶（> 封顶）仍超：B4 先 trim 候选（最后一次尝试的组装），
+	// 过关即定案；仍超 = 诊断带数字（原出口形态，数字 = trim 后的最终计数）。
+	last.assembled, last.total = trimTrial(counter, window, last.assembled, system)
+	if last.total < limit {
+		drop := append(append([]runRows{}, rawRuns...), units[:dropUnits]...)
+		if err := converge(&last, drop, last.assembled, last.summary); err != nil {
+			return nil, nil, err
+		}
+		return last.assembled, last.staged, nil
+	}
 	return nil, nil, fmt.Errorf("%w（当前 run %d 个单位折 %d 个仍超（老 run %d 个）；发送合计 %d tok ≥ limit %d）",
 		errStillOver, len(units), dropUnits, len(rawRuns), last.total, limit)
+}
+
+// ---- B4 trim 兜底（19v6-09 §8「压后仍超的最后手段」）----
+
+// 规则四件照抄 WeKnora observe.go 的 trimToolResultsToBudget（2026-10-16 实读对照）：预算 =
+// window/5 clamp [8192, 32768]（tok）；全部工具结果先换 marker（原字节数记账）；预算内从最新
+// 往回还原文本；放不下的给 1/4 头 + 3/4 尾预览夹。
+const (
+	trimBudgetDivisor = 5
+	trimBudgetMin     = 8192
+	trimBudgetMax     = 32768
+	// marker 与预览夹的两种文本件（〔〕是房内截断标记惯例，同 foldTruncMarkerFormat；
+	// 原字节数记账 = len(string) 字节，照 WeKnora original_bytes 口径）：
+	trimMarkerFormat   = "〔工具结果已瘦身：原 %d 字节；要细节请缩小范围重跑该工具〕"
+	trimPreviewMidMark = "…〔中段省略〕…"
+)
+
+// toolTrimBudget 是工具结果总预算（19v6-09 §8）：window/5，clamp [8192, 32768] tok。
+// window ≤ 0（盲降救援的未知窗）落 8192 下界：裁得深是安全方向，裁后仍超由调用方原样报错。
+func toolTrimBudget(window int) int {
+	budget := window / trimBudgetDivisor
+	if budget < trimBudgetMin {
+		budget = trimBudgetMin
+	}
+	if budget > trimBudgetMax {
+		budget = trimBudgetMax
+	}
+	return budget
+}
+
+// trimTrial 是折叠循环出口的 trim 一步（B4）：候选过 trimCandidate；动手了就打钉死的日志行
+// （格式见 19v6-09 §8，含预算与还原/夹条数），返回裁剪后的候选与重算的计数；未动手 = 原候选
+// 与原计数逐值不变。callers 用返回计数判「trim 后过关即定案」。
+func trimTrial(counter TokenCounter, window int, candidate []ModelMessage, system string) ([]ModelMessage, int) {
+	trimmed, restored, previewed, fired := trimCandidate(counter, window, candidate)
+	if fired {
+		log.Printf("compact trim: 候选仍超线，trim 工具结果（预算 %d tok，还原 %d 条，夹 %d 条）",
+			toolTrimBudget(window), restored, previewed)
+	}
+	return trimmed, countInput(counter, system, trimmed)
+}
+
+// trimCandidate 是 trim 的算法本体（B4；规则四件见上）：候选里的工具结果总和超预算才动手——
+// 全部工具结果先换 marker，预算内从最新往回还原原文；第一条放不下的给 1/4 头 + 3/4 尾预览夹，
+// 更老的只剩 marker。copy-on-write：返回的是候选的拷贝，入参一字节不动——留档原文（frames /
+// mh 原文行 / 容器 base）永不被 trim 改写，「库=模型所见」的差额只体现为候选与折后 state。
+// 返回（裁剪后候选，还原 r 条，夹 p 条，是否动手）：未动手（无工具行 / 未超预算）= 原候选原样。
+func trimCandidate(counter TokenCounter, window int, candidate []ModelMessage) ([]ModelMessage, int, int, bool) {
+	var idx []int
+	total := 0
+	for i := range candidate {
+		if candidate[i].Role == "tool" {
+			idx = append(idx, i)
+			total += countInput(counter, "", candidate[i:i+1])
+		}
+	}
+	if len(idx) == 0 || total <= toolTrimBudget(window) {
+		return candidate, 0, 0, false
+	}
+	out := append([]ModelMessage(nil), candidate...)
+	baseCost := make(map[int]int, len(idx))
+	remaining := toolTrimBudget(window)
+	for _, i := range idx {
+		out[i].Text = fmt.Sprintf(trimMarkerFormat, len(candidate[i].Text))
+		baseCost[i] = countInput(counter, "", out[i:i+1])
+		remaining -= baseCost[i]
+	}
+	if remaining < 0 {
+		remaining = 0
+	}
+	// 预算内从最新往回还原：整条塞得下 = 原文全还原；第一条塞不下的 = 头尾预览夹；更老的 marker。
+	restored, previewed := 0, 0
+	for k := len(idx) - 1; k >= 0; k-- {
+		i := idx[k]
+		extra := countInput(counter, "", candidate[i:i+1]) - baseCost[i]
+		if extra <= 0 {
+			out[i].Text = candidate[i].Text // 空/极短结果 marker 不省反涨：原样留，不动预算账
+			continue
+		}
+		if extra <= remaining {
+			out[i].Text = candidate[i].Text
+			remaining -= extra
+			restored++
+			continue
+		}
+		if remaining > 0 && trimPreview(counter, &out[i], candidate[i].Text, baseCost[i]+remaining) {
+			previewed++
+		}
+		remaining = 0
+	}
+	return out, restored, previewed, true
+}
+
+// trimPreview 给放不下的工具结果装预览夹（1/4 头 + 3/4 尾；WeKnora compactToolMessage 的二分
+// 同款）：在 maxCost 内找最大的保留量（runes 二分），装得下才改行；一条都塞不下 = 留 marker、
+// 返回 false（预算账由调用方清零）。
+func trimPreview(counter TokenCounter, row *ModelMessage, full string, maxCost int) bool {
+	marker := fmt.Sprintf(trimMarkerFormat, len(full))
+	runes := []rune(full)
+	best := ""
+	low, high := 1, len(runes)
+	for low <= high {
+		keep := low + (high-low)/2
+		head := keep / 4
+		tail := keep - head
+		probe := *row
+		probe.Text = marker + "\n\n" + string(runes[:head]) + "\n" + trimPreviewMidMark + "\n" + string(runes[len(runes)-tail:])
+		if countInput(counter, "", []ModelMessage{probe}) <= maxCost {
+			best = probe.Text
+			low = keep + 1
+		} else {
+			high = keep - 1
+		}
+	}
+	if best == "" {
+		return false
+	}
+	row.Text = best
+	return true
 }
 
 // renderFold 渲染一次摘要调用的输入：旧摘要（重压时，天然并入）在前，被压段原文按 run 时序在后。

@@ -40,6 +40,13 @@ import (
 	"github.com/cloudwego/eino/schema"
 )
 
+// agentMaxIterations 是单次 run 的模型调用上限（主代理与子代理共用；2026-10-16 用户裁定 50）。
+// eino ADK 默认 20，B4 活体发现这个默认值同时卡着折叠链：当前 run 的折叠单位数 ≤ 模型调用数，
+// 而「封顶出口」（折叠尝试封顶后仍超、候选里还剩工具行）需要单位数 ≥ 21 才存在——那是
+// trimToolResults 唯一的出场位置，默认值下 trim 恒空转。上限越高 = 单 run 能跑越长的工具循环，
+// 是产品取舍（50 为用户拍值），不是技术最小值。
+const agentMaxIterations = 50
+
 // ChatStream 是 worker 直连模型的口子：现在只剩 compact 摘要这一条路用（主循环已走 agent）；
 // 摘要不另开 agent（doc/12 §4，一次 Generate 级的动作，不该有 run/闸/帧的语义）。
 // eino 的 model.BaseChatModel（ToolCallingChatModel 的底）天然满足它。
@@ -206,6 +213,8 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		Name:        "yktako",
 		Instruction: system,
 		Model:       chat,
+		// 单 run 模型调用上限：eino 默认 20，2026-10-16 用户裁定放开到 50（agentMaxIterations，理由见常量注释）。
+		MaxIterations: agentMaxIterations,
 		ToolsConfig: adk.ToolsConfig{
 			ToolsNodeConfig: compose.ToolsNodeConfig{
 				Tools: pool,
@@ -223,12 +232,12 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 			newNoteSnapshotHandler(store, workspace, system),
 			// mid-run fold 钩子排在装载 handler 之后、观测 handler 之前（19v6-10 §4）：
 			// agentLog 看到的是模型实际所见的折后输入。
-			newMidfoldHandler(counter, compactLimit, sum.summarize, firstPartyFileEffects),
+			newMidfoldHandler(counter, compactWindow, compactLimit, sum.summarize, firstPartyFileEffects),
 			NewAgentLogHandler(),
-			// 溢出 guard（B1，D13）：链尾 = 最内 user wrapper——模型调用错误冒泡最先到它
-			// （wrappers.go:1129 逆序包裹、first registered = outermost）。本拍只观测：命中
-			// 「中途拒收」（溢出 ∧ 有帧）打一行、错误原样上抛，一期/三期全部形状零变化。
-			newOverflowGuard(compactWindow),
+			// 溢出 guard（B1 观测 → B2 救援链，D13；救援依赖与 midfold 同组装配件）：
+			// 链尾 = 最内 user wrapper——模型调用错误冒泡最先到它（wrappers.go:1129 逆序包裹、
+			// first registered = outermost）。四条件同真就折被拒输入重调一次；零帧/闸花原样上抛。
+			newOverflowGuard(compactWindow, counter, sum.summarize, firstPartyFileEffects),
 		},
 	})
 	if err != nil {
@@ -332,9 +341,10 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 	// 重试再拒时谓词读同一份（此时计数或闸已花，救援路径必然出不去）。
 	// 帧计数自 B1 起收编 foldBox（D12：guard 在模型调用点，worker 局部变量在它视野外）——
 	// 计数唯一真源 = box.frameCount()，worker 谓词与 guard 让位判据同源读。
+	// 一次性闸自 B2 起同样收编（D12，同一理由）：box.recovered() / box.tryMarkRecovered()，
+	// 三个消费方——A2 谓词、A3 检出②、B2 guard 救援——看同一个闸，guard 救过 A3 就不再触发检②。
 	// pendingForceFold 是检出②（A3）的强折意图：>0 = 本 run 检测到截断、run 末强折的目标线
 	// 基数（run 起手放行估算 C，doc §7）；写入发生在事件流排完后（Run 尾部）。
-	overflowRecovered := false
 	pendingForceFold := 0
 	for {
 		it := w.agent.Run(ctx, &adk.AgentInput{Messages: msgs, EnableStreaming: true})
@@ -346,10 +356,10 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 			}
 			if event.Err != nil {
 				overflow := w.compactWindow > 0 && IsOverflowError(event.Err)
-				if rescueWorthy(overflow, event.AgentName, box.frameCount(), overflowRecovered) {
+				if rescueWorthy(overflow, event.AgentName, box.frameCount(), box.recovered()) {
 					// 救援命中（doc §6）：闸先花（D5——无论强折成败，本 run 不再有第二次救援），
 					// 强折 mh 原文 + foldBox 同步，折成即换消息重跑；折不成记分类、原始错误照走。
-					overflowRecovered = true
+					box.tryMarkRecovered()
 					next, rerr := w.rescueOverflow(ctx, box, event.Err)
 					if rerr == nil {
 						msgs = next
@@ -365,7 +375,7 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 						window = strconv.Itoa(n)
 					}
 					log.Printf("overflow: provider 拒收（估算 %d tok；真值 %s）", box.countBase(), window)
-					if overflowRecovered {
+					if box.recovered() {
 						log.Printf("overflow: 已救过不再救")
 					}
 				}
@@ -420,8 +430,8 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 			// A3 检出②（doc §5/§7；只检主线程——折的是 mh/foldBox 这些 root 的量，子代理不救，§11）：
 			// 成功但被窗口截断。merged 的 ResponseMeta 带着 FinishReason 与 Usage（openai 组件恒开
 			// IncludeUsage、claude messageDelta 同面带，C2 plumbing 实读）。超窗行恒打（观测面：
-			// 实数 P 与估算 C 的偏差供运营商修窗标）；强折意图只记一次（闸与①共用，D5——命中即
-			// 花掉，一次 run 一个强折动作）。本答不救（D7）：帧面 append-only 撤不回，半截答案原样
+			// 实数 P 与估算 C 的偏差供运营商修窗标）；强折意图只记一次（闸与①/B2 guard 共用，D5——
+			// 命中即花掉，一次 run 一个强折动作）。本答不救（D7）：帧面 append-only 撤不回，半截答案原样
 			// 留给用户，run 正常 complete——救的是会话（run 尾部强折落库，见函数末）。
 			if agent == "" {
 				if hit := detectTruncation(merged.ResponseMeta, w.compactWindow); hit != nil {
@@ -431,8 +441,7 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 					}
 					log.Printf("overflow: 实数超窗：prompt_tokens %d > window %d（估算 %d tok；偏差 %d）%s",
 						hit.prompt, w.compactWindow, box.countBase(), hit.prompt-box.countBase(), suffix)
-					if !overflowRecovered {
-						overflowRecovered = true
+					if box.tryMarkRecovered() {
 						pendingForceFold = box.countBase()
 					}
 				}
@@ -477,7 +486,7 @@ func (w *Worker) runEndFold(ctx context.Context, box *foldBox, c int) error {
 	if err != nil {
 		return fmt.Errorf("重读 mh: %w", err)
 	}
-	folded, staged, err := foldInput(ctx, w.system, history, box.run, c*4/5, w.counter, w.sum.summarize, firstPartyFileEffects)
+	folded, staged, err := foldInput(ctx, w.system, history, box.run, c*4/5, w.compactWindow, w.counter, w.sum.summarize, firstPartyFileEffects)
 	if err != nil {
 		return fmt.Errorf("强折: %w", err)
 	}
@@ -503,7 +512,7 @@ func (w *Worker) rescueOverflow(ctx context.Context, box *foldBox, cause error) 
 	}
 	window, hasWindow := extractWindow(cause)
 	limit := rescueLimit(box.countBase(), window, hasWindow)
-	folded, staged, err := foldInput(ctx, w.system, history, box.run, limit, w.counter, w.sum.summarize, firstPartyFileEffects)
+	folded, staged, err := foldInput(ctx, w.system, history, box.run, limit, window, w.counter, w.sum.summarize, firstPartyFileEffects)
 	if err != nil {
 		return nil, fmt.Errorf("强折: %w", err)
 	}
@@ -660,7 +669,7 @@ func (w *Worker) prepareInput(ctx context.Context, sessionID SessionID, runID Ru
 		}
 		if total > limit {
 			log.Printf("compact %s/%s: 输入 %d tok > limit %d，进入折叠", sessionID, runID, total, limit)
-			history, staged, err = foldInput(ctx, w.system, history, runID, limit, w.counter, w.sum.summarize, firstPartyFileEffects)
+			history, staged, err = foldInput(ctx, w.system, history, runID, limit, w.compactWindow, w.counter, w.sum.summarize, firstPartyFileEffects)
 			if err != nil {
 				return nil, err
 			}

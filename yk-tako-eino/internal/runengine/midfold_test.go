@@ -172,7 +172,7 @@ func TestFoldBoxConcurrentSmoke(t *testing.T) {
 // ---- 钩子出口：断言违例（裁定 7，不 panic、不落 final）----
 
 func TestMidfoldHandlerAssertionErrors(t *testing.T) {
-	handler := newMidfoldHandler(fakeCounter{f: func(string) int { return 0 }}, 100,
+	handler := newMidfoldHandler(fakeCounter{f: func(string) int { return 0 }}, 0, 100,
 		func(context.Context, string) (string, error) { return "", nil }, nil)
 	ctx := withFoldBox(context.Background(), newFoldBox("s_1", "r_1"))
 
@@ -191,7 +191,7 @@ func TestMidfoldHandlerAssertionErrors(t *testing.T) {
 // ---- AfterAgent 取货口 + mhRowsFromFold 重编 ----
 
 func TestAfterAgentFinalAndMhRowsFromFold(t *testing.T) {
-	handler := newMidfoldHandler(fakeCounter{f: func(string) int { return 0 }}, 100, nil, nil)
+	handler := newMidfoldHandler(fakeCounter{f: func(string) int { return 0 }}, 0, 100, nil, nil)
 	box := newFoldBox("s_1", "r_cur")
 	box.setBase([]ModelMessage{{RunID: "r_cur", Seq: 1, Role: "user", Text: "问"}})
 	ctx := withFoldBox(context.Background(), box)
@@ -242,7 +242,7 @@ func TestMidfoldHandlerSecondFoldSameRun(t *testing.T) {
 		sumInputs = append(sumInputs, in)
 		return fmt.Sprintf("S%d", len(sumInputs)), nil
 	}
-	handler := newMidfoldHandler(counter, 150, summarize, nil)
+	handler := newMidfoldHandler(counter, 0, 150, summarize, nil)
 	box := newFoldBox("s_1", "r_cur")
 	box.setBase([]ModelMessage{
 		{RunID: "r_cur", Seq: 0, Role: "user", Text: "S0"},
@@ -436,7 +436,7 @@ func TestMidfoldUsageBaselineDecidesAndStripsReasoning(t *testing.T) {
 			{RunID: "r_cur", Seq: 0, Role: "user", Text: "BIG_老摘要"},
 			{RunID: "r_cur", Seq: 1, Role: "user", Text: "问"},
 		})
-		return newMidfoldHandler(bigCounter(), 150, summarize, nil), box
+		return newMidfoldHandler(bigCounter(), 0, 150, summarize, nil), box
 	}
 
 	t.Run("有账单：公式放行，全量口径本会折", func(t *testing.T) {
@@ -495,4 +495,189 @@ func TestMidfoldUsageBaselineDecidesAndStripsReasoning(t *testing.T) {
 				state.Messages[3].Content, state.Messages[3].ReasoningContent)
 		}
 	})
+}
+
+// TestFoldBoxRecoverGate 钉一次性救援闸的语义（B2，D12 收编）：tryMarkRecovered 首调花掉返
+// true、复调恒 false；recovered 是只读查问。三个消费方共用同一实现——A2 谓词问 recovered、
+// A3 检出②与 B2 guard 救援各自「我来救」时先花（tryMarkRecovered）——guard 救过之后 A3 的
+// 强折意图不再触发（「不重复触发」），反向同理（闸先花，A2/A3 判例）。
+func TestFoldBoxRecoverGate(t *testing.T) {
+	box := newFoldBox("s_1", "r_1")
+	if box.recovered() {
+		t.Fatal("新容器 recovered 应为 false")
+	}
+	if !box.tryMarkRecovered() {
+		t.Fatal("首调应花掉并返 true")
+	}
+	if !box.recovered() {
+		t.Fatal("花掉后 recovered 应为 true")
+	}
+	if box.tryMarkRecovered() {
+		t.Fatal("复调应返 false（A2 谓词 / A3 检出② / B2 guard 三处看同一个闸）")
+	}
+}
+
+// ---- B3 采用点：guard 救援的 state 层交接（D15）----
+
+// 采用点 1：槽非空 → 本轮跳过估算与折叠，state 换成「system + 槽 + 尾随行」（尾随行 = 救援点
+// 之后 ADK 追加的新行——重试回复、其工具结果）；base 换代 = 槽；尾随行思考被滤空；不重新摘要、
+// staged 不加条（guard 那一条原样）；槽取走即清。第二段再验采用后的正常折叠照常接管（base
+// 已是槽、坐标链随动——同 run 再超线走既有 mid-run 折叠，不是采用循环）。
+func TestMidfoldAdoptionPoint1(t *testing.T) {
+	buf := captureLog(t)
+	var sums int
+	handler := newMidfoldHandler(bigCounter(), 0, 150, func(context.Context, string) (string, error) {
+		sums++
+		return "S_new", nil
+	}, nil)
+	box := newFoldBox("s_1", "r_cur")
+	oldBase := []ModelMessage{
+		{RunID: "r_old", Seq: 1, Role: "user", Text: "老 BIG"},
+		{RunID: "r_cur", Seq: 1, Role: "user", Text: "问"},
+	}
+	box.setBase(oldBase)
+	// guard 已折成（B2 救援尾声的容器状态）：槽 = 折后行 + 救援点行数 = 被拒输入条数（4）。
+	slot := []ModelMessage{
+		{RunID: "r_old", Seq: 0, Role: "user", Text: "SUM"},
+		{RunID: "r_cur", Seq: 1, Role: "user", Text: "问"},
+	}
+	box.setAdopted(slot, 4)
+	box.appendStaged(StagedCompaction{AttachRun: "r_old", Summary: "SUM", DropRunIDs: []RunID{"r_old1"}})
+	box.addFrames(9)
+
+	reply := schema.AssistantMessage("", getTimeCall("c9"))
+	reply.ReasoningContent = "重试回复的思考（放行前应滤）"
+	state := &adk.ChatModelAgentState{Messages: []*schema.Message{
+		schema.SystemMessage("人设"),
+		schema.UserMessage("老 BIG"),
+		schema.UserMessage("问"),
+		schema.AssistantMessage("上答", nil),
+		reply,
+		schema.ToolMessage("果", "c9"),
+	}}
+	ctx := withFoldBox(context.Background(), box)
+	if _, _, err := handler.BeforeModelRewriteState(ctx, state, nil); err != nil {
+		t.Fatalf("BeforeModelRewriteState: %v", err)
+	}
+	// 形状：system + 槽 2 条 + 尾随行 2 条（重试回复、其工具结果）——不是「鼓的旧行」。
+	assertContents(t, state.Messages, "人设", "SUM", "问", "", "果")
+	assertRows(t, box.baseRows(), slot)
+	if sums != 0 {
+		t.Fatalf("采用不该重新摘要：sums=%d", sums)
+	}
+	if got := box.stagedList(); len(got) != 1 || got[0].Summary != "SUM" {
+		t.Fatalf("staged 被重写/加条: %+v", got)
+	}
+	if rc := state.Messages[3].ReasoningContent; rc != "" {
+		t.Fatalf("尾随行思考未滤: %q", rc)
+	}
+	if got, _ := box.takeAdopted(); got != nil {
+		t.Fatal("槽应已被取走清空")
+	}
+	if strings.Contains(buf.String(), "compact mid-run") || strings.Contains(buf.String(), "compact usage") {
+		t.Fatalf("采用路径不该走估算/折叠日志: %q", buf.String())
+	}
+
+	// 第二段：采用后 ADK 又追加一轮（asst c2 + BIG 工具结果）→ 同 run 再超线：既有 mid-run
+	// 折叠照常接管（base 已是槽），旧摘要并入、staged 追加一条——采用不是折叠循环。
+	state.Messages = append(state.Messages,
+		schema.AssistantMessage("", getTimeCall("c2")),
+		schema.ToolMessage("BIG_新果", "c2"),
+	)
+	if _, _, err := handler.BeforeModelRewriteState(ctx, state, nil); err != nil {
+		t.Fatalf("采用后的正常折叠: %v", err)
+	}
+	if sums == 0 {
+		t.Fatal("第二段该走普通折叠（超线未折）")
+	}
+	assertContents(t, state.Messages, "人设", "S_new", "问")
+	got := box.stagedList()
+	if len(got) != 2 || got[0].Summary != "SUM" || got[1].Summary != "S_new" {
+		t.Fatalf("staged = %+v, want [guard SUM, 普通 S_new] 两条", got)
+	}
+}
+
+// 采用后的下一轮：重试回复（带账单）留在 state 上——usageBasedInput 找得到锚点（基线 = 重试
+// 那份的 PromptTokens），不退回全量自测（doc/24 §5 的收益救援后不丢；若尾随行被丢则为全量口径、
+// 无 usage 行可查）。
+func TestMidfoldAdoptionKeepsUsageAnchor(t *testing.T) {
+	buf := captureLog(t)
+	handler := newMidfoldHandler(bigCounter(), 0, 150,
+		func(context.Context, string) (string, error) { return "S_new", nil }, nil)
+	box := newFoldBox("s_1", "r_cur")
+	box.setBase([]ModelMessage{{RunID: "r_cur", Seq: 1, Role: "user", Text: "问"}})
+	box.setAdopted([]ModelMessage{
+		{RunID: "r_cur", Seq: 0, Role: "user", Text: "SUM"},
+		{RunID: "r_cur", Seq: 1, Role: "user", Text: "问"},
+	}, 3)
+
+	reply := schema.AssistantMessage("答", nil)
+	reply.ResponseMeta = &schema.ResponseMeta{Usage: &schema.TokenUsage{PromptTokens: 10}}
+	state := &adk.ChatModelAgentState{Messages: []*schema.Message{
+		schema.SystemMessage("人设"), schema.UserMessage("鼓1"), schema.UserMessage("问"),
+		reply, // 第 4 条 = 尾随行（救援点 3 之后追加）
+	}}
+	ctx := withFoldBox(context.Background(), box)
+	if _, _, err := handler.BeforeModelRewriteState(ctx, state, nil); err != nil {
+		t.Fatalf("采用: %v", err)
+	}
+	state.Messages = append(state.Messages, schema.ToolMessage("果", "c1"))
+	if _, _, err := handler.BeforeModelRewriteState(ctx, state, nil); err != nil {
+		t.Fatalf("采用后的下一枪: %v", err)
+	}
+	if !strings.Contains(buf.String(), "compact usage s_1/r_cur: 基线 10 +") {
+		t.Fatalf("锚点脱钩（应见基线 10 的 usage 行）: %q", buf.String())
+	}
+}
+
+// 采用点 2：救援恰在收尾轮（槽没被采用点 1 取走）——AfterAgent 兜底：final = 槽 + 尾随行
+// （最终答复按槽坐标续接）；mhRowsFromFold 切出保留单位 + 最终答复（B2 校准话本 r2 的落库
+// 形状预演）；AfterAgent 不碰 base（后续没有模型调用，换代无意义）。
+func TestMidfoldAdoptionPoint2(t *testing.T) {
+	handler := newMidfoldHandler(bigCounter(), 0, 150, nil, nil)
+	box := newFoldBox("s_1", "r_cur")
+	box.setBase([]ModelMessage{{RunID: "r_cur", Seq: 1, Role: "user", Text: "问"}})
+	// 槽 = 救援折后行：老 run 摘要 + 本 run 保留往返（seq 2/3）。
+	slot := []ModelMessage{
+		{RunID: "r_old", Seq: 0, Role: "user", Text: "SUM"},
+		{RunID: "r_cur", Seq: 1, Role: "user", Text: "问"},
+		{RunID: "r_cur", Seq: 2, Role: "assistant", ToolCalls: getTimeCall("c1")},
+		{RunID: "r_cur", Seq: 3, Role: "tool", Text: "12:00", ToolCallID: "c1"},
+	}
+	box.setAdopted(slot, 6)
+	box.appendStaged(StagedCompaction{AttachRun: "r_old", Summary: "SUM"})
+
+	// state 鼓着（救援前原样 6 条）+ 重试终稿（第 7 条）——base 从未换代，索引锁定对不上。
+	state := &adk.ChatModelAgentState{Messages: []*schema.Message{
+		schema.SystemMessage("人设"),
+		schema.UserMessage("老"),
+		schema.UserMessage("问"),
+		schema.AssistantMessage("", getTimeCall("c1")),
+		schema.ToolMessage("12:00", "c1"),
+		schema.UserMessage("再问"),
+		schema.AssistantMessage("终稿", nil),
+	}}
+	ctx := withFoldBox(context.Background(), box)
+	if _, err := handler.AfterAgent(ctx, state); err != nil {
+		t.Fatalf("AfterAgent: %v", err)
+	}
+	assertRows(t, box.finalRows(), []ModelMessage{
+		{RunID: "r_old", Seq: 0, Role: "user", Text: "SUM"},
+		{RunID: "r_cur", Seq: 1, Role: "user", Text: "问"},
+		{RunID: "r_cur", Seq: 2, Role: "assistant", ToolCalls: getTimeCall("c1")},
+		{RunID: "r_cur", Seq: 3, Role: "tool", Text: "12:00", ToolCallID: "c1"},
+		{RunID: "r_cur", Seq: 4, Role: "assistant", Text: "终稿"},
+	})
+	// 落库投影 = 保留单位 + 最终答复（重编自 2 起）；被折走的本 run 单位不在列。
+	assertRows(t, mhRowsFromFold("r_cur", box.finalRows()), []ModelMessage{
+		{RunID: "r_cur", Seq: 2, Role: "assistant", ToolCalls: getTimeCall("c1")},
+		{RunID: "r_cur", Seq: 3, Role: "tool", Text: "12:00", ToolCallID: "c1"},
+		{RunID: "r_cur", Seq: 4, Role: "assistant", Text: "终稿"},
+	})
+	if got, _ := box.takeAdopted(); got != nil {
+		t.Fatal("槽应已被取走清空")
+	}
+	if got := box.baseRows(); len(got) != 1 {
+		t.Fatalf("AfterAgent 兜底不该动 base: %+v", got)
+	}
 }

@@ -16,7 +16,8 @@
 //   - 重写 state.Messages = [system 原样] + [新摘要(user)] + [保留区]（保留区恒含 user 行）。
 //     ToolInfos 不为所动（它是模型声明面，归别的 handler/装配面）。
 //
-// 没有新折叠算法：foldInput / countInput / renderFold 三个签名不动（planning 裁定 2），
+// 没有新折叠算法：foldInput / countInput / renderFold 算法本体不动（planning 裁定 2；B4 起
+// foldInput 加 window 形参走 trim 预算，见 compact.go），
 // 本文件对折叠链只做三件事——state ⇄ mh 形状的转换、容器读写、折叠日志（格式钉死在 planning 裁定 6）；
 // doc/24 之后多了第四件：发出前滤思考 + 有账单时的长度估算（下面两段，同样不动折叠算法本体）。
 //
@@ -61,6 +62,17 @@ type foldBox struct {
 	staged    []StagedCompaction // 折叠指令列表：Run fold 打头、mid-run 各次追加（EndRun 吃列表）
 	final     []ModelMessage     // 终态 mh 投影：仅 AfterAgent（成功终态）填——error / 取消不填
 	frames    int                // 已发帧计数（B1 从 worker 局部收编，D12）：A2 零帧判据 + guard 让其位的同源读数
+	// recoveredOnce 是「本 run 已救过一次」的一次性闸（B2 从 worker 局部变量收编，D12）：
+	// A2 零帧谓词读它（已救过不再救）、A3 强折闸花它、B2 guard 救援先花它。收编理由同 frames：
+	// guard 跑在模型调用点，worker 的局部变量在它视野外——两侧必须看同一个闸，否则
+	// 「guard 已救 = A3 不该再触发检②」无从判。读写只走 recovered() / tryMarkRecovered()
+	// （字段名避与同名方法冲突）。
+	recoveredOnce bool
+	// adoptedRows / adoptedLen 是 guard 救援的交接槽（B3，D15）：guard 在模型调用点折成后写入
+	// （折后行 + 被拒输入的条数），采用点在钩子里取走。与 recoveredOnce 同族：进程内交接物，
+	// 只走 setAdopted / takeAdopted 读写（takeAdopted 取走即清空——一次救援只有一个采用点消费）。
+	adoptedRows []ModelMessage
+	adoptedLen  int
 }
 
 func newFoldBox(session SessionID, run RunID) *foldBox {
@@ -128,6 +140,49 @@ func (b *foldBox) frameCount() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.frames
+}
+
+// recovered / tryMarkRecovered 是一次性闸的唯一读写口（B2，D12）：tryMarkRecovered 才是
+// 「花掉」——首次调用花掉并返 true，之后恒 false。三个消费方共用同一实现：A2 谓词问
+// 「已救过吗」（recovered）、A3 与 B2 guard 各自「我来救」时先花（tryMarkRecovered）。
+// 先花后救的顺序是语义：闸在折叠/重调之前就花掉，救援链自身再失败也不回滚（B2 折败 =
+// 原始错误上抛；同一 run 不二次救，doc §8）。
+func (b *foldBox) recovered() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.recoveredOnce
+}
+
+func (b *foldBox) tryMarkRecovered() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.recoveredOnce {
+		return false
+	}
+	b.recoveredOnce = true
+	return true
+}
+
+// setAdopted / takeAdopted 是 guard 救援交接槽的读写口（B3，D15）。inputLen = 被拒输入的条数
+// （guard 侧 len(input)），采用点用它把「救援之后 ADK 追加的新行」切出来接在槽后面（尾随行）：
+// 字面方案（只写 system+槽）会把这批新行丢掉——场景 a 丢「重试回复 + 它触发的工具结果」，
+// 下一轮模型看不到自己已调过工具 → 重发同一批调用（帧双份、工具做两遍），与 B2 已验收的
+// 「工具不重跑、帧不重发」当场冲突；场景 b 丢最终答复行本身（mh 少一行）。尾随行接回后两条
+// 不变量都保住；重试回复的账单（ResponseMeta.Usage，其 PromptTokens 恰对应槽）也留在 state
+// 上，下一轮 usageBasedInput 锚点不脱钩（doc/24 §5）。takeAdopted 读走即清空。
+func (b *foldBox) setAdopted(rows []ModelMessage, inputLen int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.adoptedRows = rows
+	b.adoptedLen = inputLen
+}
+
+func (b *foldBox) takeAdopted() ([]ModelMessage, int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	rows, n := b.adoptedRows, b.adoptedLen
+	b.adoptedRows, b.adoptedLen = nil, 0
+	return rows, n
 }
 
 // foldBoxKey 是 ctx 携带折叠容器的私有 key 类型（防撞车惯例同 agentModelTableKey）。
@@ -323,16 +378,18 @@ func usageBasedInput(counter TokenCounter, currentRun RunID, msgs []*schema.Mess
 // 快照段拼进它，数到的就是模型实见的（不再用构造期形参，「单一真源全从 state 读」）。
 type midfoldHandler struct {
 	*adk.BaseChatModelAgentMiddleware
+	window      int // = compactWindow：只喂 foldInput 的 trim 预算（B4，19v6-09 §8）；与 limit 同源、各用各的
 	limit       int // = compactLimit（compactLimitFor(window)）；<= 0 = 折叠休眠（只滤思考、不自测不折）
 	counter     TokenCounter
 	summarize   func(context.Context, string) (string, error) // = summarizer.summarize（同一条链同一个摘要器）
 	fileEffects map[string]string                             // = firstPartyFileEffects（钉块提取的判定入口）
 }
 
-func newMidfoldHandler(counter TokenCounter, limit int,
+func newMidfoldHandler(counter TokenCounter, window, limit int,
 	summarize func(context.Context, string) (string, error), fileEffects map[string]string) *midfoldHandler {
 	return &midfoldHandler{
 		BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{},
+		window:                       window,
 		limit:                        limit,
 		counter:                      counter,
 		summarize:                    summarize,
@@ -352,6 +409,21 @@ func (h *midfoldHandler) BeforeModelRewriteState(ctx context.Context, state *adk
 	}
 	// 滤思考与折叠休眠无关：limit<=0 / counter 缺时不再重发上一枪思考，仍然是对请求形状的正确修法。
 	if h.limit <= 0 || h.counter == nil {
+		stripReasoning(state.Messages)
+		return ctx, state, nil
+	}
+	// 采用点 1（B3，D15）：guard 刚救过（槽非空）→ 本轮跳过估算与折叠，直接把 state 换成
+	// 「system + 槽 + 尾随行」。尾随行 = 救援点之后 ADK 追加的新行（重试回复、其工具结果），
+	// 切分依据 = 槽里的救援点行数（见 setAdopted 注释）。base 换代 = 槽（坐标链随动）；
+	// 放行前照 doc/24 规则滤思考（尾随行里的重试回复带上一枪思考）。断言违例（state 比救援点
+	// 还短 = 重写链坏了）返回错误（裁定 7，出口与转换层同族）。
+	if slot, rescuedLen := box.takeAdopted(); slot != nil {
+		if len(state.Messages) < rescuedLen {
+			return ctx, state, fmt.Errorf("midfold: state 行数 %d 少于救援点 %d（采用链违例）", len(state.Messages), rescuedLen)
+		}
+		rewritten := append([]*schema.Message{state.Messages[0]}, toSchemaMessages(slot)...)
+		state.Messages = append(rewritten, state.Messages[rescuedLen:]...)
+		box.setBase(slot)
 		stripReasoning(state.Messages)
 		return ctx, state, nil
 	}
@@ -376,7 +448,7 @@ func (h *midfoldHandler) BeforeModelRewriteState(ctx context.Context, state *adk
 		return ctx, state, nil
 	}
 	log.Printf("compact mid-run %s/%s: 输入 %d tok > limit %d，进入折叠", box.session, box.run, total, h.limit)
-	folded, staged, err := foldInput(ctx, sys, history, box.run, h.limit, h.counter, h.summarize, h.fileEffects)
+	folded, staged, err := foldInput(ctx, sys, history, box.run, h.limit, h.window, h.counter, h.summarize, h.fileEffects)
 	if err != nil {
 		return ctx, state, err
 	}
@@ -402,6 +474,23 @@ func (h *midfoldHandler) BeforeModelRewriteState(ctx context.Context, state *adk
 func (h *midfoldHandler) AfterAgent(ctx context.Context, state *adk.ChatModelAgentState) (context.Context, error) {
 	box := foldBoxFrom(ctx)
 	if box == nil {
+		return ctx, nil
+	}
+	// 采用点 2（B3，D15）：救援发生在最后一次模型调用（收尾轮）——槽没被采用点 1 取走，
+	// 在这里兜底入 final：槽 + 尾随行（救援点之后 ADK 追加的新行 = 最终答复），尾随行按槽坐标
+	// 续接（newRowFromMessage）。不能走 convertState：state 鼓着（旧行还是救援前的原样、
+	// 与槽对不上）、base 未换代。缺这点 = 被救的最后一轮落坏账（最终答复行不进 mh）。
+	if slot, rescuedLen := box.takeAdopted(); slot != nil {
+		if len(state.Messages) < rescuedLen {
+			return ctx, fmt.Errorf("midfold: state 行数 %d 少于救援点 %d（采用链违例）", len(state.Messages), rescuedLen)
+		}
+		final := append([]ModelMessage{}, slot...)
+		next := nextRunSeq(slot, box.run)
+		for _, m := range state.Messages[rescuedLen:] {
+			final = append(final, newRowFromMessage(box.run, next, m))
+			next++
+		}
+		box.setFinal(final)
 		return ctx, nil
 	}
 	_, history, err := convertState(box.baseRows(), box.run, state.Messages)

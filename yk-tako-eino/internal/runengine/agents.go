@@ -399,7 +399,10 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 			Description: spec.Description,
 			Instruction: instruction,
 			Model:       subModel,
-			ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: pool}},
+			// 子代理与主代理同一条上限（agentMaxIterations，2026-10-16 用户裁定放开到 50）——
+			// 同一类模型循环不用两套上限，子代理折叠（doc/17 §6）将来同样吃这个值。
+			MaxIterations: agentMaxIterations,
+			ToolsConfig:   adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: pool}},
 			// 调用方身份标记（doc/22 §4）：web_search 按它查 agentModelTable 取该子代理自己的
 			// 生效 ref——不挂标记工具只能报错，挂主 ref 会把子代理的搜索打错厂商。
 			Handlers: []adk.ChatModelAgentMiddleware{&callerStampMiddleware{
