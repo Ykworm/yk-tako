@@ -426,11 +426,21 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 					if err != nil {
 						return err
 					}
+					// 子代理终稿行随行落本枪账单（doc/27 A3）：payload 列 = usage JSON；账单缺失
+					// （Usage nil = 厂商没报）不写列（payload NULL）。
+					var usageSQL any
+					if e.Usage != nil {
+						b, err := json.Marshal(e.Usage)
+						if err != nil {
+							return err
+						}
+						usageSQL = string(b)
+					}
 					if err := tx.Exec(
-						`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, created_at)
+						`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, payload, created_at)
 						 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
-						         ?, 'assistant', ?, ?, NULL, ?, now())`,
-						logID, sessionID, sessionID, runID, nullable(e.Agent), nullable(e.Model), pending[e.Agent]).Error; err != nil {
+						         ?, 'assistant', ?, ?, NULL, ?, ?, now())`,
+						logID, sessionID, sessionID, runID, nullable(e.Agent), nullable(e.Model), pending[e.Agent], usageSQL).Error; err != nil {
 						return err
 					}
 					pending[e.Agent] = ""
@@ -441,12 +451,19 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 				}
 			}
 			// root 模型生效 ref（终稿行的 model 值）：取自 root 条目的 Model（T3-1b 起每条都带；
-			// turn 全空 = 无模型产物，照旧 NULL）。
+			// turn 全空 = 无模型产物，照旧 NULL）。root 账单 = 最后一个带 Usage 的 root 条目
+			// （多枪工具循环取最后一枪 = 下一轮的基线，doc/27 §4b）。
 			rootModel := ""
+			var rootUsage *UsageBill
 			for _, e := range turn {
 				if e.Agent == "" && e.Model != "" {
 					rootModel = e.Model
 					break
+				}
+			}
+			for _, e := range turn {
+				if e.Agent == "" && e.Usage != nil {
+					rootUsage = e.Usage
 				}
 			}
 			logID, err := newRowID("rl_")
@@ -454,14 +471,23 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 				return err
 			}
 			// 终稿 assistant 行（text=draft）：与旧形状逐字节一致（agent NULL + model=主 ref），
-			// 「Σ delta == 定稿全文」的收口锚。
+			// 「Σ delta == 定稿全文」的收口锚。payload 列随行落 root 最后一枪账单（doc/27 A3；
+			// 账单缺失 = 厂商没报，不写列）。
 			// RETURNING 拿回本行 seq 即 runlogOffset（旧 Lua 的 LLEN 语义）。
+			var usageSQL any
+			if rootUsage != nil {
+				b, err := json.Marshal(rootUsage)
+				if err != nil {
+					return err
+				}
+				usageSQL = string(b)
+			}
 			if err := tx.Raw(
-				`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, created_at)
+				`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, payload, created_at)
 				 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
-				         ?, 'assistant', NULL, ?, NULL, ?, now())
+				         ?, 'assistant', NULL, ?, NULL, ?, ?, now())
 				 RETURNING seq`,
-				logID, sessionID, sessionID, runID, nullable(rootModel), draft).Scan(&nextSeq).Error; err != nil {
+				logID, sessionID, sessionID, runID, nullable(rootModel), draft, usageSQL).Scan(&nextSeq).Error; err != nil {
 				return err
 			}
 		} else {

@@ -202,7 +202,7 @@ func (s *Store) ReadLog(ctx context.Context, sessionID SessionID, from, w int) (
 		return nil, 0, false, err
 	}
 	for _, e := range entries {
-		rows = append(rows, Row{
+		row := Row{
 			RunlogOffset: int(e.Seq),
 			RunID:        e.RunID,
 			Role:         e.Role,
@@ -211,7 +211,17 @@ func (s *Store) ReadLog(ctx context.Context, sessionID SessionID, from, w int) (
 			MessageID:    e.MessageID,
 			Text:         e.Text,
 			Payload:      e.Payload,
-		})
+		}
+		// assistant 行 payload = usage JSON（doc/27 §4b）：解出注入 usage 字段、原文不透出；
+		// 无 payload（user 行 / 账单缺失）不写该字段。tool 扩展行 payload 照旧原样透出。
+		if e.Role == "assistant" && e.Payload != "" {
+			var bill UsageBill
+			if err := json.Unmarshal([]byte(e.Payload), &bill); err == nil {
+				row.Usage = &bill
+				row.Payload = ""
+			}
+		}
+		rows = append(rows, row)
 		nextOffset = int(e.Seq)
 	}
 	return rows, nextOffset, true, nil

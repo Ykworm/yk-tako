@@ -7,11 +7,23 @@ export type RunID = string
 
 export type Frame = {
   eventOffset?: number
-  kind: 'start' | 'delta' | 'terminal'
+  kind: 'start' | 'delta' | 'usage' | 'terminal'
+  agent?: string
+  model?: string
   messageId?: string
   text?: string
   status?: string
+  // usage 帧（doc/27 §4a）负载：账单缺失时引擎不发帧，这里不会出现全 0。
+  promptTokens?: number
+  completionTokens?: number
+  reasoningTokens?: number
+  totalTokens?: number
+  window?: number
 }
+
+// usage 账单展示切片（doc/27 §4a/§4b）：帧与 log 行 assistant 行的 usage 字段共用同形状。
+// window = 引擎 -compact-window 配置值；0 = 未配窗，只显示花销不显示占用。
+export type Usage = { promptTokens: number; completionTokens: number; window: number }
 
 export type Row = {
   runlogOffset?: number
@@ -19,6 +31,8 @@ export type Row = {
   role: 'user' | 'assistant'
   messageId?: string
   text: string
+  // assistant 行的 provider 账单（后端从 payload 列解出注入；user/tool 行不写该字段）。
+  usage?: Usage
 }
 
 export type PostRunsResponse = {

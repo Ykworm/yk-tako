@@ -1,11 +1,35 @@
 <script setup lang="ts">
 import { nextTick, onMounted, ref, watch } from 'vue'
 import { useChat } from './chat'
+import type { Usage } from './api'
 
 const { bubbles, draft, pending, loadingOlder, atStart, send, reconcile, loadOlder, newSession } = useChat()
 
 const listEl = ref<HTMLElement | null>(null)
 const pinned = ref(true)
+
+// usage 小字（doc/27 §4a 消费侧）：↑输入 ↓输出 · 输入/窗 (占比%)；无窗只显示花销。
+// 占比 >70% 橙、>90% 红（pi 阈值惯例）；1% 以下显示 <1 免得整轮 0%。
+function fmtTok(n: number): string {
+  if (n >= 1000) {
+    const k = n / 1000
+    return `${k >= 100 ? Math.round(k) : Number(k.toFixed(1))}k`
+  }
+  return String(n)
+}
+function usageText(u: Usage): string {
+  const a = fmtTok(u.promptTokens)
+  const line = `↑${a} ↓${fmtTok(u.completionTokens)}`
+  if (!u.window) return line
+  const pct = (u.promptTokens / u.window) * 100
+  const p = pct > 0 && pct < 1 ? '<1' : String(Math.round(pct))
+  return `${line} · ${a}/${fmtTok(u.window)} (${p}%)`
+}
+function usageClass(u: Usage): string {
+  if (!u.window) return ''
+  const pct = (u.promptTokens / u.window) * 100
+  return pct > 90 ? 'hot' : pct > 70 ? 'warm' : ''
+}
 
 function scrollBottom() {
   const el = listEl.value
@@ -97,6 +121,8 @@ async function onScroll() {
             </svg>
             失败，未进历史
           </p>
+          <span v-if="b.role === 'assistant' && b.usage" class="usage" :class="usageClass(b.usage)">{{ usageText(b.usage) }}</span>
+          <span v-else-if="b.role === 'assistant' && b.usageUnknown" class="usage">用量 ?</span>
         </div>
       </section>
 
@@ -396,6 +422,21 @@ header h1 {
   width: 0.8rem;
   height: 0.8rem;
   flex: none;
+}
+
+/* usage 小字（doc/27）：气泡下方一行灰字；>70% 橙、>90% 红 */
+.usage {
+  display: block;
+  margin-top: 0.35rem;
+  font-size: 0.7rem;
+  color: #8b8b96;
+  font-variant-numeric: tabular-nums;
+}
+.usage.warm {
+  color: #b45309;
+}
+.usage.hot {
+  color: #b03434;
 }
 
 /* ── 输入区：悬浮卡片 ── */

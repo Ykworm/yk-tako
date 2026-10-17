@@ -447,9 +447,27 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 					}
 				}
 			}
+			// usage 帧（doc/27 §4a）：每枪回执后压一帧 provider 账单进 runlive。root 与子代理同点
+			// （帧 agent 字段区分，前端第一版只渲染 root）。账单缺失或三数全 0 = 厂商没报 → 不发帧
+			// （不发 0，与 doc/24 usageBasedInput 的锚点判据同一句）。window 是 -compact-window
+			// 配置值非模型真值（真值校准归溢出层），0 = 未配窗、字段省略。同一账单随本轮 assistant
+			// 条目进 turn（A3：EndRun 把**最后一枪**的账单落终稿行 payload 列）。
+			bill, billOK := usageBill(merged, w.compactWindow)
+			if billOK {
+				live, err := w.store.AppendFrame(ctx, runID, usageFrame(bill, agent, entry.ref))
+				if err != nil {
+					log.Printf("frame %s/%s: %v", sessionID, runID, err)
+					status = "error"
+					return
+				}
+				if !live {
+					return
+				}
+				box.addFrames(1)
+			}
 			// 本轮合并全文进 turn（assistant 轮，root 与子代理都收——T3-2 起按 Agent 分拣归 EndRun）；
 			// ToolCalls 逐条压 tool_call 帧，args 取模型原始 JSON 原文。
-			turn = append(turn, TurnEntry{Role: "assistant", Agent: agent, Text: merged.Content, ToolCalls: merged.ToolCalls, Model: entry.ref})
+			turn = append(turn, TurnEntry{Role: "assistant", Agent: agent, Text: merged.Content, ToolCalls: merged.ToolCalls, Model: entry.ref, Usage: bill})
 			for _, tc := range merged.ToolCalls {
 				live, err := w.store.AppendFrame(ctx, runID, Frame{Kind: "tool_call", Agent: agent, Model: entry.ref, Name: tc.Function.Name, Args: tc.Function.Arguments})
 				if err != nil {
@@ -546,6 +564,37 @@ func mhRowsFromTurn(runID RunID, turn []TurnEntry) []ModelMessage {
 		seq++
 	}
 	return rows
+}
+
+// usageBill 从排干合并后的回执消息取 provider 账单（doc/27 §4a）。ok=false = 账单缺失
+// （ResponseMeta/Usage nil，或 Prompt/Completion/Total 三数全 0 = 厂商没报）——不发帧、不发 0、
+// turn 条目不带账单。promptTokens 即本枪发出的完整输入大小（含 system/schema/全部历史）＝
+// 上下文占用真值；window 是引擎配置值非模型真值。
+func usageBill(merged *schema.Message, window int) (*UsageBill, bool) {
+	if merged == nil || merged.ResponseMeta == nil || merged.ResponseMeta.Usage == nil {
+		return nil, false
+	}
+	u := merged.ResponseMeta.Usage
+	if u.PromptTokens == 0 && u.CompletionTokens == 0 && u.TotalTokens == 0 {
+		return nil, false
+	}
+	return &UsageBill{
+		PromptTokens:     u.PromptTokens,
+		CompletionTokens: u.CompletionTokens,
+		ReasoningTokens:  u.CompletionTokensDetails.ReasoningTokens,
+		TotalTokens:      u.TotalTokens,
+		Window:           window,
+	}, true
+}
+
+// usageFrame 把账单装成 usage 帧（帧 agent/model 标识产出方；数值列同 bill 逐字段拷贝）。
+func usageFrame(bill *UsageBill, agent, model string) Frame {
+	return Frame{Kind: "usage", Agent: agent, Model: model,
+		PromptTokens:     bill.PromptTokens,
+		CompletionTokens: bill.CompletionTokens,
+		ReasoningTokens:  bill.ReasoningTokens,
+		TotalTokens:      bill.TotalTokens,
+		Window:           bill.Window}
 }
 
 // drain 排干一条模型输出流：chunk → Translator → delta 帧；EOF 时把全部 chunk 合并成完整消息返回

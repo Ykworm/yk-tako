@@ -8,6 +8,7 @@ import {
   type Row,
   type RunID,
   type SessionID,
+  type Usage,
 } from './api'
 
 export type Bubble = {
@@ -16,6 +17,9 @@ export type Bubble = {
   role: 'user' | 'assistant'
   text: string
   state: 'queued' | 'streaming' | 'offline' | 'done' | 'error' | 'stopped'
+  usage?: Usage
+  // 本 tab 亲历收尾却全程无 usage 帧（厂商不报账单）→ 显示「用量 ?」，不静默。
+  usageUnknown?: boolean
 }
 
 // 一条待投投递 = 已渲染的 user 气泡 + 它那条 assistant 气泡 + 请求前就定下的 messageId
@@ -184,6 +188,15 @@ export function useChat() {
       let terminalStatus: string | null = null
       for (const f of resp.frames) {
         if (f.kind === 'delta' && f.text) assistant.text += f.text
+        // usage 帧（doc/27 §4a）：每枪一帧，多枪取最后一帧（= 下一枪的基线）；
+        // 子代理帧（agent 非空）第一版不渲染，跳过。
+        if (f.kind === 'usage' && !f.agent) {
+          assistant.usage = {
+            promptTokens: f.promptTokens ?? 0,
+            completionTokens: f.completionTokens ?? 0,
+            window: f.window ?? 0,
+          }
+        }
         if (f.kind === 'terminal') terminalStatus = f.status ?? 'complete'
       }
       eventOffset = resp.nextOffset
@@ -228,6 +241,8 @@ export function useChat() {
       assistant.state = 'error'
       return
     }
+    // 本 tab 亲历的收尾：全程没见过 usage 帧 = 厂商没报账单，标出来（error 态不标——失败气泡本就有说明行）。
+    if (!assistant.usage) assistant.usageUnknown = true
     if (terminalStatus === 'stopped') {
       // 半截文本原样保留（不替换）：没有定稿行可拉，人看见的就是停那一刻已流出的内容。
       assistant.state = 'stopped'
@@ -236,6 +251,11 @@ export function useChat() {
     const row = await drainLog(runId, assistant)
     if (row) {
       assistant.text = row.text
+      // 历史真源里也带账单（doc/27 §4b）：有就覆盖场内最后一帧，没有则维持 usageUnknown 判定。
+      if (row.usage) {
+        assistant.usage = row.usage
+        assistant.usageUnknown = false
+      }
       assistant.state = 'done'
       return
     }
@@ -319,7 +339,14 @@ export function useChat() {
   // 一条 log 行 → 气泡，并记账「最老已渲染 offset」（loadOlder 的翻页基准）。
   function rowBubble(r: Row): Bubble {
     noteRendered(r)
-    return { key: `log:${r.runlogOffset}`, runId: r.runId, role: r.role, text: r.text, state: 'done' }
+    return {
+      key: `log:${r.runlogOffset}`,
+      runId: r.runId,
+      role: r.role,
+      text: r.text,
+      state: 'done',
+      usage: r.usage,
+    }
   }
 
   function noteRendered(r: Row) {
@@ -367,6 +394,7 @@ export function useChat() {
             role: r.role,
             text: r.text,
             state: 'done' as const,
+            usage: r.usage,
           })),
         )
         oldestOffset = collected[0].runlogOffset ?? oldestOffset

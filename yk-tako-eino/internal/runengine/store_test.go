@@ -1034,6 +1034,81 @@ func TestEndRunLandsDelegationRows(t *testing.T) {
 	}
 }
 
+// 19. doc/27 A3：定稿 assistant 行 payload 列落 usage JSON——root 取最后一枪账单、子代理终稿行
+// 随行落本枪账单；ReadLog 解出注入 usage 字段（payload 原文不透出）；user/tool 行无该字段；
+// 账单缺失（厂商没报）= 不写列、usage 缺席。
+func TestEndRunLandsUsagePayload(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid, rid, rid2 := SessionID("s_1"), RunID("r_1"), RunID("r_2")
+	s.mustAcquire(t, sid, rid, "m_1", "帮我查一下时间")
+	s.mustDelta(t, ctx, rid, "好的，查完了。")
+
+	const mainRef = "deepseek/deepseek-flash"
+	deleg := schema.ToolCall{ID: "call_1", Type: "function",
+		Function: schema.FunctionCall{Name: "researcher", Arguments: `{"request":"查时间"}`}}
+	turn := []TurnEntry{
+		{Role: "assistant", Agent: "", Text: "好的，", ToolCalls: []schema.ToolCall{deleg}, Model: mainRef,
+			Usage: &UsageBill{PromptTokens: 100, CompletionTokens: 10, TotalTokens: 110}},
+		{Role: "assistant", Agent: "researcher", Text: "查完了。", Model: mainRef,
+			Usage: &UsageBill{PromptTokens: 200, CompletionTokens: 20, ReasoningTokens: 5, TotalTokens: 225, Window: 256000}},
+		{Role: "tool", Agent: "", Text: "查完了。", ToolCallID: "call_1", ToolName: "researcher", Model: mainRef},
+		{Role: "assistant", Agent: "", Text: "好的，查完了。", Model: mainRef,
+			Usage: &UsageBill{PromptTokens: 300, CompletionTokens: 30, TotalTokens: 330, Window: 256000}},
+	}
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, mhRowsFromTurn(rid, turn), turn); err != nil || !ok {
+		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
+	}
+
+	// 五行：user → tool_call(root) → assistant(researcher 终稿) → tool_result(root) → assistant(root 终稿)。
+	rows, _, exists, err := s.ReadLog(ctx, sid, 0, 200)
+	if err != nil || !exists {
+		t.Fatalf("ReadLog: exists=%v err=%v", exists, err)
+	}
+	if len(rows) != 5 {
+		t.Fatalf("runlog 行数 = %d, want 5", len(rows))
+	}
+	if rows[0].Usage != nil || rows[1].Usage != nil || rows[3].Usage != nil {
+		t.Errorf("user/tool_call/tool_result 行不该有 usage: %+v %+v %+v", rows[0], rows[1], rows[3])
+	}
+	if rows[1].Payload == "" {
+		t.Error("tool 扩展行 payload 应照旧原样透出")
+	}
+	sub := rows[2]
+	if sub.Usage == nil || sub.Usage.PromptTokens != 200 || sub.Usage.ReasoningTokens != 5 ||
+		sub.Usage.Window != 256000 {
+		t.Errorf("researcher 终稿行 usage = %+v, want 本枪账单（含 reasoning/window）", sub.Usage)
+	}
+	if sub.Payload != "" {
+		t.Errorf("assistant 行 payload 原文不该透出: %q", sub.Payload)
+	}
+	root := rows[4]
+	if root.Usage == nil || root.Usage.PromptTokens != 300 || root.Usage.PromptTokens == 100 {
+		t.Errorf("root 终稿行 usage = %+v, want 最后一枪账单（300，不是第一枪 100）", root.Usage)
+	}
+
+	// 账单缺失路径：同会话第二场 run 全程无 Usage → assistant 行 usage 缺席 + payload 列 NULL。
+	s.mustAcquire(t, sid, rid2, "m_2", "再来一条")
+	s.mustDelta(t, ctx, rid2, "好。")
+	turn2 := []TurnEntry{{Role: "assistant", Agent: "", Text: "好。", Model: mainRef}}
+	if _, _, ok, err := s.EndRun(ctx, sid, rid2, "complete", nil, mhRowsFromTurn(rid2, turn2), turn2); err != nil || !ok {
+		t.Fatalf("EndRun(r2): ok=%v err=%v", ok, err)
+	}
+	rows2, _, exists, err := s.ReadLog(ctx, sid, 5, 200)
+	if err != nil || !exists {
+		t.Fatalf("ReadLog(r2): exists=%v err=%v", exists, err)
+	}
+	if len(rows2) != 2 {
+		t.Fatalf("r2 行数 = %d, want 2", len(rows2))
+	}
+	if rows2[1].Usage != nil || rows2[1].Payload != "" {
+		t.Errorf("无账单 assistant 行不该有 usage/payload: %+v", rows2[1])
+	}
+	if !s.sqlBool(t, `SELECT payload IS NULL FROM runlog_entries WHERE run_id = ? AND role = 'assistant'`, rid2) {
+		t.Error("无账单 assistant 行 payload 应为 NULL（缺省不写字面空串）")
+	}
+}
+
 // ---- C 系列（compact）存储面回归网（C3 第 1/2/4/5 条；渲染/验货/重试/stall 边界在 compact_test.go）----
 
 // C3-1+2+5：EndRun(complete, staged) 同笔事务——被压行 compacted=true（原文保留）+ 新 seq=0 摘要行
