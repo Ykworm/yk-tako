@@ -108,8 +108,13 @@
   是预期态——lint 同时罩住未来的外来 MCP filesystem 服务器（挂进来不声明即拦）。
 - **工具描述面**：`description` 写给模型看——说清 workspace 相对路径约定、覆盖语义、
   体积上限。系统 prompt 不动（同 T2：描述自足，不污染 Instruction）。
-- **子代理继承**：池内工具对子代理规格的白名单/继承机制天然可见（19v6-05 §4 三态），
-  F 系列零额外工作。
+- **子代理继承**：池内工具对子代理规格的白名单/继承机制天然可见（19v6-05 §4 的工具面四态），
+  F 系列零额外工作。**2026-10-16 起多一步**（`doc/26` §7 登记的长期维护点）：新工具进父池会让
+  researcher 的有效名单变长（它走 `exclude_tools` 排除路，父池加什么就默认到达什么）⇒
+  `agents_test.go` 的 `TestShippedAgentSpecToolGuards` 红一次，红的时候当场决定这把给不给 researcher
+  （给 ⇒ 改金样；不给 ⇒ 往 `exclude_tools` 加一行、金样不动），并在 `agent tools researcher:` 日志行里复核。
+  这也是「新工具必须登记 `file_effect`（显式 `none` 也算）」的第二个理由：金样的名字宇宙派生自
+  `firstPartyFileEffects` 的键 ∪ `{get_time}`，不进注册表的新工具不在它的视野里。
 
 ## §5 与 fileOps / C5 的咬合
 

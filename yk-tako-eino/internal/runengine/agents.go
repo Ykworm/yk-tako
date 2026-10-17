@@ -37,22 +37,26 @@ import (
 
 // AgentSpec 是一条子代理规格。Name 是唯一身份
 // （= AgentTool 工具名 = runlog 的 agent 值；文件名不参与语义）。
-// Tools 三态靠指针区分：nil = 缺席（继承父池）/ 指向空切片 = 空集 / 指向非空 = 白名单按名映射。
+// 工具面四态（操作定义真源 = doc/26 §3，本注释只给判据）：Tools 三态靠指针区分——
+// nil = 缺席（继承父池）/ 指向空切片 = 空集 / 指向非空 = 白名单按名映射；第四态 =
+// Tools 为 nil 且 ExcludeTools 非 nil = 继承父池减去列出的名字。两行同写在 parse 层拒载。
 type AgentSpec struct {
-	Name        string
-	Description string
-	Tools       *[]string
-	Model       string // frontmatter model: 行原文——parse 只认语法，写法分流在装配层（19v6-05 §4）
-	Prompt      string // 正文 = system prompt
+	Name         string
+	Description  string
+	Tools        *[]string
+	ExcludeTools *[]string // 继承父池减去这些名字（doc/26）；与 Tools 互斥
+	Model        string    // frontmatter model: 行原文——parse 只认语法，写法分流在装配层（19v6-05 §4）
+	Prompt       string    // 正文 = system prompt
 }
 
 // agentSpecFront 是 frontmatter 的 YAML 形状。Model 原样带出：写了/没写、是关键词还是 ref，
 // 都在装配层分流——parse 层不做语义判断（19v6-05 §4）。
 type agentSpecFront struct {
-	Name        string    `yaml:"name"`
-	Description string    `yaml:"description"`
-	Tools       *[]string `yaml:"tools"`
-	Model       string    `yaml:"model"`
+	Name         string    `yaml:"name"`
+	Description  string    `yaml:"description"`
+	Tools        *[]string `yaml:"tools"`
+	ExcludeTools *[]string `yaml:"exclude_tools"`
+	Model        string    `yaml:"model"`
 }
 
 // LoadAgentSpecs 扫 dir 下的 *.md（按文件名排序）逐个解析校验。拒载是逐条语义：
@@ -98,8 +102,8 @@ func LoadAgentSpecs(dir string) ([]AgentSpec, error) {
 }
 
 // parseAgentSpec 拆 frontmatter 与正文：文件须以独立一行 --- 开头，下一个独立一行 --- 收口；
-// 中间是 YAML、之后是正文。KnownFields(true)：未知字段拒载——字段表是拍定的四字段，
-// 拼写手误（如 tool:）没有「悄悄忽略」的通道。
+// 中间是 YAML、之后是正文。KnownFields(true)：未知字段拒载——字段表是拍定的五字段
+// （doc/26 加 exclude_tools 之前是四字段），拼写手误（如 tool:）没有「悄悄忽略」的通道。
 func parseAgentSpec(raw []byte) (AgentSpec, error) {
 	text := strings.ReplaceAll(string(raw), "\r\n", "\n")
 	lines := strings.Split(text, "\n")
@@ -134,12 +138,18 @@ func parseAgentSpec(raw []byte) (AgentSpec, error) {
 	if f.Description == "" {
 		return AgentSpec{}, fmt.Errorf("缺必填字段 description（模型决定委派与否的唯一入口）")
 	}
+	// 互斥在 parse 层判、不留给 resolveToolPool（doc/26 §3）：两行同写时「实际名单取决于代码里
+	// 两个分支的先后」，改一次判断顺序就换一份能力面——那是护栏最不该有的性质。
+	if f.Tools != nil && f.ExcludeTools != nil {
+		return AgentSpec{}, fmt.Errorf("tools: 与 exclude_tools: 不能同时写（前者是「只给这些」，后者是「继承父池减去这些」）——二选一")
+	}
 	return AgentSpec{
-		Name:        f.Name,
-		Description: f.Description,
-		Tools:       f.Tools,
-		Model:       f.Model,
-		Prompt:      strings.TrimSpace(strings.Join(lines[end+1:], "\n")),
+		Name:         f.Name,
+		Description:  f.Description,
+		Tools:        f.Tools,
+		ExcludeTools: f.ExcludeTools,
+		Model:        f.Model,
+		Prompt:       strings.TrimSpace(strings.Join(lines[end+1:], "\n")),
 	}, nil
 }
 
@@ -438,6 +448,13 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 			log.Printf("agents: %s: 拒载: 子代理装配失败: %v", spec.Name, err)
 			continue
 		}
+		// 装载观测面（doc/26 §6）：这条规格这一场**实际**拿到的有效名单。exclude_tools 形状下规格
+		// 文件里只写着例外，实际名单是「父池减去排除项」算出来的、父池一变就变——没这行，想知道某条
+		// 子代理能干什么只能人脑跑一遍四态，护栏验收就退化成模型自觉（doc/21 §5 明写不靠模型自觉）。
+		// 放在装配成功之后 ⇒ 拒载的规格打不出这行，日志里出现的名单都是真生效的；一行明细排在
+		// 下面那段多行 system dump 之前，grep "agent tools" 直接出逐条名单。
+		_, toolNames := poolIndex(ctx, pool)
+		log.Printf("agent tools %s: %s", spec.Name, strings.Join(toolNames, ", "))
 		// 子代理 system 全文日志（M5 观测面，转正点 planning §7）：装载时打拼接后 Instruction——
 		// 快照句在规格正文之后的活体证据就靠它。
 		log.Printf("agent system %s:\n%s", spec.Name, instruction)
@@ -456,19 +473,43 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 	return ctx, runCtx, nil
 }
 
-// resolveToolPool 按 Tools 指针的三态解析子代理的工具池：
-//   - Tools == nil（没写 tools 行）→ 继承父池快照（拷贝一份，调用方后续 append 不串扰）
+// resolveToolPool 按规格的工具面四态解析子代理的工具池（操作定义真源 doc/26 §3）：
+//   - Tools == nil 且 ExcludeTools == nil（两行都没写）→ 继承父池快照（拷贝一份，调用方后续 append 不串扰）
 //   - Tools 指向空切片（写了 tools: []）→ 空集
 //   - Tools 指向非空切片（写了 tools: [a, b]）→ 按名映射，未知名报错带可选名单
+//   - ExcludeTools 非 nil（写了 exclude_tools: [a]；与 tools: 互斥，同写已在 parse 层拒）→
+//     继承父池减去列出的名字，见 excludeFromPool
+//
+// 名称空间四态同一个 = base（入口快照，此刻还没有任何委派工具 ⇒ 天然禁嵌套，
+// 写 exclude_tools: [coder] 是未知名、拒载）。
 func resolveToolPool(ctx context.Context, spec AgentSpec, base []tool.BaseTool) ([]tool.BaseTool, error) {
 	if spec.Tools == nil {
-		return append([]tool.BaseTool(nil), base...), nil
+		if spec.ExcludeTools == nil {
+			return append([]tool.BaseTool(nil), base...), nil
+		}
+		return excludeFromPool(ctx, base, *spec.ExcludeTools)
 	}
 	if len(*spec.Tools) == 0 {
 		return nil, nil
 	}
+	byName, names := poolIndex(ctx, base)
+	pool := make([]tool.BaseTool, 0, len(*spec.Tools))
+	for _, name := range *spec.Tools {
+		t, ok := byName[name]
+		if !ok {
+			return nil, fmt.Errorf("tools 列了未知名 %q（可选: %s）", name, strings.Join(names, ", "))
+		}
+		pool = append(pool, t)
+	}
+	return pool, nil
+}
+
+// poolIndex 按 Info().Name 给父池建索引，同时保序带出名字表（两条「未知名」报错的可选名单用它）。
+// 第三态与第四态共用这一份——两处各写一遍 Info() 循环就会各自腐化。
+// Info 失败的工具跳过（与第三态既有行为一致：它进不了可选名单，也就无从被挑中或排除）。
+func poolIndex(ctx context.Context, base []tool.BaseTool) (map[string]tool.BaseTool, []string) {
 	byName := make(map[string]tool.BaseTool, len(base))
-	var names []string
+	names := make([]string, 0, len(base))
 	for _, t := range base {
 		info, err := t.Info(ctx)
 		if err != nil {
@@ -477,11 +518,31 @@ func resolveToolPool(ctx context.Context, spec AgentSpec, base []tool.BaseTool) 
 		byName[info.Name] = t
 		names = append(names, info.Name)
 	}
-	pool := make([]tool.BaseTool, 0, len(*spec.Tools))
-	for _, name := range *spec.Tools {
-		t, ok := byName[name]
-		if !ok {
-			return nil, fmt.Errorf("tools 列了未知名 %q（可选: %s）", name, strings.Join(names, ", "))
+	return byName, names
+}
+
+// excludeFromPool 是第四态：父池减去 drop 里的名字，其余**按父池顺序**原样带出
+// （结果序是池序不是排除项序），元素与父池是同一个工具对象——不换壳，与 doc/21 H4 同判据。
+// 空列表 = 零排除 = 与不写同结果（显式表态「已看过、一个不排除」是合法配置，不报错）。
+// 排除项里有一个名字父池没有 → 报错：不报就是护栏最哑的失效方式——bash 拼成 bashh 被悄悄忽略，
+// 规格文件看起来已经挡住了，子代理照旧能跑命令。
+func excludeFromPool(ctx context.Context, base []tool.BaseTool, drop []string) ([]tool.BaseTool, error) {
+	if len(drop) == 0 {
+		return append([]tool.BaseTool(nil), base...), nil
+	}
+	byName, names := poolIndex(ctx, base)
+	skip := make(map[string]bool, len(drop))
+	for _, name := range drop {
+		if _, ok := byName[name]; !ok {
+			return nil, fmt.Errorf("exclude_tools 列了未知名 %q（可选: %s）", name, strings.Join(names, ", "))
+		}
+		skip[name] = true
+	}
+	pool := make([]tool.BaseTool, 0, len(base))
+	for _, t := range base {
+		info, err := t.Info(ctx)
+		if err != nil || skip[info.Name] {
+			continue
 		}
 		pool = append(pool, t)
 	}

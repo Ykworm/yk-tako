@@ -73,7 +73,8 @@ index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型�
   （`once.Do`、首次 Run 前冻结）⇒ 要新鲜只能重装配 ⇒ 装载点 = 重装配点 = run 起手。
   实现取 `BeforeAgent` 换本次工具列表（T3-1 源码实读 + 真栈落地）；随仓 seed 一条 tako 自写规格。
 - **字段表（2026-10-09 裁）**：`name`（单字段身份 = AgentTool 工具名 = runlog `agent` 值；文件名不参与语义；
-  撞名 → 拒该条 + 显式报错）/ `description`（必填，缺 → 拒该条报错）/ `tools`（三态，见下）/
+  撞名 → 拒该条 + 显式报错）/ `description`（必填，缺 → 拒该条报错）/ `tools`（2026-10-09 三态、
+  2026-10-16 加 `exclude_tools` 成四态，见下与 `doc/26` §3）/
   `model`（写值分**三种写法穷举**，不漏不重，实现落 T3-1b，链路与例子见下）：
 
   | 写法编号 | 在 agents/*.md 里怎么写 `model:` | 含义 | 行为 | YAML 例子 |
@@ -91,7 +92,7 @@ index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型�
   - **parse 层（`parseAgentSpec`）**：只管拆 YAML 语法，把 `model:` 那一行的字符串**原样拿出来**，**不在这里判断是写法一/二/三**——判断留到装配层做，理由是 parse 只该认语法、不该懂语义
   - **装配层（BeforeAgent）**：同一个钩子函数里拿刚才原样带出的字符串，按上面三种写法的穷举表**分流**——写法一/二合并走「继承」路，写法三走「查 ModelRegistry」路
 
-  用三条具体规格跑一遍全链路（主 worker 启动时 `TAKO_MODEL=deepseek/deepseek-v4-flash`，主实例已经建好）：
+  用三条具体规格跑一遍全链路（主 worker 启动时 `TAKO_MODEL=deepseek/deepseek-v4-flash`，主实例已经建好。下图里 ① 的「什么都没写」**只指 `model:` 那一行**——`researcher.md` 自 2026-10-16 起写了 `exclude_tools` 工具排除名单，`model:` 仍不写，见 `doc/26`）：
 
 ```text
 ┌─ 三条具体规格（agents/*.md） ───────────────────────────────────────────────┐
@@ -242,8 +243,12 @@ index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型�
   seq 串行分配——**并行不改表**，无共享可变状态。
 - **嵌套**：默认禁止（子代理规格不挂委派工具，pi 同款）；开放时 max=1 且深度持久化防 resume 绕过
   （dsh 默认）——随用例再立。
-- **规格 `tools` 字段（2026-10-09 更新为三态）**：**不写 → 继承父池**（父池已摘掉委派工具 = 禁嵌套；pi/harness 同款）/
-  **白名单**（按名从父池映射）/ **`[]` 空集**（「不写 vs 写空」用 nil / 空 slice 分开表达）。
+- **规格的工具面字段（`tools` 2026-10-09 定为三态；2026-10-16 加 `exclude_tools` 成四态，`doc/26`）**：
+  **不写 → 继承父池**（父池已摘掉委派工具 = 禁嵌套；pi/harness 同款）/
+  **白名单**（按名从父池映射）/ **`[]` 空集**（「不写 vs 写空」用 nil / 空 slice 分开表达）/
+  **`exclude_tools: [名字…]` → 继承父池减去列出的名字**（新字段，与 `tools:` **互斥**：同写整条拒载；
+  排除一个父池没有的名字也拒载；`exclude_tools: []` 视同不写。结果序是池序、元素是父池同一批对象。
+  四态表与操作定义只在 `doc/26` §3 一份，这里不复述）。
   「+search」= 保留名 **`tool_search`** 进列表（用户 2026-10-08 裁「子代理挂 search，当然要」；**实现随 T4 触发拍**）——
   搜索范围 = **自己的池**（统一规则见 §5）。T3 期池内工具**全声明**（无 deferred 机械件，分级随 T4 触发）。
 - **预算面（2026-10-09 三裁）**——**取消是控制面的事（abort 级联），不是时间面的事**（用户裁，并指 Google ADK 同立场）：
@@ -258,7 +263,7 @@ index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型�
     截点回退到 UTF-8 rune 边界（绝不劈开多字节字符，保留段最多比帽少 3 字节）；`cap ≤ 0` = 不裁剪。
     尾缀里的「subagent runlog」= 同一 log 端点上该 agent 的行（无新端点；客户端按行内 `agent` 字段跳转）。
   - **两个旋钮（main 旗标；选择归 human 写配置）**：`-subagent-concurrency`（默认 8；进程级信号量、全部规格共享；<1 = 启动即拒——0 = 所有委派永久等闸）+ `-subagent-return-cap`（默认 51200 B）；启动日志 `subagents: concurrency N, return cap M B`。
-  - **随仓 seed 规格** `yk-tako-eino/agents/researcher.md`（开箱可跑 + 格式参照）：不写 `tools` / 不写 `model` = 两个继承档（继承父池 / 继承主实例）的活样例。
+  - **随仓 seed 规格** `yk-tako-eino/agents/researcher.md`（开箱可跑 + 格式参照）：不写 `model` = 继承主实例那一档的活样例。`tools` 那一档自 2026-10-16 起改写成 `exclude_tools` 排除名单（`doc/26`：排除 `bash` 与写类四把，有效名单 11 项），不再是「什么都不写」的样例——**「两行都不写 = 整份继承父池」这一档今天没有出厂规格在用**，它仍是合法写法（`resolveToolPool` 第一态），但 `agents_test.go` 的 `TestShippedAgentSpecToolGuards` 要求出厂规格写 `tools:` / `exclude_tools:` 之一，有意继承要在测试的 `inheritOK` 里显式表态。
 - 挂账：continuable/后台子代理（dsh send_message/jobs）、出进程 provider（acp/codex/claude-code）、
   **子代理目录的运行时安装**（Octop catalog/install）、**子代理运行中途改自己的工具集**
   （Eino `BeforeAgent` 可改、用例未逼出）——后两条 2026-10-08 用户裁「先别搞，记下来」。

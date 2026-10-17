@@ -182,8 +182,9 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		return nil, err
 	}
 	pool = append(pool, wrapToolErrors(bash))
-	// 笔记工具入池（M1，notes.go）：文件工具族之后 append——子代理继承整池时天然拿到它
-	// （researcher 不写 tools 行 = 继承）；写入逻辑全在 writeNote。
+	// 笔记工具入池（M1，notes.go）：文件工具族之后 append——继承整池的子代理天然拿到它；
+	// researcher 走的是 exclude_tools 排除路（doc/26），memory 不在排除项里，仍在它的有效名单。
+	// 写入逻辑全在 writeNote。
 	mem, err := newMemoryTool(store, workspace)
 	if err != nil {
 		return nil, err

@@ -18,9 +18,11 @@ import (
 	"github.com/cloudwego/eino/schema"
 )
 
-// agents_test.go 钉装载面最容易悄悄坏的三处：frontmatter 的 tools 三态（缺席/[]/名单——靠 *[]string
-// 指针区分，yaml.v3 对 `tools: []` 必须给出非 nil 空切片）、逐条拒载语义（坏文件不拖垮其余）、
-// model 三写法分流（不写/default|inherit|继承 不进注册表；ref 档查表、失败拒该条）。
+// agents_test.go 钉装载面最容易悄悄坏的五处：frontmatter 的 tools 三态（缺席/[]/名单——靠 *[]string
+// 指针区分，yaml.v3 对 `tools: []` 必须给出非 nil 空切片）、exclude_tools 第四态（继承父池减排除项，
+// doc/26）与它和 tools 的互斥、逐条拒载语义（坏文件不拖垮其余）、model 三写法分流（不写/
+// default|inherit|继承 不进注册表；ref 档查表、失败拒该条）、以及**出厂规格的有效名单金样**
+// （TestShippedAgentSpecToolGuards，读 ../../agents 真文件）。
 
 func writeSpec(t *testing.T, dir, name, content string) {
 	t.Helper()
@@ -102,11 +104,197 @@ func TestResolveToolPool(t *testing.T) {
 	}
 }
 
+// TestResolveToolPoolExclude 钉 doc/26 的第四态（exclude_tools = 继承父池减去列出的名字）。三态在上面
+// 那支；第四态单独一支是因为它有三处独有性质：① 结果**顺序是池序、不是排除项序**（写成 [c a] 与
+// 写成 [a c] 同结果）；② 元素与父池是同一个工具对象（不换壳，与下面 H4 那支同判据）；③ 空列表 =
+// 与不写同结果（显式「已看过、一个不排除」是合法表态，不该报错）。
+// 外加一条拒载：排除一个父池没有的名字 ⇒ 报错并报出那个名字。不报就是护栏最哑的失效方式——
+// bash 拼成 bashh 被悄悄忽略，规格文件看起来已经挡住了，子代理照旧能跑命令。
+func TestResolveToolPoolExclude(t *testing.T) {
+	ctx := context.Background()
+	base := []tool.BaseTool{
+		&fakeInvokableTool{info: &schema.ToolInfo{Name: "a"}},
+		&fakeInvokableTool{info: &schema.ToolInfo{Name: "b"}},
+		&fakeInvokableTool{info: &schema.ToolInfo{Name: "c"}},
+	}
+	names := func(t *testing.T, pool []tool.BaseTool) []string {
+		t.Helper()
+		out := make([]string, 0, len(pool))
+		for _, x := range pool {
+			info, err := x.Info(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, info.Name)
+		}
+		return out
+	}
+
+	drop := []string{"b"}
+	pool, err := resolveToolPool(ctx, AgentSpec{ExcludeTools: &drop}, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := names(t, pool); !reflect.DeepEqual(got, []string{"a", "c"}) {
+		t.Fatalf("排除 b 应得池序 [a c]，实得 %v", got)
+	}
+	if pool[0] != base[0] || pool[1] != base[2] {
+		t.Fatal("第四态必须原对象搬运（不换壳）——池内元素与父池不是同一个接口值")
+	}
+
+	reversed := []string{"c", "a"}
+	pool, err = resolveToolPool(ctx, AgentSpec{ExcludeTools: &reversed}, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := names(t, pool); !reflect.DeepEqual(got, []string{"b"}) {
+		t.Fatalf("排除 [c a] 应得 [b]（结果序是池序不是排除项序），实得 %v", got)
+	}
+
+	zero := []string{}
+	inherited, err := resolveToolPool(ctx, AgentSpec{}, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err = resolveToolPool(ctx, AgentSpec{ExcludeTools: &zero}, base)
+	if err != nil {
+		t.Fatalf("exclude_tools: [] 应与不写同结果、不报错，实得 %v", err)
+	}
+	if !reflect.DeepEqual(names(t, pool), names(t, inherited)) {
+		t.Fatalf("空排除应与继承同结果: %v vs %v", names(t, pool), names(t, inherited))
+	}
+	if reflect.ValueOf(pool).Pointer() == reflect.ValueOf(base).Pointer() {
+		t.Fatal("空排除也必须拷贝切片——装载 handler 会就地 append 委派工具，共享底层数组即串扰")
+	}
+
+	typo := []string{"bashh"}
+	if _, err := resolveToolPool(ctx, AgentSpec{ExcludeTools: &typo}, base); err == nil || !strings.Contains(err.Error(), "bashh") {
+		t.Fatalf("排除未知名应拒载并报出名字，实得: %v", err)
+	}
+}
+
+// TestParseAgentSpecRejectsToolsAndExclude 钉两行同写的互斥落在 **parse 层**，不留给 resolveToolPool：
+// 若放到 resolve，实际名单就取决于代码里两个分支的先后——改一次判断顺序换一份能力面，
+// 那是护栏最不该有的性质。用例名带 ParseAgentSpec 是有意的（run pattern 靠它命中）。
+func TestParseAgentSpecRejectsToolsAndExclude(t *testing.T) {
+	both := []byte("---\nname: x\ndescription: 丁\ntools:\n  - get_time\nexclude_tools:\n  - bash\n---\n正文\n")
+	if _, err := parseAgentSpec(both); err == nil || !strings.Contains(err.Error(), "二选一") {
+		t.Fatalf("两行同写应在 parse 层拒载、文案含「二选一」，实得: %v", err)
+	}
+	// 单写 exclude_tools 放行，且指针非 nil——空列表与「没写」靠指针区分（与 tools 三态同法）。
+	empty := []byte("---\nname: x\ndescription: 丁\nexclude_tools: []\n---\n正文\n")
+	spec, err := parseAgentSpec(empty)
+	if err != nil || spec.ExcludeTools == nil || len(*spec.ExcludeTools) != 0 {
+		t.Fatalf("exclude_tools: [] 应为非 nil 空切片: %v %v", spec.ExcludeTools, err)
+	}
+	absent := []byte("---\nname: x\ndescription: 丁\n---\n正文\n")
+	if spec, err = parseAgentSpec(absent); err != nil || spec.ExcludeTools != nil {
+		t.Fatalf("不写 exclude_tools 应为 nil 指针（继承路）: %v %v", spec.ExcludeTools, err)
+	}
+}
+
+// TestShippedAgentSpecToolGuards 钉**仓库出厂配置**（`agents/*.md`）与 doc/26 的一致性——机制在上面
+// 两支，这支盯的是配置。它把三件「文档里写了很久、删掉却没有任何东西会红」的事转成检查：
+//   - doc/22 §7「researcher 的名单必须含 web_search」→ 金样逐名逐序比对，把它写进排除项就红；
+//   - doc/26 §2 的哑失败方向（父池加一把新工具 ⇒ 排除路让它自动到达 researcher）→ 名单变长即红，
+//     逼人当场决定这把给不给（给 ⇒ 改金样；不给 ⇒ 往 exclude_tools 加一行、金样不动）；
+//   - 名单里的手误（websearch / bashh）→ resolveToolPool 报错即红，文案说明运行时整条规格会拒载
+//     （今天只有跑起来才在日志里看得见，run 本身不失败——最难查的一类）。
+//
+// ⚠️ `agents/*.md` 是设计成给运维改的（改文件 ⇒ 下一条消息生效）。**有意改配置就同步改金样**：
+// 给 researcher 加回 bash、给 coder 添一把工具、新加一条规格，都在这张表里表态，不要删测试。
+// 盲区一处：下面的名字宇宙派生自 firstPartyFileEffects 的键 ∪ {get_time}，将来某把新工具
+// **不进注册表**（像 get_time 那样）就不在金样视野里 ⇒「新工具必须登记 file_effect（显式 none 也算）」
+// 这条既有惯例（doc/22 §3）从此多一个理由。
+func TestShippedAgentSpecToolGuards(t *testing.T) {
+	specs, err := LoadAgentSpecs(filepath.Join("..", "..", "agents"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(specs) == 0 {
+		t.Fatal("读不到出厂规格（../../agents 空或不存在）——这支测试空转就等于没有护栏")
+	}
+
+	// 父池装配序（= worker.go 的入池顺序）**显式写死**：firstPartyFileEffects 是 Go map、遍历键序随机，
+	// 而 researcher 走排除路按池序输出，不钉死顺序则逐名逐序比对会 flaky。
+	poolOrder := []string{
+		"get_time", "write_file", "read_text_file", "read_file", "edit_file", "move_file",
+		"create_directory", "list_directory", "directory_tree", "get_file_info", "search_files",
+		"read_media_file", "bash", "memory", "search_history", "web_search",
+	}
+	// 名字宇宙从注册表派生（不另抄一份名单，两份会各自腐化）：父池加一把登记过 file_effect 的
+	// 新工具 ⇒ 集合与写死的池序不等 ⇒ 红。get_time 按 fileops.go:86 的说明不进注册表，显式并进来。
+	universe := make(map[string]bool, len(firstPartyFileEffects)+1)
+	for name := range firstPartyFileEffects {
+		universe[name] = true
+	}
+	universe["get_time"] = true
+	if len(universe) != len(poolOrder) {
+		t.Fatalf("注册表派生的名字宇宙 %d 名 ≠ 写死的池序 %d 名——父池加/减了工具？两处同步改（doc/26 §7）",
+			len(universe), len(poolOrder))
+	}
+	for _, name := range poolOrder {
+		if !universe[name] {
+			t.Fatalf("池序里的 %q 不在 firstPartyFileEffects ∪ {get_time} 里——它没登记 file_effect", name)
+		}
+	}
+	base := make([]tool.BaseTool, 0, len(poolOrder))
+	for _, name := range poolOrder {
+		base = append(base, &fakeInvokableTool{info: &schema.ToolInfo{Name: name}})
+	}
+
+	// 金样 = 每条出厂规格今天应有的**有效名单**（逐名逐序；researcher 走排除路 = 池序，
+	// coder 走白名单路 = 它 frontmatter 里写的顺序，两序今天只差 memory/bash 的先后）。
+	// researcher 名单 15 项 = 2026-10-18 翻案后排除清单只剩 bash（doc/26 头注与 §4）。
+	golden := map[string][]string{
+		"researcher": {"get_time", "write_file", "read_text_file", "read_file", "edit_file", "move_file",
+			"create_directory", "list_directory", "directory_tree", "get_file_info", "search_files",
+			"read_media_file", "memory", "search_history", "web_search"},
+		"coder": {"write_file", "read_text_file", "edit_file", "list_directory", "search_files", "memory", "bash"},
+	}
+	// inheritOK：出厂规格默认必须写 tools: 或 exclude_tools: 之一——两行都不写 = 整份继承，
+	// 继承正是 doc/26 §2 那条「新工具自动到达」的通道。哪条规格有意整份继承，在这里显式表态，
+	// 不靠「不写那一行」承载语义。
+	inheritOK := map[string]bool{}
+
+	for _, spec := range specs {
+		want, registered := golden[spec.Name]
+		if !registered {
+			t.Errorf("出厂规格 %q 没登记金样——新规格的作者必须当场写下它的有效名单（通用规则，不是特例）", spec.Name)
+			continue
+		}
+		if spec.Tools == nil && spec.ExcludeTools == nil && !inheritOK[spec.Name] {
+			t.Errorf("出厂规格 %q 两行都不写 = 整份继承父池（doc/26 §2 的通道）——写 tools:/exclude_tools: 之一，或在 inheritOK 里显式放行", spec.Name)
+		}
+		pool, err := resolveToolPool(context.Background(), spec, base)
+		if err != nil {
+			t.Errorf("规格 %q 的有效名单解析失败（运行时整条规格会拒载、这场 run 里没有这个子代理）: %v", spec.Name, err)
+			continue
+		}
+		got := make([]string, 0, len(pool))
+		for _, x := range pool {
+			info, ierr := x.Info(context.Background())
+			if ierr != nil {
+				t.Fatal(ierr)
+			}
+			got = append(got, info.Name)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("规格 %q 的有效名单与金样不符（doc/26）\n期望: %s\n实得: %s",
+				spec.Name, strings.Join(want, ", "), strings.Join(got, ", "))
+		}
+	}
+}
+
 // TestSubagentPoolKeepsRealSearchHistory 钉 H4（「拒绝壳」裁定已推翻，见 tmp/21-历史查找 planning §8）：
-// 子代理池里的 search_history 就是父池里那一个真工具——继承路（tools 缺席 = Tools 指针 nil，researcher
-// 的现状）与白名单路（tools: [search_history]）两路都只做「原对象搬运」，不换壳。真工具的判据两条：
+// 子代理池里的 search_history 就是父池里那一个真工具——继承路（tools 缺席 = Tools 指针 nil）与
+// 白名单路（tools: [search_history]）两路都只做「原对象搬运」，不换壳。真工具的判据两条：
 // 同一性（池内元素与父池对象是同一个接口值）+ 行为（挂上 noteBox 真查临时库，出真命中不是拒绝句）。
 // 哪天有人把壳塞回来（同名同声明的替代实现），第一条断言就红。
+//
+// 注意这里 name 写着 researcher，用的却是**手造的 AgentSpec 值**（Tools 为 nil = 继承路），
+// 不读 agents/ 里的出厂文件；doc/26 之后出厂的 researcher 走 exclude_tools 排除路，这支照旧绿、
+// 照旧钉它本来钉的东西（不换壳）。出厂配置与 doc/26 的一致性由 TestShippedAgentSpecToolGuards 钉。
 func TestSubagentPoolKeepsRealSearchHistory(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t, time.Minute, time.Minute)

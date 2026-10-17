@@ -1,13 +1,61 @@
 # 26 · researcher 的工具护栏
 
-> 性质：**已点头，待开工**（2026-10-16 用户拍四条：① 挡法用 C——frontmatter 新字段 `exclude_tools`，
+> 性质：**已落地（2026-10-17 A1 + 10-18 A2/A3，未 commit；台账 `tmp/26-researcher工具护栏/`，验收后清理）**。
+> 2026-10-16 用户拍四条：① 挡法用 C——frontmatter 新字段 `exclude_tools`，
 > 继承父池减去列出的名字；② 写类四把一起收，researcher 变只读；③ 单测两层都要（机制四态 +
-> 出厂规格金样）；④ 本篇先落地，A3 同批改 `tmp/17-子代理折叠/todos.md` 三条 bash 剧本）。台账
-> `tmp/26-researcher工具护栏/`（planning + todos）与本篇同批写好；开工按 todos 的 A1 起。
+> 出厂规格金样）；④ 本篇先落地，A3 同批改 `tmp/17-子代理折叠/todos.md` 三条 bash 剧本。
+>
+> **2026-10-18 用户拍（第②条部分翻案）：写类四把归还，排除清单缩到 `- bash` 一项**，
+> researcher 有效名单 15 项（父池 16 − bash）。理由（当天逐条核代码确认）：写类四把全部过
+> `resolveInWorkspace` 关卡（拒绝对路径、拒 `../` 越界）——「只许写在工作区里」的牢笼本来就在，
+> 收走写类收掉的是圈子里的钥匙；全池没有删除工具，系统里唯一的删除途径是 bash 的 `rm`，
+> 且 `move_file` 遇目标已存在报错不覆盖（`filetools.go:212`）。bash 是四件独占事实的唯一载体：
+> 出圈（`cmd.Dir` 不是闸）、删除、执行与联网、入参是命令字符串故 fileOps 按路径提取的记账对它无效。
+> 「researcher 在 workspace 内可读写、不能删、跑不了命令」由此精确成立。被收回的承诺：
+> 「外部文本诱导也改不了 workspace 已有文件」（§4、§11）——减震只剩每笔写有账（fileOps 落库）
+> 与「种下到有人跑」之间隔着另一个代理的独立判断（§9 重签）。连带改口：§2 一处、§4 名单、§5 自述、
+> §7 金样（researcher 15 项）、§8 一处、§11 收尾、§12 记录；`agents/researcher.md` 与金样单测同批改，
+> 活体复验见台账 `r1-归还写类实录.md`。
+>
+> **施工状态（三拍全过，实录在台账 `a1-验收实录.md` / `a2-验收实录.md`）**：
+> - **A1 机制 + 配置 + 观测面**：`agents.go` 四态落地（`agentSpecFront`/`AgentSpec` 各加 `ExcludeTools`、
+>   parse 层互斥、`resolveToolPool` 第四态 + 抽出的 `poolIndex`/`excludeFromPool` 两个 helper）、
+>   `agents/researcher.md` 全文换（排除五项 + description 补「不能跑命令、不改文件」+ 正文自述四条）、
+>   `worker.go` 一行注释改口。活体：日志逐场打出
+>   `agent tools researcher: get_time, read_text_file, read_file, list_directory, directory_tree, get_file_info, search_files, read_media_file, memory, search_history, web_search`（11 项、池序、无 bash 无写类）与
+>   `agent tools coder: write_file, read_text_file, edit_file, list_directory, search_files, memory, bash`（7 项、有 bash）。
+>   八场探针：强制委派 researcher 跑 `echo 424242` → 它零次工具调用、终稿「我没有 bash」（run
+>   `r_01M5592MK58FXM5FA0H62QNRGE`）；主代理自己跑 → `退出码：0 stdout: 424242`；researcher 写
+>   `notes/hello.txt` → 只调读类两把、报告「做不到，文件没写」、盘上无 `notes/`，主代理同一句话 → `已写入（12 字节）`；
+>   researcher `web_search` ×4 → 四份结果均以 `来源：deepseek` 开头含链接（**当天 searchfree 未被触发，
+>   走的全是 deepseek 路**）；两条拒载反证 → `agents: researcher: 拒载: exclude_tools 列了未知名 "bashh"（可选: …16 名…）`
+>   与 `agents: researcher.md: 拒载: tools: 与 exclude_tools: 不能同时写…二选一`，两者都 `agents: 1 spec(s): coder`、
+>   run 仍 `complete`。**一处副产品**：不加强制措辞时主代理读完新 description 就自己改派 coder 了——
+>   第 5 节要的正是这个效果。
+> - **A2 两支单测**：`TestResolveToolPoolExclude`（池序不是排除项序 / 原对象搬运不换壳 / `exclude_tools: []`
+>   视同不写且仍拷贝切片 / 排除未知名报错带名字）+ `TestParseAgentSpecRejectsToolsAndExclude`（互斥在 parse 层）
+>   + `TestShippedAgentSpecToolGuards`（读 `../../agents`、base 池顺序写死 16 名、名字集合从
+>   `firstPartyFileEffects` ∪ `{get_time}` 派生、跑真 `resolveToolPool` 与金样逐名逐序比对）。四次反证全红：
+>   删 `- bash` → 金样红（实得 12 项含 bash）**且活体 researcher 真跑了 `echo 424242`**（run
+>   `r_01M559XWP3YDY825BAZZYZEKKJ`，证明护栏是唯一拦挡、不是模型自觉）；加 `- web_search` → 红（第 7 节
+>   兑现 `doc/22` §7）；`firstPartyFileEffects` 加 `fetch_url` → 红在「名字宇宙 17 ≠ 池序 16」；连池序一起加 →
+>   红在「researcher 实得多一把 fetch_url」而 **coder 不红**（白名单路不受父池增长影响）——第 2 节那条
+>   哑失败通道由此转成响失败。
+> - **A3 doc 回填**：`doc/17` §3.1 头注翻案 + 三态原句旁指回本篇 §3（**表不复制**，同一机制只留一份真源）、
+>   §7 `memory` 那句兑现；`doc/21` §3.4 排除路补注（「不换壳」结论不动）；`doc/25` §10 补委派对象
+>   （剧本 = coder，`web_search` 旁证 = researcher，两者相反）；`doc/22` §7 / `doc/23` §9 / `doc/16` §6
+>   随 A1 已改；`tmp/17-子代理折叠/todos.md` 三条剧本换 coder、**验收实录一个字未动**（已入库 `ceecc28`
+>   的历史证据）并补 coder 的两处重跑注意（基线更低要重测窗口、措辞必须禁截断）。
 >
 > 本篇翻掉两处已写下的裁定：`doc/17` §3.1 头注的 2026-10-12「不再给 researcher 写 `tools:` 白名单，
 > 长期纯继承父池」，与 `doc/22` §7 的同一句「researcher 长期保持继承」。翻案理由见第 2 节。
 > 同时把 `doc/23` §9「前提修订」里被抽掉的那个前提装回去（§1 的 coder 立项论证重新成立）。
+>
+> **2026-10-17 开工前复核**：写本篇之后又入库三拍——子代理折叠 A1–A3（`ceecc28`）、用量可见化
+> 三拍（`c211637`）、溢出修复层 B2–B5（`256a89c`）。逐条重核本篇前提：父池仍 16 把、装配序未变，
+> `resolveToolPool` 仍三态，`agentSpecFront` 仍四字段，`agents/` 仍 researcher + coder 两份，
+> `firstPartyFileEffects` 仍 15 键（∪ `get_time` = 父池），`git status` 干净 ⇒ **设计不变**；
+> 刷新的是行号与第 8 节的交叉面（折叠台账的剧本已从「会被本篇挡死」变成「已跑过入库、重跑要换角」）。
 >
 > 本篇不加端点、不加帧 kind、不加表、不改父池的装配顺序、不改 `bash` 工具自身。
 > 代码面动三样：`tools:` 的三态扩成四态（新增 `exclude_tools`，第 3 节）、装载日志一行（第 6 节）、
@@ -49,12 +97,12 @@ bash 动整机）→ 工具行落 runlog → 终稿回传主线程（51200 字�
 
 ## 2. `bash` 是怎么进到 researcher 手里的
 
-**父池**的操作定义：`NewWorker`（`worker.go:145`）在进程启动时造出来的那一份工具切片，今天 16 把，
+**父池**的操作定义：`NewWorker`（`worker.go:152`）在进程启动时造出来的那一份工具切片，今天 16 把，
 按装配顺序是 `get_time` → 11 个文件工具（`write_file` `read_text_file` `read_file` `edit_file`
 `move_file` `create_directory` `list_directory` `directory_tree` `get_file_info` `search_files`
 `read_media_file`）→ `bash` → `memory` → `search_history` → `web_search`。主代理的声明面就是这一份。
 
-**子代理的工具面**由 `agents.go` 的 `resolveToolPool`（:435）定，它读规格 frontmatter 的 `tools:` 行。
+**子代理的工具面**由 `agents.go` 的 `resolveToolPool`（:463）定，它读规格 frontmatter 的 `tools:` 行。
 今天只有三种字节形状（`doc/17` §3.1 原文明列，代码至今如此）：
 
 | frontmatter 的字节 | 子代理拿到什么 |
@@ -85,6 +133,8 @@ bash 动整机）→ 工具行落 runlog → 终稿回传主线程（51200 字�
    与『交回主线程的只有路径和结论』」。researcher 有了 `bash`，这个论证的第一句就不成立了，
    coder 的隔离价值被 `doc/23` §9 缩记成「显式白名单挡掉 `search_history`」一条。护栏一落地，
    §1 的分工论证恢复原样，而且比原样更强：researcher 连写类文件工具也没有，「写出 `agg.py` 但跑不了」
+   **（2026-10-18 翻案后此句过期：写类归还，researcher 又能写出 `agg.py` 了，但依然跑不了——论证回到
+   「它跑不了」的原样强度，不再「更强」。）**
    变成「连 `agg.py` 都写不了，只能在终稿里给内容」。
 
 所以本篇不是新增一道安全要求，是把一个**从未被拍过的能力**收回：没有人决定过「researcher 要能跑命令」，
@@ -103,8 +153,9 @@ bash 动整机）→ 工具行落 runlog → 终稿回传主线程（51200 字�
 ## 3. 挡法：`exclude_tools`（四态）
 
 **拍定的形状**（2026-10-16 用户拍 C）：frontmatter 加一个字段 `exclude_tools`，语义是
-「继承父池，减去列出的名字」。它与 `tools:` 的关系拍死为**二选一**，四态表如下（这张表是操作定义的真源，
-落地时替换 `doc/17` §3.1 的三态表）：
+「继承父池，减去列出的名字」。它与 `tools:` 的关系拍死为**二选一**，四态表如下（这张表是操作定义的
+**唯一真源**，`doc/17` §3.1 的三态表**不替换也不复制**——那一节整体性质是「作废、保留原文备查」，
+只在原句旁指回这里；同一机制不留两处真源）：
 
 | frontmatter 的字节 | 子代理拿到什么 | 出错时 |
 |---|---|---|
@@ -151,38 +202,37 @@ C 的那一格哑失败（父池加工具自动到达）是本篇必须补的洞
 
 ## 4. researcher 的排除项与有效名单
 
-`agents/researcher.md` 的 frontmatter 写：
+`agents/researcher.md` 的 frontmatter 写（**2026-10-18 翻案后的现行版**；10-16 版排除五项、有效名单
+11 项，原文保留在本节末尾备查）：
 
 ```yaml
 exclude_tools:
   - bash
-  - write_file
-  - edit_file
-  - move_file
-  - create_directory
 ```
 
-解析后的**有效名单 11 项**（按父池顺序，第 6 节的日志行打的就是这一串）：
+解析后的**有效名单 15 项**（按父池顺序，第 6 节的日志行打的就是这一串）：
 
 ```text
-get_time, read_text_file, read_file, list_directory, directory_tree, get_file_info,
-search_files, read_media_file, memory, search_history, web_search
+get_time, write_file, read_text_file, read_file, edit_file, move_file, create_directory,
+list_directory, directory_tree, get_file_info, search_files, read_media_file, memory,
+search_history, web_search
 ```
 
 逐项交代为什么是这一侧：
 
-- **`bash` 排除**——16 把里 15 把的可达面都被作业根圈住（文件工具走 `filetools.go:31` 的
+- **`bash` 排除**——其余 15 把的可达面都被作业根圈住（文件工具走 `filetools.go:31` 的
   `resolveInWorkspace`：拒绝对路径、拒绝前缀越界；`memory` 只写 notes 表；`search_history` 只读 runlog
   并把截断结果写进 `<workspace>/.tako/search/`；`web_search` 只发一次检索请求、结果只活在本次 tool_result）。
-  `bash` 的 `cmd.Dir` 只是设了个当前目录，不是关住路径：`cd /`、`cat ../.env`、`curl` 全在能力内，
+  `bash` 的 `cmd.Dir` 只是设了个当前目录，不是关住路径：`cd /`、`cat ../.env`、`rm`、`curl` 全在能力内，
   `doc/17` §3 明写「符号链接逃出 workspace、以及 `bash` 仍能访问网络，这一拍不补；危险命令规则表也不在这一拍」。
-  差别不是「危险 / 不危险」的程度问题，是「在闸内 / 出闸」的类别问题。**没这条排除**：第 1 节那场戏。
-- **写类四把排除**（2026-10-16 用户拍）——收益两条：外部文本诱导也改不了 workspace 里已有的文件；
-  「researcher 写下一个脚本、主线程或 coder 后来跑它」这条链被切断（第 9 节记的那条链，白名单方案挡不住，
-  这条排除挡得住）。代价两条，都要在正文里向模型交代清楚（第 5 节）：整理结果不能落文件，只能塞回终稿，
-  而终稿有 51200 字节回传帽（`-subagent-return-cap` 默认），超了被截断并附一行提示；
-  以及 researcher 从「能写稿的调研员」变成「只读调研员」，与 `doc/17` §3.1 原名单、`doc/23` §1 的
-  「它能 `write_file` 写出 `agg.py`」这句描述都不同了（A3 回填）。
+  另一件独占事实：bash 的入参是命令字符串，fileOps 按路径参数提取的记账对它无效——它同时是唯一
+  出圈的、唯一能删的、唯一能执行的、唯一联网的、唯一记不了账的。差别不是「危险 / 不危险」的程度问题，
+  是「在闸内 / 出闸」的类别问题。**没这条排除**：第 1 节那场戏。
+- **写类四把在名单里**（2026-10-18 用户翻案，撤销 10-16 的「四把一起收」）——归还的理由见头注：
+  牢笼本来就在（四把全过 `resolveInWorkspace`）、全池无删除工具（`move_file` 遇已存在目标报错不覆盖、
+  `write_file` 只能整文件覆盖且返回文本标注「（覆盖）」），「在 workspace 内可读写、不能删」不用任何
+  新机制就成立。归还的收益：调研/整理结果可以直接落成 workspace 文件，不再挤 51200 字节终稿回传帽。
+  代价（§9 重签）：researcher 可以直接把脚本写进 workspace 等别人跑，不再必须经终稿这道人看得见的关口。
 - **三把必须留在有效名单里**，各有出处：`web_search`（`doc/22` §7 的护栏）、`memory`（`doc/17` §7：
   漏了等于 researcher 静默丢笔记）、`search_history`（`doc/21` §3.4：子代理查主会话历史是设计意图，
   且 `doc/21` §5 的验收就是活体委派 researcher 用它）。它们都不在排除项里，且第 7 节的金样逐名钉住。
@@ -192,9 +242,19 @@ search_files, read_media_file, memory, search_history, web_search
   且已落地验收过，改形状无收益。两种形状在同一目录里合法共存（四态表第 3、4 行），
   第 7 节的单测按**解析后的有效名单**断言，不看它用哪种形状写的。
 
+**2026-10-16 版原文（已翻案，备查）**——排除五项、有效名单 11 项（`get_time, read_text_file, read_file,
+list_directory, directory_tree, get_file_info, search_files, read_media_file, memory, search_history,
+web_search`）；当时收写类的理由是「外部文本诱导也改不了 workspace 已有文件」+「researcher 写脚本、
+别人后来跑」的链被切断，代价是整理结果只能塞进 51200 字节的终稿。2026-10-18 用户指出该取舍不合理
+（牢笼本就在、删除本就不存在、真洞只有 bash），四把归还。
+
 ## 5. 规格自述同步（description 与正文）
 
-能力面一改，自述必须同批改，两处各有具体后果：
+能力面一改，自述必须同批改，两处各有具体后果。（**2026-10-18 翻案后**：description 只保留「不能跑命令」
+——「也不改 workspace 里的文件」不再成立；正文 ② 换成「能写 workspace、但删不掉（手里没有任何删除
+工具）、跑不了命令、不要在没人要求时写可执行脚本，任务确需产出脚本就当内容写并在终稿说明它没被运行」；
+③ 的字节上限仍在，但内容长时多了一条路——全文写进 workspace 文件、终稿给路径。下列 10-16 版改法
+保留备查。）
 
 - **description**：`parseAgentSpec` 的注释（`agents.go:135`）写明它是「模型决定委派与否的唯一入口」。
   它今天没有一个字提到能不能跑命令、能不能改文件。不改的后果：主代理照旧把「读 40 个日志再聚合」这类活
@@ -215,8 +275,11 @@ search_files, read_media_file, memory, search_history, web_search
 
 ## 6. 装载日志一行：名单可见
 
-`agents.go` 的 `BeforeAgent` 今天每装好一条规格打两行：`agents: N spec(s): …` 与
-`agent system <名字>:\n<拼接后的 Instruction 全文>`（M5 的 dev 观测面）。本篇加第三行：
+`agents.go` 的 `BeforeAgent` 今天的装载观测面有两处：循环内每装好一条规格打
+`agent system <名字>:\n<拼接后的 Instruction 全文>`（M5 的 dev 观测面，多行），循环外最后打一行
+`agents: N spec(s): <名字表>` 汇总。本篇在循环内加第三行——**位置在装配成功之后、`agent system`
+全文之前**（一行明细在前、多行全文在后，`grep "agent tools"` 出来的就是逐条名单，不用跳过长 dump；
+拒载的规格打不出这行，所以日志里出现的名单都是真生效的）：
 
 ```text
 agent tools <名字>: get_time, read_text_file, …, web_search
@@ -257,7 +320,8 @@ A2 验收第 5 条的 run pattern 靠它命中）；④ `exclude_tools: []` ⇒
    `firstPartyFileEffects` 的键 ∪ `{"get_time"}`（今天正好 = 父池 16 把；`get_time` 按 `fileops.go:86`
    的说明不进注册表，所以显式并进来）——集合从注册表派生，「父池加新工具 ⇒ 集合不等 ⇒ 红」这条链才
    不断。不另写一份「按名字算名单」的逻辑——那会与 `resolveToolPool` 各说各话、各自腐化。
-2. 有效名单**逐名等于金样**（`map[规格名][]string`）：researcher = 第 4 节那 11 项；coder = 七项。
+2. 有效名单**逐名等于金样**（`map[规格名][]string`）：researcher = 第 4 节那 11 项（**2026-10-18
+   翻案后为 15 项**，金样同批改）；coder = 七项。
    金样不等 ⇒ 红，报错文案打出「期望 / 实得」两串。这一条同时兜住三种事故：有人从 `exclude_tools` 里
    删掉 `bash`（有效名单多一把 ⇒ 红）；有人往父池加了一把新工具（有效名单多一把 ⇒ 红，逼人当场决定
    给不给 researcher，这就是第 3 节说的「把 C 的哑失败转成响失败」）；有人把 `web_search` 写进排除项
@@ -278,29 +342,37 @@ A2 验收第 5 条的 run pattern 靠它命中）；④ `exclude_tools: []` ⇒
 （像 `get_time` 那样），它就不在金样的宇宙里，测试不会因它变红——所以「新工具必须登记 file_effect
 （显式 `none` 也算）」这条既有惯例（`doc/22` §3）从此多一个理由。
 
-## 8. 与其他在飞台账的交叉
+## 8. 与相邻台账、文档的交叉（2026-10-17 开工前复核刷新）
 
-- **`tmp/17-子代理折叠/`（已点头待开工 A1）**：两处交叉。① 代码面同文件同函数——它要往
-  `agents.go:405` 的 Handlers 切片追加折叠 middleware、改 `delegationTool`（:282）；本篇改的是
-  `AgentSpec`/`agentSpecFront`/`parseAgentSpec`/`resolveToolPool` 与装载循环里加一行 `log.Printf`
-  （:415 一带），不碰 Handlers、不碰 `delegationTool`。冲突面小，但**谁后落地谁重核行号**。
-  ② **验收剧本面硬冲突**——它的 A1/A2/A3 三条 curl 剧本全是「委派 **researcher** 用 `bash` 执行
-  `python3 -c 'import secrets;print(secrets.token_hex(15000))'`」造长高熵输出，期望日志行
-  `agent fold researcher:`。本篇落地后 researcher 没有 `bash`，三条剧本一条都跑不出来。
-  处置（2026-10-16 用户拍「本拍先落 + 同批改剧本」）：三条剧本的委派对象换成 **coder**
-  （名单含 `bash`；折叠 handler 挂在装配循环里、对每条规格都挂，`agent fold coder:` 同形；
-  `doc/25` §10 的剧本正文不含规格名，不用改），在 A3 里改。**豁免一条**：该台账 A1 验收第 6 条
-  （旁证，不作断言）是「让 researcher 连续两次 `web_search`」——coder 的白名单没有 `web_search`，
-  换了就废；本篇落地后 researcher 仍保有 `web_search`，这条保留 researcher。
-- **工作区里有在飞的未提交改动，分两批**：① **B2/B3 溢出救援的五个 Go 文件**（`guard.go`/
-  `guard_test.go`/`midfold.go`/`midfold_test.go`/`worker.go`；handoff 在
-  `docs/2026-10-16-overflow-b2b3-handoff.md`，B2 已完工未提交、B3 未开工）；② **`doc/17` 的
-  +111 行**——实读 `git diff` 是 `tmp/17-子代理折叠` 台账 2026-10-16 第一批 doc 随批（§6 设计正文
-  回填），与 B2/B3 无关，其中一行还是别的会话留下的 2026-10-12 改动（该台账 todos 第 65 行有交代）；
-  另有 **`doc/16` 一行**（4c 行补 doc/27 指针）。本篇**不碰这批 Go 文件**（A1 改 `agents.go` +
-  `agents/researcher.md`，A2 改 `agents_test.go`）。但 A1 随批动 `doc/16`、A3 要动 `doc/17`——
-  按文件粒度提交会把在飞内容一起带走 ⇒ A3 提交时点与用户确认归置（doc/17 的问法是「与折叠台账
-  doc 随批同批还是拆开」，不是「与 B2/B3 同批」）。开工时先 `git status` 重核这批是否已落定。
+- **`tmp/17-子代理折叠/`：A1–A3 已落地入库（`ceecc28`），交叉只剩验收剧本一处，性质变了。**
+  写本篇时它还是「已点头待开工」，本篇落地会让它的剧本跑不出来；现在它的三条剧本已经按
+  「委派 **researcher** 用 `bash` 执行 `python3 -c 'import secrets;print(secrets.token_hex(15000))'`」
+  跑过、证据入了库。剩下的问题是**重跑**（回归、或下一拍借它的剧本压折叠）：本篇之后 researcher
+  没有 `bash`，同一句 curl 得到的是「报告说跑不了命令」，看不到 `agent fold researcher:` 行——
+  像是折叠坏了，实际是护栏生效。处置（2026-10-16 用户拍「本拍先落 + 同批改剧本」，A3 执行）：
+  三条剧本的委派对象换成 **coder**（名单含 `bash`；折叠 handler 在装配循环里对每条规格都挂，
+  日志行同形成 `agent fold coder:`），**验收实录（run id、tok 数、发现 1–7）一个字不改**——
+  那是已经发生的历史证据，改它等于伪造。**豁免一条**：该台账 A1 验收第 6 条（旁证，不作断言）
+  「让 researcher 连续两次 `web_search`」保留 researcher——coder 的白名单没有 `web_search`，换了就废。
+- **`doc/25`（子代理折叠的真源）**：§10 的剧本正文不含规格名（写「子代理」），不用改；但它第 2 步
+  「用 `bash` 造长高熵输出」在本篇之后只有 coder 能演，A3 补一句点明委派对象。另登记一处机制面影响：
+  折叠摘要末尾的 file-ops 钉块从工具调用记录里提路径（`fileops.go` 的 read / written / edited 三桶），
+  researcher 收掉写类四把与 `bash` 之后，只有 read 桶还会命中（读类七把都登记 `read`）——它的
+  「钉 N 路径」从此基本是读路径，写路径那半边由 coder 演。不是故障，登记免得下次当回归查。
+  （**2026-10-18 翻案后**：写类归还，researcher 的 written / edited 桶重新可达；read 路径为主的
+  判断不再成立。）
+- **工作区状态（2026-10-17 复核）**：`git status` 干净。写本篇时记的两批在飞改动都已入库——
+  B2–B5 溢出修复层 `256a89c`、子代理折叠 A1–A3 `ceecc28`、用量可见化三拍 `c211637`、
+  本篇与 `doc/28` 成文 `68a0ec2`。A3 原先那条「`doc/17` 有别人 +111 行在飞，提交归置问用户」随之取消。
+- **因本篇变陈旧的三处文字**（A1 / A3 随批改）：① `worker.go` 里 `memory` 入池那行的注释
+  「（researcher 不写 tools 行 = 继承）」；② `doc/21` §3.4 那句「`researcher.md` 没有 `tools` 行，
+  子代理装载时拿到父池的一份拷贝，`search_history` 随拷贝进子池」——机制结论不变（仍是原对象搬运、
+  不换壳，H4 的判据照旧），但 researcher 走的是第四态排除路，不再是继承路；③ `doc/17` §7 那句
+  「`researcher.md` 没有 `tools` 行，会继承到它。以后若给它写白名单，名单里要保留 `memory`」——
+  本篇兑现了这个「以后」，`memory` 在有效名单 11 项里。
+  另：`agents_test.go` 的 `TestSubagentPoolKeepsRealSearchHistory` 拿 `AgentSpec{Name: "researcher"}`
+  当「继承路」的样本——那是**手造的规格值**、不读文件，本篇之后仍绿；A2 在它旁边补一句注释讲清这点，
+  免得有人以为它在钉出厂配置（出厂配置由金样那支钉）。
 - **`doc/23` 的 coder 名单不动**：它用 `tools:` 白名单，四态表照旧支持。若将来有人想把 coder 也改成
   `exclude_tools`，第 7 节的金样按有效名单断言，改形状不会让测试失去意义。
 
@@ -317,11 +389,18 @@ A2 验收第 5 条的 run pattern 靠它命中）；④ `exclude_tools: []` ⇒
 - 不做子代理内部折叠（`doc/25`）、不改回传帽、不改并发闸。
 - 不加端点、不加帧 kind、不加表。
 
-**收写类之后仍留下的一条链**（登记不施工）：researcher 能在终稿里给出一段脚本内容，主代理或 coder
-可以照着写进 workspace 再跑。护栏挡的是「researcher 自己动机器、自己改文件」，不是「外部文本影响
-主线程的决定」——后者要挡得靠主代理侧的确认闸，属第 9 节第一条的后话。
+**留下的一条链（2026-10-18 重签——写类归还后它变宽了）**：10-16 收写类时，researcher 想让一段脚本
+进 workspace 只能经终稿这道人看得见的关口；归还之后它能**直接**把脚本写进 workspace 等主代理或
+coder 照着跑。减震还剩两层：每一笔写都过 `resolveInWorkspace` 圈在作业根内、且被 fileOps 提取落库
+（谁写的、什么工具、什么路径，事后可查）；从「种下」到「有人执行」中间隔着另一个代理的独立判断。
+护栏挡的仍是「researcher 自己动机器（bash）」；「外部文本影响主线程的决定」要挡得靠主代理侧的
+确认闸，属第 9 节第一条的后话。**正文里向模型交代这条线**（第 5 节）：没人要求时不写可执行脚本。
 
 ## 10. 验收
+
+（下列九条是 2026-10-16 形状下的验收剧本，已于 10-17/10-18 活体跑过、实录在台账 `a1-`/`a2-验收实录.md`；
+第 3 条「写类也挡住了」与第 8 条「期望 11 项」随 10-18 翻案过期——现行形状的复验见台账
+`r1-归还写类实录.md`。原文保留备查。）
 
 引擎按仓规起在 127.0.0.1:8901（起前 `lsof -tiTCP:8901 -sTCP:LISTEN` 查占用，被占换端口，不杀别人的进程），
 `TAKO_MODEL=deepseek/deepseek-v4-flash`、`.env` 里有 `DEEPSEEK_API_KEY`。
@@ -362,8 +441,10 @@ A2 验收第 5 条的 run pattern 靠它命中）；④ `exclude_tools: []` ⇒
 
 用户委派一次调研，`researcher` 在自己的上下文里吃五个网站来的外部文本。今天它手里有一把能出作业根、
 能联网、能以引擎进程那个用户身份动整机的 `bash`，外加四把能改 workspace 文件的工具，而拦挡它的只有
-一句提示词劝告。这一拍之后：它的工具面是「继承父池、明写排除五项」，有效名单 11 项全是读类 +
-搜索 + 笔记，那五个网站的文本既不能让它在机器上执行任何东西，也不能让它改掉 workspace 里已有的文件；
+一句提示词劝告。这一拍之后：它的工具面是「继承父池、明写排除项」（10-16 版排除五项、有效名单 11 项
+全是读类；**2026-10-18 翻案后只排除 `bash`、有效名单 15 项**，写类四把归还——「外部文本不能让它改
+workspace 已有文件」这条承诺收回，换成「能写、删不掉（全池无删除工具）、跑不了命令、每笔写有账」），
+那五个网站的文本无论如何不能让它在机器上执行任何东西；
 要跑命令、要批量改文件的活由 description 明确路由给 `coder`，那是主代理和用户都当它是「会动手」的角色。
 机制面上 `tools:` 的三态扩成四态，「继承但去掉某几把」这一档从此存在，两条拒载分支让写错名字当场出声；
 有效名单每场 run 打在装载日志里，并被一支读真配置的金样单测逐名钉住——有人把 `bash` 从排除项里删掉、
@@ -379,6 +460,10 @@ A2 验收第 5 条的 run pattern 靠它命中）；④ `exclude_tools: []` ⇒
 2. **写类四把一起收**（`write_file`/`edit_file`/`move_file`/`create_directory`），researcher 有效名单 11 项。
 3. **单测两层都要**：机制四态 + 出厂规格金样护栏（钉仓库出厂配置；运维有意改配置就同步改金样）。
 4. **顺序**：本篇先落地，同批（A3）把 `tmp/17-子代理折叠/todos.md` 的三条验收剧本从 researcher 改成 coder。
+
+2026-10-18 用户拍（第 2 条部分翻案）：**写类四把归还，排除清单 = `- bash` 一项**，researcher 有效名单
+15 项。理由与代价的重签见头注与 §4/§9；同批改 `agents/researcher.md`、金样单测、§2/§4/§5/§7/§8/§11
+各处标注，活体复验收录在台账 `r1-归还写类实录.md`。
 
 落地时还要用户点头的两处（都在 A3）：`doc/17` §3.1 的回填与该文件在飞改动（折叠台账 doc 随批
 +111 行，**不是** B2/B3）**是否同批提交**（同一文件，按文件粒度 `git add` 会一起带走；`doc/16` 同理，
