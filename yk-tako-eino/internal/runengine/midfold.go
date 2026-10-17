@@ -43,6 +43,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	"github.com/cloudwego/eino/adk"
@@ -374,7 +375,8 @@ func usageBasedInput(counter TokenCounter, currentRun RunID, msgs []*schema.Mess
 // midfoldHandler 是 mid-run fold 的钩子：每次模型调用前对当前 state 自测长度、超线走同一条
 // 折叠链；成功终态时把折后 state 存进容器供 worker 落库。挂载次序 = agentSpecHandler /
 // noteSnapshotHandler 之后、agentLog 之前（19v6-10 §4：日志看到的是模型实际所见的折后输入）。
-// 子代理内部不挂（§10）。计数/折叠用的 system 从 state 首条取（M1 起）——快照 handler 已把
+// 子代理侧由 agentFoldHandler 另挂（doc/17 §6）——不共用本类型，差异在容器，见彼处注释。
+// 计数/折叠用的 system 从 state 首条取（M1 起）——快照 handler 已把
 // 快照段拼进它，数到的就是模型实见的（不再用构造期形参，「单一真源全从 state 读」）。
 type midfoldHandler struct {
 	*adk.BaseChatModelAgentMiddleware
@@ -499,4 +501,92 @@ func (h *midfoldHandler) AfterAgent(ctx context.Context, state *adk.ChatModelAge
 	}
 	box.setFinal(history)
 	return ctx, nil
+}
+
+// agentFoldHandler 是子代理侧的 mid-run fold 钩子（doc/17 §6，台账 17-子代理折叠 A1）：挂子代理
+// 装配点，复用主 run 的同一条「估→折→滤」链（同 counter / compactLimit / 摘要器 / fileEffects）。
+// 与 midfoldHandler 的两条差异（planning D1 施工禁令）：
+//   - 容器只读不写：ctx 里的 foldBox 是 root 的——只读 box.run / box.session（file-ops 块的 r_
+//     指针要指 runlog，而 runlog 工具行本来就挂 root runId）；不调 setBase/appendStaged、摘要行
+//     不打 seq=0、产物永不落库。
+//   - 无 AfterAgent：子代理 state 跑完即弃，没有取货口。
+// 字段全是每规格常量，不含任何 per-delegation 状态：同一场 run 里主代理可以在一条消息里并行发
+// 两次同名委派（eino ToolsNode 默认并行，tako 未设 ExecuteSequentially），两个 goroutine 会同时
+// 进同一个实例——一次调用的东西只走参数与 ADK 给的 state。
+type agentFoldHandler struct {
+	*adk.BaseChatModelAgentMiddleware
+	name        string
+	window      int // 只喂 foldInput 的 trim 预算（B4），同 midfoldHandler.window
+	limit       int // = compactLimit：<= 0 休眠（只滤思考、不自测不折）
+	counter     TokenCounter
+	summarize   func(context.Context, string) (string, error)
+	fileEffects map[string]string
+}
+
+func newAgentFoldHandler(name string, counter TokenCounter, window, limit int,
+	summarize func(context.Context, string) (string, error), fileEffects map[string]string) *agentFoldHandler {
+	return &agentFoldHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{},
+		name: name, window: window, limit: limit, counter: counter, summarize: summarize, fileEffects: fileEffects}
+}
+
+// 编译期锚：接口一缺，编译不过（同 midfoldHandler）。
+var _ adk.ChatModelAgentMiddleware = (*agentFoldHandler)(nil)
+
+// foldChainErrorMark 是子代理折叠 handler 给自己返回的每个错误加的前缀（A2，planning D2）。
+// 判定走文本不走 errors.Is：handler 错误到 delegationTool 之间隔着 ADK graph 的 [NodeRunError]
+// 包裹层（v0.9.21 活体实证），Go 错误链不保证端到端保留——与 IsOverflowError 用报文正则同一理由。
+const foldChainErrorMark = "子代理折叠链:"
+
+// BeforeModelRewriteState：估长度（有账单 usageBasedInput、无账单 convertState+countInput，
+// doc/24 §5/§6）→ 超 limit 走同一条 foldInput → 重写子代理自己的 state.Messages（ToolInfos 不动）
+// → 滤思考（滤必须排在估之后，减项读 ReasoningContent）。子代理没有基点：convertState 传 nil，
+// 全部历史按本 run 新行处理（坐标只进折叠分组，永不落库）。
+// 折叠失败带 foldChainErrorMark 前缀上抛——delegationTool 据此把它转成委派的错误文本结果，
+// 父 run 保持 complete（A2，planning D2）；错误原文随文本一并交回，不吞信息。
+func (h *agentFoldHandler) BeforeModelRewriteState(ctx context.Context, state *adk.ChatModelAgentState, mc *adk.ModelContext) (context.Context, *adk.ChatModelAgentState, error) {
+	if h.limit <= 0 || h.counter == nil {
+		stripReasoning(state.Messages)
+		return ctx, state, nil
+	}
+	box := foldBoxFrom(ctx)
+	if box == nil {
+		return ctx, state, nil
+	}
+	sys, history, err := convertState(nil, box.run, state.Messages)
+	if err != nil {
+		return ctx, state, fmt.Errorf("%s %w", foldChainErrorMark, err)
+	}
+	var total int
+	if est, ok := usageBasedInput(h.counter, box.run, state.Messages); ok {
+		total = est.total
+		log.Printf("agent usage %s: 基线 %d + 可见输出 %d + 新增 %d = %d tok，limit %d",
+			h.name, est.baseline, est.visible, est.delta, total, h.limit)
+	} else {
+		total = countInput(h.counter, sys, history)
+	}
+	if total <= h.limit {
+		stripReasoning(state.Messages)
+		return ctx, state, nil
+	}
+	folded, _, err := foldInput(ctx, sys, history, box.run, h.limit, h.window, h.counter, h.summarize, h.fileEffects)
+	if err != nil {
+		return ctx, state, fmt.Errorf("%s %w", foldChainErrorMark, err)
+	}
+	state.Messages = append([]*schema.Message{state.Messages[0]}, toSchemaMessages(folded)...)
+	// 观测面（planning D3，格式钉死）：前 = 折前估算，后 = 折后这份的计数。路径从钉块解析回来
+	// （foldInput 已把块钉进摘要末尾，parseFileOpsBlock 是它的解析半边）。
+	ops := parseFileOpsBlock(folded[0].Text)
+	var paths []string
+	for _, e := range ops.written {
+		paths = append(paths, e.path)
+	}
+	for _, e := range ops.edited {
+		paths = append(paths, e.path)
+	}
+	for _, e := range ops.read {
+		paths = append(paths, e.path)
+	}
+	log.Printf("agent fold %s: %d→%d tok; 钉 %d 路径: %s",
+		h.name, total, countInput(h.counter, sys, folded), len(paths), strings.Join(paths, ","))
+	return ctx, state, nil
 }

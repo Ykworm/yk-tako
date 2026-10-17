@@ -247,17 +247,27 @@ type agentSpecHandler struct {
 	resolver  ModelResolver       // 写法三（具体 ref）：进程内注册表
 	sem       chan struct{}       // 委派并发闸（容量 = -subagent-concurrency）：全部规格共享一个
 	returnCap int                 // 回传上限（字节；<=0 = 不裁剪）：-subagent-return-cap
+	// 子代理折叠链（doc/17 §6，台账 17-子代理折叠 A1）：与主 run 同一条链的四件套，
+	// BeforeAgent 装配子代理时按规格名造 agentFoldHandler 挂上。
+	foldCounter   TokenCounter
+	foldWindow    int                                           // = compactWindow（foldInput 的 trim 预算）
+	foldLimit     int                                           // = compactLimit
+	foldSummarize func(context.Context, string) (string, error) // = w.sum.summarize
+	foldEffects   map[string]string                             // = firstPartyFileEffects
 }
 
 // newAgentSpecHandler 组装载 handler。dir 是规格目录（相对 CWD 或绝对路径）；
 // store/workspace 是笔记快照读口（M5）；m / mainRef / mainTranslate 是主 worker 的三件套
 // （继承档取用）；r 是模型注册表（ref 档取用）；sem/returnCap 是 T3-3 的预算面
-// （并发闸 + 回传裁剪），装配点 = NewWorker。
+// （并发闸 + 回传裁剪），装配点 = NewWorker；counter/window/limit/summarize/fileEffects
+// 是子代理折叠链（doc/17 §6）——全部沿用主 run 的实例，不另设旗标。
 func newAgentSpecHandler(dir string, store *Store, workspace string, m model.BaseChatModel, mainRef string, mainTranslate Translator,
-	r ModelResolver, sem chan struct{}, returnCap int) *agentSpecHandler {
+	r ModelResolver, sem chan struct{}, returnCap int,
+	counter TokenCounter, window, limit int, summarize func(context.Context, string) (string, error), fileEffects map[string]string) *agentSpecHandler {
 	return &agentSpecHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{},
 		dir: dir, store: store, workspace: workspace, model: m, modelRef: mainRef, translate: mainTranslate,
-		resolver: r, sem: sem, returnCap: returnCap}
+		resolver: r, sem: sem, returnCap: returnCap,
+		foldCounter: counter, foldWindow: window, foldLimit: limit, foldSummarize: summarize, foldEffects: fileEffects}
 }
 
 // delegationTool 是委派工具的预算包壳（T3-3）：并发闸（sem）+ 回传裁剪（capBytes），
@@ -278,7 +288,10 @@ func (d *delegationTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
 }
 
 // InvokableRun：取闸（满则等，ctx 取消可中断——不无限吊住父循环）→ 内层照跑 → 回传超帽截断。
-// 内层错误原样上抛（「错误→结果」语义归 wrapToolErrors 体系，不在预算面拍板）。
+// 内层错误分流（A2，doc/17 §6 + planning D2）：折叠链错误（handler 的 foldChainErrorMark 前缀，
+// graph 层的 [NodeRunError] 壳不影响文本匹配）与厂商溢出拒收（IsOverflowError，待拍①已裁转）
+// 同属「终稿出不来」一类——转成错误文本当这次委派的工具结果，父 run 保持 complete；
+// 其余错误（含手动停止的 ctx 取消）维持裸上抛。
 func (d *delegationTool) InvokableRun(ctx context.Context, args string, opts ...tool.Option) (string, error) {
 	select {
 	case d.sem <- struct{}{}:
@@ -292,6 +305,12 @@ func (d *delegationTool) InvokableRun(ctx context.Context, args string, opts ...
 	}
 	out, err := inner.InvokableRun(ctx, args, opts...)
 	if err != nil {
+		if strings.Contains(err.Error(), foldChainErrorMark) {
+			return fmt.Sprintf("错误：子代理 %s 上下文折叠失败：%v", d.name, err), nil
+		}
+		if IsOverflowError(err) {
+			return fmt.Sprintf("错误：子代理 %s 上下文窗口溢出：%v", d.name, err), nil
+		}
 		return "", err
 	}
 	return truncateDelegationReturn(out, d.capBytes), nil
@@ -405,9 +424,15 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 			ToolsConfig:   adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: pool}},
 			// 调用方身份标记（doc/22 §4）：web_search 按它查 agentModelTable 取该子代理自己的
 			// 生效 ref——不挂标记工具只能报错，挂主 ref 会把子代理的搜索打错厂商。
-			Handlers: []adk.ChatModelAgentMiddleware{&callerStampMiddleware{
-				BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, name: spec.Name,
-			}},
+			// 子代理折叠（doc/17 §6）：追加进同一列表，按规格名造——handler 无状态
+			// （同 run 内并行同名委派共用一个实例），字段全是每规格常量。
+			Handlers: []adk.ChatModelAgentMiddleware{
+				&callerStampMiddleware{
+					BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, name: spec.Name,
+				},
+				newAgentFoldHandler(spec.Name, h.foldCounter, h.foldWindow, h.foldLimit,
+					h.foldSummarize, h.foldEffects),
+			},
 		})
 		if err != nil {
 			log.Printf("agents: %s: 拒载: 子代理装配失败: %v", spec.Name, err)

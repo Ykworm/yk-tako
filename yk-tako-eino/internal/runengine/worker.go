@@ -226,7 +226,8 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 			// 放链首 = 日志里它先于其余 handler 出现；BeforeAgent 之间互不读写，位置无语义。
 			&callerStampMiddleware{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, name: ""},
 			newAgentSpecHandler(agentsDir, store, workspace, chat, modelRef, translate, resolver,
-				make(chan struct{}, subagentConcurrency), subagentReturnCap),
+				make(chan struct{}, subagentConcurrency), subagentReturnCap,
+				counter, compactWindow, compactLimit, sum.summarize, firstPartyFileEffects),
 			// 笔记快照缝（M1，notes.go）：BeforeAgent 渲染快照、每轮模型调用前把 system 重写为
 			// Instruction + 快照段；排在 midfold 之前——midfold 从 state 取 system 计数，与模型实见同源。
 			newNoteSnapshotHandler(store, workspace, system),
