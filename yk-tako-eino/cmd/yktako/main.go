@@ -12,6 +12,8 @@ import (
 
 	"yk-tako-eino/internal/config"
 	"yk-tako-eino/internal/runengine"
+
+	"github.com/cloudwego/eino/components/model"
 )
 
 // runliveTTL 是 run **正常结束**后 runlive 键的回收期限（19v6-03「生命周期」只写「设 TTL」未给数值；dev 取 300s）。
@@ -78,6 +80,11 @@ func intEnv(key string, fallback int) int {
 	return n
 }
 
+// envOn 读长期记忆的三个开关（doc/29 §8）：未设置或空 = on，字面 "off" 才关（大小写不敏感）。
+func envOn(key string) bool {
+	return !strings.EqualFold(strings.TrimSpace(os.Getenv(key)), "off")
+}
+
 func main() {
 	// 先读 .env 再注册旗标：-lease-ttl/-lease-renew 的默认值取自 TAKO_LEASE_TTL/TAKO_LEASE_RENEW。
 	// Open() 内那次调用照旧（godotenv 不覆盖已设变量、可重复调），这里只是把它提前一步。
@@ -96,6 +103,7 @@ func main() {
 	workspace := flag.String("workspace", "./workspace", "workspace root for first-party file tools; created at startup, tools are confined to it")
 	subagentConcurrency := flag.Int("subagent-concurrency", 8, "max concurrent subagent delegations (process-wide semaphore; must be >= 1)")
 	subagentReturnCap := flag.Int("subagent-return-cap", 51200, "max bytes of a subagent's return text handed back to the parent; excess is truncated with a notice (<=0 disables)")
+	rebuildDialogue := flag.Bool("rebuild-dialogue", false, "clear dialogue_chunks at startup and let the indexer rebuild them from complete runs (requires TAKO_RAG=on)")
 	flag.Parse()
 
 	// 必须 leaseRenew 严格小于 leaseTTL：
@@ -150,6 +158,35 @@ func main() {
 	}
 	log.Printf("workspace %s", wsAbs)
 
+	// 长期记忆配置（doc/29 §8）：三个开关默认 on，值 "off" 才关；tenant 一期恒 default。
+	// 配置写入 Store 后，EndRun（登记 job）、Worker（注入）、Server（预览）读同一份。
+	memCfg := runengine.MemoryConfig{
+		TenantID:  "default",
+		Workspace: wsAbs,
+		Extract:   envOn("TAKO_MEMORY_EXTRACT"),
+		Recall:    envOn("TAKO_MEMORY_RECALL"),
+		RAG:       envOn("TAKO_RAG"),
+	}
+	store.ConfigureMemory(memCfg)
+	// 线二的 pg_search 索引（doc/29 §5.4）：RAG 开且 preload/扩展缺失 = 启动即退；
+	// RAG 关完全不碰扩展（建表由 OpenStore 的 AutoMigrate 照常完成）。
+	if err := store.EnsureDialogueIndex(ctx); err != nil {
+		log.Fatalf("dialogue index: %v", err)
+	}
+	// 线二重建（doc/29 §11 D3）：显式清空派生副本，索引循环从 complete 的 runs 反查重建。
+	// RAG 关时索引循环不启动——清空后没人重建，所以旗标与开关互斥，手误启动即退。
+	if *rebuildDialogue {
+		if !memCfg.RAG {
+			log.Fatalf("rebuild-dialogue 需要 TAKO_RAG=on：索引循环未启动，清空后没人重建")
+		}
+		n, err := store.ResetDialogueChunks(ctx)
+		if err != nil {
+			log.Fatalf("rebuild-dialogue: %v", err)
+		}
+		log.Printf("rebuild-dialogue: 清空 dialogue_chunks %d 行，等待索引循环重建", n)
+	}
+	log.Printf("memory: extract=%v recall=%v rag=%v", memCfg.Extract, memCfg.Recall, memCfg.RAG)
+
 	// C5-A7：摘要预算帽的硬顶（正整数 tok；缺省/0 = 不顶；解析失败/负由 intEnv fail fast）。
 	maxOutput := intEnv("TAKO_MODEL_MAX_OUTPUT", 0)
 
@@ -157,6 +194,29 @@ func main() {
 	// 第一条用到某个 ref 的规格进来才建对应客户端；解析失败是逐条拒载（不 fail fast，
 	// 与 TAKO_MODEL 的启动 fail fast 不同：主模型没有可降级对象，子代理规格有）。
 	modelRegistry := config.NewModelRegistry(config.Environ())
+
+	// 线一抽取循环（doc/29 §4.5）：TAKO_MEMORY_MODEL 为空复用主模型；非空走 ModelRegistry
+	// 懒解析（坏 ref 只让 job 失败重试，不影响启动与 run）。循环与 server 同生命周期。
+	if memCfg.Extract {
+		memoryRef := strings.TrimSpace(os.Getenv("TAKO_MEMORY_MODEL"))
+		getModel := func(ctx context.Context) (model.BaseChatModel, error) {
+			if memoryRef == "" {
+				return opened.Chat, nil
+			}
+			m, err := modelRegistry.Get(ctx, memoryRef)
+			if err != nil {
+				return nil, err
+			}
+			return m.Chat, nil
+		}
+		go store.RunMemoryExtractor(ctx, getModel, counter)
+	}
+
+	// 线二索引循环（doc/29 §5.2）：RAG 关时不启动；反查「complete 且未入 dialogue_chunks」，
+	// 删行/漏写由下一轮自愈，不建 outbox。
+	if memCfg.RAG {
+		go store.RunDialogueIndexer(ctx)
+	}
 
 	// agent 装配（T1）失败也是启动错误：装配不出来 = 主循环跑不了，fail fast 一贯式。
 	// T3：agentsDir 只是规格目录位置（装载是 run 起手扫盘、失败降级为 log）——目录不存在不算启动错误。

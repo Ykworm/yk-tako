@@ -71,6 +71,10 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 	r.GET("/api/sessions/:id/log", s.getSessionLog)
 	r.GET("/api/mcp/servers", s.getMcpServers)
 	r.GET("/api/media", s.getMedia)
+	r.GET("/api/memory/items", s.getMemoryItems)
+	r.GET("/api/memory/jobs", s.getMemoryJobs)
+	r.GET("/api/memory/dialogue", s.getMemoryDialogue)
+	r.GET("/api/memory/recall", s.getMemoryRecall)
 	if dev {
 		r.DELETE("/api/dev/reset", s.devReset)
 		r.GET("/api/dev/runs/:runId/journal", s.devJournal)
@@ -584,8 +588,115 @@ func (s *Server) getSessionLog(c *gin.Context) {
 	c.JSON(http.StatusOK, logResponse{Rows: rows, NextOffset: next})
 }
 
-// getMedia（doc/32 A4）= 前端把占位行里的 path 换回字节流的唯一出口。
-// 牢笼与工具侧同一把闸（resolveInWorkspace）：越界 / 缺 path → 400，不存在 / 目录 → 404。
+// 字段序 = doc/29 §7.2 契约字节序（items 按 created_at DESC, id DESC）。
+type memoryItemResponse struct {
+	ID              string    `json:"id"`
+	Kind            string    `json:"kind"`
+	Topic           string    `json:"topic"`
+	Content         string    `json:"content"`
+	SourceSessionID SessionID `json:"sourceSessionId"`
+	SourceRunID     RunID     `json:"sourceRunId"`
+	SourceSeq       int64     `json:"sourceSeq"`
+	CreatedAt       time.Time `json:"createdAt"`
+}
+
+// getMemoryItems（doc/29 §7.2①）= 记忆列表（管理面 + 抽取验收口）。
+// kind 空 = 全部（含 episode）；limit 默认 50、上限 200（钳制在 ListMemoryItems）。
+func (s *Server) getMemoryItems(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	items, err := s.store.ListMemoryItems(c.Request.Context(), c.Query("kind"), limit)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	out := make([]memoryItemResponse, 0, len(items))
+	for _, it := range items {
+		out = append(out, memoryItemResponse{
+			ID: it.ID, Kind: it.Kind, Topic: it.Topic, Content: it.Content,
+			SourceSessionID: it.SourceSessionID, SourceRunID: it.SourceRunID,
+			SourceSeq: it.SourceSeq, CreatedAt: it.CreatedAt,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"items": out})
+}
+
+// 字段序 = doc/29 §7.2② 契约字节序。
+type memoryJobResponse struct {
+	ID        string    `json:"id"`
+	RunID     RunID     `json:"runId"`
+	Status    string    `json:"status"`
+	Attempts  int       `json:"attempts"`
+	LastError string    `json:"lastError"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// getMemoryJobs（doc/29 §7.2②）= 抽取任务状态（线一观测口）；runId 空 = 最近 20 条。
+func (s *Server) getMemoryJobs(c *gin.Context) {
+	jobs, err := s.store.ListMemoryJobs(c.Request.Context(), RunID(c.Query("runId")))
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	out := make([]memoryJobResponse, 0, len(jobs))
+	for _, j := range jobs {
+		out = append(out, memoryJobResponse{
+			ID: j.ID, RunID: j.RunID, Status: j.Status, Attempts: j.Attempts,
+			LastError: j.LastError, CreatedAt: j.CreatedAt, UpdatedAt: j.UpdatedAt,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"jobs": out})
+}
+
+// getMemoryDialogue（doc/29 §7.2③）＝ 索引状态（线二观测口）；runId 空 = 最近 20 条。
+// passage 随行返回：B 组要验块内容，dev 观测口，块帽 4000 rune 可接受。
+type dialogueChunkResponse struct {
+	RunID     RunID     `json:"runId"`
+	SessionID SessionID `json:"sessionId"`
+	Runes     int       `json:"runes"`
+	Truncated bool      `json:"truncated"`
+	IndexedAt time.Time `json:"indexedAt"`
+	Passage   string    `json:"passage"`
+}
+
+func (s *Server) getMemoryDialogue(c *gin.Context) {
+	chunks, err := s.store.ListDialogueChunks(c.Request.Context(), RunID(c.Query("runId")))
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	out := make([]dialogueChunkResponse, 0, len(chunks))
+	for _, ch := range chunks {
+		out = append(out, dialogueChunkResponse{
+			RunID: ch.RunID, SessionID: ch.SessionID, Runes: ch.Runes,
+			Truncated: ch.Truncated, IndexedAt: ch.IndexedAt, Passage: ch.Passage,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"chunks": out})
+}
+
+// getMemoryRecall（doc/29 §7.2④）= 召回预览：与 Worker 的注入调用同一个 Store.Recall，
+// 开关同一份——预览显示的就是模型实际会看到的东西。q 空 = 400。
+func (s *Server) getMemoryRecall(c *gin.Context) {
+	q := strings.TrimSpace(c.Query("q"))
+	if q == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request"})
+		return
+	}
+	res, err := s.store.Recall(c.Request.Context(), q)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"block":         res.Block,
+		"memoryHits":    res.MemoryHits,
+		"dialogueHits":  res.DialogueHits,
+		"injectedRunes": res.InjectedRunes,
+	})
+}
+
+// getMedia（doc/32 A4）= 前端把占位行里的 path 换回字节流的唯一出口。// 牢笼与工具侧同一把闸（resolveInWorkspace）：越界 / 缺 path → 400，不存在 / 目录 → 404。
 // mime 按扩展名表（mediaMimeByExt，与 read_media_file 同表）；回流走 ServeContent（支持 Range）。
 func (s *Server) getMedia(c *gin.Context) {
 	p := c.Query("path")

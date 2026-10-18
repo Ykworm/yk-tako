@@ -400,6 +400,12 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 		status = "error"
 		return
 	}
+	// 记忆召回注入（doc/29 §6.1/§6.4）：prepareInput 之后、agent.Run 之前；只注入新 run
+	// （续跑路径的输入尾不一定是 user，且它本就不是新一场开头）。块只加在消息副本上，
+	// mh 投影走 foldBox 的 base，没经过这里——永不落库。
+	if resume == nil {
+		w.injectRecall(ctx, sessionID, runID, msgs)
+	}
 	// T1：主循环 = ADK agent 事件流。正文 chunk 经同一 Translator 翻成 delta 帧（归一层语义不变，换的只是载体）。
 	// T2：工具环两态事件——流式（模型输出，含 tool_calls）与非流式（工具结果，Role=Tool）。
 	// T3-1b：身份表先落 root 条目（主 ref + 主 translator），塞 ctx 给装载 handler 填子代理条目
@@ -799,6 +805,46 @@ func (w *Worker) AdmitText(text string) (limit, tokens int, ok bool) {
 // 进 run 级容器（foldBox）：staged 打头进 staged 列表、折算行成为钩子的坐标基点（base）——
 // 钩子此后在每次模型调用前对同一个 base 续折（midfold.go）。本函数不写任何存储：折叠失败
 // （Summarize 失败 / errStillOver）直接返回错误，Run 置 status=error、零写入。
+// injectRecall 把两线召回块追加到本轮 user 消息末尾（doc/29 §6.4）：与预览端点同一个
+// Store.Recall（开关也同一份）。失败只记一行日志、run 继续——记忆不是主流程的硬依赖。
+func (w *Worker) injectRecall(ctx context.Context, sessionID SessionID, runID RunID, msgs []*schema.Message) {
+	cfg := w.store.MemoryConfig()
+	if !cfg.Recall && !cfg.RAG {
+		return
+	}
+	text := lastUserText(msgs)
+	if text == "" {
+		return
+	}
+	res, err := w.store.Recall(ctx, text)
+	if err != nil {
+		log.Printf("memory recall %s/%s: %v", sessionID, runID, err)
+		return
+	}
+	if res.Block == "" {
+		log.Printf("memory recall %s/%s: 无命中", sessionID, runID)
+		return
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == schema.User {
+			msgs[i].Content += "\n\n" + res.Block
+			break
+		}
+	}
+	log.Printf("memory recall %s/%s: terms=%d memoryHits=%d dialogueHits=%d injected=%d runes",
+		sessionID, runID, res.Terms, res.MemoryHits, res.DialogueHits, res.InjectedRunes)
+}
+
+// lastUserText 取本轮 user 原文（召回查询的词源）。
+func lastUserText(msgs []*schema.Message) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == schema.User {
+			return msgs[i].Content
+		}
+	}
+	return ""
+}
+
 func (w *Worker) prepareInput(ctx context.Context, sessionID SessionID, runID RunID) ([]*schema.Message, error) {
 	history, err := w.store.ModelMessages(ctx, sessionID)
 	if err != nil {

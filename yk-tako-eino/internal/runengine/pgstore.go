@@ -122,11 +122,14 @@ type RunJournal struct {
 
 func (RunJournal) TableName() string { return "run_journal" }
 
-// autoMigrate 从六个 struct 建表（dev 迁移方式，待定项①已裁：AutoMigrate 够用，无迁移文件；
+// autoMigrate 从九个 struct 建表（dev 迁移方式，待定项①已裁：AutoMigrate 够用，无迁移文件；
 // 上生产换不换显式迁移归部署面）。部分索引（WHERE 条件）优先走 GORM index tag；
 // 若某版 GORM 表达不全，在这里补 CREATE ... IF NOT EXISTS 兜底——仍是代码内，不引迁移文件。
+// 后三张是 doc/29 长期记忆：memory_items / memory_jobs（线一）与 dialogue_chunks（线二，
+// pg_search 索引另由 ensureDialogueIndex 手写；建表本身不需要扩展）。
 func autoMigrate(db *gorm.DB) error {
-	return db.AutoMigrate(&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}, &Note{}, &RunJournal{})
+	return db.AutoMigrate(&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}, &Note{}, &RunJournal{},
+		&MemoryItem{}, &MemoryJob{}, &DialogueChunk{})
 }
 
 // newRowID 生成行级代理主键：前缀 + ULID（同 s_/r_ 的铸法）。

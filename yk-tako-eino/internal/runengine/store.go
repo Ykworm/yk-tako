@@ -50,6 +50,9 @@ type Store struct {
 	rdb      *redis.Client
 	ttl      time.Duration
 	leaseTTL time.Duration
+	// memoryCfg 是长期记忆两线的运行配置（doc/29 §8）：启动装配期由 ConfigureMemory 写入一次，
+	// 之后只读。EndRun 用它决定是否登记抽取 job；Worker/Server 用它决定召回与预览的开关。
+	memoryCfg MemoryConfig
 }
 
 // OpenStore 建起两半并各自探活（main 的 fail fast：任一半不可达 = 引擎起不来，
@@ -511,6 +514,24 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, ep
 				 RETURNING seq`,
 				logID, sessionID, sessionID, runID, nullable(rootModel), draft, usageSQL).Scan(&nextSeq).Error; err != nil {
 				return err
+			}
+			// 线一 outbox（doc/29 §4.1）：**与 run 定稿同一笔事务**登记抽取任务——run 定稿 ⇒
+			// 待抽任务一定存在；进程在 COMMIT 后崩溃也有补偿线索。只登记 complete（error/stopped
+			// 没有可信结果，EndRun 本就不写完整轨迹）。登记失败 = 整笔回滚——与「同事务」同义，
+			// 不是新增的异步失败面。
+			if s.memoryCfg.Extract && s.memoryCfg.Workspace != "" {
+				jobID, err := newRowID("mj_")
+				if err != nil {
+					return err
+				}
+				if err := tx.Exec(
+					`INSERT INTO memory_jobs (id, run_id, session_id, tenant_id, workspace, status, attempts,
+					         next_attempt_at, last_error, created_at, updated_at)
+					 VALUES (?, ?, ?, ?, ?, 'pending', 0, now(), '', now(), now())
+					 ON CONFLICT (run_id) DO NOTHING`,
+					jobID, runID, sessionID, s.memoryCfg.TenantID, s.memoryCfg.Workspace).Error; err != nil {
+					return err
+				}
 			}
 		} else {
 			// 非 complete 不定稿：runlogOffset 仍返回当前高水位（旧 Lua 的 LLEN 语义原样）。
