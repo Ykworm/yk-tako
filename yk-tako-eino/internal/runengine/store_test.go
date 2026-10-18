@@ -192,7 +192,7 @@ func (s *Store) mustDelta(t *testing.T, ctx context.Context, rid RunID, text str
 	t.Helper()
 	// model 传空串：多数用例验的是生命周期语义、不关心 model 值（帧上恒在字段，无 omitempty）。
 	// model 值的序列化往返另有专测（TestAppendDeltaThenRead）。
-	if _, ok, err := s.AppendDelta(ctx, rid, "", text); err != nil || !ok {
+	if _, ok, err := s.AppendDelta(ctx, rid, 1, "", text); err != nil || !ok {
 		t.Fatalf("AppendDelta(%s): ok=%v err=%v", rid, ok, err)
 	}
 }
@@ -233,7 +233,7 @@ func TestAcquireRunGateBlocksSecondRun(t *testing.T) {
 	s.mustGone(t, ctx, keyRunlive(r2))
 	s.mustGone(t, ctx, keyDraft(r2))
 	// 闸落点 = runs 活行。
-	live, _, _, _, err := s.SessionStatus(ctx, sid)
+	live, _, _, _, _, err := s.SessionStatus(ctx, sid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +280,7 @@ func TestAppendDeltaThenRead(t *testing.T) {
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 
 	for i, want := range []int{2, 3} {
-		n, ok, err := s.AppendDelta(ctx, rid, "deepseek/deepseek-v4-flash", "你好")
+		n, ok, err := s.AppendDelta(ctx, rid, 1, "deepseek/deepseek-v4-flash", "你好")
 		if err != nil || !ok {
 			t.Fatalf("AppendDelta #%d: ok=%v err=%v", i, ok, err)
 		}
@@ -313,7 +313,7 @@ func TestEndRunCompleteFinalizes(t *testing.T) {
 
 	// T2 起 mh 的 assistant 半来自 worker 累积的 turn（不再由 EndRun 从 draft 合成）：测试给合成 turn 走同一路。
 	turn := []TurnEntry{{Role: "assistant", Text: "Hello, world"}}
-	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, mhRowsFromTurn(rid, turn), turn)
+	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, mhRowsFromTurn(rid, turn), turn)
 	if err != nil || !ok {
 		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
 	}
@@ -360,7 +360,7 @@ func TestReadFramesGoneAfterTTL(t *testing.T) {
 	s := newTestStore(t, testLease, 2*time.Second)
 	sid, rid := SessionID("s_1"), RunID("r_1")
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
-	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil, nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, nil, nil); err != nil || !ok {
 		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
 	}
 
@@ -402,7 +402,7 @@ func TestStoredShapeCarriesNoOffset(t *testing.T) {
 	sid, rid := SessionID("s_1"), RunID("r_1")
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 	s.mustDelta(t, ctx, rid, "world")
-	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil, nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, nil, nil); err != nil || !ok {
 		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
 	}
 
@@ -441,7 +441,7 @@ func TestBatchWindowCapsBothEndpoints(t *testing.T) {
 	for _, rid := range []RunID{"r_1", "r_2"} {
 		s.mustAcquire(t, sid, rid, "m_u", "q")
 		s.mustDelta(t, ctx, rid, "a")
-		if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil, nil); err != nil || !ok {
+		if _, _, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, nil, nil); err != nil || !ok {
 			t.Fatalf("EndRun %s: ok=%v err=%v", rid, ok, err)
 		}
 	}
@@ -481,7 +481,7 @@ func TestBatchWindowCapsBothEndpoints(t *testing.T) {
 	// 同一条规则也管 runlive：start+2 delta+terminal = 4 帧，W=1 时每批一帧。
 	s.mustDelta(t, ctx, rid3, "d1")
 	s.mustDelta(t, ctx, rid3, "d2")
-	if _, _, ok, err := s.EndRun(ctx, sid, rid3, "complete", nil, nil, nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid3, 1, "complete", nil, nil, nil); err != nil || !ok {
 		t.Fatalf("EndRun %s: ok=%v err=%v", rid3, ok, err)
 	}
 	for _, c := range []struct {
@@ -511,12 +511,12 @@ func TestEndRunAfterGateLostIsNoop(t *testing.T) {
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 	s.mustDelta(t, ctx, rid, "world")
 
-	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil, nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, nil, nil); err != nil || !ok {
 		t.Fatalf("首次 EndRun: ok=%v err=%v", ok, err)
 	}
 	before := s.count(t, &RunlogEntry{}, "session_id = ?", sid)
 
-	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil, nil)
+	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,10 +552,10 @@ func TestResetClearsBothHalvesOnlyOwnPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if deleted != 2 {
-		t.Errorf("Reset deleted = %d, want 2（runlive + draft 两键）", deleted)
+	if deleted != 3 {
+		t.Errorf("Reset deleted = %d, want 3（runlive + draft + runepoch 三键）", deleted)
 	}
-	for _, m := range []any{&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}, &Note{}} {
+	for _, m := range []any{&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}, &Note{}, &RunJournal{}} {
 		if got := s.count(t, m, ""); got != 0 {
 			t.Errorf("reset 后 %T 行数 = %d, want 0", m, got)
 		}
@@ -572,7 +572,7 @@ func TestResetClearsBothHalvesOnlyOwnPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, _, exists, err := s.SessionStatus(ctx, sid); err != nil || exists {
+	if _, _, _, _, exists, err := s.SessionStatus(ctx, sid); err != nil || exists {
 		t.Errorf("reset 后 session 应不存在: exists=%v err=%v", exists, err)
 	}
 }
@@ -603,7 +603,7 @@ func TestGateLeaseLifecycle(t *testing.T) {
 	if err := s.db.Raw(`SELECT lease_until FROM runs WHERE id = ?`, rid).Row().Scan(&before); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := s.RenewLease(ctx, sid, rid); err != nil || !ok {
+	if ok, err := s.RenewLease(ctx, sid, rid, 1); err != nil || !ok {
 		t.Fatalf("RenewLease: ok=%v err=%v", ok, err)
 	}
 	if err := s.db.Raw(`SELECT lease_until FROM runs WHERE id = ?`, rid).Row().Scan(&after); err != nil {
@@ -631,7 +631,7 @@ func TestGateLeaseLifecycle(t *testing.T) {
 	waitCond(t, "lease 过期（读侧判死）", 8*time.Second, func() bool {
 		return s.sqlBool(t, `SELECT lease_until < now() FROM runs WHERE id = ?`, rid)
 	})
-	live, runlogOffset, _, exists, err := s.SessionStatus(ctx, sid)
+	live, runlogOffset, _, _, exists, err := s.SessionStatus(ctx, sid)
 	if err != nil || !exists {
 		t.Fatalf("SessionStatus: exists=%v err=%v", exists, err)
 	}
@@ -657,7 +657,7 @@ func TestGateLeaseLifecycle(t *testing.T) {
 	if !s.sqlBool(t, `SELECT (status = 'error' AND finished_at IS NOT NULL AND lease_until IS NULL) FROM runs WHERE id = ?`, rid) {
 		t.Error("死行应被清扫成 error（finished_at 非空、lease_until 清空）")
 	}
-	if live, _, _, _, err := s.SessionStatus(ctx, sid); err != nil || live != r2 {
+	if live, _, _, _, _, err := s.SessionStatus(ctx, sid); err != nil || live != r2 {
 		t.Errorf("重抢后 liveRunId = %q, want %q (err=%v)", live, r2, err)
 	}
 }
@@ -670,7 +670,7 @@ func TestRenewLeaseNoopWhenGateLost(t *testing.T) {
 	sid, rid := SessionID("s_1"), RunID("r_1")
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 	s.mustDelta(t, ctx, rid, "world")
-	if ok, err := s.RenewLease(ctx, sid, rid); err != nil || !ok {
+	if ok, err := s.RenewLease(ctx, sid, rid, 1); err != nil || !ok {
 		t.Fatalf("首次续约（闸属本 run）应成功: ok=%v err=%v", ok, err)
 	}
 
@@ -685,7 +685,7 @@ func TestRenewLeaseNoopWhenGateLost(t *testing.T) {
 		}
 	}
 
-	ok, err := s.RenewLease(ctx, sid, rid)
+	ok, err := s.RenewLease(ctx, sid, rid, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -744,14 +744,14 @@ func TestRenewLeaseRefusesExpiredGate(t *testing.T) {
 		return s.sqlBool(t, `SELECT (status = 'running' AND lease_until < now()) FROM runs WHERE id = ?`, rid)
 	})
 
-	ok, err := s.RenewLease(ctx, sid, rid)
+	ok, err := s.RenewLease(ctx, sid, rid, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ok {
 		t.Fatal("lease 已过，续约应拒（过期不可复活）")
 	}
-	if live, _, _, _, err := s.SessionStatus(ctx, sid); err != nil || live != "" {
+	if live, _, _, _, _, err := s.SessionStatus(ctx, sid); err != nil || live != "" {
 		t.Errorf("过期后 liveRunId = %q, want \"\" (err=%v)", live, err)
 	}
 }
@@ -797,7 +797,7 @@ func TestEndRunRefusesExpiredGate(t *testing.T) {
 		return n == 0 && s.sqlBool(t, `SELECT lease_until < now() FROM runs WHERE id = ?`, rid)
 	})
 
-	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, nil, nil)
+	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -824,7 +824,7 @@ func TestEndRunErrorKeepsLogUntouched(t *testing.T) {
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 	s.mustDelta(t, ctx, rid, "partial...")
 
-	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, "error", nil, nil, nil)
+	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, 1, "error", nil, nil, nil)
 	if err != nil || !ok {
 		t.Fatalf("EndRun(error): ok=%v err=%v", ok, err)
 	}
@@ -898,7 +898,7 @@ func TestEndRunLandsTurnRows(t *testing.T) {
 		{Role: "tool", Text: "2026-10-08 15:04:05 +0800 CST", ToolCallID: "call_1", ToolName: "get_time"},
 		{Role: "assistant", Text: "，现在是 15:04"},
 	}
-	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, mhRowsFromTurn(rid, turn), turn); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, mhRowsFromTurn(rid, turn), turn); err != nil || !ok {
 		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
 	}
 
@@ -985,7 +985,7 @@ func TestEndRunLandsDelegationRows(t *testing.T) {
 		{Role: "tool", Agent: "", Text: "现在是 15:04。", ToolCallID: "call_1", ToolName: "researcher", Model: mainRef},
 		{Role: "assistant", Agent: "", Text: "已经查完：15:04", Model: mainRef},
 	}
-	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, mhRowsFromTurn(rid, turn), turn); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, mhRowsFromTurn(rid, turn), turn); err != nil || !ok {
 		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
 	}
 
@@ -1083,7 +1083,7 @@ func TestEndRunLandsUsagePayload(t *testing.T) {
 		{Role: "assistant", Agent: "", Text: "好的，查完了。", Model: mainRef,
 			Usage: &UsageBill{PromptTokens: 300, CompletionTokens: 30, TotalTokens: 330, Window: 256000}},
 	}
-	if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", nil, mhRowsFromTurn(rid, turn), turn); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, mhRowsFromTurn(rid, turn), turn); err != nil || !ok {
 		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
 	}
 
@@ -1118,7 +1118,7 @@ func TestEndRunLandsUsagePayload(t *testing.T) {
 	s.mustAcquire(t, sid, rid2, "m_2", "再来一条")
 	s.mustDelta(t, ctx, rid2, "好。")
 	turn2 := []TurnEntry{{Role: "assistant", Agent: "", Text: "好。", Model: mainRef}}
-	if _, _, ok, err := s.EndRun(ctx, sid, rid2, "complete", nil, mhRowsFromTurn(rid2, turn2), turn2); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, rid2, 1, "complete", nil, mhRowsFromTurn(rid2, turn2), turn2); err != nil || !ok {
 		t.Fatalf("EndRun(r2): ok=%v err=%v", ok, err)
 	}
 	rows2, _, exists, err := s.ReadLog(ctx, sid, 5, 200)
@@ -1147,14 +1147,14 @@ func TestEndRunCompleteWithStagedCompaction(t *testing.T) {
 	s.mustAcquire(t, sid, r1, "m_1", "run1 用户消息")
 	s.mustDelta(t, ctx, r1, "run1 回答")
 	turn1 := []TurnEntry{{Role: "assistant", Text: "run1 回答"}}
-	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", nil, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, r1, 1, "complete", nil, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
 		t.Fatalf("EndRun(r1): ok=%v err=%v", ok, err)
 	}
 	s.mustAcquire(t, sid, r2, "m_2", "run2 用户消息")
 
 	staged := []StagedCompaction{{DropRunIDs: []RunID{r1}, Summary: "摘要：run1 谈过的事", AttachRun: r1}}
 	turn2 := []TurnEntry{{Role: "assistant", Text: "run2 回答"}}
-	if _, _, ok, err := s.EndRun(ctx, sid, r2, "complete", staged, mhRowsFromTurn(r2, turn2), turn2); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, 1, "complete", staged, mhRowsFromTurn(r2, turn2), turn2); err != nil || !ok {
 		t.Fatalf("EndRun(r2, staged): ok=%v err=%v", ok, err)
 	}
 
@@ -1192,13 +1192,13 @@ func TestEndRunErrorWithStagedZeroWrite(t *testing.T) {
 	s.mustAcquire(t, sid, r1, "m_1", "run1 用户消息")
 	s.mustDelta(t, ctx, r1, "run1 回答")
 	turn1 := []TurnEntry{{Role: "assistant", Text: "run1 回答"}}
-	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", nil, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, r1, 1, "complete", nil, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
 		t.Fatalf("EndRun(r1): ok=%v err=%v", ok, err)
 	}
 	s.mustAcquire(t, sid, r2, "m_2", "run2 用户消息")
 
 	staged := []StagedCompaction{{DropRunIDs: []RunID{r1}, Summary: "不该落库的摘要", AttachRun: r1}}
-	if _, _, ok, err := s.EndRun(ctx, sid, r2, "error", staged, nil, nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, 1, "error", staged, nil, nil); err != nil || !ok {
 		t.Fatalf("EndRun(r2, error, staged): ok=%v err=%v", ok, err)
 	}
 	if !s.sqlBool(t, `SELECT bool_and(compacted = false) FROM run_model_messages WHERE session_id = ?`, sid) {
@@ -1231,7 +1231,7 @@ func TestSecondCompactionReattaches(t *testing.T) {
 			staged = []StagedCompaction{{DropRunIDs: []RunID{runs[0], runs[1]}, Summary: "S2", AttachRun: runs[1]}}
 		}
 		turn := []TurnEntry{{Role: "assistant", Text: fmt.Sprintf("run%d 回答", i+1)}}
-		if _, _, ok, err := s.EndRun(ctx, sid, rid, "complete", staged, mhRowsFromTurn(rid, turn), turn); err != nil || !ok {
+		if _, _, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", staged, mhRowsFromTurn(rid, turn), turn); err != nil || !ok {
 			t.Fatalf("EndRun(%s, staged=%d): ok=%v err=%v", rid, len(staged), ok, err)
 		}
 	}
@@ -1272,7 +1272,7 @@ func TestEndRunSameSlotUpsert(t *testing.T) {
 	s.mustAcquire(t, sid, r1, "m_1", "run1 用户消息")
 	turn1 := []TurnEntry{{Role: "assistant", Text: "run1 回答"}}
 	staged1 := []StagedCompaction{{Summary: "S1", AttachRun: r1}}
-	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", staged1, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, r1, 1, "complete", staged1, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
 		t.Fatalf("EndRun(r1): ok=%v err=%v", ok, err)
 	}
 	var id1 string
@@ -1283,7 +1283,7 @@ func TestEndRunSameSlotUpsert(t *testing.T) {
 	// r_2 的折叠整体折入 r_1（AttachRun 又是 r_1）→ 旧摘要槽换代（先翻死、再焕新）。
 	s.mustAcquire(t, sid, r2, "m_2", "run2 用户消息")
 	staged2 := []StagedCompaction{{DropRunIDs: []RunID{r1}, Summary: "S2", AttachRun: r1}}
-	if _, _, ok, err := s.EndRun(ctx, sid, r2, "complete", staged2, nil, nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, 1, "complete", staged2, nil, nil); err != nil || !ok {
 		t.Fatalf("EndRun(r2, staged): ok=%v err=%v", ok, err)
 	}
 
@@ -1322,14 +1322,14 @@ func TestEndRunMergedSummaryFlipsSeq0Only(t *testing.T) {
 	s.mustAcquire(t, sid, r1, "m_1", "run1 用户消息")
 	turn1 := []TurnEntry{{Role: "assistant", Text: "run1 回答"}}
 	staged1 := []StagedCompaction{{Summary: "S1", AttachRun: r1}}
-	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", staged1, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, r1, 1, "complete", staged1, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
 		t.Fatalf("EndRun(r1): ok=%v err=%v", ok, err)
 	}
 
 	// r_2 的折叠把 r_1 放进保留区（MergedSummaryRunIDs）、挂点别处（r_2 自己）。
 	s.mustAcquire(t, sid, r2, "m_2", "run2 用户消息")
 	staged2 := []StagedCompaction{{MergedSummaryRunIDs: []RunID{r1}, Summary: "S2", AttachRun: r2}}
-	if _, _, ok, err := s.EndRun(ctx, sid, r2, "complete", staged2, nil, nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, 1, "complete", staged2, nil, nil); err != nil || !ok {
 		t.Fatalf("EndRun(r2, staged): ok=%v err=%v", ok, err)
 	}
 
@@ -1359,12 +1359,12 @@ func TestEndRunStagedListLandsLastSummary(t *testing.T) {
 
 	s.mustAcquire(t, sid, r1, "m_1", "run1 用户消息")
 	turn1 := []TurnEntry{{Role: "assistant", Text: "run1 回答"}}
-	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", nil, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, r1, 1, "complete", nil, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
 		t.Fatalf("EndRun(r1): ok=%v err=%v", ok, err)
 	}
 	s.mustAcquire(t, sid, r2, "m_2", "run2 用户消息")
 	turn2 := []TurnEntry{{Role: "assistant", Text: "run2 回答"}}
-	if _, _, ok, err := s.EndRun(ctx, sid, r2, "complete", nil, mhRowsFromTurn(r2, turn2), turn2); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, 1, "complete", nil, mhRowsFromTurn(r2, turn2), turn2); err != nil || !ok {
 		t.Fatalf("EndRun(r2): ok=%v err=%v", ok, err)
 	}
 
@@ -1373,7 +1373,7 @@ func TestEndRunStagedListLandsLastSummary(t *testing.T) {
 		{DropRunIDs: []RunID{r1}, Summary: "S1", AttachRun: r1},
 		{DropRunIDs: []RunID{r2}, Summary: "S2", AttachRun: r2},
 	}
-	if _, _, ok, err := s.EndRun(ctx, sid, r3, "complete", staged, nil, nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, r3, 1, "complete", staged, nil, nil); err != nil || !ok {
 		t.Fatalf("EndRun(r3, staged 列表): ok=%v err=%v", ok, err)
 	}
 
@@ -1406,17 +1406,17 @@ func TestEndRunGateLostWithStagedNoop(t *testing.T) {
 	s.mustAcquire(t, sid, r1, "m_1", "run1 用户消息")
 	s.mustDelta(t, ctx, r1, "run1 回答")
 	turn1 := []TurnEntry{{Role: "assistant", Text: "run1 回答"}}
-	if _, _, ok, err := s.EndRun(ctx, sid, r1, "complete", nil, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, r1, 1, "complete", nil, mhRowsFromTurn(r1, turn1), turn1); err != nil || !ok {
 		t.Fatalf("EndRun(r1): ok=%v err=%v", ok, err)
 	}
 	s.mustAcquire(t, sid, r2, "m_2", "run2 用户消息")
 
 	// r2 的闸先被别人放掉（模拟清扫/易主），再带 staged 调 EndRun：必须整笔空转。
-	if _, _, ok, err := s.EndRun(ctx, sid, r2, "error", nil, nil, nil); err != nil || !ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, 1, "error", nil, nil, nil); err != nil || !ok {
 		t.Fatalf("前置 EndRun(r2, error): ok=%v err=%v", ok, err)
 	}
 	staged := []StagedCompaction{{DropRunIDs: []RunID{r1, r2}, Summary: "幽灵摘要", AttachRun: r1}}
-	if _, _, ok, err := s.EndRun(ctx, sid, r2, "complete", staged, nil, nil); err != nil || ok {
+	if _, _, ok, err := s.EndRun(ctx, sid, r2, 1, "complete", staged, nil, nil); err != nil || ok {
 		t.Fatalf("闸失后 EndRun: ok=%v err=%v, want false/nil（空转）", ok, err)
 	}
 	if n := s.count(t, &RunModelMessage{}, "session_id = ? AND seq = 0", sid); n != 0 {
@@ -1424,5 +1424,77 @@ func TestEndRunGateLostWithStagedNoop(t *testing.T) {
 	}
 	if !s.sqlBool(t, `SELECT bool_and(compacted = false) FROM run_model_messages WHERE session_id = ?`, sid) {
 		t.Error("闸失后出现了 compacted 翻转——staged 写越过了「闸在手上」守卫")
+	}
+}
+
+// TestRunStatusDerivation 盖 doc/30 A1 的读侧派生：五种状态、resumeCount 边界、resumable、
+// 未知 run，以及 session 端点新加的 lastRunId（与 lastRunStatus 指同一场 run）。
+// 拨表代替等租约：lease_until 直接改到过去 = 「执行者已经不在了」，与进程真死同一条判定。
+func TestRunStatusDerivation(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid, rid := SessionID("s_1"), RunID("r_1")
+	s.mustAcquire(t, sid, rid, "m_1", "hi")
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if err := s.db.WithContext(ctx).Exec(query, args...).Error; err != nil {
+			t.Fatalf("SQL %s: %v", query, err)
+		}
+	}
+	statusOf := func() RunState {
+		t.Helper()
+		st, found, err := s.RunStatus(ctx, rid, 3)
+		if err != nil || !found {
+			t.Fatalf("RunStatus(%s): found=%v err=%v", rid, found, err)
+		}
+		return st
+	}
+
+	// 1) running：租约活着（AcquireRun 出生即带）；session 的 live/last 两处都指它。
+	st := statusOf()
+	if st.SessionID != sid || st.Status != "running" || st.ResumeCount != 0 || st.Resumable {
+		t.Fatalf("running 派生 = %+v, want status=running count=0 resumable=false", st)
+	}
+	live, _, lastStatus, lastRunID, exists, err := s.SessionStatus(ctx, sid)
+	if err != nil || !exists || live != rid || lastStatus != "running" || lastRunID != rid {
+		t.Fatalf("session(running) = live:%q status:%q last:%q exists:%v err:%v", live, lastStatus, lastRunID, exists, err)
+	}
+
+	// 2) interrupted：租约过期，runs.status 仍是 running——读侧当场派生，不用等清扫。
+	exec(`UPDATE runs SET lease_until = now() - interval '1 second' WHERE id = ?`, rid)
+	st = statusOf()
+	if st.Status != "interrupted" || st.ResumeCount != 0 || !st.Resumable {
+		t.Fatalf("interrupted 派生 = %+v, want status=interrupted count=0 resumable=true", st)
+	}
+	live, _, lastStatus, lastRunID, _, _ = s.SessionStatus(ctx, sid)
+	if live != "" || lastStatus != "interrupted" || lastRunID != rid {
+		t.Fatalf("session(interrupted) = live:%q status:%q last:%q, want \"\"/interrupted/%q", live, lastStatus, lastRunID, rid)
+	}
+
+	// 3) resumeCount 边界：epoch-1；恰等于上限（3）时不再可续。
+	exec(`UPDATE runs SET lease_epoch = 3 WHERE id = ?`, rid)
+	if st = statusOf(); st.ResumeCount != 2 || !st.Resumable {
+		t.Fatalf("epoch=3 = %+v, want count=2 resumable=true", st)
+	}
+	exec(`UPDATE runs SET lease_epoch = 4 WHERE id = ?`, rid)
+	if st = statusOf(); st.ResumeCount != 3 || st.Resumable {
+		t.Fatalf("epoch=4(上限 3) = %+v, want count=3 resumable=false", st)
+	}
+
+	// 4) 终态原样透出（complete/error/stopped），resumable 恒 false；lastRunStatus 同步。
+	for _, status := range []string{"complete", "error", "stopped"} {
+		exec(`UPDATE runs SET status = ?, lease_until = NULL WHERE id = ?`, status, rid)
+		if st = statusOf(); st.Status != status || st.Resumable {
+			t.Fatalf("终态 %s 派生 = %+v, want status=%s resumable=false", status, st, status)
+		}
+		_, _, lastStatus, _, _, _ = s.SessionStatus(ctx, sid)
+		if lastStatus != status {
+			t.Fatalf("session lastRunStatus = %q, want %q", lastStatus, status)
+		}
+	}
+
+	// 5) 未知 run：found=false（HTTP 层 404），不伪造状态。
+	if _, found, err := s.RunStatus(ctx, "r_nope", 3); err != nil || found {
+		t.Fatalf("未知 run: found=%v err=%v, want false/nil", found, err)
 	}
 }

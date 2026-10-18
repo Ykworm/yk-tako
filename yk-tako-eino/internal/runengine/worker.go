@@ -106,23 +106,31 @@ func einoChunkText(chunk *schema.Message) (string, bool) {
 // compactWindow / counter 是长度自测（C 系列）：window > 0 时发送前数 token，超 limit = compactLimitFor(window)
 // 走折叠（compact.go）；0 = 关压缩（counter 为 nil 即可，计数与摘要都不发生）。
 type Worker struct {
-	store         *Store
-	sum           *summarizer // compact 摘要：旋钮/stall/重试分流/三层验货一条龙（C2）
-	agent         adk.Agent   // 主循环：ADK ChatModelAgent（T2 起挂 get_time）
-	translate     Translator
-	system        string
-	rootRef       string // 主模型生效 ref（T3-1b，= config.ChatModel.Ref）：root 帧的 model 值 + 身份表 root 条目
-	leaseRenew    time.Duration
+	store      *Store
+	sum        *summarizer // compact 摘要：旋钮/stall/重试分流/三层验货一条龙（C2）
+	agent      adk.Agent   // 主循环：ADK ChatModelAgent（T2 起挂 get_time）
+	translate  Translator
+	system     string
+	rootRef    string // 主模型生效 ref（T3-1b，= config.ChatModel.Ref）：root 帧的 model 值 + 身份表 root 条目
+	leaseRenew time.Duration
 	// workspace 是作业根（F1，绝对路径）：文件工具构造期消费它入池；doc/32 起入口媒体落盘
 	// 与「第一枪还原」记账（A3/translator 后）也要它——存一份给 Workspace() 取用。
 	workspace     string
 	compactWindow int
 	compactLimit  int // = compactLimitFor(window)（window=0 时 0）：触发线 / 准入线两处共用，不各自重算；摘要预算帽自 A7 起归 summarizeCeiling 分档
 	counter       TokenCounter
-	// runCancels 是手动停止（doc/17 §4）的进程内取消注册表：runID → cancelFunc。
-	// stop 端点赢竞态后查它，命中（本进程在跑这场 run）即 cancel、不等续约 tick；
-	// 跨副本传播走 watchdog：续约 CAS 0 行 → 查它 cancel（最坏一个续约间隔）。
+	// runCancels 是手动停止（doc/17 §4）的进程内取消注册表：runID → *runCancel。
+	// stop 端点赢竞态后查它，命中（本进程在跑这场 run）即 cancel、不等续约 tick（用户停止永远最大，
+	// 不看 epoch）；跨副本传播走 watchdog：续约 CAS 0 行 → 查它、**epoch 相同才** cancel
+	// （doc/30 §7：被接管后旧执行者的 cancel 不能误伤接管者，最坏一个续约间隔）。
 	runCancels sync.Map
+}
+
+// runCancel 是注册表的值：取消把柄 + 它属于哪一代执行者。epoch 让 Run 的退出清理
+// （CompareAndDelete 指针身份）与 watchdog 的判死 cancel 都只作用于自己那一代。
+type runCancel struct {
+	epoch  int64
+	cancel context.CancelFunc
 }
 
 // NewWorker 组一个 worker。chat 是两处模型的共同底座（model.BaseChatModel，
@@ -249,6 +257,10 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 			// 链尾 = 最内 user wrapper——模型调用错误冒泡最先到它（wrappers.go:1129 逆序包裹、
 			// first registered = outermost）。四条件同真就折被拒输入重调一次；零帧/闸花原样上抛。
 			newOverflowGuard(compactWindow, counter, sum.summarize, firstPartyFileEffects),
+			// 崩溃账本包壳（doc/30 §6.3）：必须排在所有 append runCtx.Tools 的 handler 之后——
+			// 一手池、MCP（mcpToolHandler）、委派（agentSpecHandler）与以后新增的工具一处覆盖。
+			// 子代理入口快照在此前已完成，拿的是未包壳工具，内部调用不记账。
+			&journalWrapHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, store: store},
 		},
 	})
 	if err != nil {
@@ -277,22 +289,47 @@ func (w *Worker) Workspace() string { return w.workspace }
 // 停 watchdog 的 defer 后注册故先跑，且 `wg.Wait()` 确保续约 goroutine 完全退出——否则续约会把 runlive
 // 定稿后的 300s TTL 覆盖回 lease 的 30s（D1 落库后终态行的续约被 PG 守卫挡成空转，这条顺序仍保持：
 // 它同时保证「最后一次续约」早于放闸，语义最干净）。
-func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
+// epoch 是 lease_epoch 真值（doc/30 §7）：POST 路径传 1，续跑路径传 claim 返回值。
+// 它进 journalTarget 与所有 Redis 帧写；watchdog 的判死 cancel 也按它认代。
+func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID, epoch int64) {
+	w.run(ctx, sessionID, runID, epoch, nil)
+}
+
+// RunResume 是续跑入口（doc/30 §9）：与 Run 共用同一条 run 主体，差异只有两处——
+// turn 从账本重放产物起手（EndRun 的 runlog/mh 投影要把中断前已发生的行一并定稿），
+// 模型输入 = mh 全序 + replay.Rows（已发生的轮次不进 mh，只在本轮输入里补上）。
+// replay.Final = 账本最后一条 assistant 无 tool_calls（答案已说完、只差放闸）：不调模型，直接定稿。
+func (w *Worker) RunResume(ctx context.Context, sessionID SessionID, runID RunID, epoch int64, replay journalReplay) {
+	w.run(ctx, sessionID, runID, epoch, &replay)
+}
+
+func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoch int64, resume *journalReplay) {
 	status := "complete"
 	// 手动停止（doc/17 §4）：run ctx 包一层可取消并注册——stop 端点 / watchdog 判死都经
 	// 注册表 cancel 这一个把柄，模型流与工具（子代理调用在 ctx.Done 上返回）随取消 unwind。
+	// 退出清理按指针身份删自己那一条：续跑接管后注册表里已是新一代的值，旧 Run 不许误删。
 	ctx, cancelRun := context.WithCancel(ctx)
-	w.runCancels.Store(runID, cancelRun)
-	defer w.runCancels.Delete(runID)
+	rc := &runCancel{epoch: epoch, cancel: cancelRun}
+	w.runCancels.Store(runID, rc)
+	defer w.runCancels.CompareAndDelete(runID, rc)
 	defer cancelRun()
 	// run 级折叠容器（A4，planning 裁定 4）：塞进 ctx 供 midfoldHandler 读写；prepareInput 填
 	// base 与 Run fold 的 staged，defer 从这里取货落库。
 	box := newFoldBox(sessionID, runID)
 	ctx = withFoldBox(ctx, box)
+	// 崩溃账本坐标（doc/30 A2）：本 run 的 id 与接管令牌（POST 路径 1，续跑路径 = claim 返回值，
+	// A3 起所有写点都带它）。这里塞进的是 agent.Run 与全部工具调用共用的 ctx——工具包装层的
+	// intent/result 都读它。
+	ctx = withJournalTarget(ctx, journalTarget{runID: runID, epoch: epoch})
 	// turn 是本 run 模型侧消息的全序（T2）：流式事件合并全文（assistant 轮，带 tool_calls）与
 	// 工具结果事件（tool 轮）按事件序累积，defer 交给 EndRun——complete 才落库，error/闸失零写入。
 	// T3-2 起子代理条目也在列（带 Agent 归属）：分拣归 EndRun 的两个投影，worker 只负责记全。
+	// 续跑（doc/30 §9）：起手先把账本重放出的已发生轮次装进 turn——EndRun 定稿时它们与
+	// 本次新产出的条目同笔落 runlog/mh，不丢中断前的半场。
 	var turn []TurnEntry
+	if resume != nil {
+		turn = resume.Turn
+	}
 	defer func() {
 		// mh 写入源 = 折后 state 派生（A4）：RunID==currentRun 且 Seq≥2 的行、按位置从 2 连续
 		// 重编（mid-fold 折走单位留下的 seq 空洞在此闭合）。final 为空 = 不可达态（成功终态
@@ -305,7 +342,7 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 		}
 		// WithoutCancel（doc/17 §4 D4）：stop 判死后本 ctx 已取消，但 stopped 收尾还要写
 		// 已配对工具行——收尾的 PG/Redis 调用不能吃取消；foldBox 等 ctx 值仍要带上。
-		_, _, ok, err := w.store.EndRun(context.WithoutCancel(ctx), sessionID, runID, status, box.stagedList(), mhRows, turn)
+		_, _, ok, err := w.store.EndRun(context.WithoutCancel(ctx), sessionID, runID, epoch, status, box.stagedList(), mhRows, turn)
 		switch {
 		case err != nil:
 			// 收尾失败仍留痕。D1 后有两个方向：DB 半败 = 闸没放（租约到点自蒸、会话自动解锁，不再永久锁死）；
@@ -321,7 +358,7 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		w.watchdog(leaseCtx, sessionID, runID)
+		w.watchdog(leaseCtx, sessionID, runID, epoch)
 	}()
 	defer func() { cancelLease(); wg.Wait() }()
 
@@ -336,7 +373,27 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 	}
 	ctx = withNoteBox(ctx, newNoteBox(sessionID, runID, userSeq))
 
-	msgs, err := w.prepareInput(ctx, sessionID, runID)
+	// 续跑终稿态（doc/30 §9.1）：账本最后一条 assistant 无 tool_calls = 模型已说完、只差放闸。
+	// 不调模型、不组输入——turn 里已是完整半场，直接走 defer 的 EndRun 定稿。
+	if resume != nil && resume.Final {
+		log.Printf("resume %s/%s: 账本终稿已在手（epoch %d，turn %d 条），直接定稿", sessionID, runID, epoch, len(turn))
+		return
+	}
+	var msgs []*schema.Message
+	if resume != nil {
+		// 续跑输入 = mh 全序 + 账本重放行（doc/30 §9.1）：中断前的轮次从未进 mh（EndRun 没跑），
+		// 只能由账本恢复；折叠自测仍走同一条 prepareInputFrom。
+		history, herr := w.store.ModelMessages(ctx, sessionID)
+		if herr != nil {
+			log.Printf("prepareInput %s/%s: %v", sessionID, runID, herr)
+			status = "error"
+			return
+		}
+		history = append(history, resume.Rows...)
+		msgs, err = w.prepareInputFrom(ctx, sessionID, runID, history)
+	} else {
+		msgs, err = w.prepareInput(ctx, sessionID, runID)
+	}
 	if err != nil {
 		// compact 的 errStillOver 也走这里：不调主模型、status=error、staged 零写入（闸放、无库写）。
 		log.Printf("prepareInput %s/%s: %v", sessionID, runID, err)
@@ -418,7 +475,7 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 					}
 					// T3-2：子代理条目也收（root 的委派回传事件 agent 为空——它属于 root 的循环）。
 					turn = append(turn, TurnEntry{Role: "tool", Agent: agent, Text: out, ToolCallID: callID, ToolName: name, Model: entry.ref})
-					live, err := w.store.AppendFrame(ctx, runID, Frame{Kind: "tool_result", Agent: agent, Model: entry.ref, Name: name, Output: out})
+					live, err := w.store.AppendFrame(ctx, runID, epoch, Frame{Kind: "tool_result", Agent: agent, Model: entry.ref, Name: name, Output: out})
 					if err != nil {
 						log.Printf("frame %s/%s: %v", sessionID, runID, err)
 						status = "error"
@@ -431,7 +488,7 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 				}
 				continue
 			}
-			merged, live, err := w.drain(ctx, runID, agent, entry, mo.MessageStream, box)
+			merged, live, err := w.drain(ctx, runID, epoch, agent, entry, mo.MessageStream, box)
 			if err != nil {
 				log.Printf("stream %s/%s: %v", sessionID, runID, err)
 				status = "error"
@@ -467,8 +524,22 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 			// 配置值非模型真值（真值校准归溢出层），0 = 未配窗、字段省略。同一账单随本轮 assistant
 			// 条目进 turn（A3：EndRun 把**最后一枪**的账单落终稿行 payload 列）。
 			bill, billOK := usageBill(merged, w.compactWindow)
+			// 崩溃账本 assistant 行（doc/30 §6.3）：drain 已排干 → 先落账，再发 usage/tool_call
+			// 帧、再进 turn。只记 root（子代理对 root 只是一次委派结果）。写失败 = run error，
+			// 不静默降级——账本丢一段，续跑重放出的输入就会与真实步骤不一致。
+			if agent == "" {
+				var billed *UsageBill
+				if billOK {
+					billed = bill
+				}
+				if err := writeJournalAssistant(ctx, w.store, merged, entry.ref, billed); err != nil {
+					log.Printf("journal assistant %s/%s: %v", sessionID, runID, err)
+					status = "error"
+					return
+				}
+			}
 			if billOK {
-				live, err := w.store.AppendFrame(ctx, runID, usageFrame(bill, agent, entry.ref))
+				live, err := w.store.AppendFrame(ctx, runID, epoch, usageFrame(bill, agent, entry.ref))
 				if err != nil {
 					log.Printf("frame %s/%s: %v", sessionID, runID, err)
 					status = "error"
@@ -483,7 +554,7 @@ func (w *Worker) Run(ctx context.Context, sessionID SessionID, runID RunID) {
 			// ToolCalls 逐条压 tool_call 帧，args 取模型原始 JSON 原文。
 			turn = append(turn, TurnEntry{Role: "assistant", Agent: agent, Text: merged.Content, ToolCalls: merged.ToolCalls, Model: entry.ref, Usage: bill})
 			for _, tc := range merged.ToolCalls {
-				live, err := w.store.AppendFrame(ctx, runID, Frame{Kind: "tool_call", Agent: agent, Model: entry.ref, Name: tc.Function.Name, Args: tc.Function.Arguments})
+				live, err := w.store.AppendFrame(ctx, runID, epoch, Frame{Kind: "tool_call", Agent: agent, Model: entry.ref, Name: tc.Function.Name, Args: tc.Function.Arguments})
 				if err != nil {
 					log.Printf("frame %s/%s: %v", sessionID, runID, err)
 					status = "error"
@@ -622,7 +693,7 @@ func usageFrame(bill *UsageBill, agent, model string) Frame {
 // 收编 foldBox（D12）——guard 与 worker 读同一个数。
 // 返回 live=false = run 已判死（该收摊，不是错误）；err != nil = 错误结局。
 // close 责任也在本函数：事件流的另一副本由 agent 内部排干，早退不关会把两边一起吊住。
-func (w *Worker) drain(ctx context.Context, runID RunID, agent string, entry agentModelEntry, stream *schema.StreamReader[*schema.Message], box *foldBox) (*schema.Message, bool, error) {
+func (w *Worker) drain(ctx context.Context, runID RunID, epoch int64, agent string, entry agentModelEntry, stream *schema.StreamReader[*schema.Message], box *foldBox) (*schema.Message, bool, error) {
 	defer stream.Close()
 	var chunks []*schema.Message
 	for {
@@ -642,9 +713,9 @@ func (w *Worker) drain(ctx context.Context, runID RunID, agent string, entry age
 		if text, ok := entry.translate(chunk); ok {
 			var live bool
 			if agent == "" {
-				_, live, err = w.store.AppendDelta(ctx, runID, entry.ref, text)
+				_, live, err = w.store.AppendDelta(ctx, runID, epoch, entry.ref, text)
 			} else {
-				live, err = w.store.AppendFrame(ctx, runID, Frame{Kind: "delta", Agent: agent, Model: entry.ref, Text: text})
+				live, err = w.store.AppendFrame(ctx, runID, epoch, Frame{Kind: "delta", Agent: agent, Model: entry.ref, Text: text})
 			}
 			if err != nil {
 				return nil, false, err
@@ -658,11 +729,15 @@ func (w *Worker) drain(ctx context.Context, runID RunID, agent string, entry age
 }
 
 // watchdog 在生成期间每 leaseRenew 续约一次闸的租约（A7）。续约 no-op（PG 守卫 UPDATE 影响 0 行：
-// 闸已易主 / 已放 / 已到期）= 本 run 被判死 → 记日志、cancel 本场 run（doc/17 §4 手动停止：
-// stop 端点翻 stopped 后由此传播取消；自然过期同样掐流——2026-10-15 用户拍，原「不杀流」语义废）。
-// 主循环的 AppendDelta 还会因 draft 蒸发自然停写（返 !live）、EndRun 被守卫挡住走 stopped 分支。
-// ctx 由 Run 在退出前 cancel，watchdog 随即返回；wg.Wait() 保证它完全退出后 EndRun 才跑。
-func (w *Worker) watchdog(ctx context.Context, sessionID SessionID, runID RunID) {
+// 闸已易主 / 已放 / 已到期 / 已被接管）= 本 run 被判死 → 记日志、cancel 本场 run（doc/17 §4
+// 手动停止：stop 端点翻 stopped 后由此传播取消；自然过期同样掐流——2026-10-15 用户拍，
+// 原「不杀流」语义废）。
+// 主循环的 AppendDelta 还会因 draft 蒸发 / 令牌不符自然停写（返 !live）、EndRun 被守卫挡住
+// 走「闸已不在，空转」。
+// epoch 匹配才 cancel（doc/30 §7）：接管者已注册新一代的 cancel，旧 watchdog 的判死
+// 不许误伤它。ctx 由 Run 在退出前 cancel，watchdog 随即返回；wg.Wait() 保证它完全退出后
+// EndRun 才跑。
+func (w *Worker) watchdog(ctx context.Context, sessionID SessionID, runID RunID, epoch int64) {
 	t := time.NewTicker(w.leaseRenew)
 	defer t.Stop()
 	for {
@@ -670,7 +745,7 @@ func (w *Worker) watchdog(ctx context.Context, sessionID SessionID, runID RunID)
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			ok, err := w.store.RenewLease(ctx, sessionID, runID)
+			ok, err := w.store.RenewLease(ctx, sessionID, runID, epoch)
 			if err != nil {
 				if ctx.Err() != nil {
 					return // Run 已收工、ctx 被 cancel 导致的在途续约失败，安静退出
@@ -680,11 +755,13 @@ func (w *Worker) watchdog(ctx context.Context, sessionID SessionID, runID RunID)
 			}
 			if !ok {
 				// 续约 CAS 0 行（doc/17 §4，2026-10-15 用户拍「採」）：闸已不属于本 run——
-				// 被 stop 端点翻了 stopped，或租约自然死亡。两种都 cancel 本场 run：
+				// 被 stop 端点翻了 stopped，或租约自然死亡，或已被接管。都 cancel 本场 run：
 				// stop 的契约是真断流；自然过期不掐只会让模型流白挂着烧 token（原「不杀流」语义废）。
 				log.Printf("lease renew %s/%s: 闸已不属于本 run，cancel 本场 run（本 run 判死）", sessionID, runID)
 				if c, hit := w.runCancels.Load(runID); hit {
-					c.(context.CancelFunc)()
+					if rc := c.(*runCancel); rc.epoch == epoch {
+						rc.cancel()
+					}
 				}
 				return
 			}
@@ -727,6 +804,13 @@ func (w *Worker) prepareInput(ctx context.Context, sessionID SessionID, runID Ru
 	if err != nil {
 		return nil, err
 	}
+	return w.prepareInputFrom(ctx, sessionID, runID, history)
+}
+
+// prepareInputFrom 是 prepareInput 的折叠段（doc/30 §9.1 拆出）：输入行由调用方给——
+// 正常路径 = mh 全序，续跑路径 = mh 全序 + 账本重放行。其余（长度自测、Run fold、容器填装）
+// 两条路径完全一致。
+func (w *Worker) prepareInputFrom(ctx context.Context, sessionID SessionID, runID RunID, history []ModelMessage) ([]*schema.Message, error) {
 	var staged *StagedCompaction
 	if w.compactWindow > 0 {
 		limit := w.compactLimit
@@ -738,6 +822,7 @@ func (w *Worker) prepareInput(ctx context.Context, sessionID SessionID, runID Ru
 		}
 		if total > limit {
 			log.Printf("compact %s/%s: 输入 %d tok > limit %d，进入折叠", sessionID, runID, total, limit)
+			var err error
 			history, staged, err = foldInput(ctx, w.system, history, runID, limit, w.compactWindow, w.counter, w.sum.summarize, firstPartyFileEffects)
 			if err != nil {
 				return nil, err

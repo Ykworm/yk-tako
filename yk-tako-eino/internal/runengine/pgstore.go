@@ -39,7 +39,10 @@ type Run struct {
 	SessionID  SessionID  `gorm:"not null;uniqueIndex:one_live_run_per_session,where:status = 'running';index:runs_session_status_lease,priority:1"`
 	Status     string     `gorm:"not null;index:runs_session_status_lease,priority:2"` // running / complete / error / stopped
 	LeaseUntil *time.Time `gorm:"index:runs_session_status_lease,priority:3"`          // 活行租约（终态置 NULL）；出生即带，watchdog 续
-	CreatedAt  time.Time  `gorm:"not null"`
+	// LeaseEpoch 是接管令牌（doc/30 §7）：出生 = 1，每一次 claim 续跑 +1；所有写点带它，
+	// 被接管后旧进程的每次写都自然失败。default:1 让 AutoMigrate 给存量 running 行补 1。
+	LeaseEpoch int64     `gorm:"not null;default:1"`
+	CreatedAt  time.Time `gorm:"not null"`
 	FinishedAt *time.Time
 }
 
@@ -95,11 +98,35 @@ type RunlogEntry struct {
 
 func (RunlogEntry) TableName() string { return "runlog_entries" }
 
-// autoMigrate 从五个 struct 建表（dev 迁移方式，待定项①已裁：AutoMigrate 够用，无迁移文件；
+// RunJournal = `run_journal` 表（doc/30 §6.2）：在途 run 的崩溃账本，**终态即删**（不是历史）。
+// 与 runlog 的分工：runlog 只记已定稿的消息、永不删；账本记「模型说到哪、哪些工具可能跑过」，
+// 供崩溃续跑重放出模型输入，正常结束/清扫/停止后立即清空。
+// seq 由 PG bigserial 发号（GORM autoIncrement）：root 多个工具在 ToolsNode 里并行执行，
+// MAX+1 会撞号；重放按 call id 归组，不按 seq 猜配对（§9.1）。
+// 三个 role：assistant（模型一枪的合并全文 + tool_calls）/ tool_call（执行前 intent）/
+// tool_result（执行后回执）。空串列一律写 ”（不是 NULL）——dev 端点逐字段出，便于 curl 断言。
+type RunJournal struct {
+	Seq        int64     `gorm:"primaryKey;autoIncrement"`
+	RunID      RunID     `gorm:"not null;index:run_journal_run_id"`
+	Epoch      int64     `gorm:"not null"`
+	Role       string    `gorm:"not null"`
+	Text       string    `gorm:"not null"`
+	ToolCalls  string    `gorm:"not null;default:''"`
+	ToolCallID string    `gorm:"not null;default:''"`
+	ToolName   string    `gorm:"not null;default:''"`
+	Args       string    `gorm:"not null;default:''"`
+	Model      string    `gorm:"not null;default:''"`
+	Usage      string    `gorm:"not null;default:''"`
+	CreatedAt  time.Time `gorm:"not null"`
+}
+
+func (RunJournal) TableName() string { return "run_journal" }
+
+// autoMigrate 从六个 struct 建表（dev 迁移方式，待定项①已裁：AutoMigrate 够用，无迁移文件；
 // 上生产换不换显式迁移归部署面）。部分索引（WHERE 条件）优先走 GORM index tag；
 // 若某版 GORM 表达不全，在这里补 CREATE ... IF NOT EXISTS 兜底——仍是代码内，不引迁移文件。
 func autoMigrate(db *gorm.DB) error {
-	return db.AutoMigrate(&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}, &Note{})
+	return db.AutoMigrate(&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}, &Note{}, &RunJournal{})
 }
 
 // newRowID 生成行级代理主键：前缀 + ULID（同 s_/r_ 的铸法）。
@@ -137,25 +164,138 @@ func (s *Store) CountMediaPlaceholders(ctx context.Context, sessionID SessionID)
 	return int(n), nil
 }
 
-// SessionStatus 返回状态查询四要素（19v6-01 §4 三要素 + doc/17 §4 手动停止加的 lastRunStatus）：
-// 活 run id（"" = 闲着）、runlog 高水位、是否已登记、该会话最新一场 run 的终态（无 run = ""）。
+// SessionStatus 返回状态查询五要素（19v6-01 §4 三要素 + doc/17 §4 手动停止加的 lastRunStatus
+// + doc/30 A1 加的 lastRunId）：活 run id（"" = 闲着）、runlog 高水位、是否已登记、
+// 该会话最新一场 run 的终态（无 run = ""）、该 run 的 id（无 run = ""）。
 // 单条 SQL 子查询取一致快照（原 MULTI 的等价物，预登记裁定）。liveRunId 读侧即回收：
 // lease 已过的死行当场不再算活，不等清扫（清扫只为放行新 run，planning §8.3）。
 // lastRunStatus 是 closeOut 无 terminal 帧路径（刷新 / 掉线重连）判断「停过没」的依据——
 // stopped 不写 assistant 行，只看 log 会把「已停止」猜成「失败」。
-func (s *Store) SessionStatus(ctx context.Context, sessionID SessionID) (liveRunID RunID, runlogOffset int, lastStatus string, exists bool, err error) {
-	var live string
+// running + 租约已过（doc/30 A1）读侧派生为 interrupted：崩溃后的 run 第一次对状态端点可见，
+// 不必等下一次 POST 的清扫把它翻成 error。lastRunId 与 lastRunStatus 同一 ORDER BY，指同一场 run。
+func (s *Store) SessionStatus(ctx context.Context, sessionID SessionID) (liveRunID RunID, runlogOffset int, lastStatus string, lastRunID RunID, exists bool, err error) {
+	var live, last string
 	var hw int64
 	err = s.db.WithContext(ctx).Raw(`
 SELECT EXISTS (SELECT 1 FROM sessions WHERE id = ?),
        COALESCE((SELECT id FROM runs WHERE session_id = ? AND status = 'running' AND lease_until > now() LIMIT 1), ''),
        COALESCE((SELECT MAX(seq) FROM runlog_entries WHERE session_id = ?), 0),
-       COALESCE((SELECT status FROM runs WHERE session_id = ? ORDER BY created_at DESC LIMIT 1), '')`,
-		sessionID, sessionID, sessionID, sessionID).Row().Scan(&exists, &live, &hw, &lastStatus)
+       COALESCE((SELECT id FROM runs WHERE session_id = ? ORDER BY created_at DESC, id DESC LIMIT 1), ''),
+       COALESCE((SELECT CASE WHEN status = 'running' AND lease_until > now() THEN 'running'
+                             WHEN status = 'running' THEN 'interrupted'
+                             ELSE status END
+                 FROM runs WHERE session_id = ? ORDER BY created_at DESC, id DESC LIMIT 1), '')`,
+		sessionID, sessionID, sessionID, sessionID, sessionID).Row().Scan(&exists, &live, &hw, &last, &lastStatus)
 	if err != nil {
-		return "", 0, "", false, err
+		return "", 0, "", "", false, err
 	}
-	return RunID(live), int(hw), lastStatus, exists, nil
+	return RunID(live), int(hw), lastStatus, RunID(last), exists, nil
+}
+
+// RunState 是 GET /api/runs/{id} 的读侧派生结果（doc/30 §5.1）。状态不新增存储值：
+// running + 租约过期当场派生 interrupted，resumeCount 由 epoch-1 推出，resumable 只是它与上限的比较。
+type RunState struct {
+	RunID       RunID
+	SessionID   SessionID
+	Status      string
+	ResumeCount int
+	Resumable   bool
+}
+
+// RunStatus 取一场 run 的对外状态；未知 run → found=false（HTTP 层回 404）。
+// 单条 SQL 一并拿回租约是否仍然有效——判定用 PG now()，多副本共用一个时钟，不用进程钟。
+// interrupted 是派生值不是存储值（runs.status 仍是 running）：读侧不要求先有人清扫。
+func (s *Store) RunStatus(ctx context.Context, runID RunID, resumeMax int) (st RunState, found bool, err error) {
+	var row struct {
+		SessionID  SessionID
+		Status     string
+		LeaseEpoch int64
+		Alive      bool
+	}
+	res := s.db.WithContext(ctx).Raw(`
+SELECT session_id, status, lease_epoch, COALESCE(lease_until > now(), false) AS alive
+  FROM runs WHERE id = ?`, runID).Scan(&row)
+	if res.Error != nil {
+		return RunState{}, false, res.Error
+	}
+	if res.RowsAffected == 0 {
+		return RunState{}, false, nil
+	}
+	status := row.Status
+	if status == "running" {
+		if row.Alive {
+			status = "running"
+		} else {
+			status = "interrupted"
+		}
+	}
+	count := int(row.LeaseEpoch - 1)
+	if count < 0 {
+		count = 0
+	}
+	return RunState{
+		RunID:       runID,
+		SessionID:   row.SessionID,
+		Status:      status,
+		ResumeCount: count,
+		Resumable:   status == "interrupted" && count < resumeMax,
+	}, true, nil
+}
+
+// InsertJournal 追加一行账本（doc/30 §6.3 的三处写入共用）。seq 由 bigserial 发号，不读回。
+// A3 起是短事务：先 FOR SHARE 锁 runs 行验「仍在跑且令牌还是我的」，再 INSERT——防「claim
+// 提交后旧 epoch 的 intent 才落账」（旧执行者的写必须自然失败）。FOR SHARE 与 claim 的
+// 行锁互斥：claim 提交时本事务要么已提交（账本属于旧代，重放会看到它）、要么被挡到 claim
+// 之后重验（0 行 → errJournalGateLost）。写失败由调用方升级为 run error（账本是恢复唯一依据，
+// 不静默降级）。
+func (s *Store) InsertJournal(ctx context.Context, row RunJournal) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var one int
+		res := tx.Raw(
+			`SELECT 1 FROM runs WHERE id = ? AND status = 'running' AND lease_epoch = ? FOR SHARE`,
+			row.RunID, row.Epoch).Scan(&one)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return errJournalGateLost
+		}
+		return tx.Exec(
+			`INSERT INTO run_journal (run_id, epoch, role, text, tool_calls, tool_call_id, tool_name, args, model, usage, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())`,
+			row.RunID, row.Epoch, row.Role, row.Text, row.ToolCalls, row.ToolCallID,
+			row.ToolName, row.Args, row.Model, row.Usage).Error
+	})
+}
+
+// JournalRows 读本 run 的账本全序（seq 升序）。重放按 call id 归组，seq 只用于稳定顺序。
+func (s *Store) JournalRows(ctx context.Context, runID RunID) ([]RunJournal, error) {
+	var rows []RunJournal
+	err := s.db.WithContext(ctx).Where("run_id = ?", runID).Order("seq").Find(&rows).Error
+	return rows, err
+}
+
+// DeleteJournal 删本 run 的账本（EndRun / StopRun / 清扫三处在各自事务里内联同一条 DELETE；
+// 本方法留给需要独立删除的调用方）。终态即删：账本不是历史，是恢复期的临时现场。
+func (s *Store) DeleteJournal(ctx context.Context, runID RunID) error {
+	return s.db.WithContext(ctx).Exec(`DELETE FROM run_journal WHERE run_id = ?`, runID).Error
+}
+
+// JournalView 是 dev 端点的一笔读：run 的当前 epoch + 账本全序。found=false = run 不存在
+// （账本可能有孤儿行，但端点契约是 404——账本只对存在的 run 有意义）。
+func (s *Store) JournalView(ctx context.Context, runID RunID) (epoch int64, rows []RunJournal, found bool, err error) {
+	res := s.db.WithContext(ctx).Raw(`SELECT lease_epoch FROM runs WHERE id = ?`, runID).Scan(&epoch)
+	if res.Error != nil {
+		return 0, nil, false, res.Error
+	}
+	if res.RowsAffected == 0 {
+		return 0, nil, false, nil
+	}
+	rows, err = s.JournalRows(ctx, runID)
+	if err != nil {
+		return 0, nil, false, err
+	}
+	return epoch, rows, true, nil
 }
 
 // ModelMessages 返回 session 的模型侧消息全序（worker 组装本次生成的输入）——单表、双列过滤，无 JOIN。

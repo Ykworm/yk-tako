@@ -3,6 +3,8 @@ package runengine
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -31,6 +33,9 @@ type Server struct {
 	mcpMu      sync.Mutex
 	mcpConns   map[string]*mcpServerConn
 	mcpConnect func(ctx context.Context, name string, sc McpServerConfig) (*mcpServerConn, error)
+	// resumeMax 是单场 run 的续跑上限（-resume-max，doc/30 A1）：GET /api/runs/{id} 的
+	// resumable = interrupted && resumeCount < resumeMax。A1 只读侧用它，A4a 的 claim 同值裁决。
+	resumeMax int
 }
 
 // NewRouter 挂 v6 第一步的全部四个 API（19v6-01 §0）。整张面的心智模型就一条循环：
@@ -51,11 +56,13 @@ type Server struct {
 // 不变量：两个**对齐游标**各自只在自己的端点前进；往上滚翻旧历史用的是**临时翻页游标**，
 // 拉完即弃，不回退对齐游标。实时性 = 客户端轮询节奏（dev 建议 300–500ms），服务端无长连接、
 // 无推送、无 heartbeat。两个拉取端点一律有界：单批上限 W（-batch-window，dev 默认 200）。
-func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker) *gin.Engine {
-	s := &Server{store: store, w: batchWindow, worker: worker, mediaRoot: worker.Workspace(), mcpConfPath: defaultMcpConfPath}
+func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMax int) *gin.Engine {
+	s := &Server{store: store, w: batchWindow, worker: worker, mediaRoot: worker.Workspace(), mcpConfPath: defaultMcpConfPath, resumeMax: resumeMax}
 	r := gin.Default()
 	r.POST("/api/runs", s.postRuns)
 	r.POST("/api/runs/:runId/stop", s.stopRun)
+	r.POST("/api/runs/:runId/resume", s.resumeRun)
+	r.GET("/api/runs/:runId", s.getRunStatus)
 	r.GET("/api/sessions/:id", s.getSession)
 	r.GET("/api/runs/:runId/frames", s.getFrames)
 	r.GET("/api/sessions/:id/log", s.getSessionLog)
@@ -63,6 +70,7 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker) *gin.Eng
 	r.GET("/api/media", s.getMedia)
 	if dev {
 		r.DELETE("/api/dev/reset", s.devReset)
+		r.GET("/api/dev/runs/:runId/journal", s.devJournal)
 	}
 	return r
 }
@@ -93,6 +101,23 @@ type sessionResponse struct {
 	LiveRunID     RunID  `json:"liveRunId"`
 	RunlogOffset  int    `json:"runlogOffset"`
 	LastRunStatus string `json:"lastRunStatus"` // doc/17 §4：最新一场 run 的终态，"" = 无 run；stopped 收口靠它
+	LastRunID     RunID  `json:"lastRunId"`     // doc/30 A1：最新一场 run 的 id，"" = 无 run；崩溃后点开 /api/runs/{id}
+}
+
+// 字段序 = doc/30 §8.4 契约字节序：runId → status → resumeCount。
+type resumeResponse struct {
+	RunID       RunID  `json:"runId"`
+	Status      string `json:"status"`
+	ResumeCount int    `json:"resumeCount"`
+}
+
+// 字段序 = doc/30 §5.1 契约字节序：runId → sessionId → status → resumeCount → resumable。
+type runResponse struct {
+	RunID       RunID     `json:"runId"`
+	SessionID   SessionID `json:"sessionId"`
+	Status      string    `json:"status"`
+	ResumeCount int       `json:"resumeCount"`
+	Resumable   bool      `json:"resumable"`
 }
 
 // 字段序 = 19v6-01 §2/§3 期望字节序。
@@ -225,7 +250,8 @@ func (s *Server) postRuns(c *gin.Context) {
 	}
 	// 抢闸成功才开 worker：POST 返回 202 时 run 已在生成，frames/log 立刻可拉（19v6-01 §1）。
 	// Background 而非请求 ctx：run 的生命周期不属于这个请求，响应写完它还在跑。
-	go s.worker.Run(context.Background(), sessionID, runID)
+	// POST 路径 = 出生执行者，令牌固定 1（doc/30 §7）；续跑路径（A4a）传 claim 返回值。
+	go s.worker.Run(context.Background(), sessionID, runID, 1)
 	c.JSON(http.StatusAccepted, postRunsResponse{SessionID: sessionID, RunID: runID, MessageID: req.MessageID})
 }
 
@@ -247,11 +273,70 @@ func (s *Server) stopRun(c *gin.Context) {
 		return
 	}
 	if status == "stopped" {
-		if cf, hit := s.worker.runCancels.Load(runID); hit {
-			cf.(context.CancelFunc)()
+		// 用户停止永远最大：不看 epoch（doc/30 §7），注册表里是谁就 cancel 谁。
+		if c, hit := s.worker.runCancels.Load(runID); hit {
+			c.(*runCancel).cancel()
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"status": status})
+}
+
+// resumeRun（doc/30 §8）= 崩溃后接管一场 run：POST /api/runs/{runId}/resume，无请求体。
+//
+//	202 {"runId":"r_01","status":"running","resumeCount":1}
+//	404 {"error":"run_not_found"}
+//	409 {"error":"not_resumable"|"run_alive"|"resume_exhausted"}
+//	500 {"error":"internal"}
+//
+// 顺序即正确性：claim（PG CAS，epoch+1，提交后才算接管）→ 重放账本 →
+// 种 Redis 现场（令牌换代、runlive 重置为一条 resume 帧、draft 覆盖为账本正文）→ 开 worker。
+// claim 之后任何一步失败都 AbandonClaim 把租约改成过期：epoch 不回退（次数照样消耗），
+// 但下一发立刻可接——不把会话卡在一个半接管状态里。
+func (s *Server) resumeRun(c *gin.Context) {
+	ctx := c.Request.Context()
+	runID := RunID(c.Param("runId"))
+	claim, err := s.store.ClaimResume(ctx, runID, s.resumeMax)
+	switch {
+	case errors.Is(err, errRunNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "run_not_found"})
+		return
+	case errors.Is(err, errNotResumable):
+		c.JSON(http.StatusConflict, gin.H{"error": "not_resumable"})
+		return
+	case errors.Is(err, errRunAlive):
+		// 租约仍有效 = 原执行者可能只是慢了一拍，抢会造出双执行者（doc/30 §8.2）。
+		c.JSON(http.StatusConflict, gin.H{"error": "run_alive"})
+		return
+	case errors.Is(err, errResumeExhausted):
+		c.JSON(http.StatusConflict, gin.H{"error": "resume_exhausted"})
+		return
+	case err != nil:
+		internal(c, err)
+		return
+	}
+	replay, err := replayJournal(runID, claim.Rows)
+	if err != nil {
+		_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
+		internal(c, err)
+		return
+	}
+	// 种子帧（doc/30 §8.3）：客户端原本轮询的 eventOffset 游标全部作废——runlive 被重置，
+	// 第一条就是这条 resume 帧，正文 = 账本里已产出的 root assistant 拼接；draft 同值，
+	// 续跑再追加 delta 后定稿文本天然连续。
+	frameJSON, err := json.Marshal(Frame{Kind: "resume", Text: replay.Seed})
+	if err != nil {
+		_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
+		internal(c, err)
+		return
+	}
+	if err := s.store.seedResume(ctx, runID, claim.Epoch, string(frameJSON), replay.Seed); err != nil {
+		_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
+		internal(c, err)
+		return
+	}
+	// 与 POST 同一条纪律：run 的生命周期不属于这个请求。
+	go s.worker.RunResume(context.Background(), claim.SessionID, runID, claim.Epoch, replay)
+	c.JSON(http.StatusAccepted, resumeResponse{RunID: runID, Status: "running", ResumeCount: int(claim.Epoch - 1)})
 }
 
 // getSession（19v6-01 §4）= 会话状态查询，reconcile 的**第一步**（refresh / 新 tab 都从它进）。
@@ -272,7 +357,7 @@ func (s *Server) stopRun(c *gin.Context) {
 // 「读到活 run 却配了旧高水位」在这条语句里不可能出现。闸的判活即租约谓词
 // `status='running' AND lease_until > now()`：租约已过的死行**读侧即回收**，不等清扫。
 func (s *Server) getSession(c *gin.Context) {
-	liveRunID, runlogOffset, lastStatus, exists, err := s.store.SessionStatus(c.Request.Context(), SessionID(c.Param("id")))
+	liveRunID, runlogOffset, lastStatus, lastRunID, exists, err := s.store.SessionStatus(c.Request.Context(), SessionID(c.Param("id")))
 	if err != nil {
 		internal(c, err)
 		return
@@ -281,7 +366,37 @@ func (s *Server) getSession(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
 		return
 	}
-	c.JSON(http.StatusOK, sessionResponse{LiveRunID: liveRunID, RunlogOffset: runlogOffset, LastRunStatus: lastStatus})
+	c.JSON(http.StatusOK, sessionResponse{LiveRunID: liveRunID, RunlogOffset: runlogOffset, LastRunStatus: lastStatus, LastRunID: lastRunID})
+}
+
+// getRunStatus（doc/30 A1）= 单场 run 的对外状态，崩溃后「这场是死了还是还能续」的唯一读口。
+//
+//	GET /api/runs/r_01
+//	200 {"runId":"r_01","sessionId":"s_01","status":"running","resumeCount":0,"resumable":false}
+//	404 {"error":"run_not_found"}
+//
+// status 五态里只有 interrupted 是派生值：runs.status 仍是 running、租约已过（PG now()），
+// 读侧当场判「执行者已经不在了」，不等清扫（清扫只在下一发 POST 时发生）。
+// resumeCount = lease_epoch - 1（每次 claim 续跑 +1）；resumable = interrupted && 次数未耗尽。
+// 未知 run 与 session 端点同形回 404（这里与 frames 的 200 gone 不同：那个是 runlive TTL 的
+// 生命周期，这里是 PG 行存在性——行在不在是确定的）。
+func (s *Server) getRunStatus(c *gin.Context) {
+	st, found, err := s.store.RunStatus(c.Request.Context(), RunID(c.Param("runId")), s.resumeMax)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": "run_not_found"})
+		return
+	}
+	c.JSON(http.StatusOK, runResponse{
+		RunID:       st.RunID,
+		SessionID:   st.SessionID,
+		Status:      st.Status,
+		ResumeCount: st.ResumeCount,
+		Resumable:   st.Resumable,
+	})
 }
 
 // getFrames（19v6-01 §2）= 拉某场 run **正在生成**的帧序列（Redis LIST `runlive:{runId}`）。
@@ -417,6 +532,50 @@ func queryOffset(c *gin.Context, name string) int {
 		return 0
 	}
 	return n
+}
+
+// 字段序 = doc/30 §10.4 契约字节序（rows 按 seq 升序，空串字段照出，方便 curl 逐字段断言）。
+type journalRowResponse struct {
+	Seq        int64  `json:"seq"`
+	Epoch      int64  `json:"epoch"`
+	Role       string `json:"role"`
+	Model      string `json:"model"`
+	Text       string `json:"text"`
+	ToolCalls  string `json:"toolCalls"`
+	ToolCallID string `json:"toolCallId"`
+	ToolName   string `json:"toolName"`
+	Args       string `json:"args"`
+	Usage      string `json:"usage"`
+}
+
+type journalResponse struct {
+	RunID RunID                `json:"runId"`
+	Epoch int64                `json:"epoch"`
+	Rows  []journalRowResponse `json:"rows"`
+}
+
+// devJournal 是账本的 dev 观测端点（doc/30 §10.4，长期 dev 工具、只在 -dev 注册）：
+// 崩溃后 curl 一眼看到「模型说到哪、哪个工具可能跑过」。run 存在但账本已删（终态）= 200 rows:[]；
+// 未知 run = 404。顶层 epoch 是 runs.lease_epoch 当前值，每行 epoch 是写它时的令牌。
+func (s *Server) devJournal(c *gin.Context) {
+	epoch, rows, found, err := s.store.JournalView(c.Request.Context(), RunID(c.Param("runId")))
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": "run_not_found"})
+		return
+	}
+	resp := journalResponse{RunID: RunID(c.Param("runId")), Epoch: epoch, Rows: make([]journalRowResponse, 0, len(rows))}
+	for _, r := range rows {
+		resp.Rows = append(resp.Rows, journalRowResponse{
+			Seq: r.Seq, Epoch: r.Epoch, Role: r.Role, Model: r.Model, Text: r.Text,
+			ToolCalls: r.ToolCalls, ToolCallID: r.ToolCallID, ToolName: r.ToolName,
+			Args: r.Args, Usage: r.Usage,
+		})
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // devReset 是 dev-only 全局归零（planning §4 脚手架表：长期 dev 工具，只在 dev 装配注册）。

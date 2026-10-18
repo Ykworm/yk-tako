@@ -91,6 +91,7 @@ func main() {
 	leaseTTL := flag.Duration("lease-ttl", durationEnv("TAKO_LEASE_TTL", defaultLeaseTTL), "gate lease TTL; watchdog keeps renewing it during generation (env TAKO_LEASE_TTL)")
 	leaseRenew := flag.Duration("lease-renew", durationEnv("TAKO_LEASE_RENEW", defaultLeaseRenew), "watchdog renew interval (must be < lease-ttl; env TAKO_LEASE_RENEW)")
 	compactWindow := flag.Int("compact-window", defaultCompactWindow, "context window in tokens for compaction; limit = window - min(window/5, 16384); 0 disables")
+	resumeMax := flag.Int("resume-max", 3, "max resumes per run (doc/30); resumeCount = lease_epoch-1, resumable while below it")
 	agentsDir := flag.String("agents-dir", "agents", "directory of sub-agent specs (*.md + YAML frontmatter); scanned at each run start (relative to CWD)")
 	workspace := flag.String("workspace", "./workspace", "workspace root for first-party file tools; created at startup, tools are confined to it")
 	subagentConcurrency := flag.Int("subagent-concurrency", 8, "max concurrent subagent delegations (process-wide semaphore; must be >= 1)")
@@ -109,6 +110,11 @@ func main() {
 	// 委派并发闸容量 0 = 信号量为空通道：每笔委派都永久等闸（直到 run ctx 取消）——同类手误，启动即退。
 	if *subagentConcurrency < 1 {
 		log.Fatalf("subagent-concurrency %d < 1：并发闸至少要 1 个位（0 = 所有委派永久等闸）", *subagentConcurrency)
+	}
+	// 续跑窗口 0 = 所有 run 都不可续（resumable 恒 false），留着只会让配置看起来开了、实际没开——
+	// 手误与默认值混淆同款，启动即退（与上面的闸容量同一处置）。
+	if *resumeMax < 1 {
+		log.Fatalf("resume-max %d < 1：至少要 1 次续跑（0 = 崩溃后永远不可续）", *resumeMax)
 	}
 
 	ctx := context.Background()
@@ -164,6 +170,6 @@ func main() {
 		log.Printf("compact off (-compact-window 0)")
 	}
 	log.Printf("subagents: concurrency %d, return cap %d B", *subagentConcurrency, *subagentReturnCap)
-	r := runengine.NewRouter(store, *batch, *dev, worker)
+	r := runengine.NewRouter(store, *batch, *dev, worker, *resumeMax)
 	log.Fatal(r.Run(*engine))
 }

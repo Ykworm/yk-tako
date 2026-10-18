@@ -27,9 +27,15 @@ import (
 
 // errGateBusy / errGateLost 是两处守卫的哨兵（只在包内流转，不进 HTTP 层）：
 // busy = runs INSERT 撞 one_live_run_per_session（→ 409）；lost = 放闸/续约 UPDATE 影响 0 行（→ 空转/判死）。
+// 四个 resume 哨兵直接对应 HTTP 409/404 的 error 字面量（doc/30 §10.2）：handler 按 errors.Is 映射，
+// 不在 handler 里重拼字符串。
 var (
-	errGateBusy = errors.New("gate busy")
-	errGateLost = errors.New("gate lost")
+	errGateBusy        = errors.New("gate busy")
+	errGateLost        = errors.New("gate lost")
+	errRunNotFound     = errors.New("run_not_found")
+	errNotResumable    = errors.New("not_resumable")
+	errRunAlive        = errors.New("run_alive")
+	errResumeExhausted = errors.New("resume_exhausted")
 )
 
 // Store 是四个 API 的存储后端（A4-3 裁：具体结构体，不抽接口；名字不再带介质——它跨两存储）。
@@ -130,17 +136,24 @@ func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID
 		}
 		// 清扫死行（§8.3）：上一任进程死掉的活行按 lease 判死翻 error，唯一索引随之放行本 run。
 		// error 形状 = mh 只留 user 半、runlog 无 assistant 行（与 run 内出错的形状同一）。
+		// 账本同一条 CTE 里删（doc/30 §6.3）：只删**被本次翻 error 的** run——先 UPDATE 再按
+		// RETURNING 的 id 删，两步分开会误删「UPDATE 之后又续约成功」的 run 的账本。
 		if err := tx.Exec(
-			`UPDATE runs SET status = 'error', finished_at = now(), lease_until = NULL
-			 WHERE session_id = ? AND status = 'running' AND lease_until < now()`,
+			`WITH dead AS (
+			   UPDATE runs SET status = 'error', finished_at = now(), lease_until = NULL
+			    WHERE session_id = ? AND status = 'running' AND lease_until < now()
+			    RETURNING id
+			 )
+			 DELETE FROM run_journal WHERE run_id IN (SELECT id FROM dead)`,
 			sessionID).Error; err != nil {
 			return err
 		}
 		// 抢闸 = 本 INSERT（AGENTS.md「闸放数据库不放进程」）；lease_until 走 DB 时钟——
-		// 多副本对租约的判定共用一个时钟。
+		// 多副本对租约的判定共用一个时钟。lease_epoch 显式写 1（doc/30 §7 出生令牌）：
+		// 列默认值只是存量行兜底，出生点自己把话说死。
 		if err := tx.Exec(
-			`INSERT INTO runs (id, session_id, status, lease_until, created_at)
-			 VALUES (?, ?, 'running', now() + make_interval(secs => ?), now())`,
+			`INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at)
+			 VALUES (?, ?, 'running', 1, now() + make_interval(secs => ?), now())`,
 			runID, sessionID, s.leaseTTL.Seconds()).Error; err != nil {
 			if isUniqueViolation(err) {
 				return errGateBusy
@@ -161,8 +174,9 @@ func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID
 			logID, sessionID, sessionID, runID, user.MessageID, user.Text).Error; err != nil {
 			return err
 		}
-		// Redis 半殿后：两键出生（同租约）。失败即回滚整笔——runlog 永不删行，只靠不写来保「零痕迹」。
-		return s.runliveStart(ctx, runID, string(startJSON))
+		// Redis 半殿后：三键出生（两键 + 令牌，同租约）。失败即回滚整笔——runlog 永不删行，
+		// 只靠不写来保「零痕迹」。
+		return s.runliveStart(ctx, runID, 1, string(startJSON))
 	})
 	if err != nil {
 		if errors.Is(err, errGateBusy) {
@@ -207,13 +221,13 @@ type toolResultPayload struct {
 // root 终稿 assistant 行仍以 draft 为准（= 全 run delta 累计，收口替换的锚）。**error / 闸失 =
 // turn 零写入**——与「error 结局只留 user 那一半」的既有形状一致。
 //
-// 守卫 = 统一谓词「闸在手上」（status='running' AND lease_until > now()，与读侧同式）：
-// 影响 0 行 = 本 run 不归自己了（已放 / 已被清扫 / 租约已过）→ 空转（false, nil）。
-// 它同时是竞态防线：行已翻 error 就不 INSERT——runlog 不会出现第二行 assistant。
+// 守卫 = 统一谓词「闸在手上」（status='running' AND lease_until > now() AND lease_epoch = 本执行者，
+// 与读侧同式 + 令牌）：影响 0 行 = 本 run 不归自己了（已放 / 已被清扫 / 租约已过 / 已被接管）
+// → 空转（false, nil）。它同时是竞态防线：行已翻 error 就不 INSERT——runlog 不会出现第二行 assistant。
 //
-// Redis 半在 commit 后：压 terminal + EXPIRE ttl + 删 draft。失败不补偿（§8.4）：闸确实放了（ok=true），
-// runlive 到 TTL 收敛成 gone、客户端从 log 拿全文——B1 冗余收口兜住。
-func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, status string,
+// Redis 半在 commit 后：压 terminal + EXPIRE ttl + 删 draft/令牌。失败不补偿（§8.4）：闸确实放了
+// （ok=true），runlive 到 TTL 收敛成 gone、客户端从 log 拿全文——B1 冗余收口兜住。
+func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, epoch int64, status string,
 	staged []StagedCompaction, mhRows []ModelMessage, turn []TurnEntry) (eventOffset, runlogOffset int, ok bool, err error) {
 	var draft string
 	if status == "complete" {
@@ -269,20 +283,27 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 		}
 		res := tx.Exec(
 			`UPDATE runs SET status = ?, finished_at = now(), lease_until = NULL
-			 WHERE id = ? AND session_id = ? AND status = 'running' AND lease_until > now()`,
-			status, runID, sessionID)
+			 WHERE id = ? AND session_id = ? AND status = 'running' AND lease_until > now()
+			   AND lease_epoch = ?`,
+			status, runID, sessionID, epoch)
 		if res.Error != nil {
 			return res.Error
 		}
 		if res.RowsAffected == 0 {
 			// 守卫 0 行补读现状（doc/17 §4）：stop 端点的 UPDATE 只带 status='running' 条件，
 			// 不查租约——它赢了竞态后本守卫必然 0 行。此时收尾归 stopped：历史只写已配对工具行。
-			var cur string
-			if err := tx.Raw(`SELECT status FROM runs WHERE id = ? AND session_id = ?`,
-				runID, sessionID).Scan(&cur).Error; err != nil {
-				return err
+			// 令牌不同 = 本执行者已被接管，即使行恰好是 stopped 也不许写（doc/30 §7：
+			// 旧进程的每次写都自然失败）；只有同令牌的 stopped 才走收尾分支。
+			var cur struct {
+				Status     string
+				LeaseEpoch int64
 			}
-			if cur != "stopped" {
+			res := tx.Raw(`SELECT status, lease_epoch FROM runs WHERE id = ? AND session_id = ?`,
+				runID, sessionID).Scan(&cur)
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected == 0 || cur.LeaseEpoch != epoch || cur.Status != "stopped" {
 				return errGateLost
 			}
 			stopped = true
@@ -318,7 +339,8 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 				sessionID).Scan(&nextSeq).Error; err != nil {
 				return err
 			}
-			return nil
+			// stopped 终态即删账本（doc/30 §6.3）：本场不再续跑，现场没人要了。
+			return tx.Exec(`DELETE FROM run_journal WHERE run_id = ?`, runID).Error
 		}
 		if status == "complete" {
 			// 压缩落库先于定稿写（同笔事务，顺序无约束）：两写要么随本笔全成，要么整笔回滚。
@@ -498,7 +520,9 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 				return err
 			}
 		}
-		return nil
+		// 终态即删账本（doc/30 §6.3）：complete / error 同一条路。闸失（上面 0 行）不删——
+		// 账本可能正被接管者使用（A3）。
+		return tx.Exec(`DELETE FROM run_journal WHERE run_id = ?`, runID).Error
 	})
 	if err != nil {
 		if errors.Is(err, errGateLost) {
@@ -524,60 +548,146 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, st
 // 0 行 = 已是 complete/error/stopped，读回当前状态原样返回不改写。行不存在 = 未找到。
 // 只翻行，不压 terminal 帧、不动 Redis——收尾归 worker 的 EndRun stopped 分支（一个出口）。
 func (s *Store) StopRun(ctx context.Context, runID RunID) (status string, found bool, err error) {
-	res := s.db.WithContext(ctx).Exec(
-		`UPDATE runs SET status = 'stopped', finished_at = now(), lease_until = NULL
-		 WHERE id = ? AND status = 'running'`, runID)
-	if res.Error != nil {
-		return "", false, res.Error
-	}
-	if res.RowsAffected == 1 {
-		return "stopped", true, nil
-	}
-	var cur string
-	if err := s.db.WithContext(ctx).Raw(`SELECT status FROM runs WHERE id = ?`, runID).
-		Scan(&cur).Error; err != nil {
-		return "", false, err
-	}
-	if cur == "" {
-		return "", false, nil
-	}
-	return cur, true, nil
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		res := tx.Exec(
+			`UPDATE runs SET status = 'stopped', finished_at = now(), lease_until = NULL
+			 WHERE id = ? AND status = 'running'`, runID)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 1 {
+			status, found = "stopped", true
+			// 用户停止 = 本场不再续跑：账本随停止同笔删（doc/30 §6.3）。
+			return tx.Exec(`DELETE FROM run_journal WHERE run_id = ?`, runID).Error
+		}
+		var cur string
+		if err := tx.Raw(`SELECT status FROM runs WHERE id = ?`, runID).Scan(&cur).Error; err != nil {
+			return err
+		}
+		if cur == "" {
+			return nil
+		}
+		status, found = cur, true
+		return nil
+	})
+	return status, found, err
 }
 
 // RenewLease 由 worker watchdog 在生成期间定期调用（§8.3）：PG 半是 CAS 本体——
-// `UPDATE runs SET lease_until = now()+lease WHERE id AND session_id AND status='running' AND lease_until > now()`，
-// 影响 0 行 = 闸已不属于本 run（已放 / 已易主 / 租约已过）→ (false, nil) = 判死，调用方停续。
+// `UPDATE runs SET lease_until = now()+lease WHERE id AND session_id AND status='running'
+//
+//	AND lease_until > now() AND lease_epoch = ?`，
+//
+// 影响 0 行 = 闸已不属于本 run（已放 / 已易主 / 租约已过 / 已被接管）→ (false, nil) = 判死，调用方停续。
 // `lease_until > now()` 那一半是「过期不可复活」：A7 的 Redis CAS（tk:live 蒸发即 no-op）逐字同义——
 // 少了它，「过期但未清扫」的 run 会被迟到续约复活，而 draft 已蒸发，收尾会拿空文本定稿出
-// 「complete 但空回复」的形状。Redis 半（两键 PEXPIRE 回 lease）在 PG 说活之后才刷；Redis 败 → error，
-// watchdog 下一拍重试（PG 半已续，多续一次无害）。
-func (s *Store) RenewLease(ctx context.Context, sessionID SessionID, runID RunID) (bool, error) {
+// 「complete 但空回复」的形状。`lease_epoch` 那一半是「接管后旧执行者失效」（doc/30 §7）。
+// Redis 半（三键含令牌 PEXPIRE 回 lease）在 PG 说活之后才刷；令牌不符 = 判死（false, nil），
+// Redis 败 → error，watchdog 下一拍重试（PG 半已续，多续一次无害）。
+func (s *Store) RenewLease(ctx context.Context, sessionID SessionID, runID RunID, epoch int64) (bool, error) {
 	res := s.db.WithContext(ctx).Exec(
 		`UPDATE runs SET lease_until = now() + make_interval(secs => ?)
-		 WHERE id = ? AND session_id = ? AND status = 'running' AND lease_until > now()`,
-		s.leaseTTL.Seconds(), runID, sessionID)
+		 WHERE id = ? AND session_id = ? AND status = 'running' AND lease_until > now()
+		   AND lease_epoch = ?`,
+		s.leaseTTL.Seconds(), runID, sessionID, epoch)
 	if res.Error != nil {
 		return false, res.Error
 	}
 	if res.RowsAffected == 0 {
 		return false, nil
 	}
-	if _, err := renewRedisScript.Run(ctx, s.rdb,
-		[]string{keyDraft(runID), keyRunlive(runID)},
-		int64(s.leaseTTL/time.Millisecond)).Result(); err != nil {
+	n, err := renewRedisScript.Run(ctx, s.rdb,
+		[]string{keyDraft(runID), keyRunlive(runID), keyRunepoch(runID)},
+		int64(s.leaseTTL/time.Millisecond), epoch).Int64()
+	if err != nil {
 		return false, err
+	}
+	if n == 0 {
+		return false, nil
 	}
 	return true, nil
 }
 
-// Reset 全局归零（dev-only 端点 /api/dev/reset 的底座，§8.4）：PG 五表 TRUNCATE + `SCAN tk:*` + UNLINK，
+// ResumeClaim 是 ClaimResume 的产物：新执行者身份（session + epoch）+ 重放原料（账本全序）。
+// Rows 在 claim 事务内读——FOR UPDATE 已把旧写者挡在外面（它们的账本插入持 FOR SHARE，
+// claim 必须等它们提交或退出，doc/30 §11.5），所以这份快照就是接管者看到的权威账本。
+type ResumeClaim struct {
+	SessionID SessionID
+	Epoch     int64
+	Rows      []RunJournal
+}
+
+// ClaimResume 是接管 CAS（doc/30 §8.2）：一笔事务里 SELECT ... FOR UPDATE → 四态判定 →
+// epoch+1 + 续租约 + finished_at=NULL → 读账本。提交即「本执行者获得这一代令牌」。
+//
+// 判定顺序即契约：行不存在 404 → 非 running 409 not_resumable → 租约仍有效 409 run_alive
+// （可能只是慢了一拍，抢会造成双执行者）→ 次数用尽 409 resume_exhausted。
+// resumeCount = epoch-1，与读侧派生同一个算式。
+func (s *Store) ClaimResume(ctx context.Context, runID RunID, resumeMax int) (ResumeClaim, error) {
+	var claim ResumeClaim
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var row struct {
+			SessionID  SessionID
+			Status     string
+			LeaseEpoch int64
+			Alive      bool
+		}
+		res := tx.Raw(`
+SELECT session_id, status, lease_epoch,
+       COALESCE(lease_until IS NOT NULL AND lease_until > now(), false) AS alive
+  FROM runs WHERE id = ? FOR UPDATE`, runID).Scan(&row)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return errRunNotFound
+		}
+		if row.Status != "running" {
+			return errNotResumable
+		}
+		if row.Alive {
+			return errRunAlive
+		}
+		if int(row.LeaseEpoch-1) >= resumeMax {
+			return errResumeExhausted
+		}
+		if err := tx.Raw(
+			`UPDATE runs
+			    SET lease_epoch = lease_epoch + 1,
+			        lease_until = now() + make_interval(secs => ?),
+			        finished_at = NULL
+			  WHERE id = ? RETURNING lease_epoch`,
+			s.leaseTTL.Seconds(), runID).Scan(&claim.Epoch).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("run_id = ?", runID).Order("seq").Find(&claim.Rows).Error; err != nil {
+			return err
+		}
+		claim.SessionID = row.SessionID
+		return nil
+	})
+	if err != nil {
+		return ResumeClaim{}, err
+	}
+	return claim, nil
+}
+
+// AbandonClaim 是 claim 后 Redis 种子失败的补偿（doc/30 §8.3）：把本代租约改成过期，
+// 让下一次 claim 立刻可接（epoch 不回退——令牌不能倒流，这次尝试消耗一次 resume 次数）。
+func (s *Store) AbandonClaim(ctx context.Context, runID RunID, epoch int64) error {
+	return s.db.WithContext(ctx).Exec(
+		`UPDATE runs SET lease_until = now() - interval '1 second'
+		  WHERE id = ? AND lease_epoch = ?`, runID, epoch).Error
+}
+
+// Reset 全局归零（dev-only 端点 /api/dev/reset 的底座，§8.4）：PG 六表 TRUNCATE + `SCAN tk:*` + UNLINK，
 // 返回 Redis 删除**键数**（响应字节与旧形态一致）。
 // 五表同清：`runs` 必须清——它是闸的落点，漏清则幽灵 running 行永久残留
 // （清扫只在新 POST 时按 session_id 触发，旧 session 已 404，再没人替它扫）；
 // `notes` 是笔记层（M1）的库内状态，同属「引擎自己的东西」，全局归零一并清。
 func (s *Store) Reset(ctx context.Context) (deleted int, err error) {
 	if err := s.db.WithContext(ctx).Exec(
-		`TRUNCATE TABLE sessions, runs, run_model_messages, runlog_entries, notes`).Error; err != nil {
+		`TRUNCATE TABLE sessions, runs, run_model_messages, runlog_entries, notes, run_journal`).Error; err != nil {
 		return 0, err
 	}
 	var cursor uint64
