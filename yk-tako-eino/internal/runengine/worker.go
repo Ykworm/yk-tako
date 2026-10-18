@@ -199,8 +199,10 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 	}
 	pool = append(pool, wrapToolErrors(sh))
 	// 网络搜索工具入池（doc/22）：search_history 之后 append（doc/22 §3「排在 search_history
-	// 后面」）；选择器在 websearch.go，按调用方 ctx 标记取生效 ref 的厂商 id。
-	ws, err := newWebSearchTool()
+	// 后面」）；选择器在 websearch.go，按调用方 ctx 标记取生效 ref 的厂商 id。workspace 是
+	// 结果落盘作业根（.tako/search/，沿 search_history 的 spill 机制），counter 与折叠链同一份
+	// （描述段 token 数同口径，nil = -compact-window 0 时不报 token）。
+	ws, err := newWebSearchTool(workspace, counter)
 	if err != nil {
 		return nil, err
 	}

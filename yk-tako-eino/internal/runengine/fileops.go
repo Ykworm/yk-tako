@@ -107,9 +107,10 @@ var firstPartyFileEffects = map[string]string{
 	// bash（doc/17 §3）：command 字段由 ③ shell 写意图表扫写路径——登记 write 这条链才通
 	// （登记 none/留空在 classifyToolCall 提前返回，command 不被扫，折叠丢写路径）。
 	"bash": fileEffectWrite,
-	// web_search（doc/22 §3）：不碰 workspace 里的路径——显式 none，提取路径时不拿 query 字符串
-	// 里的内容猜（结果只活在本次 tool_result 里，链接不进 fileOps）。
-	"web_search": fileEffectNone,
+	// web_search（doc/22 §3，2026-10-18 切新 API 二稿）：每次搜索把结果全文写 workspace 的
+	// .tako/search/（程序命名新文件、一次一写不覆盖，沿 search_history 的 spill 机制）——
+	// 声明 write。提取程序只扫调用参数、参数里只有 query 没有 path，不会去猜 query 字符串。
+	"web_search": fileEffectWrite,
 }
 
 // fileEffectToolNames 是启动 lint 的目录名单（v1 常量表，逐名带出处；精确命中用，不转小写）：

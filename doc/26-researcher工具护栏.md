@@ -222,7 +222,10 @@ search_history, web_search
 
 - **`bash` 排除**——其余 15 把的可达面都被作业根圈住（文件工具走 `filetools.go:31` 的
   `resolveInWorkspace`：拒绝对路径、拒绝前缀越界；`memory` 只写 notes 表；`search_history` 只读 runlog
-  并把截断结果写进 `<workspace>/.tako/search/`；`web_search` 只发一次检索请求、结果只活在本次 tool_result）。
+  并把截断结果写进 `<workspace>/.tako/search/`；`web_search` 只发一次检索请求、结果只活在本次 tool_result——
+  **2026-10-18 二稿补注：后半句过期**，切 DeepSeek `/v1/tools/search` 后它每次搜索还把结果全文写进
+  同一个 `.tako/search/`、`file_effect` 已登记 `write`（`doc/22` §3）；写的是程序命名新文件、
+  过 `resolveInWorkspace`，仍在闸内，本节结论不动）。
   `bash` 的 `cmd.Dir` 只是设了个当前目录，不是关住路径：`cd /`、`cat ../.env`、`rm`、`curl` 全在能力内，
   `doc/17` §3 明写「符号链接逃出 workspace、以及 `bash` 仍能访问网络，这一拍不补；危险命令规则表也不在这一拍」。
   另一件独占事实：bash 的入参是命令字符串，fileOps 按路径参数提取的记账对它无效——它同时是唯一
