@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/oklog/ulid/v2"
@@ -65,6 +67,7 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 	r.GET("/api/runs/:runId", s.getRunStatus)
 	r.GET("/api/sessions/:id", s.getSession)
 	r.GET("/api/runs/:runId/frames", s.getFrames)
+	r.GET("/api/runs/:runId/stream", s.getRunStream)
 	r.GET("/api/sessions/:id/log", s.getSessionLog)
 	r.GET("/api/mcp/servers", s.getMcpServers)
 	r.GET("/api/media", s.getMedia)
@@ -446,6 +449,101 @@ func (s *Server) getFrames(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, framesResponse{Frames: frames, NextOffset: next, Status: status})
+}
+
+// sse 节奏两个常数（doc/31 §4/§5）：tail 是流 handler 读 runlive 的间隔（定时读共享 Redis
+// ⇒ 任何副本可服务任何流，无进程内等待者）；heartbeat 是静默期注释帧的写出间隔（防 NAT/代理
+// 掐闲连接——纯拉模式没有连接可掐，流模式没有它最长挂不过中间层的空闲超时）。
+// 用 var 不用 const：单测调小验心跳，生产值不动。
+var (
+	sseTailInterval      = 150 * time.Millisecond
+	sseHeartbeatInterval = 15 * time.Second
+)
+
+// getRunStream（doc/31 §4）= 第五个 API：同一帧面的第二种运输方式（text/event-stream）。
+//
+//	GET /api/runs/r_1/stream
+//	id: 1
+//	event: frame
+//	data: {"eventOffset":1,"kind":"start","agent":"","model":"","messageId":"m_1"}
+//
+//	id: 2
+//	event: frame
+//	data: {"eventOffset":2,"kind":"delta","agent":"","model":"deepseek/deepseek-flash","text":"我查一下"}
+//	…
+//
+// 与 frames 端点同真源（runlive LIST）、同存储原语（ReadFrames）、同帧形状——data 行就是帧的
+// JSON 原文，kind 全量原样透传（随 frames 契约走，含 doc/30 的 resume），流上没有新形状。拉是正确性、流是优化：
+// 四 API 零改动，收口对账仍以拉路为准；流不承诺可靠送达（连接断 = 事件丢），续传把手是
+// Last-Event-ID——每帧 `id:` 就是 eventOffset，重连带 `Last-Event-ID: N` 从 offset > N 继续，
+// 不是流另认游标，是同一游标的第二种读法。
+//
+// 循环：读帧 → 逐帧写+flush → 见 terminal 关连接（run 结束 = 流的自然终点）；没 terminal →
+// sleep tail 再读；整个静默期每 15s 写一行 `: ping` 注释帧（EventSource 自动忽略）。
+// runlive 键不存在（含「从未存在」与 TTL 过期，与 frames 的 200 gone 同语义、故意不区分）→
+// 一条 `event: gone`（无 data 行）后关闭。本端点不回 404；建流后服务端内部错 = 直接断流
+// （SSE 协议没有错误语义，消费方凭「断了且没收到 terminal」知道该重连）。
+// 单批上限 W 不适用：W 是拉路「防超长回复撑爆单次响应」的概念，流逐条推、无批；但一批
+// 读满 W 说明积压中，立即再读不睡 tail（追平存量）。
+func (s *Server) getRunStream(c *gin.Context) {
+	runID := RunID(c.Param("runId"))
+	from := lastEventID(c.GetHeader("Last-Event-ID"))
+	w := c.Writer
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	write := func(block string) bool {
+		if _, err := w.WriteString(block); err != nil {
+			return false // 客户端已断开，SSE 无错误语义，直接退出
+		}
+		w.Flush()
+		return true
+	}
+	ctx := c.Request.Context()
+	lastWrite := time.Now()
+	for {
+		if time.Since(lastWrite) >= sseHeartbeatInterval {
+			if !write(": ping\n\n") {
+				return
+			}
+			lastWrite = time.Now()
+		}
+		frames, next, exists, err := s.store.ReadFrames(ctx, runID, from, s.w)
+		if err != nil {
+			return
+		}
+		if !exists {
+			write("event: gone\n\n")
+			return
+		}
+		for _, f := range frames {
+			b, _ := json.Marshal(f)
+			if !write(fmt.Sprintf("id: %d\nevent: frame\ndata: %s\n\n", f.EventOffset, b)) {
+				return
+			}
+			lastWrite = time.Now()
+			if f.Kind == "terminal" {
+				return
+			}
+		}
+		if len(frames) == s.w {
+			continue
+		}
+		from = next
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(sseTailInterval):
+		}
+	}
+}
+
+// lastEventID 解析 SSE 续传游标：与 queryOffset 同一宽容度——缺省/非法/负数 = 0（全量重放）。
+func lastEventID(h string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(h))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 // getSessionLog（19v6-01 §3）= 拉 session 的**定稿历史**（PG `runlog_entries` 表）。
