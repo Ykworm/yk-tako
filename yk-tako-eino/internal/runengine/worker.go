@@ -226,8 +226,12 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		},
 		Handlers: []adk.ChatModelAgentMiddleware{
 			// 调用方身份标记（doc/22 §4）：root 挂 ""（与 agentModelTable 的 root key 一致），
-			// 放链首 = 日志里它先于其余 handler 出现；BeforeAgent 之间互不读写，位置无语义。
+			// 放链首 = 日志里它先于其余 handler 出现；其余两个 BeforeAgent handler 的先后有语义：
+			// mcp 工具必须先于 agentSpecHandler append（doc/33 §4.2——子代理的入口快照 base 要含 MCP 工具）。
 			&callerStampMiddleware{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, name: ""},
+			// MCP 工具入池（doc/33 §4.2/§5）：run 起手扫 mcp.json、逐 server 拉起、append runCtx.Tools；
+			// 无配置/连不上 = 本 run 无此类工具照跑，不当致命。
+			&mcpToolHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, confPath: defaultMcpConfPath},
 			newAgentSpecHandler(agentsDir, store, workspace, chat, modelRef, translate, resolver,
 				make(chan struct{}, subagentConcurrency), subagentReturnCap,
 				counter, compactWindow, compactLimit, sum.summarize, firstPartyFileEffects),

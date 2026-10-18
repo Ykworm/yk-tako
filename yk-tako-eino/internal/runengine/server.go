@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/oklog/ulid/v2"
@@ -17,6 +18,13 @@ type Server struct {
 	store  *Store
 	w      int
 	worker *Worker
+	// mcpConfPath 是 mcp.json 的查找路径（引擎 cwd 相对）。字段只为单测可改指向临时文件；
+	// 生产装配走 NewRouter 里的 defaultMcpConfPath。
+	mcpConfPath string
+	// mcp 连接缓存与互斥（mcp.go ensureMcpConn）；mcpConnect 可注入替身，单测不真拉子进程。
+	mcpMu      sync.Mutex
+	mcpConns   map[string]*mcpServerConn
+	mcpConnect func(ctx context.Context, name string, sc McpServerConfig) (*mcpServerConn, error)
 }
 
 // NewRouter 挂 v6 第一步的全部四个 API（19v6-01 §0）。整张面的心智模型就一条循环：
@@ -38,13 +46,14 @@ type Server struct {
 // 拉完即弃，不回退对齐游标。实时性 = 客户端轮询节奏（dev 建议 300–500ms），服务端无长连接、
 // 无推送、无 heartbeat。两个拉取端点一律有界：单批上限 W（-batch-window，dev 默认 200）。
 func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker) *gin.Engine {
-	s := &Server{store: store, w: batchWindow, worker: worker}
+	s := &Server{store: store, w: batchWindow, worker: worker, mcpConfPath: defaultMcpConfPath}
 	r := gin.Default()
 	r.POST("/api/runs", s.postRuns)
 	r.POST("/api/runs/:runId/stop", s.stopRun)
 	r.GET("/api/sessions/:id", s.getSession)
 	r.GET("/api/runs/:runId/frames", s.getFrames)
 	r.GET("/api/sessions/:id/log", s.getSessionLog)
+	r.GET("/api/mcp/servers", s.getMcpServers)
 	if dev {
 		r.DELETE("/api/dev/reset", s.devReset)
 	}
