@@ -113,6 +113,9 @@ type Worker struct {
 	system        string
 	rootRef       string // 主模型生效 ref（T3-1b，= config.ChatModel.Ref）：root 帧的 model 值 + 身份表 root 条目
 	leaseRenew    time.Duration
+	// workspace 是作业根（F1，绝对路径）：文件工具构造期消费它入池；doc/32 起入口媒体落盘
+	// 与「第一枪还原」记账（A3/translator 后）也要它——存一份给 Workspace() 取用。
+	workspace     string
 	compactWindow int
 	compactLimit  int // = compactLimitFor(window)（window=0 时 0）：触发线 / 准入线两处共用，不各自重算；摘要预算帽自 A7 起归 summarizeCeiling 分档
 	counter       TokenCounter
@@ -252,8 +255,12 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		return nil, err
 	}
 	return &Worker{store: store, sum: sum, agent: agent, translate: translate, system: system,
-		rootRef: modelRef, leaseRenew: leaseRenew, compactWindow: compactWindow, compactLimit: compactLimit, counter: counter}, nil
+		rootRef: modelRef, leaseRenew: leaseRenew, workspace: workspace, compactWindow: compactWindow, compactLimit: compactLimit, counter: counter}, nil
 }
+
+// Workspace 取作业根（doc/32 A1/A4）：Server 的媒体落盘与取图端点经它拿到与文件工具
+// 同一个根——同一把牢笼，不传第二份路径。
+func (w *Worker) Workspace() string { return w.workspace }
 
 // Run 是 run 的执行体。**收尾无条件化**：endRun 挂在唯一出口（defer），不散在各级 return 前——
 // 超时 / 429 / 连接断（agent 事件报错 / 输出流中途断）都走同一出口放闸，worker 自己收的尾（新 A3 用例 6 在真源侧的延续）。
@@ -687,6 +694,11 @@ func (w *Worker) watchdog(ctx context.Context, sessionID SessionID, runID RunID)
 
 // AdmitText 是 POST 单条消息的准入检查（C5-A1，tail 支）：compact 关闭（window=0）时一切放行；
 // 开启时单条 user 消息计数 > limit/compactAdmissionDivisor ⇒ 不放行，由调用方回 413。
+// 媒体不在预算里（doc/32 A2 翻案 2026-10-18）：文本管道下请求里只有占位行，base64 字节
+// 根本不进模型窗口——对它跑 cl100k 既拒错人（3MB 图实际只发一行占位）又跑不动
+// （regexp2 对 MB 级 base64 分钟级）；图的门槛是 ingestImages 的硬帽（≤5MB/张、≤4 张）。
+// 半边二（字节真进请求）动工时窗口计数按 provider 口径（deepseek 实测按张平价 ~384 token）
+// 另拍，不回这套字节折算。
 // 返回 (limit, tokens, ok)：limit = compactLimitFor(window)（与触发折叠同一 limit，不发明第二个数）；
 // ok=false 时 limit/tokens 供错误体带回去（报清原因，客户端可裁剪重发）。策略本身属 compact
 // 域（19v6-07 §5 的三等分推导），但用的是 Worker 的 window/counter——所以是 Worker 方法、

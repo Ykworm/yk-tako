@@ -4,7 +4,10 @@ import {
   getFrames,
   getLog,
   getSession,
+  parseMedia,
   postRuns,
+  type MediaRef,
+  type PostImage,
   type Row,
   type RunID,
   type SessionID,
@@ -16,15 +19,21 @@ export type Bubble = {
   runId: RunID | null
   role: 'user' | 'assistant'
   text: string
+  // 媒体引用（doc/32 A5）：从行内占位行解析；图片渲染成 <img>（GET /api/media 换字节流），
+  // 其他媒体给文件片。text 是剥掉占位行后的正文——占位行是模型/存储的坐标，不上页面。
+  media?: MediaRef[]
   state: 'queued' | 'streaming' | 'offline' | 'done' | 'error' | 'stopped'
   usage?: Usage
   // 本 tab 亲历收尾却全程无 usage 帧（厂商不报账单）→ 显示「用量 ?」，不静默。
   usageUnknown?: boolean
 }
 
+// 附件（composer 选用）：name 供 chip 显示，img 随 postRuns 上行。
+export type Attachment = { name: string; img: PostImage }
+
 // 一条待投投递 = 已渲染的 user 气泡 + 它那条 assistant 气泡 + 请求前就定下的 messageId
 // （19v6-01 §1 情形 3：重发不换 id）。
-type Pending = { messageId: string; text: string; assistant: Bubble }
+type Pending = { messageId: string; text: string; assistant: Bubble; images?: PostImage[] }
 
 const LS_SESSION = 'tako.sessionId'
 const POLL_MS = 400
@@ -42,6 +51,7 @@ export function useChat() {
   const sessionId = ref<SessionID | null>(null)
   const bubbles = ref<Bubble[]>([])
   const draft = ref('')
+  const attachments = ref<Attachment[]>([])
   const busy = ref(false)
   const pending = ref<Pending[]>([])
   const loadingOlder = ref(false)
@@ -68,15 +78,19 @@ export function useChat() {
   }
 
   // 投递 = 乐观渲染两条气泡，真正发不发交给 pump（忙时留在队里，不变成错误）。
+  // 带图投递：乐观 user 气泡先只出文字，图在收口 drainLog 认出自己的 user 行时按服务端
+  // 真源回填（path/sha 由服务端内容寻址铸出，本地不预演第二套）。
   function send() {
     const text = draft.value.trim()
-    if (!text) return
+    const imgs = attachments.value.map((a) => a.img)
+    if (!text && !imgs.length) return
     draft.value = ''
+    attachments.value = []
     const messageId = newMessageId()
     renderedMessageIds.add(messageId)
     push({ key: `${messageId}:user`, runId: null, role: 'user', text, state: 'done' })
     const assistant = push({ key: `${messageId}:assistant`, runId: null, role: 'assistant', text: '', state: 'queued' })
-    pending.value.push({ messageId, text, assistant })
+    pending.value.push({ messageId, text, assistant, images: imgs.length ? imgs : undefined })
     void pump()
   }
 
@@ -158,11 +172,11 @@ export function useChat() {
   async function postWithFreshSession(p: Pending) {
     const sid = sessionId.value
     try {
-      return await postRuns(p.messageId, p.text, sid ?? undefined)
+      return await postRuns(p.messageId, p.text, sid ?? undefined, p.images)
     } catch (e) {
       if (sid && isNotFound(e)) {
         dropSession()
-        return await postRuns(p.messageId, p.text)
+        return await postRuns(p.messageId, p.text, undefined, p.images)
       }
       throw e
     }
@@ -292,9 +306,11 @@ export function useChat() {
           hit = r
         } else if (r.role === 'user' && r.messageId && renderedMessageIds.has(r.messageId)) {
           // 自己的 user 行：气泡早渲染过，但「最老已渲染」的记账仍要含它——否则 atStart 撒谎，
-          // 翻页会把这两行当没渲染过的再拉一遍、画成两份。
+          // 翻页会把这两行当没渲染过的再拉一遍、画成两份。带图投递在这里按服务端真源
+          // 回填媒体（乐观气泡当时只有文字，path/sha 由服务端铸出）。
           ownUserOffset = r.runlogOffset ?? 0
           noteRendered(r)
+          backfillOwnUserMedia(r)
         } else {
           foreign.push(r)
         }
@@ -337,16 +353,29 @@ export function useChat() {
   }
 
   // 一条 log 行 → 气泡，并记账「最老已渲染 offset」（loadOlder 的翻页基准）。
+  // 占位行在这里解析成媒体引用、从正文剥掉（doc/32 A5）。
   function rowBubble(r: Row): Bubble {
     noteRendered(r)
+    const { media, display } = parseMedia(r.text)
     return {
       key: `log:${r.runlogOffset}`,
       runId: r.runId,
       role: r.role,
-      text: r.text,
+      text: display,
+      media: media.length ? media : undefined,
       state: 'done',
       usage: r.usage,
     }
+  }
+
+  // 收口时认出自己的 user 行，按服务端真源回填乐观气泡的媒体与正文。
+  function backfillOwnUserMedia(r: Row) {
+    const { media, display } = parseMedia(r.text)
+    if (!media.length) return
+    const b = bubbles.value.find((x) => x.key === `${r.messageId}:user`)
+    if (!b) return
+    b.media = media
+    b.text = display
   }
 
   function noteRendered(r: Row) {
@@ -388,14 +417,18 @@ export function useChat() {
       }
       if (collected.length) {
         bubbles.value.unshift(
-          ...collected.map((r) => ({
-            key: `log:${r.runlogOffset}`,
-            runId: r.runId,
-            role: r.role,
-            text: r.text,
-            state: 'done' as const,
-            usage: r.usage,
-          })),
+          ...collected.map((r) => {
+            const { media, display } = parseMedia(r.text)
+            return {
+              key: `log:${r.runlogOffset}`,
+              runId: r.runId,
+              role: r.role,
+              text: display,
+              media: media.length ? media : undefined,
+              state: 'done' as const,
+              usage: r.usage,
+            }
+          }),
         )
         oldestOffset = collected[0].runlogOffset ?? oldestOffset
       }
@@ -411,11 +444,12 @@ export function useChat() {
     pending.value = []
     bubbles.value = []
     draft.value = ''
+    attachments.value = []
     busy.value = false
     renderedMessageIds.clear()
   }
 
-  return { sessionId, bubbles, draft, busy, pending, loadingOlder, atStart, send, reconcile, loadOlder, newSession }
+  return { sessionId, bubbles, draft, attachments, busy, pending, loadingOlder, atStart, send, reconcile, loadOlder, newSession }
 }
 
 // 409 = 闸被占（19v6-01 §1），处置是排队；404 session_not_found = 本地 sid 已成僵尸，处置是懒建重投。

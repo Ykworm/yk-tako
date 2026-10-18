@@ -83,12 +83,60 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T
 }
 
+// 入口图（doc/32 A1）：随 POST /api/runs 上行，服务端落盘换占位行——对话里只有 path。
+// name 是用户上传文件名（A6 通信字段，可省）。
+export type PostImage = { mime: string; dataBase64: string; name?: string }
+
+// 占位行（doc/32 §3）：`[media seq=… name="…" path=… mime=… size=…B sha=…；…]` 的解析切片。
+// 出现在 user 行 text 与工具回执里；前端经 GET /api/media?path=… 换回字节流显示。
+// name/seq 是 A6 通信字段：seq 恒在（全会话序号）、name 可省；回执变体两者皆无——
+// 三个捕获组全部可缺省容忍（存量行是只读事实，不迁移）。
+export type MediaRef = { path: string; mime: string; size: number; sha: string; seq?: number; name?: string }
+
+const MEDIA_LINE =
+  /^\[media(?: seq=(\d+))?(?: name="([^"]*)")? path=(\S+) mime=(\S+) size=(\d+)B sha=(\S+?)[；;]/
+
+// parseMedia 从一段文本里解析全部占位行：返回引用列表与剥掉占位行后的正文
+// （占位行是给模型/存储的坐标，页面上由 <img>/文件片替代它）。
+export function parseMedia(text: string): { media: MediaRef[]; display: string } {
+  const media: MediaRef[] = []
+  const lines = text.split('\n').filter((line) => {
+    const m = MEDIA_LINE.exec(line)
+    if (!m) return true
+    media.push({
+      path: m[3],
+      mime: m[4],
+      size: Number(m[5]),
+      sha: m[6],
+      ...(m[1] ? { seq: Number(m[1]) } : {}),
+      ...(m[2] ? { name: m[2] } : {}),
+    })
+    return false
+  })
+  return { media, display: lines.join('\n') }
+}
+
+export function mediaUrl(path: string): string {
+  return `/api/media?path=${encodeURIComponent(path)}`
+}
+
 // POST /api/runs（19v6-01 §1）：sessionId 省略 = 懒建会话；带上 = 只认登记过的。
-export function postRuns(messageId: string, text: string, sessionId?: SessionID): Promise<PostRunsResponse> {
+export function postRuns(
+  messageId: string,
+  text: string,
+  sessionId?: SessionID,
+  images?: PostImage[],
+): Promise<PostRunsResponse> {
   return request<PostRunsResponse>('/api/runs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(sessionId ? { sessionId, messageId, text } : { messageId, text }),
+    body: JSON.stringify(
+      images?.length
+        ? { sessionId, messageId, text, images }
+        : sessionId
+          ? { sessionId, messageId, text }
+          : { messageId, text },
+    ),
   })
 }
 

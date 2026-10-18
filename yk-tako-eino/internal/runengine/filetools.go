@@ -12,7 +12,8 @@ package runengine
 
 import (
 	"context"
-	"encoding/base64"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"os"
@@ -553,13 +554,15 @@ var mediaMimeByExt = map[string]string{
 	".pdf": "application/pdf", ".mp3": "audio/mpeg", ".wav": "audio/wav", ".mp4": "video/mp4",
 }
 
-// newReadMediaFileTool 造 read_media_file：返回 data URI 单行（data:<mime>;base64,<…>）。
-// 当前模型输入是文本管道，它的产出暂被模型当文本看——先把声明面与返回契约立住，
-// 多模态消费随 translator 升级（19v6-08 §3 挂账）。>5MB 拒读：base64 再膨胀约 1/3，
-// 读进来就是往上下文灌大字节（减灾档）。
+// newReadMediaFileTool 造 read_media_file：回执是占位行（doc/32 A3）——path/mime/size/sha
+// 一行带全，**不含媒体字节**。旧版回 data URI 单行：模型每调一次，几 MB base64 就永久抄进
+// runlog/model_history/帧三处落库面（doc/32 §1 病灶），而文本管道下模型本来就看不见图。
+// 句尾措辞是「请勿重复调用」——回执的读者就是刚调完的模型，指回自己 = 死循环（与入口占位
+// mediaPlaceholder 的措辞分工见 media.go）。多模态消费随 translator 升级（19v6-08 §3 挂账）。
+// >5MB 拒读：读进来就是往上下文灌大字节（减灾档），帽与入口图同值（mediaMaxBytes）。
 func newReadMediaFileTool(root string) (tool.BaseTool, error) {
 	return utils.InferTool("read_media_file",
-		"读取 workspace 内的媒体文件，返回单行 data URI（data:<mime>;base64,<base64 体>）——mime 按扩展名映射。"+
+		"读取 workspace 内的媒体文件的元信息（path/mime/size/sha 占位行；当前版本不回传媒体字节）。"+
 			"path 是相对 workspace 根的路径；文件超过 5MB 会拒绝（请先裁剪或换小文件）。",
 		func(_ context.Context, in readMediaFileInput) (string, error) {
 			full, err := resolveInWorkspace(root, in.Path)
@@ -576,8 +579,7 @@ func newReadMediaFileTool(root string) (tool.BaseTool, error) {
 			if fi.IsDir() {
 				return "", fmt.Errorf("%s 是目录不是文件", in.Path)
 			}
-			const maxBytes = 5 * 1024 * 1024
-			if fi.Size() > maxBytes {
+			if fi.Size() > mediaMaxBytes {
 				return "", fmt.Errorf("文件 %s 有 %d 字节、超过 5MB 上限——base64 会再膨胀约 1/3，请先裁剪或换用更小的文件", in.Path, fi.Size())
 			}
 			raw, err := os.ReadFile(full)
@@ -588,6 +590,14 @@ func newReadMediaFileTool(root string) (tool.BaseTool, error) {
 			if !ok {
 				mime = "application/octet-stream"
 			}
-			return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(raw), nil
+			sum := sha256.Sum256(raw)
+			return mediaReceiptPlaceholder(in.Path, mime, len(raw), hex.EncodeToString(sum[:])), nil
 		})
+}
+
+// mediaReceiptPlaceholder 是工具回执占位（doc/32 A3）：与入口占位 mediaPlaceholder 同
+// 字段面、不同句尾——不带「再调 read_media_file」自指。
+func mediaReceiptPlaceholder(relPath, mime string, size int, shaHex string) string {
+	return fmt.Sprintf("[media path=%s mime=%s size=%dB sha=%s；已按路径读取。当前版本不回传媒体字节，请勿重复调用]",
+		relPath, mime, size, shaHex)
 }

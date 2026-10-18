@@ -120,6 +120,23 @@ func (s *Store) Exists(ctx context.Context, sessionID SessionID) (bool, error) {
 	return n > 0, nil
 }
 
+// CountMediaPlaceholders 数会话里已有的 [media 占位**出现次数**（doc/32 A6）——一条 user 行
+// 可带最多 4 个占位，按行数会漏编。唯一用途是给新消息的图起 seq（全会话累计序号）：
+// 占位行只由 user 行携带，同会话同时只有一个 run 在写（409 忙闸），准入期读无并发竞争；
+// 计数在 PG 不在进程，多副本下成立。marker 无 LIKE 通配符（无 % _），原样匹配安全。
+func (s *Store) CountMediaPlaceholders(ctx context.Context, sessionID SessionID) (int, error) {
+	const marker = "[media "
+	var n int64
+	err := s.db.WithContext(ctx).Model(&RunlogEntry{}).
+		Select("COALESCE(SUM((length(text) - length(replace(text, ?, ''))) / length(?)), 0)", marker, marker).
+		Where("session_id = ? AND role = 'user' AND text LIKE ?", sessionID, "%"+marker+"%").
+		Scan(&n).Error
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
 // SessionStatus 返回状态查询四要素（19v6-01 §4 三要素 + doc/17 §4 手动停止加的 lastRunStatus）：
 // 活 run id（"" = 闲着）、runlog 高水位、是否已登记、该会话最新一场 run 的终态（无 run = ""）。
 // 单条 SQL 子查询取一致快照（原 MULTI 的等价物，预登记裁定）。liveRunId 读侧即回收：

@@ -5,7 +5,10 @@ import (
 	"crypto/rand"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
@@ -18,6 +21,9 @@ type Server struct {
 	store  *Store
 	w      int
 	worker *Worker
+	// mediaRoot 是入口媒体落盘与 GET /api/media 的作业根（doc/32 A1/A4）——
+	// 取自 worker 的 workspace（同一根、同一把牢笼）；单测直接构造 Server 时可单独给。
+	mediaRoot string
 	// mcpConfPath 是 mcp.json 的查找路径（引擎 cwd 相对）。字段只为单测可改指向临时文件；
 	// 生产装配走 NewRouter 里的 defaultMcpConfPath。
 	mcpConfPath string
@@ -46,7 +52,7 @@ type Server struct {
 // 拉完即弃，不回退对齐游标。实时性 = 客户端轮询节奏（dev 建议 300–500ms），服务端无长连接、
 // 无推送、无 heartbeat。两个拉取端点一律有界：单批上限 W（-batch-window，dev 默认 200）。
 func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker) *gin.Engine {
-	s := &Server{store: store, w: batchWindow, worker: worker, mcpConfPath: defaultMcpConfPath}
+	s := &Server{store: store, w: batchWindow, worker: worker, mediaRoot: worker.Workspace(), mcpConfPath: defaultMcpConfPath}
 	r := gin.Default()
 	r.POST("/api/runs", s.postRuns)
 	r.POST("/api/runs/:runId/stop", s.stopRun)
@@ -54,16 +60,26 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker) *gin.Eng
 	r.GET("/api/runs/:runId/frames", s.getFrames)
 	r.GET("/api/sessions/:id/log", s.getSessionLog)
 	r.GET("/api/mcp/servers", s.getMcpServers)
+	r.GET("/api/media", s.getMedia)
 	if dev {
 		r.DELETE("/api/dev/reset", s.devReset)
 	}
 	return r
 }
 
+type postImage struct {
+	MIME       string `json:"mime"`
+	DataBase64 string `json:"dataBase64"`
+	// Name 是用户上传时的原始文件名（A6，doc/32 §3 通信字段）——可省；服务端 sanitize 后
+	// 进占位行 name= 列，盘名仍是内容寻址（sha16），名字只进对话不做盘名。
+	Name string `json:"name,omitempty"`
+}
+
 type postRunsRequest struct {
-	SessionID SessionID `json:"sessionId"`
-	MessageID string    `json:"messageId"`
-	Text      string    `json:"text"`
+	SessionID SessionID   `json:"sessionId"`
+	MessageID string      `json:"messageId"`
+	Text      string      `json:"text"`
+	Images    []postImage `json:"images,omitempty"`
 }
 
 // 字段序 = 19v6-01 §1 期望字节序：sessionId → runId → messageId。
@@ -93,9 +109,9 @@ type logResponse struct {
 
 // postRuns（19v6-01 §1）= 创建一场 run，语义上就是「投递一条用户消息并立刻开跑」。
 //
-// 请求体（三个字段，按情形发）：
+// 请求体（四个字段，按情形发）：
 //
-//	{"sessionId":"s_01","messageId":"m_2","text":"..."}
+//	{"sessionId":"s_01","messageId":"m_2","text":"...","images":[{"mime":"image/png","dataBase64":"..."}]}
 //
 //	sessionId  —— 可省。**不带 = 懒建会话**（服务端在投递事务内铸 s_<ULID>，客户端必须把
 //	              返回的 sessionId 存下来，之后所有请求都带着它）；
@@ -103,11 +119,17 @@ type logResponse struct {
 //	messageId  —— 客户端生成、投递前就有（绑本地气泡），不参与排序。超时重发就原样重投
 //	              （同 messageId 同 text）；服务端**不按 messageId 去重**，幂等只在「闸」层面。
 //	text       —— 消息正文。
+//	images     —— 可省（doc/32 A1）。每项 {mime, dataBase64, name?}：name = 用户上传文件名
+//	              （可省，A6 通信字段）；白名单与单文件 5MB / 单消息 4 张帽见 media.go。
+//	              合法图落 workspace/.media/（内容寻址），user 行 text = 正文 + 每图一行
+//	              [media …] 占位（含 seq 全会话序号与 name）——对话里只有 path，没有字节。
 //
 // 响应（字段序即契约字节序：sessionId → runId → messageId）：
 //
 //	202 {"sessionId":"s_01","runId":"r_01","messageId":"m_1"}
 //	400 {"error":"bad_request"}          ← 请求体不是合法 JSON
+//	400 {"error":"bad_media","reason":…} ← images 不合法（mime 白名单外 / base64 解不开 /
+//	                                       超 5MB / 超 4 张），doc/32 A1；零痕迹可改后重投
 //	404 {"error":"session_not_found"}    ← 只可能出现在「带未知 sessionId」时
 //	409 {"error":"session_busy"}         ← 该会话已有活 run；**什么都没写**，客户端本地排队、本轮收口后补投
 //	413 {"error":"message_too_large","limit":M,"tokens":N}
@@ -140,8 +162,35 @@ func (s *Server) postRuns(c *gin.Context) {
 			return
 		}
 	}
+	// 入口媒体（doc/32 A1）：先校验+落盘（400 同形 bad_media 带原因），再准入（A2 把 base64
+	// 体折进 413 预算）——落盘在闸前，因为占位要进 user 行 text，而 user 行在 AcquireRun
+	// 的原子写里定稿。409/500 时 .media/ 可能多出文件：内容寻址幂等、无对话痕迹，
+	// 「什么都没写」语义只对落库面承诺。
+	// seq 起点（doc/32 A6）：数会话既有占位数 +1——user 行是唯一携带 seq 的行，同会话同时
+	// 只有一个 run 在写（409 忙闸），计数无并发竞争；闸在 PG 不在进程，多副本下照成立。
+	// 懒建会话（不带 sessionId）= 新会话，从 1 起。
+	placeholders := ""
+	if len(req.Images) > 0 {
+		seqStart := 1
+		if sessionID != "" {
+			n, err := s.store.CountMediaPlaceholders(ctx, sessionID)
+			if err != nil {
+				internal(c, err)
+				return
+			}
+			seqStart = n + 1
+		}
+		ph, err := ingestImages(s.mediaRoot, req.Images, seqStart)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "bad_media", "reason": err.Error()})
+			return
+		}
+		placeholders = ph
+	}
 	// 准入（C5-A1，tail 支）：单条消息超 limit/3 → 抢闸前拒收——不烧闸、不落 mh 行、零痕迹，
 	// 客户端可裁剪重发（messageId 复用无妨：幂等只在闸层面，这里根本没到闸）。
+	// 只数正文（doc/32 A2 翻案 2026-10-18）：图的门槛是 ingestImages 的硬帽（上面已过），
+	// base64 不进 cl100k——文本管道下模型窗口里只有占位行，数字节既拒错人又跑不动。
 	if limit, tokens, ok := s.worker.AdmitText(req.Text); !ok {
 		// 字段序 = error → limit → tokens（gin.H 经 encoding/json 按 key 字典序输出，三键恰好此序；
 		// 若增删字段需重钉字节序）。
@@ -159,7 +208,12 @@ func (s *Server) postRuns(c *gin.Context) {
 			return
 		}
 	}
-	user := Row{RunID: runID, Role: "user", MessageID: req.MessageID, Text: req.Text}
+	// user 行 text = 正文 + 每图一行占位（doc/32 纪律：对话里只有 path，没有字节）。
+	userText := req.Text
+	if placeholders != "" {
+		userText = strings.TrimSpace(userText + "\n" + placeholders)
+	}
+	user := Row{RunID: runID, Role: "user", MessageID: req.MessageID, Text: userText}
 	acquired, err := s.store.AcquireRun(ctx, sessionID, runID, user)
 	if err != nil {
 		internal(c, err)
@@ -315,6 +369,39 @@ func (s *Server) getSessionLog(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, logResponse{Rows: rows, NextOffset: next})
+}
+
+// getMedia（doc/32 A4）= 前端把占位行里的 path 换回字节流的唯一出口。
+// 牢笼与工具侧同一把闸（resolveInWorkspace）：越界 / 缺 path → 400，不存在 / 目录 → 404。
+// mime 按扩展名表（mediaMimeByExt，与 read_media_file 同表）；回流走 ServeContent（支持 Range）。
+func (s *Server) getMedia(c *gin.Context) {
+	p := c.Query("path")
+	if p == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request", "reason": "缺 path"})
+		return
+	}
+	full, err := resolveInWorkspace(s.mediaRoot, p)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request", "reason": "路径越出 workspace"})
+		return
+	}
+	fi, err := os.Stat(full)
+	if err != nil || fi.IsDir() {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+		return
+	}
+	f, err := os.Open(full)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	defer f.Close()
+	mime := mediaMimeByExt[strings.ToLower(filepath.Ext(full))]
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+	c.Header("Content-Type", mime)
+	http.ServeContent(c.Writer, c.Request, fi.Name(), fi.ModTime(), f)
 }
 
 // internal 是存储 / ID 生成故障的统一出口：客户端拿 19v6-01 §1 的 500 字节，原因只进服务端日志。

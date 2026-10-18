@@ -5,7 +5,8 @@ package runengine
 
 import (
 	"context"
-	"encoding/base64"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -621,8 +622,8 @@ func TestSearchFilesTool(t *testing.T) {
 	}
 }
 
-// read_media_file：data URI 逐字节（base64 可解回原文）/ 扩展名映射 / 未知扩展名兜底 /
-// 缺失与目录 / >5MB 拒。
+// read_media_file：回执占位行（doc/32 A3）——字段面 path/mime/size/sha 逐项、**无 base64**、
+// 句尾防自指（不含「再调 read_media_file」）/ 扩展名映射 / 未知扩展名兜底 / 缺失与目录 / >5MB 拒。
 func TestReadMediaFileTool(t *testing.T) {
 	root := t.TempDir()
 	pngBytes := []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01, 0x02, 0x03}
@@ -640,12 +641,16 @@ func TestReadMediaFileTool(t *testing.T) {
 	ctx := context.Background()
 
 	out, err := it.InvokableRun(ctx, `{"path":"pic.png"}`)
-	want := "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBytes)
+	sum := sha256.Sum256(pngBytes)
+	want := mediaReceiptPlaceholder("pic.png", "image/png", len(pngBytes), hex.EncodeToString(sum[:]))
 	if err != nil || out != want {
-		t.Fatalf("png data URI: out=%q err=%v", out, err)
+		t.Fatalf("png 回执占位: out=%q want=%q err=%v", out, want, err)
+	}
+	if strings.Contains(out, "base64") || strings.Contains(out, "read_media_file 读") {
+		t.Fatalf("回执不得含 base64 字节、不得含自指句尾: %q", out)
 	}
 	out, err = it.InvokableRun(ctx, `{"path":"blob.dat"}`)
-	if err != nil || !strings.HasPrefix(out, "data:application/octet-stream;base64,") {
+	if err != nil || !strings.HasPrefix(out, "[media path=blob.dat mime=application/octet-stream") {
 		t.Fatalf("未知扩展名兜底: out=%q err=%v", out, err)
 	}
 	if _, err = it.InvokableRun(ctx, `{"path":"nope.png"}`); err == nil || !strings.Contains(err.Error(), "不存在") {

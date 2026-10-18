@@ -853,6 +853,33 @@ func TestEndRunErrorKeepsLogUntouched(t *testing.T) {
 	}
 }
 
+// 16b. CountMediaPlaceholders（doc/32 A6 seq 计数）：按**出现次数**数（一条 user 行可带
+// 多个占位）、role=user 过滤（tool_result 行也含 [media 字样但不计）、未知会话 = 0。
+func TestCountMediaPlaceholdersCountsOccurrences(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid, rid := SessionID("s_media"), RunID("r_media")
+	rows := []RunlogEntry{
+		{ID: "rl_1", SessionID: sid, Seq: 1, RunID: rid, Role: "user", MessageID: "m_1",
+			Text: "看两张图\n[media seq=1 path=.media/aaaa.png mime=image/png size=1B sha=a；x]\n[media seq=2 path=.media/bbbb.png mime=image/png size=2B sha=b；x]"},
+		{ID: "rl_2", SessionID: sid, Seq: 2, RunID: rid, Role: "tool_result",
+			Text: "[media path=.media/aaaa.png mime=image/png size=1B sha=a；已按路径读取。当前版本不回传媒体字节，请勿重复调用]"},
+		{ID: "rl_3", SessionID: sid, Seq: 3, RunID: rid, Role: "user", MessageID: "m_2", Text: "这条没图"},
+	}
+	for i := range rows {
+		if err := s.db.Create(&rows[i]).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := s.CountMediaPlaceholders(ctx, sid)
+	if err != nil || n != 2 {
+		t.Fatalf("user 行占位出现次数应 2: n=%d err=%v", n, err)
+	}
+	if n, err := s.CountMediaPlaceholders(ctx, SessionID("s_absent")); err != nil || n != 0 {
+		t.Fatalf("未知会话应 0: n=%d err=%v", n, err)
+	}
+}
+
 // 17. T2 的 turn 落库（tool loop 的存储级证据）：assistant 轮（带 tool_calls）→ tool 轮 → assistant 终轮——
 // mh 逐轮落（seq 2/3/4；tool_calls/tool_call_id 两列按 OpenAI 工具协议回填，ModelMessages 原样读回 =
 // prepareInput 回放链的实证），runlog 落 tool_call/tool_result 扩展行（text 可展示、payload 结构化）+ 终稿行。

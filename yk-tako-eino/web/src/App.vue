@@ -1,12 +1,57 @@
 <script setup lang="ts">
 import { nextTick, onMounted, ref, watch } from 'vue'
 import { useChat } from './chat'
-import type { Usage } from './api'
+import { mediaUrl, type MediaRef, type Usage } from './api'
 
-const { bubbles, draft, pending, loadingOlder, atStart, send, reconcile, loadOlder, newSession } = useChat()
+const { bubbles, draft, attachments, pending, loadingOlder, atStart, send, reconcile, loadOlder, newSession } = useChat()
 
 const listEl = ref<HTMLElement | null>(null)
 const pinned = ref(true)
+const fileEl = ref<HTMLInputElement | null>(null)
+
+// 附件（doc/32 A5）：浏览器把文件读成 base64 随 POST 上行，服务端落盘换占位行——
+// 页面上传的从来不是「贴进对话的字节」，是「要落盘的文件」。
+const MAX_ATTACH = 4
+const MAX_FILE_BYTES = 5 * 1024 * 1024
+
+async function onPickFiles(ev: Event) {
+  const input = ev.target as HTMLInputElement
+  const files = Array.from(input.files ?? [])
+  input.value = ''
+  for (const f of files) {
+    if (attachments.value.length >= MAX_ATTACH) break
+    if (f.size > MAX_FILE_BYTES || !f.type) continue
+    const dataBase64 = await new Promise<string>((resolve, reject) => {
+      const r = new FileReader()
+      r.onload = () => resolve(String(r.result).split(',')[1] ?? '')
+      r.onerror = () => reject(r.error)
+      r.readAsDataURL(f)
+    })
+    attachments.value.push({ name: f.name, img: { mime: f.type, dataBase64, name: f.name } })
+  }
+}
+
+function removeAttachment(i: number) {
+  attachments.value.splice(i, 1)
+}
+
+function isImage(m: MediaRef): boolean {
+  return m.mime.startsWith('image/')
+}
+
+// 通信字段的显示面（doc/32 A6/A7）：有 name 显示 name，无名退化「图片 {seq}」，
+// 存量行（无 name/seq）退化 mime+size——三层兜底，刷新 reconcile 后名字不丢。
+function mediaLabel(m: MediaRef): string {
+  if (m.name) return m.name
+  if (m.seq != null) return `图片 ${m.seq}`
+  return `${m.mime} ${fmtSize(m.size)}`
+}
+
+function fmtSize(n: number): string {
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)}MB`
+  if (n >= 1024) return `${Math.round(n / 1024)}KB`
+  return `${n}B`
+}
 
 // usage 小字（doc/27 §4a 消费侧）：↑输入 ↓输出 · 输入/窗 (占比%)；无窗只显示花销。
 // 占比 >70% 橙、>90% 红（pi 阈值惯例）；1% 以下显示 <1 免得整轮 0%。
@@ -93,6 +138,19 @@ async function onScroll() {
         <div v-else-if="!atStart" class="older muted">上滚查看更早历史</div>
 
         <div v-for="b in bubbles" :key="b.key" :class="['bubble', b.role, b.state]">
+          <template v-if="b.media?.length">
+            <template v-for="(m, i) in b.media" :key="`${b.key}:m${i}`">
+              <img
+                v-if="isImage(m)"
+                class="bubble-media"
+                :src="mediaUrl(m.path)"
+                :alt="mediaLabel(m)"
+                :title="mediaLabel(m)"
+                loading="lazy"
+              />
+              <p v-else class="bubble-file">📎 {{ mediaLabel(m) }}（{{ m.mime }}，{{ fmtSize(m.size) }}）</p>
+            </template>
+          </template>
           <p v-if="b.text">{{ b.text }}</p>
           <span v-else-if="b.state === 'streaming' || b.state === 'offline'" class="typing" aria-label="正在生成">
             <i></i><i></i><i></i>
@@ -127,12 +185,29 @@ async function onScroll() {
       </section>
 
       <form class="composer" @submit.prevent="send">
+        <input ref="fileEl" type="file" accept="image/*,application/pdf,audio/*,video/*" multiple hidden @change="onPickFiles" />
+        <button
+          type="button"
+          class="attach"
+          :disabled="attachments.length >= MAX_ATTACH"
+          aria-label="添加图片或文件"
+          @click="fileEl?.click()"
+        >
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+            <path d="M13.2 7.6 8 12.8a3.4 3.4 0 0 1-4.8-4.8l5.4-5.4a2.3 2.3 0 0 1 3.2 3.2l-5.4 5.4a1.1 1.1 0 0 1-1.6-1.6L9.6 4.8" />
+          </svg>
+        </button>
+        <div v-if="attachments.length" class="attach-chips">
+          <span v-for="(a, i) in attachments" :key="i" class="chip">
+            {{ a.name }}<button type="button" class="chip-x" aria-label="移除附件" @click="removeAttachment(i)">×</button>
+          </span>
+        </div>
         <input
           v-model="draft"
           :placeholder="pending.length ? `排队 ${pending.length} 条，当前回复收口后自动发出` : '说点什么…'"
           aria-label="消息输入框"
         />
-        <button type="submit" :disabled="!draft.trim()" aria-label="发送">
+        <button type="submit" :disabled="!draft.trim() && !attachments.length" aria-label="发送">
           <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
             <path d="M3.1 2.2 18 10 3.1 17.8c-.7.4-1.6-.1-1.6-.9v-4.4l9-2.5-9-2.5V3.1c0-.8.9-1.3 1.6-.9z" />
           </svg>
@@ -424,6 +499,23 @@ header h1 {
   flex: none;
 }
 
+/* 气泡内媒体（doc/32 A5）：占位行换成的 <img> / 文件片 */
+.bubble-media {
+  display: block;
+  max-width: min(100%, 20rem);
+  max-height: 18rem;
+  border-radius: 0.6rem;
+  margin-bottom: 0.4rem;
+  background: rgba(255, 255, 255, 0.85);
+}
+.bubble.user .bubble-media {
+  background: #fff;
+}
+.bubble-file {
+  font-size: 0.8rem !important;
+  opacity: 0.9;
+}
+
 /* usage 小字（doc/27）：气泡下方一行灰字；>70% 橙、>90% 红 */
 .usage {
   display: block;
@@ -447,9 +539,68 @@ header h1 {
   background: #fff;
   border: 1px solid #e6e6ec;
   border-radius: 999px;
-  padding: 0.4rem 0.4rem 0.4rem 1.1rem;
+  padding: 0.4rem 0.4rem 0.4rem 0.5rem;
   box-shadow: 0 4px 20px rgba(16, 16, 24, 0.07);
   transition: border-color 0.15s, box-shadow 0.15s;
+}
+.attach {
+  flex: none;
+  width: 1.9rem;
+  height: 1.9rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: #6e6e7a;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.attach svg {
+  width: 1.05rem;
+  height: 1.05rem;
+}
+.attach:hover:not(:disabled) {
+  background: #eef2ff;
+  color: #2563eb;
+}
+.attach:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.attach-chips {
+  display: flex;
+  gap: 0.3rem;
+  flex-wrap: wrap;
+  max-width: 42%;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.72rem;
+  color: #3f3f4a;
+  background: #f1f3f9;
+  border: 1px solid #e2e6f0;
+  border-radius: 999px;
+  padding: 0.15rem 0.6rem;
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chip-x {
+  border: none;
+  background: none;
+  color: #8b8b96;
+  font-size: 0.85rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+.chip-x:hover {
+  color: #b03434;
 }
 .composer:focus-within {
   border-color: #b9cdf7;
