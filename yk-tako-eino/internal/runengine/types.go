@@ -44,21 +44,21 @@ type Row struct {
 // Name/Args/Output 是工具帧（kind=tool_call/tool_result）的负载。
 // usage 帧（doc/27 §4a）五个数值列：每枪 provider 账单 + 窗配置值；账单缺失不发帧（不发 0）。
 type Frame struct {
-	EventOffset     int    `json:"eventOffset,omitempty"`
-	Kind            string `json:"kind"`
-	Agent           string `json:"agent"`
-	Model           string `json:"model"`
-	MessageID       string `json:"messageId,omitempty"`
-	Name            string `json:"name,omitempty"`
-	Args            string `json:"args,omitempty"`
-	Output          string `json:"output,omitempty"`
-	Text            string `json:"text,omitempty"`
-	Status          string `json:"status,omitempty"`
-	PromptTokens    int    `json:"promptTokens,omitempty"`
-	CompletionTokens int   `json:"completionTokens,omitempty"`
-	ReasoningTokens int    `json:"reasoningTokens,omitempty"`
-	TotalTokens     int    `json:"totalTokens,omitempty"`
-	Window          int    `json:"window,omitempty"`
+	EventOffset      int    `json:"eventOffset,omitempty"`
+	Kind             string `json:"kind"`
+	Agent            string `json:"agent"`
+	Model            string `json:"model"`
+	MessageID        string `json:"messageId,omitempty"`
+	Name             string `json:"name,omitempty"`
+	Args             string `json:"args,omitempty"`
+	Output           string `json:"output,omitempty"`
+	Text             string `json:"text,omitempty"`
+	Status           string `json:"status,omitempty"`
+	PromptTokens     int    `json:"promptTokens,omitempty"`
+	CompletionTokens int    `json:"completionTokens,omitempty"`
+	ReasoningTokens  int    `json:"reasoningTokens,omitempty"`
+	TotalTokens      int    `json:"totalTokens,omitempty"`
+	Window           int    `json:"window,omitempty"`
 }
 
 // ModelMessage 是 model_history 里的一条模型侧消息（19v6-03「真源划分」：
@@ -87,7 +87,7 @@ type TurnEntry struct {
 	ToolCalls  []schema.ToolCall // assistant 轮：模型给出的工具调用（原样落 JSON）
 	ToolCallID string            // tool 轮：回指 assistant 轮 tool_calls 里的 id
 	ToolName   string            // tool 轮：工具名（tool_result 帧 / runlog 扩展行用）
-	Agent      string     // T3-2：产出该条目的 agent 名；空 = root
-	Model      string     // 产出该条目的模型生效 ref（T3-1b 填）
-	Usage      *UsageBill // assistant 轮：本枪 provider 账单（doc/27 A3 落终稿行 payload 列用）
+	Agent      string            // T3-2：产出该条目的 agent 名；空 = root
+	Model      string            // 产出该条目的模型生效 ref（T3-1b 填）
+	Usage      *UsageBill        // assistant 轮：本枪 provider 账单（doc/27 A3 落终稿行 payload 列用）
 }

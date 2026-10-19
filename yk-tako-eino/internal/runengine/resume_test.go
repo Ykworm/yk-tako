@@ -109,6 +109,7 @@ func TestResumeHandlerErrorMapping(t *testing.T) {
 		c, _ := gin.CreateTestContext(w)
 		c.Request = httptest.NewRequest(http.MethodPost, "/api/runs/"+string(rid)+"/resume", nil)
 		c.Params = gin.Params{{Key: "runId", Value: string(rid)}}
+		c.Set("tako.principal", testOwner)
 		srv.resumeRun(c)
 		var body map[string]any
 		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {

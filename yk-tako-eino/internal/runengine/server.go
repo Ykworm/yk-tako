@@ -38,6 +38,8 @@ type Server struct {
 	// resumeMax 是单场 run 的续跑上限（-resume-max，doc/30 A1）：GET /api/runs/{id} 的
 	// resumable = interrupted && resumeCount < resumeMax。A1 只读侧用它，A4a 的 claim 同值裁决。
 	resumeMax int
+	// auth 是身份面。业务路由挂 RequireAuth；mcp/media/memory 在有归属模型前只放 system admin。
+	auth *Auth
 }
 
 // NewRouter 挂 v6 第一步的全部四个 API（19v6-01 §0）。整张面的心智模型就一条循环：
@@ -58,26 +60,82 @@ type Server struct {
 // 不变量：两个**对齐游标**各自只在自己的端点前进；往上滚翻旧历史用的是**临时翻页游标**，
 // 拉完即弃，不回退对齐游标。实时性 = 客户端轮询节奏（dev 建议 300–500ms），服务端无长连接、
 // 无推送、无 heartbeat。两个拉取端点一律有界：单批上限 W（-batch-window，dev 默认 200）。
-func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMax int) *gin.Engine {
-	s := &Server{store: store, w: batchWindow, worker: worker, mediaRoot: worker.Workspace(), mcpConfPath: defaultMcpConfPath, resumeMax: resumeMax}
+func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMax int, auth *Auth) *gin.Engine {
+	s := &Server{store: store, w: batchWindow, worker: worker, mediaRoot: worker.Workspace(), mcpConfPath: defaultMcpConfPath, resumeMax: resumeMax, auth: auth}
 	r := gin.Default()
-	r.POST("/api/runs", s.postRuns)
-	r.POST("/api/runs/:runId/stop", s.stopRun)
-	r.POST("/api/runs/:runId/resume", s.resumeRun)
-	r.GET("/api/runs/:runId", s.getRunStatus)
-	r.GET("/api/sessions/:id", s.getSession)
-	r.GET("/api/runs/:runId/frames", s.getFrames)
-	r.GET("/api/runs/:runId/stream", s.getRunStream)
-	r.GET("/api/sessions/:id/log", s.getSessionLog)
-	r.GET("/api/mcp/servers", s.getMcpServers)
-	r.GET("/api/media", s.getMedia)
-	r.GET("/api/memory/items", s.getMemoryItems)
-	r.GET("/api/memory/jobs", s.getMemoryJobs)
-	r.GET("/api/memory/dialogue", s.getMemoryDialogue)
-	r.GET("/api/memory/recall", s.getMemoryRecall)
+	r.POST("/api/auth/signup", s.auth.Signup)
+	r.POST("/api/auth/login", s.auth.Login)
+	r.POST("/api/auth/refresh", s.auth.Refresh)
+	r.POST("/api/auth/logout", s.auth.RequireAuth(), s.auth.Logout)
+	r.GET("/api/auth/me", s.auth.RequireAuth(), s.auth.Me)
+	r.POST("/api/auth/switch-tenant", s.auth.RequireAuth(), s.auth.SwitchTenant)
+	authn := s.auth.RequireAuth()
+	sys := s.auth.RequireSystemAdmin()
+	r.POST("/api/runs", authn, s.postRuns)
+	r.POST("/api/runs/:runId/stop", authn, s.stopRun)
+	r.POST("/api/runs/:runId/resume", authn, s.resumeRun)
+	r.GET("/api/runs/:runId", authn, s.getRunStatus)
+	r.GET("/api/sessions", authn, s.listSessions)
+	r.PATCH("/api/sessions/:id/visibility", authn, s.patchSessionVisibility)
+	r.GET("/api/sessions/:id", authn, s.getSession)
+	r.GET("/api/runs/:runId/frames", authn, s.getFrames)
+	r.GET("/api/runs/:runId/stream", authn, s.getRunStream)
+	r.GET("/api/sessions/:id/log", authn, s.getSessionLog)
+	r.GET("/api/mcp/servers", authn, sys, s.getMcpServers)
+	r.GET("/api/media", authn, s.getMedia)
+	r.GET("/api/memory/items", authn, s.getMemoryItems)
+	r.GET("/api/memory/jobs", authn, s.getMemoryJobs)
+	r.GET("/api/memory/dialogue", authn, s.getMemoryDialogue)
+	r.GET("/api/memory/recall", authn, s.getMemoryRecall)
+	r.POST("/api/tenants", authn, s.createTenant)
+	r.GET("/api/tenants", authn, s.listTenants)
+	r.GET("/api/me/invitations", authn, s.myInvitations)
+	r.POST("/api/me/invitations/:id/accept", authn, s.acceptInvitation)
+	r.POST("/api/me/invitations/:id/decline", authn, s.declineInvitation)
+	r.GET("/api/invitations/:token", s.lookupInvitation)
+	r.POST("/api/auth/register-by-invite", s.registerByInvite)
+	ten := r.Group("/api/tenants/:id", authn, s.auth.PathTenantMatch())
+	ten.GET("/members", s.auth.RequireTenantRole("viewer"), s.listMembers)
+	ten.POST("/members", s.auth.RequireTenantRole("owner"), s.addMember)
+	ten.PUT("/members/:user_id", s.auth.RequireTenantRole("owner"), s.updateMember)
+	ten.DELETE("/members/:user_id", s.auth.RequireTenantRole("owner"), s.removeMember)
+	ten.POST("/leave", s.auth.RequireTenantRole("viewer"), s.leaveTenant)
+	ten.POST("/transfer-owner", s.auth.RequireTenantRole("owner"), s.transferOwner)
+	ten.GET("/audit-log", s.auth.RequireTenantRole("admin"), s.tenantAudit)
+	r.GET("/api/tenants/:id", authn, s.auth.PathTenantMatch(), s.auth.RequireTenantRole("viewer"), s.getTenant)
+	r.PUT("/api/tenants/:id", authn, s.auth.PathTenantMatch(), s.auth.RequireTenantRole("owner"), s.putTenant)
+	r.DELETE("/api/tenants/:id", authn, s.auth.PathTenantMatch(), s.auth.RequireTenantRole("owner"), s.deleteTenant)
+	ten.GET("/notes", s.auth.RequireTenantRole("viewer"), s.listTenantNotes)
+	ten.POST("/notes", s.auth.RequireTenantRole("admin"), s.postTenantNote)
+	ten.GET("/agents", s.auth.RequireTenantRole("viewer"), s.listAgents)
+	ten.POST("/agents", s.auth.RequireTenantRole("member"), s.createAgent)
+	ten.POST("/agents/import", s.auth.RequireTenantRole("member"), s.importAgents)
+	ten.PUT("/agents/:agent_id", s.auth.RequireTenantRole("member"), s.updateAgent)
+	ten.DELETE("/agents/:agent_id", s.auth.RequireTenantRole("member"), s.deleteAgent)
+	ten.GET("/usage", s.auth.RequireTenantRole("admin"), s.tenantUsage)
+	ten.GET("/runtime-config", s.auth.RequireTenantRole("viewer"), s.getRuntimeConfig)
+	ten.PUT("/runtime-config", s.auth.RequireTenantRole("admin"), s.putRuntimeConfig)
+	ten.GET("/model-resolve", s.auth.RequireTenantRole("viewer"), s.getModelResolve)
+	ten.GET("/mcp-status", s.auth.RequireTenantRole("admin"), s.getMcpStatus)
+	ten.POST("/invitations", s.auth.RequireTenantRole("owner"), s.createInvitation)
+	ten.GET("/invitations", s.auth.RequireTenantRole("viewer"), s.listInvitations)
+	ten.DELETE("/invitations/:inv_id", s.auth.RequireTenantRole("owner"), s.revokeInvitation)
+	sysg := r.Group("/api/system/admin", authn, sys)
+	sysg.GET("/tenants", s.listAdminTenants)
+	sysg.GET("/users", s.listAdminUsers)
+	sysg.POST("/users", s.createAdminUser)
+	sysg.POST("/promote", s.promoteAdmin)
+	sysg.POST("/revoke", s.revokeAdmin)
+	sysg.GET("/audit-log", s.systemAudit)
 	if dev {
 		r.DELETE("/api/dev/reset", s.devReset)
 		r.GET("/api/dev/runs/:runId/journal", s.devJournal)
+		r.GET("/api/dev/notes", authn, s.listDevNotes)
+		r.POST("/api/dev/notes", authn, s.postDevNote)
+		r.POST("/api/dev/memory", authn, s.postDevMemory)
+		r.POST("/api/dev/workspace/file", authn, s.postDevFile)
+		r.GET("/api/dev/workspace/file", authn, s.getDevFile)
+		r.POST("/api/dev/workspace/bash", authn, s.postDevBash)
 	}
 	return r
 }
@@ -95,6 +153,7 @@ type postRunsRequest struct {
 	MessageID string      `json:"messageId"`
 	Text      string      `json:"text"`
 	Images    []postImage `json:"images,omitempty"`
+	AgentID   string      `json:"agentId,omitempty"`
 }
 
 // 字段序 = 19v6-01 §1 期望字节序：sessionId → runId → messageId。
@@ -153,7 +212,7 @@ type logResponse struct {
 //	text       —— 消息正文。
 //	images     —— 可省（doc/32 A1）。每项 {mime, dataBase64, name?}：name = 用户上传文件名
 //	              （可省，A6 通信字段）；白名单与单文件 5MB / 单消息 4 张帽见 media.go。
-//	              合法图落 workspace/.media/（内容寻址），user 行 text = 正文 + 每图一行
+//	              合法图落会话目录 .media/（内容寻址，占位 path 带 sessions/<sid>/），user 行 text = 正文 + 每图一行
 //	              [media …] 占位（含 seq 全会话序号与 name）——对话里只有 path，没有字节。
 //
 // 响应（字段序即契约字节序：sessionId → runId → messageId）：
@@ -177,26 +236,73 @@ type logResponse struct {
 // frames，不必先查 session；§4 那个状态查询是给 reconnect / 新 tab 用的入口。
 func (s *Server) postRuns(c *gin.Context) {
 	ctx := c.Request.Context()
+	p, ok := principalFrom(c)
+	if !ok {
+		writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
+		return
+	}
 	var req postRunsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request"})
 		return
 	}
 	sessionID := req.SessionID
+	// 归属预检在 AdmitText / 落盘之前：别人用超长 text 或坏图不能靠 413/400 探到会话是否存在。
+	var bound Session
 	if sessionID != "" {
-		exists, err := s.store.Exists(ctx, sessionID)
+		var kind accessKind
+		var err error
+		bound, kind, err = s.store.SessionAccess(ctx, sessionID, p)
 		if err != nil {
+			if errors.Is(err, ErrSessionNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
+				return
+			}
 			internal(c, err)
 			return
 		}
-		if !exists {
-			c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
+		if kind != accessOwner {
+			writeEnvelope(c, http.StatusForbidden, codeNotOwner, "只有本人能修改", nil)
+			return
+		}
+	}
+	// 本场要用的助手：请求里的 agentId 优先；没带就沿用会话上已经记下的。
+	// 看不见的助手在抢闸前 404，不建 run。角色门槛只卡「这次新指定」，
+	// 沿用旧绑定的后续消息不再重判 member。
+	agentID := req.AgentID
+	if agentID == "" {
+		agentID = bound.AgentID
+	}
+	if req.AgentID != "" && roleRank(p.Role) < roleRank("member") {
+		writeEnvelope(c, http.StatusForbidden, codeForbidden, "没有权限做这件事", nil)
+		return
+	}
+	prof, aerr := s.assembleRun(ctx, p, agentID)
+	if aerr != nil {
+		writeEnvelope(c, aerr.Status, aerr.Code, aerr.Message, nil)
+		return
+	}
+	handed := false
+	defer func() {
+		if !handed {
+			prof.Close()
+		}
+	}()
+	if s.overQuota(c, p) {
+		return
+	}
+	// 会话 id 在落盘前定下来：占位 path 要带 sessions/<sid>/，GET 和 read_media_file 才读得到同一份。
+	// 这时还没抢闸。后面 400/413/409 可能在会话目录里留下内容寻址文件，落库面仍是空的。
+	if sessionID == "" {
+		var err error
+		if sessionID, err = newSessionID(); err != nil {
+			internal(c, err)
 			return
 		}
 	}
 	// 入口媒体（doc/32 A1）：先校验+落盘（400 同形 bad_media 带原因），再准入（A2 把 base64
 	// 体折进 413 预算）——落盘在闸前，因为占位要进 user 行 text，而 user 行在 AcquireRun
-	// 的原子写里定稿。409/500 时 .media/ 可能多出文件：内容寻址幂等、无对话痕迹，
+	// 的原子写里定稿。409/500 时会话目录里的 .media/ 可能多出文件：内容寻址幂等、无对话痕迹，
 	// 「什么都没写」语义只对落库面承诺。
 	// seq 起点（doc/32 A6）：数会话既有占位数 +1——user 行是唯一携带 seq 的行，同会话同时
 	// 只有一个 run 在写（409 忙闸），计数无并发竞争；闸在 PG 不在进程，多副本下照成立。
@@ -212,7 +318,29 @@ func (s *Server) postRuns(c *gin.Context) {
 			}
 			seqStart = n + 1
 		}
-		ph, err := ingestImages(s.mediaRoot, req.Images, seqStart)
+		dir, err := sessionWorkspace(s.mediaRoot, p.TenantID, sessionID)
+		if err != nil {
+			internal(c, err)
+			return
+		}
+		_, _, _, maxBytes, qerr := s.store.TenantQuota(ctx, p.TenantID)
+		if qerr != nil {
+			internal(c, qerr)
+			return
+		}
+		var quota func(int) (func(), error)
+		if maxBytes > 0 {
+			quota = func(n int) (func(), error) {
+				return s.store.ReserveStorage(ctx, p.TenantID, int64(n), maxBytes, func() int64 {
+					return directoryBytes(tenantStorageRoot(s.mediaRoot, p.TenantID))
+				})
+			}
+		}
+		ph, err := ingestImagesAt(dir, req.Images, seqStart, "sessions/"+string(sessionID)+"/", quota)
+		if errors.Is(err, errStorageQuota) {
+			writeEnvelope(c, http.StatusTooManyRequests, codeQuota, "这个工作区的额度用完了", nil)
+			return
+		}
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "bad_media", "reason": err.Error()})
 			return
@@ -234,19 +362,21 @@ func (s *Server) postRuns(c *gin.Context) {
 		internal(c, err)
 		return
 	}
-	if sessionID == "" {
-		if sessionID, err = newSessionID(); err != nil {
-			internal(c, err)
-			return
-		}
-	}
 	// user 行 text = 正文 + 每图一行占位（doc/32 纪律：对话里只有 path，没有字节）。
 	userText := req.Text
 	if placeholders != "" {
 		userText = strings.TrimSpace(userText + "\n" + placeholders)
 	}
 	user := Row{RunID: runID, Role: "user", MessageID: req.MessageID, Text: userText}
-	acquired, err := s.store.AcquireRun(ctx, sessionID, runID, user)
+	acquired, err := s.store.AcquireRun(ctx, sessionID, runID, user, p)
+	if errors.Is(err, ErrSessionNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
+		return
+	}
+	if errors.Is(err, ErrSessionForbidden) {
+		writeEnvelope(c, http.StatusForbidden, codeNotOwner, "只有本人能修改", nil)
+		return
+	}
 	if err != nil {
 		internal(c, err)
 		return
@@ -258,8 +388,72 @@ func (s *Server) postRuns(c *gin.Context) {
 	// 抢闸成功才开 worker：POST 返回 202 时 run 已在生成，frames/log 立刻可拉（19v6-01 §1）。
 	// Background 而非请求 ctx：run 的生命周期不属于这个请求，响应写完它还在跑。
 	// POST 路径 = 出生执行者，令牌固定 1（doc/30 §7）；续跑路径（A4a）传 claim 返回值。
-	go s.worker.Run(context.Background(), sessionID, runID, 1)
+	if req.AgentID != "" {
+		_ = s.store.db.WithContext(ctx).Exec(`UPDATE sessions SET agent_id = ? WHERE id = ?`, req.AgentID, sessionID).Error
+	}
+	go s.worker.Run(withRunProfile(withPrincipal(context.Background(), p), prof), sessionID, runID, 1)
+	handed = true
 	c.JSON(http.StatusAccepted, postRunsResponse{SessionID: sessionID, RunID: runID, MessageID: req.MessageID})
+}
+
+// runView 是 run 端点的归属结果。written=true 表示 401/500 已经写出，调用方直接 return。
+type runView struct {
+	P       principal
+	SID     SessionID
+	Kind    accessKind
+	Found   bool
+	written bool
+}
+
+func (s *Server) viewRun(c *gin.Context, runID RunID) runView {
+	p, ok := principalFrom(c)
+	if !ok {
+		writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
+		return runView{written: true}
+	}
+	sid, found, err := s.store.RunSession(c.Request.Context(), runID)
+	if err != nil {
+		internal(c, err)
+		return runView{written: true}
+	}
+	if !found {
+		return runView{P: p}
+	}
+	_, kind, err := s.store.SessionAccess(c.Request.Context(), sid, p)
+	if errors.Is(err, ErrSessionNotFound) {
+		return runView{P: p, SID: sid}
+	}
+	if err != nil {
+		internal(c, err)
+		return runView{written: true}
+	}
+	return runView{P: p, SID: sid, Kind: kind, Found: true}
+}
+
+func denyRunWrite(c *gin.Context, v runView) bool {
+	if v.written {
+		return true
+	}
+	if !v.Found || v.Kind == accessNone {
+		c.JSON(http.StatusNotFound, gin.H{"error": "run_not_found"})
+		return true
+	}
+	if v.Kind != accessOwner {
+		writeEnvelope(c, http.StatusForbidden, codeNotOwner, "只有本人能修改", nil)
+		return true
+	}
+	return false
+}
+
+func denyRunRead(c *gin.Context, v runView) bool {
+	if v.written {
+		return true
+	}
+	if !v.Found || v.Kind == accessNone {
+		c.JSON(http.StatusNotFound, gin.H{"error": "run_not_found"})
+		return true
+	}
+	return false
 }
 
 // stopRun（doc/17 §4 手动停止）：POST /api/runs/{runId}/stop。
@@ -270,6 +464,9 @@ func (s *Server) postRuns(c *gin.Context) {
 // （EndRun stopped 分支），这里不压帧、不动 Redis。
 func (s *Server) stopRun(c *gin.Context) {
 	runID := RunID(c.Param("runId"))
+	if denyRunWrite(c, s.viewRun(c, runID)) {
+		return
+	}
 	status, found, err := s.store.StopRun(c.Request.Context(), runID)
 	if err != nil {
 		internal(c, err)
@@ -302,6 +499,9 @@ func (s *Server) stopRun(c *gin.Context) {
 func (s *Server) resumeRun(c *gin.Context) {
 	ctx := c.Request.Context()
 	runID := RunID(c.Param("runId"))
+	if denyRunWrite(c, s.viewRun(c, runID)) {
+		return
+	}
 	claim, err := s.store.ClaimResume(ctx, runID, s.resumeMax)
 	switch {
 	case errors.Is(err, errRunNotFound):
@@ -342,7 +542,25 @@ func (s *Server) resumeRun(c *gin.Context) {
 		return
 	}
 	// 与 POST 同一条纪律：run 的生命周期不属于这个请求。
-	go s.worker.RunResume(context.Background(), claim.SessionID, runID, claim.Epoch, replay)
+	// 续跑也要重新装配租户模型。装配失败就放弃这次认领，不拿进程里的平台密钥接着跑。
+	bg := context.Background()
+	if p, ok := principalFrom(c); ok {
+		bg = withPrincipal(bg, p)
+		if s.worker != nil && s.worker.models != nil {
+			agentID := ""
+			if sess, _, serr := s.store.SessionAccess(ctx, claim.SessionID, p); serr == nil {
+				agentID = sess.AgentID
+			}
+			prof, aerr := s.assembleRun(ctx, p, agentID)
+			if aerr != nil {
+				_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
+				writeEnvelope(c, aerr.Status, aerr.Code, aerr.Message, nil)
+				return
+			}
+			bg = withRunProfile(bg, prof)
+		}
+	}
+	go s.worker.RunResume(bg, claim.SessionID, runID, claim.Epoch, replay)
 	c.JSON(http.StatusAccepted, resumeResponse{RunID: runID, Status: "running", ResumeCount: int(claim.Epoch - 1)})
 }
 
@@ -364,7 +582,12 @@ func (s *Server) resumeRun(c *gin.Context) {
 // 「读到活 run 却配了旧高水位」在这条语句里不可能出现。闸的判活即租约谓词
 // `status='running' AND lease_until > now()`：租约已过的死行**读侧即回收**，不等清扫。
 func (s *Server) getSession(c *gin.Context) {
-	liveRunID, runlogOffset, lastStatus, lastRunID, exists, err := s.store.SessionStatus(c.Request.Context(), SessionID(c.Param("id")))
+	p, ok := principalFrom(c)
+	if !ok {
+		writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
+		return
+	}
+	liveRunID, runlogOffset, lastStatus, lastRunID, exists, err := s.store.SessionStatus(c.Request.Context(), SessionID(c.Param("id")), p)
 	if err != nil {
 		internal(c, err)
 		return
@@ -374,6 +597,73 @@ func (s *Server) getSession(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, sessionResponse{LiveRunID: liveRunID, RunlogOffset: runlogOffset, LastRunStatus: lastStatus, LastRunID: lastRunID})
+}
+
+type sessionListItem struct {
+	ID         SessionID `json:"id"`
+	Title      string    `json:"title"`
+	Visibility string    `json:"visibility"`
+	Owner      bool      `json:"owner"`
+	CreatedAt  time.Time `json:"createdAt"`
+}
+
+type sessionListData struct {
+	Sessions []sessionListItem `json:"sessions"`
+}
+
+type visibilityRequest struct {
+	Visibility string `json:"visibility"`
+}
+
+// listSessions 是新接口：默认只列本人的会话；?scope=tenant 列本租户里显式共享的会话。
+func (s *Server) listSessions(c *gin.Context) {
+	p, ok := principalFrom(c)
+	if !ok {
+		writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
+		return
+	}
+	rows, err := s.store.ListSessions(c.Request.Context(), p, c.Query("scope"))
+	if err != nil {
+		log.Printf("%s %s: %v", c.Request.Method, c.Request.URL.Path, err)
+		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
+		return
+	}
+	items := make([]sessionListItem, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, sessionListItem{
+			ID: row.ID, Title: row.Title, Visibility: row.Visibility,
+			Owner: row.UserID == p.UserID, CreatedAt: row.CreatedAt,
+		})
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", sessionListData{Sessions: items})
+}
+
+// patchSessionVisibility 只有 owner 能把会话改成 private 或 tenant。
+func (s *Server) patchSessionVisibility(c *gin.Context) {
+	p, ok := principalFrom(c)
+	if !ok {
+		writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
+		return
+	}
+	var req visibilityRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	err := s.store.SetSessionVisibility(c.Request.Context(), SessionID(c.Param("id")), p, req.Visibility)
+	switch {
+	case errors.Is(err, ErrBadVisibility):
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "邮箱或密码不符合要求", nil)
+	case errors.Is(err, ErrSessionNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
+	case errors.Is(err, ErrSessionForbidden):
+		writeEnvelope(c, http.StatusForbidden, codeNotOwner, "只有本人能修改", nil)
+	case err != nil:
+		log.Printf("%s %s: %v", c.Request.Method, c.Request.URL.Path, err)
+		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
+	default:
+		writeEnvelope(c, http.StatusOK, codeOK, "", visibilityRequest{Visibility: req.Visibility})
+	}
 }
 
 // getRunStatus（doc/30 A1）= 单场 run 的对外状态，崩溃后「这场是死了还是还能续」的唯一读口。
@@ -388,6 +678,9 @@ func (s *Server) getSession(c *gin.Context) {
 // 未知 run 与 session 端点同形回 404（这里与 frames 的 200 gone 不同：那个是 runlive TTL 的
 // 生命周期，这里是 PG 行存在性——行在不在是确定的）。
 func (s *Server) getRunStatus(c *gin.Context) {
+	if denyRunRead(c, s.viewRun(c, RunID(c.Param("runId")))) {
+		return
+	}
 	st, found, err := s.store.RunStatus(c.Request.Context(), RunID(c.Param("runId")), s.resumeMax)
 	if err != nil {
 		internal(c, err)
@@ -436,6 +729,14 @@ func (s *Server) getRunStatus(c *gin.Context) {
 // 客户端两种情况的动作本来相同（转拉 log），区分它没有价值。
 func (s *Server) getFrames(c *gin.Context) {
 	from := queryOffset(c, "eventOffset")
+	v := s.viewRun(c, RunID(c.Param("runId")))
+	if v.written {
+		return
+	}
+	if !v.Found || v.Kind == accessNone {
+		c.JSON(http.StatusOK, framesResponse{Frames: []Frame{}, NextOffset: from, Status: "gone"})
+		return
+	}
 	frames, next, exists, err := s.store.ReadFrames(c.Request.Context(), RunID(c.Param("runId")), from, s.w)
 	if err != nil {
 		internal(c, err)
@@ -491,6 +792,10 @@ var (
 // 读满 W 说明积压中，立即再读不睡 tail（追平存量）。
 func (s *Server) getRunStream(c *gin.Context) {
 	runID := RunID(c.Param("runId"))
+	v := s.viewRun(c, runID)
+	if v.written {
+		return
+	}
 	from := lastEventID(c.GetHeader("Last-Event-ID"))
 	w := c.Writer
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -503,6 +808,10 @@ func (s *Server) getRunStream(c *gin.Context) {
 		return true
 	}
 	ctx := c.Request.Context()
+	if !v.Found || v.Kind == accessNone {
+		write("event: gone\n\n")
+		return
+	}
 	lastWrite := time.Now()
 	for {
 		if time.Since(lastWrite) >= sseHeartbeatInterval {
@@ -575,7 +884,20 @@ func lastEventID(h string) int {
 // T3-2 起子代理的行也在列（工具动作行 + 各 agent 的终稿行）：`agent`/`model` 两列是溯源坐标
 // （agent 空 = root；model 空 = 非模型产物——user 行两列皆空）。
 func (s *Server) getSessionLog(c *gin.Context) {
+	p, ok := principalFrom(c)
+	if !ok {
+		writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
+		return
+	}
 	from := queryOffset(c, "runlogOffset")
+	if _, _, err := s.store.SessionAccess(c.Request.Context(), SessionID(c.Param("id")), p); err != nil {
+		if errors.Is(err, ErrSessionNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
+			return
+		}
+		internal(c, err)
+		return
+	}
 	rows, next, exists, err := s.store.ReadLog(c.Request.Context(), SessionID(c.Param("id")), from, s.w)
 	if err != nil {
 		internal(c, err)
@@ -603,6 +925,9 @@ type memoryItemResponse struct {
 // getMemoryItems（doc/29 §7.2①）= 记忆列表（管理面 + 抽取验收口）。
 // kind 空 = 全部（含 episode）；limit 默认 50、上限 200（钳制在 ListMemoryItems）。
 func (s *Server) getMemoryItems(c *gin.Context) {
+	if ok, _ := s.memoryContext(c); !ok {
+		return
+	}
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	items, err := s.store.ListMemoryItems(c.Request.Context(), c.Query("kind"), limit)
 	if err != nil {
@@ -633,6 +958,9 @@ type memoryJobResponse struct {
 
 // getMemoryJobs（doc/29 §7.2②）= 抽取任务状态（线一观测口）；runId 空 = 最近 20 条。
 func (s *Server) getMemoryJobs(c *gin.Context) {
+	if ok, _ := s.memoryContext(c); !ok {
+		return
+	}
 	jobs, err := s.store.ListMemoryJobs(c.Request.Context(), RunID(c.Query("runId")))
 	if err != nil {
 		internal(c, err)
@@ -660,6 +988,9 @@ type dialogueChunkResponse struct {
 }
 
 func (s *Server) getMemoryDialogue(c *gin.Context) {
+	if ok, _ := s.memoryContext(c); !ok {
+		return
+	}
 	chunks, err := s.store.ListDialogueChunks(c.Request.Context(), RunID(c.Query("runId")))
 	if err != nil {
 		internal(c, err)
@@ -678,6 +1009,9 @@ func (s *Server) getMemoryDialogue(c *gin.Context) {
 // getMemoryRecall（doc/29 §7.2④）= 召回预览：与 Worker 的注入调用同一个 Store.Recall，
 // 开关同一份——预览显示的就是模型实际会看到的东西。q 空 = 400。
 func (s *Server) getMemoryRecall(c *gin.Context) {
+	if ok, _ := s.memoryContext(c); !ok {
+		return
+	}
 	q := strings.TrimSpace(c.Query("q"))
 	if q == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request"})
@@ -696,7 +1030,10 @@ func (s *Server) getMemoryRecall(c *gin.Context) {
 	})
 }
 
-// getMedia（doc/32 A4）= 前端把占位行里的 path 换回字节流的唯一出口。// 牢笼与工具侧同一把闸（resolveInWorkspace）：越界 / 缺 path → 400，不存在 / 目录 → 404。
+// getMedia（doc/32 A4）= 前端把占位行里的 path 换回字节流的唯一出口。
+// 有登录身份时，path 必须是 sessions/<sid>/...；先 Clean 再按清完的 sid 做访问检查，
+// 越出会话目录、不带会话、看不见该会话，都回旧的 404 {"error":"not_found"}。
+// 没有身份时仍相对 mediaRoot（单测探针）：越界 400，缺文件 404。
 // mime 按扩展名表（mediaMimeByExt，与 read_media_file 同表）；回流走 ServeContent（支持 Range）。
 func (s *Server) getMedia(c *gin.Context) {
 	p := c.Query("path")
@@ -704,8 +1041,27 @@ func (s *Server) getMedia(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request", "reason": "缺 path"})
 		return
 	}
-	full, err := resolveInWorkspace(s.mediaRoot, p)
+	root := s.mediaRoot
+	rel := p
+	if who, ok := principalFrom(c); ok && who.TenantID != "" {
+		sid, inside, okPath := parseSessionMediaPath(p)
+		if !okPath {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+			return
+		}
+		if _, kind, err := s.store.SessionAccess(c.Request.Context(), SessionID(sid), who); err != nil || kind == accessNone {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+			return
+		}
+		root = filepath.Join(s.mediaRoot, "tenants", who.TenantID, "sessions", sid)
+		rel = inside
+	}
+	full, err := resolveInWorkspace(root, rel)
 	if err != nil {
+		if _, ok := principalFrom(c); ok {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request", "reason": "路径越出 workspace"})
 		return
 	}

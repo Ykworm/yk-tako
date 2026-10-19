@@ -18,8 +18,9 @@ import (
 type DialogueChunk struct {
 	RunID     RunID     `gorm:"primaryKey"`
 	SessionID SessionID `gorm:"not null;index"`
-	TenantID  string    `gorm:"not null;index:dialogue_chunks_scope,priority:1"` // 一期恒 default
-	Workspace string    `gorm:"not null;index:dialogue_chunks_scope,priority:2"`
+	TenantID  string    `gorm:"not null;index:dialogue_chunks_scope,priority:1"`
+	UserID    string    `gorm:"not null;default:'';index:dialogue_chunks_scope,priority:2"`
+	Workspace string    `gorm:"not null;index:dialogue_chunks_scope,priority:3"`
 	Passage   string    `gorm:"not null"`
 	Runes     int       `gorm:"not null"`
 	Truncated bool      `gorm:"not null"`
@@ -67,6 +68,7 @@ func (s *Store) EnsureDialogueIndex(ctx context.Context) error {
 // ListDialogueChunks 是 GET /api/memory/dialogue 的读侧（doc/29 §7.2③）：runId 精确查，空参 = 最近 20 条。
 func (s *Store) ListDialogueChunks(ctx context.Context, runID RunID) ([]DialogueChunk, error) {
 	q := s.db.WithContext(ctx).Order("indexed_at DESC, run_id DESC").Limit(20)
+	q = applyMemoryScope(q, scopeFrom(ctx))
 	if runID != "" {
 		q = q.Where("run_id = ?", runID)
 	}
@@ -119,14 +121,17 @@ func (s *Store) RunDialogueIndexer(ctx context.Context) {
 type unindexedRun struct {
 	ID        RunID
 	SessionID SessionID
+	TenantID  string
+	UserID    string
 }
 
 // indexDialogueBatch 索引一批未索引 run；单条失败只记日志、不挡同批其余（下一轮自愈）。
 func (s *Store) indexDialogueBatch(ctx context.Context) (int, error) {
 	var runs []unindexedRun
 	err := s.db.WithContext(ctx).Raw(`
-SELECT r.id, r.session_id
+SELECT r.id, r.session_id, COALESCE(se.tenant_id, '') AS tenant_id, COALESCE(se.user_id, '') AS user_id
   FROM runs r
+  LEFT JOIN sessions se ON se.id = r.session_id
  WHERE r.status = 'complete'
    AND NOT EXISTS (SELECT 1 FROM dialogue_chunks c WHERE c.run_id = r.id)
  ORDER BY r.finished_at, r.id
@@ -149,13 +154,18 @@ func (s *Store) indexDialogueRun(ctx context.Context, r unindexedRun) error {
 		return err
 	}
 	passage, truncated := buildDialoguePassage(r.SessionID, r.ID, entries)
+	tid, uid := r.TenantID, r.UserID
+	if tid == "" {
+		tid = s.memoryCfg.TenantID
+	}
 	return s.db.WithContext(ctx).Exec(`
-INSERT INTO dialogue_chunks (run_id, session_id, tenant_id, workspace, passage, runes, truncated, indexed_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, now())
+INSERT INTO dialogue_chunks (run_id, session_id, tenant_id, user_id, workspace, passage, runes, truncated, indexed_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, now())
 ON CONFLICT (run_id) DO UPDATE SET
   passage = EXCLUDED.passage, runes = EXCLUDED.runes,
-  truncated = EXCLUDED.truncated, indexed_at = EXCLUDED.indexed_at`,
-		r.ID, r.SessionID, s.memoryCfg.TenantID, s.memoryCfg.Workspace,
+  truncated = EXCLUDED.truncated, indexed_at = EXCLUDED.indexed_at,
+  tenant_id = EXCLUDED.tenant_id, user_id = EXCLUDED.user_id`,
+		r.ID, r.SessionID, tid, uid, s.memoryCfg.Workspace,
 		passage, utf8.RuneCountInString(passage), truncated).Error
 }
 
@@ -178,14 +188,18 @@ type dialogueCandidate struct {
 // 分词在扩展内完成；`@@@` 左边是索引键列 run_id（不是 passage）。租户/工作区等值过滤。
 func (s *Store) recallDialogueItems(ctx context.Context, query string) ([]dialogueCandidate, error) {
 	var rows []dialogueCandidate
+	tenantID, workspace, userSQL, userArg := memoryRecallFilter(ctx, s.memoryCfg)
+	args := []any{query, tenantID, workspace}
+	args = append(args, userArg...)
+	args = append(args, dialogueRecallItemsMax)
 	err := s.db.WithContext(ctx).Raw(`
 SELECT c.run_id, c.session_id, c.passage, paradedb.score(c.run_id) AS score,
        (SELECT r.finished_at FROM runs r WHERE r.id = c.run_id) AS finished_at
   FROM dialogue_chunks c
  WHERE c.run_id @@@ paradedb.match('passage', ?)
-   AND c.tenant_id = ? AND c.workspace = ?
+   AND c.tenant_id = ? AND c.workspace = ?`+userSQL+`
  ORDER BY score DESC
- LIMIT ?`, query, s.memoryCfg.TenantID, s.memoryCfg.Workspace, dialogueRecallItemsMax).Scan(&rows).Error
+ LIMIT ?`, args...).Scan(&rows).Error
 	if err != nil {
 		return nil, err
 	}

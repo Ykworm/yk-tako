@@ -65,9 +65,10 @@ var memoryRetryBackoff = []time.Duration{time.Minute, 5 * time.Minute, 30 * time
 type MemoryItem struct {
 	ID              string    `gorm:"primaryKey"` // mem_<ULID>
 	TenantID        string    `gorm:"not null;uniqueIndex:memory_items_dedup,priority:1,where:kind <> 'episode';index:memory_items_recall,priority:1;index:memory_items_topic,priority:1"`
-	Workspace       string    `gorm:"not null;uniqueIndex:memory_items_dedup,priority:2;index:memory_items_recall,priority:2;index:memory_items_topic,priority:2"`
-	Kind            string    `gorm:"not null;uniqueIndex:memory_items_dedup,priority:3;index:memory_items_recall,priority:3"` // fact | preference | decision | episode
-	Content         string    `gorm:"not null;uniqueIndex:memory_items_dedup,priority:4"`
+	UserID          string    `gorm:"not null;default:'';uniqueIndex:memory_items_dedup,priority:2,where:kind <> 'episode';index:memory_items_recall,priority:2"`
+	Workspace       string    `gorm:"not null;uniqueIndex:memory_items_dedup,priority:3;index:memory_items_recall,priority:3;index:memory_items_topic,priority:2"`
+	Kind            string    `gorm:"not null;uniqueIndex:memory_items_dedup,priority:4;index:memory_items_recall,priority:4"` // fact | preference | decision | episode
+	Content         string    `gorm:"not null;uniqueIndex:memory_items_dedup,priority:5"`
 	Topic           string    `gorm:"not null;index:memory_items_topic,priority:3"` // 小写 kebab-case；episode 用 run:<runId>
 	SourceSessionID SessionID `gorm:"not null"`
 	SourceRunID     RunID     `gorm:"not null;uniqueIndex:memory_items_episode_once,where:kind = 'episode'"`
@@ -83,7 +84,8 @@ type MemoryJob struct {
 	ID            string    `gorm:"primaryKey"`           // mj_<ULID>
 	RunID         RunID     `gorm:"not null;uniqueIndex"` // 一个 run 一条
 	SessionID     SessionID `gorm:"not null"`
-	TenantID      string    `gorm:"not null"` // 一期恒 default
+	TenantID      string    `gorm:"not null"` // 一期恒 default；A3 起优先用 session 上的 tenant
+	UserID        string    `gorm:"not null;default:''"`
 	Workspace     string    `gorm:"not null"`
 	Status        string    `gorm:"not null;index:memory_jobs_claim,priority:1"` // pending | running | done | failed
 	Attempts      int       `gorm:"not null"`
@@ -106,6 +108,7 @@ func (s *Store) ListMemoryItems(ctx context.Context, kind string, limit int) ([]
 		limit = 200
 	}
 	q := s.db.WithContext(ctx).Order("created_at DESC, id DESC").Limit(limit)
+	q = applyMemoryScope(q, scopeFrom(ctx))
 	if kind != "" {
 		q = q.Where("kind = ?", kind)
 	}
@@ -120,6 +123,7 @@ func (s *Store) ListMemoryItems(ctx context.Context, kind string, limit int) ([]
 // ListMemoryJobs 是 GET /api/memory/jobs 的读侧（doc/29 §7.2②）：runId 空 = 最近 20 条。
 func (s *Store) ListMemoryJobs(ctx context.Context, runID RunID) ([]MemoryJob, error) {
 	q := s.db.WithContext(ctx).Order("created_at DESC, id DESC").Limit(20)
+	q = applyMemoryScope(q, scopeFrom(ctx))
 	if runID != "" {
 		q = q.Where("run_id = ?", runID)
 	}
@@ -129,6 +133,18 @@ func (s *Store) ListMemoryJobs(ctx context.Context, runID RunID) ([]MemoryJob, e
 		jobs = []MemoryJob{}
 	}
 	return jobs, err
+}
+
+// applyMemoryScope 给记忆读口加租户和人。没有身份的旧调用（单测）不加过滤。
+// scope=tenant 只限制租户，给管理员看本工作区全员；其余只看本人。
+func applyMemoryScope(db *gorm.DB, sc dataScope) *gorm.DB {
+	if !scopeActive(sc) {
+		return db
+	}
+	if sc.Scope == "tenant" {
+		return db.Where("tenant_id = ?", sc.TenantID)
+	}
+	return db.Where("tenant_id = ? AND user_id = ?", sc.TenantID, sc.UserID)
 }
 
 // MemoryModelFunc 按需解析抽取模型（doc/29 §8）：TAKO_MEMORY_MODEL 为空时返回主模型客户端；
@@ -158,6 +174,7 @@ type claimedMemoryJob struct {
 	RunID     RunID
 	SessionID SessionID
 	TenantID  string
+	UserID    string
 	Workspace string
 	Attempts  int
 	CreatedAt time.Time
@@ -222,7 +239,7 @@ UPDATE memory_jobs j
        lease_until = now() + make_interval(secs => ?), updated_at = now()
   FROM picked
  WHERE j.id = picked.id
- RETURNING j.id, j.run_id, j.session_id, j.tenant_id, j.workspace, j.attempts, j.created_at`,
+ RETURNING j.id, j.run_id, j.session_id, j.tenant_id, j.user_id, j.workspace, j.attempts, j.created_at`,
 		memoryJobLease.Seconds()).Scan(&job)
 	if res.Error != nil {
 		return nil, res.Error
@@ -252,6 +269,38 @@ var memoryTopicPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,39}$`)
 // memoryKinds 是 items 的 kind 词表（固定写死；episode 由 episode 字段单独生成，不在词表里）。
 var memoryKinds = map[string]bool{"fact": true, "preference": true, "decision": true}
 
+// memoryModel 有租户时只用这个租户解开的密钥。没有租户模型口的单测仍走原来的 getModel。
+func (s *Store) memoryModel(ctx context.Context, job *claimedMemoryJob, getModel MemoryModelFunc) (model.BaseChatModel, error) {
+	if job != nil && job.TenantID != "" && s.tenantModels != nil {
+		return s.tenantChat(ctx, job.TenantID)
+	}
+	if getModel == nil {
+		return nil, errors.New("memory extractor: 抽取模型未装配")
+	}
+	return getModel(ctx)
+}
+
+func (s *Store) tenantChat(ctx context.Context, tenantID string) (model.BaseChatModel, error) {
+	if s.tenantModels == nil {
+		return nil, errors.New("tenant models not configured")
+	}
+	cfg, raw, err := s.RuntimeConfigRecord(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	secrets, err := unsealSecretMap(cfg.Secrets)
+	if err != nil {
+		return nil, err
+	}
+	ref := effectiveModelRef("", cfg.ModelRef, s.tenantModels.RootRef())
+	built, _, err := s.tenantModels.Resolve(ctx, tenantID, ref, raw, secrets)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("memory model tenant=%s ref=%s provider=%s keyfp=%s", tenantID, built.Ref, built.Provider, built.KeyFP)
+	return built.Chat, nil
+}
+
 // processMemoryJob 处理一条已 claim 的任务：读本 run 轨迹 + 已有笔记 → 调抽取模型 →
 // 机械校验 → items + done 同一笔事务（doc/29 §4.2–§4.5）。
 func (s *Store) processMemoryJob(ctx context.Context, job *claimedMemoryJob, getModel MemoryModelFunc, counter TokenCounter) (extractStats, error) {
@@ -277,12 +326,9 @@ func (s *Store) processMemoryJob(ctx context.Context, job *claimedMemoryJob, get
 	if err != nil {
 		return extractStats{}, err
 	}
-	if getModel == nil {
-		return extractStats{}, errors.New("memory extractor: 抽取模型未装配")
-	}
 	extractCtx, cancel := context.WithTimeout(ctx, memoryExtractTimeout)
 	defer cancel()
-	m, err := getModel(extractCtx)
+	m, err := s.memoryModel(extractCtx, job, getModel)
 	if err != nil {
 		return extractStats{}, fmt.Errorf("解析抽取模型: %w", err)
 	}
@@ -504,11 +550,11 @@ func (s *Store) writeMemoryJobResult(ctx context.Context, job *claimedMemoryJob,
 				return err
 			}
 			res := tx.Exec(
-				`INSERT INTO memory_items (id, tenant_id, workspace, kind, content, topic,
+				`INSERT INTO memory_items (id, tenant_id, user_id, workspace, kind, content, topic,
 				         source_session_id, source_run_id, source_seq, created_at)
-				 VALUES (?, ?, ?, 'episode', ?, ?, ?, ?, ?, now())
+				 VALUES (?, ?, ?, ?, 'episode', ?, ?, ?, ?, ?, now())
 				 ON CONFLICT (source_run_id) WHERE kind = 'episode' DO NOTHING`,
-				id, job.TenantID, job.Workspace, episode, "run:"+string(job.RunID),
+				id, job.TenantID, job.UserID, job.Workspace, episode, "run:"+string(job.RunID),
 				job.SessionID, job.RunID, sourceSeq)
 			if res.Error != nil {
 				return res.Error
@@ -521,11 +567,11 @@ func (s *Store) writeMemoryJobResult(ctx context.Context, job *claimedMemoryJob,
 				return err
 			}
 			res := tx.Exec(
-				`INSERT INTO memory_items (id, tenant_id, workspace, kind, content, topic,
+				`INSERT INTO memory_items (id, tenant_id, user_id, workspace, kind, content, topic,
 				         source_session_id, source_run_id, source_seq, created_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, now())
-				 ON CONFLICT (tenant_id, workspace, kind, content) WHERE kind <> 'episode' DO NOTHING`,
-				id, job.TenantID, job.Workspace, it.Kind, it.Content, it.Topic,
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
+				 ON CONFLICT (tenant_id, user_id, workspace, kind, content) WHERE kind <> 'episode' DO NOTHING`,
+				id, job.TenantID, job.UserID, job.Workspace, it.Kind, it.Content, it.Topic,
 				job.SessionID, job.RunID, sourceSeq)
 			if res.Error != nil {
 				return res.Error

@@ -7,6 +7,7 @@ package runengine
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -31,9 +32,9 @@ type bashIn struct {
 
 // capWriter 包住 buf：帽内照收、帽外丢弃并置 truncated——大输出不进内存也不逼死管道对端。
 type capWriter struct {
-	buf        bytes.Buffer
-	cap        int
-	truncated  bool
+	buf       bytes.Buffer
+	cap       int
+	truncated bool
 }
 
 func (w *capWriter) Write(p []byte) (int, error) {
@@ -71,38 +72,46 @@ func outputSections(stdout, stderr *capWriter) string {
 // 启动失败返回 Go error；被终止 =「bash 被终止，死前输出：<已收输出>＋原因」经 wrapToolErrors
 // 变「错误：…」结果文本——记录制（命令+最终输出落 runlog）在非正常死亡时不缺角，
 // 卡死的命令事后可查「死前做到哪」（Qoder 记录形态同款）。
-// 无自动超时：跑多久的裁定权在用户手里（手动停止随时掐，watchdog 判死也会掐），
-// 自动一刀会误杀本来就合法的长命令（构建、装依赖）。
+// 时长帽 30 秒，到点把已收到的输出交回工具结果，不把父 run 打成 error。
+// 工作目录来自 ctx 里的会话根；这只是默认目录，不是牢笼。有 sandbox-exec 时同一条命令再套一层配置。
 func newBashTool(workspace string) (tool.BaseTool, error) {
-	return utils.InferTool("bash", "在 workspace 根目录下执行一条 bash 命令并返回退出码与 stdout/stderr。输出超 32 KB 会被截断，大输出请先写进文件再读。",
+	return utils.InferTool("bash", "在 workspace 根目录下执行一条 bash 命令并返回退出码与 stdout/stderr。输出超 32 KB 会被截断，单次最长 30 秒，大输出请先写进文件再读。",
 		func(ctx context.Context, in bashIn) (string, error) {
-			cmd := exec.CommandContext(ctx, "bash", "-c", in.Command)
-			cmd.Dir = workspace
-			for _, k := range bashEnvWhitelist {
-				if v, ok := os.LookupEnv(k); ok {
-					cmd.Env = append(cmd.Env, k+"="+v)
-				}
-			}
-			stdout, stderr := &capWriter{cap: bashOutputCap}, &capWriter{cap: bashOutputCap}
-			cmd.Stdout, cmd.Stderr = stdout, stderr
-			// WaitDelay（活体验收 2026-10-15 抓到的真卡死）：kill 只杀直接子进程 bash——
-			// 多段命令（sleep 120; echo …）fork 出的孙进程活着并持有 stdout/stderr 管道写端，
-			// EOF 永不来，cmd.Run 卡死在 awaitGoroutines。WaitDelay 在进程退出后给管道一个
-			// 收口期限，到期强制关管道放行 Run——手动停止（ctx cancel）路径仍依赖这一收口。
-			cmd.WaitDelay = 3 * time.Second
-			err := cmd.Run()
-			if ctx.Err() != nil {
-				return "", fmt.Errorf("bash 被终止，死前输出：\n%s\n原因: %w", outputSections(stdout, stderr), ctx.Err())
-			}
-			code := 0
-			if err != nil {
-				ee, ok := err.(*exec.ExitError)
-				if !ok {
-					return "", fmt.Errorf("bash 启动失败: %w", err)
-				}
-				code = ee.ExitCode()
-			}
-			out := fmt.Sprintf("退出码：%d\n%s", code, outputSections(stdout, stderr))
-			return out, nil
+			// 没有 sandbox-exec 就拒绝。cwd 只是默认目录，不能当成隔离。
+			return runBash(ctx, activeRoot(ctx, workspace), in.Command, bashTimeout, true)
 		})
+}
+
+// runBash 执行一条命令。cwd 不是安全边界：requireSandbox 为真时没有 sandbox-exec 就拒绝执行。
+func runBash(ctx context.Context, workspace, command string, timeout time.Duration, requireSandbox bool) (string, error) {
+	cmd, cleanup, _, runCtx, err := startBash(ctx, workspace, command, timeout, requireSandbox)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+	for _, k := range bashEnvWhitelist {
+		if v, ok := os.LookupEnv(k); ok {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+	}
+	stdout, stderr := &capWriter{cap: bashOutputCap}, &capWriter{cap: bashOutputCap}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	cmd.WaitDelay = 3 * time.Second
+	err = cmd.Run()
+	// sandbox-exec 被时长帽杀掉时，Run 返回的是退出码 -1，不是 DeadlineExceeded。
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Sprintf("bash 超时，死前输出：\n%s", outputSections(stdout, stderr)), nil
+	}
+	if ctx.Err() != nil {
+		return "", fmt.Errorf("bash 被终止，死前输出：\n%s\n原因: %w", outputSections(stdout, stderr), ctx.Err())
+	}
+	code := 0
+	if err != nil {
+		ee, ok := err.(*exec.ExitError)
+		if !ok {
+			return "", fmt.Errorf("bash 启动失败: %w", err)
+		}
+		code = ee.ExitCode()
+	}
+	return fmt.Sprintf("退出码：%d\n%s", code, outputSections(stdout, stderr)), nil
 }

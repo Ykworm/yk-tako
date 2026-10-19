@@ -291,6 +291,7 @@ type delegationTool struct {
 	sem      chan struct{} // 池级并发闸：容量 = -subagent-concurrency，所有规格共享
 	capBytes int           // 回传上限（字节）；<=0 = 不裁剪
 	name     string        // 规格名（错误话术用）
+	store    *Store        // 租户子代理槽；nil 时只走进程内 sem（单测）
 }
 
 func (d *delegationTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
@@ -303,11 +304,26 @@ func (d *delegationTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
 // 同属「终稿出不来」一类——转成错误文本当这次委派的工具结果，父 run 保持 complete；
 // 其余错误（含手动停止的 ctx 取消）维持裸上抛。
 func (d *delegationTool) InvokableRun(ctx context.Context, args string, opts ...tool.Option) (string, error) {
-	select {
-	case d.sem <- struct{}{}:
-		defer func() { <-d.sem }()
-	case <-ctx.Done():
-		return "", ctx.Err()
+	// 有 Redis 时租户槽就是闸：进程级 sem 会让 A 占满本进程后，B 即使自己还有额度也在这里等。
+	// 没有 Redis（单测）才用进程级 sem。
+	useProcessSem := d.store == nil || d.store.rdb == nil
+	if d.store != nil {
+		ok, err := d.store.trySubagentSlot(ctx)
+		if err != nil {
+			return fmt.Sprintf("错误：子代理额度检查失败：%v", err), nil
+		}
+		if !ok {
+			return "错误：这个工作区的子代理额度用完了", nil
+		}
+		defer d.store.releaseSubagentSlot(context.WithoutCancel(ctx))
+	}
+	if useProcessSem {
+		select {
+		case d.sem <- struct{}{}:
+			defer func() { <-d.sem }()
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
 	}
 	inner, ok := d.inner.(tool.InvokableTool)
 	if !ok {
@@ -384,21 +400,27 @@ func truncateDelegationReturn(s string, capBytes int) string {
 // 装载面错误（坏规格 / 解析失败 / 装配失败）全部降级为 log 拒该条——run 本身照跑（最差 = 无委派工具）。
 // 唯一不降级的 = 笔记快照读库失败走 error：笔记层不可信不静默，与主代理 noteSnapshotHandler 同政策
 // （链上紧随其后、对同一次读的失败同判，所以持久故障下 run 必死、瞬时故障下最多差这一场装载）。
+func (h *agentSpecHandler) loadSpecs(ctx context.Context) ([]AgentSpec, error) {
+	if p, ok := principalFromCtx(ctx); ok && p.TenantID != "" && h.store != nil {
+		return h.store.EffectiveSubagentSpecs(ctx, p.TenantID, p.UserID)
+	}
+	return LoadAgentSpecs(h.dir)
+}
+
 func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelAgentContext) (context.Context, *adk.ChatModelAgentContext, error) {
-	specs, err := LoadAgentSpecs(h.dir)
+	specs, err := h.loadSpecs(ctx)
 	if err != nil {
-		log.Printf("agents: 扫盘 %s 失败: %v", h.dir, err)
+		log.Printf("agents: 装载规格失败: %v", err)
 		return ctx, runCtx, nil
 	}
 	// 笔记快照（M5，planning §5 子代理快照缝）：装载时点 = run 起手，此刻读一次未替代行、渲染
 	// 快照段，全部规格共用同一份（run 内冻结语义与主代理相同——工具写库不回写，下一场才可见）。
 	snap := ""
 	if len(specs) > 0 {
-		entries, err := h.store.listLiveNotes(ctx, h.workspace)
+		snap, err = renderRunNotes(ctx, h.store, h.workspace)
 		if err != nil {
 			return ctx, runCtx, fmt.Errorf("agents: 笔记快照读库失败: %w", err)
 		}
-		snap = renderNotesSnapshot(entries)
 	}
 	table := agentModelTableFrom(ctx) // 本 run 的身份表（worker.Run 建并塞 ctx）；写帧/drain 读它，见 worker.go
 	base := runCtx.Tools              // 入口快照：继承档取它（此刻无任何委派工具 = 禁嵌套）
@@ -413,8 +435,18 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 		// = 继承主实例，不进注册表；写法三 = ref 档 → ModelResolver 解析，失败拒该条、其余照载。
 		subModel := h.model
 		entry := agentModelEntry{ref: h.modelRef, translate: h.translate}
+		resolver := h.resolver
+		if prof := profileFrom(ctx); prof != nil {
+			if prof.Model != nil {
+				subModel = prof.Model
+				entry = agentModelEntry{ref: prof.ModelRef, translate: prof.Translator}
+			}
+			if prof.Resolver != nil {
+				resolver = prof.Resolver
+			}
+		}
 		if ref := strings.TrimSpace(spec.Model); ref != "" && !isInheritRef(ref) {
-			inst, err := h.resolver.Get(ctx, ref)
+			inst, err := resolver.Get(ctx, ref)
 			if err != nil {
 				log.Printf("agents: %s: 拒载: model %q: %v", spec.Name, ref, err)
 				continue
@@ -460,7 +492,7 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 		log.Printf("agent system %s:\n%s", spec.Name, instruction)
 		// 委派工具出池前过预算包壳（T3-3）：并发闸 + 回传裁剪；Info/调用面透传，声明字节不变。
 		runCtx.Tools = append(runCtx.Tools, &delegationTool{
-			inner: adk.NewAgentTool(ctx, sub), sem: h.sem, capBytes: h.returnCap, name: spec.Name,
+			inner: adk.NewAgentTool(ctx, sub), sem: h.sem, capBytes: h.returnCap, name: spec.Name, store: h.store,
 		})
 		table.set(spec.Name, entry)
 		loaded = append(loaded, spec.Name)

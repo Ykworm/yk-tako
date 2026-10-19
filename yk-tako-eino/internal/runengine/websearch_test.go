@@ -75,7 +75,7 @@ func countingServer(t *testing.T, hits *atomic.Int64, body string) *httptest.Ser
 // 与请求形状用）。
 func captureServer(t *testing.T, hits *atomic.Int64, body string, auth *string, reqBody *string) *httptest.Server {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request, ) {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		if auth != nil {
 			*auth = r.Header.Get("Authorization")
@@ -146,9 +146,9 @@ func TestWebSearchStrictLookup(t *testing.T) {
 
 // searchfree 行（非 deepseek 厂商）：始终落盘 + 描述段形状。文件里标题截 200、url 去重、
 // 无 url 项丢掉、摘要空写无摘要、searchfree 的 500 字帽生效；描述段 token 数 = 文件字数
-//（runeCounter 口径自洽）。
+// （runeCounter 口径自洽）。
 func TestWebSearchSearchfreeSpillsFile(t *testing.T) {
-	long := strings.Repeat("标", 250)  // 250 字，超 200 截
+	long := strings.Repeat("标", 250) // 250 字，超 200 截
 	huge := strings.Repeat("摘", 500) // 500 字 = searchfree parse 帽，文件里应全文在场
 	results := map[string]any{"results": []map[string]any{
 		{"title": long, "url": "https://a.example/1", "snippet": "s1"},

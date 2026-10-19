@@ -502,7 +502,7 @@ func foldInput(ctx context.Context, system string, history []ModelMessage, curre
 		t.total = countInput(counter, system, assembled)
 		if t.total >= limit {
 			t.assembled = assembled // B4：未收敛也留本档候选——trim 兜底（循环出口处）的原料
-			return t, nil // 未收敛：调用方按阶段推进下一档
+			return t, nil           // 未收敛：调用方按阶段推进下一档
 		}
 		if err := converge(&t, drop, assembled, summary); err != nil {
 			return t, err
@@ -910,7 +910,7 @@ func (s *summarizer) attempt(ctx context.Context, input string, attempt int) (st
 	// 验货拒收 → 重试耗尽 → 每次折叠都走 A——prompt 软目标必须与硬帽同源。
 	// 换算系数 4/5 字/tok：来源 C2 实测中文摘要 ≈1.18 tok/字，保守取 0.8（dev 校准）。
 	budgetRunes := s.maxTokens * 4 / 5
-	stream, err := s.chat.Stream(ctx, []*schema.Message{
+	stream, err := chatFrom(ctx, s.chat).Stream(ctx, []*schema.Message{
 		schema.SystemMessage(fmt.Sprintf(compactPrompt, budgetRunes)),
 		schema.UserMessage(input),
 	}, model.WithTemperature(s.temp), model.WithMaxTokens(s.maxTokens))

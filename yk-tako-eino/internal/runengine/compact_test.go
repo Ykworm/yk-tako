@@ -744,11 +744,11 @@ func TestFoldInputPhase2CapExhausted(t *testing.T) {
 // 预算 clamp 两端：window/5 落 [8192, 32768]；0（盲降未知窗）取下界。
 func TestToolTrimBudgetClamp(t *testing.T) {
 	cases := []struct{ window, want int }{
-		{0, trimBudgetMin},        // 盲降：窗未知取下界，裁得深是安全方向
-		{20000, trimBudgetMin},    // 4000 → 下界
-		{40960, trimBudgetMin},    // 8192 = 下界（临界）
-		{163840, trimBudgetMax},   // 32768 = 上界（临界）
-		{1048576, trimBudgetMax},  // 209715 → 上界
+		{0, trimBudgetMin},       // 盲降：窗未知取下界，裁得深是安全方向
+		{20000, trimBudgetMin},   // 4000 → 下界
+		{40960, trimBudgetMin},   // 8192 = 下界（临界）
+		{163840, trimBudgetMax},  // 32768 = 上界（临界）
+		{1048576, trimBudgetMax}, // 209715 → 上界
 	}
 	for _, c := range cases {
 		if got := toolTrimBudget(c.window); got != c.want {

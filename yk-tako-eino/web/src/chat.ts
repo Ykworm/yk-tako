@@ -354,7 +354,15 @@ export function useChat() {
 
   // 一条 log 行 → 气泡，并记账「最老已渲染 offset」（loadOlder 的翻页基准）。
   // 占位行在这里解析成媒体引用、从正文剥掉（doc/32 A5）。
-  function rowBubble(r: Row): Bubble {
+  // runlog 同时是工具执行账本（tool_call / tool_result），气泡只收对话两角色——
+  // 账本行留在库里和模型输入里，不上对话页面。
+  type ChatRow = Row & { role: 'user' | 'assistant' }
+
+  function isChatRow(r: Row): r is ChatRow {
+    return r.role === 'user' || r.role === 'assistant'
+  }
+
+  function rowBubble(r: ChatRow): Bubble {
     noteRendered(r)
     const { media, display } = parseMedia(r.text)
     return {
@@ -389,6 +397,7 @@ export function useChat() {
   // （收口检测与拉 log 之间别人的投递，竞态窗口）紧跟本轮气泡之后、排队气泡之前。
   function renderForeign(rows: Row[], assistant: Bubble, ownUserOffset: number) {
     for (const r of rows) {
+      if (!isChatRow(r)) continue
       const idx = bubbles.value.indexOf(assistant)
       if (idx < 0) return // 列表已被 newSession 清空，整批作废
       const before = ownUserOffset > 0 && (r.runlogOffset ?? 0) < ownUserOffset
@@ -397,23 +406,35 @@ export function useChat() {
   }
 
   function appendRows(rows: Row[]) {
-    for (const r of rows) push(rowBubble(r))
+    for (const r of rows) if (isChatRow(r)) push(rowBubble(r))
   }
 
   // 翻页：临时游标只用于这一次请求，拉完 prepend，**不回退对齐游标**（19v6-02「两种游标别混」）。
   // 批被 W 截断时按 nextOffset 续拉补齐（19v6-01 §3：「客户端从它继续拉即补齐」）。
+  // 窗口里可能整块都是工具账本行（气泡不画它们）；这一页没捞到任何对话行时，
+  // 把窗口继续往更早移，直到捞到一页或到达会话开头——否则「上滚」会卡在工具块前面。
   async function loadOlder() {
     const sid = sessionId.value
     if (!sid || loadingOlder.value || atStart.value) return
     loadingOlder.value = true
     try {
-      let from = Math.max(0, oldestOffset - 1 - PAGE)
-      const collected: Row[] = []
+      let upper = oldestOffset
+      let floor = Math.max(0, upper - 1 - PAGE)
+      const collected: ChatRow[] = []
       for (;;) {
-        const resp = await getLog(sid, from)
-        collected.push(...resp.rows.filter((r) => (r.runlogOffset ?? 0) < oldestOffset))
-        if (resp.nextOffset >= oldestOffset || resp.nextOffset === from) break
-        from = resp.nextOffset
+        const windowRows: ChatRow[] = []
+        for (let from = floor; ; ) {
+          const resp = await getLog(sid, from)
+          windowRows.push(...resp.rows.filter((r): r is ChatRow => isChatRow(r) && (r.runlogOffset ?? 0) < upper))
+          const advanced = resp.nextOffset > from
+          from = resp.nextOffset
+          if (!advanced || from >= upper) break
+        }
+        // 窗口是从新到旧依次处理的：更早的一窗要放在已收集的前面。
+        collected.unshift(...windowRows)
+        if (collected.length || floor === 0) break
+        upper = floor
+        floor = Math.max(0, upper - 1 - PAGE)
       }
       if (collected.length) {
         bubbles.value.unshift(

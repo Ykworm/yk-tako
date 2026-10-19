@@ -15,6 +15,10 @@ func newStreamRouter(t *testing.T, s *Store) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	srv := &Server{store: s, w: 200}
 	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("tako.principal", testOwner)
+		c.Next()
+	})
 	r.GET("/api/runs/:runId/stream", srv.getRunStream)
 	return r
 }

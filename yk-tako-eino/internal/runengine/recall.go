@@ -143,20 +143,22 @@ func (s *Store) recallMemoryItems(ctx context.Context, terms []string) ([]memory
 		or[i] = `content ILIKE ? ESCAPE '\'`
 	}
 	hits.WriteString(")")
+	tenantID, workspace, userSQL, userArg := memoryRecallFilter(ctx, s.memoryCfg)
 	query := `SELECT id, kind, topic, content, created_at, ` + hits.String() + ` AS hits
   FROM memory_items
- WHERE tenant_id = ? AND workspace = ?
+ WHERE tenant_id = ? AND workspace = ?` + userSQL + `
    AND kind IN ('fact', 'preference', 'decision')
    AND (` + strings.Join(or, " OR ") + `)
  ORDER BY hits DESC,
           CASE kind WHEN 'preference' THEN 0 WHEN 'fact' THEN 1 ELSE 2 END,
           created_at DESC, id DESC
  LIMIT ?`
-	args := make([]any, 0, len(terms)*2+3)
+	args := make([]any, 0, len(terms)*2+4)
 	for _, p := range patterns {
 		args = append(args, p)
 	}
-	args = append(args, s.memoryCfg.TenantID, s.memoryCfg.Workspace)
+	args = append(args, tenantID, workspace)
+	args = append(args, userArg...)
 	for _, p := range patterns {
 		args = append(args, p)
 	}
@@ -184,6 +186,21 @@ func (s *Store) recallMemoryItems(ctx context.Context, terms []string) ([]memory
 		}
 	}
 	return out, nil
+}
+
+// memoryRecallFilter 决定召回的租户和人。没有身份时沿用启动配置（单测的 default 分区）。
+// 有身份时按这个人过滤；管理员 scope=tenant 只按租户，能看到本工作区全员。
+func memoryRecallFilter(ctx context.Context, cfg MemoryConfig) (tenantID, workspace, userSQL string, userArg []any) {
+	tenantID, workspace = cfg.TenantID, cfg.Workspace
+	sc := scopeFrom(ctx)
+	if !scopeActive(sc) {
+		return tenantID, workspace, "", nil
+	}
+	tenantID = sc.TenantID
+	if sc.Scope == "tenant" {
+		return tenantID, workspace, "", nil
+	}
+	return tenantID, workspace, " AND user_id = ?", []any{sc.UserID}
 }
 
 // escapeLike 转义 ILIKE 的通配符：词表允许 `_`（read_media_file），不转义会变成单字符通配。

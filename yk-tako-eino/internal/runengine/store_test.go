@@ -177,9 +177,12 @@ func waitCond(t *testing.T, desc string, timeout time.Duration, cond func() bool
 	}
 }
 
+// testOwner 是存储层单测的会话主人。AcquireRun 现在把 tenant/user 写进 sessions。
+var testOwner = principal{UserID: "u_test", TenantID: "t_test", Role: "owner"}
+
 func (s *Store) mustAcquire(t *testing.T, sid SessionID, rid RunID, msgID, text string) {
 	t.Helper()
-	ok, err := s.AcquireRun(context.Background(), sid, rid, Row{RunID: rid, Role: "user", MessageID: msgID, Text: text})
+	ok, err := s.AcquireRun(context.Background(), sid, rid, Row{RunID: rid, Role: "user", MessageID: msgID, Text: text}, testOwner)
 	if err != nil {
 		t.Fatalf("AcquireRun(%s, %s): %v", sid, rid, err)
 	}
@@ -205,7 +208,7 @@ func TestAcquireRunGateBlocksSecondRun(t *testing.T) {
 	sid, r1, r2 := SessionID("s_1"), RunID("r_1"), RunID("r_2")
 
 	s.mustAcquire(t, sid, r1, "m_1", "hi")
-	ok, err := s.AcquireRun(ctx, sid, r2, Row{RunID: r2, Role: "user", MessageID: "m_2", Text: "second"})
+	ok, err := s.AcquireRun(ctx, sid, r2, Row{RunID: r2, Role: "user", MessageID: "m_2", Text: "second"}, testOwner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +236,7 @@ func TestAcquireRunGateBlocksSecondRun(t *testing.T) {
 	s.mustGone(t, ctx, keyRunlive(r2))
 	s.mustGone(t, ctx, keyDraft(r2))
 	// 闸落点 = runs 活行。
-	live, _, _, _, _, err := s.SessionStatus(ctx, sid)
+	live, _, _, _, _, err := s.SessionStatus(ctx, sid, testOwner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -572,7 +575,7 @@ func TestResetClearsBothHalvesOnlyOwnPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, _, _, exists, err := s.SessionStatus(ctx, sid); err != nil || exists {
+	if _, _, _, _, exists, err := s.SessionStatus(ctx, sid, testOwner); err != nil || exists {
 		t.Errorf("reset 后 session 应不存在: exists=%v err=%v", exists, err)
 	}
 }
@@ -631,7 +634,7 @@ func TestGateLeaseLifecycle(t *testing.T) {
 	waitCond(t, "lease 过期（读侧判死）", 8*time.Second, func() bool {
 		return s.sqlBool(t, `SELECT lease_until < now() FROM runs WHERE id = ?`, rid)
 	})
-	live, runlogOffset, _, _, exists, err := s.SessionStatus(ctx, sid)
+	live, runlogOffset, _, _, exists, err := s.SessionStatus(ctx, sid, testOwner)
 	if err != nil || !exists {
 		t.Fatalf("SessionStatus: exists=%v err=%v", exists, err)
 	}
@@ -647,7 +650,7 @@ func TestGateLeaseLifecycle(t *testing.T) {
 
 	// 再抢闸：不是 409——清扫把死行翻 error，唯一索引放行。
 	r2 := RunID("r_2")
-	ok, err := s.AcquireRun(ctx, sid, r2, Row{RunID: r2, Role: "user", MessageID: "m_2", Text: "again"})
+	ok, err := s.AcquireRun(ctx, sid, r2, Row{RunID: r2, Role: "user", MessageID: "m_2", Text: "again"}, testOwner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -657,7 +660,7 @@ func TestGateLeaseLifecycle(t *testing.T) {
 	if !s.sqlBool(t, `SELECT (status = 'error' AND finished_at IS NOT NULL AND lease_until IS NULL) FROM runs WHERE id = ?`, rid) {
 		t.Error("死行应被清扫成 error（finished_at 非空、lease_until 清空）")
 	}
-	if live, _, _, _, _, err := s.SessionStatus(ctx, sid); err != nil || live != r2 {
+	if live, _, _, _, _, err := s.SessionStatus(ctx, sid, testOwner); err != nil || live != r2 {
 		t.Errorf("重抢后 liveRunId = %q, want %q (err=%v)", live, r2, err)
 	}
 }
@@ -721,7 +724,7 @@ func TestGateLeaseBirthWindowExpiresWithoutRenew(t *testing.T) {
 
 	// 闸随租约自开：同 session 再抢成功。
 	r2 := RunID("r_2")
-	ok, err := s.AcquireRun(ctx, sid, r2, Row{RunID: r2, Role: "user", MessageID: "m_2", Text: "again"})
+	ok, err := s.AcquireRun(ctx, sid, r2, Row{RunID: r2, Role: "user", MessageID: "m_2", Text: "again"}, testOwner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -751,7 +754,7 @@ func TestRenewLeaseRefusesExpiredGate(t *testing.T) {
 	if ok {
 		t.Fatal("lease 已过，续约应拒（过期不可复活）")
 	}
-	if live, _, _, _, _, err := s.SessionStatus(ctx, sid); err != nil || live != "" {
+	if live, _, _, _, _, err := s.SessionStatus(ctx, sid, testOwner); err != nil || live != "" {
 		t.Errorf("过期后 liveRunId = %q, want \"\" (err=%v)", live, err)
 	}
 }
@@ -766,7 +769,7 @@ func TestAcquireRunRollsBackWhenRedisFails(t *testing.T) {
 	bad := &Store{db: s.db, rdb: deadRdb, ttl: s.ttl, leaseTTL: s.leaseTTL}
 
 	sid, rid := SessionID("s_1"), RunID("r_1")
-	ok, err := bad.AcquireRun(ctx, sid, rid, Row{RunID: rid, Role: "user", MessageID: "m_1", Text: "hi"})
+	ok, err := bad.AcquireRun(ctx, sid, rid, Row{RunID: rid, Role: "user", MessageID: "m_1", Text: "hi"}, testOwner)
 	if err == nil {
 		t.Fatal("Redis 半不可达时 AcquireRun 应报错（调用方回 500）")
 	}
@@ -1455,7 +1458,7 @@ func TestRunStatusDerivation(t *testing.T) {
 	if st.SessionID != sid || st.Status != "running" || st.ResumeCount != 0 || st.Resumable {
 		t.Fatalf("running 派生 = %+v, want status=running count=0 resumable=false", st)
 	}
-	live, _, lastStatus, lastRunID, exists, err := s.SessionStatus(ctx, sid)
+	live, _, lastStatus, lastRunID, exists, err := s.SessionStatus(ctx, sid, testOwner)
 	if err != nil || !exists || live != rid || lastStatus != "running" || lastRunID != rid {
 		t.Fatalf("session(running) = live:%q status:%q last:%q exists:%v err:%v", live, lastStatus, lastRunID, exists, err)
 	}
@@ -1466,7 +1469,7 @@ func TestRunStatusDerivation(t *testing.T) {
 	if st.Status != "interrupted" || st.ResumeCount != 0 || !st.Resumable {
 		t.Fatalf("interrupted 派生 = %+v, want status=interrupted count=0 resumable=true", st)
 	}
-	live, _, lastStatus, lastRunID, _, _ = s.SessionStatus(ctx, sid)
+	live, _, lastStatus, lastRunID, _, _ = s.SessionStatus(ctx, sid, testOwner)
 	if live != "" || lastStatus != "interrupted" || lastRunID != rid {
 		t.Fatalf("session(interrupted) = live:%q status:%q last:%q, want \"\"/interrupted/%q", live, lastStatus, lastRunID, rid)
 	}
@@ -1487,7 +1490,7 @@ func TestRunStatusDerivation(t *testing.T) {
 		if st = statusOf(); st.Status != status || st.Resumable {
 			t.Fatalf("终态 %s 派生 = %+v, want status=%s resumable=false", status, st, status)
 		}
-		_, _, lastStatus, _, _, _ = s.SessionStatus(ctx, sid)
+		_, _, lastStatus, _, _, _ = s.SessionStatus(ctx, sid, testOwner)
 		if lastStatus != status {
 			t.Fatalf("session lastRunStatus = %q, want %q", lastStatus, status)
 		}

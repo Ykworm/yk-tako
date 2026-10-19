@@ -19,3 +19,5 @@ model-windows.json
 tmp/
 # 运行时数据（-workspace 根：hist / notes / .tako 落盘，进程写、可重建）
 yk-tako-eino/workspace/
+# MCP 本地配置：仓库只提交 mcp.example.json，真配置按机器各自复制；验收删改不弄脏工作区
+yk-tako-eino/mcp.json

@@ -1,8 +1,9 @@
 // 本文件：overflow guard 的单测——B1 观测（既有几条原样回归）+ B2 救援链 + B3 交接（槽/staged）。
 // 裸 model 替身直调 guardModel——不打引擎、不碰库，钉住行为面：
-//   判据四条件（零帧不救 / window=0 不救 / 闸花不救 / 全真才救）；折败上抛原始错误（闸已花）；
-//   重调再拒上抛第二次错误；happy path 的重调输入形状（system 原样 + 折后行、无思考残留）、
-//   rescue 行格式与交接槽形状（折后行 + 救援点行数）；base 换代不在 guard（归采用点 1）。Generate 直通。
+//
+//	判据四条件（零帧不救 / window=0 不救 / 闸花不救 / 全真才救）；折败上抛原始错误（闸已花）；
+//	重调再拒上抛第二次错误；happy path 的重调输入形状（system 原样 + 折后行、无思考残留）、
+//	rescue 行格式与交接槽形状（折后行 + 救援点行数）；base 换代不在 guard（归采用点 1）。Generate 直通。
 package runengine
 
 import (
@@ -28,9 +29,9 @@ type stubChatModel struct {
 	genMsg     *schema.Message
 	genErr     error
 	chunks     []*schema.Message
-	streamErr  error                    // 缺省错误：每个调用都用它（既有单调用测试的形态）
-	errs       []error                  // 按调用序覆盖（nil 项 = 该次成功）
-	inputs     [][]*schema.Message      // 每次调用的输入转录
+	streamErr  error                                 // 缺省错误：每个调用都用它（既有单调用测试的形态）
+	errs       []error                               // 按调用序覆盖（nil 项 = 该次成功）
+	inputs     [][]*schema.Message                   // 每次调用的输入转录
 	lastStream *schema.StreamReader[*schema.Message] // 最近一次返回的流（原流传递断言的同一性靶）
 }
 
@@ -116,7 +117,7 @@ func drainStream(t *testing.T, sr *schema.StreamReader[*schema.Message]) []strin
 	}
 }
 
-// ---- B2 救援 happy path：四条件全真 = 折被拒输入 + 重调一次 ---- 
+// ---- B2 救援 happy path：四条件全真 = 折被拒输入 + 重调一次 ----
 
 // 料：sys + r1/r2 两个老 run（各一条 500 字符 user 行）+ 当前 run 的 user/工具往返。
 // 折叠走位（fakeCounter=字节数）：limit' = C_rej×4/5 ≈ 870 → phase1 n=1 档（drop r1、keep r2）

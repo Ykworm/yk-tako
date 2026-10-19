@@ -63,6 +63,14 @@ v6 今天的对话是纯文本的：用户发不了图（`postRunsRequest` 只�
 
 - `path` 相对 workspace 根——就是 `read_media_file` 现有入参的形状（`filetools.go:546`），
   同一根、同一牢笼，模型拿占位就能直接调，不需要新的放行规则。
+- 2026-10-19 多租户修正：登录后的入口图不再写全局 `workspace/.media/`。字节落在
+  `<workspace>/tenants/<tid>/sessions/<sid>/.media/<sha 前 16 位>.<扩展名>`。
+  占位 path、`GET /api/media` 和 `read_media_file` 共用
+  `sessions/<sid>/.media/<sha>.ext`。`read_media_file` 只在路径以本会话的
+  `sessions/<sid>/` 开头时剥掉这段前缀，再在会话目录里解析。
+  `sessions/<可见>/../<别人>/...` 先 Clean，再按清完的会话做访问检查；
+  不带会话的 `.media/...` 在有登录身份时直接 404。上面那行 `.media/...` 的例子
+  仍是没带身份时的形状，单测还用它。
 - `mime`/`size`/`sha` 三个字段让模型**不读文件也能判断值不值得重看**（一张 30KB 的示意图
   和一张 4MB 的大图，重看的代价不同）。
 - `sha` 是内容寻址：同一张图在对话里出现多少次，盘上只有一份、占位里的 path 也相同。
@@ -176,8 +184,9 @@ POST /api/runs 请求体加图：`images` 数组（每项 `{mime, dataBase64}`�
    标志丢失则重新还原（保守回退：多发字节，不漏看）。**机制随 A3/translator 升级一并落地**，
    本 loop 不实现——还原动作本身依赖多模态管道，记账没有可闸的对象；本 loop 只保证占位行
    格式稳定、行上坐标（RunID/seq）现成够用。
-4. **前端取文件端点** ✅：`GET /api/media?path=…`——相对 workspace 根、
-   `resolveInWorkspace` 牢笼校验后回流文件；workspace 是全局单根，不做按会话的假分组。
+4. **前端取文件端点** ✅：`GET /api/media?path=…`。2026-10-18 当时按全局 workspace 根回流。
+   2026-10-19 起，带登录身份的 path 是 `sessions/<sid>/.media/...`，字节在该会话目录里；
+   越出授权会话的路径回旧体 404 `{"error":"not_found"}`。
 5. **清理契约**（维持原推荐）：`.media/` 随 workspace 生命周期走，先不做回收，到点看占用再裁。
 6. **音频/视频/PDF**（维持原推荐）：占位格式同一条、白名单含它们，活体只验图片。
 

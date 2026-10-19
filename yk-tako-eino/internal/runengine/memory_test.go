@@ -46,8 +46,8 @@ func TestMemoryOutboxOnCompleteOnly(t *testing.T) {
 	if job.Status != "pending" || job.Attempts != 0 || job.LastError != "" {
 		t.Fatalf("complete 后 job = %+v, want pending/attempts=0", job)
 	}
-	if job.Workspace != "/tmp/ws-test" || job.TenantID != "default" {
-		t.Fatalf("job scope = %s/%s, want default//tmp/ws-test", job.TenantID, job.Workspace)
+	if job.Workspace != "/tmp/ws-test" || job.TenantID != testOwner.TenantID || job.UserID != testOwner.UserID {
+		t.Fatalf("job scope = %s/%s/%s, want %s/%s//tmp/ws-test", job.TenantID, job.UserID, job.Workspace, testOwner.TenantID, testOwner.UserID)
 	}
 
 	// error 结局不登记（没有可信结果，EndRun 本就不写完整轨迹）。

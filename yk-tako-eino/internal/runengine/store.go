@@ -53,6 +53,14 @@ type Store struct {
 	// memoryCfg 是长期记忆两线的运行配置（doc/29 §8）：启动装配期由 ConfigureMemory 写入一次，
 	// 之后只读。EndRun 用它决定是否登记抽取 job；Worker/Server 用它决定召回与预览的开关。
 	memoryCfg MemoryConfig
+	// tenantModels 是记忆抽取用的租户模型口。空的时候抽取仍走启动时的 getModel。
+	tenantModels *TenantModels
+}
+
+func (s *Store) SetTenantModels(m *TenantModels) {
+	if s != nil {
+		s.tenantModels = m
+	}
 }
 
 // OpenStore 建起两半并各自探活（main 的 fail fast：任一半不可达 = 引擎起不来，
@@ -117,7 +125,7 @@ func openRedis(addr string) (*redis.Client, error) {
 // 唯一冲突 = 会话忙（one_live_run_per_session 部分唯一索引），整笔回滚零痕迹 → (false, nil) = 409；
 // Redis 败 → ROLLBACK → error = 500，与 409 同形「什么都没写」。
 // 抢闸 = INSERT runs 本身；出生即带 lease_until（A7-2 的 DB 形态：不存在「先建后补租约」的两步窗口）。
-func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID, user Row) (bool, error) {
+func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID, user Row, p principal) (bool, error) {
 	startJSON, err := json.Marshal(Frame{Kind: "start", MessageID: user.MessageID})
 	if err != nil {
 		return false, err
@@ -131,11 +139,29 @@ func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID
 		return false, err
 	}
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// 懒建会话：存在即已登记；title 只在真建那一刻写（重复投递不重写，§8.6 待定项③的裁）。
-		if err := tx.Exec(
-			`INSERT INTO sessions (id, title, created_at) VALUES (?, ?, now()) ON CONFLICT (id) DO NOTHING`,
-			sessionID, truncateTitle(user.Text)).Error; err != nil {
+		// 归属在同一笔事务里判（doc/28 A1）：新会话写入调用者的 tenant/user/private；
+		// 已有会话先锁行。不归属整笔回滚，调用方看到的是 404/403，库里没有新 run。
+		var existing []Session
+		if err := tx.Raw(
+			`SELECT id, tenant_id, user_id, visibility FROM sessions WHERE id = ? FOR UPDATE`,
+			sessionID).Scan(&existing).Error; err != nil {
 			return err
+		}
+		if len(existing) == 0 {
+			if err := tx.Exec(
+				`INSERT INTO sessions (id, title, tenant_id, user_id, visibility, created_at)
+				 VALUES (?, ?, ?, ?, 'private', now())`,
+				sessionID, truncateTitle(user.Text), p.TenantID, p.UserID).Error; err != nil {
+				return err
+			}
+		} else {
+			switch decideAccess(existing[0], p) {
+			case accessOwner:
+			case accessRead:
+				return ErrSessionForbidden
+			default:
+				return ErrSessionNotFound
+			}
 		}
 		// 清扫死行（§8.3）：上一任进程死掉的活行按 lease 判死翻 error，唯一索引随之放行本 run。
 		// error 形状 = mh 只留 user 半、runlog 无 assistant 行（与 run 内出错的形状同一）。
@@ -520,17 +546,43 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, ep
 			// 没有可信结果，EndRun 本就不写完整轨迹）。登记失败 = 整笔回滚——与「同事务」同义，
 			// 不是新增的异步失败面。
 			if s.memoryCfg.Extract && s.memoryCfg.Workspace != "" {
+				var owner struct {
+					TenantID string
+					UserID   string
+				}
+				if err := tx.Raw(`SELECT tenant_id, user_id FROM sessions WHERE id = ?`, sessionID).Scan(&owner).Error; err != nil {
+					return err
+				}
+				tid := owner.TenantID
+				if tid == "" {
+					tid = s.memoryCfg.TenantID
+				}
 				jobID, err := newRowID("mj_")
 				if err != nil {
 					return err
 				}
 				if err := tx.Exec(
-					`INSERT INTO memory_jobs (id, run_id, session_id, tenant_id, workspace, status, attempts,
+					`INSERT INTO memory_jobs (id, run_id, session_id, tenant_id, user_id, workspace, status, attempts,
 					         next_attempt_at, last_error, created_at, updated_at)
-					 VALUES (?, ?, ?, ?, ?, 'pending', 0, now(), '', now(), now())
+					 VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, now(), '', now(), now())
 					 ON CONFLICT (run_id) DO NOTHING`,
-					jobID, runID, sessionID, s.memoryCfg.TenantID, s.memoryCfg.Workspace).Error; err != nil {
+					jobID, runID, sessionID, tid, owner.UserID, s.memoryCfg.Workspace).Error; err != nil {
 					return err
+				}
+			}
+			if rootUsage != nil && rootUsage.TotalTokens > 0 {
+				var tid string
+				if err := tx.Raw(`SELECT tenant_id FROM sessions WHERE id = ?`, sessionID).Scan(&tid).Error; err != nil {
+					return err
+				}
+				if tid != "" {
+					day := time.Now().UTC().Format("2006-01-02")
+					if err := tx.Exec(`
+INSERT INTO tenant_usage_daily (tenant_id, day, tokens) VALUES (?, ?, ?)
+ON CONFLICT (tenant_id, day) DO UPDATE SET tokens = tenant_usage_daily.tokens + EXCLUDED.tokens`,
+						tid, day, rootUsage.TotalTokens).Error; err != nil {
+						return err
+					}
 				}
 			}
 		} else {
@@ -708,7 +760,7 @@ func (s *Store) AbandonClaim(ctx context.Context, runID RunID, epoch int64) erro
 // `notes` 是笔记层（M1）的库内状态，同属「引擎自己的东西」，全局归零一并清。
 func (s *Store) Reset(ctx context.Context) (deleted int, err error) {
 	if err := s.db.WithContext(ctx).Exec(
-		`TRUNCATE TABLE sessions, runs, run_model_messages, runlog_entries, notes, run_journal`).Error; err != nil {
+		`TRUNCATE TABLE tenant_invitations, tenant_agents, tenant_settings, tenant_usage_daily, audit_log, refresh_tokens, tenant_members, tenants, users, sessions, runs, run_model_messages, runlog_entries, notes, run_journal`).Error; err != nil {
 		return 0, err
 	}
 	var cursor uint64

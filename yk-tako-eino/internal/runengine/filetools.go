@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -37,7 +38,68 @@ func resolveInWorkspace(root, path string) (string, error) {
 	if full != root && !strings.HasPrefix(full, root+string(filepath.Separator)) {
 		return "", fmt.Errorf("路径越出 workspace（%s）", path)
 	}
+	if err := rejectSymlinkEscape(root, full); err != nil {
+		return "", fmt.Errorf("路径越出 workspace（%s）", path)
+	}
 	return full, nil
+}
+
+// rejectSymlinkEscape 跟着符号链接看最终落点。父目录还不存在时允许创建。
+// 比较前两边都解析符号链接：macOS 上 /var 指向 /private/var，不解析会把合法临时目录误判成越界。
+func rejectSymlinkEscape(root, full string) error {
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		realRoot = root
+	}
+	target := full
+	if _, err := os.Lstat(full); err != nil {
+		target = filepath.Dir(full)
+	}
+	real, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return nil
+	}
+	if target != full {
+		rest, _ := filepath.Rel(target, full)
+		if rest != "." {
+			real = filepath.Join(real, rest)
+		}
+	}
+	if real == realRoot || strings.HasPrefix(real, realRoot+string(filepath.Separator)) {
+		return nil
+	}
+	return fmt.Errorf("symlink")
+}
+
+// reserveStorage 在租户设了存储上限时先占住这次要写的字节。上限 0 表示不限制。
+// 调用方必须在写入结束（成功或失败）后调用 release，否则预留会一直算在额度里。
+func reserveStorage(ctx context.Context, adding int) (func(), error) {
+	noop := func() {}
+	ref, ok := workspaceFrom(ctx)
+	if !ok || ref.MaxBytes <= 0 || adding <= 0 {
+		return noop, nil
+	}
+	if ref.Reserve != nil {
+		release, err := ref.Reserve(adding)
+		if errors.Is(err, errStorageQuota) {
+			return nil, fmt.Errorf("这个工作区的存储额度用完了")
+		}
+		if err != nil {
+			return nil, err
+		}
+		if release == nil {
+			return noop, nil
+		}
+		return release, nil
+	}
+	root := ref.Root
+	if ref.TenantRoot != "" {
+		root = ref.TenantRoot
+	}
+	if directoryBytes(root)+int64(adding) > ref.MaxBytes {
+		return nil, fmt.Errorf("这个工作区的存储额度用完了")
+	}
+	return noop, nil
 }
 
 // writeFileInput 是 write_file 的入参 schema（InferTool 反射生成）；两字段都必填
@@ -54,13 +116,18 @@ func newWriteFileTool(root string) (tool.BaseTool, error) {
 	return utils.InferTool("write_file",
 		"在 workspace 内创建或覆盖写入一个文件（整文件覆盖）。path 是相对 workspace 根的路径（如 notes/todo.txt）；"+
 			"父目录不存在会自动创建；文件已存在则覆盖、返回文本会标注「（覆盖）」。返回格式：已写入 <path>（<n> 字节）。",
-		func(_ context.Context, in writeFileInput) (string, error) {
-			full, err := resolveInWorkspace(root, in.Path)
+		func(ctx context.Context, in writeFileInput) (string, error) {
+			full, err := resolveInWorkspace(activeRoot(ctx, root), in.Path)
 			if err != nil {
 				return "", err
 			}
 			_, statErr := os.Stat(full)
 			existed := statErr == nil
+			release, err := reserveStorage(ctx, len(in.Content))
+			if err != nil {
+				return "", err
+			}
+			defer release()
 			if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 				return "", fmt.Errorf("创建父目录失败：%v", err)
 			}
@@ -104,8 +171,8 @@ func newReadFileTool(root string) (tool.BaseTool, error) {
 // buildReadTool 是读工具的两个名字共用的装配体（名字/描述随调用方，行为一份）。
 func buildReadTool(name, desc, root string) (tool.BaseTool, error) {
 	return utils.InferTool(name, desc,
-		func(_ context.Context, in readTextFileInput) (string, error) {
-			full, err := resolveInWorkspace(root, in.Path)
+		func(ctx context.Context, in readTextFileInput) (string, error) {
+			full, err := resolveInWorkspace(activeRoot(ctx, root), in.Path)
 			if err != nil {
 				return "", err
 			}
@@ -169,8 +236,8 @@ func newEditFileTool(root string) (tool.BaseTool, error) {
 		"在 workspace 内编辑文本文件：把 old_text 精确替换成 new_text。path 是相对 workspace 根的路径；"+
 			"old_text 必须与文件中某段逐字符一致。默认只替换恰好一处命中——0 处或多处命中都会报错；多处时请补足前后文让它唯一，或显式 replace_all:true 全部替换。"+
 			"返回格式：已编辑 <path>（替换 n 处）。",
-		func(_ context.Context, in editFileInput) (string, error) {
-			full, err := resolveInWorkspace(root, in.Path)
+		func(ctx context.Context, in editFileInput) (string, error) {
+			full, err := resolveInWorkspace(activeRoot(ctx, root), in.Path)
 			if err != nil {
 				return "", err
 			}
@@ -219,12 +286,12 @@ func newMoveFileTool(root string) (tool.BaseTool, error) {
 	return utils.InferTool("move_file",
 		"在 workspace 内移动或重命名文件/目录。path 是源、destination 是目标（都相对 workspace 根）；"+
 			"目标已存在时不覆盖、直接报错；目标的父目录不存在会自动创建。返回格式：已移动 <path> → <destination>。",
-		func(_ context.Context, in moveFileInput) (string, error) {
-			src, err := resolveInWorkspace(root, in.Path)
+		func(ctx context.Context, in moveFileInput) (string, error) {
+			src, err := resolveInWorkspace(activeRoot(ctx, root), in.Path)
 			if err != nil {
 				return "", err
 			}
-			dst, err := resolveInWorkspace(root, in.Destination)
+			dst, err := resolveInWorkspace(activeRoot(ctx, root), in.Destination)
 			if err != nil {
 				return "", err
 			}
@@ -256,8 +323,8 @@ type createDirectoryInput struct {
 func newCreateDirectoryTool(root string) (tool.BaseTool, error) {
 	return utils.InferTool("create_directory",
 		"在 workspace 内创建目录（多级路径会递归创建）。path 是相对 workspace 根的路径；目录已存在时幂等成功。返回格式：已建目录 <path>。",
-		func(_ context.Context, in createDirectoryInput) (string, error) {
-			full, err := resolveInWorkspace(root, in.Path)
+		func(ctx context.Context, in createDirectoryInput) (string, error) {
+			full, err := resolveInWorkspace(activeRoot(ctx, root), in.Path)
 			if err != nil {
 				return "", err
 			}
@@ -286,8 +353,8 @@ type listDirectoryInput struct {
 func newListDirectoryTool(root string) (tool.BaseTool, error) {
 	return utils.InferTool("list_directory",
 		"列出 workspace 内一个目录的直接子项，每行一个名字（目录以 / 结尾，按名排序）。path 是相对 workspace 根的路径；空目录返回（空目录）。",
-		func(_ context.Context, in listDirectoryInput) (string, error) {
-			full, err := resolveInWorkspace(root, in.Path)
+		func(ctx context.Context, in listDirectoryInput) (string, error) {
+			full, err := resolveInWorkspace(activeRoot(ctx, root), in.Path)
 			if err != nil {
 				return "", err
 			}
@@ -337,12 +404,12 @@ func newDirectoryTreeTool(root string) (tool.BaseTool, error) {
 	return utils.InferTool("directory_tree",
 		"以缩进树列出 workspace 内目录结构（两空格一级，目录以 / 结尾）。path 是起始目录（不写 = 根）；"+
 			"depth 默认 3、上限 5。超过 depth 的目录以 … 标记不再展开；条目超 500 会截断。",
-		func(_ context.Context, in directoryTreeInput) (string, error) {
+		func(ctx context.Context, in directoryTreeInput) (string, error) {
 			p := in.Path
 			if p == "" {
 				p = "."
 			}
-			full, err := resolveInWorkspace(root, p)
+			full, err := resolveInWorkspace(activeRoot(ctx, root), p)
 			if err != nil {
 				return "", err
 			}
@@ -430,8 +497,8 @@ type getFileInfoInput struct {
 func newGetFileInfoTool(root string) (tool.BaseTool, error) {
 	return utils.InferTool("get_file_info",
 		"查看 workspace 内一个文件或目录的元信息，固定四行：size（字节）/ modified（RFC3339）/ mode（权限串如 -rw-r--r--）/ type（文件或目录）。path 相对 workspace 根。",
-		func(_ context.Context, in getFileInfoInput) (string, error) {
-			full, err := resolveInWorkspace(root, in.Path)
+		func(ctx context.Context, in getFileInfoInput) (string, error) {
+			full, err := resolveInWorkspace(activeRoot(ctx, root), in.Path)
 			if err != nil {
 				return "", err
 			}
@@ -471,8 +538,8 @@ func newSearchFilesTool(root string) (tool.BaseTool, error) {
 	return utils.InferTool("search_files",
 		"在 workspace 内递归搜索固定子串（纯文本，不是正则），返回命中的 相对路径:行号:行内容，每行一条。"+
 			"path 是起始目录（相对 workspace 根）；file_glob 可选（如 *.go 只搜 Go 文件）。最多返回 50 条。",
-		func(_ context.Context, in searchFilesInput) (string, error) {
-			full, err := resolveInWorkspace(root, in.Path)
+		func(ctx context.Context, in searchFilesInput) (string, error) {
+			full, err := resolveInWorkspace(activeRoot(ctx, root), in.Path)
 			if err != nil {
 				return "", err
 			}
@@ -542,6 +609,21 @@ func newSearchFilesTool(root string) (tool.BaseTool, error) {
 		})
 }
 
+// sessionRelativeMediaPath 把占位里的 sessions/<本会话>/... 收成会话目录内的相对路径。
+// 别的会话前缀不剥，交给 resolveInWorkspace 在本会话目录里找不到。
+func sessionRelativeMediaPath(ctx context.Context, path string) string {
+	ref, ok := workspaceFrom(ctx)
+	if !ok || ref.SessionID == "" {
+		return path
+	}
+	prefix := "sessions/" + string(ref.SessionID) + "/"
+	slash := filepath.ToSlash(path)
+	if strings.HasPrefix(slash, prefix) {
+		return slash[len(prefix):]
+	}
+	return path
+}
+
 // readMediaFileInput 是 read_media_file 的入参 schema。
 type readMediaFileInput struct {
 	Path string `json:"path" jsonschema:"description=相对 workspace 根的路径（如 assets/pic.png）"`
@@ -564,8 +646,8 @@ func newReadMediaFileTool(root string) (tool.BaseTool, error) {
 	return utils.InferTool("read_media_file",
 		"读取 workspace 内的媒体文件的元信息（path/mime/size/sha 占位行；当前版本不回传媒体字节）。"+
 			"path 是相对 workspace 根的路径；文件超过 5MB 会拒绝（请先裁剪或换小文件）。",
-		func(_ context.Context, in readMediaFileInput) (string, error) {
-			full, err := resolveInWorkspace(root, in.Path)
+		func(ctx context.Context, in readMediaFileInput) (string, error) {
+			full, err := resolveInWorkspace(activeRoot(ctx, root), sessionRelativeMediaPath(ctx, in.Path))
 			if err != nil {
 				return "", err
 			}

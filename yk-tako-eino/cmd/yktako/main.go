@@ -45,6 +45,17 @@ func (a modelRegistryResolver) Get(ctx context.Context, ref string) (runengine.M
 	return runengine.ModelInstance{Chat: m.Chat, Ref: m.Ref, Protocol: string(m.Protocol)}, nil
 }
 
+func (a modelRegistryResolver) Build(ctx context.Context, cacheKey, ref string, env []string) (runengine.TenantBuilt, error) {
+	got, err := a.r.GetFor(ctx, cacheKey, ref, config.PairsToEnv(env))
+	if err != nil {
+		return runengine.TenantBuilt{}, err
+	}
+	return runengine.TenantBuilt{
+		Chat: got.Model.Chat, Ref: got.Model.Ref, Protocol: string(got.Model.Protocol),
+		Provider: got.Provider, ModelID: got.ModelID, KeyFP: got.KeyFP,
+	}, nil
+}
+
 // defaultCompactWindow 是上下文压缩的窗口 token 数（C 系列；doc/12 §2：查不到就用 256000）。
 // 触发阈值 limit = window − min(window/5, 16384)（三期重裁，19v6-09 §9）；0 = 关压缩（验收对照跑法）。
 const defaultCompactWindow = 256000
@@ -93,6 +104,7 @@ func main() {
 	engine := flag.String("engine", "127.0.0.1:8090", "listen address")
 	batch := flag.Int("batch-window", 200, "per-batch limit for frames/log reads")
 	dev := flag.Bool("dev", true, "register dev-only endpoints (reset)")
+	bootstrapAdmin := flag.String("bootstrap-admin-email", os.Getenv("TAKO_BOOTSTRAP_ADMIN_EMAIL"), "existing user email to mark system admin at startup")
 	redisAddr := flag.String("redis", "127.0.0.1:6390", "redis address holding the tk:runlive/tk:draft keys")
 	pgDSN := flag.String("pg", defaultPGDSN, "postgres DSN (sessions/runs/run_model_messages/runlog_entries)")
 	leaseTTL := flag.Duration("lease-ttl", durationEnv("TAKO_LEASE_TTL", defaultLeaseTTL), "gate lease TTL; watchdog keeps renewing it during generation (env TAKO_LEASE_TTL)")
@@ -137,7 +149,26 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if err := store.SeedAgentDefaults(ctx, *agentsDir); err != nil {
+		log.Fatalf("agent defaults: %v", err)
+	}
 	log.Printf("redis %s + pg %s (runlive ttl %s, lease %s renew %s)", *redisAddr, *pgDSN, runliveTTL, *leaseTTL, *leaseRenew)
+	// 密钥缺失在这里退，不让后面的抽取循环先跑起来再被 Fatal 掐掉。
+	auth, err := runengine.NewAuth(store, *dev)
+	if err != nil {
+		log.Fatalf("auth: %v", err)
+	}
+	if email := strings.TrimSpace(*bootstrapAdmin); email != "" {
+		found, err := store.BootstrapSystemAdmin(ctx, strings.ToLower(email))
+		if err != nil {
+			log.Fatalf("bootstrap admin: %v", err)
+		}
+		if !found {
+			log.Printf("bootstrap admin %s 不存在，跳过", email)
+		} else {
+			log.Printf("bootstrap admin %s", email)
+		}
+	}
 
 	// 压缩计数器同走 fail fast（§10.3 第 10 条）：词表取不到就别起——超窗后才发现「压不动」更糟。
 	// 首次获取从 openaipublic 拉词表并落盘缓存，之后启动即命中（缓存目录 TIKTOKEN_CACHE_DIR/系统临时目录）。
@@ -157,6 +188,15 @@ func main() {
 		log.Fatalf("workspace %q 创建: %v", wsAbs, err)
 	}
 	log.Printf("workspace %s", wsAbs)
+	if host, herr := os.Hostname(); herr == nil {
+		marker := filepath.Join(wsAbs, ".tako-replica")
+		prev, rerr := os.ReadFile(marker)
+		if rerr != nil {
+			_ = os.WriteFile(marker, []byte(host+"\n"), 0o644)
+		} else if strings.TrimSpace(string(prev)) != host {
+			log.Printf("workspace 警告: %s 上次由主机 %s 使用，本机是 %s。多副本必须把 -workspace 指到同一块共享盘，否则另一边读不到文件", wsAbs, strings.TrimSpace(string(prev)), host)
+		}
+	}
 
 	// 长期记忆配置（doc/29 §8）：三个开关默认 on，值 "off" 才关；tenant 一期恒 default。
 	// 配置写入 Store 后，EndRun（登记 job）、Worker（注入）、Server（预览）读同一份。
@@ -194,6 +234,8 @@ func main() {
 	// 第一条用到某个 ref 的规格进来才建对应客户端；解析失败是逐条拒载（不 fail fast，
 	// 与 TAKO_MODEL 的启动 fail fast 不同：主模型没有可降级对象，子代理规格有）。
 	modelRegistry := config.NewModelRegistry(config.Environ())
+	tenantModels := runengine.NewTenantModels(modelRegistryResolver{modelRegistry}, os.Environ(), opened.Ref)
+	store.SetTenantModels(tenantModels)
 
 	// 线一抽取循环（doc/29 §4.5）：TAKO_MEMORY_MODEL 为空复用主模型；非空走 ModelRegistry
 	// 懒解析（坏 ref 只让 job 失败重试，不影响启动与 run）。循环与 server 同生命周期。
@@ -224,12 +266,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("agent 装配: %v", err)
 	}
+	worker.SetTenantModels(tenantModels)
 	if *compactWindow > 0 {
 		log.Printf("compact window %d tok (limit %d)", *compactWindow, runengine.CompactLimitFor(*compactWindow))
 	} else {
 		log.Printf("compact off (-compact-window 0)")
 	}
 	log.Printf("subagents: concurrency %d, return cap %d B", *subagentConcurrency, *subagentReturnCap)
-	r := runengine.NewRouter(store, *batch, *dev, worker, *resumeMax)
+	r := runengine.NewRouter(store, *batch, *dev, worker, *resumeMax, auth)
 	log.Fatal(r.Run(*engine))
 }

@@ -130,7 +130,7 @@ func webSearchFn(ctx context.Context, in webSearchInput, workspace string, count
 	full := renderSearchFile(source, query, hits)
 	rel := ""
 	if box := noteBoxFrom(ctx); box != nil {
-		rel, _ = spillSearchResult(workspace, box, full)
+		rel, _ = spillSearchResult(activeRoot(ctx, workspace), box, full)
 	}
 	return describeSearchResult(source, note, query, len(hits), rel, counter, full), nil
 }

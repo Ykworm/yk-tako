@@ -17,9 +17,12 @@
 # 没显式给 TAKO_ENGINE 时，脚本按 ENGINE_PORT 把它填好，两边必然一致；
 # 显式给了 TAKO_ENGINE，就以它为准——引擎绑的也是它上面那个端口。
 #
-# 引擎的存储层是 Redis（tk:runlive/tk:draft 两键）+ Postgres（四表），任一不可达就 fail fast 不起进程，
+# 引擎的存储层是 Redis（tk:runlive/tk:draft 两键）+ Postgres，任一不可达就 fail fast 不起进程，
 # 所以这里先把两半都备好：端口上已有监听者就复用（可能是你自己留着的那份数据，脚本不碰），
 # 空闲才自己起——Redis 一个内存态实例，Postgres 一个 initdb 在 tmp/pg-<端口>/data 的本地实例。
+#
+# 登录和租户密钥封存也在这一条链上：没设 TAKO_JWT_SECRET（至少 32 字节）时引擎在 auth 处退出。
+# 脚本只在调用方没给够长的值时填开发用默认值，不写进 .env。TAKO_DATA_KEY 同理，新的租户密钥写成 seal2。
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -70,7 +73,7 @@ cmd_status() {
     return 0
   fi
   while read -r pid port; do
-    if [ -n "$pid" ]; then echo "在跑：dev.sh PID $pid，引擎 http://127.0.0.1:$port"; fi
+    if [ -n "$pid" ]; then echo "在跑：dev.sh PID ${pid}，引擎 http://127.0.0.1:${port}"; fi
   done <<<"$report"
 }
 
@@ -205,7 +208,7 @@ printf '%s\n' "$$" > "$pid_file"
 # 自己起的那个由收尾的 pkill -P 收走。
 redis_listener="$(lsof -tiTCP:"$redis_port" -sTCP:LISTEN 2>/dev/null | head -1 || true)"
 if [ -n "$redis_listener" ]; then
-  echo "Redis $redis_addr 已有监听者（PID $redis_listener），直接复用。"
+  echo "Redis ${redis_addr} 已有监听者（PID ${redis_listener}），直接复用。"
 else
   redis_bin="${REDIS_SERVER_BIN:-}"
   if [ -z "$redis_bin" ]; then
@@ -236,7 +239,7 @@ fi
 # 空闲才自己起——首跑 initdb 到 tmp/pg-<端口>/data，此后直接 pg_ctl start。
 pg_listener="$(lsof -tiTCP:"$pg_port" -sTCP:LISTEN 2>/dev/null | head -1 || true)"
 if [ -n "$pg_listener" ]; then
-  echo "Postgres $pg_addr 已有监听者（PID $pg_listener），直接复用。"
+  echo "Postgres ${pg_addr} 已有监听者（PID ${pg_listener}），直接复用。"
 else
   if [ -z "$pg_bin_dir" ]; then
     for cand in "$(dirname "$(command -v psql 2>/dev/null || echo .)" 2>/dev/null)" \
@@ -252,13 +255,13 @@ else
   if [ ! -f "$pg_data_dir/PG_VERSION" ]; then
     mkdir -p "$pg_base"
     "$pg_bin_dir/initdb" -D "$pg_data_dir" --no-locale --encoding=UTF8 >/dev/null
-    echo "initdb → $pg_data_dir（首次拉起，数据在仓的 tmp/ 下）"
+    echo "initdb → ${pg_data_dir}（首次拉起，数据在仓的 tmp/ 下）"
   fi
   "$pg_bin_dir/pg_ctl" -D "$pg_data_dir" -l "$pg_log" \
     -o "-p $pg_port -k /tmp -c listen_addresses=127.0.0.1" -w start >/dev/null
   pg_started=1
   if ! "$pg_bin_dir/pg_isready" -h 127.0.0.1 -p "$pg_port" >/dev/null 2>&1; then
-    echo "Postgres 没能在 $pg_addr 上就绪，看 $pg_log。" >&2
+    echo "Postgres 没能在 ${pg_addr} 上就绪，看 ${pg_log}。" >&2
     exit 1
   fi
   # tako 库懒建：只在自己起的实例上建（复用别人的实例不写一个字）。
@@ -266,6 +269,18 @@ else
     "SELECT 1 FROM pg_database WHERE datname='tako'" | grep -q 1; then
     "$pg_bin_dir/createdb" -h 127.0.0.1 -p "$pg_port" tako
   fi
+fi
+
+# 调用方已经 export 的值优先。这里的两把只给本机开发，不打印内容。
+jwt_secret="${TAKO_JWT_SECRET-}"
+if [ "${#jwt_secret}" -lt 32 ]; then
+  export TAKO_JWT_SECRET='dev-only-jwt-secret-change-me-32bytes'
+  echo "TAKO_JWT_SECRET 不够 32 字节，这次用开发默认值。要换自己的，先 export 再跑。"
+fi
+data_key="${TAKO_DATA_KEY-}"
+if [ "${#data_key}" -lt 32 ]; then
+  export TAKO_DATA_KEY='data-key-aaaaaaaaaaaaaaaaaaaaaaaa32'
+  echo "TAKO_DATA_KEY 不够 32 字节，这次用开发默认值。新的租户密钥写成 seal2，已有的 seal1 仍用登录密钥解开。"
 fi
 
 run 引擎 '\033[36m' "$repo_root/yk-tako-eino" \

@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -22,11 +23,16 @@ import (
 	"gorm.io/gorm"
 )
 
-// Session = `sessions` 表（19v6-03）：会话登记，存在即已登记（懒建于 POST 事务内）。永久状态。
+// Session = `sessions` 表（19v6-03 + doc/28 A1）：会话登记，存在即已登记（懒建于 POST 事务内）。永久状态。
+// TenantID/UserID 是归属；Visibility 默认 private，tenant 表示同租户成员只读。
 type Session struct {
-	ID        SessionID `gorm:"primaryKey"`
-	Title     string    `gorm:"not null"` // 展示字段（会话列表用），非契约；初值 = 首条用户消息截断
-	CreatedAt time.Time `gorm:"not null"`
+	ID         SessionID `gorm:"primaryKey"`
+	Title      string    `gorm:"not null"` // 展示字段（会话列表用），非契约；初值 = 首条用户消息截断
+	TenantID   string    `gorm:"not null;default:'';index:sessions_tenant_visibility,priority:1"`
+	UserID     string    `gorm:"not null;default:''"`
+	Visibility string    `gorm:"not null;default:private;index:sessions_tenant_visibility,priority:2"`
+	AgentID    string    `gorm:"not null;default:''"`
+	CreatedAt  time.Time `gorm:"not null;index:sessions_tenant_visibility,priority:3"`
 }
 
 func (Session) TableName() string { return "sessions" }
@@ -128,8 +134,20 @@ func (RunJournal) TableName() string { return "run_journal" }
 // 后三张是 doc/29 长期记忆：memory_items / memory_jobs（线一）与 dialogue_chunks（线二，
 // pg_search 索引另由 ensureDialogueIndex 手写；建表本身不需要扩展）。
 func autoMigrate(db *gorm.DB) error {
-	return db.AutoMigrate(&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}, &Note{}, &RunJournal{},
-		&MemoryItem{}, &MemoryJob{}, &DialogueChunk{})
+	// 旧库上的 memory_items_dedup 不含 user_id。先丢掉，AutoMigrate 按新列重建，
+	// 再建一次显式部分索引，保证 ON CONFLICT 的列和 WHERE 与代码一致。
+	_ = db.Exec(`DROP INDEX IF EXISTS memory_items_dedup`).Error
+	_ = db.Exec(`DROP INDEX IF EXISTS idx_memory_items_memory_items_dedup`).Error
+	if err := db.AutoMigrate(&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}, &Note{}, &RunJournal{},
+		&MemoryItem{}, &MemoryJob{}, &DialogueChunk{},
+		&User{}, &Tenant{}, &TenantMember{}, &RefreshToken{}, &AuditLog{}, &TenantUsageDaily{},
+		&TenantInvitation{}, &TenantAgent{}, &AgentDefault{}, &TenantSetting{}, &TenantStorage{}); err != nil {
+		return err
+	}
+	_ = db.Exec(`DROP INDEX IF EXISTS memory_items_dedup`).Error
+	return db.Exec(`CREATE UNIQUE INDEX memory_items_dedup
+ON memory_items (tenant_id, user_id, workspace, kind, content)
+WHERE kind <> 'episode'`).Error
 }
 
 // newRowID 生成行级代理主键：前缀 + ULID（同 s_/r_ 的铸法）。
@@ -176,7 +194,13 @@ func (s *Store) CountMediaPlaceholders(ctx context.Context, sessionID SessionID)
 // stopped 不写 assistant 行，只看 log 会把「已停止」猜成「失败」。
 // running + 租约已过（doc/30 A1）读侧派生为 interrupted：崩溃后的 run 第一次对状态端点可见，
 // 不必等下一次 POST 的清扫把它翻成 error。lastRunId 与 lastRunStatus 同一 ORDER BY，指同一场 run。
-func (s *Store) SessionStatus(ctx context.Context, sessionID SessionID) (liveRunID RunID, runlogOffset int, lastStatus string, lastRunID RunID, exists bool, err error) {
+func (s *Store) SessionStatus(ctx context.Context, sessionID SessionID, p principal) (liveRunID RunID, runlogOffset int, lastStatus string, lastRunID RunID, exists bool, err error) {
+	if _, _, err := s.SessionAccess(ctx, sessionID, p); err != nil {
+		if errors.Is(err, ErrSessionNotFound) {
+			return "", 0, "", "", false, nil
+		}
+		return "", 0, "", "", false, err
+	}
 	var live, last string
 	var hw int64
 	err = s.db.WithContext(ctx).Raw(`

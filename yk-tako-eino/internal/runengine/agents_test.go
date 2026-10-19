@@ -555,3 +555,26 @@ func TestDelegationToolForwardsOptsAndGates(t *testing.T) {
 		t.Fatalf("放闸后应可再调: %v", err)
 	}
 }
+
+// TestDelegationRedisSkipsProcessSem：Redis 租户槽在时，进程 sem 满了也不能挡住另一个租户。
+// 没有 Redis 的单测仍走进程 sem，见上一个用例。
+func TestDelegationRedisSkipsProcessSem(t *testing.T) {
+	st := newTestStore(t, time.Minute, time.Minute)
+	user, tenant, _, err := st.Signup(context.Background(), "slot@example.com", "hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(withPrincipal(context.Background(), principal{
+		UserID: user.ID, TenantID: tenant.ID, Role: "owner",
+	}), 2*time.Second)
+	defer cancel()
+	inner := &fakeInvokableTool{info: &schema.ToolInfo{Name: "researcher"}, out: "报告"}
+	d := &delegationTool{
+		inner: inner, sem: make(chan struct{}, 1), capBytes: 0, name: "researcher", store: st,
+	}
+	d.sem <- struct{}{}
+	out, err := d.InvokableRun(ctx, "{}")
+	if err != nil || out != "报告" || inner.calls != 1 {
+		t.Fatalf("租户槽应放行、进程 sem 不应挡住，得到 out=%q err=%v calls=%d", out, err, inner.calls)
+	}
+}

@@ -1,34 +1,268 @@
 <script setup lang="ts">
-import { nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useChat } from './chat'
 import { mediaUrl, type MediaRef, type Usage } from './api'
+import Configure from './Configure.vue'
+import { authFetch, authState, clearAuth, loginWithPassword, readTenant } from './auth'
 
-const { bubbles, draft, attachments, pending, loadingOlder, atStart, send, reconcile, loadOlder, newSession } = useChat()
+type Page = 'chat' | 'agents' | 'team'
+
+function readPage(): Page {
+  const saved = sessionStorage.getItem('tako.page')
+  return saved === 'agents' || saved === 'team' ? saved : 'chat'
+}
+
+const page = ref<Page>(readPage())
+watch(page, (value) => sessionStorage.setItem('tako.page', value))
+const configPage = computed<'agents' | 'team'>(() => (page.value === 'team' ? 'team' : 'agents'))
+
+const { bubbles, draft, attachments, pending, loadingOlder, atStart, busy, send, reconcile, loadOlder, newSession } = useChat()
 
 const listEl = ref<HTMLElement | null>(null)
+const composerEl = ref<HTMLTextAreaElement | null>(null)
 const pinned = ref(true)
 const fileEl = ref<HTMLInputElement | null>(null)
+const askNew = ref(false)
+const copiedKey = ref('')
+const lightbox = ref('')
+const showPassword = ref(false)
 
-// 附件（doc/32 A5）：浏览器把文件读成 base64 随 POST 上行，服务端落盘换占位行——
-// 页面上传的从来不是「贴进对话的字节」，是「要落盘的文件」。
+const loggedIn = computed(() => authState.value)
+const tenant = computed(() => (authState.value ? readTenant() : { id: '', name: '', role: '' }))
+const initial = computed(() => (tenant.value.name || '我').slice(0, 1))
+const email = ref('')
+const password = ref('')
+const authBusy = ref(false)
+const authError = ref('')
+
+const starters = [
+  '这个工作区里现在有哪些文件？',
+  '用三句话说说你能帮我做什么',
+  '把我下一条消息整理成待办清单',
+]
+
+function roleLabel(role: string): string {
+  if (role === 'owner') return '所有者'
+  if (role === 'admin') return '管理员'
+  if (role === 'member') return '成员'
+  return role
+}
+
+async function doLogin() {
+  authError.value = ''
+  authBusy.value = true
+  try {
+    const res = await loginWithPassword(email.value, password.value)
+    if (!res.ok) {
+      authError.value = res.status ? `${res.status}：${res.message}` : res.message
+      return
+    }
+    password.value = ''
+  } finally {
+    authBusy.value = false
+  }
+}
+
+function logout() {
+  clearAuth()
+}
+
+function requestNewSession() {
+  const dirty = bubbles.value.length > 0 || draft.value.trim() !== '' || attachments.value.length > 0
+  if (!dirty) {
+    newSession()
+    page.value = 'chat'
+    return
+  }
+  askNew.value = true
+}
+
+function confirmNewSession() {
+  askNew.value = false
+  newSession()
+  page.value = 'chat'
+}
+
+function applyStarter(text: string) {
+  draft.value = text
+  void nextTick(() => composerEl.value?.focus())
+}
+
+function onSend() {
+  send()
+  void nextTick(() => {
+    fitComposer()
+    composerEl.value?.focus()
+  })
+}
+
+// 中文输入法选词时 Enter 只是上屏，不能当成发送。
+function onDraftKeydown(ev: KeyboardEvent) {
+  if (ev.key !== 'Enter' || ev.shiftKey || ev.isComposing || ev.keyCode === 229) return
+  ev.preventDefault()
+  onSend()
+}
+
+function fitComposer() {
+  const el = composerEl.value
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = `${Math.min(el.scrollHeight, 168)}px`
+}
+
+watch(draft, () => {
+  void nextTick(fitComposer)
+})
+
+async function copyBubble(key: string, text: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    copiedKey.value = key
+    window.setTimeout(() => {
+      if (copiedKey.value === key) copiedKey.value = ''
+    }, 1400)
+  } catch {
+    copiedKey.value = ''
+  }
+}
+
+function onWindowKey(ev: KeyboardEvent) {
+  if (ev.key !== 'Escape') return
+  if (lightbox.value) {
+    lightbox.value = ''
+    return
+  }
+  askNew.value = false
+}
+
 const MAX_ATTACH = 4
 const MAX_FILE_BYTES = 5 * 1024 * 1024
+
+const HEIC_RE = /\.(heic|heif)$/i
+const EXT_MIME: Record<string, string> = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml',
+  pdf: 'application/pdf', mp3: 'audio/mpeg', wav: 'audio/wav', mp4: 'video/mp4',
+  heic: 'image/heic', heif: 'image/heif',
+}
+const SERVER_MIME = new Set([
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp', 'image/svg+xml',
+  'application/pdf', 'audio/mpeg', 'audio/wav', 'video/mp4',
+])
+
+function fileMime(f: File): string {
+  if (f.type) return f.type.toLowerCase()
+  const ext = f.name.split('.').pop()?.toLowerCase() ?? ''
+  return EXT_MIME[ext] ?? ''
+}
+
+async function toJpeg(f: File): Promise<File> {
+  const { default: heic2any } = await import('heic2any')
+  const out = await heic2any({ blob: f, toType: 'image/jpeg', quality: 0.92 })
+  const blob = Array.isArray(out) ? out[0] : out
+  return new File([blob], f.name.replace(HEIC_RE, '.jpg'), { type: 'image/jpeg' })
+}
+
+function readBase64(f: File): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const r = new FileReader()
+    r.onload = () => resolve(String(r.result).split(',')[1] ?? '')
+    r.onerror = () => reject(r.error)
+    r.readAsDataURL(f)
+  })
+}
+
+const attachNotice = ref('')
+
+async function addFiles(files: File[]) {
+  const problems: string[] = []
+  for (const raw of files) {
+    if (attachments.value.length >= MAX_ATTACH) {
+      problems.push(`最多 ${MAX_ATTACH} 个附件`)
+      break
+    }
+    let f = raw
+    let mime = fileMime(raw)
+    if (mime === 'image/heic' || mime === 'image/heif' || HEIC_RE.test(raw.name)) {
+      try {
+        f = await toJpeg(raw)
+        mime = 'image/jpeg'
+      } catch {
+        problems.push(`${raw.name}：HEIC 解不开，请先在照片里导出为 JPEG`)
+        continue
+      }
+    }
+    if (!SERVER_MIME.has(mime)) {
+      problems.push(`${raw.name}：不支持 ${mime || '未知类型'}`)
+      continue
+    }
+    if (f.size > MAX_FILE_BYTES) {
+      problems.push(`${raw.name}：${fmtSize(f.size)} 超过 5MB`)
+      continue
+    }
+    attachments.value.push({ name: f.name, img: { mime, dataBase64: await readBase64(f), name: f.name } })
+  }
+  attachNotice.value = problems.join('；')
+}
+
+function attachmentPreview(mime: string, dataBase64: string): string {
+  if (!mime.startsWith('image/')) return ''
+  return `data:${mime};base64,${dataBase64}`
+}
+
+watch(attachments, () => {
+  if (!attachments.value.length) attachNotice.value = ''
+}, { deep: true })
 
 async function onPickFiles(ev: Event) {
   const input = ev.target as HTMLInputElement
   const files = Array.from(input.files ?? [])
   input.value = ''
-  for (const f of files) {
-    if (attachments.value.length >= MAX_ATTACH) break
-    if (f.size > MAX_FILE_BYTES || !f.type) continue
-    const dataBase64 = await new Promise<string>((resolve, reject) => {
-      const r = new FileReader()
-      r.onload = () => resolve(String(r.result).split(',')[1] ?? '')
-      r.onerror = () => reject(r.error)
-      r.readAsDataURL(f)
-    })
-    attachments.value.push({ name: f.name, img: { mime: f.type, dataBase64, name: f.name } })
-  }
+  await addFiles(files)
+}
+
+function onPaste(ev: ClipboardEvent) {
+  const files = Array.from(ev.clipboardData?.files ?? [])
+  if (!files.length) return
+  ev.preventDefault()
+  void addFiles(files)
+}
+
+const dragActive = ref(false)
+let dragDepth = 0
+
+function canDrop(): boolean {
+  return page.value === 'chat' && loggedIn.value
+}
+
+function hasFiles(e: DragEvent): boolean {
+  return canDrop() && Array.from(e.dataTransfer?.types ?? []).includes('Files')
+}
+
+function onDragEnter(e: DragEvent) {
+  if (!hasFiles(e)) return
+  e.preventDefault()
+  dragDepth++
+  dragActive.value = true
+}
+
+function onDragOver(e: DragEvent) {
+  if (!hasFiles(e)) return
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+}
+
+function onDragLeave() {
+  dragDepth = Math.max(0, dragDepth - 1)
+  if (!dragDepth) dragActive.value = false
+}
+
+async function onDrop(e: DragEvent) {
+  e.preventDefault()
+  dragDepth = 0
+  dragActive.value = false
+  const files = Array.from(e.dataTransfer?.files ?? [])
+  if (files.length) await addFiles(files)
 }
 
 function removeAttachment(i: number) {
@@ -39,8 +273,6 @@ function isImage(m: MediaRef): boolean {
   return m.mime.startsWith('image/')
 }
 
-// 通信字段的显示面（doc/32 A6/A7）：有 name 显示 name，无名退化「图片 {seq}」，
-// 存量行（无 name/seq）退化 mime+size——三层兜底，刷新 reconcile 后名字不丢。
 function mediaLabel(m: MediaRef): string {
   if (m.name) return m.name
   if (m.seq != null) return `图片 ${m.seq}`
@@ -53,8 +285,6 @@ function fmtSize(n: number): string {
   return `${n}B`
 }
 
-// usage 小字（doc/27 §4a 消费侧）：↑输入 ↓输出 · 输入/窗 (占比%)；无窗只显示花销。
-// 占比 >70% 橙、>90% 红（pi 阈值惯例）；1% 以下显示 <1 免得整轮 0%。
 function fmtTok(n: number): string {
   if (n >= 1000) {
     const k = n / 1000
@@ -81,14 +311,67 @@ function scrollBottom() {
   if (el) el.scrollTop = el.scrollHeight
 }
 
+function jumpBottom() {
+  pinned.value = true
+  scrollBottom()
+}
+
 watch(bubbles, () => {
   if (pinned.value) nextTick(scrollBottom)
 }, { deep: true })
 
-onMounted(async () => {
+const mediaSrc = ref<Record<string, string>>({})
+const mediaPending = new Set<string>()
+
+async function loadMedia(path: string) {
+  if (mediaSrc.value[path] || mediaPending.has(path)) return
+  mediaPending.add(path)
+  try {
+    const res = await authFetch(mediaUrl(path))
+    if (!res.ok) return
+    const url = URL.createObjectURL(await res.blob())
+    if (mediaSrc.value[path]) {
+      URL.revokeObjectURL(url)
+      return
+    }
+    mediaSrc.value = { ...mediaSrc.value, [path]: url }
+  } finally {
+    mediaPending.delete(path)
+  }
+}
+
+watch(
+  bubbles,
+  () => {
+    for (const b of bubbles.value) for (const m of b.media ?? []) void loadMedia(m.path)
+  },
+  { deep: true, immediate: true },
+)
+
+watch(authState, async (ok) => {
+  if (!ok) {
+    newSession()
+    askNew.value = false
+    return
+  }
   await reconcile()
   await nextTick()
   scrollBottom()
+  composerEl.value?.focus()
+})
+
+onMounted(async () => {
+  window.addEventListener('keydown', onWindowKey)
+  if (!loggedIn.value) return
+  await reconcile()
+  await nextTick()
+  scrollBottom()
+  composerEl.value?.focus()
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onWindowKey)
+  for (const url of Object.values(mediaSrc.value)) URL.revokeObjectURL(url)
 })
 
 async function onScroll() {
@@ -99,357 +382,688 @@ async function onScroll() {
     const before = el.scrollHeight
     await loadOlder()
     await nextTick()
-    // prepend 后把视口推回原内容，避免跳顶。
     el.scrollTop += el.scrollHeight - before
   }
 }
 </script>
 
 <template>
-  <div class="shell">
-    <main>
-      <header>
-        <div class="brand">
-          <span class="brand-dot" aria-hidden="true"></span>
-          <h1>tako</h1>
+  <div
+    class="app"
+    @dragenter="onDragEnter"
+    @dragover="onDragOver"
+    @dragleave="onDragLeave"
+    @drop="onDrop"
+  >
+    <aside v-if="loggedIn" class="rail">
+      <div class="brand">
+        <span class="mark" aria-hidden="true">t</span>
+        <div>
+          <strong>tako</strong>
+          <span class="brand-sub">工作区</span>
         </div>
-        <button class="ghost" @click="newSession">
+      </div>
+
+      <div class="new-wrap">
+        <button type="button" class="new-chat" @click="requestNewSession">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
             <path d="M8 3v10M3 8h10" />
           </svg>
           新对话
         </button>
-      </header>
-
-      <section ref="listEl" class="list" @scroll="onScroll">
-        <div v-if="!bubbles.length" class="empty">
-          <div class="empty-logo" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.6 8.6 0 0 1-3.8-.9L3 21l1.9-5.2a8.4 8.4 0 1 1 16.1-4.3z" />
-            </svg>
+        <div v-if="askNew" class="pop" role="dialog" aria-labelledby="new-chat-title">
+          <p id="new-chat-title">新开一段会忘掉浏览器里记住的当前对话。</p>
+          <div class="pop-actions">
+            <button type="button" class="pop-go" @click="confirmNewSession">仍然新开</button>
+            <button type="button" class="pop-stay" @click="askNew = false">取消</button>
           </div>
-          <p class="empty-title">开始一段对话</p>
-          <p class="empty-hint">投递后看着回复逐字生成<br />刷新或新开标签页都能接上</p>
         </div>
+      </div>
 
-        <div v-if="loadingOlder" class="older">
-          <span class="spinner" aria-hidden="true"></span>加载更早…
-        </div>
-        <div v-else-if="!atStart" class="older muted">上滚查看更早历史</div>
-
-        <div v-for="b in bubbles" :key="b.key" :class="['bubble', b.role, b.state]">
-          <template v-if="b.media?.length">
-            <template v-for="(m, i) in b.media" :key="`${b.key}:m${i}`">
-              <img
-                v-if="isImage(m)"
-                class="bubble-media"
-                :src="mediaUrl(m.path)"
-                :alt="mediaLabel(m)"
-                :title="mediaLabel(m)"
-                loading="lazy"
-              />
-              <p v-else class="bubble-file">📎 {{ mediaLabel(m) }}（{{ m.mime }}，{{ fmtSize(m.size) }}）</p>
-            </template>
-          </template>
-          <p v-if="b.text">{{ b.text }}</p>
-          <span v-else-if="b.state === 'streaming' || b.state === 'offline'" class="typing" aria-label="正在生成">
-            <i></i><i></i><i></i>
-          </span>
-          <p v-if="b.state === 'offline'" class="queue-note">
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
-              <path d="M2.6 13.4 13.4 2.6M6.2 9.8a3.4 3.4 0 0 1 3.6-.8" /><path d="M3.4 6.8a6.2 6.2 0 0 1 8.4-1.4" />
-            </svg>
-            拉不到帧，改看会话状态
-          </p>
-          <p v-if="b.state === 'queued'" class="queue-note">
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
-              <circle cx="8" cy="8" r="6.2" /><path d="M8 4.6V8l2.2 1.6" />
-            </svg>
-            会话忙，排队待发
-          </p>
-          <p v-if="b.state === 'stopped'" class="stopped-note">
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
-              <rect x="4.4" y="4.4" width="7.2" height="7.2" rx="1.4" />
-            </svg>
-            已停止，未进历史
-          </p>
-          <p v-if="b.state === 'error'" class="err-note">
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
-              <circle cx="8" cy="8" r="6.2" /><path d="M8 5v3.6M8 11h.01" />
-            </svg>
-            失败，未进历史
-          </p>
-          <span v-if="b.role === 'assistant' && b.usage" class="usage" :class="usageClass(b.usage)">{{ usageText(b.usage) }}</span>
-          <span v-else-if="b.role === 'assistant' && b.usageUnknown" class="usage">用量 ?</span>
-        </div>
-      </section>
-
-      <form class="composer" @submit.prevent="send">
-        <input ref="fileEl" type="file" accept="image/*,application/pdf,audio/*,video/*" multiple hidden @change="onPickFiles" />
-        <button
-          type="button"
-          class="attach"
-          :disabled="attachments.length >= MAX_ATTACH"
-          aria-label="添加图片或文件"
-          @click="fileEl?.click()"
-        >
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
-            <path d="M13.2 7.6 8 12.8a3.4 3.4 0 0 1-4.8-4.8l5.4-5.4a2.3 2.3 0 0 1 3.2 3.2l-5.4 5.4a1.1 1.1 0 0 1-1.6-1.6L9.6 4.8" />
-          </svg>
+      <nav class="nav" aria-label="页面">
+        <button type="button" :class="{ on: page === 'chat' }" :aria-current="page === 'chat' ? 'page' : undefined" @click="page = 'chat'">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 3.5h10v7.2H6.2L3 13z" stroke-linejoin="round" /></svg>
+          对话
         </button>
-        <div v-if="attachments.length" class="attach-chips">
-          <span v-for="(a, i) in attachments" :key="i" class="chip">
-            {{ a.name }}<button type="button" class="chip-x" aria-label="移除附件" @click="removeAttachment(i)">×</button>
-          </span>
-        </div>
-        <input
-          v-model="draft"
-          :placeholder="pending.length ? `排队 ${pending.length} 条，当前回复收口后自动发出` : '说点什么…'"
-          aria-label="消息输入框"
-        />
-        <button type="submit" :disabled="!draft.trim() && !attachments.length" aria-label="发送">
-          <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
-            <path d="M3.1 2.2 18 10 3.1 17.8c-.7.4-1.6-.1-1.6-.9v-4.4l9-2.5-9-2.5V3.1c0-.8.9-1.3 1.6-.9z" />
-          </svg>
-          <span class="sr-only">发送</span>
+        <button type="button" :class="{ on: page === 'agents' }" :aria-current="page === 'agents' ? 'page' : undefined" @click="page = 'agents'">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="5.2" r="2.2" /><path d="M3.4 13.2c.7-2.2 2.4-3.2 4.6-3.2s3.9 1 4.6 3.2" stroke-linecap="round" /></svg>
+          助手
         </button>
+        <button type="button" :class="{ on: page === 'team' }" :aria-current="page === 'team' ? 'page' : undefined" @click="page = 'team'">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="2.5" y="2.5" width="11" height="11" rx="2" /><path d="M5 8h6M8 5v6" stroke-linecap="round" /></svg>
+          团队
+        </button>
+      </nav>
+
+      <div class="rail-foot">
+        <span class="avatar" aria-hidden="true">{{ initial }}</span>
+        <div class="who">
+          <strong>{{ tenant.name || '当前工作区' }}</strong>
+          <span>{{ roleLabel(tenant.role) || '已登录' }}</span>
+        </div>
+        <button type="button" class="logout" @click="logout">退出</button>
+      </div>
+    </aside>
+
+    <div class="stage">
+      <div v-if="dragActive" class="drop-hint" aria-hidden="true">松开，加到这条消息里</div>
+
+      <form v-if="!loggedIn" class="gate" @submit.prevent="doLogin">
+        <div class="gate-copy">
+          <span class="mark lg" aria-hidden="true">t</span>
+          <h1>tako</h1>
+          <p>登录之后可以对话、改助手、配这个工作区。刷新这个标签页，同一段对话还能接上。</p>
+        </div>
+        <div class="gate-card">
+          <h2>登录</h2>
+          <label>
+            邮箱
+            <input v-model="email" type="email" autocomplete="username" required autofocus />
+          </label>
+          <label>
+            密码
+            <span class="secret">
+              <input v-model="password" :type="showPassword ? 'text' : 'password'" autocomplete="current-password" required />
+              <button type="button" class="ghost-link" @click="showPassword = !showPassword">{{ showPassword ? '隐藏' : '显示' }}</button>
+            </span>
+          </label>
+          <button type="submit" class="primary" :disabled="authBusy">{{ authBusy ? '正在登录…' : '登录' }}</button>
+          <p v-if="authError" class="auth-error" role="alert">{{ authError }}</p>
+        </div>
       </form>
-    </main>
+
+      <template v-else>
+        <Configure v-if="page !== 'chat'" :page="configPage" />
+
+        <div v-show="page === 'chat'" class="thread">
+          <section ref="listEl" class="list" @scroll="onScroll">
+            <div v-if="!bubbles.length" class="empty">
+              <p class="empty-kicker">对话</p>
+              <h2>从一句话开始</h2>
+              <p class="empty-hint">发出去之后，回复会逐字出现。往上滚可以翻更早的记录。</p>
+              <div class="starters">
+                <button v-for="s in starters" :key="s" type="button" @click="applyStarter(s)">{{ s }}</button>
+              </div>
+            </div>
+
+            <div v-if="loadingOlder" class="older">
+              <span class="spinner" aria-hidden="true"></span>正在加载更早的记录
+            </div>
+            <div v-else-if="bubbles.length && !atStart" class="older muted">上滚查看更早的记录</div>
+
+            <article v-for="b in bubbles" :key="b.key" :class="['bubble', b.role, b.state]">
+              <div class="bubble-main">
+                <template v-if="b.media?.length">
+                  <template v-for="(m, i) in b.media" :key="`${b.key}:m${i}`">
+                    <button
+                      v-if="isImage(m) && mediaSrc[m.path]"
+                      type="button"
+                      class="media-btn"
+                      :aria-label="`查看 ${mediaLabel(m)}`"
+                      @click="lightbox = mediaSrc[m.path]"
+                    >
+                      <img class="bubble-media" :src="mediaSrc[m.path]" :alt="mediaLabel(m)" />
+                    </button>
+                    <p v-else class="bubble-file">
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M4 2.5h5l3 3V13.5H4z" stroke-linejoin="round" /><path d="M9 2.5V6h3.2" /></svg>
+                      <span>{{ mediaLabel(m) }}</span>
+                      <span class="file-meta">{{ m.mime }} · {{ fmtSize(m.size) }}</span>
+                    </p>
+                  </template>
+                </template>
+                <p v-if="b.text" class="bubble-text">{{ b.text }}</p>
+                <span v-else-if="b.state === 'streaming' || b.state === 'offline'" class="typing" aria-label="正在生成">
+                  <i></i><i></i><i></i>
+                </span>
+                <p v-if="b.state === 'offline'" class="note">拉不到帧，改看会话状态</p>
+                <p v-if="b.state === 'queued'" class="note">会话忙，这条还在排队</p>
+                <p v-if="b.state === 'stopped'" class="note">已停止，没有写进历史</p>
+                <p v-if="b.state === 'error'" class="note">失败，没有写进历史</p>
+                <span v-if="b.role === 'assistant' && b.usage" class="usage" :class="usageClass(b.usage)">{{ usageText(b.usage) }}</span>
+                <span v-else-if="b.role === 'assistant' && b.usageUnknown" class="usage">用量 ?</span>
+                <button
+                  v-if="b.text"
+                  type="button"
+                  class="copy"
+                  @click="copyBubble(b.key, b.text)"
+                >{{ copiedKey === b.key ? '已复制' : '复制' }}</button>
+              </div>
+            </article>
+          </section>
+
+          <p v-if="attachNotice" class="attach-notice" role="alert">{{ attachNotice }}</p>
+          <form class="composer" @submit.prevent="onSend">
+            <input
+              ref="fileEl"
+              type="file"
+              accept="image/*,image/heic,image/heif,.heic,.heif,application/pdf,audio/*,video/*"
+              multiple
+              hidden
+              @change="onPickFiles"
+            />
+            <div v-if="attachments.length" class="chips">
+              <span v-for="(a, i) in attachments" :key="i" class="chip">
+                <img v-if="attachmentPreview(a.img.mime, a.img.dataBase64)" :src="attachmentPreview(a.img.mime, a.img.dataBase64)" alt="" />
+                <span class="chip-name">{{ a.name }}</span>
+                <button type="button" class="chip-x" aria-label="移除附件" @click="removeAttachment(i)">×</button>
+              </span>
+            </div>
+            <textarea
+              ref="composerEl"
+              v-model="draft"
+              rows="1"
+              enterkeyhint="send"
+              :placeholder="pending.length ? `还有 ${pending.length} 条在排队，这轮结束后自动发出` : '写一条消息'"
+              aria-label="消息"
+              @keydown="onDraftKeydown"
+              @paste="onPaste"
+            />
+            <div class="composer-bar">
+              <button
+                type="button"
+                class="icon-btn"
+                :disabled="attachments.length >= MAX_ATTACH"
+                aria-label="添加图片或文件"
+                title="添加图片或文件。选不了「照片」时，可以从照片 app 拖进来，也可以直接粘贴。"
+                @click="fileEl?.click()"
+              >
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+                  <path d="M13.2 7.6 8 12.8a3.4 3.4 0 0 1-4.8-4.8l5.4-5.4a2.3 2.3 0 0 1 3.2 3.2l-5.4 5.4a1.1 1.1 0 0 1-1.6-1.6L9.6 4.8" />
+                </svg>
+              </button>
+              <span v-if="pending.length" class="hint queue">排队 {{ pending.length }}</span>
+              <span v-else-if="busy" class="hint live">正在回复</span>
+              <span v-else class="hint">Enter 发送 · Shift+Enter 换行 · 可粘贴图片</span>
+              <button type="submit" class="send" :disabled="!draft.trim() && !attachments.length" aria-label="发送">
+                <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                  <path d="M10 16.2V4.4M5.2 8.8 10 4l4.8 4.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none" />
+                </svg>
+              </button>
+            </div>
+          </form>
+          <button v-if="!pinned && bubbles.length" type="button" class="jump" @click="jumpBottom">回到最新</button>
+        </div>
+      </template>
+    </div>
+
+    <div v-if="lightbox" class="lightbox" role="dialog" aria-label="查看图片" @click="lightbox = ''">
+      <img :src="lightbox" alt="" />
+    </div>
+    <span class="sr-only" aria-live="polite">{{ copiedKey ? '已复制' : '' }}</span>
   </div>
 </template>
 
-<style>
-html,
-body {
-  margin: 0;
-  padding: 0;
-  height: 100%;
-  background: #f7f7f9;
-}
-</style>
-
 <style scoped>
-.shell {
-  height: 100vh;
+.app {
+  height: 100%;
+  display: flex;
   background:
-    radial-gradient(60rem 30rem at 50% -10rem, #eef2ff 0%, transparent 60%),
-    #f7f7f9;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', system-ui, sans-serif;
-  color: #1c1c22;
-  -webkit-font-smoothing: antialiased;
+    radial-gradient(42rem 24rem at 100% -8rem, rgba(15, 110, 86, 0.08), transparent 60%),
+    var(--bg);
 }
-main {
-  max-width: 44rem;
-  margin: 0 auto;
-  padding: 0 1rem 1.25rem;
+
+.rail {
+  width: 15.5rem;
+  flex: none;
   display: flex;
   flex-direction: column;
-  height: 100%;
-  box-sizing: border-box;
+  gap: 0.85rem;
+  padding: 1.1rem 0.85rem 0.9rem;
+  background: rgba(232, 226, 214, 0.72);
+  border-right: 1px solid var(--line);
 }
 
-/* ── 顶栏：毛玻璃吸顶 ── */
-header {
-  position: sticky;
-  top: 0;
-  z-index: 10;
+.brand,
+.rail-foot,
+.nav button,
+.new-chat,
+.composer-bar,
+.note,
+.older,
+.chip,
+.bubble-file {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 0.9rem 0.25rem;
-  background: rgba(247, 247, 249, 0.82);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
 }
+
 .brand {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
+  gap: 0.65rem;
+  padding: 0.15rem 0.35rem 0.2rem;
 }
-.brand-dot {
-  width: 0.6rem;
-  height: 0.6rem;
-  border-radius: 50%;
-  background: linear-gradient(135deg, #60a5fa, #2563eb);
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
+.brand strong {
+  display: block;
+  font-size: 0.98rem;
+  letter-spacing: 0.04em;
 }
-header h1 {
-  font-size: 1.05rem;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  margin: 0;
-}
-.ghost {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  border: 1px solid #e2e2e8;
-  background: #fff;
-  color: #3f3f4a;
-  font-size: 0.8rem;
-  border-radius: 999px;
-  padding: 0.4rem 0.9rem;
-  cursor: pointer;
-  transition: border-color 0.15s, color 0.15s, box-shadow 0.15s;
-  box-shadow: 0 1px 2px rgba(16, 16, 24, 0.04);
-}
-.ghost svg {
-  width: 0.85rem;
-  height: 0.85rem;
-}
-.ghost:hover:not(:disabled) {
-  border-color: #b9cdf7;
-  color: #2563eb;
-  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.1);
-}
-.ghost:disabled {
-  opacity: 0.5;
-  cursor: default;
+.brand-sub,
+.who span,
+.hint,
+.file-meta {
+  color: var(--muted);
+  font-size: 0.75rem;
 }
 
-/* ── 消息列表 ── */
+.mark {
+  width: 1.85rem;
+  height: 1.85rem;
+  display: grid;
+  place-items: center;
+  border-radius: 0.6rem;
+  background: var(--ink);
+  color: #f6f1e7;
+  font-weight: 650;
+  letter-spacing: -0.03em;
+}
+.mark.lg {
+  width: 2.6rem;
+  height: 2.6rem;
+  border-radius: 0.8rem;
+  font-size: 1.25rem;
+}
+
+.new-chat,
+.primary,
+.send,
+.pop-go {
+  border: 0;
+  background: var(--ink);
+  color: #f6f1e7;
+}
+.new-wrap { position: relative; }
+.new-chat {
+  gap: 0.4rem;
+  justify-content: center;
+  border-radius: 999px;
+  padding: 0.55rem 0.8rem;
+  font-size: 0.86rem;
+}
+.new-chat svg {
+  width: 0.9rem;
+  height: 0.9rem;
+}
+.new-chat:hover,
+.primary:hover:not(:disabled),
+.send:hover:not(:disabled) {
+  background: #292524;
+}
+
+.pop {
+  position: absolute;
+  z-index: 6;
+  top: 0;
+  left: calc(100% + 0.55rem);
+  width: 16rem;
+  background: var(--bg-raised);
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  padding: 0.75rem;
+  box-shadow: var(--shadow);
+}
+.pop p {
+  margin: 0 0 0.65rem;
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+.pop-actions {
+  display: flex;
+  gap: 0.4rem;
+}
+.pop-go,
+.pop-stay,
+.logout,
+.icon-btn,
+.jump,
+.ghost-link {
+  border-radius: 999px;
+  font-size: 0.78rem;
+}
+.pop-go,
+.pop-stay {
+  border: 0;
+  padding: 0.35rem 0.7rem;
+}
+.pop-stay,
+.logout,
+.icon-btn,
+.jump {
+  background: transparent;
+  color: var(--ink-soft);
+  border: 1px solid var(--line-strong);
+}
+.pop-stay:hover,
+.logout:hover,
+.icon-btn:hover:not(:disabled),
+.jump:hover {
+  background: #fff;
+  border-color: #cfc6b6;
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.nav button {
+  gap: 0.55rem;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  color: var(--ink-soft);
+  border-radius: 12px;
+  padding: 0.5rem 0.65rem;
+  font-size: 0.9rem;
+}
+.nav button svg {
+  width: 1rem;
+  height: 1rem;
+  flex: none;
+}
+.nav button.on {
+  background: var(--bg-raised);
+  color: var(--ink);
+  box-shadow: 0 1px 2px rgba(68, 48, 24, 0.06);
+}
+.nav button:hover:not(.on) {
+  background: rgba(255, 253, 248, 0.55);
+}
+
+.rail-foot {
+  margin-top: auto;
+  gap: 0.55rem;
+  padding: 0.45rem;
+  border-radius: 14px;
+  background: rgba(255, 253, 248, 0.55);
+}
+.avatar {
+  width: 1.9rem;
+  height: 1.9rem;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  font-size: 0.82rem;
+  font-weight: 650;
+}
+.who {
+  min-width: 0;
+  flex: 1;
+}
+.who strong,
+.chip-name {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.82rem;
+}
+.logout {
+  padding: 0.28rem 0.55rem;
+}
+
+.stage {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.gate {
+  margin: auto;
+  width: min(100% - 2rem, 52rem);
+  display: grid;
+  grid-template-columns: 1.1fr 0.9fr;
+  gap: 2.5rem;
+  align-items: center;
+}
+.gate-copy h1 {
+  margin: 0.8rem 0 0.45rem;
+  font-size: 2.4rem;
+  letter-spacing: 0.04em;
+  font-weight: 650;
+}
+.gate-copy p {
+  margin: 0;
+  max-width: 28rem;
+  color: var(--ink-soft);
+  line-height: 1.7;
+}
+.gate-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1.35rem;
+  box-shadow: var(--shadow);
+}
+.gate-card h2 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+.gate-card label,
+.secret {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.8rem;
+  color: var(--ink-soft);
+}
+.secret {
+  position: relative;
+}
+.gate-card input {
+  border: 1px solid var(--line-strong);
+  background: #fff;
+  border-radius: 12px;
+  padding: 0.7rem 0.8rem;
+  font-size: 0.95rem;
+}
+.gate-card .secret input { padding-right: 3.6rem; }
+.gate-card input:focus {
+  outline: none;
+  border-color: #8fbfb0;
+  box-shadow: 0 0 0 3px rgba(15, 110, 86, 0.14);
+}
+.ghost-link {
+  position: absolute;
+  right: 0.45rem;
+  bottom: 0.45rem;
+  border: 0;
+  background: var(--bg);
+  padding: 0.2rem 0.5rem;
+}
+.primary {
+  margin-top: 0.3rem;
+  border-radius: 999px;
+  padding: 0.7rem 1rem;
+  font-size: 0.95rem;
+}
+.primary:disabled {
+  opacity: 0.55;
+}
+.auth-error,
+.attach-notice {
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  border-radius: 12px;
+}
+.auth-error {
+  color: var(--danger);
+  background: var(--danger-soft);
+  padding: 0.55rem 0.7rem;
+}
+
+.thread {
+  width: min(46rem, calc(100% - 2rem));
+  margin: 0 auto;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 1rem;
+}
 .list {
   flex: 1;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 0.65rem;
-  padding: 0.75rem 0.25rem 1rem;
+  gap: 0.85rem;
+  padding: 1.4rem 0.2rem 1rem;
   scrollbar-width: thin;
-  scrollbar-color: #d8d8e0 transparent;
+  scrollbar-color: var(--line-strong) transparent;
 }
-.list::-webkit-scrollbar {
-  width: 6px;
-}
-.list::-webkit-scrollbar-thumb {
-  background: #d8d8e0;
-  border-radius: 3px;
-}
-
-/* ── 空态 ── */
 .empty {
   margin: auto;
-  text-align: center;
-  padding: 2rem 1rem;
+  max-width: 34rem;
+  padding: 2rem 0 3rem;
 }
-.empty-logo {
-  width: 4rem;
-  height: 4rem;
-  margin: 0 auto 1.1rem;
-  border-radius: 1.4rem;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: #2563eb;
-  background: linear-gradient(160deg, #ffffff, #eaf0ff);
-  border: 1px solid #e3e9f8;
-  box-shadow: 0 8px 24px rgba(37, 99, 235, 0.12);
-}
-.empty-logo svg {
-  width: 2rem;
-  height: 2rem;
-}
-.empty-title {
-  font-size: 1.15rem;
-  font-weight: 650;
+.empty-kicker {
   margin: 0 0 0.4rem;
+  color: var(--accent-ink);
+  font-size: 0.75rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.empty h2 {
+  margin: 0;
+  font-size: 2rem;
+  font-weight: 620;
+  letter-spacing: -0.03em;
 }
 .empty-hint {
-  font-size: 0.85rem;
-  line-height: 1.7;
-  color: #8b8b96;
-  margin: 0;
+  margin: 0.55rem 0 1.2rem;
+  color: var(--muted);
+}
+.starters {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+.starters button {
+  text-align: left;
+  border: 1px solid var(--line);
+  background: rgba(255, 253, 248, 0.8);
+  border-radius: 14px;
+  padding: 0.75rem 0.9rem;
+  color: var(--ink-soft);
+}
+.starters button:hover {
+  border-color: #b7d7cc;
+  background: #fff;
+  color: var(--ink);
 }
 
-/* ── 更早历史提示 ── */
 .older {
   align-self: center;
-  display: inline-flex;
-  align-items: center;
   gap: 0.4rem;
-  font-size: 0.72rem;
-  color: #6e6e7a;
-  background: #fff;
-  border: 1px solid #e8e8ee;
+  font-size: 0.75rem;
+  color: var(--ink-soft);
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
   border-radius: 999px;
-  padding: 0.25rem 0.8rem;
-  box-shadow: 0 1px 2px rgba(16, 16, 24, 0.04);
+  padding: 0.25rem 0.75rem;
 }
 .older.muted {
-  color: #a5a5b0;
+  color: var(--muted);
   background: transparent;
   border-color: transparent;
-  box-shadow: none;
 }
 .spinner {
   width: 0.75rem;
   height: 0.75rem;
   border-radius: 50%;
-  border: 2px solid #cfd8ea;
-  border-top-color: #2563eb;
+  border: 2px solid #d5ddd6;
+  border-top-color: var(--accent);
   animation: spin 0.8s linear infinite;
 }
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
+@keyframes spin { to { transform: rotate(360deg); } }
 
-/* ── 气泡 ── */
 .bubble {
-  max-width: 78%;
-  padding: 0.6rem 0.9rem;
-  font-size: 0.92rem;
-  line-height: 1.65;
-  white-space: pre-wrap;
-  word-break: break-word;
+  max-width: min(100%, 40rem);
+  display: flex;
+  align-items: flex-end;
+  gap: 0.35rem;
   animation: rise 0.18s ease-out;
 }
 @keyframes rise {
-  from { opacity: 0; transform: translateY(4px); }
+  from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: none; }
 }
-.bubble p {
-  margin: 0;
+.bubble.user { align-self: flex-end; flex-direction: row-reverse; }
+.bubble.assistant { align-self: flex-start; }
+.bubble-main {
+  padding: 0.72rem 0.95rem;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
-.bubble.user {
-  align-self: flex-end;
-  color: #fff;
-  background: linear-gradient(135deg, #3b82f6, #2563eb);
-  border-radius: 1.1rem 1.1rem 0.3rem 1.1rem;
-  box-shadow: 0 2px 10px rgba(37, 99, 235, 0.22);
+.bubble p { margin: 0; }
+.bubble.user .bubble-main {
+  color: #f6f1e7;
+  background: var(--ink);
+  border-radius: 1.15rem 1.15rem 0.4rem 1.15rem;
 }
-.bubble.assistant {
-  align-self: flex-start;
-  background: #fff;
-  border: 1px solid #ececf1;
-  border-radius: 1.1rem 1.1rem 1.1rem 0.3rem;
-  box-shadow: 0 1px 3px rgba(16, 16, 24, 0.05);
+.bubble.assistant .bubble-main {
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: 0.4rem 1.15rem 1.15rem 1.15rem;
 }
-.bubble.error {
-  background: #fff5f5;
-  border-color: #fbd5d5;
-  color: #b03434;
+.bubble.assistant.streaming .bubble-main {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.bubble.assistant.streaming .bubble-text::after {
+  content: "";
+  display: inline-block;
+  width: 0.45rem;
+  height: 1em;
+  margin-left: 0.15rem;
+  background: var(--accent);
+  opacity: 0.7;
+  vertical-align: text-bottom;
+  animation: caret 1s steps(1) infinite;
+}
+@keyframes caret {
+  50% { opacity: 0; }
+}
+.bubble.queued { opacity: 0.72; }
+.bubble.assistant.queued .bubble-main { border-style: dashed; }
+.bubble.error .bubble-main {
+  background: var(--danger-soft);
+  border-color: #fecdd3;
+  color: var(--danger);
   box-shadow: none;
 }
-/* 排队待发：还没投递成功，视觉上就该和「已在服务端」的气泡分开 */
-.bubble.queued {
-  opacity: 0.62;
-  border-style: dashed;
-  border-color: #dfe3ee;
-  box-shadow: none;
+.copy {
+  display: block;
+  width: fit-content;
+  margin-top: 0.4rem;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.72rem;
 }
+.bubble.user .copy { color: rgba(246, 241, 231, 0.72); }
+.copy:hover { color: var(--ink); }
+.bubble.user .copy:hover { color: #f6f1e7; }
 
-/* 打字指示（streaming 且尚无文本） */
 .typing {
   display: inline-flex;
-  align-items: center;
-  gap: 0.3rem;
+  gap: 0.28rem;
   height: 1.2em;
+  align-items: center;
 }
 .typing i {
-  width: 0.38rem;
-  height: 0.38rem;
+  width: 0.36rem;
+  height: 0.36rem;
   border-radius: 50%;
-  background: #b3bfd6;
+  background: #b7b0a4;
   animation: blink 1.2s ease-in-out infinite;
 }
 .typing i:nth-child(2) { animation-delay: 0.15s; }
@@ -458,209 +1072,209 @@ header h1 {
   0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
   30% { opacity: 1; transform: translateY(-2px); }
 }
-
-.err-note {
-  display: flex;
-  align-items: center;
+.note {
   gap: 0.3rem;
-  font-size: 0.72rem;
   margin-top: 0.4rem !important;
-  opacity: 0.85;
+  font-size: 0.75rem;
+  color: var(--muted);
 }
-.err-note svg {
-  width: 0.8rem;
-  height: 0.8rem;
+.bubble.error .note { color: var(--danger); }
+.bubble-file {
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  font-size: 0.82rem;
+}
+.bubble-file svg {
+  width: 0.95rem;
+  height: 0.95rem;
   flex: none;
 }
-.stopped-note {
-  display: flex;
-  align-items: center;
-  gap: 0.3rem;
-  font-size: 0.72rem;
-  margin-top: 0.4rem !important;
-  color: #6e6e7a;
+.media-btn {
+  display: block;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  margin-bottom: 0.4rem;
 }
-.stopped-note svg {
-  width: 0.8rem;
-  height: 0.8rem;
-  flex: none;
-}
-.queue-note {
-  display: flex;
-  align-items: center;
-  gap: 0.3rem;
-  font-size: 0.72rem;
-  margin-top: 0.4rem !important;
-  color: #6e6e7a;
-}
-.queue-note svg {
-  width: 0.8rem;
-  height: 0.8rem;
-  flex: none;
-}
-
-/* 气泡内媒体（doc/32 A5）：占位行换成的 <img> / 文件片 */
 .bubble-media {
   display: block;
   max-width: min(100%, 20rem);
   max-height: 18rem;
-  border-radius: 0.6rem;
-  margin-bottom: 0.4rem;
-  background: rgba(255, 255, 255, 0.85);
-}
-.bubble.user .bubble-media {
+  border-radius: 0.7rem;
   background: #fff;
 }
-.bubble-file {
-  font-size: 0.8rem !important;
-  opacity: 0.9;
-}
-
-/* usage 小字（doc/27）：气泡下方一行灰字；>70% 橙、>90% 红 */
 .usage {
   display: block;
-  margin-top: 0.35rem;
-  font-size: 0.7rem;
-  color: #8b8b96;
+  margin-top: 0.4rem;
+  font-size: 0.72rem;
+  color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
-.usage.warm {
-  color: #b45309;
-}
-.usage.hot {
-  color: #b03434;
-}
+.usage.warm { color: #b45309; }
+.usage.hot { color: var(--danger); }
 
-/* ── 输入区：悬浮卡片 ── */
+.attach-notice {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border: 1px solid #fed7aa;
+  padding: 0.45rem 0.7rem;
+}
+.drop-hint {
+  position: absolute;
+  inset: 0.75rem;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  color: var(--accent-ink);
+  background: rgba(229, 243, 238, 0.92);
+  border: 1.5px dashed #7dbaa8;
+  border-radius: 22px;
+  pointer-events: none;
+  font-size: 1rem;
+}
 .composer {
   display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  background: #fff;
-  border: 1px solid #e6e6ec;
-  border-radius: 999px;
-  padding: 0.4rem 0.4rem 0.4rem 0.5rem;
-  box-shadow: 0 4px 20px rgba(16, 16, 24, 0.07);
-  transition: border-color 0.15s, box-shadow 0.15s;
-}
-.attach {
-  flex: none;
-  width: 1.9rem;
-  height: 1.9rem;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: none;
-  border-radius: 50%;
-  background: transparent;
-  color: #6e6e7a;
-  cursor: pointer;
-  transition: background 0.15s, color 0.15s;
-}
-.attach svg {
-  width: 1.05rem;
-  height: 1.05rem;
-}
-.attach:hover:not(:disabled) {
-  background: #eef2ff;
-  color: #2563eb;
-}
-.attach:disabled {
-  opacity: 0.4;
-  cursor: default;
-}
-.attach-chips {
-  display: flex;
-  gap: 0.3rem;
-  flex-wrap: wrap;
-  max-width: 42%;
-}
-.chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.25rem;
-  font-size: 0.72rem;
-  color: #3f3f4a;
-  background: #f1f3f9;
-  border: 1px solid #e2e6f0;
-  border-radius: 999px;
-  padding: 0.15rem 0.6rem;
-  max-width: 12rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.chip-x {
-  border: none;
-  background: none;
-  color: #8b8b96;
-  font-size: 0.85rem;
-  line-height: 1;
-  cursor: pointer;
-  padding: 0;
-}
-.chip-x:hover {
-  color: #b03434;
+  flex-direction: column;
+  gap: 0.35rem;
+  background: var(--bg-raised);
+  border: 1px solid var(--line-strong);
+  border-radius: 22px;
+  padding: 0.7rem 0.7rem 0.55rem;
+  box-shadow: var(--shadow);
 }
 .composer:focus-within {
-  border-color: #b9cdf7;
-  box-shadow: 0 4px 24px rgba(37, 99, 235, 0.13);
+  border-color: #8fbfb0;
+  box-shadow: 0 0 0 4px rgba(15, 110, 86, 0.1), var(--shadow);
 }
-.composer input {
-  flex: 1;
-  min-width: 0;
-  border: none;
+.composer textarea {
+  width: 100%;
+  resize: none;
+  border: 0;
   outline: none;
   background: transparent;
-  font: inherit;
-  font-size: 0.92rem;
-  color: inherit;
-  padding: 0.45rem 0;
+  padding: 0.25rem 0.35rem 0;
+  line-height: 1.55;
+  max-height: 10.5rem;
 }
-.composer input::placeholder {
-  color: #a5a5b0;
-}
-.composer input:disabled {
-  cursor: default;
-}
-.composer button {
-  flex: none;
-  width: 2.35rem;
-  height: 2.35rem;
+.composer textarea::placeholder { color: #a8a29e; }
+.chips {
   display: flex;
-  align-items: center;
-  justify-content: center;
-  border: none;
-  border-radius: 50%;
-  background: linear-gradient(135deg, #3b82f6, #2563eb);
-  color: #fff;
-  cursor: pointer;
-  transition: transform 0.12s, box-shadow 0.15s, opacity 0.15s;
-  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.3);
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  padding: 0 0.2rem;
 }
-.composer button svg {
-  width: 1rem;
-  height: 1rem;
-  margin-left: 0.1rem;
+.chip {
+  gap: 0.35rem;
+  max-width: 16rem;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.15rem 0.35rem 0.15rem 0.15rem;
+  font-size: 0.75rem;
 }
-.composer button:hover:not(:disabled) {
-  transform: scale(1.06);
+.chip img {
+  width: 1.45rem;
+  height: 1.45rem;
+  object-fit: cover;
+  border-radius: 999px;
 }
-.composer button:active:not(:disabled) {
-  transform: scale(0.96);
+.chip-x {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 0 0.25rem;
+  font-size: 0.95rem;
+  line-height: 1;
 }
-.composer button:disabled {
-  background: #dde5f3;
-  color: #fff;
-  box-shadow: none;
-  cursor: default;
+.chip-x:hover { color: var(--danger); }
+.composer-bar { gap: 0.55rem; padding-left: 0.1rem; }
+.icon-btn,
+.send {
+  width: 2.15rem;
+  height: 2.15rem;
+  display: grid;
+  place-items: center;
+  flex: none;
+  padding: 0;
 }
-.sr-only {
+.icon-btn { border-radius: 50%; }
+.icon-btn svg,
+.send svg { width: 1.05rem; height: 1.05rem; }
+.icon-btn:disabled { opacity: 0.4; }
+.hint {
+  margin-right: auto;
+  min-width: 0;
+}
+.hint.live { color: var(--accent-ink); }
+.hint.queue { color: #b45309; }
+.send { border-radius: 50%; }
+.send:disabled {
+  background: #e7e0d4;
+  color: #a8a29e;
+}
+
+.jump {
   position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  white-space: nowrap;
+  left: 50%;
+  bottom: 8.2rem;
+  transform: translateX(-50%);
+  padding: 0.35rem 0.75rem;
+  background: var(--bg-raised);
+  box-shadow: var(--shadow);
+}
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 2rem;
+  background: rgba(28, 25, 23, 0.78);
+}
+.lightbox img {
+  max-width: min(92vw, 64rem);
+  max-height: 88vh;
+  border-radius: 14px;
+}
+
+@media (max-width: 860px) {
+  .app { flex-direction: column; }
+  .rail {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      "brand new foot"
+      "nav nav nav";
+    align-items: center;
+    width: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    padding: 0.65rem 0.7rem 0.55rem;
+    gap: 0.45rem 0.55rem;
+  }
+  .brand { grid-area: brand; }
+  .new-wrap { grid-area: new; }
+  .nav { grid-area: nav; flex-direction: row; }
+  .brand-sub,
+  .rail-foot .who span { display: none; }
+  .nav button { width: auto; padding: 0.4rem 0.55rem; }
+  .rail-foot { grid-area: foot; margin: 0; background: transparent; padding: 0; }
+  .who { max-width: 4.6rem; }
+  .rail { position: relative; }
+  .new-wrap { position: static; }
+  .pop {
+    top: calc(100% + 0.35rem);
+    left: 0.7rem;
+    width: min(16rem, calc(100vw - 1.4rem));
+  }
+  .gate {
+    grid-template-columns: 1fr;
+    gap: 1.2rem;
+    width: min(100% - 1.5rem, 28rem);
+  }
+  .gate-copy h1 { font-size: 1.8rem; }
+  .thread { width: min(100% - 1.2rem, 46rem); }
+  .hint:not(.live):not(.queue) { display: none; }
 }
 </style>

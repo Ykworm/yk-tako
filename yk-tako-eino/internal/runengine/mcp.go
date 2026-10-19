@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cloudwego/eino-ext/components/tool/mcp/officialmcp"
@@ -171,6 +172,74 @@ func (s *Server) ensureMcpConn(name string, sc McpServerConfig) (*mcpServerConn,
 	return conn, nil
 }
 
+func (s *Server) getMcpStatus(c *gin.Context) {
+	p, ok := principalFrom(c)
+	if !ok {
+		writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
+		return
+	}
+	cfg, _, err := s.store.RuntimeConfigRecord(c.Request.Context(), p.TenantID)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	secrets, err := unsealSecretMap(cfg.Secrets)
+	if err != nil {
+		log.Printf("mcp-status unseal tenant=%s: %v", p.TenantID, err)
+		internal(c, err)
+		return
+	}
+	sys, lerr := loadMcpConfig(s.mcpConfPath)
+	if lerr != nil {
+		log.Printf("mcp-status system: %v", lerr)
+		sys = McpConfig{}
+	}
+	tenantServers, merr := materializeServers(cfg.McpServers, secrets)
+	if merr != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeMcpIllegal, merr.Error(), nil)
+		return
+	}
+	connect := s.mcpConnect
+	if connect == nil {
+		connect = connectMcpServer
+	}
+	type item struct {
+		Name   string   `json:"name"`
+		State  string   `json:"state"`
+		Tools  []string `json:"tools"`
+		Reason string   `json:"reason,omitempty"`
+	}
+	data := struct {
+		System []item `json:"system"`
+		Custom []item `json:"custom"`
+	}{System: []item{}, Custom: []item{}}
+	for _, srv := range mergeServers(sys.McpServers, tenantServers) {
+		it := item{Name: srv.name, Tools: []string{}}
+		if strings.TrimSpace(srv.conf.Command) == "" {
+			it.State = "disabled"
+		} else if conn, cerr := connect(c.Request.Context(), srv.name, srv.conf); cerr != nil {
+			if srv.custom {
+				it.State = "failed"
+			} else {
+				it.State = "degraded"
+			}
+			it.Reason = cerr.Error()
+		} else {
+			it.State = "connected"
+			it.Tools = append([]string{}, conn.toolNames...)
+			if conn.session != nil {
+				_ = conn.session.Close()
+			}
+		}
+		if srv.custom {
+			data.Custom = append(data.Custom, it)
+		} else {
+			data.System = append(data.System, it)
+		}
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", data)
+}
+
 func (s *Server) getMcpServers(c *gin.Context) {
 	cfg, err := loadMcpConfig(s.mcpConfPath)
 	if err != nil {
@@ -207,6 +276,10 @@ type mcpToolHandler struct {
 }
 
 func (h *mcpToolHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelAgentContext) (context.Context, *adk.ChatModelAgentContext, error) {
+	// 租户 run 在抢闸前已经连过 MCP，工具在 profile 里。这里再连一次会多出一份进程。
+	if profileFrom(ctx) != nil {
+		return ctx, runCtx, nil
+	}
 	cfg, err := loadMcpConfig(h.confPath)
 	if err != nil {
 		// 配置拒载不当致命：本场 run 照跑、只是没有 MCP 工具（与「server 起不来降级」同一立场）。

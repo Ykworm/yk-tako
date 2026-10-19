@@ -112,6 +112,9 @@ type Note struct {
 	SourceRunID  RunID     `gorm:"not null"` // 写入那场 run（配合 source_seq 找回原话现场）
 	SourceSeq    int64     `gorm:"not null"` // 该消息在 runlog 的 seq
 	SupersededBy *string   // 非空 = 已被替代（replace 时旧行指向新行；remove 直接删行不留指针）
+	TenantID     string    `gorm:"not null;default:'';index:notes_scope,priority:1"`
+	UserID       string    `gorm:"not null;default:'';index:notes_scope,priority:3"`
+	Scope        string    `gorm:"not null;default:user;index:notes_scope,priority:2"` // user | tenant
 	CreatedAt    time.Time `gorm:"not null"`
 }
 
@@ -165,16 +168,16 @@ type noteWrite struct {
 // entries/sums 恒带（成功 = 写后有效集，失败 = 当前有效集）——工具结果文本的清单与「已用」行；
 // 清单是本场定位旧条目的唯一来源（快照冻结，规划 §1-4）。
 type noteWriteResult struct {
-	fail        string
-	op          string // add / replace / remove
-	kind        string // 目标 kind（超帽原因句取它）
-	entries     []noteEntry
-	sums        noteSums
-	itemRunes   int    // 本条 content 的 rune 数
-	quoteRunes  int    // 本条 quote 的 rune 数
-	locateHits  int    // 定位结果：-1 未带 old_content；0 无命中；>1 多行命中；1 唯一命中
-	oldRunes    int    // replace 中被替代行的 rune 数（超帽原因句带数字）
-	projRunes   int    // replace 超帽时的替换后合计（同上）
+	fail           string
+	op             string // add / replace / remove
+	kind           string // 目标 kind（超帽原因句取它）
+	entries        []noteEntry
+	sums           noteSums
+	itemRunes      int    // 本条 content 的 rune 数
+	quoteRunes     int    // 本条 quote 的 rune 数
+	locateHits     int    // 定位结果：-1 未带 old_content；0 无命中；>1 多行命中；1 唯一命中
+	oldRunes       int    // replace 中被替代行的 rune 数（超帽原因句带数字）
+	projRunes      int    // replace 超帽时的替换后合计（同上）
 	invisibleField string // 不可见字符拒写时：content / quote
 	invisibleID    string // 不可见字符拒写时：命中的码点（invisible_unicode_U+XXXX）
 }
@@ -199,11 +202,16 @@ func (s *Store) writeNote(ctx context.Context, workspace string, sourceRunID Run
 	in = noteWrite{Action: action, Kind: kind, Content: content, Quote: quote, OldContent: oldContent}
 	res := noteWriteResult{op: action, kind: kind}
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Exec(`SELECT pg_advisory_xact_lock(hashtext(?))`, workspace).Error; err != nil {
+		sc := scopeFrom(ctx)
+		lockKey := workspace
+		if scopeActive(sc) {
+			lockKey = sc.TenantID + "|" + sc.Scope + "|" + sc.UserID + "|" + workspace
+		}
+		if err := tx.Exec(`SELECT pg_advisory_xact_lock(hashtext(?))`, lockKey).Error; err != nil {
 			return err
 		}
 		// 当前有效集先读出：字段/超帽/定位拒绝时结果文本也要带清单与「已用」行（planning §3-C）。
-		entries, sums, err := liveNotesFrom(tx, workspace)
+		entries, sums, err := liveNotesFrom(tx, workspace, sc)
 		if err != nil {
 			return err
 		}
@@ -226,7 +234,7 @@ func (s *Store) writeNote(ctx context.Context, workspace string, sourceRunID Run
 		}
 		switch action {
 		case "remove":
-			old, hits, err := locateLiveNote(tx, workspace, oldContent)
+			old, hits, err := locateLiveNote(tx, workspace, oldContent, sc)
 			if err != nil {
 				return err
 			}
@@ -239,7 +247,7 @@ func (s *Store) writeNote(ctx context.Context, workspace string, sourceRunID Run
 				return err
 			}
 		case "replace":
-			old, hits, err := locateLiveNote(tx, workspace, oldContent)
+			old, hits, err := locateLiveNote(tx, workspace, oldContent, sc)
 			if err != nil {
 				return err
 			}
@@ -259,9 +267,9 @@ func (s *Store) writeNote(ctx context.Context, workspace string, sourceRunID Run
 				return err
 			}
 			if err := tx.Exec(
-				`INSERT INTO notes (id, workspace, kind, content, quote, source_run_id, source_seq, created_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, now())`,
-				id, workspace, kind, content, quote, sourceRunID, sourceSeq).Error; err != nil {
+				`INSERT INTO notes (id, workspace, kind, content, quote, source_run_id, source_seq, tenant_id, user_id, scope, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())`,
+				id, workspace, kind, content, quote, sourceRunID, sourceSeq, sc.TenantID, sc.UserID, noteScopeName(sc)).Error; err != nil {
 				return err
 			}
 			if err := tx.Exec(
@@ -278,14 +286,14 @@ func (s *Store) writeNote(ctx context.Context, workspace string, sourceRunID Run
 				return err
 			}
 			if err := tx.Exec(
-				`INSERT INTO notes (id, workspace, kind, content, quote, source_run_id, source_seq, created_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, now())`,
-				id, workspace, kind, content, quote, sourceRunID, sourceSeq).Error; err != nil {
+				`INSERT INTO notes (id, workspace, kind, content, quote, source_run_id, source_seq, tenant_id, user_id, scope, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())`,
+				id, workspace, kind, content, quote, sourceRunID, sourceSeq, sc.TenantID, sc.UserID, noteScopeName(sc)).Error; err != nil {
 				return err
 			}
 		}
 		// 写后有效集（清单必须含新行——它是下一轮 replace/remove 的定位凭据）。
-		entries, sums, err = liveNotesFrom(tx, workspace)
+		entries, sums, err = liveNotesFrom(tx, workspace, sc)
 		if err != nil {
 			return err
 		}
@@ -333,10 +341,29 @@ func validateNoteWrite(in noteWrite) (fail string, itemRunes, quoteRunes int) {
 
 // locateLiveNote 按 content 全文在未替代行里定位（doc/17 §7：old_content 必须等于未替代行的
 // content 全文）。返回首个命中与命中数；调用方只在命中数 == 1 时才允许写。
-func locateLiveNote(db *gorm.DB, workspace, content string) (Note, int, error) {
+func noteScopeName(sc dataScope) string {
+	if sc.Scope == "tenant" {
+		return "tenant"
+	}
+	return "user"
+}
+
+func applyNoteScope(db *gorm.DB, sc dataScope) *gorm.DB {
+	if !scopeActive(sc) {
+		return db
+	}
+	name := noteScopeName(sc)
+	db = db.Where("tenant_id = ? AND scope = ?", sc.TenantID, name)
+	if name != "tenant" {
+		db = db.Where("user_id = ?", sc.UserID)
+	}
+	return db
+}
+
+func locateLiveNote(db *gorm.DB, workspace, content string, sc dataScope) (Note, int, error) {
 	var rows []Note
-	if err := db.Where("workspace = ? AND superseded_by IS NULL AND content = ?", workspace, content).
-		Find(&rows).Error; err != nil {
+	q := applyNoteScope(db, sc).Where("workspace = ? AND superseded_by IS NULL AND content = ?", workspace, content)
+	if err := q.Find(&rows).Error; err != nil {
 		return Note{}, 0, err
 	}
 	if len(rows) == 0 {
@@ -347,10 +374,10 @@ func locateLiveNote(db *gorm.DB, workspace, content string) (Note, int, error) {
 
 // liveNotesFrom 从给定连接读未替代行并算合计（写事务内与读口共用同一条查询）。
 // 排序 kind, id：agent 先于 user、各自按 ULID 创建序——快照与清单在两种读路径下逐字节一致。
-func liveNotesFrom(db *gorm.DB, workspace string) ([]noteEntry, noteSums, error) {
+func liveNotesFrom(db *gorm.DB, workspace string, sc dataScope) ([]noteEntry, noteSums, error) {
 	var rows []Note
-	if err := db.Where("workspace = ? AND superseded_by IS NULL", workspace).
-		Order("kind, id").Find(&rows).Error; err != nil {
+	q := applyNoteScope(db, sc).Where("workspace = ? AND superseded_by IS NULL", workspace)
+	if err := q.Order("kind, id").Find(&rows).Error; err != nil {
 		return nil, noteSums{}, err
 	}
 	entries := make([]noteEntry, 0, len(rows))
@@ -368,8 +395,23 @@ func liveNotesFrom(db *gorm.DB, workspace string) ([]noteEntry, noteSums, error)
 
 // listLiveNotes 是有效集的读口（快照 handler 的 BeforeAgent 用；M5 子代理装载处同用）。
 func (s *Store) listLiveNotes(ctx context.Context, workspace string) ([]noteEntry, error) {
-	entries, _, err := liveNotesFrom(s.db.WithContext(ctx), workspace)
-	return entries, err
+	sc := scopeFrom(ctx)
+	if !scopeActive(sc) {
+		entries, _, err := liveNotesFrom(s.db.WithContext(ctx), workspace, dataScope{})
+		return entries, err
+	}
+	userScope := sc
+	userScope.Scope = "user"
+	entries, _, err := liveNotesFrom(s.db.WithContext(ctx), workspace, userScope)
+	if err != nil {
+		return nil, err
+	}
+	teamScope := dataScope{TenantID: sc.TenantID, Scope: "tenant"}
+	team, _, err := liveNotesFrom(s.db.WithContext(ctx), workspace, teamScope)
+	if err != nil {
+		return nil, err
+	}
+	return append(team, entries...), nil
 }
 
 // renderNoteEntry 渲染清单/快照里的一条：content 全文 + 缩进的原话行。
@@ -409,6 +451,47 @@ func renderNotesSnapshot(entries []noteEntry) string {
 	return b.String()
 }
 
+// renderRunNotes 是一场 run 起手真正塞进系统提示的笔记段。没有身份时字节与 renderNotesSnapshot 相同。
+// 有身份时分成团队记忆和个人记忆：模型读得到团队规矩，写入口仍然只开个人。
+func renderRunNotes(ctx context.Context, store *Store, workspace string) (string, error) {
+	sc := scopeFrom(ctx)
+	db := store.db.WithContext(ctx)
+	if !scopeActive(sc) {
+		entries, _, err := liveNotesFrom(db, workspace, dataScope{})
+		if err != nil {
+			return "", err
+		}
+		return renderNotesSnapshot(entries), nil
+	}
+	teamScope := dataScope{TenantID: sc.TenantID, Scope: "tenant"}
+	userScope := sc
+	userScope.Scope = "user"
+	team, _, err := liveNotesFrom(db, workspace, teamScope)
+	if err != nil {
+		return "", err
+	}
+	user, _, err := liveNotesFrom(db, workspace, userScope)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	b.WriteString("团队记忆：")
+	writeNoteSection(&b, team)
+	b.WriteString("\n个人记忆：")
+	writeNoteSection(&b, user)
+	return b.String(), nil
+}
+
+func writeNoteSection(b *strings.Builder, entries []noteEntry) {
+	if len(entries) == 0 {
+		b.WriteString("\n（空）")
+		return
+	}
+	for _, e := range entries {
+		b.WriteString("\n" + renderNoteEntryForPrompt(e))
+	}
+}
+
 // memoryToolDesc 是 memory 工具的说明文案（逐字照 planning §3-A，不改写）。
 const memoryToolDesc = `把以后每一场 run 都要遵守的事实写进笔记。笔记会进以后每一场的系统提示，所以只写短句。
 action=add 是新的一条，必须带 quote，quote 是用户原句。
@@ -436,6 +519,11 @@ func newMemoryTool(store *Store, workspace string) (tool.BaseTool, error) {
 		box := noteBoxFrom(ctx)
 		if box == nil {
 			return "", errors.New("memory 工具缺 run 上下文（noteBox 无 source run/seq）")
+		}
+		// 模型只能写个人笔记。团队笔记走管理接口，不从工具参数里取 scope。
+		if sc := scopeFrom(ctx); scopeActive(sc) {
+			sc.Scope = "user"
+			ctx = withScope(ctx, sc)
 		}
 		res, err := store.writeNote(ctx, workspace, box.run, box.userSeq, noteWrite{
 			Action: in.Action, Kind: in.Kind, Content: in.Content, Quote: in.Quote, OldContent: in.OldContent,
@@ -611,11 +699,10 @@ func (h *noteSnapshotHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatM
 	if box == nil {
 		return ctx, runCtx, nil
 	}
-	entries, err := h.store.listLiveNotes(ctx, h.workspace)
+	snap, err := renderRunNotes(ctx, h.store, h.workspace)
 	if err != nil {
 		return ctx, runCtx, err
 	}
-	snap := renderNotesSnapshot(entries)
 	box.setSnapshot(snap)
 	log.Printf("note snapshot %s/%s:\n%s", box.session, box.run, snap)
 	return ctx, runCtx, nil
@@ -636,6 +723,11 @@ func (h *noteSnapshotHandler) BeforeModelRewriteState(ctx context.Context, state
 	if state.Messages[0].Role != schema.System {
 		return ctx, state, errors.New("note snapshot: state 首条不是 system（ADK 输入形状违例）")
 	}
-	state.Messages[0].Content = h.system + "\n\n" + snap
+	// 这场 run 绑了助手时，系统提示是那一行的 spec，不是进程启动时冻进 handler 的那份。
+	sys := h.system
+	if s, ok := instructionFrom(ctx); ok {
+		sys = s
+	}
+	state.Messages[0].Content = sys + "\n\n" + snap
 	return ctx, state, nil
 }

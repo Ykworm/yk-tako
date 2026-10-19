@@ -1,6 +1,7 @@
 // 协议层：19v6-01 §1–§4 期望字节的 TS 镜像。U1 只定义，U2–U5 消费。
 // 命名类型在 TS 里只是别名、不拦传参——「两种游标别混」靠参数名分开
 // （eventOffset / runlogOffset 各是各端点的参数，不存在统一 cursor 抽象）。
+import { authFetch } from './auth'
 
 export type SessionID = string
 export type RunID = string
@@ -28,7 +29,8 @@ export type Usage = { promptTokens: number; completionTokens: number; window: nu
 export type Row = {
   runlogOffset?: number
   runId: RunID
-  role: 'user' | 'assistant'
+  // 工具执行账本行（tool_call / tool_result）也在 runlog 里；对话界面只画 user/assistant。
+  role: 'user' | 'assistant' | 'tool_call' | 'tool_result'
   messageId?: string
   text: string
   // assistant 行的 provider 账单（后端从 payload 列解出注入；user/tool 行不写该字段）。
@@ -70,7 +72,7 @@ export class ApiError extends Error {
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init)
+  const res = await authFetch(url, init)
   if (!res.ok) {
     let body: ApiErrorBody | null = null
     try {

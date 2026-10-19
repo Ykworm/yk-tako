@@ -25,6 +25,19 @@ func pngB64(t *testing.T, b byte) string {
 	return base64.StdEncoding.EncodeToString([]byte{0x89, 0x50, 0x4E, 0x47, b, b, b, b})
 }
 
+func TestParseSessionMediaPath(t *testing.T) {
+	sid, rel, ok := parseSessionMediaPath("sessions/vis/../priv/secret.png")
+	if !ok || sid != "priv" || rel != "secret.png" {
+		t.Fatalf("Clean 后应落到 priv 会话，得到 sid=%q rel=%q ok=%v", sid, rel, ok)
+	}
+	if _, _, ok := parseSessionMediaPath(".media/abc.png"); ok {
+		t.Fatal("不带会话的 .media 路径不能跳过访问检查")
+	}
+	if _, _, ok := parseSessionMediaPath("sessions/s1/../../etc/passwd"); ok {
+		t.Fatal("清出 sessions 前缀的路径必须拒绝")
+	}
+}
+
 func TestIngestImagesHappy(t *testing.T) {
 	root := t.TempDir()
 	out, err := ingestImages(root, []postImage{{MIME: "image/png", DataBase64: pngB64(t, 1)}}, 1)

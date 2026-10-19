@@ -108,7 +108,10 @@ func einoChunkText(chunk *schema.Message) (string, bool) {
 type Worker struct {
 	store      *Store
 	sum        *summarizer // compact 摘要：旋钮/stall/重试分流/三层验货一条龙（C2）
-	agent      adk.Agent   // 主循环：ADK ChatModelAgent（T2 起挂 get_time）
+	agent      adk.Agent   // 启动时试装配一次，确认配置能建成；真正跑的时候每场 run 另建一个
+	chat       model.BaseChatModel
+	tools      []tool.BaseTool
+	handlers   []adk.ChatModelAgentMiddleware
 	translate  Translator
 	system     string
 	rootRef    string // 主模型生效 ref（T3-1b，= config.ChatModel.Ref）：root 帧的 model 值 + 身份表 root 条目
@@ -124,6 +127,14 @@ type Worker struct {
 	// 不看 epoch）；跨副本传播走 watchdog：续约 CAS 0 行 → 查它、**epoch 相同才** cancel
 	// （doc/30 §7：被接管后旧执行者的 cancel 不能误伤接管者，最坏一个续约间隔）。
 	runCancels sync.Map
+	// models 是租户 run 的模型口。单测不设它，没带 profile 的 run 仍用启动时的 chat。
+	models *TenantModels
+}
+
+func (w *Worker) SetTenantModels(m *TenantModels) {
+	if w != nil {
+		w.models = m
+	}
 }
 
 // runCancel 是注册表的值：取消把柄 + 它属于哪一代执行者。epoch 让 Run 的退出清理
@@ -223,51 +234,132 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 	compactLimit := CompactLimitFor(compactWindow)
 	ceiling := summarizeCeiling(compactWindow, modelRef, maxOutput)
 	sum := newSummarizer(chat, ceiling)
-	agent, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
-		Name:        "yktako",
-		Instruction: system,
-		Model:       chat,
-		// 单 run 模型调用上限：eino 默认 20，2026-10-16 用户裁定放开到 50（agentMaxIterations，理由见常量注释）。
-		MaxIterations: agentMaxIterations,
-		ToolsConfig: adk.ToolsConfig{
-			ToolsNodeConfig: compose.ToolsNodeConfig{
-				Tools: pool,
-			},
-			EmitInternalEvents: true,
-		},
-		Handlers: []adk.ChatModelAgentMiddleware{
-			// 调用方身份标记（doc/22 §4）：root 挂 ""（与 agentModelTable 的 root key 一致），
-			// 放链首 = 日志里它先于其余 handler 出现；其余两个 BeforeAgent handler 的先后有语义：
-			// mcp 工具必须先于 agentSpecHandler append（doc/33 §4.2——子代理的入口快照 base 要含 MCP 工具）。
-			&callerStampMiddleware{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, name: ""},
-			// MCP 工具入池（doc/33 §4.2/§5）：run 起手扫 mcp.json、逐 server 拉起、append runCtx.Tools；
-			// 无配置/连不上 = 本 run 无此类工具照跑，不当致命。
-			&mcpToolHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, confPath: defaultMcpConfPath},
-			newAgentSpecHandler(agentsDir, store, workspace, chat, modelRef, translate, resolver,
-				make(chan struct{}, subagentConcurrency), subagentReturnCap,
-				counter, compactWindow, compactLimit, sum.summarize, firstPartyFileEffects),
-			// 笔记快照缝（M1，notes.go）：BeforeAgent 渲染快照、每轮模型调用前把 system 重写为
-			// Instruction + 快照段；排在 midfold 之前——midfold 从 state 取 system 计数，与模型实见同源。
-			newNoteSnapshotHandler(store, workspace, system),
-			// mid-run fold 钩子排在装载 handler 之后、观测 handler 之前（19v6-10 §4）：
-			// agentLog 看到的是模型实际所见的折后输入。
-			newMidfoldHandler(counter, compactWindow, compactLimit, sum.summarize, firstPartyFileEffects),
-			NewAgentLogHandler(),
-			// 溢出 guard（B1 观测 → B2 救援链，D13；救援依赖与 midfold 同组装配件）：
-			// 链尾 = 最内 user wrapper——模型调用错误冒泡最先到它（wrappers.go:1129 逆序包裹、
-			// first registered = outermost）。四条件同真就折被拒输入重调一次；零帧/闸花原样上抛。
-			newOverflowGuard(compactWindow, counter, sum.summarize, firstPartyFileEffects),
-			// 崩溃账本包壳（doc/30 §6.3）：必须排在所有 append runCtx.Tools 的 handler 之后——
-			// 一手池、MCP（mcpToolHandler）、委派（agentSpecHandler）与以后新增的工具一处覆盖。
-			// 子代理入口快照在此前已完成，拿的是未包壳工具，内部调用不记账。
-			&journalWrapHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, store: store},
-		},
-	})
+	handlers := []adk.ChatModelAgentMiddleware{
+		// 调用方身份标记（doc/22 §4）：root 挂 ""（与 agentModelTable 的 root key 一致），
+		// 放链首 = 日志里它先于其余 handler 出现；其余两个 BeforeAgent handler 的先后有语义：
+		// mcp 工具必须先于 agentSpecHandler append（doc/33 §4.2——子代理的入口快照 base 要含 MCP 工具）。
+		&callerStampMiddleware{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, name: ""},
+		// MCP 工具入池（doc/33 §4.2/§5）：run 起手扫 mcp.json、逐 server 拉起、append runCtx.Tools；
+		// 无配置/连不上 = 本 run 无此类工具照跑，不当致命。
+		&mcpToolHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, confPath: defaultMcpConfPath},
+		newAgentSpecHandler(agentsDir, store, workspace, chat, modelRef, translate, resolver,
+			make(chan struct{}, subagentConcurrency), subagentReturnCap,
+			counter, compactWindow, compactLimit, sum.summarize, firstPartyFileEffects),
+		// 笔记快照缝（M1，notes.go）：BeforeAgent 渲染快照、每轮模型调用前把 system 重写为
+		// Instruction + 快照段；排在 midfold 之前——midfold 从 state 取 system 计数，与模型实见同源。
+		newNoteSnapshotHandler(store, workspace, system),
+		// mid-run fold 钩子排在装载 handler 之后、观测 handler 之前（19v6-10 §4）：
+		// agentLog 看到的是模型实际所见的折后输入。
+		newMidfoldHandler(counter, compactWindow, compactLimit, sum.summarize, firstPartyFileEffects),
+		NewAgentLogHandler(),
+		// 溢出 guard（B1 观测 → B2 救援链，D13；救援依赖与 midfold 同组装配件）：
+		// 链尾 = 最内 user wrapper——模型调用错误冒泡最先到它（wrappers.go:1129 逆序包裹、
+		// first registered = outermost）。四条件同真就折被拒输入重调一次；零帧/闸花原样上抛。
+		newOverflowGuard(compactWindow, counter, sum.summarize, firstPartyFileEffects),
+		// 崩溃账本包壳（doc/30 §6.3）：必须排在所有 append runCtx.Tools 的 handler 之后——
+		// 一手池、MCP（mcpToolHandler）、委派（agentSpecHandler）与以后新增的工具一处覆盖。
+		// 子代理入口快照在此前已完成，拿的是未包壳工具，内部调用不记账。
+		&journalWrapHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, store: store},
+	}
+	w := &Worker{store: store, sum: sum, chat: chat, tools: pool, handlers: handlers, translate: translate, system: system,
+		rootRef: modelRef, leaseRenew: leaseRenew, workspace: workspace, compactWindow: compactWindow, compactLimit: compactLimit, counter: counter}
+	// 启动时先建一次，配置坏了立刻退出。每场 run 再新建，避免多个租户共用一个 agent 实例时取消互相踩掉。
+	agent, err := w.newRunAgent(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	return &Worker{store: store, sum: sum, agent: agent, translate: translate, system: system,
-		rootRef: modelRef, leaseRenew: leaseRenew, workspace: workspace, compactWindow: compactWindow, compactLimit: compactLimit, counter: counter}, nil
+	w.agent = agent
+	return w, nil
+}
+
+// runInstructionKey 把这一场 run 已经定下来的系统提示放进 ctx。
+// 会话绑了助手时，值是 tenant_agents.spec（prompt 正文）；没绑时值就是启动时的 w.system。
+// 空字符串是合法值：助手行的 spec 就是空的。没写这个 key 只发生在 run 外面（启动自检），
+// 调用方那时退回 w.system。
+type runInstructionKey struct{}
+
+func withRunInstruction(ctx context.Context, instruction string) context.Context {
+	return context.WithValue(ctx, runInstructionKey{}, instruction)
+}
+
+type chatOverrideKey struct{}
+
+func withChatOverride(ctx context.Context, chat ChatStream) context.Context {
+	return context.WithValue(ctx, chatOverrideKey{}, chat)
+}
+
+func chatFrom(ctx context.Context, fallback ChatStream) ChatStream {
+	if c, ok := ctx.Value(chatOverrideKey{}).(ChatStream); ok && c != nil {
+		return c
+	}
+	return fallback
+}
+
+func instructionFrom(ctx context.Context) (string, bool) {
+	s, ok := ctx.Value(runInstructionKey{}).(string)
+	return s, ok
+}
+
+func (w *Worker) instruction(ctx context.Context) string {
+	if s, ok := instructionFrom(ctx); ok {
+		return s
+	}
+	return w.system
+}
+
+// resolveRunInstruction 读会话上的 agent_id。空则用进程启动时的系统提示。
+// 有绑定就取那一行的 spec（prompt 正文）。模型名和工具名单不在这里换。
+// 行已经看不见：调用方把这场 run 收成 error，不用全局提示顶上。
+func (w *Worker) resolveRunInstruction(ctx context.Context, sessionID SessionID) (string, error) {
+	p, ok := principalFromCtx(ctx)
+	if !ok || p.TenantID == "" {
+		return w.system, nil
+	}
+	sess, _, err := w.store.SessionAccess(ctx, sessionID, p)
+	if err != nil {
+		return "", err
+	}
+	if sess.AgentID == "" {
+		return w.system, nil
+	}
+	row, err := w.store.VisibleAgent(ctx, p.TenantID, p.UserID, sess.AgentID)
+	if err != nil {
+		return "", err
+	}
+	return row.Spec, nil
+}
+
+// newRunAgent 为这一场 run 单独建一个 ChatModelAgent。工具和 handler 仍是启动时那一份。
+// Instruction 优先用 ctx 里这场 run 的 spec；启动自检没有这场绑定，仍用 w.system。
+func (w *Worker) newRunAgent(ctx context.Context) (adk.Agent, error) {
+	chat := w.chat
+	tools := w.tools
+	if prof := profileFrom(ctx); prof != nil {
+		if prof.Model == nil {
+			return nil, fmt.Errorf("tenant model missing")
+		}
+		chat = prof.Model
+		tools = prof.Tools
+		if tools == nil {
+			tools = []tool.BaseTool{}
+		}
+	}
+	if chat == nil {
+		return w.agent, nil
+	}
+	return adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+		Name:          "yktako",
+		Instruction:   w.instruction(ctx),
+		Model:         chat,
+		MaxIterations: agentMaxIterations,
+		ToolsConfig: adk.ToolsConfig{
+			ToolsNodeConfig: compose.ToolsNodeConfig{
+				Tools: tools,
+			},
+			EmitInternalEvents: true,
+		},
+		Handlers: w.handlers,
+	})
 }
 
 // Workspace 取作业根（doc/32 A1/A4）：Server 的媒体落盘与取图端点经它拿到与文件工具
@@ -309,6 +401,12 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 	// 注册表 cancel 这一个把柄，模型流与工具（子代理调用在 ctx.Done 上返回）随取消 unwind。
 	// 退出清理按指针身份删自己那一条：续跑接管后注册表里已是新一代的值，旧 Run 不许误删。
 	ctx, cancelRun := context.WithCancel(ctx)
+	if prof := profileFrom(ctx); prof != nil {
+		go func() {
+			<-ctx.Done()
+			prof.Close()
+		}()
+	}
 	rc := &runCancel{epoch: epoch, cancel: cancelRun}
 	w.runCancels.Store(runID, rc)
 	defer w.runCancels.CompareAndDelete(runID, rc)
@@ -321,6 +419,34 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 	// A3 起所有写点都带它）。这里塞进的是 agent.Run 与全部工具调用共用的 ctx——工具包装层的
 	// intent/result 都读它。
 	ctx = withJournalTarget(ctx, journalTarget{runID: runID, epoch: epoch})
+	if p, ok := principalFromCtx(ctx); ok {
+		ctx = withScope(ctx, dataScope{TenantID: p.TenantID, UserID: p.UserID, Scope: "user"})
+		if p.TenantID != "" {
+			_, _, daily, maxBytes, qerr := w.store.TenantQuota(ctx, p.TenantID)
+			if qerr == nil && daily > 0 {
+				used, uerr := w.store.DailyTokenUsage(ctx, p.TenantID, time.Now())
+				if uerr == nil && used >= daily {
+					log.Printf("quota %s/%s: daily tokens %d/%d", sessionID, runID, used, daily)
+					status = "error"
+					return
+				}
+			}
+			if dir, err := sessionWorkspace(w.workspace, p.TenantID, sessionID); err != nil {
+				log.Printf("workspace %s/%s: %v", sessionID, runID, err)
+			} else {
+				ref := WorkspaceRef{TenantID: p.TenantID, SessionID: sessionID, Root: dir, TenantRoot: tenantStorageRoot(w.workspace, p.TenantID), MaxBytes: maxBytes}
+				if maxBytes > 0 {
+					tenantID := p.TenantID
+					ref.Reserve = func(adding int) (func(), error) {
+						return w.store.ReserveStorage(context.WithoutCancel(ctx), tenantID, int64(adding), maxBytes, func() int64 {
+							return directoryBytes(tenantStorageRoot(w.workspace, tenantID))
+						})
+					}
+				}
+				ctx = withWorkspace(ctx, ref)
+			}
+		}
+	}
 	// turn 是本 run 模型侧消息的全序（T2）：流式事件合并全文（assistant 轮，带 tool_calls）与
 	// 工具结果事件（tool 轮）按事件序累积，defer 交给 EndRun——complete 才落库，error/闸失零写入。
 	// T3-2 起子代理条目也在列（带 Agent 归属）：分拣归 EndRun 的两个投影，worker 只负责记全。
@@ -373,6 +499,23 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 	}
 	ctx = withNoteBox(ctx, newNoteBox(sessionID, runID, userSeq))
 
+	// 系统提示在抢闸之后才定：带了 profile 就用装配时定下的 spec，摘要也换到租户模型。
+	// 没带 profile 的单测仍读会话上的助手行。放在 EndRun 的 defer 之后，查不到助手时 return 仍会放闸。
+	if prof := profileFrom(ctx); prof != nil {
+		ctx = withRunInstruction(ctx, prof.Instruction)
+		if cs, ok := prof.Model.(ChatStream); ok {
+			ctx = withChatOverride(ctx, cs)
+		}
+	} else {
+		instruction, ierr := w.resolveRunInstruction(ctx, sessionID)
+		if ierr != nil {
+			log.Printf("agent spec %s/%s: %v", sessionID, runID, ierr)
+			status = "error"
+			return
+		}
+		ctx = withRunInstruction(ctx, instruction)
+	}
+
 	// 续跑终稿态（doc/30 §9.1）：账本最后一条 assistant 无 tool_calls = 模型已说完、只差放闸。
 	// 不调模型、不组输入——turn 里已是完整半场，直接走 defer 的 EndRun 定稿。
 	if resume != nil && resume.Final {
@@ -413,7 +556,14 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 	// A2（doc §6 / planning 裁定 8）：agent.Run + 事件消费整体包进外层循环——零帧拒收时强折一次、
 	// 同 ctx 再调一次 agent.Run（watchdog 同闸同租约，无新生命周期）；谓词未命中 / 重试再拒
 	// 照走同一段 error 出口（出口不复制）。
-	table := newAgentModelTable(w.rootRef, w.translate)
+	rootRef, translate := w.rootRef, w.translate
+	if prof := profileFrom(ctx); prof != nil && prof.ModelRef != "" {
+		rootRef = prof.ModelRef
+		if prof.Translator != nil {
+			translate = prof.Translator
+		}
+	}
+	table := newAgentModelTable(rootRef, translate)
 	ctx = withAgentModelTable(ctx, table)
 	// 救援状态（planning 裁定 7/8）：帧计数与一次性闸都是 per-run，重跑不重置——
 	// 重试再拒时谓词读同一份（此时计数或闸已花，救援路径必然出不去）。
@@ -424,8 +574,14 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 	// pendingForceFold 是检出②（A3）的强折意图：>0 = 本 run 检测到截断、run 末强折的目标线
 	// 基数（run 起手放行估算 C，doc §7）；写入发生在事件流排完后（Run 尾部）。
 	pendingForceFold := 0
+	agent, err := w.newRunAgent(ctx)
+	if err != nil {
+		log.Printf("agent %s/%s: %v", sessionID, runID, err)
+		status = "error"
+		return
+	}
 	for {
-		it := w.agent.Run(ctx, &adk.AgentInput{Messages: msgs, EnableStreaming: true})
+		it := agent.Run(ctx, &adk.AgentInput{Messages: msgs, EnableStreaming: true})
 		retry := false
 		for {
 			event, ok := it.Next()
@@ -596,7 +752,7 @@ func (w *Worker) runEndFold(ctx context.Context, box *foldBox, c int) error {
 	if err != nil {
 		return fmt.Errorf("重读 mh: %w", err)
 	}
-	folded, staged, err := foldInput(ctx, w.system, history, box.run, c*4/5, w.compactWindow, w.counter, w.sum.summarize, firstPartyFileEffects)
+	folded, staged, err := foldInput(ctx, w.instruction(ctx), history, box.run, c*4/5, w.compactWindow, w.counter, w.sum.summarize, firstPartyFileEffects)
 	if err != nil {
 		return fmt.Errorf("强折: %w", err)
 	}
@@ -622,7 +778,7 @@ func (w *Worker) rescueOverflow(ctx context.Context, box *foldBox, cause error) 
 	}
 	window, hasWindow := extractWindow(cause)
 	limit := rescueLimit(box.countBase(), window, hasWindow)
-	folded, staged, err := foldInput(ctx, w.system, history, box.run, limit, window, w.counter, w.sum.summarize, firstPartyFileEffects)
+	folded, staged, err := foldInput(ctx, w.instruction(ctx), history, box.run, limit, window, w.counter, w.sum.summarize, firstPartyFileEffects)
 	if err != nil {
 		return nil, fmt.Errorf("强折: %w", err)
 	}
@@ -862,20 +1018,21 @@ func (w *Worker) prepareInputFrom(ctx context.Context, sessionID SessionID, runI
 		limit := w.compactLimit
 		// 放行估算 C 恒算并入容器（A1，planning 裁定 3）：detect 行 / rescue 行 / D4 的 limit'
 		// 三处消费同一个数——C 跟「产出全进容器」同一条路（box.setBase 的先例），不恢复返回值传递。
-		total := countInput(w.counter, w.system, history)
+		sys := w.instruction(ctx)
+		total := countInput(w.counter, sys, history)
 		if box := foldBoxFrom(ctx); box != nil {
 			box.setBaseCount(total)
 		}
 		if total > limit {
 			log.Printf("compact %s/%s: 输入 %d tok > limit %d，进入折叠", sessionID, runID, total, limit)
 			var err error
-			history, staged, err = foldInput(ctx, w.system, history, runID, limit, w.compactWindow, w.counter, w.sum.summarize, firstPartyFileEffects)
+			history, staged, err = foldInput(ctx, sys, history, runID, limit, w.compactWindow, w.counter, w.sum.summarize, firstPartyFileEffects)
 			if err != nil {
 				return nil, err
 			}
 			log.Printf("compact %s/%s: 压 %d 个 run，摘要 %d tok，挂 %s；发送输入 %d tok < limit %d",
 				sessionID, runID, len(staged.DropRunIDs), w.counter.Count(staged.Summary),
-				staged.AttachRun, countInput(w.counter, w.system, history), limit)
+				staged.AttachRun, countInput(w.counter, sys, history), limit)
 		}
 	}
 	if box := foldBoxFrom(ctx); box != nil {

@@ -510,6 +510,7 @@ func (h *midfoldHandler) AfterAgent(ctx context.Context, state *adk.ChatModelAge
 //     指针要指 runlog，而 runlog 工具行本来就挂 root runId）；不调 setBase/appendStaged、摘要行
 //     不打 seq=0、产物永不落库。
 //   - 无 AfterAgent：子代理 state 跑完即弃，没有取货口。
+//
 // 字段全是每规格常量，不含任何 per-delegation 状态：同一场 run 里主代理可以在一条消息里并行发
 // 两次同名委派（eino ToolsNode 默认并行，tako 未设 ExecuteSequentially），两个 goroutine 会同时
 // 进同一个实例——一次调用的东西只走参数与 ADK 给的 state。

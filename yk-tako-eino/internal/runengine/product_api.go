@@ -1,0 +1,1146 @@
+package runengine
+
+import (
+	"errors"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"golang.org/x/crypto/bcrypt"
+)
+
+func (s *Server) requirePrincipal(c *gin.Context) (principal, bool) {
+	p, ok := principalFrom(c)
+	if !ok {
+		writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
+		return principal{}, false
+	}
+	return p, true
+}
+
+func (s *Server) overQuota(c *gin.Context, p principal) bool {
+	if p.TenantID == "" {
+		return false
+	}
+	ctx := c.Request.Context()
+	maxRuns, _, daily, _, err := s.store.TenantQuota(ctx, p.TenantID)
+	if err != nil {
+		internal(c, err)
+		return true
+	}
+	live, err := s.store.CountLiveRuns(ctx, p.TenantID)
+	if err != nil {
+		internal(c, err)
+		return true
+	}
+	if daily > 0 {
+		used, uerr := s.store.DailyTokenUsage(ctx, p.TenantID, time.Now())
+		if uerr != nil {
+			internal(c, uerr)
+			return true
+		}
+		if used >= daily {
+			writeEnvelope(c, http.StatusTooManyRequests, codeQuota, "这个工作区的额度用完了", nil)
+			return true
+		}
+	}
+	if live >= maxRuns {
+		writeEnvelope(c, http.StatusTooManyRequests, codeQuota, "这个工作区的额度用完了", nil)
+		return true
+	}
+	return false
+}
+
+func (s *Server) createTenant(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		writeEnvelope(c, http.StatusBadRequest, codeNameRequired, "请填写工作区名称", nil)
+		return
+	}
+	tenant, member, err := s.store.CreateTeamTenant(c.Request.Context(), p.UserID, name)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusCreated, codeOK, "", ginTenant(tenant, member.Role))
+}
+
+func ginTenant(t Tenant, role string) any {
+	return struct {
+		Tenant struct {
+			ID     string `json:"id"`
+			Kind   string `json:"kind"`
+			Name   string `json:"name"`
+			Status string `json:"status"`
+			Plan   string `json:"plan"`
+		} `json:"tenant"`
+		Membership struct {
+			TenantID string `json:"tenantId"`
+			Role     string `json:"role"`
+		} `json:"membership"`
+	}{
+		Tenant: struct {
+			ID     string `json:"id"`
+			Kind   string `json:"kind"`
+			Name   string `json:"name"`
+			Status string `json:"status"`
+			Plan   string `json:"plan"`
+		}{ID: t.ID, Kind: t.Kind, Name: t.Name, Status: t.Status, Plan: t.Plan},
+		Membership: struct {
+			TenantID string `json:"tenantId"`
+			Role     string `json:"role"`
+		}{TenantID: t.ID, Role: role},
+	}
+}
+
+func (s *Server) listTenants(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	rows, err := s.store.ListUserTenants(c.Request.Context(), p.UserID)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	type item struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Kind   string `json:"kind"`
+		Role   string `json:"role"`
+		Status string `json:"status"`
+	}
+	out := make([]item, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, item{ID: row.ID, Name: row.Name, Kind: row.Kind, Role: row.Role, Status: row.Status})
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		Tenants []item `json:"tenants"`
+	}{Tenants: out})
+}
+
+func (s *Server) getTenant(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	t, err := s.store.GetTenant(c.Request.Context(), p.TenantID)
+	if err != nil {
+		writeEnvelope(c, http.StatusNotFound, codeNotMember, "你不是这个工作区的成员", nil)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		Tenant struct {
+			ID     string `json:"id"`
+			Kind   string `json:"kind"`
+			Name   string `json:"name"`
+			Status string `json:"status"`
+			Plan   string `json:"plan"`
+		} `json:"tenant"`
+	}{Tenant: struct {
+		ID     string `json:"id"`
+		Kind   string `json:"kind"`
+		Name   string `json:"name"`
+		Status string `json:"status"`
+		Plan   string `json:"plan"`
+	}{ID: t.ID, Kind: t.Kind, Name: t.Name, Status: t.Status, Plan: t.Plan}})
+}
+
+func (s *Server) putTenant(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		writeEnvelope(c, http.StatusBadRequest, codeNameRequired, "请填写工作区名称", nil)
+		return
+	}
+	if err := s.store.RenameTenant(c.Request.Context(), p.TenantID, name); err != nil {
+		internal(c, err)
+		return
+	}
+	s.getTenant(c)
+}
+
+func (s *Server) deleteTenant(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	err := s.store.ArchiveTenant(c.Request.Context(), p.TenantID)
+	if errors.Is(err, ErrPersonalTenant) {
+		writeEnvelope(c, http.StatusForbidden, codeForbidden, "没有权限做这件事", nil)
+		return
+	}
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		Status string `json:"status"`
+	}{Status: "archived"})
+}
+
+type noteBody struct {
+	ID        string `json:"id"`
+	Scope     string `json:"scope"`
+	Workspace string `json:"workspace"`
+	Kind      string `json:"kind"`
+	Content   string `json:"content"`
+	Quote     string `json:"quote"`
+}
+
+func notesData(rows []Note) any {
+	out := make([]noteBody, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, noteBody{ID: row.ID, Scope: row.Scope, Workspace: row.Workspace, Kind: row.Kind, Content: row.Content, Quote: row.Quote})
+	}
+	return struct {
+		Notes []noteBody `json:"notes"`
+	}{Notes: out}
+}
+
+func (s *Server) listDevNotes(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	ctx := withScope(c.Request.Context(), dataScope{TenantID: p.TenantID, UserID: p.UserID, Scope: "user"})
+	rows, err := s.store.ListScopedNotes(ctx, c.Query("workspace"))
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", notesData(rows))
+}
+
+func (s *Server) postDevNote(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	var req struct {
+		Workspace string `json:"workspace"`
+		Kind      string `json:"kind"`
+		Content   string `json:"content"`
+		Quote     string `json:"quote"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	if req.Kind == "" {
+		req.Kind = noteKindAgent
+	}
+	ctx := withScope(c.Request.Context(), dataScope{TenantID: p.TenantID, UserID: p.UserID, Scope: "user"})
+	res, err := s.store.writeNote(ctx, req.Workspace, "", 0, noteWrite{Action: "add", Kind: req.Kind, Content: req.Content, Quote: req.Quote})
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	if res.fail != "" {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "笔记内容不符合要求", nil)
+		return
+	}
+	rows, err := s.store.ListScopedNotes(ctx, req.Workspace)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusCreated, codeOK, "", notesData(rows))
+}
+
+func (s *Server) listTenantNotes(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	ctx := withScope(c.Request.Context(), dataScope{TenantID: p.TenantID, Scope: "tenant"})
+	rows, err := s.store.ListScopedNotes(ctx, c.Query("workspace"))
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", notesData(rows))
+}
+
+func (s *Server) postTenantNote(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	var req struct {
+		Workspace string `json:"workspace"`
+		Kind      string `json:"kind"`
+		Content   string `json:"content"`
+		Quote     string `json:"quote"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	if req.Workspace == "" {
+		req.Workspace = "team"
+	}
+	if req.Kind == "" {
+		req.Kind = noteKindAgent
+	}
+	ctx := withScope(c.Request.Context(), dataScope{TenantID: p.TenantID, UserID: p.UserID, Scope: "tenant"})
+	res, err := s.store.writeNote(ctx, req.Workspace, "", 0, noteWrite{Action: "add", Kind: req.Kind, Content: req.Content, Quote: req.Quote})
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	if res.fail != "" {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "笔记内容不符合要求", nil)
+		return
+	}
+	rows, err := s.store.ListScopedNotes(ctx, req.Workspace)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusCreated, codeOK, "", notesData(rows))
+}
+
+func (s *Server) postDevMemory(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	var req struct {
+		Kind    string `json:"kind"`
+		Content string `json:"content"`
+		Topic   string `json:"topic"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Content) == "" {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "邮箱或密码不符合要求", nil)
+		return
+	}
+	ctx := withScope(c.Request.Context(), dataScope{TenantID: p.TenantID, UserID: p.UserID, Scope: "user"})
+	id, err := s.store.SeedMemoryFact(ctx, req.Kind, req.Topic, req.Content)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusCreated, codeOK, "", struct {
+		ID string `json:"id"`
+	}{ID: id})
+}
+
+func (s *Server) devWorkspaceDir(c *gin.Context, p principal) (string, SessionID, bool) {
+	sid, err := s.store.EnsureDevSession(c.Request.Context(), p)
+	if err != nil {
+		internal(c, err)
+		return "", "", false
+	}
+	dir, err := sessionWorkspace(s.mediaRoot, p.TenantID, sid)
+	if err != nil {
+		internal(c, err)
+		return "", "", false
+	}
+	return dir, sid, true
+}
+
+func (s *Server) postDevFile(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	var req struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Path) == "" {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	dir, sid, ok := s.devWorkspaceDir(c, p)
+	if !ok {
+		return
+	}
+	full, err := resolveInWorkspace(dir, req.Path)
+	if err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "邮箱或密码不符合要求", nil)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		internal(c, err)
+		return
+	}
+	if err := os.WriteFile(full, []byte(req.Content), 0o644); err != nil {
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusCreated, codeOK, "", struct {
+		Path      string    `json:"path"`
+		SessionID SessionID `json:"sessionId"`
+	}{Path: req.Path, SessionID: sid})
+}
+
+func (s *Server) getDevFile(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	path := c.Query("path")
+	if path == "" {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	dir, sid, ok := s.devWorkspaceDir(c, p)
+	if !ok {
+		return
+	}
+	full, err := resolveInWorkspace(dir, path)
+	if err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "邮箱或密码不符合要求", nil)
+		return
+	}
+	b, err := os.ReadFile(full)
+	if err != nil {
+		writeEnvelope(c, http.StatusNotFound, codeAgentMissing, "找不到这个文件", nil)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		Path      string    `json:"path"`
+		Content   string    `json:"content"`
+		SessionID SessionID `json:"sessionId"`
+	}{Path: path, Content: string(b), SessionID: sid})
+}
+
+func (s *Server) postDevBash(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	var req struct {
+		Cmd     string `json:"cmd"`
+		Command string `json:"command"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	command := req.Cmd
+	if command == "" {
+		command = req.Command
+	}
+	if strings.TrimSpace(command) == "" {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "邮箱或密码不符合要求", nil)
+		return
+	}
+	dir, sid, ok := s.devWorkspaceDir(c, p)
+	if !ok {
+		return
+	}
+	out, err := runBash(c.Request.Context(), dir, command, bashDevTimeout, true)
+	if err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeForbidden, err.Error(), nil)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		Output    string    `json:"output"`
+		SessionID SessionID `json:"sessionId"`
+		Sandboxed bool      `json:"sandboxed"`
+	}{Output: out, SessionID: sid, Sandboxed: sandboxAvailable()})
+}
+
+func (s *Server) memoryContext(c *gin.Context) (bool, bool) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return false, true
+	}
+	sc := dataScope{TenantID: p.TenantID, UserID: p.UserID, Scope: "user"}
+	if c.Query("scope") == "tenant" {
+		if p.Role != "owner" && p.Role != "admin" && !p.SystemAdmin {
+			writeEnvelope(c, http.StatusForbidden, codeForbidden, "没有权限做这件事", nil)
+			return false, true
+		}
+		sc.Scope = "tenant"
+	}
+	if tid := strings.TrimSpace(c.Query("tenantId")); tid != "" {
+		if !p.SystemAdmin {
+			writeEnvelope(c, http.StatusForbidden, codeForbidden, "没有权限做这件事", nil)
+			return false, true
+		}
+		sc.TenantID = tid
+		sc.Scope = "tenant"
+	}
+	c.Request = c.Request.WithContext(withScope(c.Request.Context(), sc))
+	return true, false
+}
+
+func (s *Server) listAgents(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	kind := c.Query("kind")
+	if kind != "root" && kind != "subagent" {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "kind 只能是 root 或 subagent", nil)
+		return
+	}
+	rows, err := s.store.ListEffectiveAgents(c.Request.Context(), p.TenantID, p.UserID, kind)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		Agents []effectiveAgentBody `json:"agents"`
+	}{Agents: effectiveBodies(rows)})
+}
+
+type effectiveAgentBody struct {
+	ID          string     `json:"id"`
+	DefaultID   string     `json:"defaultId"`
+	Source      string     `json:"source"`
+	Overridden  bool       `json:"overridden"`
+	Name        string     `json:"name"`
+	Description string     `json:"description"`
+	Spec        string     `json:"spec"`
+	ModelRef    string     `json:"modelRef"`
+	ToolPolicy  ToolPolicy `json:"toolPolicy"`
+	Visibility  string     `json:"visibility"`
+}
+
+func effectiveBodies(rows []EffectiveAgent) []effectiveAgentBody {
+	out := make([]effectiveAgentBody, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, effectiveAgentBody{
+			ID: row.ID, DefaultID: row.DefaultID, Source: row.Source, Overridden: row.Overridden,
+			Name: row.Name, Description: row.Description, Spec: row.Spec, ModelRef: row.ModelRef,
+			ToolPolicy: parseToolPolicy(row.ToolPolicy), Visibility: row.Visibility,
+		})
+	}
+	return out
+}
+
+type agentBody struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Spec       string `json:"spec"`
+	ModelRef   string `json:"modelRef"`
+	Visibility string `json:"visibility"`
+	Builtin    bool   `json:"builtin"`
+	CreatedBy  string `json:"createdBy"`
+}
+
+func agentBodies(rows []TenantAgent) []agentBody {
+	out := make([]agentBody, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, agentBody{ID: row.ID, Name: row.Name, Spec: row.Spec, ModelRef: row.ModelRef, Visibility: row.Visibility, Builtin: row.IsBuiltin, CreatedBy: row.CreatedBy})
+	}
+	return out
+}
+
+type agentWrite struct {
+	Name        string      `json:"name"`
+	Kind        string      `json:"kind"`
+	Description *string     `json:"description"`
+	Spec        *string     `json:"spec"`
+	ModelRef    *string     `json:"modelRef"`
+	ToolPolicy  *ToolPolicy `json:"toolPolicy"`
+	Visibility  *string     `json:"visibility"`
+}
+
+func validAgentKind(kind string) bool {
+	return kind == "root" || kind == "subagent" || kind == "both"
+}
+
+func writeAgentFields(c *gin.Context, row *TenantAgent, req agentWrite) bool {
+	if err := applyAgentWrite(row, req); err != nil {
+		msg := "工具策略不合法"
+		if errors.Is(err, ErrBadVisibility) {
+			msg = "助手的名字或 kind 不对"
+		}
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, msg, nil)
+		return false
+	}
+	return true
+}
+
+func applyAgentWrite(row *TenantAgent, req agentWrite) error {
+	if name := strings.TrimSpace(req.Name); name != "" {
+		row.Name = name
+	}
+	if req.Kind != "" {
+		if !validAgentKind(req.Kind) {
+			return ErrBadVisibility
+		}
+		row.Kind = req.Kind
+	}
+	if req.Description != nil {
+		row.Description = *req.Description
+	}
+	if req.Spec != nil {
+		row.Spec = *req.Spec
+	}
+	if req.ModelRef != nil {
+		row.ModelRef = strings.TrimSpace(*req.ModelRef)
+	}
+	if req.Visibility != nil {
+		if *req.Visibility != "private" && *req.Visibility != "tenant" {
+			return ErrBadVisibility
+		}
+		row.Visibility = *req.Visibility
+	}
+	if req.ToolPolicy != nil {
+		raw, err := policyJSON(*req.ToolPolicy)
+		if err != nil {
+			return err
+		}
+		row.ToolPolicy = raw
+	}
+	return nil
+}
+
+func (s *Server) writeAgent(c *gin.Context, status int, row TenantAgent) {
+	body := effectiveBodies([]EffectiveAgent{effectiveFromTenant(row)})[0]
+	writeEnvelope(c, status, codeOK, "", struct {
+		Agent effectiveAgentBody `json:"agent"`
+	}{Agent: body})
+}
+
+func (s *Server) rejectDefaultAgent(c *gin.Context, id string) bool {
+	_, err := s.store.AgentDefaultByID(c.Request.Context(), id)
+	if err == nil {
+		writeEnvelope(c, http.StatusForbidden, codeForbidden, "默认助手不能直接改", nil)
+		return true
+	}
+	if !errors.Is(err, ErrAgentNotFound) {
+		internal(c, err)
+		return true
+	}
+	return false
+}
+
+func (s *Server) createAgent(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	var req agentWrite
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" || !validAgentKind(req.Kind) {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "助手的名字或 kind 不对", nil)
+		return
+	}
+	if _, err := s.store.TenantAgentByName(c.Request.Context(), p.TenantID, req.Name); err == nil {
+		writeEnvelope(c, http.StatusConflict, codeAgentTaken, "这个名字已经有一份配置", nil)
+		return
+	} else if !errors.Is(err, ErrAgentNotFound) {
+		internal(c, err)
+		return
+	}
+	def, err := s.store.AgentDefaultByName(c.Request.Context(), req.Name)
+	var row TenantAgent
+	if err == nil {
+		row = TenantAgent{
+			DefaultID: def.ID, Name: def.Name, Kind: def.Kind, Description: def.Description,
+			Spec: def.Spec, ModelRef: def.ModelRef, ToolPolicy: def.ToolPolicy,
+			Visibility: "tenant", Source: "override",
+		}
+	} else if errors.Is(err, ErrAgentNotFound) {
+		row = TenantAgent{Name: req.Name, Kind: req.Kind, Source: "custom", Visibility: "private", ToolPolicy: `{"mode":"inherit","names":[]}`}
+	} else {
+		internal(c, err)
+		return
+	}
+	if !writeAgentFields(c, &row, req) {
+		return
+	}
+	row.TenantID = p.TenantID
+	row.CreatedBy = p.UserID
+	saved, err := s.store.CreateAgent(c.Request.Context(), row)
+	if errors.Is(err, ErrAgentExists) {
+		writeEnvelope(c, http.StatusConflict, codeAgentTaken, "这个名字已经有一份配置", nil)
+		return
+	}
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	s.writeAgent(c, http.StatusCreated, saved)
+}
+
+func (s *Server) updateAgent(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	if s.rejectDefaultAgent(c, c.Param("agent_id")) {
+		return
+	}
+	row, err := s.store.VisibleAgent(c.Request.Context(), p.TenantID, p.UserID, c.Param("agent_id"))
+	if errors.Is(err, ErrAgentNotFound) {
+		writeEnvelope(c, http.StatusNotFound, codeAgentMissing, "找不到这个助手", nil)
+		return
+	}
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	if p.Role != "owner" && p.Role != "admin" && row.CreatedBy != p.UserID {
+		writeEnvelope(c, http.StatusForbidden, codeForbidden, "没有权限做这件事", nil)
+		return
+	}
+	var req agentWrite
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	if !writeAgentFields(c, &row, req) {
+		return
+	}
+	if err := s.store.UpdateAgent(c.Request.Context(), row); errors.Is(err, ErrAgentExists) {
+		writeEnvelope(c, http.StatusConflict, codeAgentTaken, "这个名字已经有一份配置", nil)
+		return
+	} else if err != nil {
+		internal(c, err)
+		return
+	}
+	s.writeAgent(c, http.StatusOK, row)
+}
+
+func (s *Server) deleteAgent(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	if s.rejectDefaultAgent(c, c.Param("agent_id")) {
+		return
+	}
+	row, err := s.store.VisibleAgent(c.Request.Context(), p.TenantID, p.UserID, c.Param("agent_id"))
+	if errors.Is(err, ErrAgentNotFound) {
+		writeEnvelope(c, http.StatusNotFound, codeAgentMissing, "找不到这个助手", nil)
+		return
+	}
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	if row.IsBuiltin {
+		writeEnvelope(c, http.StatusForbidden, codeForbidden, "没有权限做这件事", nil)
+		return
+	}
+	if p.Role != "owner" && p.Role != "admin" && row.CreatedBy != p.UserID {
+		writeEnvelope(c, http.StatusForbidden, codeForbidden, "没有权限做这件事", nil)
+		return
+	}
+	if err := s.store.DeleteAgent(c.Request.Context(), p.TenantID, row.ID); err != nil {
+		internal(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (s *Server) importAgents(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	var req struct {
+		Files []struct {
+			Name    string `json:"name"`
+			Content string `json:"content"`
+		} `json:"files"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	if len(req.Files) == 0 {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "请上传至少一份规格", nil)
+		return
+	}
+	rows := make([]TenantAgent, 0, len(req.Files))
+	seen := map[string]struct{}{}
+	for _, file := range req.Files {
+		spec, err := parseAgentSpec([]byte(file.Content))
+		if err != nil {
+			writeEnvelope(c, http.StatusBadRequest, codeBadInput, "有一份规格格式不对", nil)
+			return
+		}
+		if _, ok := seen[spec.Name]; ok {
+			writeEnvelope(c, http.StatusBadRequest, codeBadInput, "同一次上传里有重名的助手", nil)
+			return
+		}
+		seen[spec.Name] = struct{}{}
+		if _, err := s.store.TenantAgentByName(c.Request.Context(), p.TenantID, spec.Name); err == nil {
+			writeEnvelope(c, http.StatusConflict, codeAgentTaken, "这个名字已经有一份配置", nil)
+			return
+		} else if !errors.Is(err, ErrAgentNotFound) {
+			internal(c, err)
+			return
+		}
+		pol, err := policyJSON(policyFromSpec(spec))
+		if err != nil {
+			writeEnvelope(c, http.StatusBadRequest, codeBadInput, "有一份规格格式不对", nil)
+			return
+		}
+		def, err := s.store.AgentDefaultByName(c.Request.Context(), spec.Name)
+		var row TenantAgent
+		if err == nil {
+			row = TenantAgent{
+				DefaultID: def.ID, Name: def.Name, Kind: def.Kind, Visibility: "tenant", Source: "override",
+			}
+		} else if errors.Is(err, ErrAgentNotFound) {
+			row = TenantAgent{Name: spec.Name, Kind: "subagent", Visibility: "tenant", Source: "custom"}
+		} else {
+			internal(c, err)
+			return
+		}
+		row.Description = spec.Description
+		row.Spec = spec.Prompt
+		row.ModelRef = spec.Model
+		row.ToolPolicy = pol
+		row.TenantID = p.TenantID
+		row.CreatedBy = p.UserID
+		rows = append(rows, row)
+	}
+	saved, err := s.store.InsertAgents(c.Request.Context(), rows)
+	if errors.Is(err, ErrAgentExists) {
+		writeEnvelope(c, http.StatusConflict, codeAgentTaken, "这个名字已经有一份配置", nil)
+		return
+	}
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	out := make([]effectiveAgentBody, 0, len(saved))
+	for _, row := range saved {
+		out = append(out, effectiveBodies([]EffectiveAgent{effectiveFromTenant(row)})[0])
+	}
+	writeEnvelope(c, http.StatusCreated, codeOK, "", struct {
+		Agents []effectiveAgentBody `json:"agents"`
+	}{Agents: out})
+}
+
+func (s *Server) tenantUsage(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	tokens, live, maxRuns, maxSub, daily, storage, err := s.store.TenantUsage(c.Request.Context(), p.TenantID)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		Tokens            int64 `json:"tokens"`
+		LiveRuns          int   `json:"liveRuns"`
+		MaxConcurrentRuns int   `json:"maxConcurrentRuns"`
+		MaxSubagents      int   `json:"maxSubagents"`
+		DailyTokens       int64 `json:"dailyTokens"`
+		MaxStorageBytes   int64 `json:"maxStorageBytes"`
+	}{Tokens: tokens, LiveRuns: live, MaxConcurrentRuns: maxRuns, MaxSubagents: maxSub, DailyTokens: daily, MaxStorageBytes: storage})
+}
+
+func (s *Server) getRuntimeConfig(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	cfg, err := s.store.GetRuntimeConfig(c.Request.Context(), p.TenantID)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		Config runtimeConfig `json:"config"`
+	}{Config: maskSecrets(cfg)})
+}
+
+func (s *Server) putRuntimeConfig(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	var cfg runtimeConfig
+	if err := c.ShouldBindJSON(&cfg); err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	if err := validateRuntime(cfg); err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "MCP 配置不合法", nil)
+		return
+	}
+	if err := s.store.PutRuntimeConfig(c.Request.Context(), p.TenantID, p.UserID, cfg); err != nil {
+		internal(c, err)
+		return
+	}
+	s.getRuntimeConfig(c)
+}
+
+func (s *Server) createInvitation(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	var req struct {
+		Email string `json:"email"`
+		Role  string `json:"role"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	email, okEmail := normalizeEmail(req.Email)
+	if !okEmail {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "邮箱或密码不符合要求", nil)
+		return
+	}
+	if req.Role == "owner" {
+		writeEnvelope(c, http.StatusBadRequest, codeInviteOwner, "不能邀请所有者", nil)
+		return
+	}
+	if !assignableRole(req.Role) {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "邮箱或密码不符合要求", nil)
+		return
+	}
+	inv, token, err := s.store.CreateInvitation(c.Request.Context(), p.TenantID, p.UserID, email, req.Role)
+	if errors.Is(err, ErrAlreadyMember) {
+		writeEnvelope(c, http.StatusConflict, codeInviteMember, "已经是这个工作区的成员", nil)
+		return
+	}
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusCreated, codeOK, "", struct {
+		Invitation  inviteBody `json:"invitation"`
+		InviteToken string     `json:"inviteToken"`
+	}{Invitation: inviteBodyOf(inv), InviteToken: token})
+}
+
+type inviteBody struct {
+	ID        string `json:"id"`
+	Email     string `json:"email"`
+	Role      string `json:"role"`
+	Status    string `json:"status"`
+	ExpiresAt string `json:"expiresAt"`
+}
+
+func inviteBodyOf(inv TenantInvitation) inviteBody {
+	return inviteBody{ID: inv.ID, Email: inv.Email, Role: inv.Role, Status: inv.Status, ExpiresAt: inv.ExpiresAt.UTC().Format(time.RFC3339)}
+}
+
+func (s *Server) listInvitations(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	rows, err := s.store.ListTenantInvitations(c.Request.Context(), p.TenantID)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	out := make([]inviteBody, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, inviteBodyOf(row))
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		Invitations []inviteBody `json:"invitations"`
+	}{Invitations: out})
+}
+
+func (s *Server) revokeInvitation(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	err := s.store.RevokeInvitation(c.Request.Context(), p.TenantID, c.Param("inv_id"))
+	if errors.Is(err, ErrInviteInvalid) {
+		writeEnvelope(c, http.StatusNotFound, codeInviteInvalid, "邀请无效或已过期", nil)
+		return
+	}
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (s *Server) myInvitations(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	rows, err := s.store.ListMyInvitations(c.Request.Context(), p.Email)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	out := make([]inviteBody, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, inviteBodyOf(row))
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		Invitations []inviteBody `json:"invitations"`
+	}{Invitations: out})
+}
+
+func (s *Server) acceptInvitation(c *gin.Context) {
+	s.answerInvitation(c, true)
+}
+
+func (s *Server) declineInvitation(c *gin.Context) {
+	s.answerInvitation(c, false)
+}
+
+func (s *Server) answerInvitation(c *gin.Context, accept bool) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	var err error
+	if accept {
+		err = s.store.AcceptInvitation(c.Request.Context(), p.UserID, p.Email, c.Param("id"))
+	} else {
+		err = s.store.DeclineInvitation(c.Request.Context(), p.Email, c.Param("id"))
+	}
+	if errors.Is(err, ErrInviteInvalid) {
+		writeEnvelope(c, http.StatusNotFound, codeInviteInvalid, "邀请无效或已过期", nil)
+		return
+	}
+	if errors.Is(err, ErrAlreadyMember) {
+		writeEnvelope(c, http.StatusConflict, codeInviteMember, "已经是这个工作区的成员", nil)
+		return
+	}
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		Status string `json:"status"`
+	}{Status: map[bool]string{true: "accepted", false: "declined"}[accept]})
+}
+
+func (s *Server) getModelResolve(c *gin.Context) {
+	p, ok := principalFrom(c)
+	if !ok {
+		writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
+		return
+	}
+	if s.worker == nil || s.worker.models == nil {
+		writeEnvelope(c, http.StatusConflict, codeModelUnavailable, "这个工作区的模型还不可用", nil)
+		return
+	}
+	cfg, raw, err := s.store.RuntimeConfigRecord(c.Request.Context(), p.TenantID)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	secrets, err := unsealSecretMap(cfg.Secrets)
+	if err != nil {
+		log.Printf("model-resolve unseal tenant=%s: %v", p.TenantID, err)
+		internal(c, err)
+		return
+	}
+	ref := strings.TrimSpace(c.Query("ref"))
+	if ref == "" {
+		ref = effectiveModelRef("", cfg.ModelRef, s.worker.models.RootRef())
+	}
+	built, cacheKey, err := s.worker.models.Resolve(c.Request.Context(), p.TenantID, ref, raw, secrets)
+	if err != nil {
+		log.Printf("model-resolve tenant=%s ref=%s: %v", p.TenantID, ref, err)
+		writeEnvelope(c, http.StatusConflict, codeModelUnavailable, "这个工作区的模型还不可用", nil)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		Ref            string `json:"ref"`
+		Provider       string `json:"provider"`
+		Model          string `json:"model"`
+		KeyFingerprint string `json:"keyFingerprint"`
+		CacheKey       string `json:"cacheKey"`
+	}{Ref: built.Ref, Provider: built.Provider, Model: built.ModelID, KeyFingerprint: built.KeyFP, CacheKey: cacheKey})
+}
+
+func (s *Server) lookupInvitation(c *gin.Context) {
+	inv, tenant, err := s.store.LookupInvitation(c.Request.Context(), c.Param("token"))
+	if errors.Is(err, ErrInviteInvalid) {
+		writeEnvelope(c, http.StatusNotFound, codeInviteInvalid, "邀请无效或已过期", nil)
+		return
+	}
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		TenantName string `json:"tenantName"`
+		Role       string `json:"role"`
+		Status     string `json:"status"`
+	}{TenantName: tenant.Name, Role: inv.Role, Status: inv.Status})
+}
+
+func (s *Server) registerByInvite(c *gin.Context) {
+	var req struct {
+		Token    string `json:"token"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	email, ok := normalizeEmail(req.Email)
+	if !ok || len([]rune(req.Password)) < 8 || strings.TrimSpace(req.Token) == "" {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "邮箱或密码不符合要求", nil)
+		return
+	}
+	inv, _, err := s.store.LookupInvitation(c.Request.Context(), req.Token)
+	if err != nil || inv.Email != email || inv.Status != "pending" || time.Now().After(inv.ExpiresAt) {
+		writeEnvelope(c, http.StatusNotFound, codeInviteInvalid, "邀请无效或已过期", nil)
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	user, err := s.store.RegisterByInvite(c.Request.Context(), email, string(hash), inv.ID)
+	if errors.Is(err, ErrEmailTaken) {
+		writeEnvelope(c, http.StatusConflict, codeEmailTaken, "这个邮箱已经注册", nil)
+		return
+	}
+	if errors.Is(err, ErrInviteInvalid) {
+		writeEnvelope(c, http.StatusNotFound, codeInviteInvalid, "邀请无效或已过期", nil)
+		return
+	}
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusCreated, codeOK, "", struct {
+		UserID string `json:"userId"`
+		Status string `json:"status"`
+	}{UserID: user.ID, Status: "accepted"})
+}

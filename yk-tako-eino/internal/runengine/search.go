@@ -132,7 +132,7 @@ func newSearchHistoryTool(store *Store, workspace string) (tool.BaseTool, error)
 				return "", err
 			}
 			inline, full, truncated := renderSearchWindow(rows, in.AroundSeq, window)
-			return spillIfTruncated(inline, full, truncated, workspace, box), nil
+			return spillIfTruncated(inline, full, truncated, activeRoot(ctx, workspace), box), nil
 		}
 		words := strings.Fields(in.Query)
 		switch {
@@ -166,7 +166,7 @@ func newSearchHistoryTool(store *Store, workspace string) (tool.BaseTool, error)
 			return "", err
 		}
 		inline, full, truncated := renderSearchHits(hits, words[0])
-		return spillIfTruncated(inline, full, truncated, workspace, box), nil
+		return spillIfTruncated(inline, full, truncated, activeRoot(ctx, workspace), box), nil
 	})
 }
 

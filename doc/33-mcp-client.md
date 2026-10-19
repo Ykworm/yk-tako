@@ -66,7 +66,9 @@ eino-ext 有两个 MCP 工具适配器，都把「一个已连上的 MCP 会话�
 
 ### 3.1 配置文件形状（照 Claude Code 惯例）
 
-`yk-tako-eino/mcp.json`（与 `agents/`、`workspace/` 同级）：
+运行时读 `yk-tako-eino/mcp.json`（与 `agents/`、`workspace/` 同级）。
+仓库只提交 `mcp.example.json`（`mcp.json` 已进 `.gitignore`）：要用 MCP 时复制成
+`mcp.json`，验收想测空名单就把本地文件移走——不默认启用、删改也不弄脏工作区。
 
 ```json
 {
@@ -156,7 +158,7 @@ fileOps 账本只记一手写工具的账。MCP server（如 filesystem server�
   # 期望字节（形）：{"servers":[{"name":"fs","state":"connected","tools":
   #   ["mcp__fs__read_file","mcp__fs__list_directory", ...]}],"count":1}
   # 2. 改坏 command 指向不存在的程序 → curl 应见 "state":"failed" + 原因，引擎不崩
-  # 3. 删掉 mcp.json → curl 应见 {"servers":[],"count":0}
+  # 3. mv mcp.json /tmp/ → curl 应见 {"servers":[],"count":0}（验完移回）
   ```
 - **回答什么问题**：stdio 拉起 + 官方 SDK 握手 + GetTools 三件在真实进程里通不通（含 §2.3 待核实项）。
 
@@ -170,7 +172,7 @@ fileOps 账本只记一手写工具的账。MCP server（如 filesystem server�
   curl -s -X POST 127.0.0.1:PORT/sessions/<id>/runs \
     -d '{"query":"用 read_file 读 workspace/notes.md 开头三行，原样引用"}'
   # 期望：tool 行 name=mcp__fs__read_file；引用内容与文件头三行逐字一致；terminal complete
-  # 反证：删 mcp.json 再跑同话本 → agent 报「没有这个工具」，无伪造执行痕迹
+  # 反证：mv mcp.json /tmp/ 再跑同话本 → agent 报「没有这个工具」，无伪造执行痕迹（验完移回）
   ```
 - **回答什么问题**：MCP 工具经声明过滤、四态池、溢出层全链路跑通；模型真的会调它。
 
