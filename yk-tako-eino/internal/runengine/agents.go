@@ -394,8 +394,10 @@ func truncateDelegationReturn(s string, capBytes int) string {
 // （继承档用主实例 / ref 档查注册表）→ 装配子代理（Instruction = 规格正文 + 快照段）→
 // 包 AgentTool → append runCtx.Tools + 写身份表（agentModelTable），最后打装载日志与逐条 system 日志。
 //
-// 白名单档的名称空间 = base 本身：tools: [a, b] 里的 a、b 其实已经在 base tools 里面——
-// resolveToolPool 只按名从 base 挑子集（挑不到 = 拒该条并列出可选名单），只收窄、不扩容。
+// 白名单档的名称空间 = base + 保留名 tool_search：tools: [a, b] 里的 a、b 其实已经在 base
+// tools 里面——resolveToolPool 只按名从 base 挑子集（挑不到 = 拒该条并列出可选名单），只收窄。
+// 唯一例外是 tool_search：它不在 base（入口快照早于根 handler 入池），由子代理自己的
+// toolSearchHandler 在 BeforeAgent 末尾装入并绑定该 agent 的目录；写进 tools: 才是显式要。
 //
 // 装载面错误（坏规格 / 解析失败 / 装配失败）全部降级为 log 拒该条——run 本身照跑（最差 = 无委派工具）。
 // 唯一不降级的 = 笔记快照读库失败走 error：笔记层不可信不静默，与主代理 noteSnapshotHandler 同政策
@@ -455,6 +457,22 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 			entry = agentModelEntry{ref: inst.Ref, translate: TranslatorFor(inst.Protocol)}
 		}
 		instruction := spec.Prompt + "\n\n" + snap
+		// 子代理的目录分级（T4/T5 A2）：只有显式写进 tools: 才挂自己的 toolSearchHandler——
+		// 每条规格一份完整目录/激活集，tool_search 只搜自己的池。继承档与 exclude_tools 档
+		// 不自动加（2026-10-20 已拍），其 MCP 工具照旧全部 direct 声明。
+		wantSearch := specWantsToolSearch(spec)
+		handlers := []adk.ChatModelAgentMiddleware{
+			&callerStampMiddleware{
+				BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, name: spec.Name,
+			},
+		}
+		if wantSearch {
+			handlers = append(handlers, newToolSearchHandler())
+		}
+		// 子代理折叠（doc/17 §6）：追加进同一列表，按规格名造——handler 无状态
+		// （同 run 内并行同名委派共用一个实例），字段全是每规格常量。
+		handlers = append(handlers, newAgentFoldHandler(spec.Name, h.foldCounter, h.foldWindow, h.foldLimit,
+			h.foldSummarize, h.foldEffects))
 		sub, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
 			Name:        spec.Name,
 			Description: spec.Description,
@@ -466,15 +484,7 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 			ToolsConfig:   adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: pool}},
 			// 调用方身份标记（doc/22 §4）：web_search 按它查 agentModelTable 取该子代理自己的
 			// 生效 ref——不挂标记工具只能报错，挂主 ref 会把子代理的搜索打错厂商。
-			// 子代理折叠（doc/17 §6）：追加进同一列表，按规格名造——handler 无状态
-			// （同 run 内并行同名委派共用一个实例），字段全是每规格常量。
-			Handlers: []adk.ChatModelAgentMiddleware{
-				&callerStampMiddleware{
-					BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, name: spec.Name,
-				},
-				newAgentFoldHandler(spec.Name, h.foldCounter, h.foldWindow, h.foldLimit,
-					h.foldSummarize, h.foldEffects),
-			},
+			Handlers: handlers,
 		})
 		if err != nil {
 			log.Printf("agents: %s: 拒载: 子代理装配失败: %v", spec.Name, err)
@@ -486,6 +496,9 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 		// 放在装配成功之后 ⇒ 拒载的规格打不出这行，日志里出现的名单都是真生效的；一行明细排在
 		// 下面那段多行 system dump 之前，grep "agent tools" 直接出逐条名单。
 		_, toolNames := poolIndex(ctx, pool)
+		if wantSearch {
+			toolNames = append(toolNames, toolSearchToolName) // handler 在 BeforeAgent 末尾装入，排在池尾
+		}
 		log.Printf("agent tools %s: %s", spec.Name, strings.Join(toolNames, ", "))
 		// 子代理 system 全文日志（M5 观测面，转正点 planning §7）：装载时打拼接后 Instruction——
 		// 快照句在规格正文之后的活体证据就靠它。
@@ -513,7 +526,8 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 //     继承父池减去列出的名字，见 excludeFromPool
 //
 // 名称空间四态同一个 = base（入口快照，此刻还没有任何委派工具 ⇒ 天然禁嵌套，
-// 写 exclude_tools: [coder] 是未知名、拒载）。
+// 写 exclude_tools: [coder] 是未知名、拒载）。白名单档额外认保留名 tool_search：
+// 它由子代理自己的 toolSearchHandler 装入，本函数只负责不把它当未知名。
 func resolveToolPool(ctx context.Context, spec AgentSpec, base []tool.BaseTool) ([]tool.BaseTool, error) {
 	if spec.Tools == nil {
 		if spec.ExcludeTools == nil {
@@ -527,13 +541,32 @@ func resolveToolPool(ctx context.Context, spec AgentSpec, base []tool.BaseTool) 
 	byName, names := poolIndex(ctx, base)
 	pool := make([]tool.BaseTool, 0, len(*spec.Tools))
 	for _, name := range *spec.Tools {
+		if name == toolSearchToolName {
+			continue // 保留名：不在 base，由子代理自己的 toolSearchHandler 装入
+		}
 		t, ok := byName[name]
 		if !ok {
-			return nil, fmt.Errorf("tools 列了未知名 %q（可选: %s）", name, strings.Join(names, ", "))
+			options := append(append([]string(nil), names...), toolSearchToolName)
+			return nil, fmt.Errorf("tools 列了未知名 %q（可选: %s）", name, strings.Join(options, ", "))
 		}
 		pool = append(pool, t)
 	}
 	return pool, nil
+}
+
+// specWantsToolSearch 是子代理要 tool_search 的唯一判据：显式写进 tools:。
+// 继承档与 exclude_tools 档不自动加——入口快照 base 本就不含 tool_search，
+// 这类子代理拿不到检索工具，其 MCP 工具照旧全部 direct 声明，不出现「有目录无检索」的半边天。
+func specWantsToolSearch(spec AgentSpec) bool {
+	if spec.Tools == nil {
+		return false
+	}
+	for _, name := range *spec.Tools {
+		if name == toolSearchToolName {
+			return true
+		}
+	}
+	return false
 }
 
 // poolIndex 按 Info().Name 给父池建索引，同时保序带出名字表（两条「未知名」报错的可选名单用它）。

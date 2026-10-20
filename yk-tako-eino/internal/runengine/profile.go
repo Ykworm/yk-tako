@@ -373,6 +373,11 @@ func (s *Server) checkSubagentBounds(ctx context.Context, p principal, rootTools
 		switch policy.Mode {
 		case "allow":
 			for _, name := range policy.Names {
+				// tool_search 是保留名：装配期池里没有它（由子代理自己的 toolSearchHandler
+				// 在 BeforeAgent 末尾装入），不能按普通工具名拒绝。
+				if name == toolSearchToolName {
+					continue
+				}
 				if !full[name] {
 					log.Printf("assemble subagent %s allow unknown %s", row.Name, name)
 					return failAssemble(http.StatusBadRequest, codeUnknownTool, "工具策略里有不认识的工具", errors.New(name))
@@ -384,6 +389,9 @@ func (s *Server) checkSubagentBounds(ctx context.Context, p principal, rootTools
 			}
 		case "exclude":
 			for _, name := range policy.Names {
+				if name == toolSearchToolName {
+					continue // 同上：保留名不在装配期池里；本档也不自动给 tool_search
+				}
 				if !full[name] {
 					log.Printf("assemble subagent %s exclude unknown %s", row.Name, name)
 					return failAssemble(http.StatusBadRequest, codeUnknownTool, "工具策略里有不认识的工具", errors.New(name))

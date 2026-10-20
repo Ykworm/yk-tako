@@ -209,6 +209,47 @@ func TestToolSearchHandlerDeclaresAndActivates(t *testing.T) {
 	}
 }
 
+// TestResolveToolPoolReservedToolSearch 钉 A2 的池解析面：tool_search 是保留名——
+// 写进 tools: 不算未知名、也不进池（真工具由子代理自己的 handler 装入）；
+// 继承档与 exclude_tools 档不自动获得它。
+func TestResolveToolPoolReservedToolSearch(t *testing.T) {
+	ctx := context.Background()
+	base := []tool.BaseTool{
+		fakeSearchTool(t, "get_time", "查当前时间"),
+		fakeSearchTool(t, "mcp__fs__list_directory", "List the contents of a directory."),
+	}
+
+	list := []string{toolSearchToolName, "mcp__fs__list_directory"}
+	pool, err := resolveToolPool(ctx, AgentSpec{Tools: &list}, base)
+	if err != nil {
+		t.Fatalf("保留名不应被当未知名: %v", err)
+	}
+	if got := toolNames(t, pool); len(got) != 1 || got[0] != "mcp__fs__list_directory" {
+		t.Fatalf("池里应只有声明的 MCP 工具（tool_search 由 handler 装入），得 %v", got)
+	}
+	if !specWantsToolSearch(AgentSpec{Tools: &list}) {
+		t.Fatal("显式写 tool_search 应要求挂子代理 handler")
+	}
+
+	only := []string{toolSearchToolName}
+	if pool, err := resolveToolPool(ctx, AgentSpec{Tools: &only}, base); err != nil || len(pool) != 0 {
+		t.Fatalf("只写 tool_search 应得空池、不报错: %v %v", toolNames(t, pool), err)
+	}
+	if specWantsToolSearch(AgentSpec{}) {
+		t.Fatal("继承档不应自动获得 tool_search")
+	}
+	drop := []string{"get_time"}
+	if specWantsToolSearch(AgentSpec{ExcludeTools: &drop}) {
+		t.Fatal("exclude_tools 档不应自动获得 tool_search")
+	}
+
+	typo := []string{"tool_serch"}
+	_, err = resolveToolPool(ctx, AgentSpec{Tools: &typo}, base)
+	if err == nil || !strings.Contains(err.Error(), "tool_serch") || !strings.Contains(err.Error(), toolSearchToolName) {
+		t.Fatalf("未知名报错的可选名单应含保留名，实得: %v", err)
+	}
+}
+
 func TestToolSearchHandlerRunLocalBox(t *testing.T) {
 	h := newToolSearchHandler()
 	direct := fakeSearchTool(t, "get_time", "查当前时间")

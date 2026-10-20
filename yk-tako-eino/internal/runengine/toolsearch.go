@@ -20,6 +20,11 @@
 //
 // 激活集寿命 = 只活一场 run（2026-10-20 已拍）：新 run / 崩溃续跑都从零激活，
 // 回执固定写 `Loaded N tool(s) for this run...`，不承诺跨 run。
+//
+// 子代理（A2）：规格显式写 tools: [tool_search, ...] 时，agentSpecHandler 给该子代理的
+// handler 链也挂一个 toolSearchHandler——每条规格自己的 box/完整目录/激活集，tool_search
+// 只搜自己的池。继承档 / exclude_tools 档不自动加（已拍），其工具全部 direct 声明。
+// resolveToolPool 把保留名 tool_search 跳过：真工具由本 handler 在子代理 BeforeAgent 末尾装入。
 package runengine
 
 import (
