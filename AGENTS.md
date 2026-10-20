@@ -1,7 +1,48 @@
 # AGENTS.md
 
 tako 是一个 agent 运行时（不是知识库；RAG/记忆只作横切支撑）。
-**方案真源在 `doc/`**，`tmp/` 下只有执行台账。版本号跳不跳由用户判定，不要自行宣布 vN+1。
+**方案真源在 `doc/`（索引：[doc/README.md](doc/README.md)）**，`tmp/` 下只有执行台账。版本号跳不跳由用户判定，不要自行宣布 vN+1。
+
+## 仓库结构
+
+```text
+yk-tako/
+  yk-tako-eino/            Go 引擎 + Vue 前端（唯一施工面）
+    cmd/yktako/            唯一入口
+    internal/runengine/    运行引擎：API、worker、存储、工具、子代理、记忆、MCP
+    internal/config/       模型厂商目录、模型客户端、系统提示词
+    agents/                出厂子代理规格（coder.md / researcher.md）
+    web/                   Vue 3 + Vite 前端
+    mcp.example.json       MCP 配置样例（本机真配置 mcp.json 不入库）
+  doc/                     当前方案与实现真源（入口 doc/README.md）
+    19-v6/                 运行引擎架构文档集
+  docs/                    历史交接与文章，不作施工真源
+  scripts/dev.sh           一键开发环境（Redis / Postgres / 引擎 / Vite）
+  tmp/                     本地执行台账（不入库，验收后清理）
+  AGENTS.md                协作与施工纪律
+  README.md                项目门面与快速开始
+```
+
+- 所有 Go 代码在 `yk-tako-eino/` 下，Go 命令都以它为 cwd（`go run ./cmd/yktako`、`go test ./internal/runengine`）。
+- 运行时产物不入库：`yk-tako-eino/workspace/`、`yk-tako-eino/tmp/`、`tmp/`、`yk-tako-eino/mcp.json`、`.env`。
+- 方案与实现记录放 `doc/`；执行台账放 `tmp/<方案名>/`，验收完清理，不当作文档真源。
+
+## 文档状态与真源
+
+- `doc/`：当前方案与实现真源。改代码前先看这里；与代码冲突时先判断哪一边过期，再同步。
+- `doc/README.md`：文档索引——现行真源 / 历史存档 / 非方案内容三张表、阅读顺序、新增文档规则。读任何一篇文档前先查这里。
+- `doc/19-v6/`：运行引擎架构文档集，v6 契约与机制的真源。
+- `docs/`：历史交接与文章（早期 handoff、superpowers 记录等），**不作施工真源**；引用前先确认结论是否已被 `doc/` 取代。
+- `tmp/`：本地执行台账（planning.md / todos.md），验收后清理，不进版本库。
+- **归档区**：本轮不搬家，历史文档仍按原编号留在 `doc/`；将来迁入 `doc/archive/` 后只作历史诊断。归档文档不能作为「所以方案该怎么做」的论据。
+
+新增或修改文档时：
+
+1. 方案文档放 `doc/`，沿用 `NN-主题.md` 编号（成套文档用 `doc/NN-主题/` 目录），不复用旧编号。
+2. 头注写清状态：方案（待点头）/ 已落地 / 部分落地（列出未做的拍）/ 归档。
+3. 落地后回头改头注，写 commit 或验收结论；「未 commit」这类临时状态在提交后必须清掉。
+4. 同一批更新 `doc/README.md` 的状态与代码落点，别让索引和正文各说一套。
+5. 被取代的文档在头注标「已取代」并指向新真源，不删原文。
 
 ## 协作模式：用例驱动 loop
 
@@ -145,14 +186,48 @@ v1/v2 方案文档与旧实现（run 级协议、409 表示「会话忙」、旧
 - 凡是要长期存在的状态，先问「多副本下它在哪」。进程内的互斥闸、`chan` 形式的等待者、
   内存里的事件缓存，上线即失效。**闸放数据库不放进程**（部分唯一索引，插入失败本身就是闸）。
 
+## 构建与测试
+
+Go 不在 PATH，命令前加 `PATH="$HOME/sdk/go1.27.0/bin:$PATH"`。
+
+```bash
+./scripts/dev.sh                  # 仓库根执行：Redis + Postgres + 引擎 + Vite（默认 8901 / 5173）
+./scripts/dev.sh status           # 也有 stop / restart
+
+cd yk-tako-eino
+PATH="$HOME/sdk/go1.27.0/bin:$PATH" go test ./internal/runengine
+PATH="$HOME/sdk/go1.27.0/bin:$PATH" go vet ./internal/runengine
+PATH="$HOME/sdk/go1.27.0/bin:$PATH" go build ./cmd/yktako
+
+cd web
+npm run typecheck                 # vue-tsc -b
+npm run build                     # vue-tsc -b && vite build
+```
+
+- 单元测试不打模型，不需要 API Key。
+- 每拍收尾跑 `go test ./internal/runengine` + `go vet ./internal/runengine`；改前端再加 `npm run typecheck`。
+- 依赖与手动启动方式见根 `README.md`。
+
 ## 环境
 
 - Go 不在 PATH：用 `PATH="$HOME/sdk/go1.27.0/bin:$PATH" go ...`
-- 代码在仓库子目录 `yk-tako-eino/` 下（v6 新仓，从零写；目前只有 `cmd/yktako` + `internal/runengine`）。
-- `yk-tako-eino-backup/` 是旧实现的冻结存档（待遇同 `maf/`，此后不改一行）；
-  里面是老 v1/v2 协议载体，**不作施工面**，引用只用于历史现状诊断。
-- 启动：`go run ./cmd/yktako -engine 127.0.0.1:<port>`（旧 `-web` 单页前端只在 backup 里，v6 验收不用）。
+- 所有代码在仓库子目录 `yk-tako-eino/` 下，Go 命令都以它为 cwd（目录地图见「仓库结构」）。
+- 开发启动：仓库根执行 `./scripts/dev.sh`；手动起引擎与依赖见根 `README.md`。
 - **端口被占时先 `lsof` 查是谁**，可能是用户自己留着的实例——换一个端口验收，不要杀别人的进程。
+
+## 双远端同步
+
+同一份历史推到两个私有仓：**AtomGit 是主仓**（华为云部署从它拉最新代码），GitHub 是镜像。
+
+- `origin` = AtomGit `git@atomgit.com:webcan/yk-tako.git`（主仓）
+- `github` = GitHub `https://github.com/Ykworm/yk-tako.git`（镜像）
+
+**铁律：先推 AtomGit，成功后再推 GitHub。** GitHub 可以落后，不能领先——领先就意味着华为云上的代码是旧的。
+
+- 日常同步：`./scripts/sync-remotes.sh [branch]`（默认 `main`）。脚本先推 `origin`，成功后才推 `github`。
+- 每个 clone 执行一次 `git config core.hooksPath .githooks`。`.githooks/pre-push` 会比对两边同分支的 SHA，任何让 GitHub 领先的推送直接拒绝。
+- 禁止 `git push --mirror`：本地还有远端不需要的引用，`--mirror` 会把它们一起推上去。
+- 远端 URL 不写访问令牌或密码；AtomGit 用 SSH key，GitHub 用凭据助手。
 
 ## 参考实现
 

@@ -1,6 +1,6 @@
 # 32 · media_offload（对话只存 path）
 
-> 性质：**方案真源；施工已落地（2026-10-18，A1–A5 五拍全过，未 commit）**。
+> 性质：**方案真源；施工已落地（2026-10-18，A1–A7，commit dcf3e6b）**。
 > 施工台账：tmp/32-media-offload/（planning + todos + 实录）。
 > 本篇是 doc/16 能力表 #4b「media_offload」在 v6 的方案真源。旧线实现（doc/18，`internal/mediaoffload`）
 > 已随 2026-10-03 仓体翻篇删除，doc/18 降级为旧线实现存档，不作施工面；它踩过的坑在本篇 §6 吸收。

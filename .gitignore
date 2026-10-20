@@ -1,23 +1,25 @@
+# macOS 目录元数据
+.DS_Store
+
+# 本地工具产物（编辑器配置 / 文件快照）
+.arts/
+.merkle-snapshot.json
+
+# 密钥与日志
 .env
 *.log
+
 # 可视化头脑风暴会话产物（superpowers visual companion）
 .superpowers/
-# .NET 构建产物（maf/）
-bin/
-obj/
-# Go 编译产物（yk-tako-eino/，go build ./cmd/yktako 默认落在包目录；backup 为翻篇前留档）
+
+# Go 编译产物（go build ./cmd/yktako 默认落在包目录）
 yk-tako-eino/yktako
-yk-tako-eino-backup/yktako
-yktako-webui.db
-yktako-webui.db-wal
-yktako-webui.db-shm
-# 运行时写入的窗口大小（当前目录，和 yktako-webui.db 一样）
-model-windows.json
-# 媒体落盘缓存（工作区根下，media_offload 把图/音/视频换占位符时写入）
-.media-cache/
+
 # 执行台账（planning.md / todos.md），用户验收完即清理，不进版本库
 tmp/
-# 运行时数据（-workspace 根：hist / notes / .tako 落盘，进程写、可重建）
+
+# 运行时数据（-workspace 根：hist / notes / .tako / .media 落盘，进程写、可重建）
 yk-tako-eino/workspace/
-# MCP 本地配置：仓库只提交 mcp.example.json，真配置按机器各自复制；验收删改不弄脏工作区
+
+# MCP 本地配置：仓库只提交 mcp.example.json，真配置按机器各自复制
 yk-tako-eino/mcp.json

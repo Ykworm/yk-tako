@@ -1,6 +1,6 @@
 # 26 · researcher 的工具护栏
 
-> 性质：**已落地（2026-10-17 A1 + 10-18 A2/A3，未 commit；台账 `tmp/26-researcher工具护栏/`，验收后清理）**。
+> 性质：**已落地（2026-10-17 A1 + 10-18 A2/A3，commit d22d27c；台账 `tmp/26-researcher工具护栏/`，验收后清理）**。
 > 2026-10-16 用户拍四条：① 挡法用 C——frontmatter 新字段 `exclude_tools`，
 > 继承父池减去列出的名字；② 写类四把一起收，researcher 变只读；③ 单测两层都要（机制四态 +
 > 出厂规格金样）；④ 本篇先落地，A3 同批改 `tmp/17-子代理折叠/todos.md` 三条 bash 剧本。
