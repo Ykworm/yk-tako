@@ -562,6 +562,8 @@ func (s *Server) stopRun(c *gin.Context) {
 // 种 Redis 现场（令牌换代、runlive 重置为一条 resume 帧）→ 开 worker。
 // claim 之后任何一步失败都 AbandonClaim 把租约改成过期：epoch 不回退（次数照样消耗），
 // 但下一发立刻可接——不把会话卡在一个半接管状态里。
+// 已删会话先经过 viewRun → SessionAccess。deleted_at 非空时 SessionAccess 回未找到，
+// denyRunWrite 写成 404 run_not_found，ClaimResume 不会执行。
 func (s *Server) resumeRun(c *gin.Context) {
 	ctx := c.Request.Context()
 	runID := RunID(c.Param("runId"))

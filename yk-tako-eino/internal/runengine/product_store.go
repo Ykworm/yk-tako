@@ -300,7 +300,7 @@ func (s *Store) ListUserTenants(ctx context.Context, userID string) ([]tenantLis
 SELECT t.id, t.name, t.kind, m.role, t.status
   FROM tenant_members m
   JOIN tenants t ON t.id = m.tenant_id
- WHERE m.user_id = ? AND m.status = 'active'
+ WHERE m.user_id = ? AND m.status = 'active' AND t.status = 'active'
  ORDER BY m.joined_at, t.id`, userID).Scan(&rows).Error
 	if rows == nil {
 		rows = []tenantListRow{}

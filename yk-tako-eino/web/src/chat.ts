@@ -1,4 +1,5 @@
 import { ref } from 'vue'
+import { readTenant } from './auth'
 import {
   ApiError,
   getFrames,
@@ -36,6 +37,29 @@ export type Attachment = { name: string; img: PostImage }
 type Pending = { messageId: string; text: string; assistant: Bubble; images?: PostImage[] }
 
 const LS_SESSION = 'tako.sessionId'
+
+// 每个工作区各记自己的会话。切走再切回来要能把原来的对话拉出来，不能共用一个键。
+function tenantSessionKey(tenantId: string): string {
+  return tenantId ? `${LS_SESSION}.${tenantId}` : LS_SESSION
+}
+
+function readStoredSession(): SessionID | null {
+  const tenantId = readTenant().id
+  const key = tenantSessionKey(tenantId)
+  const scoped = localStorage.getItem(key)
+  if (scoped) return scoped as SessionID
+  if (!tenantId) return null
+  const legacy = localStorage.getItem(LS_SESSION)
+  if (!legacy) return null
+  localStorage.setItem(key, legacy)
+  localStorage.removeItem(LS_SESSION)
+  return legacy as SessionID
+}
+
+function writeStoredSession(id: SessionID, tenantId: string) {
+  localStorage.setItem(tenantSessionKey(tenantId), id)
+  if (localStorage.getItem(LS_SESSION) === id) localStorage.removeItem(LS_SESSION)
+}
 const POLL_MS = 400
 // 冗余信号核对节奏：每 STATUS_EVERY 拍 frames 顺带查一次 session（≈2s 一次 GET）。
 // 放闸与定稿是同一笔 PG 事务（19v6-03 D1：UPDATE runs 落终态 + assistant 行入 runlog），
@@ -116,8 +140,10 @@ export function useChat() {
   // 对齐游标是 **session 作用域**的：本地会话一被丢弃（404 自愈 / 新对话），旧 session 的高水位
   // 对新会话毫无意义——留着它，收口就会从「新会话里根本不存在的偏移」往下拉，永远拉不到定稿行。
   function dropSession() {
+    const id = sessionId.value
     sessionId.value = null
-    localStorage.removeItem(LS_SESSION)
+    localStorage.removeItem(tenantSessionKey(readTenant().id))
+    if (id && localStorage.getItem(LS_SESSION) === id) localStorage.removeItem(LS_SESSION)
     runlogOffset = 0
     oldestOffset = 0
     atStart.value = true
@@ -142,16 +168,19 @@ export function useChat() {
   async function deliver(p: Pending) {
     const assistant = p.assistant
     const token = pollToken
+    const tenantAtSend = readTenant().id
     assistant.state = 'streaming'
     assistant.text = ''
     busy.value = true
     try {
       const resp = await postWithFreshSession(p)
+      writeStoredSession(resp.sessionId, tenantAtSend)
+      if (token !== pollToken) return
       sessionId.value = resp.sessionId
-      localStorage.setItem(LS_SESSION, resp.sessionId)
       assistant.runId = resp.runId
       await pollFrames(resp.runId, assistant, 0, token)
     } catch (e) {
+      if (token !== pollToken) return
       if (isBusy(e)) {
         // 别的客户端抢到了闸：什么都不写（19v6-01 §1），所以原样回队首等补投，不是投递失败。
         // 但「新对话」之后的补投属于另一个会话，不能把它塞回队列（幽灵消息）。
@@ -162,7 +191,7 @@ export function useChat() {
         assistant.text = e instanceof ApiError ? `投递失败：${e.body?.error ?? e.status}` : '投递失败'
       }
     } finally {
-      busy.value = false
+      if (token === pollToken) busy.value = false
     }
   }
 
@@ -294,13 +323,16 @@ export function useChat() {
   // 借此进列表）；本 tab 乐观渲染过的 user 行按 messageId 认出跳过（气泡早就在）；本次要替换的
   // 那条 assistant 行只记下、不渲染，交给 closeOut 整条替换半截气泡。
   async function drainLog(runId: RunID, assistant: Bubble): Promise<Row | null> {
+    const token = pollToken
     const sid = sessionId.value
     if (!sid) return null
     let hit: Row | null = null
     let ownUserOffset = 0
     const foreign: Row[] = []
     for (;;) {
+      if (token !== pollToken) return null
       const resp = await getLog(sid, runlogOffset)
+      if (token !== pollToken) return null
       for (const r of resp.rows) {
         if (r.role === 'assistant' && r.runId === runId) {
           hit = r
@@ -319,13 +351,31 @@ export function useChat() {
       runlogOffset = resp.nextOffset
       if (!advanced) break
     }
+    if (token !== pollToken) return null
     renderForeign(foreign, assistant, ownUserOffset)
     return hit
   }
 
+  // 切换工作区后调用：清掉屏幕上的气泡，再按新工作区自己的会话键重拉。不删其他工作区记下的会话。
+  async function showTenantSession() {
+    pollToken++
+    sessionId.value = null
+    pending.value = []
+    bubbles.value = []
+    draft.value = ''
+    attachments.value = []
+    busy.value = false
+    loadingOlder.value = false
+    renderedMessageIds.clear()
+    runlogOffset = 0
+    oldestOffset = 0
+    atStart.value = true
+    await reconcile()
+  }
+
   // reconcile（19v6-02 四步）：查状态 → 窗口化补历史 → 有活 run 则 frames(0) 重建半截气泡。
   async function reconcile() {
-    const sid = localStorage.getItem(LS_SESSION) as SessionID | null
+    const sid = readStoredSession()
     if (!sid) return
     let status
     try {
@@ -470,7 +520,7 @@ export function useChat() {
     renderedMessageIds.clear()
   }
 
-  return { sessionId, bubbles, draft, attachments, busy, pending, loadingOlder, atStart, send, reconcile, loadOlder, newSession }
+  return { sessionId, bubbles, draft, attachments, busy, pending, loadingOlder, atStart, send, reconcile, loadOlder, newSession, showTenantSession }
 }
 
 // 409 = 闸被占（19v6-01 §1），处置是排队；404 session_not_found = 本地 sid 已成僵尸，处置是懒建重投。

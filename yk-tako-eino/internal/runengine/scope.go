@@ -117,6 +117,16 @@ func runWorkspace(ctx context.Context, w *Worker, tenantID string, sessionID Ses
 	return sessionWorkspace(w.workspace, tenantID, sessionID)
 }
 
+// sessionDir 算出会话目录，不创建它。id 只允许单段路径。删除用它做 RemoveAll。
+func sessionDir(root, tenantID string, sessionID SessionID) (string, error) {
+	id := string(sessionID)
+	if root == "" || tenantID == "" || id == "" || id == "." || id == ".." ||
+		strings.ContainsRune(id, os.PathSeparator) || strings.ContainsRune(id, '/') {
+		return "", os.ErrInvalid
+	}
+	return filepath.Join(root, "tenants", tenantID, "sessions", id), nil
+}
+
 // sessionWorkspace 把作业根落到 <root>/tenants/<tenant>/sessions/<session>。
 func sessionWorkspace(root, tenantID string, sessionID SessionID) (string, error) {
 	if tenantID == "" || sessionID == "" {

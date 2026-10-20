@@ -3,7 +3,9 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useChat } from './chat'
 import { mediaUrl, type MediaRef, type Usage } from './api'
 import Configure from './Configure.vue'
-import { authFetch, authState, clearAuth, loginWithPassword, readTenant } from './auth'
+import InviteLanding from './InviteLanding.vue'
+import PendingInvites from './PendingInvites.vue'
+import { authFetch, authState, clearAuth, loginWithPassword, switchTenant, tenantState } from './auth'
 
 type Page = 'chat' | 'agents' | 'team'
 
@@ -12,11 +14,23 @@ function readPage(): Page {
   return saved === 'agents' || saved === 'team' ? saved : 'chat'
 }
 
+function tokenFromLocation(): string {
+  const prefix = '/invite/'
+  if (!location.pathname.startsWith(prefix)) return ''
+  return decodeURIComponent(location.pathname.slice(prefix.length).replace(/\/+$/, ''))
+}
+
+const inviteToken = ref(tokenFromLocation())
+function leaveInvite() {
+  history.replaceState(null, '', '/')
+  inviteToken.value = ''
+}
+
 const page = ref<Page>(readPage())
 watch(page, (value) => sessionStorage.setItem('tako.page', value))
 const configPage = computed<'agents' | 'team'>(() => (page.value === 'team' ? 'team' : 'agents'))
 
-const { bubbles, draft, attachments, pending, loadingOlder, atStart, busy, send, reconcile, loadOlder, newSession } = useChat()
+const { bubbles, draft, attachments, pending, loadingOlder, atStart, busy, send, reconcile, loadOlder, newSession, showTenantSession } = useChat()
 
 const listEl = ref<HTMLElement | null>(null)
 const composerEl = ref<HTMLTextAreaElement | null>(null)
@@ -28,7 +42,7 @@ const lightbox = ref('')
 const showPassword = ref(false)
 
 const loggedIn = computed(() => authState.value)
-const tenant = computed(() => (authState.value ? readTenant() : { id: '', name: '', role: '' }))
+const tenant = computed(() => tenantState.value)
 const initial = computed(() => (tenant.value.name || '我').slice(0, 1))
 const email = ref('')
 const password = ref('')
@@ -45,7 +59,119 @@ function roleLabel(role: string): string {
   if (role === 'owner') return '所有者'
   if (role === 'admin') return '管理员'
   if (role === 'member') return '成员'
+  if (role === 'viewer') return '查看者'
   return role
+}
+
+function kindLabel(kind: string): string {
+  if (kind === 'personal') return '个人'
+  if (kind === 'team') return '团队'
+  return kind
+}
+
+type TenantItem = { id: string; name: string; kind: string; role: string; status: string }
+
+const switcherEl = ref<HTMLElement | null>(null)
+const menuOpen = ref(false)
+const tenants = ref<TenantItem[]>([])
+const switching = ref(false)
+const switchError = ref('')
+const createOpen = ref(false)
+const createName = ref('')
+const createError = ref('')
+const createBusy = ref(false)
+
+async function loadTenants() {
+  const res = await authFetch('/api/tenants')
+  const body = (await res.json().catch(() => null)) as {
+    code?: number
+    message?: string
+    data?: { tenants?: TenantItem[] }
+  } | null
+  if (!res.ok || !body || body.code !== 0) {
+    switchError.value = body?.message || '工作区列表加载失败'
+    return
+  }
+  tenants.value = body.data?.tenants ?? []
+}
+
+async function toggleMenu() {
+  menuOpen.value = !menuOpen.value
+  if (!menuOpen.value) {
+    createOpen.value = false
+    return
+  }
+  switchError.value = ''
+  createError.value = ''
+  await loadTenants()
+}
+
+async function pickTenant(row: TenantItem) {
+  if (switching.value) return
+  if (row.id === tenant.value.id) {
+    menuOpen.value = false
+    return
+  }
+  switching.value = true
+  switchError.value = ''
+  try {
+    const res = await switchTenant(row.id)
+    if (!res.ok) {
+      if (res.status !== 401) switchError.value = res.message
+      return
+    }
+    menuOpen.value = false
+    createOpen.value = false
+  } finally {
+    switching.value = false
+  }
+}
+
+function openCreate() {
+  createOpen.value = true
+  createName.value = ''
+  createError.value = ''
+}
+
+async function createWorkspace() {
+  if (createBusy.value) return
+  createBusy.value = true
+  createError.value = ''
+  try {
+    const res = await authFetch('/api/tenants', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: createName.value }),
+    })
+    const body = (await res.json().catch(() => null)) as {
+      code?: number
+      message?: string
+      data?: { tenant?: { id?: string } }
+    } | null
+    if (!res.ok || !body || body.code !== 0 || !body.data?.tenant?.id) {
+      createError.value = body?.message || '创建失败'
+      return
+    }
+    const switched = await switchTenant(body.data.tenant.id)
+    if (!switched.ok) {
+      createError.value = switched.message
+      await loadTenants()
+      return
+    }
+    menuOpen.value = false
+    createOpen.value = false
+  } finally {
+    createBusy.value = false
+  }
+}
+
+function onDocPointer(ev: PointerEvent) {
+  if (!menuOpen.value) return
+  const root = switcherEl.value
+  if (root && ev.target instanceof Node && !root.contains(ev.target)) {
+    menuOpen.value = false
+    createOpen.value = false
+  }
 }
 
 async function doLogin() {
@@ -130,6 +256,11 @@ function onWindowKey(ev: KeyboardEvent) {
   if (ev.key !== 'Escape') return
   if (lightbox.value) {
     lightbox.value = ''
+    return
+  }
+  if (menuOpen.value) {
+    menuOpen.value = false
+    createOpen.value = false
     return
   }
   askNew.value = false
@@ -352,17 +483,34 @@ watch(authState, async (ok) => {
   if (!ok) {
     newSession()
     askNew.value = false
+    menuOpen.value = false
     return
   }
+  await loadTenants()
   await reconcile()
   await nextTick()
   scrollBottom()
   composerEl.value?.focus()
 })
 
+// 成员页归档、离开也会 switchTenant，但够不着 useChat。
+// 登录时 id 从空变成有值，那一轮由上面的 authState 负责，这里跳过，避免拉两次。
+watch(
+  () => tenant.value.id,
+  async (id, prev) => {
+    if (!loggedIn.value || !id || !prev || id === prev) return
+    await showTenantSession()
+    await loadTenants()
+    await nextTick()
+    scrollBottom()
+  },
+)
+
 onMounted(async () => {
   window.addEventListener('keydown', onWindowKey)
+  window.addEventListener('pointerdown', onDocPointer)
   if (!loggedIn.value) return
+  await loadTenants()
   await reconcile()
   await nextTick()
   scrollBottom()
@@ -371,6 +519,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onWindowKey)
+  window.removeEventListener('pointerdown', onDocPointer)
   for (const url of Object.values(mediaSrc.value)) URL.revokeObjectURL(url)
 })
 
@@ -388,7 +537,9 @@ async function onScroll() {
 </script>
 
 <template>
+  <InviteLanding v-if="inviteToken" :token="inviteToken" @leave="leaveInvite" />
   <div
+    v-else
     class="app"
     @dragenter="onDragEnter"
     @dragover="onDragOver"
@@ -437,9 +588,56 @@ async function onScroll() {
 
       <div class="rail-foot">
         <span class="avatar" aria-hidden="true">{{ initial }}</span>
-        <div class="who">
-          <strong>{{ tenant.name || '当前工作区' }}</strong>
-          <span>{{ roleLabel(tenant.role) || '已登录' }}</span>
+        <div ref="switcherEl" class="switcher">
+          <button
+            type="button"
+            class="switcher-btn"
+            :aria-expanded="menuOpen"
+            aria-haspopup="menu"
+            @click="toggleMenu"
+          >
+            <span class="who">
+              <strong>{{ tenant.name || '当前工作区' }}</strong>
+              <span>{{ roleLabel(tenant.role) || '已登录' }}</span>
+            </span>
+            <svg class="chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+              <path d="M4 6.5 8 10.5 12 6.5" />
+            </svg>
+          </button>
+          <div v-if="menuOpen" class="switcher-pop" role="menu">
+            <div data-slot="pending-invites">
+              <PendingInvites @changed="loadTenants" />
+            </div>
+            <template v-if="!createOpen">
+              <button
+                v-for="row in tenants"
+                :key="row.id"
+                type="button"
+                role="menuitem"
+                class="switcher-row"
+                :class="{ on: row.id === tenant.id }"
+                :disabled="switching"
+                @click="pickTenant(row)"
+              >
+                <strong>{{ row.name }}</strong>
+                <span class="tag">{{ kindLabel(row.kind) }}</span>
+                <span class="tag">{{ roleLabel(row.role) }}</span>
+              </button>
+              <p v-if="switchError" class="auth-error" role="alert">{{ switchError }}</p>
+              <button type="button" class="switch-create" @click="openCreate">+ 创建工作区</button>
+            </template>
+            <form v-else class="switch-create-form" @submit.prevent="createWorkspace">
+              <label>
+                工作区名称
+                <input v-model="createName" type="text" autocomplete="off" />
+              </label>
+              <p v-if="createError" class="auth-error" role="alert">{{ createError }}</p>
+              <div class="pop-actions">
+                <button type="submit" class="pop-go" :disabled="createBusy">{{ createBusy ? '正在创建…' : '创建' }}</button>
+                <button type="button" class="pop-stay" @click="createOpen = false">取消</button>
+              </div>
+            </form>
+          </div>
         </div>
         <button type="button" class="logout" @click="logout">退出</button>
       </div>
@@ -473,7 +671,7 @@ async function onScroll() {
       </form>
 
       <template v-else>
-        <Configure v-if="page !== 'chat'" :page="configPage" />
+        <Configure v-if="page !== 'chat'" :key="tenant.id" :page="configPage" />
 
         <div v-show="page === 'chat'" class="thread">
           <section ref="listEl" class="list" @scroll="onScroll">
@@ -802,6 +1000,107 @@ async function onScroll() {
 .logout {
   padding: 0.28rem 0.55rem;
 }
+
+.switcher {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+.switcher-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  padding: 0;
+}
+.switcher-btn .who { flex: 1; }
+.chevron {
+  width: 0.85rem;
+  height: 0.85rem;
+  flex: none;
+  color: var(--muted);
+}
+.switcher-pop {
+  position: absolute;
+  z-index: 8;
+  bottom: calc(100% + 0.45rem);
+  left: 0;
+  width: 16.5rem;
+  max-height: 18rem;
+  overflow: auto;
+  background: var(--bg-raised);
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  padding: 0.35rem;
+}
+.switcher-row,
+.switch-create {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  border-radius: 10px;
+  padding: 0.45rem 0.55rem;
+  text-align: left;
+  font-size: 0.82rem;
+}
+.switcher-row strong {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.82rem;
+}
+.switcher-row .tag {
+  flex: none;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+.switcher-row.on {
+  background: var(--accent-soft);
+}
+.switcher-row:hover:not(:disabled),
+.switch-create:hover {
+  background: rgba(255, 253, 248, 0.9);
+}
+.switcher-row:disabled { opacity: 0.6; }
+.switch-create {
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  margin-top: 0.25rem;
+  color: var(--accent-ink);
+}
+.switch-create-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  padding: 0.4rem 0.45rem 0.35rem;
+}
+.switch-create-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+.switch-create-form input {
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: #fff;
+  color: var(--ink);
+  padding: 0.4rem 0.55rem;
+  font-size: 0.86rem;
+}
+.switcher-pop .auth-error { margin: 0.3rem 0.4rem; }
 
 .stage {
   position: relative;
@@ -1261,6 +1560,13 @@ async function onScroll() {
   .nav button { width: auto; padding: 0.4rem 0.55rem; }
   .rail-foot { grid-area: foot; margin: 0; background: transparent; padding: 0; }
   .who { max-width: 4.6rem; }
+  .switcher-pop {
+    bottom: auto;
+    top: calc(100% + 0.35rem);
+    left: auto;
+    right: 0;
+    width: min(16.5rem, calc(100vw - 1.4rem));
+  }
   .rail { position: relative; }
   .new-wrap { position: static; }
   .pop {

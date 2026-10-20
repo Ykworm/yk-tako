@@ -38,11 +38,11 @@ func decideAccess(sess Session, p principal) accessKind {
 	return accessNone
 }
 
-// SessionAccess 按 principal 判一场会话。无行、跨租户、private 非 owner 都是 ErrSessionNotFound。
+// SessionAccess 按 principal 判一场会话。无行、已软删、跨租户、private 非 owner 都是 ErrSessionNotFound。
 // tenant-visible 的非 owner 得到 accessRead；owner 得到 accessOwner。
 func (s *Store) SessionAccess(ctx context.Context, id SessionID, p principal) (Session, accessKind, error) {
 	var sess Session
-	err := s.db.WithContext(ctx).Where("id = ?", id).Take(&sess).Error
+	err := s.db.WithContext(ctx).Where("id = ? AND deleted_at IS NULL", id).Take(&sess).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return Session{}, accessNone, ErrSessionNotFound
 	}
@@ -73,8 +73,9 @@ func (s *Store) RunSession(ctx context.Context, runID RunID) (SessionID, bool, e
 // workspaceID 非空时再按项目筛。空串表示不筛，游离会话留在结果里。
 // 创建者用默认列表筛自己的项目时，返回挂在上面的全部会话，含别人的私人会话。
 // scope=tenant 不放宽，避免借项目筛把别人的私人会话带出来。
+// deleted_at 非空的行不出现，已删会话不在列表里复活。
 func (s *Store) ListSessions(ctx context.Context, p principal, scope, workspaceID string) ([]Session, error) {
-	q := s.db.WithContext(ctx).Where("tenant_id = ?", p.TenantID)
+	q := s.db.WithContext(ctx).Where("tenant_id = ? AND deleted_at IS NULL", p.TenantID)
 	if scope == "tenant" {
 		q = q.Where("visibility = ?", "tenant")
 	} else if workspaceID != "" {
@@ -103,7 +104,8 @@ func (s *Store) SetSessionVisibility(ctx context.Context, id SessionID, p princi
 	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var rows []Session
-		if err := tx.Raw(`SELECT id, tenant_id, user_id, visibility FROM sessions WHERE id = ? FOR UPDATE`, id).Scan(&rows).Error; err != nil {
+		// 已软删的行不锁、不改。调用方看到的和没有这场会话一样。
+		if err := tx.Raw(`SELECT id, tenant_id, user_id, visibility FROM sessions WHERE id = ? AND deleted_at IS NULL FOR UPDATE`, id).Scan(&rows).Error; err != nil {
 			return err
 		}
 		if len(rows) == 0 {
@@ -132,8 +134,9 @@ func (s *Store) SetSessionWorkspace(ctx context.Context, id SessionID, p princip
 			}
 		}
 		var rows []Session
+		// 已软删的行不锁、不改挂。调用方看到的和没有这场会话一样。
 		if err := tx.Raw(
-			`SELECT id, tenant_id, user_id, visibility, workspace_id FROM sessions WHERE id = ? FOR UPDATE`,
+			`SELECT id, tenant_id, user_id, visibility, workspace_id FROM sessions WHERE id = ? AND deleted_at IS NULL FOR UPDATE`,
 			id).Scan(&rows).Error; err != nil {
 			return err
 		}

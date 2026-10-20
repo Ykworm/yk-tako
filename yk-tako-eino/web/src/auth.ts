@@ -30,6 +30,8 @@ function hasSession(): boolean {
 
 // 响应式登录态：api.ts 刷新失败会 clearAuth，页面据此退回登录表单。
 export const authState = ref(hasSession())
+// 当前工作区单独做成响应式：切换时人已经登录，authState 仍是 true，顶栏要靠这里改名字和角色。
+export const tenantState = ref(readTenant())
 
 export function saveAuth(
   accessToken: string,
@@ -43,7 +45,17 @@ export function saveAuth(
   sessionStorage.setItem(tenantKey, tenantID)
   sessionStorage.setItem(tenantNameKey, tenantName)
   sessionStorage.setItem(roleKey, role)
+  tenantState.value = { id: tenantID, name: tenantName, role }
   authState.value = hasSession()
+}
+
+// 顶栏角色来自 sessionStorage。改自己的角色或转走所有者之后，人还停在这个工作区，
+// 没有一次新的 switch-tenant 把 role 写回来，所以成员页重拉名单后单独记一笔。
+export function rememberRole(role: string) {
+  const cur = readTenant()
+  if (!cur.id || cur.role === role) return
+  sessionStorage.setItem(roleKey, role)
+  tenantState.value = { id: cur.id, name: cur.name, role }
 }
 
 // 刷新只换 token 对，工作区信息来自登录时那一次。
@@ -59,6 +71,7 @@ export function clearAuth() {
   sessionStorage.removeItem(tenantKey)
   sessionStorage.removeItem(tenantNameKey)
   sessionStorage.removeItem(roleKey)
+  tenantState.value = { id: '', name: '', role: '' }
   authState.value = false
 }
 
@@ -87,6 +100,68 @@ export async function loginWithPassword(email: string, password: string): Promis
     return { ok: false, status: res.status, message: body?.message || '登录失败' }
   }
   const data = body.data
+  const role = data.memberships.find((m) => m.tenantId === data.activeTenant.id)?.role || ''
+  saveAuth(data.accessToken, data.refreshToken || '', data.activeTenant.id, data.activeTenant.name, role)
+  return { ok: true }
+}
+
+export type SwitchResult = { ok: true } | { ok: false; status: number; code: number; message: string }
+
+// 切换工作区：用 sessionStorage 里的 refreshToken 换一对新 token，并改写当前工作区。
+// 不走 authFetch。access 过期时先刷新再重发，否则重试仍带着已经被轮换掉的旧 refreshToken。
+export async function switchTenant(tenantId: string): Promise<SwitchResult> {
+  if (!readRefreshToken()) {
+    clearAuth()
+    return { ok: false, status: 401, code: 111105, message: '登录已失效，请重新登录' }
+  }
+  const first = await postSwitch(tenantId, readRefreshToken())
+  if (first.kind === 'unauthorized' && first.code === 111104) {
+    if (!(await refreshAccessToken())) {
+      return { ok: false, status: 401, code: 111105, message: '登录已失效，请重新登录' }
+    }
+    return settleSwitch(await postSwitch(tenantId, readRefreshToken()))
+  }
+  return settleSwitch(first)
+}
+
+type SwitchPost =
+  | { kind: 'network' }
+  | { kind: 'unauthorized'; code: number; message: string }
+  | { kind: 'fail'; status: number; code: number; message: string }
+  | { kind: 'ok'; data: LoginData }
+
+async function postSwitch(tenantId: string, refreshToken: string): Promise<SwitchPost> {
+  let res: Response
+  try {
+    res = await fetch('/api/auth/switch-tenant', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer ' + readToken(),
+      },
+      body: JSON.stringify({ tenantId, refreshToken }),
+    })
+  } catch {
+    return { kind: 'network' }
+  }
+  const body = (await res.json().catch(() => null)) as { code?: number; message?: string; data?: LoginData } | null
+  if (res.status === 401) {
+    return { kind: 'unauthorized', code: body?.code ?? 111105, message: body?.message || '登录已失效，请重新登录' }
+  }
+  if (!res.ok || !body || body.code !== 0 || !body.data?.accessToken || !body.data.activeTenant) {
+    return { kind: 'fail', status: res.status, code: body?.code ?? 0, message: body?.message || '切换失败' }
+  }
+  return { kind: 'ok', data: body.data }
+}
+
+function settleSwitch(result: SwitchPost): SwitchResult {
+  if (result.kind === 'network') return { ok: false, status: 0, code: 0, message: '连不上引擎' }
+  if (result.kind === 'unauthorized') {
+    clearAuth()
+    return { ok: false, status: 401, code: result.code, message: result.message }
+  }
+  if (result.kind === 'fail') return { ok: false, status: result.status, code: result.code, message: result.message }
+  const data = result.data
   const role = data.memberships.find((m) => m.tenantId === data.activeTenant.id)?.role || ''
   saveAuth(data.accessToken, data.refreshToken || '', data.activeTenant.id, data.activeTenant.name, role)
   return { ok: true }

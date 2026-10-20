@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
 )
 
 func (s *Server) requirePrincipal(c *gin.Context) (principal, bool) {
@@ -195,36 +196,41 @@ func (s *Server) patchWorkspaceVisibility(c *gin.Context) {
 	}{Visibility: *req.Visibility})
 }
 
-// deleteWorkspace 只删空项目。还有会话则 409，行和目录都留着。
-// 成功是真删：先删行，再删目录。租户删除回的是 archived，这里用 deleted，两件事不是同一件事。
+// deleteWorkspace 删创建者自己的项目，并软删挂在上面的会话。
+// 有活 run 则 409，项目行、会话行和目录都留着。默认工作区仍不能删。
+// 成功是先提交事务，再删项目目录和各会话目录。目录删失败只记日志，响应仍是 deleted。
 func (s *Server) deleteWorkspace(c *gin.Context) {
 	p, ok := s.requirePrincipal(c)
 	if !ok {
 		return
 	}
 	id := c.Param("id")
-	err := s.store.DeleteWorkspace(c.Request.Context(), p.TenantID, p.UserID, id)
+	sessionIDs, err := s.store.DeleteWorkspaceCascade(c.Request.Context(), p.TenantID, p.UserID, id)
 	switch {
 	case errors.Is(err, ErrWorkspaceNotFound):
 		writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
 	case errors.Is(err, ErrWorkspaceDefault):
 		writeEnvelope(c, http.StatusConflict, codeWorkspaceDefault, "默认工作区不能删除", nil)
-	case errors.Is(err, ErrWorkspaceNotEmpty):
-		writeEnvelope(c, http.StatusConflict, codeWorkspaceNotEmpty, "项目里还有会话，先挪走再删", nil)
+	case errors.Is(err, ErrWorkspaceBusy):
+		writeEnvelope(c, http.StatusConflict, codeWorkspaceBusyLive, "项目里有正在运行的会话，等它跑完再删", nil)
 	case err != nil:
 		log.Printf("DELETE /api/workspaces/%s: %v", id, err)
 		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
 	default:
-		dir, dirErr := workspaceDir(s.mediaRoot, p.TenantID, id)
-		if dirErr != nil {
+		if dir, dirErr := workspaceDir(s.mediaRoot, p.TenantID, id); dirErr != nil {
 			log.Printf("DELETE /api/workspaces/%s: %v", id, dirErr)
-			writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
-			return
-		}
-		if rmErr := os.RemoveAll(dir); rmErr != nil {
+		} else if rmErr := os.RemoveAll(dir); rmErr != nil {
 			log.Printf("DELETE /api/workspaces/%s: %v", id, rmErr)
-			writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
-			return
+		}
+		for _, sid := range sessionIDs {
+			sdir, serr := sessionDir(s.mediaRoot, p.TenantID, sid)
+			if serr != nil {
+				log.Printf("DELETE /api/workspaces/%s session %s: %v", id, sid, serr)
+				continue
+			}
+			if rmErr := os.RemoveAll(sdir); rmErr != nil {
+				log.Printf("DELETE /api/workspaces/%s session %s: %v", id, sid, rmErr)
+			}
 		}
 		writeEnvelope(c, http.StatusOK, codeOK, "", struct {
 			Status string `json:"status"`
@@ -1174,13 +1180,37 @@ func (s *Server) myInvitations(c *gin.Context) {
 		internal(c, err)
 		return
 	}
-	out := make([]inviteBody, 0, len(rows))
+	// 预览接口带团队名，这份「我的邀请」原来没有。没有名字和 tenantId，
+	// 切换器那一行写不出团队，接受之后也不知道 switch-tenant 该切哪一个。
+	out := make([]myInviteBody, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, inviteBodyOf(row))
+		tenant, err := s.store.GetTenant(c.Request.Context(), row.TenantID)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			continue
+		}
+		if err != nil {
+			internal(c, err)
+			return
+		}
+		item := inviteBodyOf(row)
+		out = append(out, myInviteBody{
+			ID: item.ID, Email: item.Email, Role: item.Role, Status: item.Status, ExpiresAt: item.ExpiresAt,
+			TenantID: tenant.ID, TenantName: tenant.Name,
+		})
 	}
 	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
-		Invitations []inviteBody `json:"invitations"`
+		Invitations []myInviteBody `json:"invitations"`
 	}{Invitations: out})
+}
+
+type myInviteBody struct {
+	ID         string `json:"id"`
+	Email      string `json:"email"`
+	Role       string `json:"role"`
+	Status     string `json:"status"`
+	ExpiresAt  string `json:"expiresAt"`
+	TenantID   string `json:"tenantId"`
+	TenantName string `json:"tenantName"`
 }
 
 func (s *Server) acceptInvitation(c *gin.Context) {
@@ -1270,10 +1300,20 @@ func (s *Server) lookupInvitation(c *gin.Context) {
 		return
 	}
 	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
-		TenantName string `json:"tenantName"`
-		Role       string `json:"role"`
-		Status     string `json:"status"`
-	}{TenantName: tenant.Name, Role: inv.Role, Status: inv.Status})
+		TenantName   string `json:"tenantName"`
+		Role         string `json:"role"`
+		Status       string `json:"status"`
+		InvitationID string `json:"invitationId"`
+		Email        string `json:"email"`
+		ExpiresAt    string `json:"expiresAt"`
+	}{
+		TenantName:   tenant.Name,
+		Role:         inv.Role,
+		Status:       inv.Status,
+		InvitationID: inv.ID,
+		Email:        inv.Email,
+		ExpiresAt:    inv.ExpiresAt.UTC().Format(time.RFC3339),
+	})
 }
 
 func (s *Server) registerByInvite(c *gin.Context) {

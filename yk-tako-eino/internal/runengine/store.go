@@ -144,9 +144,22 @@ func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID
 		// 已有会话先锁行。不归属整笔回滚，调用方看到的是 404/403，库里没有新 run。
 		var existing []Session
 		if err := tx.Raw(
-			`SELECT id, tenant_id, user_id, visibility, workspace_id FROM sessions WHERE id = ? FOR UPDATE`,
+			`SELECT id, tenant_id, user_id, visibility, workspace_id FROM sessions WHERE id = ? AND deleted_at IS NULL FOR UPDATE`,
 			sessionID).Scan(&existing).Error; err != nil {
 			return err
+		}
+		// 过滤把已删行排除在外。同一 id 上若还留着 deleted_at 非空的行，这是已删会话：
+		// 按未登记回 404。不能落进下面的 INSERT，主键还在，插进去会失败，也可能多出 run。
+		if len(existing) == 0 {
+			var gone []struct {
+				ID string `gorm:"column:id"`
+			}
+			if err := tx.Raw(`SELECT id FROM sessions WHERE id = ?`, sessionID).Scan(&gone).Error; err != nil {
+				return err
+			}
+			if len(gone) > 0 {
+				return ErrSessionNotFound
+			}
 		}
 		// 项目闸看这场 run 实际要写的目录。新会话用请求里的项目；已有会话用行上的列。
 		// 请求带了 workspaceId 但会话是游离的，列不变，文件仍进会话目录，不占项目闸。

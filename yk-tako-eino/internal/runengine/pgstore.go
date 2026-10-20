@@ -34,6 +34,8 @@ type Session struct {
 	AgentID     string    `gorm:"not null;default:''"`
 	WorkspaceID *string   `gorm:"index"` // 空 = 游离会话，作业根仍是 sessions/<sid>/
 	CreatedAt   time.Time `gorm:"not null;index:sessions_tenant_visibility,priority:3"`
+	// DeletedAt 非空表示这场会话已经随项目删掉。按 id 取、列表、抢闸都要把它当成没有这行。
+	DeletedAt *time.Time `gorm:"column:deleted_at"`
 }
 
 func (Session) TableName() string { return "sessions" }
@@ -218,8 +220,8 @@ func (s *Store) RenameWorkspace(ctx context.Context, tenantID, userID, id, name 
 	return row, err
 }
 
-// ErrWorkspaceNotEmpty 表示项目上还有会话，这一拍不能删。
-var ErrWorkspaceNotEmpty = errors.New("workspace not empty")
+// ErrWorkspaceBusy 表示项目上还有租约没过的 running run。删除整笔回滚，项目行和会话行都留着。
+var ErrWorkspaceBusy = errors.New("workspace busy")
 
 // ErrWorkspaceDefault 表示这行是默认工作区，不能删。
 var ErrWorkspaceDefault = errors.New("default workspace")
@@ -287,10 +289,13 @@ func lockWorkspace(tx *gorm.DB, id, tenantID, userID string, visible bool) error
 	return nil
 }
 
-// DeleteWorkspace 在一笔事务里锁行、数会话、删行。数到会话就回 ErrWorkspaceNotEmpty，行还在。
-// 磁盘目录由调用方在提交成功之后删。这里不碰目录，避免库回滚了目录却已经没了。
-func (s *Store) DeleteWorkspace(ctx context.Context, tenantID, userID, id string) error {
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+// DeleteWorkspaceCascade 在一笔事务里删掉创建者自己的项目，并软删挂在上面的会话。
+// 顺序是：锁项目行 → 默认工作区拒绝 → 数活 run → 记下会话 id → 写 deleted_at（这一步才锁会话行）
+// → 再数一次活 run → 删项目行。活 run 的谓词与读侧相同：status='running' AND lease_until > now()。
+// 数到就整笔回滚。返回的 id 给调用方在提交之后删会话目录。这里不碰目录，避免库回滚了目录却已经没了。
+func (s *Store) DeleteWorkspaceCascade(ctx context.Context, tenantID, userID, id string) ([]SessionID, error) {
+	var sessionIDs []SessionID
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := lockOwnedWorkspace(tx, id, tenantID, userID); err != nil {
 			return err
 		}
@@ -302,11 +307,36 @@ func (s *Store) DeleteWorkspace(ctx context.Context, tenantID, userID, id string
 			return ErrWorkspaceDefault
 		}
 		var n int64
-		if err := tx.Model(&Session{}).Where("workspace_id = ?", id).Count(&n).Error; err != nil {
+		if err := tx.Raw(
+			`SELECT COUNT(*) FROM runs WHERE workspace_id = ? AND status = 'running' AND lease_until > now()`,
+			id).Scan(&n).Error; err != nil {
 			return err
 		}
 		if n > 0 {
-			return ErrWorkspaceNotEmpty
+			return ErrWorkspaceBusy
+		}
+		var rows []struct {
+			ID string `gorm:"column:id"`
+		}
+		if err := tx.Raw(`SELECT id FROM sessions WHERE workspace_id = ?`, id).Scan(&rows).Error; err != nil {
+			return err
+		}
+		sessionIDs = make([]SessionID, 0, len(rows))
+		for _, row := range rows {
+			sessionIDs = append(sessionIDs, SessionID(row.ID))
+		}
+		if err := tx.Exec(`UPDATE sessions SET deleted_at = now() WHERE workspace_id = ?`, id).Error; err != nil {
+			return err
+		}
+		// 上面的 UPDATE 才锁住会话行，并等到正在发消息的事务提交。
+		// 第一次计数若早于那次提交，会看不见刚插入的 running 行。锁到手后再数一次，有活 run 就整笔回滚。
+		if err := tx.Raw(
+			`SELECT COUNT(*) FROM runs WHERE workspace_id = ? AND status = 'running' AND lease_until > now()`,
+			id).Scan(&n).Error; err != nil {
+			return err
+		}
+		if n > 0 {
+			return ErrWorkspaceBusy
 		}
 		res := tx.Exec(`DELETE FROM workspaces WHERE id = ?`, id)
 		if res.Error != nil {
@@ -317,6 +347,10 @@ func (s *Store) DeleteWorkspace(ctx context.Context, tenantID, userID, id string
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return sessionIDs, nil
 }
 
 // VisibleWorkspace 认当前用户在 active tenant 里看得见的项目：自己创建的，或 visibility=tenant 的。
@@ -430,6 +464,12 @@ ON runs (workspace_id)
 WHERE workspace_id IS NOT NULL AND status = 'running'`).Error; err != nil {
 		return err
 	}
+	// 会话列表按 tenant_id + user_id 查还活着的行。软删行不进这支索引。
+	if err := db.Exec(`CREATE INDEX IF NOT EXISTS sessions_owner_alive
+ON sessions (tenant_id, user_id)
+WHERE deleted_at IS NULL`).Error; err != nil {
+		return err
+	}
 	return db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS one_default_workspace_per_user
 ON workspaces (tenant_id, user_id)
 WHERE is_default`).Error
@@ -444,10 +484,12 @@ func newRowID(prefix string) (string, error) {
 	return prefix + id.String(), nil
 }
 
-// Exists 报告 session 是否已登记（带 sessionId 投递时的准入检查）。
+// Exists 报告这场会话是否还在。deleted_at 非空与没有这行相同。
+// 唯一调用点是 ReadLog。getSessionLog 先用 SessionAccess 拦人，ReadLog 再用 Exists
+// 决定回不回 404。这里滤掉软删行，已删会话的定稿不会从 ReadLog 漏出去。
 func (s *Store) Exists(ctx context.Context, sessionID SessionID) (bool, error) {
 	var n int64
-	if err := s.db.WithContext(ctx).Model(&Session{}).Where("id = ?", sessionID).Count(&n).Error; err != nil {
+	if err := s.db.WithContext(ctx).Model(&Session{}).Where("id = ? AND deleted_at IS NULL", sessionID).Count(&n).Error; err != nil {
 		return false, err
 	}
 	return n > 0, nil
@@ -657,6 +699,7 @@ func (s *Store) runlogUserSeq(ctx context.Context, sessionID SessionID, runID Ru
 func (s *Store) ReadLog(ctx context.Context, sessionID SessionID, from, w int) (rows []Row, nextOffset int, exists bool, err error) {
 	rows = []Row{}
 	nextOffset = from
+	// Exists 已把软删会话算成未登记。已删会话在这里和从未建过一样，调用方回 404。
 	exists, err = s.Exists(ctx, sessionID)
 	if err != nil || !exists {
 		return rows, nextOffset, exists, err

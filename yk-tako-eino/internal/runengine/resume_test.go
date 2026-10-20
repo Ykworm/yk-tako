@@ -140,3 +140,38 @@ func TestResumeHandlerErrorMapping(t *testing.T) {
 		t.Fatalf("拒掉后 epoch = %d, want 1", epoch)
 	}
 }
+
+// TestResumeDeletedSession 钉已删会话的 run 不能复活。
+// resume 先走 viewRun → SessionAccess。deleted_at 非空时这里回 404 run_not_found，ClaimResume 不跑。
+func TestResumeDeletedSession(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	srv := &Server{store: s, resumeMax: 3}
+	sid, rid := SessionID("s_del_resume"), RunID("r_del_resume")
+	s.mustAcquire(t, sid, rid, "m_del_resume", "hi")
+	if err := s.db.WithContext(ctx).Exec(
+		`UPDATE runs SET lease_until = now() - interval '1 second' WHERE id = ?`, rid).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.WithContext(ctx).Exec(`UPDATE sessions SET deleted_at = now() WHERE id = ?`, sid).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/runs/"+string(rid)+"/resume", nil)
+	c.Params = gin.Params{{Key: "runId", Value: string(rid)}}
+	c.Set("tako.principal", testOwner)
+	srv.resumeRun(c)
+
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("响应不是 JSON: %q", w.Body.String())
+	}
+	if w.Code != http.StatusNotFound || body["error"] != "run_not_found" {
+		t.Fatalf("已删会话 resume = %d %v, want 404 run_not_found", w.Code, body)
+	}
+	if !s.sqlBool(t, `SELECT lease_epoch = 1 AND status = 'running' FROM runs WHERE id = ?`, rid) {
+		t.Fatal("拒掉后 run 的 epoch 或 status 变了")
+	}
+}

@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { api, type AgentRow, type McpItem, type McpServer, type RuntimeConfig, type ToolPolicy } from './configureApi'
 import { authState, loginWithPassword, readTenant, readToken } from './auth'
+import MembersView from './MembersView.vue'
 
 const props = defineProps<{ page: 'agents' | 'team' }>()
 
@@ -50,6 +51,13 @@ async function login() {
 }
 
 const tab = ref<'root' | 'subagent'>('root')
+const teamSub = ref<'settings' | 'members'>(
+  sessionStorage.getItem('tako.team.sub.' + readTenant().id) === 'members' ? 'members' : 'settings',
+)
+watch(teamSub, (value) => {
+  const id = readTenant().id
+  if (id) sessionStorage.setItem('tako.team.sub.' + id, value)
+})
 const agents = ref<AgentRow[]>([])
 const selected = ref<AgentRow | null>(null)
 const namesText = ref('')
@@ -337,7 +345,7 @@ function stateClass(state: string, custom: boolean): string {
 
 async function reload() {
   if (props.page === 'agents') await loadAgents()
-  else {
+  else if (teamSub.value === 'settings') {
     await loadConfig()
     await testMcp()
   }
@@ -353,6 +361,11 @@ watch(tab, () => {
 watch(() => props.page, () => {
   banner.value = ''
   if (loggedIn.value) void reload()
+})
+
+watch(teamSub, () => {
+  banner.value = ''
+  if (props.page === 'team' && loggedIn.value && teamSub.value === 'settings') void reload()
 })
 
 onMounted(() => {
@@ -379,10 +392,14 @@ onMounted(() => {
       <header class="page-head">
         <div>
           <p class="kicker">{{ page === 'agents' ? '助手' : '团队' }}</p>
-          <h2>{{ page === 'agents' ? '这个工作区能调用的助手' : '模型、密钥和 MCP' }}</h2>
+          <h2>{{ page === 'agents' ? '这个工作区能调用的助手' : (teamSub === 'members' ? '成员和邀请' : '模型、密钥和 MCP') }}</h2>
         </div>
         <p v-if="note" class="toast" role="status">{{ note }}</p>
       </header>
+      <div v-if="page === 'team'" class="tabs subnav" role="tablist">
+        <button type="button" role="tab" :class="{ on: teamSub === 'settings' }" :aria-selected="teamSub === 'settings'" @click="teamSub = 'settings'">设置</button>
+        <button type="button" role="tab" :class="{ on: teamSub === 'members' }" :aria-selected="teamSub === 'members'" @click="teamSub = 'members'">成员</button>
+      </div>
       <p v-if="banner" class="banner" role="alert">{{ banner }}</p>
 
       <div v-if="page === 'agents'" class="split">
@@ -458,6 +475,8 @@ onMounted(() => {
           <p>从左边选一个助手，或新建一个自定义助手。</p>
         </div>
       </div>
+
+      <MembersView v-else-if="teamSub === 'members'" />
 
       <form v-else class="stack" @submit.prevent="saveConfig">
         <section class="card">
@@ -649,6 +668,7 @@ button:hover:not(:disabled), .file:hover { border-color: #cfc6b6; }
   border-radius: 999px;
   border: 1px solid var(--line);
 }
+.subnav { margin: 0 0 0.9rem; align-self: flex-start; }
 .tabs button {
   border: 0;
   background: transparent;
