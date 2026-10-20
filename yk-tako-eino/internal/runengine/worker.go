@@ -250,6 +250,10 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		newAgentSpecHandler(agentsDir, store, workspace, chat, modelRef, translate, resolver,
 			make(chan struct{}, subagentConcurrency), subagentReturnCap,
 			counter, compactWindow, compactLimit, sum.summarize, firstPartyFileEffects),
+		// 工具目录分级（T4/T5，toolsearch.go）：排在 mcp 与 agentSpec 之后——BeforeAgent 建的完整目录
+		// 要含两者 append 的工具；tool_search 自己在本 handler 里入池，不进子代理入口快照。
+		// BeforeModelRewriteState 每轮用完整目录重建声明面（mcp__ 只留已激活项）。
+		newToolSearchHandler(),
 		// 笔记快照缝（M1，notes.go）：BeforeAgent 渲染快照、每轮模型调用前把 system 重写为
 		// Instruction + 快照段；排在 midfold 之前——midfold 从 state 取 system 计数，与模型实见同源。
 		newNoteSnapshotHandler(store, workspace, system),
