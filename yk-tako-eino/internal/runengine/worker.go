@@ -189,7 +189,7 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 	for _, mk := range []func(string) (tool.BaseTool, error){
 		newWriteFileTool, newReadTextFileTool, newReadFileTool, newEditFileTool,
 		newMoveFileTool, newCreateDirectoryTool, newListDirectoryTool,
-		newDirectoryTreeTool, newGetFileInfoTool, newSearchFilesTool, newReadMediaFileTool,
+		newDirectoryTreeTool, newGetFileInfoTool, newSearchFilesTool,
 	} {
 		t, err := mk(workspace)
 		if err != nil {
@@ -197,6 +197,11 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		}
 		pool = append(pool, wrapToolErrors(t))
 	}
+	readMedia, err := newReadMediaFileTool(store, workspace)
+	if err != nil {
+		return nil, err
+	}
+	pool = append(pool, wrapToolErrors(readMedia))
 	// bash 执行工具入池（doc/17 §3）：11 个文件工具后、memory 前——批量活先写脚本再跑；
 	// 作业根 workspace（相对路径在 workspace 内解析），32 KB 帽 / 环境白名单在 bash.go（无自动超时，2026-10-15 用户裁）。
 	bash, err := newBashTool(workspace)
@@ -431,7 +436,7 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 					return
 				}
 			}
-			if dir, err := sessionWorkspace(w.workspace, p.TenantID, sessionID); err != nil {
+			if dir, err := runWorkspace(ctx, w, p.TenantID, sessionID); err != nil {
 				log.Printf("workspace %s/%s: %v", sessionID, runID, err)
 			} else {
 				ref := WorkspaceRef{TenantID: p.TenantID, SessionID: sessionID, Root: dir, TenantRoot: tenantStorageRoot(w.workspace, p.TenantID), MaxBytes: maxBytes}

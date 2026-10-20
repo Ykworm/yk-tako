@@ -40,15 +40,15 @@ func TestSessionAccessPrivateAndTenant(t *testing.T) {
 	if _, kind, err := s.SessionAccess(ctx, sid, bob); err != nil || kind != accessRead {
 		t.Fatalf("tenant-visible = %v %v, want read", kind, err)
 	}
-	ok, err := s.AcquireRun(ctx, sid, RunID("r_acc2"), Row{RunID: "r_acc2", Role: "user", MessageID: "m2", Text: "x"}, bob)
+	ok, err := s.AcquireRun(ctx, sid, RunID("r_acc2"), Row{RunID: "r_acc2", Role: "user", MessageID: "m2", Text: "x"}, bob, "")
 	if ok || !errors.Is(err, ErrSessionForbidden) {
 		t.Fatalf("bob 写入 = (ok %v, err %v), want forbidden", ok, err)
 	}
-	rows, err := s.ListSessions(ctx, bob, "own")
+	rows, err := s.ListSessions(ctx, bob, "own", "")
 	if err != nil || len(rows) != 0 {
 		t.Fatalf("bob own = %d %v", len(rows), err)
 	}
-	rows, err = s.ListSessions(ctx, bob, "tenant")
+	rows, err = s.ListSessions(ctx, bob, "tenant", "")
 	if err != nil || len(rows) != 1 || rows[0].ID != sid {
 		t.Fatalf("bob tenant list = %+v %v", rows, err)
 	}

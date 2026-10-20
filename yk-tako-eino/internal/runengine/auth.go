@@ -109,33 +109,38 @@ type devTenantData struct {
 }
 
 const (
-	codeOK               = 0
-	codeBadJSON          = 111001
-	codeBadInput         = 111002
-	codeNameRequired     = 111003
-	codeBadCredentials   = 111101
-	codeMissingToken     = 111102
-	codeInvalidToken     = 111103
-	codeTokenExpired     = 111104
-	codeBadRefresh       = 111105
-	codeNotMember        = 111201
-	codeForbidden        = 111203
-	codeNotOwner         = 111204
-	codeEmailTaken       = 111401
-	codeNoTenant         = 111402
-	codeLastOwner        = 111403
-	codeLastAdmin        = 111404
-	codeInviteInvalid    = 111405
-	codeInviteMember     = 111406
-	codeInviteOwner      = 111407
-	codeModelUnavailable = 111408
-	codeUnknownTool      = 111409
-	codeMcpIllegal       = 111410
-	codeMcpDown          = 111411
-	codeAgentTaken       = 111412
-	codeAgentMissing     = 112003
-	codeQuota            = 113001
-	codeInternal         = 111901
+	codeOK                    = 0
+	codeBadJSON               = 111001
+	codeBadInput              = 111002
+	codeNameRequired          = 111003
+	codeBadCredentials        = 111101
+	codeMissingToken          = 111102
+	codeInvalidToken          = 111103
+	codeTokenExpired          = 111104
+	codeBadRefresh            = 111105
+	codeNotMember             = 111201
+	codeForbidden             = 111203
+	codeNotOwner              = 111204
+	codeEmailTaken            = 111401
+	codeNoTenant              = 111402
+	codeLastOwner             = 111403
+	codeLastAdmin             = 111404
+	codeInviteInvalid         = 111405
+	codeInviteMember          = 111406
+	codeInviteOwner           = 111407
+	codeModelUnavailable      = 111408
+	codeUnknownTool           = 111409
+	codeMcpIllegal            = 111410
+	codeMcpDown               = 111411
+	codeAgentTaken            = 111412
+	codeAgentMissing          = 112003
+	codeQuota                 = 113001
+	codeWorkspaceMissing      = 114001
+	codeWorkspaceNotEmpty     = 114002
+	codeWorkspaceNameRequired = 114003
+	codeWorkspaceBusy         = 114004
+	codeWorkspaceDefault      = 114005
+	codeInternal              = 111901
 )
 
 var emailPattern = regexp.MustCompile(`^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$`)

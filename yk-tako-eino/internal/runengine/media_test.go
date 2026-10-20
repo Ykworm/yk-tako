@@ -26,15 +26,46 @@ func pngB64(t *testing.T, b byte) string {
 }
 
 func TestParseSessionMediaPath(t *testing.T) {
-	sid, rel, ok := parseSessionMediaPath("sessions/vis/../priv/secret.png")
-	if !ok || sid != "priv" || rel != "secret.png" {
-		t.Fatalf("Clean 后应落到 priv 会话，得到 sid=%q rel=%q ok=%v", sid, rel, ok)
+	wid, rel, ok := parseSessionMediaPath("workspaces/vis/../priv/secret.png")
+	if !ok || wid != "priv" || rel != "secret.png" {
+		t.Fatalf("Clean 后应落到 priv 工作区，得到 wid=%q rel=%q ok=%v", wid, rel, ok)
 	}
 	if _, _, ok := parseSessionMediaPath(".media/abc.png"); ok {
-		t.Fatal("不带会话的 .media 路径不能跳过访问检查")
+		t.Fatal("不带工作区的 .media 路径不能跳过访问检查")
 	}
-	if _, _, ok := parseSessionMediaPath("sessions/s1/../../etc/passwd"); ok {
-		t.Fatal("清出 sessions 前缀的路径必须拒绝")
+	if _, _, ok := parseSessionMediaPath("workspaces/w1/../../etc/passwd"); ok {
+		t.Fatal("清出 workspaces 前缀的路径必须拒绝")
+	}
+	if _, _, ok := parseSessionMediaPath("sessions/s1/.media/a.png"); ok {
+		t.Fatal("旧的 sessions 路径不再解析")
+	}
+}
+
+func TestClearSessionMedia(t *testing.T) {
+	root := t.TempDir()
+	old := filepath.Join(root, "tenants", "t1", "sessions", "s1", ".media", "old.png")
+	keepSession := filepath.Join(root, "tenants", "t1", "sessions", "s1", "note.md")
+	keepWS := filepath.Join(root, "tenants", "t1", "workspaces", "w1", ".media", "keep.png")
+	for _, path := range []string{old, keepSession, keepWS} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := ClearSessionMedia(root)
+	if err != nil || n != 1 {
+		t.Fatalf("应删 1 个会话 .media: n=%d err=%v", n, err)
+	}
+	if _, err := os.Stat(filepath.Dir(old)); !os.IsNotExist(err) {
+		t.Fatalf("会话 .media 应消失: %v", err)
+	}
+	if _, err := os.Stat(keepSession); err != nil {
+		t.Fatalf("会话里的其他文件应留下: %v", err)
+	}
+	if _, err := os.Stat(keepWS); err != nil {
+		t.Fatalf("工作区 .media 应留下: %v", err)
 	}
 }
 

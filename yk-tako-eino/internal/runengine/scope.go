@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -79,6 +80,41 @@ func activeRoot(ctx context.Context, fallback string) string {
 // tenantStorageRoot 是一个租户在 workspace 下的目录。存储帽数这整棵树，不单数一场会话。
 func tenantStorageRoot(root, tenantID string) string {
 	return filepath.Join(root, "tenants", tenantID)
+}
+
+// workspaceDir 算出项目目录，不创建它。id 只允许单段路径，避免从库里的值走出去。
+// 删除用它做 RemoveAll：目录还没建过时，删一个不存在的路径也成功。
+func workspaceDir(root, tenantID, workspaceID string) (string, error) {
+	if root == "" || tenantID == "" || workspaceID == "" || workspaceID == "." || workspaceID == ".." ||
+		strings.ContainsRune(workspaceID, os.PathSeparator) || strings.ContainsRune(workspaceID, '/') {
+		return "", os.ErrInvalid
+	}
+	return filepath.Join(root, "tenants", tenantID, "workspaces", workspaceID), nil
+}
+
+// workspaceRoot 把挂了项目的会话的作业根落到 <root>/tenants/<tenant>/workspaces/<wid>/。
+// 目录在第一场 run 起跑时建。
+func workspaceRoot(root, tenantID, workspaceID string) (string, error) {
+	dir, err := workspaceDir(root, tenantID, workspaceID)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// runWorkspace 按会话行选作业根。挂了项目就用项目目录，否则仍是这场会话自己的目录。
+func runWorkspace(ctx context.Context, w *Worker, tenantID string, sessionID SessionID) (string, error) {
+	wid, err := w.store.SessionWorkspaceID(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	if wid != "" {
+		return workspaceRoot(w.workspace, tenantID, wid)
+	}
+	return sessionWorkspace(w.workspace, tenantID, sessionID)
 }
 
 // sessionWorkspace 把作业根落到 <root>/tenants/<tenant>/sessions/<session>。

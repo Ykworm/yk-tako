@@ -188,6 +188,11 @@ func main() {
 		log.Fatalf("workspace %q 创建: %v", wsAbs, err)
 	}
 	log.Printf("workspace %s", wsAbs)
+	if n, err := runengine.ClearSessionMedia(wsAbs); err != nil {
+		log.Fatalf("清理会话旧媒体: %v", err)
+	} else if n > 0 {
+		log.Printf("清理了 %d 个会话 .media 目录", n)
+	}
 	if host, herr := os.Hostname(); herr == nil {
 		marker := filepath.Join(wsAbs, ".tako-replica")
 		prev, rerr := os.ReadFile(marker)

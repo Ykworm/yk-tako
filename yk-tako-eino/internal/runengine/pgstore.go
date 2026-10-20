@@ -26,13 +26,14 @@ import (
 // Session = `sessions` 表（19v6-03 + doc/28 A1）：会话登记，存在即已登记（懒建于 POST 事务内）。永久状态。
 // TenantID/UserID 是归属；Visibility 默认 private，tenant 表示同租户成员只读。
 type Session struct {
-	ID         SessionID `gorm:"primaryKey"`
-	Title      string    `gorm:"not null"` // 展示字段（会话列表用），非契约；初值 = 首条用户消息截断
-	TenantID   string    `gorm:"not null;default:'';index:sessions_tenant_visibility,priority:1"`
-	UserID     string    `gorm:"not null;default:''"`
-	Visibility string    `gorm:"not null;default:private;index:sessions_tenant_visibility,priority:2"`
-	AgentID    string    `gorm:"not null;default:''"`
-	CreatedAt  time.Time `gorm:"not null;index:sessions_tenant_visibility,priority:3"`
+	ID          SessionID `gorm:"primaryKey"`
+	Title       string    `gorm:"not null"` // 展示字段（会话列表用），非契约；初值 = 首条用户消息截断
+	TenantID    string    `gorm:"not null;default:'';index:sessions_tenant_visibility,priority:1"`
+	UserID      string    `gorm:"not null;default:''"`
+	Visibility  string    `gorm:"not null;default:private;index:sessions_tenant_visibility,priority:2"`
+	AgentID     string    `gorm:"not null;default:''"`
+	WorkspaceID *string   `gorm:"index"` // 空 = 游离会话，作业根仍是 sessions/<sid>/
+	CreatedAt   time.Time `gorm:"not null;index:sessions_tenant_visibility,priority:3"`
 }
 
 func (Session) TableName() string { return "sessions" }
@@ -50,6 +51,10 @@ type Run struct {
 	LeaseEpoch int64     `gorm:"not null;default:1"`
 	CreatedAt  time.Time `gorm:"not null"`
 	FinishedAt *time.Time
+	// WorkspaceID 是这场 run 要写的项目。空 = 游离会话，不进项目闸。
+	// 活行上的部分唯一索引 one_live_run_per_workspace 保证同一项目同时只有一场 running。
+	// 终态行留着这一列，靠 status 退出索引，下一场才能再抢。
+	WorkspaceID *string
 }
 
 func (Run) TableName() string { return "runs" }
@@ -128,6 +133,274 @@ type RunJournal struct {
 
 func (RunJournal) TableName() string { return "run_journal" }
 
+// Workspace 是 workspaces 表（doc/35）：某个用户在当前 tenant 下的一个项目。
+// 一行记归属、名字和 visibility。磁盘目录 tenants/<tid>/workspaces/<id>/ 不在创建时建，
+// 挂上第一场 run 时由 worker 建。visibility 只有 private 和 tenant，新建是 private。
+type Workspace struct {
+	ID         string `gorm:"primaryKey"`
+	TenantID   string `gorm:"not null;index:workspaces_owner,priority:1"`
+	UserID     string `gorm:"not null;index:workspaces_owner,priority:2"`
+	Name       string `gorm:"not null"`
+	Visibility string `gorm:"not null;default:private"`
+	// IsDefault 标记「当前租户 × 这个用户」的默认工作区。部分唯一索引保证每对至多一个。
+	IsDefault bool      `gorm:"not null;default:false"`
+	CreatedAt time.Time `gorm:"not null"`
+}
+
+func (Workspace) TableName() string { return "workspaces" }
+
+// CreateWorkspace 插入一行。id 用 ws_ 前缀。tenant 和 user 由调用方从 token 传入，不从请求体取。
+func (s *Store) CreateWorkspace(ctx context.Context, tenantID, userID, name string) (Workspace, error) {
+	id, err := newRowID("ws_")
+	if err != nil {
+		return Workspace{}, err
+	}
+	row := Workspace{ID: id, TenantID: tenantID, UserID: userID, Name: name, Visibility: "private", CreatedAt: time.Now()}
+	if err := s.db.WithContext(ctx).Create(&row).Error; err != nil {
+		return Workspace{}, err
+	}
+	return row, nil
+}
+
+// ErrWorkspaceNotFound 表示这行不存在，或当前用户看不见。两种情况对调用方一样。
+var ErrWorkspaceNotFound = errors.New("workspace not found")
+
+// ListWorkspaces：scope 为 tenant 时返回本租户里 visibility=tenant 的项目，含自己共享出去的。
+// 其他 scope 只返回这个用户在当前 tenant 下创建的项目。两种都按创建时间再按 id。
+func (s *Store) ListWorkspaces(ctx context.Context, tenantID, userID, scope string) ([]Workspace, error) {
+	q := s.db.WithContext(ctx).Where("tenant_id = ?", tenantID)
+	if scope == "tenant" {
+		q = q.Where("visibility = ?", "tenant")
+	} else {
+		q = q.Where("user_id = ?", userID)
+	}
+	var rows []Workspace
+	err := q.Order("created_at, id").Find(&rows).Error
+	return rows, err
+}
+
+// SetWorkspaceVisibility 只改创建者自己的项目。对不上就当没有这个项目。
+// visibility 只接受 private 与 tenant。
+func (s *Store) SetWorkspaceVisibility(ctx context.Context, tenantID, userID, id, visibility string) error {
+	if visibility != "private" && visibility != "tenant" {
+		return ErrBadVisibility
+	}
+	res := s.db.WithContext(ctx).Model(&Workspace{}).
+		Where("id = ? AND tenant_id = ? AND user_id = ?", id, tenantID, userID).
+		Update("visibility", visibility)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return ErrWorkspaceNotFound
+	}
+	return nil
+}
+
+// RenameWorkspace 只改创建者自己的那一行。对不上就当没有这个项目。
+func (s *Store) RenameWorkspace(ctx context.Context, tenantID, userID, id, name string) (Workspace, error) {
+	res := s.db.WithContext(ctx).Model(&Workspace{}).
+		Where("id = ? AND tenant_id = ? AND user_id = ?", id, tenantID, userID).
+		Update("name", name)
+	if res.Error != nil {
+		return Workspace{}, res.Error
+	}
+	if res.RowsAffected == 0 {
+		return Workspace{}, ErrWorkspaceNotFound
+	}
+	var row Workspace
+	err := s.db.WithContext(ctx).
+		Where("id = ? AND tenant_id = ? AND user_id = ?", id, tenantID, userID).
+		Take(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return Workspace{}, ErrWorkspaceNotFound
+	}
+	return row, err
+}
+
+// ErrWorkspaceNotEmpty 表示项目上还有会话，这一拍不能删。
+var ErrWorkspaceNotEmpty = errors.New("workspace not empty")
+
+// ErrWorkspaceDefault 表示这行是默认工作区，不能删。
+var ErrWorkspaceDefault = errors.New("default workspace")
+
+// lockOwnedWorkspace 锁住创建者自己的项目行。删除和 PATCH 挪进仍走这把锁。
+// 新建会话改走 lockVisibleWorkspace：同租户里 visibility=tenant 的项目，成员也能挂上新会话。
+func lockOwnedWorkspace(tx *gorm.DB, id, tenantID, userID string) error {
+	return lockWorkspace(tx, id, tenantID, userID, false)
+}
+
+// lockVisibleWorkspace 锁住当前用户看得见的项目行：创建者自己的，或本租户 visibility=tenant 的。
+// 新建会话写入 workspace_id 之前拿这把锁，和删除排队。
+func lockVisibleWorkspace(tx *gorm.DB, id, tenantID, userID string) error {
+	return lockWorkspace(tx, id, tenantID, userID, true)
+}
+
+// seeVisibleWorkspace 在已经锁着会话行的事务里再看一次项目。不加 FOR UPDATE：
+// PATCH 挪进是先锁项目再锁会话，这里再锁项目会和它对死。
+func seeVisibleWorkspace(tx *gorm.DB, id, tenantID, userID string) error {
+	var rows []struct {
+		ID string
+	}
+	err := tx.Raw(
+		`SELECT id FROM workspaces WHERE id = ? AND tenant_id = ? AND (user_id = ? OR visibility = 'tenant')`,
+		id, tenantID, userID).Scan(&rows).Error
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return ErrWorkspaceNotFound
+	}
+	return nil
+}
+
+// workspaceOwned 只认创建者自己的项目行。列表放宽和解绑别人的会话都用它，不看 visibility。
+func workspaceOwned(db *gorm.DB, id, tenantID, userID string) (bool, error) {
+	var rows []struct {
+		ID string
+	}
+	err := db.Raw(
+		`SELECT id FROM workspaces WHERE id = ? AND tenant_id = ? AND user_id = ?`,
+		id, tenantID, userID).Scan(&rows).Error
+	if err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
+}
+
+func lockWorkspace(tx *gorm.DB, id, tenantID, userID string, visible bool) error {
+	var rows []struct {
+		ID string
+	}
+	q := `SELECT id FROM workspaces WHERE id = ? AND tenant_id = ? AND user_id = ? FOR UPDATE`
+	args := []any{id, tenantID, userID}
+	if visible {
+		q = `SELECT id FROM workspaces WHERE id = ? AND tenant_id = ? AND (user_id = ? OR visibility = 'tenant') FOR UPDATE`
+	}
+	err := tx.Raw(q, args...).Scan(&rows).Error
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return ErrWorkspaceNotFound
+	}
+	return nil
+}
+
+// DeleteWorkspace 在一笔事务里锁行、数会话、删行。数到会话就回 ErrWorkspaceNotEmpty，行还在。
+// 磁盘目录由调用方在提交成功之后删。这里不碰目录，避免库回滚了目录却已经没了。
+func (s *Store) DeleteWorkspace(ctx context.Context, tenantID, userID, id string) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockOwnedWorkspace(tx, id, tenantID, userID); err != nil {
+			return err
+		}
+		var flags []bool
+		if err := tx.Raw(`SELECT is_default FROM workspaces WHERE id = ?`, id).Scan(&flags).Error; err != nil {
+			return err
+		}
+		if len(flags) > 0 && flags[0] {
+			return ErrWorkspaceDefault
+		}
+		var n int64
+		if err := tx.Model(&Session{}).Where("workspace_id = ?", id).Count(&n).Error; err != nil {
+			return err
+		}
+		if n > 0 {
+			return ErrWorkspaceNotEmpty
+		}
+		res := tx.Exec(`DELETE FROM workspaces WHERE id = ?`, id)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrWorkspaceNotFound
+		}
+		return nil
+	})
+}
+
+// VisibleWorkspace 认当前用户在 active tenant 里看得见的项目：自己创建的，或 visibility=tenant 的。
+// 对不上与不存在相同。跨租户看不见。
+func (s *Store) VisibleWorkspace(ctx context.Context, id, tenantID, userID string) (Workspace, error) {
+	var row Workspace
+	err := s.db.WithContext(ctx).
+		Where("id = ? AND tenant_id = ? AND (user_id = ? OR visibility = ?)", id, tenantID, userID, "tenant").
+		Take(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return Workspace{}, ErrWorkspaceNotFound
+	}
+	return row, err
+}
+
+// SessionWorkspaceID 读会话挂着的项目。没有挂，或会话行还不存在，都返回空串。
+func (s *Store) SessionWorkspaceID(ctx context.Context, id SessionID) (string, error) {
+	var rows []struct {
+		WorkspaceID *string `gorm:"column:workspace_id"`
+	}
+	err := s.db.WithContext(ctx).Raw(`SELECT workspace_id FROM sessions WHERE id = ?`, id).Scan(&rows).Error
+	if err != nil || len(rows) == 0 || rows[0].WorkspaceID == nil {
+		return "", err
+	}
+	return *rows[0].WorkspaceID, nil
+}
+
+// EnsureDefaultWorkspace 取出「当前租户 × 这个用户」的默认工作区。没有就在这一笔事务里建。
+// 名字是「默认」，visibility 是 private，is_default 为 true。两副本同时建时，唯一索引只留一行，
+// 没插上的那笔回读已有行。
+func (s *Store) EnsureDefaultWorkspace(ctx context.Context, tenantID, userID string) (Workspace, error) {
+	var found Workspace
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		row, err := findDefaultWorkspace(tx, tenantID, userID)
+		if err != nil {
+			return err
+		}
+		if row.ID != "" {
+			found = row
+			return nil
+		}
+		if err := tx.SavePoint("default_ws").Error; err != nil {
+			return err
+		}
+		id, err := newRowID("ws_")
+		if err != nil {
+			return err
+		}
+		row = Workspace{
+			ID: id, TenantID: tenantID, UserID: userID,
+			Name: "默认", Visibility: "private", IsDefault: true,
+			CreatedAt: time.Now(),
+		}
+		if err := tx.Create(&row).Error; err != nil {
+			if !isUniqueViolation(err) {
+				return err
+			}
+			if rb := tx.RollbackTo("default_ws").Error; rb != nil {
+				return rb
+			}
+			row, err = findDefaultWorkspace(tx, tenantID, userID)
+			if err != nil {
+				return err
+			}
+			if row.ID == "" {
+				return err
+			}
+		}
+		found = row
+		return nil
+	})
+	return found, err
+}
+
+func findDefaultWorkspace(tx *gorm.DB, tenantID, userID string) (Workspace, error) {
+	var rows []Workspace
+	err := tx.Where("tenant_id = ? AND user_id = ? AND is_default = ?", tenantID, userID, true).
+		Limit(1).Find(&rows).Error
+	if err != nil || len(rows) == 0 {
+		return Workspace{}, err
+	}
+	return rows[0], nil
+}
+
 // autoMigrate 从九个 struct 建表（dev 迁移方式，待定项①已裁：AutoMigrate 够用，无迁移文件；
 // 上生产换不换显式迁移归部署面）。部分索引（WHERE 条件）优先走 GORM index tag；
 // 若某版 GORM 表达不全，在这里补 CREATE ... IF NOT EXISTS 兜底——仍是代码内，不引迁移文件。
@@ -141,13 +414,25 @@ func autoMigrate(db *gorm.DB) error {
 	if err := db.AutoMigrate(&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}, &Note{}, &RunJournal{},
 		&MemoryItem{}, &MemoryJob{}, &DialogueChunk{},
 		&User{}, &Tenant{}, &TenantMember{}, &RefreshToken{}, &AuditLog{}, &TenantUsageDaily{},
-		&TenantInvitation{}, &TenantAgent{}, &AgentDefault{}, &TenantSetting{}, &TenantStorage{}); err != nil {
+		&TenantInvitation{}, &TenantAgent{}, &AgentDefault{}, &TenantSetting{}, &TenantStorage{},
+		&Workspace{}); err != nil {
 		return err
 	}
 	_ = db.Exec(`DROP INDEX IF EXISTS memory_items_dedup`).Error
-	return db.Exec(`CREATE UNIQUE INDEX memory_items_dedup
+	if err := db.Exec(`CREATE UNIQUE INDEX memory_items_dedup
 ON memory_items (tenant_id, user_id, workspace, kind, content)
-WHERE kind <> 'episode'`).Error
+WHERE kind <> 'episode'`).Error; err != nil {
+		return err
+	}
+	// 活行的 status 值是 running。写成 live 的话，索引里一行都不会有，闸等于没装。
+	if err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS one_live_run_per_workspace
+ON runs (workspace_id)
+WHERE workspace_id IS NOT NULL AND status = 'running'`).Error; err != nil {
+		return err
+	}
+	return db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS one_default_workspace_per_user
+ON workspaces (tenant_id, user_id)
+WHERE is_default`).Error
 }
 
 // newRowID 生成行级代理主键：前缀 + ULID（同 s_/r_ 的铸法）。

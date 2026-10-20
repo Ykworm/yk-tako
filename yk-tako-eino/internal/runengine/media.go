@@ -2,7 +2,7 @@ package runengine
 
 // media.go — doc/32 A1 + A6：入口媒体的校验、内容寻址落盘与占位行渲染。
 // 纪律（doc/32 第 2 节）：媒体字节永远不进对话的落库面。登录后的字节落在
-// <workspace>/tenants/<tid>/sessions/<sid>/.media/，占位 path 是 sessions/<sid>/.media/...。
+// <workspace>/tenants/<tid>/workspaces/<wid>/.media/，占位 path 是 workspaces/<wid>/.media/...。
 // 对话里只有一行占位文本。A4 的 GET /api/media 是 path 换字节的唯一出口。
 // A6 通信字段（doc/32 §3）：占位行加 name=/seq=——name 是用户上传文件名（可省），
 // seq 是全会话累计序号（恒在）；模型拿这对字段回应「第 N 张」「同名的新版」。
@@ -57,8 +57,8 @@ func ingestImages(root string, images []postImage, seqStart int) (string, error)
 
 // ingestImagesAt 校验并落盘一批入口图，返回拼好的占位行块（每图一行、按入参序；
 // 无图返回空串）。任何一项不合法整批拒收（调用方回 400）。seqStart 是本消息首图的
-// 全会话序号。relPrefix 拼在占位 path 前面（会话图用 sessions/<sid>/，
-// GET /api/media 和 read_media_file 读同一条路径）。quota 在落盘前数本张字节；nil 表示不限额。
+// 全会话序号。relPrefix 拼在占位 path 前面（入口图用 workspaces/<wid>/，
+// GET /api/media 读同一条路径）。quota 在落盘前数本张字节；nil 表示不限额。
 func ingestImagesAt(root string, images []postImage, seqStart int, relPrefix string, quota func(int) (func(), error)) (string, error) {
 	if len(images) == 0 {
 		return "", nil
@@ -105,6 +105,48 @@ func ingestImagesAt(root string, images []postImage, seqStart int, relPrefix str
 	return strings.Join(lines, "\n"), nil
 }
 
+// ClearSessionMedia 删掉租户会话目录下的旧 .media。附件已经改挂工作区，这些目录不再可读。
+// 只删 sessions/<sid>/.media 这一层，会话里的其他文件和 workspaces 下的 .media 留着。
+func ClearSessionMedia(root string) (int, error) {
+	tenants := filepath.Join(root, "tenants")
+	tids, err := os.ReadDir(tenants)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, tid := range tids {
+		if !tid.IsDir() {
+			continue
+		}
+		sessions := filepath.Join(tenants, tid.Name(), "sessions")
+		sids, err := os.ReadDir(sessions)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return n, err
+		}
+		for _, sid := range sids {
+			if !sid.IsDir() {
+				continue
+			}
+			media := filepath.Join(sessions, sid.Name(), mediaDirName)
+			fi, err := os.Stat(media)
+			if err != nil || !fi.IsDir() {
+				continue
+			}
+			if err := os.RemoveAll(media); err != nil {
+				return n, err
+			}
+			n++
+		}
+	}
+	return n, nil
+}
+
 // writeFileOnce 内容寻址写：O_EXCL 创建，已存在（同 sha 同字节）即跳过——并发与重投幂等。
 func writeFileOnce(path string, raw []byte) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
@@ -137,11 +179,11 @@ func mediaDisplayName(raw string) string {
 	return string(runes)
 }
 
-// parseSessionMediaPath 把占位 path 收成「会话 id + 会话目录内的相对路径」。
-// 先 Clean，再认 sessions/<sid>/。sessions/<可见>/../<别人> 会变成别人的 sid，
-// 调用方按清完的 sid 做访问检查，不能按第一段放行。
-// .media/... 这种不带会话的路径返回 false。
-func parseSessionMediaPath(path string) (sid, rel string, ok bool) {
+// parseSessionMediaPath 把占位 path 收成「工作区 id + 工作区目录内的相对路径」。
+// 先 Clean，再认 workspaces/<wid>/。workspaces/<可见>/../<别人> 会变成别人的 wid，
+// 调用方按清完的 wid 做 VisibleWorkspace，不能按第一段放行。
+// sessions/<sid>/... 和 .media/... 都返回 false。
+func parseSessionMediaPath(path string) (wid, rel string, ok bool) {
 	slash := filepath.ToSlash(strings.TrimSpace(path))
 	if slash == "" || strings.HasPrefix(slash, "/") {
 		return "", "", false
@@ -151,7 +193,7 @@ func parseSessionMediaPath(path string) (sid, rel string, ok bool) {
 		return "", "", false
 	}
 	parts := strings.Split(cleaned, "/")
-	if len(parts) < 3 || parts[0] != "sessions" || parts[1] == "" || parts[1] == "." || parts[1] == ".." {
+	if len(parts) < 3 || parts[0] != "workspaces" || parts[1] == "" || parts[1] == "." || parts[1] == ".." {
 		return "", "", false
 	}
 	for _, part := range parts[2:] {

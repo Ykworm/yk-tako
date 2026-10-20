@@ -80,6 +80,181 @@ func (s *Server) createTenant(c *gin.Context) {
 	writeEnvelope(c, http.StatusCreated, codeOK, "", ginTenant(tenant, member.Role))
 }
 
+type workspaceBody struct {
+	ID         string    `json:"id"`
+	Name       string    `json:"name"`
+	CreatedAt  time.Time `json:"createdAt"`
+	Visibility string    `json:"visibility"`
+	Owner      bool      `json:"owner"`
+}
+
+type workspaceData struct {
+	Workspace workspaceBody `json:"workspace"`
+}
+
+// postWorkspaces 建一个项目。归属是 token 里的 active tenant 和当前用户，请求体只带名字。
+func (s *Server) postWorkspaces(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	name, ok := workspaceNameFrom(c)
+	if !ok {
+		return
+	}
+	row, err := s.store.CreateWorkspace(c.Request.Context(), p.TenantID, p.UserID, name)
+	if err != nil {
+		log.Printf("POST /api/workspaces: %v", err)
+		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
+		return
+	}
+	writeEnvelope(c, http.StatusCreated, codeOK, "", workspaceData{Workspace: toWorkspaceBody(row, p.UserID)})
+}
+
+type workspaceListData struct {
+	Workspaces []workspaceBody `json:"workspaces"`
+}
+
+// listWorkspaces 默认只列当前用户在 active tenant 里创建的项目。
+// ?scope=tenant 列本租户里 visibility=tenant 的项目。其他 scope 仍走默认。
+func (s *Server) listWorkspaces(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	rows, err := s.store.ListWorkspaces(c.Request.Context(), p.TenantID, p.UserID, c.Query("scope"))
+	if err != nil {
+		log.Printf("GET /api/workspaces: %v", err)
+		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
+		return
+	}
+	items := make([]workspaceBody, 0, len(rows))
+	for _, row := range rows {
+		items = append(items, toWorkspaceBody(row, p.UserID))
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", workspaceListData{Workspaces: items})
+}
+
+// patchWorkspace 改名。不是创建者，或这行不存在，都回 404，不透露别人有没有这个项目。
+func (s *Server) patchWorkspace(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	name, ok := workspaceNameFrom(c)
+	if !ok {
+		return
+	}
+	row, err := s.store.RenameWorkspace(c.Request.Context(), p.TenantID, p.UserID, c.Param("id"), name)
+	if errors.Is(err, ErrWorkspaceNotFound) {
+		writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
+		return
+	}
+	if err != nil {
+		log.Printf("PATCH /api/workspaces/%s: %v", c.Param("id"), err)
+		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", workspaceData{Workspace: toWorkspaceBody(row, p.UserID)})
+}
+
+// patchWorkspaceVisibility 只让创建者把项目改成 private 或 tenant。
+// 不塞进改名的 PATCH，避免一个 body 同时表示两件事。
+func (s *Server) patchWorkspaceVisibility(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	var req struct {
+		Visibility *string `json:"visibility"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	if req.Visibility == nil || (*req.Visibility != "private" && *req.Visibility != "tenant") {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "可见性只能是 private 或 tenant", nil)
+		return
+	}
+	err := s.store.SetWorkspaceVisibility(c.Request.Context(), p.TenantID, p.UserID, c.Param("id"), *req.Visibility)
+	if errors.Is(err, ErrBadVisibility) {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "可见性只能是 private 或 tenant", nil)
+		return
+	}
+	if errors.Is(err, ErrWorkspaceNotFound) {
+		writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
+		return
+	}
+	if err != nil {
+		log.Printf("PATCH /api/workspaces/%s/visibility: %v", c.Param("id"), err)
+		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		Visibility string `json:"visibility"`
+	}{Visibility: *req.Visibility})
+}
+
+// deleteWorkspace 只删空项目。还有会话则 409，行和目录都留着。
+// 成功是真删：先删行，再删目录。租户删除回的是 archived，这里用 deleted，两件事不是同一件事。
+func (s *Server) deleteWorkspace(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	id := c.Param("id")
+	err := s.store.DeleteWorkspace(c.Request.Context(), p.TenantID, p.UserID, id)
+	switch {
+	case errors.Is(err, ErrWorkspaceNotFound):
+		writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
+	case errors.Is(err, ErrWorkspaceDefault):
+		writeEnvelope(c, http.StatusConflict, codeWorkspaceDefault, "默认工作区不能删除", nil)
+	case errors.Is(err, ErrWorkspaceNotEmpty):
+		writeEnvelope(c, http.StatusConflict, codeWorkspaceNotEmpty, "项目里还有会话，先挪走再删", nil)
+	case err != nil:
+		log.Printf("DELETE /api/workspaces/%s: %v", id, err)
+		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
+	default:
+		dir, dirErr := workspaceDir(s.mediaRoot, p.TenantID, id)
+		if dirErr != nil {
+			log.Printf("DELETE /api/workspaces/%s: %v", id, dirErr)
+			writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
+			return
+		}
+		if rmErr := os.RemoveAll(dir); rmErr != nil {
+			log.Printf("DELETE /api/workspaces/%s: %v", id, rmErr)
+			writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
+			return
+		}
+		writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+			Status string `json:"status"`
+		}{Status: "deleted"})
+	}
+}
+
+func workspaceNameFrom(c *gin.Context) (string, bool) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return "", false
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		writeEnvelope(c, http.StatusBadRequest, codeWorkspaceNameRequired, "请填写项目名称", nil)
+		return "", false
+	}
+	return name, true
+}
+
+func toWorkspaceBody(row Workspace, userID string) workspaceBody {
+	return workspaceBody{
+		ID: row.ID, Name: row.Name, CreatedAt: row.CreatedAt,
+		Visibility: row.Visibility, Owner: row.UserID == userID,
+	}
+}
+
 func ginTenant(t Tenant, role string) any {
 	return struct {
 		Tenant struct {

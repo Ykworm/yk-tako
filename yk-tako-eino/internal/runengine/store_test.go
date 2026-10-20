@@ -182,7 +182,7 @@ var testOwner = principal{UserID: "u_test", TenantID: "t_test", Role: "owner"}
 
 func (s *Store) mustAcquire(t *testing.T, sid SessionID, rid RunID, msgID, text string) {
 	t.Helper()
-	ok, err := s.AcquireRun(context.Background(), sid, rid, Row{RunID: rid, Role: "user", MessageID: msgID, Text: text}, testOwner)
+	ok, err := s.AcquireRun(context.Background(), sid, rid, Row{RunID: rid, Role: "user", MessageID: msgID, Text: text}, testOwner, "")
 	if err != nil {
 		t.Fatalf("AcquireRun(%s, %s): %v", sid, rid, err)
 	}
@@ -208,7 +208,7 @@ func TestAcquireRunGateBlocksSecondRun(t *testing.T) {
 	sid, r1, r2 := SessionID("s_1"), RunID("r_1"), RunID("r_2")
 
 	s.mustAcquire(t, sid, r1, "m_1", "hi")
-	ok, err := s.AcquireRun(ctx, sid, r2, Row{RunID: r2, Role: "user", MessageID: "m_2", Text: "second"}, testOwner)
+	ok, err := s.AcquireRun(ctx, sid, r2, Row{RunID: r2, Role: "user", MessageID: "m_2", Text: "second"}, testOwner, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -650,7 +650,7 @@ func TestGateLeaseLifecycle(t *testing.T) {
 
 	// 再抢闸：不是 409——清扫把死行翻 error，唯一索引放行。
 	r2 := RunID("r_2")
-	ok, err := s.AcquireRun(ctx, sid, r2, Row{RunID: r2, Role: "user", MessageID: "m_2", Text: "again"}, testOwner)
+	ok, err := s.AcquireRun(ctx, sid, r2, Row{RunID: r2, Role: "user", MessageID: "m_2", Text: "again"}, testOwner, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -724,7 +724,7 @@ func TestGateLeaseBirthWindowExpiresWithoutRenew(t *testing.T) {
 
 	// 闸随租约自开：同 session 再抢成功。
 	r2 := RunID("r_2")
-	ok, err := s.AcquireRun(ctx, sid, r2, Row{RunID: r2, Role: "user", MessageID: "m_2", Text: "again"}, testOwner)
+	ok, err := s.AcquireRun(ctx, sid, r2, Row{RunID: r2, Role: "user", MessageID: "m_2", Text: "again"}, testOwner, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -769,7 +769,7 @@ func TestAcquireRunRollsBackWhenRedisFails(t *testing.T) {
 	bad := &Store{db: s.db, rdb: deadRdb, ttl: s.ttl, leaseTTL: s.leaseTTL}
 
 	sid, rid := SessionID("s_1"), RunID("r_1")
-	ok, err := bad.AcquireRun(ctx, sid, rid, Row{RunID: rid, Role: "user", MessageID: "m_1", Text: "hi"}, testOwner)
+	ok, err := bad.AcquireRun(ctx, sid, rid, Row{RunID: rid, Role: "user", MessageID: "m_1", Text: "hi"}, testOwner, "")
 	if err == nil {
 		t.Fatal("Redis 半不可达时 AcquireRun 应报错（调用方回 500）")
 	}

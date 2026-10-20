@@ -609,24 +609,32 @@ func newSearchFilesTool(root string) (tool.BaseTool, error) {
 		})
 }
 
-// sessionRelativeMediaPath 把占位里的 sessions/<本会话>/... 收成会话目录内的相对路径。
-// 别的会话前缀不剥，交给 resolveInWorkspace 在本会话目录里找不到。
-func sessionRelativeMediaPath(ctx context.Context, path string) string {
-	ref, ok := workspaceFrom(ctx)
-	if !ok || ref.SessionID == "" {
-		return path
+// resolveReadMediaPath 决定 read_media_file 读哪一个文件。
+// 占位 path 是 workspaces/<wid>/... 时，先按清完的 wid 做 VisibleWorkspace，
+// 再从租户根下的这个工作区读。范围不是这场会话的作业根。
+// sessions/<sid>/... 不再解析。其余相对路径仍落在作业根里。
+func resolveReadMediaPath(ctx context.Context, store *Store, fallbackRoot, path string) (string, error) {
+	if wid, rel, ok := parseSessionMediaPath(path); ok {
+		who, hasWho := principalFromCtx(ctx)
+		ref, hasRef := workspaceFrom(ctx)
+		if store == nil || !hasWho || !hasRef || ref.TenantRoot == "" {
+			return "", fmt.Errorf("文件不存在：%s", path)
+		}
+		if _, err := store.VisibleWorkspace(ctx, wid, who.TenantID, who.UserID); err != nil {
+			return "", fmt.Errorf("文件不存在：%s", path)
+		}
+		return resolveInWorkspace(filepath.Join(ref.TenantRoot, "workspaces", wid), rel)
 	}
-	prefix := "sessions/" + string(ref.SessionID) + "/"
-	slash := filepath.ToSlash(path)
-	if strings.HasPrefix(slash, prefix) {
-		return slash[len(prefix):]
+	cleaned := filepath.ToSlash(filepath.Clean(filepath.ToSlash(strings.TrimSpace(path))))
+	if cleaned == "sessions" || strings.HasPrefix(cleaned, "sessions/") {
+		return "", fmt.Errorf("文件不存在：%s", path)
 	}
-	return path
+	return resolveInWorkspace(activeRoot(ctx, fallbackRoot), path)
 }
 
 // readMediaFileInput 是 read_media_file 的入参 schema。
 type readMediaFileInput struct {
-	Path string `json:"path" jsonschema:"description=相对 workspace 根的路径（如 assets/pic.png）"`
+	Path string `json:"path" jsonschema:"description=占位行里的 path 原文，形如 workspaces/<id>/.media/<file>。作业根内的相对路径仍可用。不要改写 path。"`
 }
 
 // mediaMimeByExt 是 read_media_file 的扩展名→MIME 表（小写扩展名匹配）；表外 = application/octet-stream。
@@ -642,12 +650,12 @@ var mediaMimeByExt = map[string]string{
 // 句尾措辞是「请勿重复调用」——回执的读者就是刚调完的模型，指回自己 = 死循环（与入口占位
 // mediaPlaceholder 的措辞分工见 media.go）。多模态消费随 translator 升级（19v6-08 §3 挂账）。
 // >5MB 拒读：读进来就是往上下文灌大字节（减灾档），帽与入口图同值（mediaMaxBytes）。
-func newReadMediaFileTool(root string) (tool.BaseTool, error) {
+func newReadMediaFileTool(store *Store, root string) (tool.BaseTool, error) {
 	return utils.InferTool("read_media_file",
-		"读取 workspace 内的媒体文件的元信息（path/mime/size/sha 占位行；当前版本不回传媒体字节）。"+
-			"path 是相对 workspace 根的路径；文件超过 5MB 会拒绝（请先裁剪或换小文件）。",
+		"读取媒体文件的元信息（path/mime/size/sha 占位行；当前版本不回传媒体字节）。"+
+			"path 用对话里占位行的 path 原文（workspaces/<id>/.media/<file>），不要改写。文件超过 5MB 会拒绝。",
 		func(ctx context.Context, in readMediaFileInput) (string, error) {
-			full, err := resolveInWorkspace(activeRoot(ctx, root), sessionRelativeMediaPath(ctx, in.Path))
+			full, err := resolveReadMediaPath(ctx, store, root, in.Path)
 			if err != nil {
 				return "", err
 			}

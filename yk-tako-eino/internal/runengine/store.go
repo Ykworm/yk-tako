@@ -31,6 +31,7 @@ import (
 // 不在 handler 里重拼字符串。
 var (
 	errGateBusy        = errors.New("gate busy")
+	errProjectBusy     = errors.New("project gate busy")
 	errGateLost        = errors.New("gate lost")
 	errRunNotFound     = errors.New("run_not_found")
 	errNotResumable    = errors.New("not_resumable")
@@ -125,7 +126,7 @@ func openRedis(addr string) (*redis.Client, error) {
 // 唯一冲突 = 会话忙（one_live_run_per_session 部分唯一索引），整笔回滚零痕迹 → (false, nil) = 409；
 // Redis 败 → ROLLBACK → error = 500，与 409 同形「什么都没写」。
 // 抢闸 = INSERT runs 本身；出生即带 lease_until（A7-2 的 DB 形态：不存在「先建后补租约」的两步窗口）。
-func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID, user Row, p principal) (bool, error) {
+func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID, user Row, p principal, workspaceID string) (bool, error) {
 	startJSON, err := json.Marshal(Frame{Kind: "start", MessageID: user.MessageID})
 	if err != nil {
 		return false, err
@@ -143,15 +144,29 @@ func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID
 		// 已有会话先锁行。不归属整笔回滚，调用方看到的是 404/403，库里没有新 run。
 		var existing []Session
 		if err := tx.Raw(
-			`SELECT id, tenant_id, user_id, visibility FROM sessions WHERE id = ? FOR UPDATE`,
+			`SELECT id, tenant_id, user_id, visibility, workspace_id FROM sessions WHERE id = ? FOR UPDATE`,
 			sessionID).Scan(&existing).Error; err != nil {
 			return err
 		}
+		// 项目闸看这场 run 实际要写的目录。新会话用请求里的项目；已有会话用行上的列。
+		// 请求带了 workspaceId 但会话是游离的，列不变，文件仍进会话目录，不占项目闸。
+		var runWorkspace any
 		if len(existing) == 0 {
+			// workspace_id 只在新建时写入。已有会话的分支不碰这一列，挪进挪出走 PATCH。
+			// 写入前锁项目行：删除那边持有同一把锁，这里要么等到删除提交后发现行没了，
+			// 要么先把会话挂上，让删除的计数看到它。
+			var workspace any
+			if workspaceID != "" {
+				if err := lockVisibleWorkspace(tx, workspaceID, p.TenantID, p.UserID); err != nil {
+					return err
+				}
+				workspace = workspaceID
+				runWorkspace = workspaceID
+			}
 			if err := tx.Exec(
-				`INSERT INTO sessions (id, title, tenant_id, user_id, visibility, created_at)
-				 VALUES (?, ?, ?, ?, 'private', now())`,
-				sessionID, truncateTitle(user.Text), p.TenantID, p.UserID).Error; err != nil {
+				`INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, created_at)
+				 VALUES (?, ?, ?, ?, 'private', ?, now())`,
+				sessionID, truncateTitle(user.Text), p.TenantID, p.UserID, workspace).Error; err != nil {
 				return err
 			}
 		} else {
@@ -161,6 +176,13 @@ func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID
 				return ErrSessionForbidden
 			default:
 				return ErrSessionNotFound
+			}
+			if existing[0].WorkspaceID != nil && *existing[0].WorkspaceID != "" {
+				// 列先留着。项目若已改回 private，非创建者这一发不建 run。
+				if err := seeVisibleWorkspace(tx, *existing[0].WorkspaceID, p.TenantID, p.UserID); err != nil {
+					return err
+				}
+				runWorkspace = *existing[0].WorkspaceID
 			}
 		}
 		// 清扫死行（§8.3）：上一任进程死掉的活行按 lease 判死翻 error，唯一索引随之放行本 run。
@@ -177,17 +199,47 @@ func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID
 			sessionID).Error; err != nil {
 			return err
 		}
+		// 别的会话上租约已过的活行也占着项目闸。沿用同一条「lease 到了就翻 error」的清扫，
+		// 不另做看门狗。只清这个项目，且只清已经过期的行。
+		if ws, ok := runWorkspace.(string); ok && ws != "" {
+			if err := tx.Exec(
+				`WITH dead AS (
+				   UPDATE runs SET status = 'error', finished_at = now(), lease_until = NULL
+				    WHERE workspace_id = ? AND status = 'running' AND lease_until < now()
+				    RETURNING id
+				 )
+				 DELETE FROM run_journal WHERE run_id IN (SELECT id FROM dead)`,
+				ws).Error; err != nil {
+				return err
+			}
+		}
 		// 抢闸 = 本 INSERT（AGENTS.md「闸放数据库不放进程」）；lease_until 走 DB 时钟——
 		// 多副本对租约的判定共用一个时钟。lease_epoch 显式写 1（doc/30 §7 出生令牌）：
 		// 列默认值只是存量行兜底，出生点自己把话说死。
+		// workspace_id 非空时再撞 one_live_run_per_workspace：同项目已有活行则整笔回滚。
+		if err := tx.Exec(`SAVEPOINT project_gate`).Error; err != nil {
+			return err
+		}
 		if err := tx.Exec(
-			`INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at)
-			 VALUES (?, ?, 'running', 1, now() + make_interval(secs => ?), now())`,
-			runID, sessionID, s.leaseTTL.Seconds()).Error; err != nil {
-			if isUniqueViolation(err) {
+			`INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, workspace_id, created_at)
+			 VALUES (?, ?, 'running', 1, now() + make_interval(secs => ?), ?, now())`,
+			runID, sessionID, s.leaseTTL.Seconds(), runWorkspace).Error; err != nil {
+			if !isUniqueViolation(err) {
+				return err
+			}
+			if rb := tx.Exec(`ROLLBACK TO SAVEPOINT project_gate`).Error; rb != nil {
+				return rb
+			}
+			var n int64
+			if qerr := tx.Raw(
+				`SELECT COUNT(*) FROM runs WHERE session_id = ? AND status = 'running' AND id <> ?`,
+				sessionID, runID).Scan(&n).Error; qerr != nil {
+				return qerr
+			}
+			if n > 0 || runWorkspace == nil {
 				return errGateBusy
 			}
-			return err
+			return errProjectBusy
 		}
 		if err := tx.Exec(
 			`INSERT INTO run_model_messages (id, session_id, run_id, seq, role, text, compacted, created_at)
@@ -210,6 +262,9 @@ func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID
 	if err != nil {
 		if errors.Is(err, errGateBusy) {
 			return false, nil
+		}
+		if errors.Is(err, errProjectBusy) {
+			return false, errProjectBusy
 		}
 		return false, err
 	}

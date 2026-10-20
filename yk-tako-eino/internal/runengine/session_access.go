@@ -70,12 +70,26 @@ func (s *Store) RunSession(ctx context.Context, runID RunID) (SessionID, bool, e
 }
 
 // ListSessions：scope=own（默认）只列本人；scope=tenant 只列本租户 visibility=tenant 的会话。
-func (s *Store) ListSessions(ctx context.Context, p principal, scope string) ([]Session, error) {
+// workspaceID 非空时再按项目筛。空串表示不筛，游离会话留在结果里。
+// 创建者用默认列表筛自己的项目时，返回挂在上面的全部会话，含别人的私人会话。
+// scope=tenant 不放宽，避免借项目筛把别人的私人会话带出来。
+func (s *Store) ListSessions(ctx context.Context, p principal, scope, workspaceID string) ([]Session, error) {
 	q := s.db.WithContext(ctx).Where("tenant_id = ?", p.TenantID)
 	if scope == "tenant" {
 		q = q.Where("visibility = ?", "tenant")
+	} else if workspaceID != "" {
+		owned, err := workspaceOwned(s.db.WithContext(ctx), workspaceID, p.TenantID, p.UserID)
+		if err != nil {
+			return nil, err
+		}
+		if !owned {
+			q = q.Where("user_id = ?", p.UserID)
+		}
 	} else {
 		q = q.Where("user_id = ?", p.UserID)
+	}
+	if workspaceID != "" {
+		q = q.Where("workspace_id = ?", workspaceID)
 	}
 	var rows []Session
 	err := q.Order("created_at DESC, id DESC").Find(&rows).Error
@@ -103,5 +117,54 @@ func (s *Store) SetSessionVisibility(ctx context.Context, id SessionID, p princi
 			return ErrSessionForbidden
 		}
 		return tx.Exec(`UPDATE sessions SET visibility = ? WHERE id = ?`, visibility, id).Error
+	})
+}
+
+// SetSessionWorkspace 把会话挂到项目上，或在 workspaceID 为空时解绑。
+// 挂上只允许会话主人，并且先锁创建者自己的项目行，再锁会话。
+// 解绑多一条：项目创建者可以把别人挂在自己项目上的会话解下来。不能改挂到别的项目。
+// 这里只改列，不删会话，也不搬磁盘上的文件。
+func (s *Store) SetSessionWorkspace(ctx context.Context, id SessionID, p principal, workspaceID string) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if workspaceID != "" {
+			if err := lockOwnedWorkspace(tx, workspaceID, p.TenantID, p.UserID); err != nil {
+				return err
+			}
+		}
+		var rows []Session
+		if err := tx.Raw(
+			`SELECT id, tenant_id, user_id, visibility, workspace_id FROM sessions WHERE id = ? FOR UPDATE`,
+			id).Scan(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return ErrSessionNotFound
+		}
+		kind := decideAccess(rows[0], p)
+		allow := kind == accessOwner
+		if !allow && workspaceID == "" {
+			bound := ""
+			if rows[0].WorkspaceID != nil {
+				bound = *rows[0].WorkspaceID
+			}
+			if bound != "" {
+				owned, err := workspaceOwned(tx, bound, p.TenantID, p.UserID)
+				if err != nil {
+					return err
+				}
+				allow = owned
+			}
+		}
+		if !allow {
+			if kind == accessNone {
+				return ErrSessionNotFound
+			}
+			return ErrSessionForbidden
+		}
+		var wid any
+		if workspaceID != "" {
+			wid = workspaceID
+		}
+		return tx.Exec(`UPDATE sessions SET workspace_id = ? WHERE id = ?`, wid, id).Error
 	})
 }

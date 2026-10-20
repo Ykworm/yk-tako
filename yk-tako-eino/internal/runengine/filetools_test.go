@@ -633,7 +633,7 @@ func TestReadMediaFileTool(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "blob.dat"), pngBytes, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := newReadMediaFileTool(root)
+	raw, err := newReadMediaFileTool(nil, root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -655,6 +655,26 @@ func TestReadMediaFileTool(t *testing.T) {
 	}
 	if _, err = it.InvokableRun(ctx, `{"path":"nope.png"}`); err == nil || !strings.Contains(err.Error(), "不存在") {
 		t.Fatalf("缺失应报不存在: %v", err)
+	}
+	oldDir := filepath.Join(root, "sessions", "s1", ".media")
+	if err := os.MkdirAll(oldDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oldDir, "old.png"), pngBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = it.InvokableRun(ctx, `{"path":"sessions/s1/.media/old.png"}`); err == nil || !strings.Contains(err.Error(), "不存在") {
+		t.Fatalf("旧 sessions 路径应拒绝: %v", err)
+	}
+	planted := filepath.Join(root, "workspaces", "w1", ".media")
+	if err := os.MkdirAll(planted, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(planted, "a.png"), pngBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = it.InvokableRun(ctx, `{"path":"workspaces/w1/.media/a.png"}`); err == nil || !strings.Contains(err.Error(), "不存在") {
+		t.Fatalf("没有身份时工作区 path 不能从作业根里读出来: %v", err)
 	}
 	if _, err = it.InvokableRun(ctx, `{"path":"."}`); err == nil || !strings.Contains(err.Error(), "目录") {
 		t.Fatalf("目录应拒: %v", err)

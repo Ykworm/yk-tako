@@ -77,6 +77,7 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 	r.GET("/api/runs/:runId", authn, s.getRunStatus)
 	r.GET("/api/sessions", authn, s.listSessions)
 	r.PATCH("/api/sessions/:id/visibility", authn, s.patchSessionVisibility)
+	r.PATCH("/api/sessions/:id", authn, s.patchSessionWorkspace)
 	r.GET("/api/sessions/:id", authn, s.getSession)
 	r.GET("/api/runs/:runId/frames", authn, s.getFrames)
 	r.GET("/api/runs/:runId/stream", authn, s.getRunStream)
@@ -88,6 +89,11 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 	r.GET("/api/memory/dialogue", authn, s.getMemoryDialogue)
 	r.GET("/api/memory/recall", authn, s.getMemoryRecall)
 	r.POST("/api/tenants", authn, s.createTenant)
+	r.POST("/api/workspaces", authn, s.postWorkspaces)
+	r.GET("/api/workspaces", authn, s.listWorkspaces)
+	r.PATCH("/api/workspaces/:id", authn, s.patchWorkspace)
+	r.PATCH("/api/workspaces/:id/visibility", authn, s.patchWorkspaceVisibility)
+	r.DELETE("/api/workspaces/:id", authn, s.deleteWorkspace)
 	r.GET("/api/tenants", authn, s.listTenants)
 	r.GET("/api/me/invitations", authn, s.myInvitations)
 	r.POST("/api/me/invitations/:id/accept", authn, s.acceptInvitation)
@@ -149,11 +155,12 @@ type postImage struct {
 }
 
 type postRunsRequest struct {
-	SessionID SessionID   `json:"sessionId"`
-	MessageID string      `json:"messageId"`
-	Text      string      `json:"text"`
-	Images    []postImage `json:"images,omitempty"`
-	AgentID   string      `json:"agentId,omitempty"`
+	SessionID   SessionID   `json:"sessionId"`
+	MessageID   string      `json:"messageId"`
+	Text        string      `json:"text"`
+	Images      []postImage `json:"images,omitempty"`
+	AgentID     string      `json:"agentId,omitempty"`
+	WorkspaceID string      `json:"workspaceId,omitempty"`
 }
 
 // 字段序 = 19v6-01 §1 期望字节序：sessionId → runId → messageId。
@@ -164,10 +171,11 @@ type postRunsResponse struct {
 }
 
 type sessionResponse struct {
-	LiveRunID     RunID  `json:"liveRunId"`
-	RunlogOffset  int    `json:"runlogOffset"`
-	LastRunStatus string `json:"lastRunStatus"` // doc/17 §4：最新一场 run 的终态，"" = 无 run；stopped 收口靠它
-	LastRunID     RunID  `json:"lastRunId"`     // doc/30 A1：最新一场 run 的 id，"" = 无 run；崩溃后点开 /api/runs/{id}
+	LiveRunID     RunID   `json:"liveRunId"`
+	RunlogOffset  int     `json:"runlogOffset"`
+	LastRunStatus string  `json:"lastRunStatus"` // doc/17 §4：最新一场 run 的终态，"" = 无 run；stopped 收口靠它
+	LastRunID     RunID   `json:"lastRunId"`     // doc/30 A1：最新一场 run 的 id，"" = 无 run；崩溃后点开 /api/runs/{id}
+	WorkspaceID   *string `json:"workspaceId"`   // doc/35 A4：挂着的项目；游离会话是 null
 }
 
 // 字段序 = doc/30 §8.4 契约字节序：runId → status → resumeCount。
@@ -212,7 +220,7 @@ type logResponse struct {
 //	text       —— 消息正文。
 //	images     —— 可省（doc/32 A1）。每项 {mime, dataBase64, name?}：name = 用户上传文件名
 //	              （可省，A6 通信字段）；白名单与单文件 5MB / 单消息 4 张帽见 media.go。
-//	              合法图落会话目录 .media/（内容寻址，占位 path 带 sessions/<sid>/），user 行 text = 正文 + 每图一行
+//	              合法图落工作区目录 .media/（内容寻址，占位 path 带 workspaces/<wid>/），user 行 text = 正文 + 每图一行
 //	              [media …] 占位（含 seq 全会话序号与 name）——对话里只有 path，没有字节。
 //
 // 响应（字段序即契约字节序：sessionId → runId → messageId）：
@@ -247,6 +255,20 @@ func (s *Server) postRuns(c *gin.Context) {
 		return
 	}
 	sessionID := req.SessionID
+	// 项目预检在会话准入之前：请求里的 workspaceId 看不见则 114001，不铸会话、不建 run。
+	// 已有会话即使带了合法的 workspaceId，AcquireRun 也不改 workspace_id。
+	// 已经挂上的项目被收回时，AcquireRun 按会话行上的列再看一次，这一发也不建 run。
+	workspaceID := strings.TrimSpace(req.WorkspaceID)
+	if workspaceID != "" {
+		if _, err := s.store.VisibleWorkspace(ctx, workspaceID, p.TenantID, p.UserID); err != nil {
+			if errors.Is(err, ErrWorkspaceNotFound) {
+				writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
+				return
+			}
+			internal(c, err)
+			return
+		}
+	}
 	// 归属预检在 AdmitText / 落盘之前：别人用超长 text 或坏图不能靠 413/400 探到会话是否存在。
 	var bound Session
 	if sessionID != "" {
@@ -291,8 +313,10 @@ func (s *Server) postRuns(c *gin.Context) {
 	if s.overQuota(c, p) {
 		return
 	}
-	// 会话 id 在落盘前定下来：占位 path 要带 sessions/<sid>/，GET 和 read_media_file 才读得到同一份。
-	// 这时还没抢闸。后面 400/413/409 可能在会话目录里留下内容寻址文件，落库面仍是空的。
+	// 会话 id 在落盘前定下来。占位 path 带 workspaces/<wid>/，GET /api/media 读同一条。
+	// 已有会话不看这次请求里的 workspaceId：列为空就进默认工作区。新会话才用请求里的项目。
+	// 这时还没抢闸。后面 400/413/409 可能在工作区目录里留下内容寻址文件，落库面仍是空的。
+	sessionExists := sessionID != ""
 	if sessionID == "" {
 		var err error
 		if sessionID, err = newSessionID(); err != nil {
@@ -302,7 +326,7 @@ func (s *Server) postRuns(c *gin.Context) {
 	}
 	// 入口媒体（doc/32 A1）：先校验+落盘（400 同形 bad_media 带原因），再准入（A2 把 base64
 	// 体折进 413 预算）——落盘在闸前，因为占位要进 user 行 text，而 user 行在 AcquireRun
-	// 的原子写里定稿。409/500 时会话目录里的 .media/ 可能多出文件：内容寻址幂等、无对话痕迹，
+	// 的原子写里定稿。409/500 时工作区目录里的 .media/ 可能多出文件：内容寻址幂等、无对话痕迹，
 	// 「什么都没写」语义只对落库面承诺。
 	// seq 起点（doc/32 A6）：数会话既有占位数 +1——user 行是唯一携带 seq 的行，同会话同时
 	// 只有一个 run 在写（409 忙闸），计数无并发竞争；闸在 PG 不在进程，多副本下照成立。
@@ -318,7 +342,11 @@ func (s *Server) postRuns(c *gin.Context) {
 			}
 			seqStart = n + 1
 		}
-		dir, err := sessionWorkspace(s.mediaRoot, p.TenantID, sessionID)
+		dir, prefix, err := s.imageRoot(ctx, p, sessionID, workspaceID, sessionExists)
+		if errors.Is(err, ErrWorkspaceNotFound) {
+			writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
+			return
+		}
 		if err != nil {
 			internal(c, err)
 			return
@@ -336,7 +364,7 @@ func (s *Server) postRuns(c *gin.Context) {
 				})
 			}
 		}
-		ph, err := ingestImagesAt(dir, req.Images, seqStart, "sessions/"+string(sessionID)+"/", quota)
+		ph, err := ingestImagesAt(dir, req.Images, seqStart, prefix, quota)
 		if errors.Is(err, errStorageQuota) {
 			writeEnvelope(c, http.StatusTooManyRequests, codeQuota, "这个工作区的额度用完了", nil)
 			return
@@ -368,13 +396,21 @@ func (s *Server) postRuns(c *gin.Context) {
 		userText = strings.TrimSpace(userText + "\n" + placeholders)
 	}
 	user := Row{RunID: runID, Role: "user", MessageID: req.MessageID, Text: userText}
-	acquired, err := s.store.AcquireRun(ctx, sessionID, runID, user, p)
+	acquired, err := s.store.AcquireRun(ctx, sessionID, runID, user, p, workspaceID)
 	if errors.Is(err, ErrSessionNotFound) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
 		return
 	}
 	if errors.Is(err, ErrSessionForbidden) {
 		writeEnvelope(c, http.StatusForbidden, codeNotOwner, "只有本人能修改", nil)
+		return
+	}
+	if errors.Is(err, ErrWorkspaceNotFound) {
+		writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
+		return
+	}
+	if errors.Is(err, errProjectBusy) {
+		writeEnvelope(c, http.StatusConflict, codeWorkspaceBusy, "项目正在另一场会话里运行", nil)
 		return
 	}
 	if err != nil {
@@ -394,6 +430,36 @@ func (s *Server) postRuns(c *gin.Context) {
 	go s.worker.Run(withRunProfile(withPrincipal(context.Background(), p), prof), sessionID, runID, 1)
 	handed = true
 	c.JSON(http.StatusAccepted, postRunsResponse{SessionID: sessionID, RunID: runID, MessageID: req.MessageID})
+}
+
+// imageRoot 决定这批入口图写到哪，并给出占位 path 的前缀 workspaces/<wid>/。
+// 已有会话只看会话行上的项目；新会话看这次请求的 workspaceId。两边都空就用默认工作区，没有这行就建。
+// 解析出来的项目当前用户看不见时，返回 ErrWorkspaceNotFound，调用方回 114001，字节不落盘。
+func (s *Server) imageRoot(ctx context.Context, p principal, sessionID SessionID, requestWorkspaceID string, sessionExists bool) (string, string, error) {
+	wid := ""
+	if sessionExists {
+		var err error
+		wid, err = s.store.SessionWorkspaceID(ctx, sessionID)
+		if err != nil {
+			return "", "", err
+		}
+	} else {
+		wid = requestWorkspaceID
+	}
+	if wid == "" {
+		ws, err := s.store.EnsureDefaultWorkspace(ctx, p.TenantID, p.UserID)
+		if err != nil {
+			return "", "", err
+		}
+		wid = ws.ID
+	} else if _, err := s.store.VisibleWorkspace(ctx, wid, p.TenantID, p.UserID); err != nil {
+		return "", "", err
+	}
+	dir, err := workspaceDir(s.mediaRoot, p.TenantID, wid)
+	if err != nil {
+		return "", "", err
+	}
+	return dir, "workspaces/" + wid + "/", nil
 }
 
 // runView 是 run 端点的归属结果。written=true 表示 401/500 已经写出，调用方直接 return。
@@ -587,6 +653,15 @@ func (s *Server) getSession(c *gin.Context) {
 		writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
 		return
 	}
+	sess, _, err := s.store.SessionAccess(c.Request.Context(), SessionID(c.Param("id")), p)
+	if err != nil {
+		if errors.Is(err, ErrSessionNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
+			return
+		}
+		internal(c, err)
+		return
+	}
 	liveRunID, runlogOffset, lastStatus, lastRunID, exists, err := s.store.SessionStatus(c.Request.Context(), SessionID(c.Param("id")), p)
 	if err != nil {
 		internal(c, err)
@@ -596,15 +671,19 @@ func (s *Server) getSession(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
 		return
 	}
-	c.JSON(http.StatusOK, sessionResponse{LiveRunID: liveRunID, RunlogOffset: runlogOffset, LastRunStatus: lastStatus, LastRunID: lastRunID})
+	c.JSON(http.StatusOK, sessionResponse{
+		LiveRunID: liveRunID, RunlogOffset: runlogOffset, LastRunStatus: lastStatus, LastRunID: lastRunID,
+		WorkspaceID: sess.WorkspaceID,
+	})
 }
 
 type sessionListItem struct {
-	ID         SessionID `json:"id"`
-	Title      string    `json:"title"`
-	Visibility string    `json:"visibility"`
-	Owner      bool      `json:"owner"`
-	CreatedAt  time.Time `json:"createdAt"`
+	ID          SessionID `json:"id"`
+	Title       string    `json:"title"`
+	Visibility  string    `json:"visibility"`
+	Owner       bool      `json:"owner"`
+	CreatedAt   time.Time `json:"createdAt"`
+	WorkspaceID *string   `json:"workspaceId"`
 }
 
 type sessionListData struct {
@@ -616,13 +695,26 @@ type visibilityRequest struct {
 }
 
 // listSessions 是新接口：默认只列本人的会话；?scope=tenant 列本租户里显式共享的会话。
+// 创建者用 workspaceId 筛自己的项目时，结果含别人挂在上面的会话。详情和 log 仍按会话 visibility。
 func (s *Server) listSessions(c *gin.Context) {
 	p, ok := principalFrom(c)
 	if !ok {
 		writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
 		return
 	}
-	rows, err := s.store.ListSessions(c.Request.Context(), p, c.Query("scope"))
+	workspaceID := strings.TrimSpace(c.Query("workspaceId"))
+	if workspaceID != "" {
+		if _, err := s.store.VisibleWorkspace(c.Request.Context(), workspaceID, p.TenantID, p.UserID); err != nil {
+			if errors.Is(err, ErrWorkspaceNotFound) {
+				writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
+				return
+			}
+			log.Printf("%s %s: %v", c.Request.Method, c.Request.URL.Path, err)
+			writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
+			return
+		}
+	}
+	rows, err := s.store.ListSessions(c.Request.Context(), p, c.Query("scope"), workspaceID)
 	if err != nil {
 		log.Printf("%s %s: %v", c.Request.Method, c.Request.URL.Path, err)
 		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
@@ -632,10 +724,58 @@ func (s *Server) listSessions(c *gin.Context) {
 	for _, row := range rows {
 		items = append(items, sessionListItem{
 			ID: row.ID, Title: row.Title, Visibility: row.Visibility,
-			Owner: row.UserID == p.UserID, CreatedAt: row.CreatedAt,
+			Owner: row.UserID == p.UserID, CreatedAt: row.CreatedAt, WorkspaceID: row.WorkspaceID,
 		})
 	}
 	writeEnvelope(c, http.StatusOK, codeOK, "", sessionListData{Sessions: items})
+}
+
+type workspaceBindData struct {
+	WorkspaceID *string `json:"workspaceId"`
+}
+
+// patchSessionWorkspace 把会话挂进项目，或用空串解绑。磁盘上已有的文件留在原地。
+func (s *Server) patchSessionWorkspace(c *gin.Context) {
+	p, ok := principalFrom(c)
+	if !ok {
+		writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
+		return
+	}
+	var req workspaceBindData
+	if err := c.ShouldBindJSON(&req); err != nil || req.WorkspaceID == nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	wid := strings.TrimSpace(*req.WorkspaceID)
+	if wid != "" {
+		if _, err := s.store.VisibleWorkspace(c.Request.Context(), wid, p.TenantID, p.UserID); err != nil {
+			if errors.Is(err, ErrWorkspaceNotFound) {
+				writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
+				return
+			}
+			log.Printf("PATCH /api/sessions/%s: %v", c.Param("id"), err)
+			writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
+			return
+		}
+	}
+	err := s.store.SetSessionWorkspace(c.Request.Context(), SessionID(c.Param("id")), p, wid)
+	switch {
+	case errors.Is(err, ErrSessionNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
+	case errors.Is(err, ErrSessionForbidden):
+		writeEnvelope(c, http.StatusForbidden, codeNotOwner, "只有本人能修改", nil)
+	case errors.Is(err, ErrWorkspaceNotFound):
+		writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
+	case err != nil:
+		log.Printf("PATCH /api/sessions/%s: %v", c.Param("id"), err)
+		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
+	default:
+		var out *string
+		if wid != "" {
+			out = &wid
+		}
+		writeEnvelope(c, http.StatusOK, codeOK, "", workspaceBindData{WorkspaceID: out})
+	}
 }
 
 // patchSessionVisibility 只有 owner 能把会话改成 private 或 tenant。
@@ -1031,8 +1171,8 @@ func (s *Server) getMemoryRecall(c *gin.Context) {
 }
 
 // getMedia（doc/32 A4）= 前端把占位行里的 path 换回字节流的唯一出口。
-// 有登录身份时，path 必须是 sessions/<sid>/...；先 Clean 再按清完的 sid 做访问检查，
-// 越出会话目录、不带会话、看不见该会话，都回旧的 404 {"error":"not_found"}。
+// 有登录身份时，path 必须是 workspaces/<wid>/...；先 Clean 再按清完的 wid 做 VisibleWorkspace。
+// 旧的 sessions/<sid>/...、越出工作区、看不见该工作区，都回旧的 404 {"error":"not_found"}。
 // 没有身份时仍相对 mediaRoot（单测探针）：越界 400，缺文件 404。
 // mime 按扩展名表（mediaMimeByExt，与 read_media_file 同表）；回流走 ServeContent（支持 Range）。
 func (s *Server) getMedia(c *gin.Context) {
@@ -1044,16 +1184,25 @@ func (s *Server) getMedia(c *gin.Context) {
 	root := s.mediaRoot
 	rel := p
 	if who, ok := principalFrom(c); ok && who.TenantID != "" {
-		sid, inside, okPath := parseSessionMediaPath(p)
+		wid, inside, okPath := parseSessionMediaPath(p)
 		if !okPath {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
 			return
 		}
-		if _, kind, err := s.store.SessionAccess(c.Request.Context(), SessionID(sid), who); err != nil || kind == accessNone {
+		if _, err := s.store.VisibleWorkspace(c.Request.Context(), wid, who.TenantID, who.UserID); err != nil {
+			if errors.Is(err, ErrWorkspaceNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+				return
+			}
+			internal(c, err)
+			return
+		}
+		dir, err := workspaceDir(s.mediaRoot, who.TenantID, wid)
+		if err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
 			return
 		}
-		root = filepath.Join(s.mediaRoot, "tenants", who.TenantID, "sessions", sid)
+		root = dir
 		rel = inside
 	}
 	full, err := resolveInWorkspace(root, rel)
