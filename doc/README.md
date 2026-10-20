@@ -14,7 +14,7 @@
 3. [`19-v6/19-运行引擎架构-v6.md`](19-v6/19-运行引擎架构-v6.md)：v6 文档集总入口。
 4. 契约与存储四篇，按这个顺序读：
    - [`19v6-01-契约-四个API.md`](19-v6/19v6-01-契约-四个API.md)：四个端点的请求／响应／错误字节。
-   - [`19v6-03-存储形态与生命周期.md`](19-v6/19v6-03-存储形态与生命周期.md)：四表两键、真源划分、多副本。
+   - [`19v6-03-存储形态与生命周期.md`](19-v6/19v6-03-存储形态与生命周期.md)：四表 + 两键（runlive / runepoch）、真源划分、多副本。
    - [`19v6-02-reconcile与双游标.md`](19-v6/19v6-02-reconcile与双游标.md)：客户端轮询与游标。
    - [`19v6-04-验收-curl.md`](19-v6/19v6-04-验收-curl.md)：用例 → curl → 期望字节。
 
@@ -24,8 +24,11 @@
 - 加工具、改子代理：`19v6-05`、`19v6-08`、`doc/23`、`doc/25`、`doc/26`。
 - 改上下文压缩：`19v6-07`、`19v6-09`、`19v6-10`。
 - 改登录、租户、会话归属：`doc/28`、`doc/34`、`doc/35`。
+- 改团队前端（切换器／成员管理／邀请落地页）：`doc/36`。
+- 改项目删除（连带删会话）：`doc/37`。
 - 改记忆、召回：`doc/29`。
 - 改崩溃续跑：`doc/30`。
+- 改 Redis 临时键（移除 draft）：`doc/38`。
 - 改流式端点：`doc/31`。
 - 改媒体／附件：`doc/32`、`doc/35`。
 - 接 MCP：`doc/33`。
@@ -42,7 +45,7 @@
 | 19-v6 | [运行引擎架构 v6（index）](19-v6/19-运行引擎架构-v6.md) | ✅ | `cmd/yktako/`、`internal/runengine/`、`web/` | v6 文档集总入口；取代 v5 |
 | 19v6-01 | [契约：四个 API](19-v6/19v6-01-契约-四个API.md) | ✅ | `server.go`、`types.go`、`product_api.go` | 端点字节真源；含 SSE 端点（doc/31）的翻案标注 |
 | 19v6-02 | [reconcile 与双游标](19-v6/19v6-02-reconcile与双游标.md) | ✅ | `server.go`、`redisstore.go`、`store.go` | 客户端流程与 `eventOffset` 语义 |
-| 19v6-03 | [存储形态与生命周期](19-v6/19v6-03-存储形态与生命周期.md) | ✅ | `pgstore.go`、`redisstore.go`、`store.go` | 四表两键、真源划分、多副本 |
+| 19v6-03 | [存储形态与生命周期](19-v6/19v6-03-存储形态与生命周期.md) | ✅ | `pgstore.go`、`redisstore.go`、`store.go` | 四表 + 两键（runlive / runepoch）、真源划分、多副本 |
 | 19v6-04 | [验收（curl 手打）](19-v6/19v6-04-验收-curl.md) | ✅ | —（被测端点见 19v6-01） | 改契约字节必须同步改本篇并重跑 |
 | 19v6-05 | [tool loop（T 系列）](19-v6/19v6-05-tool-loop.md) | ✅ | `tools.go`、`agents.go`、`agentlog.go`、`midfold.go`、`toolsearch.go`、`profile.go` | T1–T3 已落地；T4/T5（分级 + BM25 `tool_search`）2026-10-20 落地（A1 `ad1ab6b`、A2 `a190f4d`；A3 寿命验收、A4 回归收口） |
 | 19v6-06 | [工具分级与 deferred tools](19-v6/19v6-06-deferred-tools与缓存机制.md) | 🔶 | —（机制背景，provider 原生 deferred 未落） | 非契约篇；各厂商支持矩阵与升级路素材 |
@@ -53,19 +56,22 @@
 | 19v6-90 | [演进记录](19-v6/19v6-90-演进记录.md) | ✅ | —（修订记录） | 只追加不篡改；契约本身看 19v6-01 |
 | 21 | [同会话历史查找](21-同会话历史查找.md) | ✅ | `search.go`、`search_test.go` | H1–H5 落地；`search_history` 工具 |
 | 22 | [网络搜索](22-网络搜索.md) | ✅ | `websearch.go`、`websearch_test.go` | 已切 DeepSeek `/v1/tools/search`；结果始终落盘再给描述段 |
-| 23 | [coder 规格](23-coder规格.md) | ✅ | `agents/coder.md`、`agents.go` | §2 已逐字落盘；七项白名单挡 `search_history`／`web_search` |
+| 23 | [coder 规格](23-coder规格.md) | ✅ | `agents/coder.md`、`agents.go` | §2 已逐字落盘；`tools:` 白名单挡 `search_history`／`web_search` |
 | 24 | [用量账单、滤思考与折叠触发](24-用量计数.md) | ✅ | `compact.go`、`agentlog.go`、`worker.go` | 计数、滤思考、Usage mid-run 触发 |
 | 25 | [子代理进程内折叠](25-子代理折叠.md) | ✅ | `midfold.go`、`agentfold_test.go` | 取代 doc/17 §6；A1–A3 已验收 |
-| 26 | [researcher 的工具护栏](26-researcher工具护栏.md) | ✅ | `agents.go`、`agents/researcher.md`、`agents/coder.md` | `exclude_tools` 四态；排除清单只剩 `bash`（有效 15 项） |
+| 26 | [researcher 的工具护栏](26-researcher工具护栏.md) | ✅ | `agents.go`、`agents/researcher.md`、`agents/coder.md` | `exclude_tools` 四态；排除清单只剩 `bash` |
 | 27 | [用量可见化](27-用量可见.md) | ✅ | `product_api.go`、`server.go`、`worker.go`、`web/src/` | usage 帧／页面阈值／runlog 历史行 |
 | 28 | [多租户运行时](28-多租户.md) | 🔶 | `auth.go`、`identity_store.go`、`members_store.go`、`tenant_api.go`、`scope.go`、`pgstore.go` | A0–A6 已落地并 curl 过，头注仍不标“已验收”；团队前端不在本篇 |
 | 29 | [长期记忆与对话召回](29-长期记忆.md) | ✅ | `memory.go`、`recall.go`、`dialogue.go` | A1–B4 全落地；两条加工线共用 runlog |
 | 30 | [崩溃续跑](30-崩溃续跑.md) | 🔶 | `journal.go`、`worker.go`、`resume_test.go` | A1–A5 已落地；A6 自动巡检／A7 回归收口未开工 |
 | 31 | [SSE 流式端点](31-sse流式端点.md) | ✅ | `server.go`、`redisstore.go`、`stream_test.go` | 同一帧面的第二种运输方式；拉是正确性、流是优化 |
-| 32 | [media_offload（对话只存 path）](32-media-offload.md) | 🔶 | `media.go`、`filetools.go`、`media_test.go` | A1–A7 已落地（commit dcf3e6b）；多模态发送（字节进请求，模型看图）未做 |
+| 32 | [media_offload（对话只存 path）](32-media-offload.md) | 🔶 | `media.go`、`media_send.go`、`media_tokens.go`、`filetools.go`、`pdftext.go`、`pdftool.go`、`midfold.go`、`worker.go`、`guard.go`、`profile.go`、`compact.go`、`provider-catalog.json`、`media_test.go` | A1–A7 已落地（dcf3e6b）；A3-1 至 A3-5 已落地并活体验收（2026-10-20）。A3-5 按 DeepSeek v41 计价：800×800 为 422、100×100 为 184；窗口 940 上 814>752 进入折叠。A8-1 已施工并活体验收（2026-10-20，run `r_01M5CF1DFS9ZAD72GYQ5YXRYH8` complete，assistant 含 banana，user 行仍是占位，该 run 两表零 base64）。A8-2 边界已活体验收（2026-10-20）：第 3 页 run `r_01M5CH3GN1Y9KDKPMJ90R0NPCS` 含 orange；第 99 页 run `r_01M5CH3MM7HTQ2KDXA36YWW35M` 返回 pages=3 与超出范围；扫描件 run `r_01M5CH3RM7JY9GS0CX779Y5S0Y` 写明无文本层；音视频 run `r_01M5CH3WK609YQJBGFVCAQ4BDN` 上 `read_pdf_text` 拒绝非 PDF；`TAKO_MEDIA_SEND=off` 的 run `r_01M5CH5KCY1RQA6T7Z1QY0YW7Y` 仍读到 orange 且无 media send 行。这些 run 的两表零 base64。扫描件 OCR 不做 |
 | 33 | [MCP client](33-mcp-client.md) | ✅ | `mcp.go`、`mcpconf.go`、`mcpconf_test.go` | stdio 本地 server；工具直接进池 |
 | 34 | [租户运行时装配](34-租户运行时装配.md) | ✅ | `tenantmodel.go`、`agents.go`、`mcpconf.go`、`tenant_runtime_test.go`、`web/` | R1–R5＋U1 已落地并浏览器验收；commit 9c21b66 |
 | 35 | [项目目录（workspace）](35-项目目录.md) | 🔶 | `product_store.go`、`session_access.go`、`media.go`、`web/` | A1–A8c 已写并随 e30d1f9 入库，等收口验收；路径方案取代 doc/32 的 `sessions/<sid>/` 版 |
+| 36 | [团队前端（切换器／成员／邀请）](36-团队前端.md) | ⬜ | `web/`；G0 小改在 `product_api.go` | 方案待点头；后端 API 见 doc/28 A6，Team 设置页已随 doc/34 U1 落地 |
+| 37 | [删除项目连带删会话](37-删除项目连带删会话.md) | ⬜ | `pgstore.go`、`product_api.go`、`session_access.go`、`store.go` | 方案待点头；改写 doc/35 的「删除只删空项目」语义，`114002` 本篇起退役 |
+| 38 | [删除 tk:draft 键](38-删除draft键.md) | ✅ | `redisstore.go`、`store.go`、`server.go`、`worker.go`、`store_test.go` | 2026-10-20 已落地；定稿正文来自 turn，写口只认 runepoch |
 
 ## 2. 历史存档（`doc/`，不作施工面）
 

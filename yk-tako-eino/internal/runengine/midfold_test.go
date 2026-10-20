@@ -335,7 +335,7 @@ func TestUsageBasedInputFormula(t *testing.T) {
 	}
 
 	t.Run("厂商 ReasoningTokens 优先", func(t *testing.T) {
-		est, ok := usageBasedInput(runeCount, "r_cur", newRows(runest("答复", thinking, 1000, 50, 30)))
+		est, ok := usageBasedInput(context.Background(), runeCount, "r_cur", newRows(runest("答复", thinking, 1000, 50, 30)))
 		if !ok {
 			t.Fatalf("有账单应成立")
 		}
@@ -353,14 +353,14 @@ func TestUsageBasedInputFormula(t *testing.T) {
 	})
 
 	t.Run("无明细时滤前自测思考", func(t *testing.T) {
-		est, ok := usageBasedInput(runeCount, "r_cur", newRows(runest("答复", thinking, 1000, 50, -1)))
+		est, ok := usageBasedInput(context.Background(), runeCount, "r_cur", newRows(runest("答复", thinking, 1000, 50, -1)))
 		if !ok || est.visible != 40 || est.total != 1041 {
 			t.Fatalf("est = %+v ok=%v, want visible 40、total 1041（思考按 10 tok 减）", est, ok)
 		}
 	})
 
 	t.Run("思考大于输出时置零", func(t *testing.T) {
-		est, ok := usageBasedInput(runeCount, "r_cur", newRows(runest("答复", thinking, 1000, 5, 30)))
+		est, ok := usageBasedInput(context.Background(), runeCount, "r_cur", newRows(runest("答复", thinking, 1000, 5, 30)))
 		if !ok || est.visible != 0 || est.total != 1001 {
 			t.Fatalf("est = %+v ok=%v, want visible 0、total 1001", est, ok)
 		}
@@ -370,7 +370,7 @@ func TestUsageBasedInputFormula(t *testing.T) {
 		msgs := []*schema.Message{schema.SystemMessage("人设"), schema.UserMessage("问"),
 			runest("旧答", "", 9000, 9000, -1), schema.ToolMessage("旧果", "c1"),
 			runest("新答", "", 100, 0, -1), schema.ToolMessage("果", "c2")}
-		est, ok := usageBasedInput(runeCount, "r_cur", msgs)
+		est, ok := usageBasedInput(context.Background(), runeCount, "r_cur", msgs)
 		if !ok || est != (usageEstimate{baseline: 100, visible: 0, delta: 1, total: 101}) {
 			t.Fatalf("est = %+v ok=%v, want 以最后一条有账单的锚点起算 {100 0 1 101}", est, ok)
 		}
@@ -379,11 +379,11 @@ func TestUsageBasedInputFormula(t *testing.T) {
 	t.Run("无账单不进公式", func(t *testing.T) {
 		msgs := []*schema.Message{schema.SystemMessage("人设"), schema.UserMessage("问"),
 			schema.AssistantMessage("答", nil), schema.ToolMessage("果", "c1")}
-		if est, ok := usageBasedInput(runeCount, "r_cur", msgs); ok {
+		if est, ok := usageBasedInput(context.Background(), runeCount, "r_cur", msgs); ok {
 			t.Fatalf("无账单应回退全量自测，got %+v", est)
 		}
 		// 全零账单 = 厂商给了个空壳，同义于没有账单。
-		if _, ok := usageBasedInput(runeCount, "r_cur", newRows(runest("答", "", 0, 0, -1))); ok {
+		if _, ok := usageBasedInput(context.Background(), runeCount, "r_cur", newRows(runest("答", "", 0, 0, -1))); ok {
 			t.Fatalf("三个整数全 0 的账单不应当锚点")
 		}
 	})
@@ -395,7 +395,7 @@ func TestUsageBasedInputFormula(t *testing.T) {
 			{RunID: "r_cur", Seq: 1, Role: "user", Text: "问"},
 			{RunID: "r_cur", Seq: 2, Role: "assistant", Text: "答复"},
 		})
-		if est, ok := usageBasedInput(runeCount, "r_cur", append([]*schema.Message{schema.SystemMessage("人设")}, rewritten...)); ok {
+		if est, ok := usageBasedInput(context.Background(), runeCount, "r_cur", append([]*schema.Message{schema.SystemMessage("人设")}, rewritten...)); ok {
 			t.Fatalf("折后不应再找到锚点，got %+v", est)
 		}
 	})

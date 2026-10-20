@@ -18,7 +18,7 @@
 //
 // T3 的帧路由：事件按 event.AgentName 归属——"" = root（主线程直走 agent.Run、不过 flowAgent 指名），
 // 非空 = 子代理（AgentTool 内转发事件，经内层 flowAgent 着名、EmitInternalEvents 打开才到场）。
-// 帧上带 Agent；子代理的 delta 走 AppendFrame（不写 draft——draft 只装 root），turn 收 root 与
+// 帧上带 Agent；子代理的 delta 走 AppendFrame（不进 root 定稿；定稿只认 turn 里 root 的累计），turn 收 root 与
 // 子代理条目（T3-2 起带 Agent 归属，EndRun 按投影分拣：mh 只装 root、runlog 全量）。
 // T3-1b：帧上再带 Model（生效 ref）——Run 建「agent 名 → 模型身份」表（agentModelTable）塞 ctx，
 // 装载 handler 在同一 ctx 下填表，这里按 event.AgentName 查它：写帧取 model 值、drain 取 translator。
@@ -171,8 +171,10 @@ type runCancel struct {
 // T3-3：subagentConcurrency 是委派并发闸容量（-subagent-concurrency，main 已保证 >= 1）——
 // 池级信号量、全部规格共享；subagentReturnCap 是子代理回传上限字节数（-subagent-return-cap，
 // <=0 = 不裁剪）——超帽截断的语义在 delegationTool（agents.go）。
+//
+// mediaSend 是 TAKO_MEDIA_SEND（默认开，字面 off 才关）。关时不挂媒体包壳，模型输入与占位逐字节相同。
 func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, system, workspace, agentsDir string, leaseRenew time.Duration,
-	compactWindow int, modelRef string, maxOutput int, subagentConcurrency, subagentReturnCap int, resolver ModelResolver, counter TokenCounter) (*Worker, error) {
+	compactWindow int, modelRef string, maxOutput int, subagentConcurrency, subagentReturnCap int, resolver ModelResolver, counter TokenCounter, mediaSend bool) (*Worker, error) {
 	// file_effect 启动 lint（C5-A4，fileops.go）：F1 起注册表非空（write_file 首条），
 	// lint 从空转变成真检查——此后任何文件工具漏声明 = 启动失败。
 	if err := lintFileEffects(firstPartyFileEffects); err != nil {
@@ -202,7 +204,12 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		return nil, err
 	}
 	pool = append(pool, wrapToolErrors(readMedia))
-	// bash 执行工具入池（doc/17 §3）：11 个文件工具后、memory 前——批量活先写脚本再跑；
+	readPDF, err := newReadPDFTextTool(store, workspace)
+	if err != nil {
+		return nil, err
+	}
+	pool = append(pool, wrapToolErrors(readPDF))
+	// bash 执行工具入池（doc/17 第 3 节）：文件工具之后、memory 前——批量活先写脚本再跑；
 	// 作业根 workspace（相对路径在 workspace 内解析），32 KB 帽 / 环境白名单在 bash.go（无自动超时，2026-10-15 用户裁）。
 	bash, err := newBashTool(workspace)
 	if err != nil {
@@ -262,14 +269,20 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		newMidfoldHandler(counter, compactWindow, compactLimit, sum.summarize, firstPartyFileEffects),
 		NewAgentLogHandler(),
 		// 溢出 guard（B1 观测 → B2 救援链，D13；救援依赖与 midfold 同组装配件）：
-		// 链尾 = 最内 user wrapper——模型调用错误冒泡最先到它（wrappers.go:1129 逆序包裹、
-		// first registered = outermost）。四条件同真就折被拒输入重调一次；零帧/闸花原样上抛。
+		// 媒体包壳在它里面（后注册 = 更内层），但媒体包壳只换输入副本、错误原样上抛——
+		// 模型拒收错误冒泡最先到 guard（wrappers.go:1129 逆序包裹、first registered = outermost）。
+		// 四条件同真就折被拒输入重调一次；零帧/闸花原样上抛。
 		newOverflowGuard(compactWindow, counter, sum.summarize, firstPartyFileEffects),
-		// 崩溃账本包壳（doc/30 §6.3）：必须排在所有 append runCtx.Tools 的 handler 之后——
-		// 一手池、MCP（mcpToolHandler）、委派（agentSpecHandler）与以后新增的工具一处覆盖。
-		// 子代理入口快照在此前已完成，拿的是未包壳工具，内部调用不记账。
-		&journalWrapHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, store: store},
 	}
+	// 媒体发送包壳（doc/32 A3）：当前 run 的 user 图只在第一枪换成 image part，其后的 tool
+	// 回执按 ToolCallID 附一次。挂 guard 里面，guard 的折叠/计数/救援看到的仍是原始占位文本。
+	// 发过与否记在 foldBox，handler 无 run 状态。TAKO_MEDIA_SEND=off 时不挂这一层。
+	// 子代理自己的 handler 链不含它，子代理模型调用不还原。
+	handlers = withMediaRestore(handlers, mediaSend, store, workspace)
+	// 崩溃账本包壳（doc/30 §6.3）：必须排在所有 append runCtx.Tools 的 handler 之后——
+	// 一手池、MCP（mcpToolHandler）、委派（agentSpecHandler）与以后新增的工具一处覆盖。
+	// 子代理入口快照在此前已完成，拿的是未包壳工具，内部调用不记账。
+	handlers = append(handlers, &journalWrapHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, store: store})
 	w := &Worker{store: store, sum: sum, chat: chat, tools: pool, handlers: handlers, translate: translate, system: system,
 		rootRef: modelRef, leaseRenew: leaseRenew, workspace: workspace, compactWindow: compactWindow, compactLimit: compactLimit, counter: counter}
 	// 启动时先建一次，配置坏了立刻退出。每场 run 再新建，避免多个租户共用一个 agent 实例时取消互相踩掉。
@@ -279,6 +292,15 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 	}
 	w.agent = agent
 	return w, nil
+}
+
+// withMediaRestore 在 guard 之后、崩溃账本之前挂媒体包壳。mediaSend 为 false 时原样返回，
+// 模型看到的输入与没做发送侧时逐字节相同。
+func withMediaRestore(handlers []adk.ChatModelAgentMiddleware, mediaSend bool, store *Store, workspace string) []adk.ChatModelAgentMiddleware {
+	if !mediaSend {
+		return handlers
+	}
+	return append(handlers, newMediaRestoreHandler(store, workspace))
 }
 
 // runInstructionKey 把这一场 run 已经定下来的系统提示放进 ctx。
@@ -423,6 +445,9 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 	// run 级折叠容器（A4，planning 裁定 4）：塞进 ctx 供 midfoldHandler 读写；prepareInput 填
 	// base 与 Run fold 的 staged，defer 从这里取货落库。
 	box := newFoldBox(sessionID, runID)
+	box.setMediaResolve(func(ctx context.Context, path string) (string, error) {
+		return resolveReadMediaPath(ctx, w.store, w.workspace, path)
+	})
 	ctx = withFoldBox(ctx, box)
 	// 崩溃账本坐标（doc/30 A2）：本 run 的 id 与接管令牌（POST 路径 1，续跑路径 = claim 返回值，
 	// A3 起所有写点都带它）。这里塞进的是 agent.Run 与全部工具调用共用的 ctx——工具包装层的
@@ -646,27 +671,27 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 					}
 					// T3-2：子代理条目也收（root 的委派回传事件 agent 为空——它属于 root 的循环）。
 					turn = append(turn, TurnEntry{Role: "tool", Agent: agent, Text: out, ToolCallID: callID, ToolName: name, Model: entry.ref})
-					live, err := w.store.AppendFrame(ctx, runID, epoch, Frame{Kind: "tool_result", Agent: agent, Model: entry.ref, Name: name, Output: out})
+					accepted, err := w.store.AppendFrame(ctx, runID, epoch, Frame{Kind: "tool_result", Agent: agent, Model: entry.ref, Name: name, Output: out})
 					if err != nil {
 						log.Printf("frame %s/%s: %v", sessionID, runID, err)
 						status = "error"
 						return
 					}
-					if !live {
-						return // 同 drain 的判死出口：run 已没了，该收摊
+					if !accepted {
+						return // 同 drain 的拒写出口：本执行者已不是当前一代，该收摊
 					}
 					box.addFrames(1) // A2 帧计数（裁定 7：不分 root/子代理——有帧后重跑同样造成帧重复；B1 收编进 box）
 				}
 				continue
 			}
-			merged, live, err := w.drain(ctx, runID, epoch, agent, entry, mo.MessageStream, box)
+			merged, accepted, err := w.drain(ctx, runID, epoch, agent, entry, mo.MessageStream, box)
 			if err != nil {
 				log.Printf("stream %s/%s: %v", sessionID, runID, err)
 				status = "error"
 				return
 			}
-			if !live {
-				// run 已被判死（draft 随租约到期蒸发）/ 被 reset 清掉 / 闸已不在：停止推流。
+			if !accepted {
+				// 本执行者已不是当前一代（令牌缺失或不等）/ 被 reset 清掉 / 闸已不在：停止推流。
 				// defer 的 EndRun 拿不到闸自然空转。
 				return
 			}
@@ -677,6 +702,9 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 			// 命中即花掉，一次 run 一个强折动作）。本答不救（D7）：帧面 append-only 撤不回，半截答案原样
 			// 留给用户，run 正常 complete——救的是会话（run 尾部强折落库，见函数末）。
 			if agent == "" {
+				// 媒体发送确认（doc/32 A3-2/A3-3）：只有 root 的成功回复才把本枪附过的 user 图和 tool 图记为已发。
+				// 失败/取消/零帧的枪走不到这里，pending 留到下一枪重试。Stream 的提交点只在这里。
+				box.commitMediaSend()
 				if hit := detectTruncation(merged.ResponseMeta, w.compactWindow); hit != nil {
 					suffix := ""
 					if hit.subB {
@@ -710,13 +738,13 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 				}
 			}
 			if billOK {
-				live, err := w.store.AppendFrame(ctx, runID, epoch, usageFrame(bill, agent, entry.ref))
+				accepted, err := w.store.AppendFrame(ctx, runID, epoch, usageFrame(bill, agent, entry.ref))
 				if err != nil {
 					log.Printf("frame %s/%s: %v", sessionID, runID, err)
 					status = "error"
 					return
 				}
-				if !live {
+				if !accepted {
 					return
 				}
 				box.addFrames(1)
@@ -725,13 +753,13 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 			// ToolCalls 逐条压 tool_call 帧，args 取模型原始 JSON 原文。
 			turn = append(turn, TurnEntry{Role: "assistant", Agent: agent, Text: merged.Content, ToolCalls: merged.ToolCalls, Model: entry.ref, Usage: bill})
 			for _, tc := range merged.ToolCalls {
-				live, err := w.store.AppendFrame(ctx, runID, epoch, Frame{Kind: "tool_call", Agent: agent, Model: entry.ref, Name: tc.Function.Name, Args: tc.Function.Arguments})
+				accepted, err := w.store.AppendFrame(ctx, runID, epoch, Frame{Kind: "tool_call", Agent: agent, Model: entry.ref, Name: tc.Function.Name, Args: tc.Function.Arguments})
 				if err != nil {
 					log.Printf("frame %s/%s: %v", sessionID, runID, err)
 					status = "error"
 					return
 				}
-				if !live {
+				if !accepted {
 					return
 				}
 				box.addFrames(1)
@@ -855,14 +883,14 @@ func usageFrame(bill *UsageBill, agent, model string) Frame {
 
 // drain 排干一条模型输出流：chunk → Translator → delta 帧；EOF 时把全部 chunk 合并成完整消息返回
 // （T2：merged.ToolCalls 是 tool_call 帧的来源、merged.Content 是本轮 assistant 行）。
-// T3：agent = "" 走 AppendDelta（root——draft 的唯一写入方）；子代理文本走 AppendFrame
-// （delta 帧带 agent，**不 APPEND draft**——收口锚「Σ root delta」不被子代理文本污染）。
+// T3：agent = "" 走 AppendDelta（root 正文帧）；子代理文本走 AppendFrame
+// （delta 帧带 agent——收口锚「Σ root delta」不被子代理文本污染；定稿只认 turn）。
 // T3-1b：drain 的 translator 与 model 值都取自 entry（该 agent 的模型身份）——继承档 = 主 translator/主 ref，
 // 写值档 = 按该模型协议选的 translator / 其生效 ref；root 与子代理共用同一条排干逻辑。
 // A2：帧计数（裁定 7：AppendDelta/AppendFrame 成功次数总和，不分 root/子代理）——救援谓词的
-// 零帧判据；只有 err==nil && live 才 +1（判死/失败没写进 runlive，不算发过帧）。B1 起计数
+// 零帧判据；只有 err==nil && accepted 才 +1（令牌拒写/失败没写进 runlive，不算发过帧）。B1 起计数
 // 收编 foldBox（D12）——guard 与 worker 读同一个数。
-// 返回 live=false = run 已判死（该收摊，不是错误）；err != nil = 错误结局。
+// 返回 accepted=false = 本执行者已不是当前一代（该收摊，不是错误）；err != nil = 错误结局。
 // close 责任也在本函数：事件流的另一副本由 agent 内部排干，早退不关会把两边一起吊住。
 func (w *Worker) drain(ctx context.Context, runID RunID, epoch int64, agent string, entry agentModelEntry, stream *schema.StreamReader[*schema.Message], box *foldBox) (*schema.Message, bool, error) {
 	defer stream.Close()
@@ -882,16 +910,16 @@ func (w *Worker) drain(ctx context.Context, runID RunID, epoch int64, agent stri
 		}
 		chunks = append(chunks, chunk)
 		if text, ok := entry.translate(chunk); ok {
-			var live bool
+			var accepted bool
 			if agent == "" {
-				_, live, err = w.store.AppendDelta(ctx, runID, epoch, entry.ref, text)
+				_, accepted, err = w.store.AppendDelta(ctx, runID, epoch, entry.ref, text)
 			} else {
-				live, err = w.store.AppendFrame(ctx, runID, epoch, Frame{Kind: "delta", Agent: agent, Model: entry.ref, Text: text})
+				accepted, err = w.store.AppendFrame(ctx, runID, epoch, Frame{Kind: "delta", Agent: agent, Model: entry.ref, Text: text})
 			}
 			if err != nil {
 				return nil, false, err
 			}
-			if !live {
+			if !accepted {
 				return nil, false, nil
 			}
 			box.addFrames(1)
@@ -903,7 +931,7 @@ func (w *Worker) drain(ctx context.Context, runID RunID, epoch int64, agent stri
 // 闸已易主 / 已放 / 已到期 / 已被接管）= 本 run 被判死 → 记日志、cancel 本场 run（doc/17 §4
 // 手动停止：stop 端点翻 stopped 后由此传播取消；自然过期同样掐流——2026-10-15 用户拍，
 // 原「不杀流」语义废）。
-// 主循环的 AppendDelta 还会因 draft 蒸发 / 令牌不符自然停写（返 !live）、EndRun 被守卫挡住
+// 主循环的 AppendDelta 还会因令牌缺失或不等自然停写（返 !accepted）、EndRun 被守卫挡住
 // 走「闸已不在，空转」。
 // epoch 匹配才 cancel（doc/30 §7）：接管者已注册新一代的 cancel，旧 watchdog 的判死
 // 不许误伤它。ctx 由 Run 在退出前 cancel，watchdog 随即返回；wg.Wait() 保证它完全退出后
@@ -1028,8 +1056,19 @@ func (w *Worker) prepareInputFrom(ctx context.Context, sessionID SessionID, runI
 		// 放行估算 C 恒算并入容器（A1，planning 裁定 3）：detect 行 / rescue 行 / D4 的 limit'
 		// 三处消费同一个数——C 跟「产出全进容器」同一条路（box.setBase 的先例），不恢复返回值传递。
 		sys := w.instruction(ctx)
+		// 图片 token 先标在行上。这一次的超限判断，以及紧接着的 foldInput，用的是同一份 history。
+		resolve := func(ctx context.Context, path string) (string, error) {
+			return resolveReadMediaPath(ctx, w.store, w.workspace, path)
+		}
+		box := foldBoxFrom(ctx)
+		if box != nil {
+			if r := box.mediaResolver(); r != nil {
+				resolve = r
+			}
+		}
+		annotateMediaTokens(ctx, history, box, resolve)
 		total := countInput(w.counter, sys, history)
-		if box := foldBoxFrom(ctx); box != nil {
+		if box != nil {
 			box.setBaseCount(total)
 		}
 		if total > limit {

@@ -238,7 +238,7 @@ type logResponse struct {
 //
 // 服务端在**一笔原子写**里做完（D1 落库后 = 一笔 PG 事务持有跨 Redis 写，planning §8.4）：
 // 抢闸（INSERT runs，部分唯一索引冲突即 409）+ runlog 追加 role:user 记录（占一个
-// runlogOffset）+ 建 runlive:{runId} 并压 start 帧（eventOffset=1）+ 建空 draft。
+// runlogOffset）+ 建 runlive:{runId} 并压 start 帧（eventOffset=1）+ 建 runepoch。
 // 要么整笔成功（消息开跑），要么整笔回滚（409/500 同形「什么都没写」）；**没有「入队待调度」这种中间态**。
 // POST 本身不返回任何生成内容——客户端拿 runId 去 §2 轮询观测。拿到 runId 就能直接拉
 // frames，不必先查 session；§4 那个状态查询是给 reconnect / 新 tab 用的入口。
@@ -559,7 +559,7 @@ func (s *Server) stopRun(c *gin.Context) {
 //	500 {"error":"internal"}
 //
 // 顺序即正确性：claim（PG CAS，epoch+1，提交后才算接管）→ 重放账本 →
-// 种 Redis 现场（令牌换代、runlive 重置为一条 resume 帧、draft 覆盖为账本正文）→ 开 worker。
+// 种 Redis 现场（令牌换代、runlive 重置为一条 resume 帧）→ 开 worker。
 // claim 之后任何一步失败都 AbandonClaim 把租约改成过期：epoch 不回退（次数照样消耗），
 // 但下一发立刻可接——不把会话卡在一个半接管状态里。
 func (s *Server) resumeRun(c *gin.Context) {
@@ -594,15 +594,15 @@ func (s *Server) resumeRun(c *gin.Context) {
 		return
 	}
 	// 种子帧（doc/30 §8.3）：客户端原本轮询的 eventOffset 游标全部作废——runlive 被重置，
-	// 第一条就是这条 resume 帧，正文 = 账本里已产出的 root assistant 拼接；draft 同值，
-	// 续跑再追加 delta 后定稿文本天然连续。
+	// 第一条就是这条 resume 帧，正文 = 账本里已产出的 root assistant 拼接。
+	// 续跑再追加 delta 后，定稿读 turn（账本重放 + 新枪），文本天然连续。
 	frameJSON, err := json.Marshal(Frame{Kind: "resume", Text: replay.Seed})
 	if err != nil {
 		_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
 		internal(c, err)
 		return
 	}
-	if err := s.store.seedResume(ctx, runID, claim.Epoch, string(frameJSON), replay.Seed); err != nil {
+	if err := s.store.seedResume(ctx, runID, claim.Epoch, string(frameJSON)); err != nil {
 		_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
 		internal(c, err)
 		return

@@ -74,6 +74,9 @@ type ModelMessage struct {
 	Text       string            `json:"text"`
 	ToolCalls  []schema.ToolCall `json:"toolCalls,omitempty"`
 	ToolCallID string            `json:"toolCallId,omitempty"`
+	// MediaTokens 是这一行里、这一枪还会发给视觉模型的图片 token。
+	// 已经算好，countInput 直接相加。不进 JSON，所以不进 mh、不进帧。
+	MediaTokens int `json:"-"`
 }
 
 // TurnEntry 是 worker 在 run 内累积的一条模型侧消息（T2 归一层产物，随 defer 交 EndRun 落库），

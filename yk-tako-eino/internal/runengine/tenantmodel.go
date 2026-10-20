@@ -18,6 +18,7 @@ type TenantBuilt struct {
 	Provider string
 	ModelID  string
 	KeyFP    string
+	Vision   bool
 }
 
 // TenantModelSource 按调用方给的环境和缓存键建客户端。实现在 config.ModelRegistry，main 做适配。

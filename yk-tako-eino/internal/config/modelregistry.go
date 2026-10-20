@@ -27,6 +27,7 @@ type BuiltModel struct {
 	Provider string
 	ModelID  string
 	KeyFP    string
+	Vision   bool
 }
 
 // NewModelRegistry 建一张空表。env 是进程环境快照（API Key / BaseURL 都从这里读，
@@ -91,6 +92,7 @@ func (r *ModelRegistry) GetFor(ctx context.Context, cacheKey, ref string, env En
 		Provider: resolved.Provider.ID,
 		ModelID:  resolved.ModelID,
 		KeyFP:    keyFingerprint(resolved.Provider.APIKey),
+		Vision:   resolved.Vision,
 	}
 	r.forCache[cacheKey] = built
 	log.Printf("modelregistry: tenant new ref=%s provider=%s model=%s keyfp=%s", built.Model.Ref, built.Provider, built.ModelID, built.KeyFP)

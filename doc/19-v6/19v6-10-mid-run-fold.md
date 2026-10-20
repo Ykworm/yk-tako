@@ -105,7 +105,7 @@ ReAct 中途读文件涨出来的部分根本没被那一次覆盖**——起手
           ├─ 模型调用（流式 delta 帧）
           └─ 工具执行（tool_call/tool_result 帧；结果回注 state）
       → EndRun（唯一 PG 写点）：放闸 + 定稿 + staged 落库 + mh 行 + runlog 行
-          （commit 后 Redis 半：terminal 帧 + 删 draft）
+          （commit 后 Redis 半：terminal 帧 + 删 runepoch）
 ```
 
 钩子是 eino ADK 的 `BeforeModelRewriteState`：**run 内每一次模型调用前**触发，入参是
@@ -354,7 +354,7 @@ run 以 error 收场——而且这个错是折叠自造的，原文毫无问题
   与钩子语义严丝合缝。eino 的 SetRunLocalValue 不可用：它只能在 middleware 执行
   上下文内读写，EndRun 在 agent.Run 之外够不到。EndRun 的 mh 写入源切到容器里的折后
   state：过滤 system 行、跳过已在库的 user 行（seq=1），保留轮次 seq 从 2 连续排；
-  终轮 assistant 取 state 末条（runlog 终稿仍取 draft——两投影分离不动）。
+  终轮 assistant 取 state 末条（runlog 终稿取 `pending[""]`，即 Σ root turn 正文——两投影分离不动）。
 
 ## §9 失败出口与兄弟层关系
 

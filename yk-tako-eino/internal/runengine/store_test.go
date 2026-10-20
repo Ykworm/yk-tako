@@ -195,8 +195,8 @@ func (s *Store) mustDelta(t *testing.T, ctx context.Context, rid RunID, text str
 	t.Helper()
 	// model 传空串：多数用例验的是生命周期语义、不关心 model 值（帧上恒在字段，无 omitempty）。
 	// model 值的序列化往返另有专测（TestAppendDeltaThenRead）。
-	if _, ok, err := s.AppendDelta(ctx, rid, 1, "", text); err != nil || !ok {
-		t.Fatalf("AppendDelta(%s): ok=%v err=%v", rid, ok, err)
+	if _, accepted, err := s.AppendDelta(ctx, rid, 1, "", text); err != nil || !accepted {
+		t.Fatalf("AppendDelta(%s): accepted=%v err=%v", rid, accepted, err)
 	}
 }
 
@@ -234,7 +234,6 @@ func TestAcquireRunGateBlocksSecondRun(t *testing.T) {
 		t.Errorf("runlive(r1) LLEN = %d, want 1", got)
 	}
 	s.mustGone(t, ctx, keyRunlive(r2))
-	s.mustGone(t, ctx, keyDraft(r2))
 	// 闸落点 = runs 活行。
 	live, _, _, _, _, err := s.SessionStatus(ctx, sid, testOwner)
 	if err != nil {
@@ -283,9 +282,9 @@ func TestAppendDeltaThenRead(t *testing.T) {
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 
 	for i, want := range []int{2, 3} {
-		n, ok, err := s.AppendDelta(ctx, rid, 1, "deepseek/deepseek-v4-flash", "你好")
-		if err != nil || !ok {
-			t.Fatalf("AppendDelta #%d: ok=%v err=%v", i, ok, err)
+		n, accepted, err := s.AppendDelta(ctx, rid, 1, "deepseek/deepseek-v4-flash", "你好")
+		if err != nil || !accepted {
+			t.Fatalf("AppendDelta #%d: accepted=%v err=%v", i, accepted, err)
 		}
 		if n != want {
 			t.Errorf("AppendDelta #%d eventOffset = %d, want %d", i, n, want)
@@ -305,7 +304,7 @@ func TestAppendDeltaThenRead(t *testing.T) {
 }
 
 // 4. EndRun(complete) 的一笔 PG 事务：放闸 + 定稿（mh seq2 / runlog assistant 同事务）；
-// Redis 半在 commit 后：末帧 terminal + runlive 设 TTL + 删 draft。
+// Redis 半在 commit 后：末帧 terminal + runlive 设 TTL + 删 runepoch。
 func TestEndRunCompleteFinalizes(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t, testLease, testTTL)
@@ -314,7 +313,7 @@ func TestEndRunCompleteFinalizes(t *testing.T) {
 	s.mustDelta(t, ctx, rid, "Hello, ")
 	s.mustDelta(t, ctx, rid, "world")
 
-	// T2 起 mh 的 assistant 半来自 worker 累积的 turn（不再由 EndRun 从 draft 合成）：测试给合成 turn 走同一路。
+	// T2 起 mh 的 assistant 半来自 worker 累积的 turn：测试给合成 turn 走同一路。
 	turn := []TurnEntry{{Role: "assistant", Text: "Hello, world"}}
 	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, mhRowsFromTurn(rid, turn), turn)
 	if err != nil || !ok {
@@ -342,8 +341,8 @@ func TestEndRunCompleteFinalizes(t *testing.T) {
 	if got := s.count(t, &RunlogEntry{}, "session_id = ?", sid); got != 2 {
 		t.Errorf("runlog 行数 = %d, want 2", got)
 	}
-	// Redis 半：draft 已删；runlive 键还在（done ≠ gone）且带 TTL。
-	s.mustGone(t, ctx, keyDraft(rid))
+	// Redis 半：runepoch 已删；runlive 键还在（done ≠ gone）且带 TTL。
+	s.mustGone(t, ctx, keyRunepoch(rid))
 	last, _, exists, err := s.ReadFrames(ctx, rid, 3, 200)
 	if err != nil || !exists {
 		t.Fatalf("定稿后 runlive 键应还在（done ≠ gone）: exists=%v err=%v", exists, err)
@@ -555,8 +554,8 @@ func TestResetClearsBothHalvesOnlyOwnPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if deleted != 3 {
-		t.Errorf("Reset deleted = %d, want 3（runlive + draft + runepoch 三键）", deleted)
+	if deleted != 2 {
+		t.Errorf("Reset deleted = %d, want 2（runlive + runepoch 两键）", deleted)
 	}
 	for _, m := range []any{&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}, &Note{}, &RunJournal{}} {
 		if got := s.count(t, m, ""); got != 0 {
@@ -592,7 +591,7 @@ func TestGateLeaseLifecycle(t *testing.T) {
 	s.mustDelta(t, ctx, rid, "world")
 
 	// 出生即带租约：Redis 两键 TTL > 0；PG 侧 lease_until 在 (now(), now()+2s) 窗口内（DB 时钟，now() 事务语义）。
-	for _, k := range []string{keyDraft(rid), keyRunlive(rid)} {
+	for _, k := range []string{keyRunepoch(rid), keyRunlive(rid)} {
 		if ttl := s.ttlOf(t, ctx, k); ttl <= 0 {
 			t.Fatalf("抢闸后 %s 应带租约 TTL, got %v", k, ttl)
 		}
@@ -615,7 +614,7 @@ func TestGateLeaseLifecycle(t *testing.T) {
 	if !after.After(before) {
 		t.Errorf("续约后 lease_until 应前进: %v → %v", before, after)
 	}
-	for _, k := range []string{keyDraft(rid), keyRunlive(rid)} {
+	for _, k := range []string{keyRunepoch(rid), keyRunlive(rid)} {
 		if ttl := s.ttlOf(t, ctx, k); ttl <= 0 {
 			t.Errorf("续约后 %s 应带租约 TTL, got %v", k, ttl)
 		}
@@ -623,7 +622,7 @@ func TestGateLeaseLifecycle(t *testing.T) {
 
 	// 零续约越过租约：两键蒸发（等真钟）。
 	waitCond(t, "两键随租约蒸发", 8*time.Second, func() bool {
-		n1, err1 := s.rdb.Exists(ctx, keyDraft(rid)).Result()
+		n1, err1 := s.rdb.Exists(ctx, keyRunepoch(rid)).Result()
 		n2, err2 := s.rdb.Exists(ctx, keyRunlive(rid)).Result()
 		if err1 != nil || err2 != nil {
 			t.Fatalf("EXISTS: %v %v", err1, err2)
@@ -682,7 +681,7 @@ func TestRenewLeaseNoopWhenGateLost(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 摘掉两键 TTL——续约若被误执行（PEXPIRE）会把 TTL 刷回来，no-op 则保持 -1。
-	for _, k := range []string{keyDraft(rid), keyRunlive(rid)} {
+	for _, k := range []string{keyRunepoch(rid), keyRunlive(rid)} {
 		if err := s.rdb.Persist(ctx, k).Err(); err != nil {
 			t.Fatal(err)
 		}
@@ -695,7 +694,7 @@ func TestRenewLeaseNoopWhenGateLost(t *testing.T) {
 	if ok {
 		t.Fatal("闸已不在本 run，续约应 no-op（返 false）")
 	}
-	for _, k := range []string{keyDraft(rid), keyRunlive(rid)} {
+	for _, k := range []string{keyRunepoch(rid), keyRunlive(rid)} {
 		s.mustOK(t, ctx, k) // 没被删
 		if ttl := s.ttlOf(t, ctx, k); ttl >= 0 {
 			t.Errorf("续约 no-op 不应改写 %s 的 TTL: %v", k, ttl)
@@ -704,7 +703,7 @@ func TestRenewLeaseNoopWhenGateLost(t *testing.T) {
 }
 
 // 12. 出生窗口（A7-2 的 DB 形态）：进程死在「抢闸 → 首次续约」之间（一次续约都没做成）时，
-// 两键也随租约一起蒸发、闸自开——修前 draft/runlive 出生不带 TTL，这个窗口里死掉会永久泄漏。
+// 两键也随租约一起蒸发、闸自开——修前 runlive/runepoch 出生不带 TTL，这个窗口里死掉会永久泄漏。
 func TestGateLeaseBirthWindowExpiresWithoutRenew(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t, 1*time.Second, 2*time.Second)
@@ -714,7 +713,7 @@ func TestGateLeaseBirthWindowExpiresWithoutRenew(t *testing.T) {
 
 	// 零续约（= 进程死在首次续约前），直接等过租约。
 	waitCond(t, "两键随租约蒸发（零续约）", 8*time.Second, func() bool {
-		n1, err1 := s.rdb.Exists(ctx, keyDraft(rid)).Result()
+		n1, err1 := s.rdb.Exists(ctx, keyRunepoch(rid)).Result()
 		n2, err2 := s.rdb.Exists(ctx, keyRunlive(rid)).Result()
 		if err1 != nil || err2 != nil {
 			t.Fatalf("EXISTS: %v %v", err1, err2)
@@ -734,8 +733,8 @@ func TestGateLeaseBirthWindowExpiresWithoutRenew(t *testing.T) {
 }
 
 // 13. 过期不可复活：lease 已过但行还挂着 running（没人清扫过）时，续约也必须拒——
-// 「lease_until > now()」是续约守卫的另一半；少了它，迟到续约会复活死 run，而 draft 已蒸发，
-// 收尾会拿空文本定稿出「complete 但空回复」的形状。
+// 「lease_until > now()」是续约守卫的另一半；少了它，迟到续约会复活死 run，
+// 调用方手里的 turn 会被定稿。
 func TestRenewLeaseRefusesExpiredGate(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t, 1*time.Second, 2*time.Second)
@@ -783,24 +782,26 @@ func TestAcquireRunRollsBackWhenRedisFails(t *testing.T) {
 	}
 }
 
-// 15. 过期不可复活（EndRun 侧，test 13 的孪生）：lease 已过、draft 已蒸发后，迟到的
-// EndRun(complete) 必须空转——少了守卫会拿空 draft 定稿出「complete 但空回复」的形状。
-func TestEndRunRefusesExpiredGate(t *testing.T) {
+// 15. 过期不可复活（EndRun 侧，test 13 的孪生）：lease 已过、两键蒸发后，迟到的
+// EndRun(complete) 即使带着非空 turn 也必须空转——少了守卫会把调用方手里的正文定稿。
+func TestLateEndRunWithTextStillBlockedByLease(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t, 1*time.Second, 2*time.Second)
 	sid, rid := SessionID("s_1"), RunID("r_1")
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 	s.mustDelta(t, ctx, rid, "world")
 
-	waitCond(t, "lease 过期且 draft 蒸发", 8*time.Second, func() bool {
-		n, err := s.rdb.Exists(ctx, keyDraft(rid)).Result()
-		if err != nil {
-			t.Fatalf("EXISTS: %v", err)
+	waitCond(t, "lease 过期且两键蒸发", 8*time.Second, func() bool {
+		n1, err1 := s.rdb.Exists(ctx, keyRunepoch(rid)).Result()
+		n2, err2 := s.rdb.Exists(ctx, keyRunlive(rid)).Result()
+		if err1 != nil || err2 != nil {
+			t.Fatalf("EXISTS: %v %v", err1, err2)
 		}
-		return n == 0 && s.sqlBool(t, `SELECT lease_until < now() FROM runs WHERE id = ?`, rid)
+		return n1 == 0 && n2 == 0 && s.sqlBool(t, `SELECT lease_until < now() FROM runs WHERE id = ?`, rid)
 	})
 
-	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, nil, nil)
+	late := []TurnEntry{{Role: "assistant", Text: "late"}}
+	eventOffset, runlogOffset, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, mhRowsFromTurn(rid, late), late)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -811,7 +812,7 @@ func TestEndRunRefusesExpiredGate(t *testing.T) {
 		t.Errorf("空转时返回值 = (%d, %d), want (0, 0)", eventOffset, runlogOffset)
 	}
 	if got := s.count(t, &RunlogEntry{}, "session_id = ? AND role = 'assistant'", sid); got != 0 {
-		t.Errorf("assistant 行数 = %d, want 0（空 draft 不得定稿）", got)
+		t.Errorf("assistant 行数 = %d, want 0（租约过期不得定稿）", got)
 	}
 	if !s.sqlBool(t, `SELECT (status = 'running' AND lease_until IS NOT NULL) FROM runs WHERE id = ?`, rid) {
 		t.Error("空转的 EndRun 不应动行（清扫归下次 AcquireRun）")
@@ -846,7 +847,7 @@ func TestEndRunErrorKeepsLogUntouched(t *testing.T) {
 	if got := s.count(t, &RunModelMessage{}, "session_id = ?", sid); got != 1 {
 		t.Errorf("mh 行数 = %d, want 1（只留 user 半）", got)
 	}
-	s.mustGone(t, ctx, keyDraft(rid))
+	s.mustGone(t, ctx, keyRunepoch(rid))
 	last, _, exists, err := s.ReadFrames(ctx, rid, 2, 200)
 	if err != nil || !exists {
 		t.Fatalf("收尾后 runlive 应还在: exists=%v err=%v", exists, err)
@@ -866,7 +867,7 @@ func TestCountMediaPlaceholdersCountsOccurrences(t *testing.T) {
 		{ID: "rl_1", SessionID: sid, Seq: 1, RunID: rid, Role: "user", MessageID: "m_1",
 			Text: "看两张图\n[media seq=1 path=.media/aaaa.png mime=image/png size=1B sha=a；x]\n[media seq=2 path=.media/bbbb.png mime=image/png size=2B sha=b；x]"},
 		{ID: "rl_2", SessionID: sid, Seq: 2, RunID: rid, Role: "tool_result",
-			Text: "[media path=.media/aaaa.png mime=image/png size=1B sha=a；已按路径读取。当前版本不回传媒体字节，请勿重复调用]"},
+			Text: "[media path=.media/aaaa.png mime=image/png size=1B sha=a；已按路径读取。媒体字节不会写入对话记录，请勿重复调用]"},
 		{ID: "rl_3", SessionID: sid, Seq: 3, RunID: rid, Role: "user", MessageID: "m_2", Text: "这条没图"},
 	}
 	for i := range rows {
@@ -1017,7 +1018,7 @@ func TestEndRunLandsDelegationRows(t *testing.T) {
 	}
 
 	// runlog：七行——user → tool_call(委派，root) → [researcher：tool_call + tool_result + 终稿] →
-	// tool_result(回传，root) → assistant(root 终稿=draft)。agent/model 两列随行直查。
+	// tool_result(回传，root) → assistant(root 终稿=Σ root turn)。agent/model 两列随行直查。
 	rows, _, exists, err := s.ReadLog(ctx, sid, 0, 200)
 	if err != nil || !exists {
 		t.Fatalf("ReadLog: exists=%v err=%v", exists, err)
@@ -1499,5 +1500,196 @@ func TestRunStatusDerivation(t *testing.T) {
 	// 5) 未知 run：found=false（HTTP 层 404），不伪造状态。
 	if _, found, err := s.RunStatus(ctx, "r_nope", 3); err != nil || found {
 		t.Fatalf("未知 run: found=%v err=%v, want false/nil", found, err)
+	}
+}
+
+// scanTK 扫本库 tk:*。测试库在 newTestStore 开头已清空，扫出来的就是这一场造的键。
+func (s *Store) scanTK(t *testing.T, ctx context.Context) []string {
+	t.Helper()
+	var out []string
+	var cursor uint64
+	for {
+		keys, next, err := s.rdb.Scan(ctx, cursor, keyPrefix+"*", 500).Result()
+		if err != nil {
+			t.Fatalf("SCAN tk:*: %v", err)
+		}
+		out = append(out, keys...)
+		if next == 0 {
+			return out
+		}
+		cursor = next
+	}
+}
+
+func keysOnly(keys []string, allow ...string) error {
+	ok := map[string]bool{}
+	for _, k := range allow {
+		ok[k] = true
+	}
+	for _, k := range keys {
+		if !ok[k] {
+			return fmt.Errorf("意外的键 %s（允许 %v）", k, allow)
+		}
+	}
+	return nil
+}
+
+// TestEndRunRootTextComesFromTurn：定稿正文来自 turn 的 root assistant 累计，不读 Redis。
+// 不写 delta；旧实现 GET 空串，会把 assistant 行写成空。
+func TestEndRunRootTextComesFromTurn(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid, rid := SessionID("s_turn"), RunID("r_turn")
+	s.mustAcquire(t, sid, rid, "m_turn", "hi")
+	turn := []TurnEntry{
+		{Role: "assistant", Text: "A"},
+		{Role: "assistant", Text: "B"},
+	}
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, mhRowsFromTurn(rid, turn), turn); err != nil || !ok {
+		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
+	}
+	var text string
+	if err := s.db.Raw(`SELECT text FROM runlog_entries WHERE run_id = ? AND role = 'assistant' AND agent IS NULL`, rid).Row().Scan(&text); err != nil {
+		t.Fatal(err)
+	}
+	if text != "AB" {
+		t.Errorf("runlog assistant text = %q, want %q", text, "AB")
+	}
+}
+
+// TestEndRunSurvivesRedisOutage：PG 事务提交之后 Redis 才写 terminal。
+// 把 rdb 换成不可达客户端后，EndRun 仍 ok=true、正文已落库，err 来自 terminal 写失败。
+func TestEndRunSurvivesRedisOutage(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid, rid := SessionID("s_outage"), RunID("r_outage")
+	s.mustAcquire(t, sid, rid, "m_outage", "hi")
+	s.mustDelta(t, ctx, rid, "ignored")
+	old := s.rdb
+	dead := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", DialTimeout: 50 * time.Millisecond, MaxRetries: -1})
+	s.rdb = dead
+	defer func() {
+		s.rdb = old
+		_ = dead.Close()
+	}()
+	turn := []TurnEntry{{Role: "assistant", Text: "AB"}}
+	_, _, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, mhRowsFromTurn(rid, turn), turn)
+	if !ok {
+		t.Fatalf("Redis 不可达时 PG 事务仍应提交: ok=%v err=%v", ok, err)
+	}
+	if err == nil {
+		t.Fatal("terminal 写失败应让 err 非 nil")
+	}
+	var text string
+	if err := s.db.Raw(`SELECT text FROM runlog_entries WHERE run_id = ? AND role = 'assistant' AND agent IS NULL`, rid).Row().Scan(&text); err != nil {
+		t.Fatal(err)
+	}
+	if text != "AB" {
+		t.Errorf("runlog assistant text = %q, want %q", text, "AB")
+	}
+}
+
+// TestAppendStillRejectsWrongEpoch：令牌不等时 delta 与工具帧都不进 runlive；本代令牌仍可写。
+func TestAppendStillRejectsWrongEpoch(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid, rid := SessionID("s_epoch"), RunID("r_epoch")
+	s.mustAcquire(t, sid, rid, "m_epoch", "hi")
+	before := s.llen(t, ctx, keyRunlive(rid))
+	if _, accepted, err := s.AppendDelta(ctx, rid, 2, "", "x"); err != nil || accepted {
+		t.Fatalf("错 epoch AppendDelta accepted=%v err=%v, want false", accepted, err)
+	}
+	if accepted, err := s.AppendFrame(ctx, rid, 2, Frame{Kind: "tool_call"}); err != nil || accepted {
+		t.Fatalf("错 epoch AppendFrame accepted=%v err=%v, want false", accepted, err)
+	}
+	if got := s.llen(t, ctx, keyRunlive(rid)); got != before {
+		t.Fatalf("拒写后 LLEN = %d, want %d", got, before)
+	}
+	if _, accepted, err := s.AppendDelta(ctx, rid, 1, "", "x"); err != nil || !accepted {
+		t.Fatalf("本代 AppendDelta accepted=%v err=%v, want true", accepted, err)
+	}
+	if got := s.llen(t, ctx, keyRunlive(rid)); got != before+1 {
+		t.Fatalf("本代写入后 LLEN = %d, want %d", got, before+1)
+	}
+}
+
+// TestRunLeavesOnlyRunliveAndEpoch：一场 run 的 Redis 键只有 runlive 与 runepoch；收尾后只剩 runlive。
+func TestRunLeavesOnlyRunliveAndEpoch(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid, rid := SessionID("s_only"), RunID("r_only")
+	s.mustAcquire(t, sid, rid, "m_only", "hi")
+	s.mustDelta(t, ctx, rid, "A")
+	s.mustDelta(t, ctx, rid, "B")
+	if accepted, err := s.AppendFrame(ctx, rid, 1, Frame{Kind: "tool_call", Name: "get_time"}); err != nil || !accepted {
+		t.Fatalf("AppendFrame: accepted=%v err=%v", accepted, err)
+	}
+	mid := s.scanTK(t, ctx)
+	if err := keysOnly(mid, keyRunlive(rid), keyRunepoch(rid)); err != nil {
+		t.Fatal(err)
+	}
+	if len(mid) != 2 {
+		t.Fatalf("进行中键 = %v, want runlive + runepoch", mid)
+	}
+	turn := []TurnEntry{{Role: "assistant", Text: "AB"}}
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, mhRowsFromTurn(rid, turn), turn); err != nil || !ok {
+		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
+	}
+	left := s.scanTK(t, ctx)
+	if err := keysOnly(left, keyRunlive(rid)); err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 1 {
+		t.Fatalf("EndRun 后键 = %v, want 只剩 runlive", left)
+	}
+}
+
+// TestSeedResumeLeavesOnlyRunliveAndEpoch：续跑种子只留两键；旧令牌拒写、新令牌可写。
+func TestSeedResumeLeavesOnlyRunliveAndEpoch(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid, rid := SessionID("s_seed"), RunID("r_seed")
+	s.mustAcquire(t, sid, rid, "m_seed", "hi")
+	s.mustDelta(t, ctx, rid, "半")
+	if err := s.db.WithContext(ctx).Exec(
+		`UPDATE runs SET lease_until = now() - interval '1 second' WHERE id = ?`, rid).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertJournal(ctx, RunJournal{RunID: rid, Epoch: 1, Role: "assistant", Text: "半场"}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := s.ClaimResume(ctx, rid, 3)
+	if err != nil {
+		t.Fatalf("ClaimResume: %v", err)
+	}
+	frame := `{"kind":"resume","agent":"","model":"","text":"半场"}`
+	if err := s.seedResume(ctx, rid, claim.Epoch, frame); err != nil {
+		t.Fatalf("seedResume: %v", err)
+	}
+	keys := s.scanTK(t, ctx)
+	if err := keysOnly(keys, keyRunlive(rid), keyRunepoch(rid)); err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("seed 后键 = %v, want runlive + runepoch", keys)
+	}
+	if ttl := s.ttlOf(t, ctx, keyRunepoch(rid)); ttl <= 0 {
+		t.Fatalf("seed 后 runepoch TTL = %v, want > 0（SET 之后要补 PEXPIRE）", ttl)
+	}
+	before := s.llen(t, ctx, keyRunlive(rid))
+	if _, accepted, err := s.AppendDelta(ctx, rid, 1, "", "x"); err != nil || accepted {
+		t.Fatalf("旧 epoch AppendDelta accepted=%v err=%v, want false", accepted, err)
+	}
+	if accepted, err := s.AppendFrame(ctx, rid, 1, Frame{Kind: "tool_call"}); err != nil || accepted {
+		t.Fatalf("旧 epoch AppendFrame accepted=%v err=%v, want false", accepted, err)
+	}
+	if got := s.llen(t, ctx, keyRunlive(rid)); got != before {
+		t.Fatalf("旧令牌拒写后 LLEN = %d, want %d", got, before)
+	}
+	if _, accepted, err := s.AppendDelta(ctx, rid, claim.Epoch, "", "新"); err != nil || !accepted {
+		t.Fatalf("新 epoch AppendDelta accepted=%v err=%v, want true", accepted, err)
+	}
+	if accepted, err := s.AppendFrame(ctx, rid, claim.Epoch, Frame{Kind: "tool_result", Output: "ok"}); err != nil || !accepted {
+		t.Fatalf("新 epoch AppendFrame accepted=%v err=%v, want true", accepted, err)
 	}
 }

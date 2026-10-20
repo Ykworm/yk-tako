@@ -204,17 +204,21 @@ func parseSessionMediaPath(path string) (wid, rel string, ok bool) {
 	return parts[1], strings.Join(parts[2:], "/"), true
 }
 
-// mediaPlaceholder 是 doc/32 §3 的占位行真身（入口图用）。句尾指回 read_media_file 的
-// 读者是**后续轮次**的模型——A3 的工具回执占位不含这句（读者就是刚调完的模型，指回
-// 自己 = 死循环），两种占位永远别混。A6：name/seq 是通信字段——seq 恒在（全会话累计，
-// 调用方计），name 可省（清完为空不写字段，不写字面空值）；name 值带引号包裹，
-// 文件名里的空格不破坏按空格分字段的读法。
+// mediaPlaceholder 是 doc/32 第 3 节的占位行真身（入口附件用）。句尾按 mime 指下一轮该调哪把工具：
+// PDF 指 read_pdf_text，其余（图片、音视频）仍指 read_media_file。读者是后续轮次的模型。
+// 工具回执占位不含这句（读者就是刚调完的模型，指回自己会打转），两种占位永远别混。
+// A6：name/seq 是通信字段——seq 恒在（全会话累计，调用方计），name 可省（清完为空不写字段，
+// 不写字面空值）；name 值带引号包裹，文件名里的空格不破坏按空格分字段的读法。
 func mediaPlaceholder(rawName string, seq int, relPath, mime string, size int, shaHex string) string {
 	name := mediaDisplayName(rawName)
 	head := fmt.Sprintf("[media seq=%d", seq)
 	if name != "" {
 		head += fmt.Sprintf(" name=%q", name)
 	}
-	return fmt.Sprintf("%s path=%s mime=%s size=%dB sha=%s；要看就调 read_media_file 读这个路径]",
-		head, relPath, mime, size, shaHex)
+	suffix := "要看就调 read_media_file 读这个路径"
+	if mime == "application/pdf" {
+		suffix = "要看就调 read_pdf_text 读这个路径（可分页）"
+	}
+	return fmt.Sprintf("%s path=%s mime=%s size=%dB sha=%s；%s]",
+		head, relPath, mime, size, shaHex, suffix)
 }

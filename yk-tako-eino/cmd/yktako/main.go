@@ -21,7 +21,7 @@ import (
 const runliveTTL = 300 * time.Second
 
 // 闸租约（A7/A7-2；D1 落库后闸 = runs 活行）：抢闸的 INSERT 出生即带 lease_until（DB 时钟 now()+lease），
-// tk:draft / tk:runlive 两键同笔出生、同租约（A7-2 的 Redis 半边）；worker watchdog 每 leaseRenew 续回。
+// tk:runlive / tk:runepoch 两键同笔出生、同租约（A7-2 的 Redis 半边）；worker watchdog 每 leaseRenew 续回。
 // 进程死亡后没人续 → 活行按 lease 判死（读侧即回收、新 POST 清扫翻 error）、两键到点蒸发——同生同灭、会话自动解锁。
 // 二者同为回收参数：30s/10s = 连续 3 次续约全失败才误放；默认值可被 .env 的 TAKO_LEASE_* 改（见 durationEnv）。
 const (
@@ -52,7 +52,7 @@ func (a modelRegistryResolver) Build(ctx context.Context, cacheKey, ref string, 
 	}
 	return runengine.TenantBuilt{
 		Chat: got.Model.Chat, Ref: got.Model.Ref, Protocol: string(got.Model.Protocol),
-		Provider: got.Provider, ModelID: got.ModelID, KeyFP: got.KeyFP,
+		Provider: got.Provider, ModelID: got.ModelID, KeyFP: got.KeyFP, Vision: got.Vision,
 	}, nil
 }
 
@@ -105,7 +105,7 @@ func main() {
 	batch := flag.Int("batch-window", 200, "per-batch limit for frames/log reads")
 	dev := flag.Bool("dev", true, "register dev-only endpoints (reset)")
 	bootstrapAdmin := flag.String("bootstrap-admin-email", os.Getenv("TAKO_BOOTSTRAP_ADMIN_EMAIL"), "existing user email to mark system admin at startup")
-	redisAddr := flag.String("redis", "127.0.0.1:6390", "redis address holding the tk:runlive/tk:draft keys")
+	redisAddr := flag.String("redis", "127.0.0.1:6390", "redis address holding the tk:runlive/tk:runepoch keys")
 	pgDSN := flag.String("pg", defaultPGDSN, "postgres DSN (sessions/runs/run_model_messages/runlog_entries)")
 	leaseTTL := flag.Duration("lease-ttl", durationEnv("TAKO_LEASE_TTL", defaultLeaseTTL), "gate lease TTL; watchdog keeps renewing it during generation (env TAKO_LEASE_TTL)")
 	leaseRenew := flag.Duration("lease-renew", durationEnv("TAKO_LEASE_RENEW", defaultLeaseRenew), "watchdog renew interval (must be < lease-ttl; env TAKO_LEASE_RENEW)")
@@ -267,7 +267,9 @@ func main() {
 
 	// agent 装配（T1）失败也是启动错误：装配不出来 = 主循环跑不了，fail fast 一贯式。
 	// T3：agentsDir 只是规格目录位置（装载是 run 起手扫盘、失败降级为 log）——目录不存在不算启动错误。
-	worker, err := runengine.NewWorker(store, opened.Chat, runengine.TranslatorFor(string(opened.Protocol)), config.SystemPrompt(), wsAbs, *agentsDir, *leaseRenew, *compactWindow, opened.Ref, maxOutput, *subagentConcurrency, *subagentReturnCap, modelRegistryResolver{modelRegistry}, counter)
+	mediaSend := envOn("TAKO_MEDIA_SEND")
+	log.Printf("media: send=%v", mediaSend)
+	worker, err := runengine.NewWorker(store, opened.Chat, runengine.TranslatorFor(string(opened.Protocol)), config.SystemPrompt(), wsAbs, *agentsDir, *leaseRenew, *compactWindow, opened.Ref, maxOutput, *subagentConcurrency, *subagentReturnCap, modelRegistryResolver{modelRegistry}, counter, mediaSend)
 	if err != nil {
 		log.Fatalf("agent 装配: %v", err)
 	}

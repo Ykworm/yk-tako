@@ -314,7 +314,7 @@ defer EndRun（唯一出口）：complete → 同一笔 PG 事务
   搭理它就得显式声明 read/write/edit；工具**不在注册表**（外来 MCP 工具）→ 走 ②。
   配套**启动 lint**（装配
   阶段跑一次，不在提取热路径）：注册表中工具名**精确等于**目录里的某个名字、且 `file_effect`
-  为空串 → 启动报错。目录 v1 完整名单（常量表，11 个名字，出处见下注）：
+  为空串 → 启动报错。目录 v1 完整名单（常量表，出处见下注）：
 
   ```
   read_text_file  read_media_file  write_file  edit_file  move_file

@@ -28,6 +28,8 @@ type ResolvedModel struct {
 	Ref      string
 	ModelID  string
 	Provider ResolvedProvider
+	// Vision 来自目录里同 id 的那条。目录没有这条，或那条没标 vision，就是 false。
+	Vision bool
 }
 
 // customKey 认出 TAKO_PROVIDER_<名字>_API_KEY 这类自定义厂商密钥变量。
@@ -213,8 +215,23 @@ func withOllama(providers []ResolvedProvider, env Env, spec string) []ResolvedPr
 }
 
 // pack 把厂商和模型 id 打包成解析结果。
+// Vision 只认目录里同 id 的那一条；裸名放行或写了一个目录里没有的 id 时是 false。
 func pack(provider ResolvedProvider, modelID string) ResolvedModel {
-	return ResolvedModel{Provider: provider, ModelID: modelID, Ref: provider.ID + "/" + modelID}
+	return ResolvedModel{
+		Provider: provider,
+		ModelID:  modelID,
+		Ref:      provider.ID + "/" + modelID,
+		Vision:   presetVision(provider.Models, modelID),
+	}
+}
+
+func presetVision(models []ModelPreset, modelID string) bool {
+	for _, model := range models {
+		if model.ID == modelID {
+			return model.Vision
+		}
+	}
+	return false
 }
 
 // exampleRef 给报错信息造一个当前就能用的 TAKO_MODEL 例子。
@@ -268,7 +285,7 @@ func ResolveModelWithRef(env Env, ref string) (ResolvedModel, error) {
 	}
 	providers = withOllama(providers, env, spec)
 	if len(providers) == 0 {
-		return ResolvedModel{}, fmt.Errorf("没有可用的模型厂商。在 .env 里设置 API Key，例如 DEEPSEEK_API_KEY，再用 TAKO_MODEL=deepseek/deepseek-v4-flash 选择模型")
+		return ResolvedModel{}, fmt.Errorf("没有可用的模型厂商。在 .env 里设置 API Key，例如 DEEPSEEK_API_KEY，再用 TAKO_MODEL=deepseek/deepseek-flash 选择模型")
 	}
 	if spec == "" {
 		if len(providers) != 1 {

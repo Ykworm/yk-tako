@@ -17,7 +17,7 @@
 # 没显式给 TAKO_ENGINE 时，脚本按 ENGINE_PORT 把它填好，两边必然一致；
 # 显式给了 TAKO_ENGINE，就以它为准——引擎绑的也是它上面那个端口。
 #
-# 引擎的存储层是 Redis（tk:runlive/tk:draft 两键）+ Postgres，任一不可达就 fail fast 不起进程，
+# 引擎的存储层是 Redis（tk:runlive/tk:runepoch 两键）+ Postgres，任一不可达就 fail fast 不起进程，
 # 所以这里先把两半都备好：端口上已有监听者就复用（可能是你自己留着的那份数据，脚本不碰），
 # 空闲才自己起——Redis 一个内存态实例，Postgres 一个 initdb 在 tmp/pg-<端口>/data 的本地实例。
 #
@@ -203,7 +203,7 @@ trap shutdown INT TERM EXIT
 mkdir -p "$dev_run_dir"
 printf '%s\n' "$$" > "$pid_file"
 
-# Redis 是引擎临时态的存储层（tk:runlive/tk:draft 两键），main.go 连不上就 fail fast 不进监听，
+# Redis 是引擎临时态的存储层（tk:runlive/tk:runepoch 两键），main.go 连不上就 fail fast 不进监听，
 # 所以必须在引擎之前备好。端口上已有监听者就复用——那可能是你自己留着的那份数据，脚本不杀；
 # 自己起的那个由收尾的 pkill -P 收走。
 redis_listener="$(lsof -tiTCP:"$redis_port" -sTCP:LISTEN 2>/dev/null | head -1 || true)"

@@ -224,8 +224,9 @@
     "apiKeyEnv": "DEEPSEEK_API_KEY",
     "models": [
       {
-        "id": "deepseek-v4-flash",
-        "name": "DeepSeek V4 Flash"
+        "id": "deepseek-flash",
+        "name": "DeepSeek Flash",
+        "vision": true
       },
       {
         "id": "deepseek-v4-pro",

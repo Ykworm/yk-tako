@@ -652,7 +652,7 @@ var mediaMimeByExt = map[string]string{
 // >5MB 拒读：读进来就是往上下文灌大字节（减灾档），帽与入口图同值（mediaMaxBytes）。
 func newReadMediaFileTool(store *Store, root string) (tool.BaseTool, error) {
 	return utils.InferTool("read_media_file",
-		"读取媒体文件的元信息（path/mime/size/sha 占位行；当前版本不回传媒体字节）。"+
+		"读取媒体文件的元信息（path/mime/size/sha 占位行；媒体字节不会写入对话记录）。"+
 			"path 用对话里占位行的 path 原文（workspaces/<id>/.media/<file>），不要改写。文件超过 5MB 会拒绝。",
 		func(ctx context.Context, in readMediaFileInput) (string, error) {
 			full, err := resolveReadMediaPath(ctx, store, root, in.Path)
@@ -688,6 +688,6 @@ func newReadMediaFileTool(store *Store, root string) (tool.BaseTool, error) {
 // mediaReceiptPlaceholder 是工具回执占位（doc/32 A3）：与入口占位 mediaPlaceholder 同
 // 字段面、不同句尾——不带「再调 read_media_file」自指。
 func mediaReceiptPlaceholder(relPath, mime string, size int, shaHex string) string {
-	return fmt.Sprintf("[media path=%s mime=%s size=%dB sha=%s；已按路径读取。当前版本不回传媒体字节，请勿重复调用]",
+	return fmt.Sprintf("[media path=%s mime=%s size=%dB sha=%s；已按路径读取。媒体字节不会写入对话记录，请勿重复调用]",
 		relPath, mime, size, shaHex)
 }

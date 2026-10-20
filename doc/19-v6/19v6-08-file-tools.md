@@ -1,8 +1,12 @@
 # 19v6-08 · 文件工具族（F 系列）
 
-> **立项（2026-10-11 交审）**：T 系列（19v6-05）延拍。把 fileOps 目录名单（19v6-07 §5，
-> 11 个名字）从「lint 对照表上的纸面名字」落成第一方真工具。本文是 F 系列的机制与契约真源；
+> **立项（2026-10-11 交审）**：T 系列（19v6-05）延拍。把 fileOps 目录名单（19v6-07 §5）
+> 从「lint 对照表上的纸面名字」落成第一方真工具。本文是 F 系列的机制与契约真源；
 > 施工台账在 `tmp/19-v6/filetools/`；冲突以本文为准、回头改台账。
+>
+> **2026-10-20**：文件工具新增 `read_pdf_text`（doc/32 A8-1）。
+> `fileEffectToolNames` 那份目录名单不变。`read_pdf_text` 只登记 `firstPartyFileEffects`，不进那份名单。
+> **2026-10-20 A8-2**：页码超出、无文本层、加密或损坏、非 PDF，都降级成正常结果或「错误：…」，run 继续。`TAKO_MEDIA_SEND=off` 时这把工具仍可读。PDF 正文里印着的回执行不附图。
 
 ## §0 立项由来：两个「空转」等这拍转正
 
@@ -22,14 +26,15 @@
 
 ## §1 范围与非目标
 
-**范围内**：目录名单 11 个名字全部落地为第一方工具（`read_text_file`、`read_media_file`、
+**范围内**：目录名单里的名字全部落地为第一方工具（`read_text_file`、`read_media_file`、
 `write_file`、`edit_file`、`move_file`、`create_directory`、`list_directory`、
 `directory_tree`、`get_file_info`、`search_files`、`read_file`），逐个带 `file_effect`
-声明进注册表，受启动 lint 管辖。
+声明进注册表，受启动 lint 管辖。2026-10-20 起文件工具另增加 `read_pdf_text`。
+它不在目录名单里，启动 lint 不拿它做「名单内必须声明」的对照；`firstPartyFileEffects` 给它登记 read，父池在 `read_media_file` 之后装配。
 
 **明确不做**（本节登记，未来用例逼出再立项）：
 
-- **`read_multiple_files` 不发明**——MCP filesystem 服务器的后增工具，不在 11 名名单内
+- **`read_multiple_files` 不发明**——MCP filesystem 服务器的后增工具，不在目录名单内
   （C5-A4 裁：按字面清单实现，不凑数）。
 - **内容正则搜索**——`search_files` v1 只做固定子串；正则的 ReDoS 面不自找。
 - **符号链接逃逸防护**——v1 只防 `..` 路径逃逸；symlink 指向 workspace 外是已登记盲区
@@ -82,7 +87,8 @@
 | `directory_tree` | read | `path`,`depth?`(默认 3，上限 5) | 缩进树（两空格一级），目录以 `/` 结尾；超深处标 `…`；节点上限 500、超出标 `（已截断）` | 越界；不是目录 |
 | `get_file_info` | read | `path` | 四行：`size: <n> 字节` / `modified: <RFC3339>` / `mode: <-rw-r--r-->` / `type: 文件\|目录` | 越界；不存在 |
 | `search_files` | read | `path`(起始目录),`query`(固定子串),`file_glob?`(如 `*.go`) | 命中行 `relpath:行号:行内容`，上限 50 条、超出标 `（更多命中已省略）`；单文件 >1MB 跳过 | 越界；不是目录 |
-| `read_media_file` | read | `path` | 单行 `data:<mime>;base64,<…>` | 越界；不存在；>5MB（提示太大） |
+| `read_media_file` | read | `path` | 单行 `[media path=… mime=… size=…B sha=…；已按路径读取。媒体字节不会写入对话记录，请勿重复调用]`（doc/32 A2/A3-2） | 越界；不存在；>5MB（提示太大） |
+| `read_pdf_text` | read | `path`,`page_from?`,`page_to?` | 页眉 `[pdf path=… pages=N；第 a-b 页；文本层抽取]`，随后 `--- page N ---` 与该页文本。默认第 1-3 页，单次最多 10 页、16KB。扫描件与页码超出是正常结果 | 越界；不存在；不是 `.pdf`；不是普通文件；>5MB；加密或损坏 |
 
 语义裁定：
 
@@ -92,8 +98,16 @@
   时原文必须**恰好一处**命中（0 处或 >1 处都报错，>1 处错误文本带出现次数）——把
   「编辑哪一处」的决定权留在模型手里，程序不做模糊匹配。
 - **`read_file` 与 `read_text_file` 同体**：OpenHands / Open Interpreter 系的惯用名
-  （19v6-07 §5 出处），同参同行为，仅名字与描述不同。两个都落地的原因：名单 11 名照单
+  （19v6-07 §5 出处），同参同行为，仅名字与描述不同。两个都落地的原因：目录名单照单
   全收，别名让两系生态的 prompt/习惯在 tako 上直接可跑。
+- **`read_media_file` 的回执与发送份是两件事**：回执（落库、payload、帧）永远是上面的
+  占位行；A3-2 在下一枪的模型输入副本里把回执换成 tool 角色的 image part，模型因此能看见图。
+  工具描述与回执里的「媒体字节不会写入对话记录」说的是落库纪律，不是说模型看不到图。
+  同一 run 里，用户随消息带来的图只附在第一次成功回复之前的那一枪；模型要再看，调
+  `read_media_file`，下一枪的回执发送份会把图附上。这道闸记在 `foldBox` 上，续跑新建容器会再发一次。
+  发送份只在两把闸都开时才换成图：目录里这条模型标了 `vision`，并且进程的 `TAKO_MEDIA_SEND` 不是 `off`。
+  关闸或模型不收图时，模型看到的仍是占位。细节见 doc/32 A3。
+- **`read_pdf_text` 读的是文本层，不是图片回执**。工具结果写入 runlog 和 `run_model_messages`，按页和 16KB 封顶。它不产生「已按路径读取」回执，发送侧也不会因为它被调用就把图附上。PDF 正文里即使印着一行完整的媒体回执，也不附图：还原 tool 消息要同时满足两件事，ToolCallID 在最后一条 user 之后的 assistant 消息里对应 `read_media_file`，并且该行带「已按路径读取」。映射缺失按不还原处理。
 - **`head`/`tail` 同时给出** → 错误（同 MCP）。
 - **`move_file` 的 `destination` 不进 fileOps 清单**：提取器 `pathsFromArgs` 只收 `path`
   字段（C5-A4 形状），destination 是登记盲区（§6 挂账）——防重建保险丝关心「内容写过

@@ -15,19 +15,19 @@
 
 ### 1.1 这件事在什么场景发生
 
-tako 的 agent 现在只有 16 个一手工具（`internal/runengine/tools.go` 一族：fileops/bash/web_search/委派等），**每一个都是我们手写的 Go 代码**。用户接下来想让 agent 干的事——操作浏览器、读自家内部系统、调第三方服务——按现状每加一种就要手写一个工具、过一轮单测金样、再发一版。
+tako 的 agent 现在只有一组一手工具（`internal/runengine/tools.go` 一族：fileops/bash/web_search/委派等），**每一个都是我们手写的 Go 代码**。用户接下来想让 agent 干的事——操作浏览器、读自家内部系统、调第三方服务——按现状每加一种就要手写一个工具、过一轮单测金样、再发一版。
 
 而 MCP（Model Context Protocol）是一个现成的工具生态：任何程序按协议声明自己的能力，就成为一个 **MCP server**（提供工具的一方）；连上去取工具用的一方叫 **MCP client**。社区里已有大量现成 server（filesystem、浏览器控制、数据库、各类 SaaS）。tako 在 doc/03:42 的技术栈表里挂了 MCP 的名分，doc/04:54/80 也写过「Eino 官方支持 MCP」，但 doc/16 能力总表里至今没有这一行——名分挂了，账没立。
 
 ### 1.2 不做的具体后果（失败故事）
 
-用户对 agent 说「帮我把 workspace 里这张截图里的表格整理成 markdown」。agent 看着图片无能为力——16 个工具里没有一个能操作图片编辑器或 OCR 服务。用户只能等我们手写一个 OCR 工具。而社区现成有一个 filesystem server、若干 vision server，MCP client 一接，**当天**就能用上，零 Go 代码。
+用户对 agent 说「帮我把 workspace 里这张截图里的表格整理成 markdown」。agent 看着图片无能为力——现有工具里没有一个能操作图片编辑器或 OCR 服务。用户只能等我们手写一个 OCR 工具。而社区现成有一个 filesystem server、若干 vision server，MCP client 一接，**当天**就能用上，零 Go 代码。
 
 再往后：用户想接自己公司的 API。没有 MCP client 时，路径是「教用户改 tako 源码」；有 MCP client 时，路径是「用户写一个 20 行的 MCP server，往配置文件里加两行」。**工具的供给方从「tako 开发者」变成「任何人」**——这是接入 MCP 的唯一本质收益，其余都是工程细节。
 
 ### 1.3 本方案的边界
 
-只做 **client** 这半边：tako 作为 client 去连 server、把 server 的工具搬进自己的工具池。不做 server 半边（把 tako 的 16 个工具暴露给别人调）。只做 **stdio 传输**：server 是引擎按配置拉起的本地子进程，通过 stdin/stdout 通话——这是所有 MCP server 里最简单、也最适合首拍的一类；HTTP/SSE 远程 server 要背连接管理、超时、断线语义、凭证，留作后置拍（§9）。
+只做 **client** 这半边：tako 作为 client 去连 server、把 server 的工具搬进自己的工具池。不做 server 半边（把 tako 现有的工具暴露给别人调）。只做 **stdio 传输**：server 是引擎按配置拉起的本地子进程，通过 stdin/stdout 通话——这是所有 MCP server 里最简单、也最适合首拍的一类；HTTP/SSE 远程 server 要背连接管理、超时、断线语义、凭证，留作后置拍（§9）。
 
 ## 2. 选型与依据
 
@@ -83,7 +83,7 @@ eino-ext 有两个 MCP 工具适配器，都把「一个已连上的 MCP 会话�
 ```
 
 - `fs` 是**本地短名**，只用于前缀命名（§4）与配置引用；`command`+`args` 是拉起子进程的命令行；`env` 透传子进程环境。
-- 文件不存在或 `mcpServers` 为空 = 引擎行为与今天完全一致（16 个一手工具），**无配置即无 MCP**——这是显式字段承载语义，不靠默认值夹带。
+- 文件不存在或 `mcpServers` 为空 = 引擎行为与今天完全一致（一手工具全集），**无配置即无 MCP**——这是显式字段承载语义，不靠默认值夹带。
 - 已知字段之外的键（如将来的 `transport: "http"`）拒载并列出可选名，对齐 agents 规格 parse 层的哑失败转响失败纪律。
 
 ### 3.2 真源与扫盘时机
@@ -96,11 +96,11 @@ eino-ext 有两个 MCP 工具适配器，都把「一个已连上的 MCP 会话�
 
 ### 4.1 命名：`mcp__<短名>__<工具名>`
 
-MCP 工具名（如 filesystem server 的 `read_file`）与 tako 一手工具名（16 个）和别的 server 的工具名都可能撞。**双重下划线三段式** `mcp__fs__read_file` 是业界现行惯例（Claude Code/Qoder 同形）：`mcp` 段保证一手工具永远不撞，`<短名>` 段保证不同 server 之间不撞，第三段是 server 自己报的工具名。短名在配置层必须合法（`[a-z0-9_-]+`），否则拒载。
+MCP 工具名（如 filesystem server 的 `read_file`）与 tako 一手工具名和别的 server 的工具名都可能撞。**双重下划线三段式** `mcp__fs__read_file` 是业界现行惯例（Claude Code/Qoder 同形）：`mcp` 段保证一手工具永远不撞，`<短名>` 段保证不同 server 之间不撞，第三段是 server 自己报的工具名。短名在配置层必须合法（`[a-z0-9_-]+`），否则拒载。
 
 ### 4.2 进池位置与生效链
 
-现有机制是「全注册 + 每轮声明过滤」（19v6-05 §5 / 19v6-06 §3）：所有工具注册进 tools node（注册 ≠ 声明），每轮 `BeforeModelRewriteState` 筛出本轮发给模型的名单。MCP 工具的接入点是**base 池的构建处**：run 起手扫配置 → 逐 server 拉起子进程 → `GetTools` 翻译成 BaseTool → 以 `mcp__短名__工具名` 并进 base 池尾部（排在 16 个一手工具之后，池序稳定）。
+现有机制是「全注册 + 每轮声明过滤」（19v6-05 §5 / 19v6-06 §3）：所有工具注册进 tools node（注册 ≠ 声明），每轮 `BeforeModelRewriteState` 筛出本轮发给模型的名单。MCP 工具的接入点是**base 池的构建处**：run 起手扫配置 → 逐 server 拉起子进程 → `GetTools` 翻译成 BaseTool → 以 `mcp__短名__工具名` 并进 base 池尾部（排在一手工具之后，池序稳定）。
 
 之后**现有机制全部原样生效，零新增**：
 

@@ -246,6 +246,7 @@ type StagedCompaction struct {
 // 可以把整份文件塞进 arguments，旧口径（只数 text）对这类行全盲。tool_calls 的序列化
 // 与 mh 的 tool_calls 列同源（json.Marshal([]schema.ToolCall)）——量级口径，不要求与
 // 落库字节逐字节相等。工具 schema 声明不计（登记项，19v6-10 §6）。
+// MediaTokens 是行上已经算好的图片 token，直接相加，不再交给计数器。
 func countInput(counter TokenCounter, system string, msgs []ModelMessage) int {
 	n := 0
 	if system != "" {
@@ -253,6 +254,7 @@ func countInput(counter TokenCounter, system string, msgs []ModelMessage) int {
 	}
 	for _, m := range msgs {
 		n += counter.Count(m.Text)
+		n += m.MediaTokens
 		if len(m.ToolCalls) > 0 {
 			if b, err := json.Marshal(m.ToolCalls); err == nil {
 				n += counter.Count(string(b))

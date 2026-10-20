@@ -220,7 +220,7 @@ func TestShippedAgentSpecToolGuards(t *testing.T) {
 	poolOrder := []string{
 		"get_time", "write_file", "read_text_file", "read_file", "edit_file", "move_file",
 		"create_directory", "list_directory", "directory_tree", "get_file_info", "search_files",
-		"read_media_file", "bash", "memory", "search_history", "web_search",
+		"read_media_file", "read_pdf_text", "bash", "memory", "search_history", "web_search",
 	}
 	// 名字宇宙从注册表派生（不另抄一份名单，两份会各自腐化）：父池加一把登记过 file_effect 的
 	// 新工具 ⇒ 集合与写死的池序不等 ⇒ 红。get_time 按 fileops.go:86 的说明不进注册表，显式并进来。
@@ -245,11 +245,12 @@ func TestShippedAgentSpecToolGuards(t *testing.T) {
 
 	// 金样 = 每条出厂规格今天应有的**有效名单**（逐名逐序；researcher 走排除路 = 池序，
 	// coder 走白名单路 = 它 frontmatter 里写的顺序，两序今天只差 memory/bash 的先后）。
-	// researcher 名单 15 项 = 2026-10-18 翻案后排除清单只剩 bash（doc/26 头注与 §4）。
+	// researcher 的金样 = 父池去掉 bash，逐名写死；不写总数——数字会随父池变化而腐化。
+	// 给 researcher read_pdf_text，是因为它本来就能读 workspace 里的文件，PDF 文本属于同一类读。
 	golden := map[string][]string{
 		"researcher": {"get_time", "write_file", "read_text_file", "read_file", "edit_file", "move_file",
 			"create_directory", "list_directory", "directory_tree", "get_file_info", "search_files",
-			"read_media_file", "memory", "search_history", "web_search"},
+			"read_media_file", "read_pdf_text", "memory", "search_history", "web_search"},
 		"coder": {"write_file", "read_text_file", "edit_file", "list_directory", "search_files", "memory", "bash"},
 	}
 	// inheritOK：出厂规格默认必须写 tools: 或 exclude_tools: 之一——两行都不写 = 整份继承，

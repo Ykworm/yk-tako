@@ -97,6 +97,9 @@ var firstPartyFileEffects = map[string]string{
 	"get_file_info":    fileEffectRead,
 	"search_files":     fileEffectRead,
 	"read_media_file":  fileEffectRead,
+	// read_pdf_text（doc/32 A8-1）：读 PDF 文本层，路径仍在 workspace 圈内，声明 read。
+	// 不进 fileEffectToolNames：那张表是原来的文件系统工具名，lint 只拦表内漏声明的名字。
+	"read_pdf_text": fileEffectRead,
 	// memory（M1）：笔记落 PG notes 表、不碰 workspace 路径——显式表态 none（planning §1-6，
 	// 作者没声明 = 不碰文件的同一表态方式）。
 	"memory": fileEffectNone,

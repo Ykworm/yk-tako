@@ -121,7 +121,7 @@ func (t *journalInvokableTool) InvokableRun(ctx context.Context, argumentsInJSON
 }
 
 // journalReplay 是账本重放的产物（doc/30 §9.1）：模型输入行、EndRun 的两个投影所用 turn、
-// draft 种子（所有 root assistant 正文拼接）、以及「最后一条 assistant 没有 tool_calls」的终点判定。
+// resume 帧正文（所有 root assistant 正文拼接）、以及「最后一条 assistant 没有 tool_calls」的终点判定。
 type journalReplay struct {
 	Rows  []ModelMessage
 	Turn  []TurnEntry

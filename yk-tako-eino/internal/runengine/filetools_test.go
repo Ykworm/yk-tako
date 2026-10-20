@@ -127,7 +127,7 @@ func TestWriteFileToolErrorAsResult(t *testing.T) {
 	}
 }
 
-// 两个登记点配对（F1–F11 全量 + memory 表态 none）：11 把文件工具的声明与 bucket 逐一钉死、
+// 两个登记点配对（F 系列 + read_pdf_text + memory 表态 none）：文件工具的声明与 bucket 逐一钉死、
 // memory 显式声明 none，lint 必须放行。
 // 漏一行 = 池里有工具而注册表没有（lint 报启动失败），声明错 = fileOps 分桶错（这里先钉住）。
 func TestFirstPartyFileEffectsPassLint(t *testing.T) {
@@ -146,13 +146,14 @@ func TestFirstPartyFileEffectsPassLint(t *testing.T) {
 		"get_file_info":    fileEffectRead,
 		"search_files":     fileEffectRead,
 		"read_media_file":  fileEffectRead,
+		"read_pdf_text":    fileEffectRead,
 		"memory":           fileEffectNone,
 		"search_history":   fileEffectWrite,
 		"bash":             fileEffectWrite,
 		"web_search":       fileEffectWrite,
 	}
 	if len(firstPartyFileEffects) != len(want) {
-		t.Fatalf("注册表条目数 %d, want %d（11 文件工具 + memory + search_history + bash + web_search）", len(firstPartyFileEffects), len(want))
+		t.Fatalf("注册表条目数 %d, want %d（文件工具 + memory + search_history + bash + web_search）", len(firstPartyFileEffects), len(want))
 	}
 	for name, effect := range want {
 		if firstPartyFileEffects[name] != effect {

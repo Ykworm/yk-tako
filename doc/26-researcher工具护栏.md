@@ -6,7 +6,7 @@
 > 出厂规格金样）；④ 本篇先落地，A3 同批改 `tmp/17-子代理折叠/todos.md` 三条 bash 剧本。
 >
 > **2026-10-18 用户拍（第②条部分翻案）：写类四把归还，排除清单缩到 `- bash` 一项**，
-> researcher 有效名单 15 项（父池 16 − bash）。理由（当天逐条核代码确认）：写类四把全部过
+> researcher 的有效名单 = 父池去掉 `bash`（名字列在 §4；2026-10-20 起父池含 `read_pdf_text`）。理由（当天逐条核代码确认）：写类四把全部过
 > `resolveInWorkspace` 关卡（拒绝对路径、拒 `../` 越界）——「只许写在工作区里」的牢笼本来就在，
 > 收走写类收掉的是圈子里的钥匙；全池没有删除工具，系统里唯一的删除途径是 bash 的 `rm`，
 > 且 `move_file` 遇目标已存在报错不覆盖（`filetools.go:212`）。bash 是四件独占事实的唯一载体：
@@ -14,31 +14,31 @@
 > 「researcher 在 workspace 内可读写、不能删、跑不了命令」由此精确成立。被收回的承诺：
 > 「外部文本诱导也改不了 workspace 已有文件」（§4、§11）——减震只剩每笔写有账（fileOps 落库）
 > 与「种下到有人跑」之间隔着另一个代理的独立判断（§9 重签）。连带改口：§2 一处、§4 名单、§5 自述、
-> §7 金样（researcher 15 项）、§8 一处、§11 收尾、§12 记录；`agents/researcher.md` 与金样单测同批改，
+> §7 金样（researcher 逐名）、§8 一处、§11 收尾、§12 记录；`agents/researcher.md` 与金样单测同批改，
 > 活体复验见台账 `r1-归还写类实录.md`。
 >
 > **施工状态（三拍全过，实录在台账 `a1-验收实录.md` / `a2-验收实录.md`）**：
 > - **A1 机制 + 配置 + 观测面**：`agents.go` 四态落地（`agentSpecFront`/`AgentSpec` 各加 `ExcludeTools`、
 >   parse 层互斥、`resolveToolPool` 第四态 + 抽出的 `poolIndex`/`excludeFromPool` 两个 helper）、
->   `agents/researcher.md` 全文换（排除五项 + description 补「不能跑命令、不改文件」+ 正文自述四条）、
+>   `agents/researcher.md` 全文换（排除项 + description 补「不能跑命令、不改文件」+ 正文自述四条）、
 >   `worker.go` 一行注释改口。活体：日志逐场打出
->   `agent tools researcher: get_time, read_text_file, read_file, list_directory, directory_tree, get_file_info, search_files, read_media_file, memory, search_history, web_search`（11 项、池序、无 bash 无写类）与
->   `agent tools coder: write_file, read_text_file, edit_file, list_directory, search_files, memory, bash`（7 项、有 bash）。
+>   `agent tools researcher: get_time, read_text_file, read_file, list_directory, directory_tree, get_file_info, search_files, read_media_file, memory, search_history, web_search`（池序、无 bash 无写类）与
+>   `agent tools coder: write_file, read_text_file, edit_file, list_directory, search_files, memory, bash`（白名单、有 bash）。
 >   八场探针：强制委派 researcher 跑 `echo 424242` → 它零次工具调用、终稿「我没有 bash」（run
 >   `r_01M5592MK58FXM5FA0H62QNRGE`）；主代理自己跑 → `退出码：0 stdout: 424242`；researcher 写
 >   `notes/hello.txt` → 只调读类两把、报告「做不到，文件没写」、盘上无 `notes/`，主代理同一句话 → `已写入（12 字节）`；
 >   researcher `web_search` ×4 → 四份结果均以 `来源：deepseek` 开头含链接（**当天 searchfree 未被触发，
->   走的全是 deepseek 路**）；两条拒载反证 → `agents: researcher: 拒载: exclude_tools 列了未知名 "bashh"（可选: …16 名…）`
+>   走的全是 deepseek 路**）；两条拒载反证 → `agents: researcher: 拒载: exclude_tools 列了未知名 "bashh"（可选: …）`
 >   与 `agents: researcher.md: 拒载: tools: 与 exclude_tools: 不能同时写…二选一`，两者都 `agents: 1 spec(s): coder`、
 >   run 仍 `complete`。**一处副产品**：不加强制措辞时主代理读完新 description 就自己改派 coder 了——
 >   第 5 节要的正是这个效果。
 > - **A2 两支单测**：`TestResolveToolPoolExclude`（池序不是排除项序 / 原对象搬运不换壳 / `exclude_tools: []`
 >   视同不写且仍拷贝切片 / 排除未知名报错带名字）+ `TestParseAgentSpecRejectsToolsAndExclude`（互斥在 parse 层）
->   + `TestShippedAgentSpecToolGuards`（读 `../../agents`、base 池顺序写死 16 名、名字集合从
+>   + `TestShippedAgentSpecToolGuards`（读 `../../agents`、base 池顺序逐名写死、名字集合从
 >   `firstPartyFileEffects` ∪ `{get_time}` 派生、跑真 `resolveToolPool` 与金样逐名逐序比对）。四次反证全红：
->   删 `- bash` → 金样红（实得 12 项含 bash）**且活体 researcher 真跑了 `echo 424242`**（run
+>   删 `- bash` → 金样红（实得多出 `bash`）**且活体 researcher 真跑了 `echo 424242`**（run
 >   `r_01M559XWP3YDY825BAZZYZEKKJ`，证明护栏是唯一拦挡、不是模型自觉）；加 `- web_search` → 红（第 7 节
->   兑现 `doc/22` §7）；`firstPartyFileEffects` 加 `fetch_url` → 红在「名字宇宙 17 ≠ 池序 16」；连池序一起加 →
+>   兑现 `doc/22` §7）；`firstPartyFileEffects` 加 `fetch_url` → 红在「名字宇宙与池序不等」；连池序一起加 →
 >   红在「researcher 实得多一把 fetch_url」而 **coder 不红**（白名单路不受父池增长影响）——第 2 节那条
 >   哑失败通道由此转成响失败。
 > - **A3 doc 回填**：`doc/17` §3.1 头注翻案 + 三态原句旁指回本篇 §3（**表不复制**，同一机制只留一份真源）、
@@ -52,9 +52,9 @@
 > 同时把 `doc/23` §9「前提修订」里被抽掉的那个前提装回去（§1 的 coder 立项论证重新成立）。
 >
 > **2026-10-17 开工前复核**：写本篇之后又入库三拍——子代理折叠 A1–A3（`ceecc28`）、用量可见化
-> 三拍（`c211637`）、溢出修复层 B2–B5（`256a89c`）。逐条重核本篇前提：父池仍 16 把、装配序未变，
+> 三拍（`c211637`）、溢出修复层 B2–B5（`256a89c`）。逐条重核本篇前提：父池与本篇成文时一致、装配序未变，
 > `resolveToolPool` 仍三态，`agentSpecFront` 仍四字段，`agents/` 仍 researcher + coder 两份，
-> `firstPartyFileEffects` 仍 15 键（∪ `get_time` = 父池），`git status` 干净 ⇒ **设计不变**；
+> `firstPartyFileEffects` 未变（∪ `get_time` = 父池），`git status` 干净 ⇒ **设计不变**；
 > 刷新的是行号与第 8 节的交叉面（折叠台账的剧本已从「会被本篇挡死」变成「已跑过入库、重跑要换角」）。
 >
 > 本篇不加端点、不加帧 kind、不加表、不改父池的装配顺序、不改 `bash` 工具自身。
@@ -97,10 +97,10 @@ bash 动整机）→ 工具行落 runlog → 终稿回传主线程（51200 字�
 
 ## 2. `bash` 是怎么进到 researcher 手里的
 
-**父池**的操作定义：`NewWorker`（`worker.go:152`）在进程启动时造出来的那一份工具切片，今天 16 把，
-按装配顺序是 `get_time` → 11 个文件工具（`write_file` `read_text_file` `read_file` `edit_file`
-`move_file` `create_directory` `list_directory` `directory_tree` `get_file_info` `search_files`
-`read_media_file`）→ `bash` → `memory` → `search_history` → `web_search`。主代理的声明面就是这一份。
+**父池**的操作定义：`NewWorker`（`worker.go:152`）在进程启动时造出来的那一份工具切片，按装配顺序是
+`get_time` → 文件工具（`write_file` `read_text_file` `read_file` `edit_file` `move_file`
+`create_directory` `list_directory` `directory_tree` `get_file_info` `search_files` `read_media_file`
+`read_pdf_text`）→ `bash` → `memory` → `search_history` → `web_search`。主代理的声明面就是这一份。
 
 **子代理的工具面**由 `agents.go` 的 `resolveToolPool`（:463）定，它读规格 frontmatter 的 `tools:` 行。
 今天只有三种字节形状（`doc/17` §3.1 原文明列，代码至今如此）：
@@ -117,7 +117,7 @@ bash 动整机）→ 工具行落 runlog → 终稿回传主线程（51200 字�
 时间线：
 
 1. `doc/17` §3.1 原先要求「`bash` 进池与给 `researcher` 写不含 `bash` 的名单是同一次改动」，
-   名单 13 项，理由就是「不能先发布工具、过几天再改文件」。
+   名单逐个写全，理由就是「不能先发布工具、过几天再改文件」。
 2. 2026-10-12 用户拍：**§3.1 作废**，researcher 长期不写这一行、纯继承；安全面改收在 `bash` 工具自身
    （超时 / 截断 / env 白名单）。
 3. 2026-10-15 `dfb2364`：`bash` 进父池。researcher 因为没有名单，自动拿到它。同一批里
@@ -182,7 +182,7 @@ bash 动整机）→ 工具行落 runlog → 终稿回传主线程（51200 字�
 
 | | B 白名单（我原先推荐） | **C `exclude_tools`（拍定）** |
 |---|---|---|
-| 规格文件里看得见什么 | 实际名单本身（15/11 行名字） | 只看得见例外（5 行排除项）；实际名单要算 |
+| 规格文件里看得见什么 | 实际名单本身（逐名写全） | 只看得见例外（排除项）；实际名单要算 |
 | 父池加一把新工具 | 不到达 researcher，要手工补一行；忘了 = 少能力（**响**：终稿说做不了、日志可比） | 自动到达 researcher；忘了排除 = 多能力（**哑**：没人报警） |
 | 排除名/名单名写错 | 拒载（响） | 拒载（响） |
 | Go 改动 | 0 | frontmatter 四字段 → 五字段、`KnownFields(true)` 放行新名、`resolveToolPool` 三态 → 四态、拒载两条新分支 |
@@ -202,25 +202,25 @@ C 的那一格哑失败（父池加工具自动到达）是本篇必须补的洞
 
 ## 4. researcher 的排除项与有效名单
 
-`agents/researcher.md` 的 frontmatter 写（**2026-10-18 翻案后的现行版**；10-16 版排除五项、有效名单
-11 项，原文保留在本节末尾备查）：
+`agents/researcher.md` 的 frontmatter 写（**2026-10-18 翻案后的现行版**；10-16 版把写类四把与 `bash`
+一起排除，原文保留在本节末尾备查）：
 
 ```yaml
 exclude_tools:
   - bash
 ```
 
-解析后的**有效名单 15 项**（按父池顺序，第 6 节的日志行打的就是这一串）：
+解析后的**有效名单**（按父池顺序，第 6 节的日志行打的就是这一串）：
 
 ```text
 get_time, write_file, read_text_file, read_file, edit_file, move_file, create_directory,
-list_directory, directory_tree, get_file_info, search_files, read_media_file, memory,
-search_history, web_search
+list_directory, directory_tree, get_file_info, search_files, read_media_file, read_pdf_text,
+memory, search_history, web_search
 ```
 
 逐项交代为什么是这一侧：
 
-- **`bash` 排除**——其余 15 把的可达面都被作业根圈住（文件工具走 `filetools.go:31` 的
+- **`bash` 排除**——其余各把的可达面都被作业根圈住（文件工具走 `filetools.go:31` 的
   `resolveInWorkspace`：拒绝对路径、拒绝前缀越界；`memory` 只写 notes 表；`search_history` 只读 runlog
   并把截断结果写进 `<workspace>/.tako/search/`；`web_search` 只发一次检索请求、结果只活在本次 tool_result——
   **2026-10-18 二稿补注：后半句过期**，切 DeepSeek `/v1/tools/search` 后它每次搜索还把结果全文写进
@@ -241,11 +241,11 @@ search_history, web_search
   且 `doc/21` §5 的验收就是活体委派 researcher 用它）。它们都不在排除项里，且第 7 节的金样逐名钉住。
   注意 `search_history` 的 file_effect 登记是 `write`（截断时落 `<workspace>/.tako/search/`，
   路径由程序生成、不在参数里）——「只读」说的是**模型指定不了写哪**，不是「不落一个字节」。
-- **`coder.md` 一个字不改**：它的七项 `tools:` 白名单是「只给这七把」的正面决定，白名单形状更贴，
+- **`coder.md` 一个字不改**：它的 `tools:` 白名单是「只给名单里的这些」的正面决定，白名单形状更贴，
   且已落地验收过，改形状无收益。两种形状在同一目录里合法共存（四态表第 3、4 行），
   第 7 节的单测按**解析后的有效名单**断言，不看它用哪种形状写的。
 
-**2026-10-16 版原文（已翻案，备查）**——排除五项、有效名单 11 项（`get_time, read_text_file, read_file,
+**2026-10-16 版原文（已翻案，备查）**——排除写类四把与 `bash`，有效名单（`get_time, read_text_file, read_file,
 list_directory, directory_tree, get_file_info, search_files, read_media_file, memory, search_history,
 web_search`）；当时收写类的理由是「外部文本诱导也改不了 workspace 已有文件」+「researcher 写脚本、
 别人后来跑」的链被切断，代价是整理结果只能塞进 51200 字节的终稿。2026-10-18 用户指出该取舍不合理
@@ -266,7 +266,7 @@ web_search`）；当时收写类的理由是「外部文本诱导也改不了 wo
   改法：末尾加「它不能跑命令、也不改 workspace 里的文件：要执行脚本、批量改文件的活交给 coder。」
 - **正文**：今天只提 `get_time` 与 `web_search`（第 10 行），一字不提它有的文件工具，也不提它没有 `bash`。
   `doc/17` §3.1 早就记过这笔不一致（「正文里『手里有 get_time』和它实际已能读写文件」）。
-  改法：把那一条工具自述换成三条——① 手里有哪几类工具（含读类七把、`memory`、`search_history`、
+  改法：把那一条工具自述换成三条——① 手里有哪几类工具（含读类各把、`memory`、`search_history`、
   `web_search`）；② **没有 `bash`、没有写类文件工具**，跑不了命令、改不了 workspace 里的文件、
   也委派不了别的子代理（父池快照里没有任何委派工具，天然禁嵌套），要跑脚本或要落文件的活怎么办
   （终稿里写明做不了，需要时把脚本或文件内容原样写进终稿交主线程处置，不假装跑过、不假装写过）；
@@ -291,8 +291,8 @@ agent tools <名字>: get_time, read_text_file, …, web_search
 内容是 `resolveToolPool` 返回那一份池里每把工具 `Info().Name` 的逗号连接，即**这条规格这一场实际拿到的
 有效名单**（`exclude_tools` 路按父池顺序输出，`tools:` 路按名单顺序输出——两序今天只差 coder 名单里 memory/bash 的先后：名单把 memory 写在 bash 前，父池装配序 bash 在 memory 前）。
 
-**没它会怎样**：在 C 这个形状下这行日志是**承重**的，比白名单方案更要紧——规格文件里只写着五个排除项，
-实际名单是「父池 16 把减去 5 把」算出来的，父池一变结果就变。没有这行，谁想知道 researcher 今天能干什么，
+**没它会怎样**：在 C 这个形状下这行日志是**承重**的，比白名单方案更要紧——规格文件里只写着排除项，
+实际名单是「父池减去排除项」算出来的，父池一变结果就变。没有这行，谁想知道 researcher 今天能干什么，
 只能读 `worker.go` 的装配顺序、读规格文件、再手跑一遍四态。验收也只能退化成「叫模型跑命令看它说不行」
 这种模型自觉证据，而 `doc/21` §5 明写过他们的标准是「不靠模型自觉」。父池将来加一把工具时，
 这行日志是金样单测（第 7 节）之外唯一的活体证据。
@@ -316,15 +316,15 @@ A2 验收第 5 条的 run pattern 靠它命中）；④ `exclude_tools: []` ⇒
 与 `-agents-dir` 默认值 `agents`、相对 CWD 是同一份文件），对每条规格：
 
 1. 用**真的 `resolveToolPool`** 算有效名单：base 用假工具造（`agents_test.go` 里已有
-   `fakeInvokableTool`，只带 `schema.ToolInfo{Name: …}`）。**顺序显式写死** 16 名字的列表（=
-   `worker.go` 装配序：get_time → 11 文件工具 → bash → memory → search_history →
-   web_search）——`firstPartyFileEffects` 是 Go map，遍历键序随机，而 researcher 走 exclude 路
-   按池序输出，不钉死顺序金样逐名逐序比对会 flaky；同时断言写死列表的名字**集合** ==
-   `firstPartyFileEffects` 的键 ∪ `{"get_time"}`（今天正好 = 父池 16 把；`get_time` 按 `fileops.go:86`
+   `fakeInvokableTool`，只带 `schema.ToolInfo{Name: …}`）。**顺序显式写死**一整份池序（=
+   `worker.go` 装配序：get_time → 文件工具 → bash → memory → search_history →
+   web_search；文件工具含 `read_pdf_text`）——`firstPartyFileEffects` 是 Go map，遍历键序随机，
+   而 researcher 走 exclude 路按池序输出，不钉死顺序金样逐名逐序比对会 flaky；同时断言写死列表的名字**集合** ==
+   `firstPartyFileEffects` 的键 ∪ `{"get_time"}`（今天正好 = 父池全集；`get_time` 按 `fileops.go:86`
    的说明不进注册表，所以显式并进来）——集合从注册表派生，「父池加新工具 ⇒ 集合不等 ⇒ 红」这条链才
    不断。不另写一份「按名字算名单」的逻辑——那会与 `resolveToolPool` 各说各话、各自腐化。
-2. 有效名单**逐名等于金样**（`map[规格名][]string`）：researcher = 第 4 节那 11 项（**2026-10-18
-   翻案后为 15 项**，金样同批改）；coder = 七项。
+2. 有效名单**逐名等于金样**（`map[规格名][]string`）：researcher = 第 4 节那一串（**2026-10-18
+   翻案后含写类四把**，金样同批改）；coder = `coder.md` 白名单那一串。
    金样不等 ⇒ 红，报错文案打出「期望 / 实得」两串。这一条同时兜住三种事故：有人从 `exclude_tools` 里
    删掉 `bash`（有效名单多一把 ⇒ 红）；有人往父池加了一把新工具（有效名单多一把 ⇒ 红，逼人当场决定
    给不给 researcher，这就是第 3 节说的「把 C 的哑失败转成响失败」）；有人把 `web_search` 写进排除项
@@ -360,7 +360,7 @@ A2 验收第 5 条的 run pattern 靠它命中）；④ `exclude_tools: []` ⇒
 - **`doc/25`（子代理折叠的真源）**：§10 的剧本正文不含规格名（写「子代理」），不用改；但它第 2 步
   「用 `bash` 造长高熵输出」在本篇之后只有 coder 能演，A3 补一句点明委派对象。另登记一处机制面影响：
   折叠摘要末尾的 file-ops 钉块从工具调用记录里提路径（`fileops.go` 的 read / written / edited 三桶），
-  researcher 收掉写类四把与 `bash` 之后，只有 read 桶还会命中（读类七把都登记 `read`）——它的
+  researcher 收掉写类四把与 `bash` 之后，只有 read 桶还会命中（读类各把都登记 `read`）——它的
   「钉 N 路径」从此基本是读路径，写路径那半边由 coder 演。不是故障，登记免得下次当回归查。
   （**2026-10-18 翻案后**：写类归还，researcher 的 written / edited 桶重新可达；read 路径为主的
   判断不再成立。）
@@ -372,7 +372,7 @@ A2 验收第 5 条的 run pattern 靠它命中）；④ `exclude_tools: []` ⇒
   子代理装载时拿到父池的一份拷贝，`search_history` 随拷贝进子池」——机制结论不变（仍是原对象搬运、
   不换壳，H4 的判据照旧），但 researcher 走的是第四态排除路，不再是继承路；③ `doc/17` §7 那句
   「`researcher.md` 没有 `tools` 行，会继承到它。以后若给它写白名单，名单里要保留 `memory`」——
-  本篇兑现了这个「以后」，`memory` 在有效名单 11 项里。
+  本篇兑现了这个「以后」，`memory` 在有效名单里。
   另：`agents_test.go` 的 `TestSubagentPoolKeepsRealSearchHistory` 拿 `AgentSpec{Name: "researcher"}`
   当「继承路」的样本——那是**手造的规格值**、不读文件，本篇之后仍绿；A2 在它旁边补一句注释讲清这点，
   免得有人以为它在钉出厂配置（出厂配置由金样那支钉）。
@@ -402,7 +402,7 @@ coder 照着跑。减震还剩两层：每一笔写都过 `resolveInWorkspace` �
 ## 10. 验收
 
 （下列九条是 2026-10-16 形状下的验收剧本，已于 10-17/10-18 活体跑过、实录在台账 `a1-`/`a2-验收实录.md`；
-第 3 条「写类也挡住了」与第 8 条「期望 11 项」随 10-18 翻案过期——现行形状的复验见台账
+第 3 条「写类也挡住了」与第 8 条「期望名单」随 10-18 翻案过期——现行形状的复验见台账
 `r1-归还写类实录.md`。原文保留备查。）
 
 引擎按仓规起在 127.0.0.1:8901（起前 `lsof -tiTCP:8901 -sTCP:LISTEN` 查占用，被占换端口，不杀别人的进程），
@@ -421,9 +421,9 @@ coder 照着跑。减震还剩两层：每一笔写都过 `resolveInWorkspace` �
    （对照，证明工具没坏）。
 4. **名单可见**：启动日志无 lint 报错、无 `agents: researcher: 拒载`；每条 `agent tools <名>:` 紧跟该条
    `agent system <名>:` 出现（`agent tools coder: write_file, read_text_file, edit_file, list_directory,
-   search_files, memory, bash`（7 项、有 `bash`）与 `agent tools researcher: get_time, read_text_file,
+   search_files, memory, bash`（白名单、有 `bash`）与 `agent tools researcher: get_time, read_text_file,
    read_file, list_directory, directory_tree, get_file_info, search_files, read_media_file, memory,
-   search_history, web_search`（**11 项、无 `bash`、无写类四把**）），`agents: 2 spec(s): coder,
+   search_history, web_search`（**池序、无 `bash`、无写类四把**）），`agents: 2 spec(s): coder,
    researcher` 汇总行在最后；`agent system researcher:` 那段（= 正文 + 笔记快照）里能读到「手里没有
    bash」；description 的新句子不进任何日志（frontmatter 不打），grep `agents/researcher.md` 验。
 5. **`doc/22` §7 护栏兑现**（有效名单里有 `web_search` 且真能搜）：同一会话投「请委派 researcher 用
@@ -437,15 +437,15 @@ coder 照着跑。减震还剩两层：每一笔写都过 `resolveInWorkspace` �
    → 重启引擎 → 日志出现 `agents: researcher: 拒载: …` 且这场 run 里没有 `name:"researcher"` 的委派工具；
    给 researcher 同时写上 `tools:` 与 `exclude_tools:` → 同样拒载、日志写明二选一。两次都改回。
 8. **金样护栏**：`go test ./internal/runengine/ -run 'ShippedAgentSpec'` 绿；反证一次——从
-   `exclude_tools` 里删掉 `- bash`，该测试红、文案指出期望 11 项实得 12 项含 `bash`；改回后绿。
+   `exclude_tools` 里删掉 `- bash`，该测试红、文案指出期望名单与实得名单的差异（实得多出 `bash`）；改回后绿。
 9. `go test ./internal/runengine/` 全量绿 + `go vet` 干净。
 
 ## 11. 所以这解决了什么
 
 用户委派一次调研，`researcher` 在自己的上下文里吃五个网站来的外部文本。今天它手里有一把能出作业根、
 能联网、能以引擎进程那个用户身份动整机的 `bash`，外加四把能改 workspace 文件的工具，而拦挡它的只有
-一句提示词劝告。这一拍之后：它的工具面是「继承父池、明写排除项」（10-16 版排除五项、有效名单 11 项
-全是读类；**2026-10-18 翻案后只排除 `bash`、有效名单 15 项**，写类四把归还——「外部文本不能让它改
+一句提示词劝告。这一拍之后：它的工具面是「继承父池、明写排除项」（10-16 版排除写类四把与 `bash`、
+有效名单全是读类；**2026-10-18 翻案后只排除 `bash`**，写类四把归还——「外部文本不能让它改
 workspace 已有文件」这条承诺收回，换成「能写、删不掉（全池无删除工具）、跑不了命令、每笔写有账」），
 那五个网站的文本无论如何不能让它在机器上执行任何东西；
 要跑命令、要批量改文件的活由 description 明确路由给 `coder`，那是主代理和用户都当它是「会动手」的角色。
@@ -460,12 +460,12 @@ workspace 已有文件」这条承诺收回，换成「能写、删不掉（全�
 2026-10-16 用户拍定四条：
 
 1. **挡法 = C**（frontmatter 新字段 `exclude_tools`，继承减排除），不是白名单 B、不是代码级拒绝 D。
-2. **写类四把一起收**（`write_file`/`edit_file`/`move_file`/`create_directory`），researcher 有效名单 11 项。
+2. **写类四把一起收**（`write_file`/`edit_file`/`move_file`/`create_directory`）。
 3. **单测两层都要**：机制四态 + 出厂规格金样护栏（钉仓库出厂配置；运维有意改配置就同步改金样）。
 4. **顺序**：本篇先落地，同批（A3）把 `tmp/17-子代理折叠/todos.md` 的三条验收剧本从 researcher 改成 coder。
 
-2026-10-18 用户拍（第 2 条部分翻案）：**写类四把归还，排除清单 = `- bash` 一项**，researcher 有效名单
-15 项。理由与代价的重签见头注与 §4/§9；同批改 `agents/researcher.md`、金样单测、§2/§4/§5/§7/§8/§11
+2026-10-18 用户拍（第 2 条部分翻案）：**写类四把归还，排除清单 = `- bash` 一项**。理由与代价的重签见
+头注与 §4/§9；同批改 `agents/researcher.md`、金样单测、§2/§4/§5/§7/§8/§11
 各处标注，活体复验收录在台账 `r1-归还写类实录.md`。
 
 落地时还要用户点头的两处（都在 A3）：`doc/17` §3.1 的回填与该文件在飞改动（折叠台账 doc 随批

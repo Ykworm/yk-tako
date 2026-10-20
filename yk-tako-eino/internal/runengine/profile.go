@@ -26,8 +26,12 @@ type RunProfile struct {
 	Tools       []tool.BaseTool
 	ConfigVer   string
 	KeyFP       string
-	Resolver    ModelResolver
-	conns       []*mcpServerConn
+	// Provider 是目录里的厂商 id。图片 token 目前只有 deepseek 有计算器。
+	Provider string
+	// Vision 是这场 root 模型在目录里的收图标记。mediaRestoreHandler 每次调用读它。
+	Vision   bool
+	Resolver ModelResolver
+	conns    []*mcpServerConn
 }
 
 func (p *RunProfile) Close() {
@@ -162,6 +166,8 @@ func (s *Server) assembleRun(ctx context.Context, p principal, agentID string) (
 		Tools:       filtered,
 		ConfigVer:   configVersion(raw),
 		KeyFP:       built.KeyFP,
+		Provider:    built.Provider,
+		Vision:      built.Vision,
 		Resolver: tenantResolver{
 			models: s.worker.models, tenantID: p.TenantID, raw: raw, secrets: secrets,
 		},

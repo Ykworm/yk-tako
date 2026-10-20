@@ -22,9 +22,11 @@ const (
 )
 
 // ModelPreset 是目录里的一条模型条目。
+// Vision 缺省 false：JSON 没写 vision 的模型不收图。发送侧只在它为 true 时才把占位还原成 image part。
 type ModelPreset struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Vision bool   `json:"vision"`
 }
 
 // ProviderPreset 是目录里的一家厂商：协议、默认 baseURL、密钥环境变量名、可选模型。

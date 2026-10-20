@@ -10,11 +10,11 @@
 // 折不动或重调再拒才把错误放走。闸花（本 run 已救过一次）仍打 B1 观测行原样上抛。
 //
 // 缝实读（eino v0.9.21，2026-10-12）：WrapModel 在每次模型调用点逐层包裹（wrappers.go:1129
-// 逆序包裹、first registered = outermost）——guard 挂 Handlers 链尾 = 最内 user wrapper，
-// 模型调用错误冒泡最先到它，且它的 inner 恰是裸模型端点（eventSender 在用户链之外再包一层，
-// 其对成功流发一次 model-output 事件、对错误 `return nil, err` 不发事件）——被拒调用在事件面
-// 上无声，重调成功后事件恰好一次，不会双发。子代理装配（agents.go）不含本 guard：装配面没有
-// Handlers 字段，天然排除（§10 的边界，零排除代码）。
+// 逆序包裹、first registered = outermost）——guard 挂在媒体包壳之外，模型调用错误冒泡最先到它；
+// 媒体包壳（media_send.go）只换输入副本、错误原样上抛，guard 的折叠/计数/救援看到的仍是占位文本。
+// guard 的 inner 不再是裸模型端点，而是 mediaSendModel；被拒调用在事件面上无声，重调成功后事件
+// 恰好一次，不会双发。子代理装配（agents.go）不含本 guard：装配面没有 Handlers 字段，
+// 天然排除（§10 的边界，零排除代码）。
 //
 // 救援链（D14）逐段与来源：
 //   - 原料 = **当次 input 转录**（convertState(box.baseRows(), box.run, input)，midfold 现役）
@@ -132,6 +132,7 @@ func (m *guardModel) rescueFold(ctx context.Context, box *foldBox, input []*sche
 	if err != nil {
 		return nil, false
 	}
+	annotateMediaTokens(ctx, history, box, box.mediaResolver())
 	cRej := countInput(m.counter, sys, history)
 	window, hasWindow := extractWindow(cause)
 	folded, staged, err := foldInput(ctx, sys, history, box.run, rescueLimit(cRej, window, hasWindow), window,

@@ -74,6 +74,20 @@ type foldBox struct {
 	// 只走 setAdopted / takeAdopted 读写（takeAdopted 取走即清空——一次救援只有一个采用点消费）。
 	adoptedRows []ModelMessage
 	adoptedLen  int
+	// 媒体发送记账（doc/32 A3-2/A3-3）。工具图按 ToolCallID：mediaPendingTools 是本枪已附、
+	// 等 root 成功回复确认的 call id，mediaSentTools 是已确认发过的。用户图按 run：
+	// mediaPendingUser 是本枪已把 user 图附进发送份，mediaSentUser 是成功回复后确认发过。
+	// 失败的枪不 commit，下一枪仍还原；成功后同一 box 不再重复背 user 图，同一 call id 不再重复背工具图。
+	// 读写与上面字段同一把锁。
+	mediaSentTools    map[string]struct{}
+	mediaPendingTools []string
+	mediaSentUser     bool
+	mediaPendingUser  bool
+	// mediaPrices 是本 run 已算过的 path+sha → 图片 token。后面的枪命中就不再读整文件。
+	// 占位写完后文件被换掉时，这里仍按原尺寸计价（最多 1024）；发送侧会因 sha 不符跳过。
+	mediaPrices map[string]int
+	// mediaResolve 把占位 path 解成作业根里的文件。worker 建箱时塞入，prepare、midfold、guard 共用。
+	mediaResolve func(context.Context, string) (string, error)
 }
 
 func newFoldBox(session SessionID, run RunID) *foldBox {
@@ -184,6 +198,108 @@ func (b *foldBox) takeAdopted() ([]ModelMessage, int) {
 	rows, n := b.adoptedRows, b.adoptedLen
 	b.adoptedRows, b.adoptedLen = nil, 0
 	return rows, n
+}
+
+// toolMediaSent / noteToolMediaPending、userMediaSent / noteUserMediaPending、commitMediaSend
+// 是媒体发送记账的唯一读写口（doc/32 A3-2/A3-3）。没有 call id 的工具消息无法去重：不查、不记。
+// userMediaSent 只看已确认发过的标志。本枪附过但还没成功的 pending 不算已发——guard 重试和
+// 失败后的下一枪都要再还原。
+func (b *foldBox) toolMediaSent(id string) bool {
+	if id == "" {
+		return false
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	_, ok := b.mediaSentTools[id]
+	return ok
+}
+
+func (b *foldBox) noteToolMediaPending(id string) {
+	if id == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, pending := range b.mediaPendingTools {
+		if pending == id {
+			return
+		}
+	}
+	b.mediaPendingTools = append(b.mediaPendingTools, id)
+}
+
+func (b *foldBox) userMediaSent() bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.mediaSentUser
+}
+
+func (b *foldBox) noteUserMediaPending() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.mediaPendingUser = true
+}
+
+// commitMediaSend 在 root 成功回复后调用：本枪附过的 user 图与工具图转为已发送。
+// 失败/取消的枪不调用，pending 留到下一枪重试。没有 user 图的成功回复不会把 user 标志置上，
+// 这样读盘失败的首枪之后还有机会再还原。已发送集合跨枪保留。
+func (b *foldBox) commitMediaSend() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.mediaPendingUser {
+		b.mediaSentUser = true
+		b.mediaPendingUser = false
+	}
+	if len(b.mediaPendingTools) == 0 {
+		return
+	}
+	if b.mediaSentTools == nil {
+		b.mediaSentTools = map[string]struct{}{}
+	}
+	for _, id := range b.mediaPendingTools {
+		b.mediaSentTools[id] = struct{}{}
+	}
+	b.mediaPendingTools = nil
+}
+
+func (b *foldBox) setMediaResolve(fn func(context.Context, string) (string, error)) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.mediaResolve = fn
+}
+
+func (b *foldBox) mediaResolver() func(context.Context, string) (string, error) {
+	if b == nil {
+		return nil
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.mediaResolve
+}
+
+func (b *foldBox) cachedMediaTokens(path, sha string) (int, bool) {
+	if b == nil {
+		return 0, false
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	n, ok := b.mediaPrices[path+"\x00"+sha]
+	return n, ok
+}
+
+func (b *foldBox) rememberMediaTokens(path, sha string, n int) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.mediaPrices == nil {
+		b.mediaPrices = map[string]int{}
+	}
+	b.mediaPrices[path+"\x00"+sha] = n
 }
 
 // foldBoxKey 是 ctx 携带折叠容器的私有 key 类型（防撞车惯例同 agentModelTableKey）。
@@ -336,7 +452,8 @@ type usageEstimate struct {
 // 第一枪、刚折完、厂商没给账单）返回 false，调用方退回全量 countInput（doc/24 §6）。
 // 锚点自己的正文 / tool_calls 由 visible 代表，不进 delta——算两遍会偏大、早折。
 // system 与工具 schema 声明都不另加：前者已在账单里，后者有意不进触发（doc/24 §7）。
-func usageBasedInput(counter TokenCounter, currentRun RunID, msgs []*schema.Message) (usageEstimate, bool) {
+// 锚点之后的新行按发送侧规则补图片 token。已经发过的图在 PromptTokens 里，不在这些行上，不会再加一次。
+func usageBasedInput(ctx context.Context, counter TokenCounter, currentRun RunID, msgs []*schema.Message) (usageEstimate, bool) {
 	idx := -1
 	for i := len(msgs) - 1; i >= 0; i-- {
 		m := msgs[i]
@@ -367,6 +484,12 @@ func usageBasedInput(counter TokenCounter, currentRun RunID, msgs []*schema.Mess
 		// seq 传占位 0：这些行只进 countInput 数长度，不落库、不参与坐标推导。
 		rows = append(rows, newRowFromMessage(currentRun, 0, m))
 	}
+	box := foldBoxFrom(ctx)
+	var resolve func(context.Context, string) (string, error)
+	if box != nil {
+		resolve = box.mediaResolver()
+	}
+	annotateMediaTokens(ctx, rows, box, resolve)
 	delta := countInput(counter, "", rows)
 	return usageEstimate{baseline: u.PromptTokens, visible: visible, delta: delta,
 		total: u.PromptTokens + visible + delta}, true
@@ -434,8 +557,11 @@ func (h *midfoldHandler) BeforeModelRewriteState(ctx context.Context, state *adk
 	if err != nil {
 		return ctx, state, err
 	}
+	// 先标价再数。有账单时 total 只含锚点后的新图；没账单时 countInput 看到全文上的图。
+	// 超线后 foldInput 用的是这份 history，图片成本跟着进去。
+	annotateMediaTokens(ctx, history, box, box.mediaResolver())
 	var total int
-	if est, ok := usageBasedInput(h.counter, box.run, state.Messages); ok {
+	if est, ok := usageBasedInput(ctx, h.counter, box.run, state.Messages); ok {
 		// 账单在读的地方（原始 state）只数锚点之后的新行，整份历史不再重数一次。
 		// 对照用的全量自测不在这里算：每轮都算一遍等于没省，doc/24 §10 的收益正是跳过整份重数；
 		// 两条口径同量级由单测钉（midfold_test TestUsageBasedInput）。
@@ -557,8 +683,11 @@ func (h *agentFoldHandler) BeforeModelRewriteState(ctx context.Context, state *a
 	if err != nil {
 		return ctx, state, fmt.Errorf("%s %w", foldChainErrorMark, err)
 	}
+	// 与 root 同一条标价，避免 usage 分支和全量分支一个算图、一个不算。
+	// 子代理链不还原像素；这里多出来的只是折叠压力。
+	annotateMediaTokens(ctx, history, box, box.mediaResolver())
 	var total int
-	if est, ok := usageBasedInput(h.counter, box.run, state.Messages); ok {
+	if est, ok := usageBasedInput(ctx, h.counter, box.run, state.Messages); ok {
 		total = est.total
 		log.Printf("agent usage %s: 基线 %d + 可见输出 %d + 新增 %d = %d tok，limit %d",
 			h.name, est.baseline, est.visible, est.delta, total, h.limit)

@@ -1,5 +1,5 @@
 // 本文件是存储层的装配与跨存储方法：Store 握住两半——PG（sessions / runs / run_model_messages /
-// runlog_entries / notes，见 pgstore.go 与 notes.go）与 Redis（tk:runlive / tk:draft，见 redisstore.go）。
+// runlog_entries / notes，见 pgstore.go 与 notes.go）与 Redis（tk:runlive / tk:runepoch，见 redisstore.go）。
 // 只有四个方法要同时动两半：AcquireRun / EndRun / RenewLease / Reset（planning §8.4 事务映射）。
 //
 // 跨存储排序的两条已裁边界（§8.4，2026-10-07）：
@@ -41,10 +41,10 @@ var (
 
 // Store 是四个 API 的存储后端（A4-3 裁：具体结构体，不抽接口；名字不再带介质——它跨两存储）。
 //   - db：PG 半——会话登记 / 闸与租约 / 模型侧消息 / 历史定稿（永久状态）；
-//   - rdb：Redis 半——runlive / draft 两类键（临时态）。
+//   - rdb：Redis 半——runlive / runepoch 两键（临时态）。
 //   - ttl：runlive 在 run **正常结束**后的回收期限（19v6-03「生命周期」，dev 取 300s）——只是回收参数，
 //     不是正确性参数：`done` 与 `gone` 收敛到同一条收口路径。
-//   - leaseTTL：闸租约期限（A7，dev 取 30s）：runs.lease_until 与两键 TTL 出生即带、watchdog 续回；
+//   - leaseTTL：闸租约期限（A7，dev 取 30s）：runs.lease_until 与 runlive/runepoch 两键 TTL 出生即带、watchdog 续回；
 //     进程死亡后没人续，三处同生同灭、会话自动解锁。同为回收参数：30s/5s = 连续 6 次续约全失败才误放。
 type Store struct {
 	db       *gorm.DB
@@ -122,7 +122,7 @@ func openRedis(addr string) (*redis.Client, error) {
 
 // AcquireRun 抢闸并落 POST 事务（§8.4 第一行）：**PG 事务持有跨 Redis 写**——
 // BEGIN → PG 写（懒建 session → 清扫死行 → INSERT runs → mh seq1 → runlog user 行）
-// → Redis 写（runlive/draft 两键出生，单条 Lua）→ COMMIT。
+// → Redis 写（runlive/runepoch 两键出生，单条 Lua）→ COMMIT。
 // 唯一冲突 = 会话忙（one_live_run_per_session 部分唯一索引），整笔回滚零痕迹 → (false, nil) = 409；
 // Redis 败 → ROLLBACK → error = 500，与 409 同形「什么都没写」。
 // 抢闸 = INSERT runs 本身；出生即带 lease_until（A7-2 的 DB 形态：不存在「先建后补租约」的两步窗口）。
@@ -302,26 +302,18 @@ type toolResultPayload struct {
 // seq 2,3,4…；A4 起 = 折后 state 派生），本函数直接写 m.Seq——存储层不理解 system 丢弃 /
 // 当前 run 标签 / seq 规则那套转换知识，转换归 worker。runlog 仍吃全量 turn（T2；T3-2 起含子
 // 代理条目）：complete 分支两投影分拣——runlog 扩展行 + 各 agent 的终稿行，agent/model 两列随行；
-// root 终稿 assistant 行仍以 draft 为准（= 全 run delta 累计，收口替换的锚）。**error / 闸失 =
+// root 终稿 assistant 行 = pending[""]（= Σ root turn 正文，收口替换的锚）。**error / 闸失 =
 // turn 零写入**——与「error 结局只留 user 那一半」的既有形状一致。
 //
 // 守卫 = 统一谓词「闸在手上」（status='running' AND lease_until > now() AND lease_epoch = 本执行者，
 // 与读侧同式 + 令牌）：影响 0 行 = 本 run 不归自己了（已放 / 已被清扫 / 租约已过 / 已被接管）
 // → 空转（false, nil）。它同时是竞态防线：行已翻 error 就不 INSERT——runlog 不会出现第二行 assistant。
 //
-// Redis 半在 commit 后：压 terminal + EXPIRE ttl + 删 draft/令牌。失败不补偿（§8.4）：闸确实放了
+// Redis 半在 commit 后：压 terminal + EXPIRE ttl + 删 runepoch。失败不补偿（§8.4）：闸确实放了
 // （ok=true），runlive 到 TTL 收敛成 gone、客户端从 log 拿全文——B1 冗余收口兜住。
+// 定稿正文不读 Redis：complete 分支用 pending[""]（turn 里 root assistant 文本的累计）。
 func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, epoch int64, status string,
 	staged []StagedCompaction, mhRows []ModelMessage, turn []TurnEntry) (eventOffset, runlogOffset int, ok bool, err error) {
-	var draft string
-	if status == "complete" {
-		// 定稿文本的真源在 draft（只有 Redis 有）；本 run 的 worker 已停止产出，无并发追加。
-		v, gerr := s.rdb.Get(ctx, keyDraft(runID)).Result()
-		if gerr != nil && !errors.Is(gerr, redis.Nil) {
-			return 0, 0, false, gerr
-		}
-		draft = v
-	}
 	var nextSeq int64
 	// stopped 收尾标记（doc/17 §4，2026-10-15 用户点头 A1）：守卫 0 行不再一律空转——
 	// 行已被 stop 端点翻成 stopped 时，走 stopped 收尾（只写已配对工具行），terminal 以库为准。
@@ -514,8 +506,8 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, ep
 			}
 			// runlog 全量行（T3-2，消息粒度）：root 与子代理都写——tool 条目 → tool_result 行；
 			// assistant 条目 → tool_call 行 + 文本进该 agent 的暂存。子代理遇无 tool_calls 的末轮 =
-			// 它的终稿：落一行 assistant（agent=名、model=其生效 ref），与 root 终稿=draft 同构；
-			// root 的暂存不落行（它的终稿行在下面——draft）。会话内同一 agent 二次委派 = 暂存清空重算
+			// 它的终稿：落一行 assistant（agent=名、model=其生效 ref），与 root 终稿=pending[""] 同构；
+			// root 的暂存不落行（它的终稿行在下面——pending[""]）。会话内同一 agent 二次委派 = 暂存清空重算
 			// （终稿各归各的调用）。各行的 agent/model 两列空值照「缺省即 NULL」惯例（读侧归一成 ""）。
 			// 与 assistant 定稿行同笔：要么整轮可见，要么整笔没写。
 			pending := map[string]string{} // agent 名 → 该 agent 已出的 assistant 文本累计（root 键 = ""）
@@ -576,8 +568,8 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, ep
 			if err != nil {
 				return err
 			}
-			// 终稿 assistant 行（text=draft）：与旧形状逐字节一致（agent NULL + model=主 ref），
-			// 「Σ delta == 定稿全文」的收口锚。payload 列随行落 root 最后一枪账单（doc/27 A3；
+			// 终稿 assistant 行（text=pending[""]）：与旧形状逐字节一致（agent NULL + model=主 ref），
+			// 「Σ root turn 正文 == 定稿全文」的收口锚。payload 列随行落 root 最后一枪账单（doc/27 A3；
 			// 账单缺失 = 厂商没报，不写列）。
 			// RETURNING 拿回本行 seq 即 runlogOffset（旧 Lua 的 LLEN 语义）。
 			var usageSQL any
@@ -593,7 +585,7 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, ep
 				 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
 				         ?, 'assistant', NULL, ?, NULL, ?, ?, now())
 				 RETURNING seq`,
-				logID, sessionID, sessionID, runID, nullable(rootModel), draft, usageSQL).Scan(&nextSeq).Error; err != nil {
+				logID, sessionID, sessionID, runID, nullable(rootModel), pending[""], usageSQL).Scan(&nextSeq).Error; err != nil {
 				return err
 			}
 			// 线一 outbox（doc/29 §4.1）：**与 run 定稿同一笔事务**登记抽取任务——run 定稿 ⇒
@@ -707,10 +699,9 @@ func (s *Store) StopRun(ctx context.Context, runID RunID) (status string, found 
 //	AND lease_until > now() AND lease_epoch = ?`，
 //
 // 影响 0 行 = 闸已不属于本 run（已放 / 已易主 / 租约已过 / 已被接管）→ (false, nil) = 判死，调用方停续。
-// `lease_until > now()` 那一半是「过期不可复活」：A7 的 Redis CAS（tk:live 蒸发即 no-op）逐字同义——
-// 少了它，「过期但未清扫」的 run 会被迟到续约复活，而 draft 已蒸发，收尾会拿空文本定稿出
-// 「complete 但空回复」的形状。`lease_epoch` 那一半是「接管后旧执行者失效」（doc/30 §7）。
-// Redis 半（三键含令牌 PEXPIRE 回 lease）在 PG 说活之后才刷；令牌不符 = 判死（false, nil），
+// `lease_until > now()` 那一半是「过期不可复活」：少了它，「过期但未清扫」的 run 会被迟到续约复活，
+// 调用方手里的 turn 会被定稿。`lease_epoch` 那一半是「接管后旧执行者失效」（doc/30 §7）。
+// Redis 半（runlive 与 runepoch 两键 PEXPIRE 回 lease）在 PG 说活之后才刷；令牌不符 = 本执行者已不是当前一代（false, nil），
 // Redis 败 → error，watchdog 下一拍重试（PG 半已续，多续一次无害）。
 func (s *Store) RenewLease(ctx context.Context, sessionID SessionID, runID RunID, epoch int64) (bool, error) {
 	res := s.db.WithContext(ctx).Exec(
@@ -725,7 +716,7 @@ func (s *Store) RenewLease(ctx context.Context, sessionID SessionID, runID RunID
 		return false, nil
 	}
 	n, err := renewRedisScript.Run(ctx, s.rdb,
-		[]string{keyDraft(runID), keyRunlive(runID), keyRunepoch(runID)},
+		[]string{keyRunlive(runID), keyRunepoch(runID)},
 		int64(s.leaseTTL/time.Millisecond), epoch).Int64()
 	if err != nil {
 		return false, err
