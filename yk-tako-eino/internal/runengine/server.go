@@ -79,6 +79,7 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 	r.PATCH("/api/sessions/:id/visibility", authn, s.patchSessionVisibility)
 	r.PATCH("/api/sessions/:id", authn, s.patchSessionWorkspace)
 	r.GET("/api/sessions/:id", authn, s.getSession)
+	r.GET("/api/sessions/:id/subagents", authn, s.getSessionSubagents)
 	r.GET("/api/runs/:runId/frames", authn, s.getFrames)
 	r.GET("/api/runs/:runId/stream", authn, s.getRunStream)
 	r.GET("/api/sessions/:id/log", authn, s.getSessionLog)
@@ -677,6 +678,45 @@ func (s *Server) getSession(c *gin.Context) {
 		LiveRunID: liveRunID, RunlogOffset: runlogOffset, LastRunStatus: lastStatus, LastRunID: lastRunID,
 		WorkspaceID: sess.WorkspaceID,
 	})
+}
+
+// getSessionSubagents 列出这场会话目录下的子代理档案。
+// 权限与 getSession 同一道 SessionAccess。目录不存在时 subagents 是空数组。
+//
+//	GET /api/sessions/s_01/subagents
+//	200 {"code":0,"message":"","data":{"subagents":[{"saId":"sa_…","agentName":"researcher","status":"complete","createdAt":"…","finishedAt":"…"}]}}
+//	404 {"code":112001,"message":"找不到这场会话","data":null}
+func (s *Server) getSessionSubagents(c *gin.Context) {
+	p, ok := principalFrom(c)
+	if !ok {
+		writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
+		return
+	}
+	sid := SessionID(c.Param("id"))
+	if _, _, err := s.store.SessionAccess(c.Request.Context(), sid, p); err != nil {
+		if errors.Is(err, ErrSessionNotFound) {
+			writeEnvelope(c, http.StatusNotFound, codeSessionMissing, "找不到这场会话", nil)
+			return
+		}
+		log.Printf("GET /api/sessions/%s/subagents: %v", sid, err)
+		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
+		return
+	}
+	dir, err := sessionDir(s.mediaRoot, p.TenantID, sid)
+	if err != nil {
+		log.Printf("GET /api/sessions/%s/subagents: %v", sid, err)
+		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
+		return
+	}
+	items, err := listSubagentWires(filepath.Join(dir, ".tako", "subagents"))
+	if err != nil {
+		log.Printf("GET /api/sessions/%s/subagents: %v", sid, err)
+		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		Subagents []subagentListItem `json:"subagents"`
+	}{Subagents: items})
 }
 
 type sessionListItem struct {

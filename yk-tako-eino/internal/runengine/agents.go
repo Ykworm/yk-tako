@@ -329,17 +329,30 @@ func (d *delegationTool) InvokableRun(ctx context.Context, args string, opts ...
 	if !ok {
 		return "", fmt.Errorf("委派工具 %s: 内层不可调用（装配错误）", d.name)
 	}
+	// 档案在内层开跑前铸。开档失败时 wire 为 nil，回传不带实例 id，委派照旧。
+	ctx, wire := beginDelegationWire(ctx, d.name)
+	if wire != nil {
+		defer wire.close()
+	}
 	out, err := inner.InvokableRun(ctx, args, opts...)
 	if err != nil {
 		if strings.Contains(err.Error(), foldChainErrorMark) {
-			return fmt.Sprintf("错误：子代理 %s 上下文折叠失败：%v", d.name, err), nil
+			text := withSubagentInstance(fmt.Sprintf("错误：子代理 %s 上下文折叠失败：%v", d.name, err), subagentWireID(wire))
+			wire.finish("error", text)
+			return text, nil
 		}
 		if IsOverflowError(err) {
-			return fmt.Sprintf("错误：子代理 %s 上下文窗口溢出：%v", d.name, err), nil
+			text := withSubagentInstance(fmt.Sprintf("错误：子代理 %s 上下文窗口溢出：%v", d.name, err), subagentWireID(wire))
+			wire.finish("error", text)
+			return text, nil
 		}
+		// ctx 取消、panic 转成的事件错误、其余上抛：不写 terminal，文件留成半成品。
 		return "", err
 	}
-	return truncateDelegationReturn(out, d.capBytes), nil
+	// 先按帽截断正文，再把实例 id 接在末尾，帽不会把 id 切掉。
+	text := withSubagentInstance(truncateDelegationReturn(out, d.capBytes), subagentWireID(wire))
+	wire.finish("complete", text)
+	return text, nil
 }
 
 // delegationTruncationNotice 是超帽回传的尾缀模板（照 pi：50 KB 上限、UTF-8 安全 + omitted 提示；
@@ -469,6 +482,9 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 		if wantSearch {
 			handlers = append(handlers, newToolSearchHandler())
 		}
+		// wire 紧挨折叠之前：折叠会换短 state.Messages，先把折前新增行追加进档案。
+		// handler 本身无调用态，写句柄在 ctx（doc/38，同 callerStampMiddleware）。
+		handlers = append(handlers, newWireAppendHandler())
 		// 子代理折叠（doc/17 §6）：追加进同一列表，按规格名造——handler 无状态
 		// （同 run 内并行同名委派共用一个实例），字段全是每规格常量。
 		handlers = append(handlers, newAgentFoldHandler(spec.Name, h.foldCounter, h.foldWindow, h.foldLimit,

@@ -133,6 +133,7 @@ const (
 	codeMcpIllegal       = 111410
 	codeMcpDown          = 111411
 	codeAgentTaken       = 111412
+	codeSessionMissing   = 112001
 	codeAgentMissing     = 112003
 	codeQuota            = 113001
 	codeWorkspaceMissing = 114001
