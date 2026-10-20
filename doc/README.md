@@ -44,7 +44,7 @@
 | 19v6-02 | [reconcile 与双游标](19-v6/19v6-02-reconcile与双游标.md) | ✅ | `server.go`、`redisstore.go`、`store.go` | 客户端流程与 `eventOffset` 语义 |
 | 19v6-03 | [存储形态与生命周期](19-v6/19v6-03-存储形态与生命周期.md) | ✅ | `pgstore.go`、`redisstore.go`、`store.go` | 四表两键、真源划分、多副本 |
 | 19v6-04 | [验收（curl 手打）](19-v6/19v6-04-验收-curl.md) | ✅ | —（被测端点见 19v6-01） | 改契约字节必须同步改本篇并重跑 |
-| 19v6-05 | [tool loop（T 系列）](19-v6/19v6-05-tool-loop.md) | 🔶 | `tools.go`、`agents.go`、`agentlog.go`、`midfold.go` | T1–T3 已落地；T4／T5 为触发式，未做 |
+| 19v6-05 | [tool loop（T 系列）](19-v6/19v6-05-tool-loop.md) | ✅ | `tools.go`、`agents.go`、`agentlog.go`、`midfold.go`、`toolsearch.go`、`profile.go` | T1–T3 已落地；T4/T5（分级 + BM25 `tool_search`）2026-10-20 落地（A1 `ad1ab6b`、A2 `a190f4d`；A3 寿命验收、A4 回归收口） |
 | 19v6-06 | [工具分级与 deferred tools](19-v6/19v6-06-deferred-tools与缓存机制.md) | 🔶 | —（机制背景，provider 原生 deferred 未落） | 非契约篇；各厂商支持矩阵与升级路素材 |
 | 19v6-07 | [compact（v6 形态）](19-v6/19v6-07-compact.md) | ✅ | `compact.go`、`compact_test.go` | C1–C4 已落地 |
 | 19v6-08 | [文件工具族（F 系列）](19-v6/19v6-08-file-tools.md) | ✅ | `fileops.go`、`filetools.go`、`media.go` | 文件工具机制与契约真源 |

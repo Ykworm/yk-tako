@@ -4,6 +4,7 @@ package runengine
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -54,6 +55,87 @@ func TestTokenize(t *testing.T) {
 	want = []string{"search", "query", "http", "server"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("tokenize stem/upper: got %v, want %v", got, want)
+	}
+}
+
+// TestToolSearchDocIncludesSchemaText 钉文档构造：名字（原形与下划线拆词）、描述、
+// schema 属性名与属性描述都进检索文本；没有 ParamsOneOf 的裸 ToolInfo 也不丢名字/描述。
+func TestToolSearchDocIncludesSchemaText(t *testing.T) {
+	doc := newToolSearchDoc(mustSearchToolInfo[searchIssueParams](t, "mcp__github__list_issues", "List issues."))
+	set := map[string]bool{}
+	for _, tok := range tokenize(doc.text) {
+		set[tok] = true
+	}
+	for _, tok := range []string{"mcp", "github", "list", "issue", "state", "open", "closed"} {
+		if !set[tok] {
+			t.Fatalf("文档缺 token %q: %q", tok, doc.text)
+		}
+	}
+	bare := newToolSearchDoc(&schema.ToolInfo{Name: "mcp__x__ping", Desc: "Ping the server."})
+	if !strings.Contains(bare.text, "mcp__x__ping") || !strings.Contains(bare.text, "Ping the server.") {
+		t.Fatalf("裸 ToolInfo 文档丢了名字或描述: %q", bare.text)
+	}
+}
+
+// TestRankToolSearchStableTieAndLimit 钉同分保文档序（sort.SliceStable）与截断。
+func TestRankToolSearchStableTieAndLimit(t *testing.T) {
+	docs := []toolSearchDoc{
+		newToolSearchDoc(mustSearchToolInfo[struct{}](t, "mcp__a__widget", "Widget widget.")),
+		newToolSearchDoc(mustSearchToolInfo[struct{}](t, "mcp__b__widget", "Widget widget.")),
+		newToolSearchDoc(mustSearchToolInfo[struct{}](t, "mcp__c__widget", "Widget widget.")),
+	}
+	if got := rankNames(rankToolSearch("widget", docs, 8)); strings.Join(got, ",") !=
+		"mcp__a__widget,mcp__b__widget,mcp__c__widget" {
+		t.Fatalf("同分应保文档序，得 %v", got)
+	}
+	if got := rankNames(rankToolSearch("widget", docs, 2)); strings.Join(got, ",") !=
+		"mcp__a__widget,mcp__b__widget" {
+		t.Fatalf("limit 2 应截前两条，得 %v", got)
+	}
+}
+
+// TestToolSearchLimitDefaultAndExplicit 钉默认 limit=8、显式 limit、超量不补、非法 limit。
+func TestToolSearchLimitDefaultAndExplicit(t *testing.T) {
+	ctx := context.Background()
+	newBox := func() *toolSearchBox {
+		b := newToolSearchBox()
+		for i := 0; i < 10; i++ {
+			info := mustSearchToolInfo[struct{}](t, fmt.Sprintf("mcp__s__widget%d", i), "Widget tool.")
+			if err := b.add(info); err != nil {
+				t.Fatalf("add: %v", err)
+			}
+		}
+		return b
+	}
+	run := func(args string) string {
+		ts, err := newToolSearchTool(newBox())
+		if err != nil {
+			t.Fatalf("newToolSearchTool: %v", err)
+		}
+		out, err := ts.InvokableRun(ctx, args)
+		if err != nil {
+			t.Fatalf("InvokableRun %s: %v", args, err)
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		args string
+		want string
+	}{
+		{`{"query":"widget"}`, "Loaded 8 tools for this run:"},
+		{`{"query":"widget","limit":3}`, "Loaded 3 tools for this run:"},
+		{`{"query":"widget","limit":50}`, "Loaded 10 tools for this run:"},
+	} {
+		if out := run(tc.args); !strings.HasPrefix(out, tc.want) {
+			t.Fatalf("%s 应回 %q，得 %q", tc.args, tc.want, out)
+		}
+	}
+	ts, err := newToolSearchTool(newBox())
+	if err != nil {
+		t.Fatalf("newToolSearchTool: %v", err)
+	}
+	if _, err := ts.InvokableRun(ctx, `{"query":"widget","limit":-1}`); err == nil {
+		t.Fatal("负 limit 应报错")
 	}
 }
 
@@ -192,6 +274,15 @@ func TestToolSearchHandlerDeclaresAndActivates(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(declaredNames(state), ","), "mcp__fs__list_directory") {
 		t.Fatalf("激活项第二轮应声明，得 %v", declaredNames(state))
+	}
+	if !strings.Contains(strings.Join(declaredNames(state), ","), "get_time") {
+		t.Fatalf("direct 工具激活后应恒留声明面，得 %v", declaredNames(state))
+	}
+
+	// 已加载的工具不重复返回（pi 同语义）。
+	out, err = search.InvokableRun(ctx, `{"query":"list directory"}`)
+	if err != nil || out != "No matching tools found." {
+		t.Fatalf("已激活工具不应重复返回: %q / %v", out, err)
 	}
 
 	// 无命中不激活；错误经 wrapToolErrors 变成「错误：」结果。

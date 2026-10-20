@@ -2,8 +2,10 @@
 
 > 本篇是 doc/19-v6 文档集的 **deferred tools 机制篇**：工具分级为什么存在、前缀缓存的失效力学、
 > client mode 与 hosted mode 的完整链路、各厂商支持矩阵（2026-10-08 实证）、v6 的升级路。
-> 分级的 v6 落点（全注册 + `BeforeModelRewriteState` 声明过滤、三档定义）见 `19v6-05` §5——本篇不重复裁定，
+> 分级的 v6 落点（启用工具全注册 + `BeforeModelRewriteState` 声明过滤、两档定义）见 `19v6-05` §5——本篇不重复裁定，
 > 只给机制背景与 provider 原生通道的对照。**本篇不做契约承诺**，所有 provider 原生内容均为「升级路素材」。
+> **2026-10-20 校正**：§1 的 hidden 原文「代码内部/子代理用」先校正为 pi 的操作定义（注册但不可达），
+> 随后裁定 **tako 不设 hidden 档**——只留 direct / deferred，禁用工具 = 装配时不 append。见 `19v6-90` 十九修。
 
 ## 0. 一句话
 
@@ -14,8 +16,16 @@
 
 - 模型在协议上只能调用**当前请求 `tools` 数组里声明了**的工具；声明 = 占用前缀 token。
 - 上百个工具的全量 schema 既烧 token 又稀释注意力 → 只常声明一小撮（direct），
-  其余进目录（deferred：模型经检索按需激活）或彻底藏起（hidden：代码内部/子代理用）。
-- v6 三档 = pi `ToolExposure` 五档（direct / model-only / codemode / deferred / hidden）的收敛。
+  其余进目录（deferred：模型经检索按需激活）；不想要就在装配时不放进池（tako 不设 hidden 档）。
+- **pi 的 hidden（仅作对照，tako 不采纳）**：原文是 *registered but unreachable*——
+  工具仍在注册表里，但模型与 `ctx.executeTool()` 两条路都够不着，激活也不生效
+  （`packages/coding-agent/docs/extensions.md`「Tool exposure」）。pi 需要它是因为注册表没有
+  unregister，只能重注册成 hidden 来「撤回」；MCP 配置里它也是 server 级默认值与工具级覆盖的
+  一个取值（`"delete_*": "hidden"` 做黑名单，server 默认 hidden + 逐工具覆盖做白名单）。
+  但 tako 的池每 run 重建，禁用 = 装配时不 append，不需要这一档；只撤声明、不撤执行的 hidden
+  在 Eino 下也关不住执行面（tools node 按全量工具表按名分发，见 `19v6-05` §5）。
+- v6 两档 = pi `ToolExposure` 五档（direct / model-only / codemode / deferred / hidden）中取
+  **direct / deferred**；model-only / codemode 不在 v6 范围，hidden 按上条不采纳。
 
 ## 2. 缓存力学（一切的根源）
 
@@ -31,13 +41,17 @@
 
 ## 3. client mode = v6 现在（手写声明过滤）
 
-- 全工具注册进 tools node（永远可执行，注册 ≠ 声明）；
-  `BeforeModelRewriteState` 每轮筛 `state.ToolInfos` 决定本轮发给模型的 `tools` 数组（eino 钩子，provider 零感知）。
-- `tool_search` 是**普通工具**：模型调用 → 客户端执行检索 → 结果落消息历史 →
-  钩子扫历史把命中工具的 ToolInfo 补回声明集 → 下一轮模型才「看见」。
-- **代价**：激活那轮 tools 数组在中段变更 → 前缀哈希作废 → 缓存失效（单调收敛：搜出即常驻，
-  之后稳定，仅「发现期」几次 miss）。
-- **优点**：对 provider 零要求——任何模型、任何兼容端点都能跑。T4（目录直出）/ T5（BM25 排序器）复刻的就是检索层。
+- 全工具注册进 tools node（永远可执行，注册 ≠ 声明）；deferred 的**整条 ToolInfo（名字、描述、
+  参数 schema）都不进声明面**，模型不知道目录里有哪些非必要工具，只知道 `tool_search` 这个入口存在。
+  `BeforeModelRewriteState` 每轮用本 run 保存的完整目录**重建** `state.ToolInfos`，决定本轮发给模型的
+  `tools` 数组（eino 钩子，provider 零感知）。不能对当前 `state.ToolInfos` 做减法：首轮过滤后
+  deferred 项已不在其中，目录必须另存。
+- `tool_search` 是**普通工具**：模型调用 → 客户端 BM25 检索 → 命中名单写进本 run 的激活集
+  （tool_search 的 handler 持有；不扫消息文本）→ 钩子每轮按「direct + 激活集」从完整目录重建 `state.ToolInfos` →
+  下一轮模型才「看见」。结果文本同时落消息历史，供模型读「加载了什么」——**它只是回执，不是激活真源**。
+- **代价**：激活那轮 tools 数组在中段变更 → 前缀哈希作废 → 缓存失效（本 run 内单调收敛：搜出即常驻，
+  之后稳定，仅「发现期」几次 miss；跨 run 不保留——激活集只活一场 run，2026-10-20 已拍，见 `19v6-05` §5）。
+- **优点**：对 provider 零要求——任何模型、任何兼容端点都能跑。T4/T5（分级 + BM25 目录）复刻的就是检索层。
 
 ## 4. hosted mode = provider 原生 deferred tools
 
@@ -117,11 +131,11 @@
 - **默认底座 = client 过滤**（`19v6-05` §5）：碎片化格局下的最大公约数，不挑 provider。
 - 升级路按家接：claude 经 eino-ext 已具备（切 `WithDeferredTools` 即可）；
   DeepSeek 认标记但服务端检索能力未证实；Kimi 需私有协议适配；OpenAI 要等 eino-ext 组件补齐。
-- T4/T5（目录直出 + BM25）复刻的是检索层——即使将来切 hosted mode，这套客户端目录与匹配逻辑仍是
+- T4/T5（分级 + BM25 目录）复刻的是检索层——即使将来切 hosted mode，这套客户端目录与匹配逻辑仍是
   client-executed 变体的执行体，不白做。
-- **第一个真实负载已经到场**（2026-10-18 补）：MCP client（doc/33）落地后，MCP 工具以
-  `mcp__短名__工具名` 直接进池走声明过滤——数量少时照旧；工具总数涨到声明成本可见的量级时，
-  T4/T5 的目录代理以 MCP 工具为第一个真实负载开工（doc/33 §9 后置拍表）。
+- **第一个真实负载已经到场**（2026-10-18 补；2026-10-20 开工）：MCP client（doc/33）落地后，MCP 工具以
+  `mcp__短名__工具名` 直接进池；用户 2026-10-20 裁「一步到位把 T5 也做了」——T4/T5 合批开工，
+  MCP 工具是 deferred 目录的第一批真实负载（`19v6-05` §5，施工台账 `tmp/19-v6/`）。
 
 ## 附 · 证据清单（全部 2026-10-08 实读）
 

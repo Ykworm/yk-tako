@@ -6,6 +6,10 @@
 > `model` 字段（2026-10-10 纠偏，帧/行同带）**已补 19v6-01，随 T3-1b/T3-2 落地**；
 > 本篇是 tool loop 的**机制裁定真源**。
 > 立项：2026-10-08（用户拍板：循环走 Eino ADK）；执行台账 = `tmp/19-v6/planning.md` §11 + todos「T 系列」。
+> **T4/T5 已落地（2026-10-20）**：工具分级（direct/deferred）+ `tool_search`（BM25 首版）A1–A4 四拍完成——
+> A1 `ad1ab6b`（`toolsearch.go`：分词/BM25/检索/run-local box + 单测）、A2 `a190f4d`（子代理保留名与
+> 显式挂载）、A3 纯验收（激活集只活一场 run）、A4 回归与收口（单测补网、A1/A2 话本重跑、四个 API
+> 字节零变化）。落地细节与验收实录见 §5 尾条与 `tmp/19-v6/todos.md`。
 
 ## 0. 术语（2026-10-08 用户裁；2026-10-10 补 3 条模型侧术语）
 
@@ -249,8 +253,9 @@ index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型�
   **`exclude_tools: [名字…]` → 继承父池减去列出的名字**（新字段，与 `tools:` **互斥**：同写整条拒载；
   排除一个父池没有的名字也拒载；`exclude_tools: []` 视同不写。结果序是池序、元素是父池同一批对象。
   四态表与操作定义只在 `doc/26` §3 一份，这里不复述）。
-  「+search」= 保留名 **`tool_search`** 进列表（用户 2026-10-08 裁「子代理挂 search，当然要」；**实现随 T4 触发拍**）——
-  搜索范围 = **自己的池**（统一规则见 §5）。T3 期池内工具**全声明**（无 deferred 机械件，分级随 T4 触发）。
+  「+search」= 保留名 **`tool_search`** 显式进列表才挂（用户 2026-10-08 裁「子代理挂 search，当然要」；
+  2026-10-20 已拍：继承档——不写 / `exclude_tools`——不自动加，搜索面是能力面，不悄悄多一把工具）——
+  搜索范围 = **自己的池**（统一规则见 §5）。分级落地后子代理池同样分 direct/deferred，池内工具不再全声明。
 - **预算面（2026-10-09 三裁）**——**取消是控制面的事（abort 级联），不是时间面的事**（用户裁，并指 Google ADK 同立场）：
   - **并发**：上限 = **配置项（默认 8）**（选择归 human 写配置、代码只做机械件）；pi 为硬编码常量（单批 8 / 同时 4），tako 无「单批」概念，只设「同时」一个旋钮。
   - **超时**：**不设总时限**、不另立计时器；要掐走将来的「取消」面（abort 级联；与 T1 遗留「abandon 不断流」是同一个待做面）。pi 实读（2026-10-09）：两套子代理实现均无计时器，唯一 kill 路径都是 abort 传播；时间上限只加在有界操作上（per-request / 单条命令）。
@@ -270,14 +275,50 @@ index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型�
 
 ## 5. 工具目录与 tool_search
 
-- **施工触发（2026-10-09 裁）**：本节的分级与 tool_search **施工推迟到触发信号**——**MCP 工具 loop 进来**
-  （工具多到撑上下文）或**子代理库长到几十条**，二者之一出现才动工；纸面保留分离原则
-  「**可执行集合 ⊇ 声明集合 ⊇ 可检索集合**」。T3 期 = **一个源（文件）、一个装载点（run 起手）、一个声明状态（全声明）**。
-- **分级 = node 全注册 + 声明过滤**：全部工具注册进 tools node（永远可执行），
-  `BeforeModelRewriteState` 每轮筛 `state.ToolInfos` 决定模型看见什么——
-  **direct** = 常声明 / **deferred** = 目录层、激活才声明 / **hidden** = 永不声明。
-- **tool_search**：模型检索目录、命中即激活（下一次模型调用即声明）。T4 = 目录直出（名称/描述匹配）；
-  **T5 = BM25 排序器，独立 task**（用户指令）——pi 版 40 行 TS（camelCase 分词+词干+停用词）的 Go 移植。
+- **施工状态（2026-10-09 裁触发式；2026-10-20 开工并当日落地）**：原裁「等 MCP 工具 loop 进来（工具多到
+  撑上下文）或子代理库长到几十条再动工」；MCP client（doc/33）已落地、工具规模信号成立，用户
+  2026-10-20 裁「**一步到位把 T5 也做了**」——T4（分级 + tool_search）与 T5（BM25 排序）**同批施工**，
+  **BM25 是首版排序器，不先做名称/描述直出再替换**。分离原则不变：
+  「**可执行集合 ⊇ 声明集合 ⊇ 可检索集合**」；T3 期「一个源、一个装载点、一个声明状态（全声明）」到此让位给分级。
+  施工与验收结论见本节尾条。
+- **分级 = 启用工具全注册 + 声明过滤**：装配时决定放不放进池——**不放 = 禁用**，不进 tools node，
+  既不可执行也不可检索；放进池的工具全部注册进 tools node。每轮模型调用前，
+  `BeforeModelRewriteState` 用本 run 保存的**完整目录**重建 `state.ToolInfos` 决定模型看见什么——
+  **direct** = 常声明 / **deferred** = 目录层，整条 ToolInfo（名字、描述、参数 schema）都不进声明面，
+  `tool_search` 激活后才声明。不能对当前 `state.ToolInfos` 做减法：
+  首轮过滤后 deferred 项已不在其中，减法的源会丢；完整目录必须另存（run-local）。
+  **不设 hidden 档（2026-10-20 裁）**：tako 的池每 run 重建，禁用就是装配时不 append，不存在 pi
+  「注册表撤不掉、只能重注册成 hidden」的问题。把 hidden 定义成「永不声明」也不成立——工具仍在
+  node 里，而 Eino tools node 按全量工具表按名分发（名字不在节点才报 `tool X not found`，v0.9.21
+  `compose/tool_node.go` 实读），执行面并没有关，模型猜中名字仍可能调起。今日没有「只给代码调、
+  不给模型调」的消费者（三条来源都在装配时不放；子代理池从入口快照按名收窄、只减不增，§4），
+  所以不留这一档；将来真出现该需求，按新需求重新立档并同时设执行闸。
+- **tool_search（T4/T5 合批，2026-10-20 用户裁）**：模型检索目录、BM25 排序、命中即激活（**同一 run** 的
+  下一次模型调用即声明）。首版就是 pi 的 Go 移植——camelCase 分词 + 朴素词干 + 停用词；Okapi BM25
+  （k1=1.2、b=0.75）；文档 = 名字 + 下划线拆词 + 描述 + 参数 schema 的描述与属性名（MCP 工具再加
+  server 短名）；`query` 必填、`limit` 缺省 8、空 query / 非正整数 limit 当场报错；无命中回
+  `No matching tools found.`。**直出版不落地**。
+- **mh 与激活集分家（2026-10-20 定）**：mh 只记 tool_search 的 assistant 调用行与 tool 结果文本
+  （`Loaded N tools...`），**不记工具 schema、不记「已激活」**。激活集是 run 状态；每轮模型看见哪些工具
+  由 `BeforeModelRewriteState` 用完整目录按「direct + 激活集」**重建** `state.ToolInfos` 决定，
+  同一 run 内由 run-local 状态延续。新 run 读回
+  的历史里只有那句结果文本，没有声明——**「记录了」不等于「模型这一轮看得见」**。
+- **激活集寿命（2026-10-20 已拍：只活一场 run）**：新 run 从零激活（tool_search 本身是 direct，模型可重检）；
+  崩溃续跑同一场 run 时同样从零激活（doc/30 账本不存激活集），模型凭历史里上次的回执与调用参数重检。
+  回执固定写 `Loaded N tools for this run...`——不照抄 pi 的 `available from your next call`（跨 run 读回
+  历史时会变成半句假话）。若产品将来要「加载过就一直可用」，必须把激活集结构化持久化（多副本不能靠
+  进程内状态），从 mh 文本重放会被折叠折走、不可靠——那是另立方案。
+- **首版分级来源（2026-10-20 已拍：按来源的机械规则）**：`mcp__` 前缀 = deferred（工具规模增长源）；
+  一手工具 + 子代理 = direct。不新增配置面；单个 MCP 工具若将来要固定 direct，再加 server 级覆盖。
+- **落地与验收（2026-10-20）**：A1 `ad1ab6b`（`toolsearch.go`：分词/BM25/`tool_search`/run-local box，
+  worker 每 run 挂载）；A2 `a190f4d`（子代理保留名不进池、只有显式 `tools:` 才挂自己的 handler，
+  租户 `checkSubagentBounds` 预检给保留名开例外）。A3 纯验收：同会话第二场 run `declared=21 active=[]`、
+  崩溃续跑同样从零激活（账本无 schema），回执「for this run」与真实寿命一致。A4 回归：
+  单测补 schema 文本入文档、同分稳定序与 limit 截断、缺省 8 与越界报错、已激活不重复返回；
+  活体重跑 A1（`catalog=35 deferred=14`，`declared` 21→29）、A2 正/负路径（子代理 `catalog=2`、
+  继承档名单无 `tool_search`）、无 mcp.json（`catalog=19 deferred=0`，`tool_search` 回
+  `No matching tools found.`）；`server.go`/`types.go`/`redisstore.go` 自 `ad60e49` 到 `a190f4d`
+  零 diff，四个 API 字节不变。
 - **红线**（pi/dsh 同款收敛）：模型只能**装配目录内工具**，不能改 harness 本身。
 - **统一搜索规则（2026-10-08）**：任何 agent（主或子）的 tool_search 只搜**自己 tools node 里注册的
   deferred 项**——搜索范围 = 可执行范围的子集，越界激活物理上不存在；主 agent 的 node 不含子代理
