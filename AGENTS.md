@@ -219,6 +219,9 @@ npm run build                     # vue-tsc -b && vite build
 - 所有代码在仓库子目录 `yk-tako-eino/` 下，Go 命令都以它为 cwd（目录地图见「仓库结构」）。
 - 开发启动：仓库根执行 `./scripts/dev.sh`；手动起引擎与依赖见根 `README.md`。
 - **端口被占时先 `lsof` 查是谁**，可能是用户自己留着的实例——换一个端口验收，不要杀别人的进程。
+- **要跑 curl / 浏览器验收，需要一个能登录的账号**：`yk-tako-eino/.env` 里存着本地测试账号
+  （`TAKO_DEV_TEST_EMAIL` / `TAKO_DEV_TEST_PASSWORD`）和**三步重建法**（注册 → 租户装模型密钥 → 登录）。
+  账号行被清掉后照那三步重建即可；租户不自带 `*_API_KEY` 就起不了 run（回 111408，是设计不是故障）。
 
 ## 双远端同步
 
