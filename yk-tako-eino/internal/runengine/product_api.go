@@ -238,7 +238,7 @@ func (s *Server) deleteWorkspace(c *gin.Context) {
 	}
 }
 
-// deleteSession 软删属主自己的一场会话。看不见走旧体 404，看得见但不是本人走 111204。
+// deleteSession 软删属主自己的一场会话。看不见走 404（112001），看得见但不是本人走 111204。
 // 有活 run 则 409，行和目录都留着。成功先提交，再只删会话目录下的 .tako 与 .media。
 // 产出文件和项目目录不动。目录删失败只记日志，响应仍是 deleted。
 func (s *Server) deleteSession(c *gin.Context) {
@@ -250,7 +250,7 @@ func (s *Server) deleteSession(c *gin.Context) {
 	err := s.store.DeleteSession(c.Request.Context(), p.TenantID, p.UserID, id)
 	switch {
 	case errors.Is(err, ErrSessionNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
+		writeEnvelope(c, http.StatusNotFound, codeSessionMissing, "找不到这场会话", nil)
 	case errors.Is(err, ErrSessionForbidden):
 		writeEnvelope(c, http.StatusForbidden, codeNotOwner, "只有本人能修改", nil)
 	case errors.Is(err, ErrSessionBusy):

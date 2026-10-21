@@ -352,8 +352,10 @@ researcher 走排除路，排除清单仍只有 bash，所以它的有效名单�
    回执按 ToolCallID 再附一次。接管或续跑新建 `foldBox`，标志自然为 false，保守再还原一次
    （多发字节，不漏看）。
 4. **前端取文件端点** ✅：`GET /api/media?path=…`。2026-10-20 起 path 是
-   `workspaces/<wid>/.media/<sha16>.<ext>`，按 `VisibleWorkspace` 取图（doc/35）；
-   越权路径回旧体 404 `{"error":"not_found"}`。
+   `workspaces/<wid>/.media/<sha16>.<ext>`，按 `VisibleWorkspace` 取图（doc/35）。
+   2026-10-22 起错误分支换信封（doc/40）：越权路径回 `404 {"code":114001,"message":"找不到这个项目","data":null}`；
+   path 格式不对是 `114102`「媒体路径不对」，文件不存在是 `114101`「找不到这个文件」，缺 `path` 是
+   `400 111001`。**成功体不进信封**——它是图片字节，不是 JSON。
 5. **清理契约**（维持原推荐）：`.media/` 随 workspace 生命周期走，先不做回收，到点看占用再裁。
 6. **音频/视频/PDF**：占位格式同一条、入口白名单含它们。发送份当前只还原 png/jpeg/gif/webp 四种栅格图。
    PDF 的文本层走 `read_pdf_text`（A8-1），不把 PDF 字节当图片发送。音视频仍只有元信息占位。

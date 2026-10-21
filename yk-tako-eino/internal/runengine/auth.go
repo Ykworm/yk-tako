@@ -109,10 +109,20 @@ type devTenantData struct {
 }
 
 const (
-	codeOK               = 0
+	codeOK = 0
+	// 码段口径（doc/40 §4）：前两位是模块——11 身份与参数，12 会话与运行，13 配额，
+	// 14 项目与工作区。1110xx 参数，1111xx 登录与 token，1112xx 权限，1114xx 冲突，
+	// 1119xx 这一模块的内部失败；1120xx 资源缺失，1121xx 会话与运行的冲突；
+	// 1130xx 配额与准入；1140xx 项目，1141xx 项目里的文件。
 	codeBadJSON          = 111001
 	codeBadInput         = 111002
 	codeNameRequired     = 111003
+	// 111004：入口图片不合法（mime 白名单外／base64 解不开／超 5MB／超 4 张）。
+	// 原因文字进 data.reason，不进 message（doc/40 §3 规则 3）。
+	codeBadMedia         = 111004
+	// 111005：mcp.json 读不出来。旧的 400 直接把 Go 原始错误串当 body 吐出来，
+	// 那是机器细节；现在固定 message，细节进 data.reason。
+	codeBadMcpConf       = 111005
 	codeBadCredentials   = 111101
 	codeMissingToken     = 111102
 	codeInvalidToken     = 111103
@@ -134,8 +144,22 @@ const (
 	codeMcpDown          = 111411
 	codeAgentTaken       = 111412
 	codeSessionMissing   = 112001
-	codeAgentMissing     = 112003
-	codeQuota            = 113001
+	// 112002：run 不可见。doc/28 §5.4 早已定码，这里补上代码里的常量。
+	codeRunMissing = 112002
+	codeAgentMissing = 112003
+	// 112101：这场会话已有活 run，发消息撞闸。
+	// ⚠️ 与 codeSessionBusy（114007）不是一回事：114007 是「删除会话时这场会话有活 run」
+	// （doc/37 D3），语义不同，码不能撞。
+	codeSessionRunning = 112101
+	// 112102：这场 run 已定稿，没有可续的。前端据此不显示续跑按钮。
+	codeNotResumable = 112102
+	// 112103：租约仍有效，原执行者可能只是慢了一拍——不是失败，转去重建帧面。
+	codeRunAlive = 112103
+	// 112104：续跑次数用尽，提示重发。
+	codeResumeExhausted = 112104
+	codeQuota = 113001
+	// 113003：单条消息超准入线。limit 与 tokens 进 data，message 只放人话。
+	codeMessageTooLarge = 113003
 	codeWorkspaceMissing = 114001
 	// 114002 退役。删除项目不再因为「还有会话」拒绝。码位留着，没有任何路径返回它。
 	codeWorkspaceNotEmpty     = 114002
@@ -144,7 +168,11 @@ const (
 	codeWorkspaceDefault      = 114005
 	codeWorkspaceBusyLive     = 114006
 	codeSessionBusy           = 114007
-	codeInternal              = 111901
+	// 114101：media 的文件真的不存在（旧的一个 not_found 字符串拆出来的四种语义之一）。
+	codeMediaMissing = 114101
+	// 114102：media 的 path 不是 workspaces/<wid>/… 格式，或越出工作区。
+	codeMediaPathBad = 114102
+	codeInternal     = 111901
 )
 
 var emailPattern = regexp.MustCompile(`^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$`)

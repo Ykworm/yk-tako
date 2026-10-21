@@ -228,16 +228,18 @@ type logResponse struct {
 //
 // 响应（字段序即契约字节序：sessionId → runId → messageId）：
 //
-//	202 {"sessionId":"s_01","runId":"r_01","messageId":"m_1"}
-//	400 {"error":"bad_request"}          ← 请求体不是合法 JSON
-//	400 {"error":"bad_media","reason":…} ← images 不合法（mime 白名单外 / base64 解不开 /
-//	                                       超 5MB / 超 4 张），doc/32 A1；零痕迹可改后重投
-//	404 {"error":"session_not_found"}    ← 只可能出现在「带未知 sessionId」时
-//	409 {"error":"session_busy"}         ← 该会话已有活 run；**什么都没写**，客户端本地排队、本轮收口后补投
-//	413 {"error":"message_too_large","limit":M,"tokens":N}
+//	202 {"code":0,"message":"","data":{"sessionId":"s_01","runId":"r_01","messageId":"m_1"}}
+//	400 {"code":111001,"message":"请求格式不对","data":null}   ← 请求体不是合法 JSON
+//	400 {"code":111004,"message":"图片不符合要求","data":{"reason":…}}
+//	                                       ← images 不合法（mime 白名单外 / base64 解不开 /
+//	                                         超 5MB / 超 4 张），doc/32 A1；零痕迹可改后重投
+//	404 {"code":112001,"message":"找不到这场会话","data":null}   ← 只可能出现在「带未知 sessionId」时
+//	409 {"code":112101,"message":"这场会话正在跑，等它跑完再发","data":null}
+//	                                       ← 该会话已有活 run；**什么都没写**，客户端本地排队、本轮收口后补投
+//	413 {"code":113003,"message":"这条消息太长，裁剪后再发","data":{"limit":M,"tokens":N}}
 //	                                     ← 单条消息超准入线（仅 compact 开启时；limit = compactLimitFor(window)，
 //	                                       线 = limit/3）；抢闸前拒收，零痕迹，客户端裁剪后可原样重投
-//	500 {"error":"internal"}
+//	500 {"code":111901,"message":"服务暂时不可用，请再试一次","data":null}
 //
 // 服务端在**一笔原子写**里做完（D1 落库后 = 一笔 PG 事务持有跨 Redis 写，planning §8.4）：
 // 抢闸（INSERT runs，部分唯一索引冲突即 409）+ runlog 追加 role:user 记录（占一个
@@ -254,7 +256,7 @@ func (s *Server) postRuns(c *gin.Context) {
 	}
 	var req postRunsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request"})
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
 		return
 	}
 	sessionID := req.SessionID
@@ -280,7 +282,7 @@ func (s *Server) postRuns(c *gin.Context) {
 		bound, kind, err = s.store.SessionAccess(ctx, sessionID, p)
 		if err != nil {
 			if errors.Is(err, ErrSessionNotFound) {
-				c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
+				writeEnvelope(c, http.StatusNotFound, codeSessionMissing, "找不到这场会话", nil)
 				return
 			}
 			internal(c, err)
@@ -373,7 +375,7 @@ func (s *Server) postRuns(c *gin.Context) {
 			return
 		}
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "bad_media", "reason": err.Error()})
+			writeEnvelope(c, http.StatusBadRequest, codeBadMedia, "图片不符合要求", gin.H{"reason": err.Error()})
 			return
 		}
 		placeholders = ph
@@ -383,9 +385,9 @@ func (s *Server) postRuns(c *gin.Context) {
 	// 只数正文（doc/32 A2 翻案 2026-10-18）：图的门槛是 ingestImages 的硬帽（上面已过），
 	// base64 不进 cl100k——文本管道下模型窗口里只有占位行，数字节既拒错人又跑不动。
 	if limit, tokens, ok := s.worker.AdmitText(req.Text); !ok {
-		// 字段序 = error → limit → tokens（gin.H 经 encoding/json 按 key 字典序输出，三键恰好此序；
-		// 若增删字段需重钉字节序）。
-		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "message_too_large", "limit": limit, "tokens": tokens})
+		// limit 与 tokens 进 data（客户端据此裁剪重发），message 只放人话（doc/40 §3 规则 3）。
+		writeEnvelope(c, http.StatusRequestEntityTooLarge, codeMessageTooLarge, "这条消息太长，裁剪后再发",
+			gin.H{"limit": limit, "tokens": tokens})
 		return
 	}
 	runID, err := newRunID()
@@ -401,7 +403,7 @@ func (s *Server) postRuns(c *gin.Context) {
 	user := Row{RunID: runID, Role: "user", MessageID: req.MessageID, Text: userText}
 	acquired, err := s.store.AcquireRun(ctx, sessionID, runID, user, p, workspaceID)
 	if errors.Is(err, ErrSessionNotFound) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
+		writeEnvelope(c, http.StatusNotFound, codeSessionMissing, "找不到这场会话", nil)
 		return
 	}
 	if errors.Is(err, ErrSessionForbidden) {
@@ -421,7 +423,7 @@ func (s *Server) postRuns(c *gin.Context) {
 		return
 	}
 	if !acquired {
-		c.JSON(http.StatusConflict, gin.H{"error": "session_busy"})
+		writeEnvelope(c, http.StatusConflict, codeSessionRunning, "这场会话正在跑，等它跑完再发", nil)
 		return
 	}
 	// 抢闸成功才开 worker：POST 返回 202 时 run 已在生成，frames/log 立刻可拉（19v6-01 §1）。
@@ -432,7 +434,7 @@ func (s *Server) postRuns(c *gin.Context) {
 	}
 	go s.worker.Run(withRunProfile(withPrincipal(context.Background(), p), prof), sessionID, runID, 1)
 	handed = true
-	c.JSON(http.StatusAccepted, postRunsResponse{SessionID: sessionID, RunID: runID, MessageID: req.MessageID})
+	writeEnvelope(c, http.StatusAccepted, codeOK, "", postRunsResponse{SessionID: sessionID, RunID: runID, MessageID: req.MessageID})
 }
 
 // imageRoot 决定这批入口图写到哪，并给出占位 path 的前缀 workspaces/<wid>/。
@@ -504,7 +506,7 @@ func denyRunWrite(c *gin.Context, v runView) bool {
 		return true
 	}
 	if !v.Found || v.Kind == accessNone {
-		c.JSON(http.StatusNotFound, gin.H{"error": "run_not_found"})
+		writeEnvelope(c, http.StatusNotFound, codeRunMissing, "找不到这次运行", nil)
 		return true
 	}
 	if v.Kind != accessOwner {
@@ -519,13 +521,18 @@ func denyRunRead(c *gin.Context, v runView) bool {
 		return true
 	}
 	if !v.Found || v.Kind == accessNone {
-		c.JSON(http.StatusNotFound, gin.H{"error": "run_not_found"})
+		writeEnvelope(c, http.StatusNotFound, codeRunMissing, "找不到这次运行", nil)
 		return true
 	}
 	return false
 }
 
 // stopRun（doc/17 §4 手动停止）：POST /api/runs/{runId}/stop。
+//
+//	200 {"code":0,"message":"","data":{"status":"stopped"}}
+//	404 {"code":112002,"message":"找不到这次运行","data":null}
+//	500 {"code":111901,"message":"服务暂时不可用，请再试一次","data":null}
+//
 // 竞态裁决在条件 UPDATE（Store.StopRun）：1 行 = 停止赢过正常收尾，翻 stopped；0 行 = 已是
 // 终态，读回现值原样返回；行不存在 = 404。赢了之后查 worker 的取消注册表：本进程在跑这场
 // run 就立刻 cancel（秒级断流）；打到别的副本时由跑着那侧的 watchdog 在下一个续约 tick
@@ -542,7 +549,7 @@ func (s *Server) stopRun(c *gin.Context) {
 		return
 	}
 	if !found {
-		c.JSON(http.StatusNotFound, gin.H{"error": "run_not_found"})
+		writeEnvelope(c, http.StatusNotFound, codeRunMissing, "找不到这次运行", nil)
 		return
 	}
 	if status == "stopped" {
@@ -551,15 +558,17 @@ func (s *Server) stopRun(c *gin.Context) {
 			c.(*runCancel).cancel()
 		}
 	}
-	c.JSON(http.StatusOK, gin.H{"status": status})
+	writeEnvelope(c, http.StatusOK, codeOK, "", gin.H{"status": status})
 }
 
 // resumeRun（doc/30 §8）= 崩溃后接管一场 run：POST /api/runs/{runId}/resume，无请求体。
 //
-//	202 {"runId":"r_01","status":"running","resumeCount":1}
-//	404 {"error":"run_not_found"}
-//	409 {"error":"not_resumable"|"run_alive"|"resume_exhausted"}
-//	500 {"error":"internal"}
+//	202 {"code":0,"message":"","data":{"runId":"r_01","status":"running","resumeCount":1}}
+//	404 {"code":112002,"message":"找不到这次运行","data":null}
+//	409 {"code":112102,"message":"这场 run 已经定稿，没有可续的","data":null}   ← not_resumable
+//	409 {"code":112103,"message":"这场 run 还活着，别抢","data":null}           ← run_alive
+//	409 {"code":112104,"message":"续跑次数用完了，重新发一轮","data":null}       ← resume_exhausted
+//	500 {"code":111901,"message":"服务暂时不可用，请再试一次","data":null}
 //
 // 顺序即正确性：claim（PG CAS，epoch+1，提交后才算接管）→ 重放账本 →
 // 种 Redis 现场（令牌换代、runlive 重置为一条 resume 帧）→ 开 worker。
@@ -576,17 +585,17 @@ func (s *Server) resumeRun(c *gin.Context) {
 	claim, err := s.store.ClaimResume(ctx, runID, s.resumeMax)
 	switch {
 	case errors.Is(err, errRunNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": "run_not_found"})
+		writeEnvelope(c, http.StatusNotFound, codeRunMissing, "找不到这次运行", nil)
 		return
 	case errors.Is(err, errNotResumable):
-		c.JSON(http.StatusConflict, gin.H{"error": "not_resumable"})
+		writeEnvelope(c, http.StatusConflict, codeNotResumable, "这场 run 已经定稿，没有可续的", nil)
 		return
 	case errors.Is(err, errRunAlive):
 		// 租约仍有效 = 原执行者可能只是慢了一拍，抢会造出双执行者（doc/30 §8.2）。
-		c.JSON(http.StatusConflict, gin.H{"error": "run_alive"})
+		writeEnvelope(c, http.StatusConflict, codeRunAlive, "这场 run 还活着，别抢", nil)
 		return
 	case errors.Is(err, errResumeExhausted):
-		c.JSON(http.StatusConflict, gin.H{"error": "resume_exhausted"})
+		writeEnvelope(c, http.StatusConflict, codeResumeExhausted, "续跑次数用完了，重新发一轮", nil)
 		return
 	case err != nil:
 		internal(c, err)
@@ -632,15 +641,17 @@ func (s *Server) resumeRun(c *gin.Context) {
 		}
 	}
 	go s.worker.RunResume(bg, claim.SessionID, runID, claim.Epoch, replay)
-	c.JSON(http.StatusAccepted, resumeResponse{RunID: runID, Status: "running", ResumeCount: int(claim.Epoch - 1)})
+	writeEnvelope(c, http.StatusAccepted, codeOK, "", resumeResponse{RunID: runID, Status: "running", ResumeCount: int(claim.Epoch - 1)})
 }
 
 // getSession（19v6-01 §4）= 会话状态查询，reconcile 的**第一步**（refresh / 新 tab 都从它进）。
 //
 //	GET /api/sessions/s_01
-//	200 {"liveRunId":"r_1","runlogOffset":1}   ← 有 run 正在跑；runlog 已有 1 条（刚投递的 user 消息）
-//	200 {"liveRunId":"","runlogOffset":2}      ← run 已结束；助手全文已进 runlog
-//	404 {"error":"session_not_found"}
+//	200 {"code":0,"message":"","data":{"liveRunId":"r_1","runlogOffset":1,…}}
+//	                              ← 有 run 正在跑；runlog 已有 1 条（刚投递的 user 消息）
+//	200 {"code":0,"message":"","data":{"liveRunId":"","runlogOffset":2,…}}
+//	                              ← run 已结束；助手全文已进 runlog
+//	404 {"code":112001,"message":"找不到这场会话","data":null}
 //
 // 两个字段各回答一个问题，客户端据此决定后面拉哪个端点：
 //   - `liveRunId`：该会话当前的活 run（读闸），`""` = 会话闲着。**非空才需要去拉 §2 的 frames**；
@@ -661,7 +672,7 @@ func (s *Server) getSession(c *gin.Context) {
 	sess, _, err := s.store.SessionAccess(c.Request.Context(), SessionID(c.Param("id")), p)
 	if err != nil {
 		if errors.Is(err, ErrSessionNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
+			writeEnvelope(c, http.StatusNotFound, codeSessionMissing, "找不到这场会话", nil)
 			return
 		}
 		internal(c, err)
@@ -673,10 +684,10 @@ func (s *Server) getSession(c *gin.Context) {
 		return
 	}
 	if !exists {
-		c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
+		writeEnvelope(c, http.StatusNotFound, codeSessionMissing, "找不到这场会话", nil)
 		return
 	}
-	c.JSON(http.StatusOK, sessionResponse{
+	writeEnvelope(c, http.StatusOK, codeOK, "", sessionResponse{
 		LiveRunID: liveRunID, RunlogOffset: runlogOffset, LastRunStatus: lastStatus, LastRunID: lastRunID,
 		WorkspaceID: sess.WorkspaceID,
 	})
@@ -805,7 +816,7 @@ func (s *Server) patchSessionWorkspace(c *gin.Context) {
 	err := s.store.SetSessionWorkspace(c.Request.Context(), SessionID(c.Param("id")), p, wid)
 	switch {
 	case errors.Is(err, ErrSessionNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
+		writeEnvelope(c, http.StatusNotFound, codeSessionMissing, "找不到这场会话", nil)
 	case errors.Is(err, ErrSessionForbidden):
 		writeEnvelope(c, http.StatusForbidden, codeNotOwner, "只有本人能修改", nil)
 	case errors.Is(err, ErrWorkspaceNotFound):
@@ -839,7 +850,7 @@ func (s *Server) patchSessionVisibility(c *gin.Context) {
 	case errors.Is(err, ErrBadVisibility):
 		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "邮箱或密码不符合要求", nil)
 	case errors.Is(err, ErrSessionNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
+		writeEnvelope(c, http.StatusNotFound, codeSessionMissing, "找不到这场会话", nil)
 	case errors.Is(err, ErrSessionForbidden):
 		writeEnvelope(c, http.StatusForbidden, codeNotOwner, "只有本人能修改", nil)
 	case err != nil:
@@ -853,8 +864,8 @@ func (s *Server) patchSessionVisibility(c *gin.Context) {
 // getRunStatus（doc/30 A1）= 单场 run 的对外状态，崩溃后「这场是死了还是还能续」的唯一读口。
 //
 //	GET /api/runs/r_01
-//	200 {"runId":"r_01","sessionId":"s_01","status":"running","resumeCount":0,"resumable":false}
-//	404 {"error":"run_not_found"}
+//	200 {"code":0,"message":"","data":{"runId":"r_01","sessionId":"s_01","status":"running","resumeCount":0,"resumable":false}}
+//	404 {"code":112002,"message":"找不到这次运行","data":null}
 //
 // status 五态里只有 interrupted 是派生值：runs.status 仍是 running、租约已过（PG now()），
 // 读侧当场判「执行者已经不在了」，不等清扫（清扫只在下一发 POST 时发生）。
@@ -871,10 +882,10 @@ func (s *Server) getRunStatus(c *gin.Context) {
 		return
 	}
 	if !found {
-		c.JSON(http.StatusNotFound, gin.H{"error": "run_not_found"})
+		writeEnvelope(c, http.StatusNotFound, codeRunMissing, "找不到这次运行", nil)
 		return
 	}
-	c.JSON(http.StatusOK, runResponse{
+	writeEnvelope(c, http.StatusOK, codeOK, "", runResponse{
 		RunID:       st.RunID,
 		SessionID:   st.SessionID,
 		Status:      st.Status,
@@ -886,12 +897,14 @@ func (s *Server) getRunStatus(c *gin.Context) {
 // getFrames（19v6-01 §2）= 拉某场 run **正在生成**的帧序列（Redis LIST `runlive:{runId}`）。
 //
 //	GET /api/runs/r_1/frames?eventOffset=0
-//	200 {"frames":[
-//	  {"eventOffset":1,"kind":"start","messageId":"m_1"},
-//	  {"eventOffset":2,"kind":"delta","text":"好的"},
-//	  {"eventOffset":3,"kind":"delta","text":"，我来读"},
-//	  {"eventOffset":4,"kind":"terminal","status":"complete"}
-//	],"nextOffset":4,"status":"done"}
+//	200 {"code":0,"message":"","data":{
+//	  "frames":[
+//	    {"eventOffset":1,"kind":"start","messageId":"m_1"},
+//	    {"eventOffset":2,"kind":"delta","text":"好的"},
+//	    {"eventOffset":3,"kind":"delta","text":"，我来读"},
+//	    {"eventOffset":4,"kind":"terminal","status":"complete"}
+//	  ],"nextOffset":4,"status":"done"
+//	}}
 //
 // 游标语义：`eventOffset=N` 返回该 run 内 offset **> N** 的帧，升序，单批最多 W 条；缺省、
 // 非法、负数都当 0（= 从 start 起，新客户端能看到整段生成，超长回复分批拉完）。实现是
@@ -918,7 +931,7 @@ func (s *Server) getFrames(c *gin.Context) {
 		return
 	}
 	if !v.Found || v.Kind == accessNone {
-		c.JSON(http.StatusOK, framesResponse{Frames: []Frame{}, NextOffset: from, Status: "gone"})
+		writeEnvelope(c, http.StatusOK, codeOK, "", framesResponse{Frames: []Frame{}, NextOffset: from, Status: "gone"})
 		return
 	}
 	frames, next, exists, err := s.store.ReadFrames(c.Request.Context(), RunID(c.Param("runId")), from, s.w)
@@ -937,7 +950,7 @@ func (s *Server) getFrames(c *gin.Context) {
 			}
 		}
 	}
-	c.JSON(http.StatusOK, framesResponse{Frames: frames, NextOffset: next, Status: status})
+	writeEnvelope(c, http.StatusOK, codeOK, "", framesResponse{Frames: frames, NextOffset: next, Status: status})
 }
 
 // sse 节奏两个常数（doc/31 §4/§5）：tail 是流 handler 读 runlive 的间隔（定时读共享 Redis
@@ -1046,11 +1059,13 @@ func lastEventID(h string) int {
 // getSessionLog（19v6-01 §3）= 拉 session 的**定稿历史**（PG `runlog_entries` 表）。
 //
 //	GET /api/sessions/s_01/log?runlogOffset=0
-//	200 {"rows":[
-//	  {"runlogOffset":1,"runId":"r_1","role":"user","agent":"","model":"","messageId":"m_1","text":"读一下 doc/19"},
-//	  {"runlogOffset":2,"runId":"r_1","role":"assistant","agent":"","model":"deepseek/deepseek-flash","text":"好的，我来读……"}
-//	],"nextOffset":2}
-//	404 {"error":"session_not_found"}
+//	200 {"code":0,"message":"","data":{
+//	  "rows":[
+//	    {"runlogOffset":1,"runId":"r_1","role":"user","agent":"","model":"","messageId":"m_1","text":"读一下 doc/19"},
+//	    {"runlogOffset":2,"runId":"r_1","role":"assistant","agent":"","model":"deepseek/deepseek-flash","text":"好的，我来读……"}
+//	  ],"nextOffset":2
+//	}}
+//	404 {"code":112001,"message":"找不到这场会话","data":null}
 //
 // 游标语义：`runlogOffset` 是 **session 内全局序号**（跨 run 单调，每条定稿记录占一个，
 // index+1 即 offset），跟 §2 那个 run 内的 eventOffset 是两个东西，别混。N 返回 offset **> N**
@@ -1076,7 +1091,7 @@ func (s *Server) getSessionLog(c *gin.Context) {
 	from := queryOffset(c, "runlogOffset")
 	if _, _, err := s.store.SessionAccess(c.Request.Context(), SessionID(c.Param("id")), p); err != nil {
 		if errors.Is(err, ErrSessionNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
+			writeEnvelope(c, http.StatusNotFound, codeSessionMissing, "找不到这场会话", nil)
 			return
 		}
 		internal(c, err)
@@ -1088,10 +1103,10 @@ func (s *Server) getSessionLog(c *gin.Context) {
 		return
 	}
 	if !exists {
-		c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
+		writeEnvelope(c, http.StatusNotFound, codeSessionMissing, "找不到这场会话", nil)
 		return
 	}
-	c.JSON(http.StatusOK, logResponse{Rows: rows, NextOffset: next})
+	writeEnvelope(c, http.StatusOK, codeOK, "", logResponse{Rows: rows, NextOffset: next})
 }
 
 // 字段序 = doc/29 §7.2 契约字节序（items 按 created_at DESC, id DESC）。
@@ -1108,6 +1123,7 @@ type memoryItemResponse struct {
 
 // getMemoryItems（doc/29 §7.2①）= 记忆列表（管理面 + 抽取验收口）。
 // kind 空 = 全部（含 episode）；limit 默认 50、上限 200（钳制在 ListMemoryItems）。
+// 信封（doc/40 A7-5）：200 {"code":0,"message":"","data":{"items":[…]}}；内层字段序仍按 doc/29 §7.2。
 func (s *Server) getMemoryItems(c *gin.Context) {
 	if ok, _ := s.memoryContext(c); !ok {
 		return
@@ -1126,7 +1142,7 @@ func (s *Server) getMemoryItems(c *gin.Context) {
 			SourceSeq: it.SourceSeq, CreatedAt: it.CreatedAt,
 		})
 	}
-	c.JSON(http.StatusOK, gin.H{"items": out})
+	writeEnvelope(c, http.StatusOK, codeOK, "", gin.H{"items": out})
 }
 
 // 字段序 = doc/29 §7.2② 契约字节序。
@@ -1141,6 +1157,7 @@ type memoryJobResponse struct {
 }
 
 // getMemoryJobs（doc/29 §7.2②）= 抽取任务状态（线一观测口）；runId 空 = 最近 20 条。
+// 信封（doc/40 A7-5）：200 {"code":0,"message":"","data":{"jobs":[…]}}。
 func (s *Server) getMemoryJobs(c *gin.Context) {
 	if ok, _ := s.memoryContext(c); !ok {
 		return
@@ -1157,11 +1174,12 @@ func (s *Server) getMemoryJobs(c *gin.Context) {
 			LastError: j.LastError, CreatedAt: j.CreatedAt, UpdatedAt: j.UpdatedAt,
 		})
 	}
-	c.JSON(http.StatusOK, gin.H{"jobs": out})
+	writeEnvelope(c, http.StatusOK, codeOK, "", gin.H{"jobs": out})
 }
 
 // getMemoryDialogue（doc/29 §7.2③）＝ 索引状态（线二观测口）；runId 空 = 最近 20 条。
 // passage 随行返回：B 组要验块内容，dev 观测口，块帽 4000 rune 可接受。
+// 信封（doc/40 A7-5）：200 {"code":0,"message":"","data":{"chunks":[…]}}。
 type dialogueChunkResponse struct {
 	RunID     RunID     `json:"runId"`
 	SessionID SessionID `json:"sessionId"`
@@ -1187,18 +1205,20 @@ func (s *Server) getMemoryDialogue(c *gin.Context) {
 			Truncated: ch.Truncated, IndexedAt: ch.IndexedAt, Passage: ch.Passage,
 		})
 	}
-	c.JSON(http.StatusOK, gin.H{"chunks": out})
+	writeEnvelope(c, http.StatusOK, codeOK, "", gin.H{"chunks": out})
 }
 
 // getMemoryRecall（doc/29 §7.2④）= 召回预览：与 Worker 的注入调用同一个 Store.Recall，
 // 开关同一份——预览显示的就是模型实际会看到的东西。q 空 = 400。
+// 信封（doc/40 A7-5）：200 {"code":0,"message":"","data":{block,memoryHits,dialogueHits,injectedRunes}}；
+// q 空是 400 {"code":111001,"message":"请求格式不对","data":null}。
 func (s *Server) getMemoryRecall(c *gin.Context) {
 	if ok, _ := s.memoryContext(c); !ok {
 		return
 	}
 	q := strings.TrimSpace(c.Query("q"))
 	if q == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request"})
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
 		return
 	}
 	res, err := s.store.Recall(c.Request.Context(), q)
@@ -1206,7 +1226,7 @@ func (s *Server) getMemoryRecall(c *gin.Context) {
 		internal(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
+	writeEnvelope(c, http.StatusOK, codeOK, "", gin.H{
 		"block":         res.Block,
 		"memoryHits":    res.MemoryHits,
 		"dialogueHits":  res.DialogueHits,
@@ -1216,13 +1236,23 @@ func (s *Server) getMemoryRecall(c *gin.Context) {
 
 // getMedia（doc/32 A4）= 前端把占位行里的 path 换回字节流的唯一出口。
 // 有登录身份时，path 必须是 workspaces/<wid>/...；先 Clean 再按清完的 wid 做 VisibleWorkspace。
-// 旧的 sessions/<sid>/...、越出工作区、看不见该工作区，都回旧的 404 {"error":"not_found"}。
 // 没有身份时仍相对 mediaRoot（单测探针）：越界 400，缺文件 404。
 // mime 按扩展名表（mediaMimeByExt，与 read_media_file 同表）；回流走 ServeContent（支持 Range）。
+//
+// **成功体是图片字节，不是 JSON —— 不套信封**（doc/40 §6）。套了就把 doc/32
+// 「对话里只存 path、显示时才换回字节」推翻。只有错误分支换信封，且把旧的一个
+// not_found 字符串拆成三种语义（doc/40 §4.3）：
+//
+//	200 <图片字节>（Content-Type 按扩展名）
+//	400 {"code":111001,"message":"请求格式不对","data":{"reason":"缺 path"}}
+//	400 {"code":111001,"message":"请求格式不对","data":{"reason":"路径越出 workspace"}}   ← 仅无身份的探针
+//	404 {"code":114001,"message":"找不到这个项目","data":null}   ← 工作区看不见
+//	404 {"code":114101,"message":"找不到这个文件","data":null}   ← 文件不存在／是目录
+//	404 {"code":114102,"message":"媒体路径不对","data":null}   ← path 不是 workspaces/<wid>/… 格式
 func (s *Server) getMedia(c *gin.Context) {
 	p := c.Query("path")
 	if p == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request", "reason": "缺 path"})
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", gin.H{"reason": "缺 path"})
 		return
 	}
 	root := s.mediaRoot
@@ -1230,12 +1260,12 @@ func (s *Server) getMedia(c *gin.Context) {
 	if who, ok := principalFrom(c); ok && who.TenantID != "" {
 		wid, inside, okPath := parseSessionMediaPath(p)
 		if !okPath {
-			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+			writeEnvelope(c, http.StatusNotFound, codeMediaPathBad, "媒体路径不对", nil)
 			return
 		}
 		if _, err := s.store.VisibleWorkspace(c.Request.Context(), wid, who.TenantID, who.UserID); err != nil {
 			if errors.Is(err, ErrWorkspaceNotFound) {
-				c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+				writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
 				return
 			}
 			internal(c, err)
@@ -1243,7 +1273,7 @@ func (s *Server) getMedia(c *gin.Context) {
 		}
 		dir, err := workspaceDir(s.mediaRoot, who.TenantID, wid)
 		if err != nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+			writeEnvelope(c, http.StatusNotFound, codeMediaMissing, "找不到这个文件", nil)
 			return
 		}
 		root = dir
@@ -1252,15 +1282,15 @@ func (s *Server) getMedia(c *gin.Context) {
 	full, err := resolveInWorkspace(root, rel)
 	if err != nil {
 		if _, ok := principalFrom(c); ok {
-			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+			writeEnvelope(c, http.StatusNotFound, codeMediaMissing, "找不到这个文件", nil)
 			return
 		}
-		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request", "reason": "路径越出 workspace"})
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", gin.H{"reason": "路径越出 workspace"})
 		return
 	}
 	fi, err := os.Stat(full)
 	if err != nil || fi.IsDir() {
-		c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+		writeEnvelope(c, http.StatusNotFound, codeMediaMissing, "找不到这个文件", nil)
 		return
 	}
 	f, err := os.Open(full)
@@ -1277,10 +1307,12 @@ func (s *Server) getMedia(c *gin.Context) {
 	http.ServeContent(c.Writer, c.Request, fi.Name(), fi.ModTime(), f)
 }
 
-// internal 是存储 / ID 生成故障的统一出口：客户端拿 19v6-01 §1 的 500 字节，原因只进服务端日志。
+// internal 是存储 / ID 生成故障的统一出口：客户端拿 500 信封，原因只进服务端日志。
+// doc/40 A7-1：全局 500 出口换成信封——全仓 76 处调用都走这里，一改全场生效，
+// 免得出现「某些端点已换信封、某些还是旧体」的半迁移状态。
 func internal(c *gin.Context, err error) {
 	log.Printf("%s %s: %v", c.Request.Method, c.Request.URL.Path, err)
-	c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+	writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
 }
 
 // queryOffset 解析拉取游标：缺省 / 非法 / 负数一律视为 0（契约只规定缺省=0，不发明新错误码）。
@@ -1315,6 +1347,8 @@ type journalResponse struct {
 // devJournal 是账本的 dev 观测端点（doc/30 §10.4，长期 dev 工具、只在 -dev 注册）：
 // 崩溃后 curl 一眼看到「模型说到哪、哪个工具可能跑过」。run 存在但账本已删（终态）= 200 rows:[]；
 // 未知 run = 404。顶层 epoch 是 runs.lease_epoch 当前值，每行 epoch 是写它时的令牌。
+// 信封（doc/40 A7-5）：200 {"code":0,"message":"","data":{runId,epoch,rows}}；
+// 未知 run 是 404 {"code":112002,"message":"找不到这次运行","data":null}。
 func (s *Server) devJournal(c *gin.Context) {
 	epoch, rows, found, err := s.store.JournalView(c.Request.Context(), RunID(c.Param("runId")))
 	if err != nil {
@@ -1322,7 +1356,7 @@ func (s *Server) devJournal(c *gin.Context) {
 		return
 	}
 	if !found {
-		c.JSON(http.StatusNotFound, gin.H{"error": "run_not_found"})
+		writeEnvelope(c, http.StatusNotFound, codeRunMissing, "找不到这次运行", nil)
 		return
 	}
 	resp := journalResponse{RunID: RunID(c.Param("runId")), Epoch: epoch, Rows: make([]journalRowResponse, 0, len(rows))}
@@ -1333,7 +1367,7 @@ func (s *Server) devJournal(c *gin.Context) {
 			Args: r.Args, Usage: r.Usage,
 		})
 	}
-	c.JSON(http.StatusOK, resp)
+	writeEnvelope(c, http.StatusOK, codeOK, "", resp)
 }
 
 // devReset 是 dev-only 全局归零（planning §4 脚手架表：长期 dev 工具，只在 dev 装配注册）。

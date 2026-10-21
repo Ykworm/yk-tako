@@ -25,9 +25,12 @@ import (
 //
 // 响应（字段序即契约字节序：name → command → state → tools → reason；servers 按短名字典序）：
 //
-//	200 {"servers":[{"name":"fs","command":"npx","state":"connected","tools":["mcp__fs__read_file",…]}],"count":1}
-//	200 {"servers":[{"name":"fs","command":"nope","state":"failed","tools":[],"reason":"…"}],"count":1}
-//	400 {"error":"mcp.json 解析失败（…）: …"}
+//	200 {"code":0,"message":"","data":{"servers":[{"name":"fs","command":"npx","state":"connected","tools":["mcp__fs__read_file",…]}],"count":1}}
+//	200 {"code":0,"message":"","data":{"servers":[{"name":"fs","command":"nope","state":"failed","tools":[],"reason":"…"}],"count":1}}
+//	400 {"code":111005,"message":"MCP 配置读不出来","data":{"reason":"mcp.json 解析失败（…）: …"}}
+//
+// 旧的 400 直接把 Go 原始错误串当 body 吐出来——那是机器细节。doc/40 A7-6 起固定 message，
+// 原因文字进 data.reason。
 //
 // state 两值：connected / failed（failed 带原因、每次请求重试拉起，command 修好即自愈）。
 // 连接缓存的临时语义（A3 换 run 级生命周期）见 ensureMcpConn。
@@ -243,7 +246,7 @@ func (s *Server) getMcpStatus(c *gin.Context) {
 func (s *Server) getMcpServers(c *gin.Context) {
 	cfg, err := loadMcpConfig(s.mcpConfPath)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		writeEnvelope(c, http.StatusBadRequest, codeBadMcpConf, "MCP 配置读不出来", gin.H{"reason": err.Error()})
 		return
 	}
 	names := sortedServerNames(cfg)
@@ -261,7 +264,7 @@ func (s *Server) getMcpServers(c *gin.Context) {
 		}
 		resp.Servers = append(resp.Servers, status)
 	}
-	c.JSON(http.StatusOK, resp)
+	writeEnvelope(c, http.StatusOK, codeOK, "", resp)
 }
 
 // mcpToolHandler 把 MCP 工具接进 run（A3，doc/33 §4.2/§5）：BeforeAgent 在 run 起手扫

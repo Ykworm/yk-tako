@@ -1,4 +1,6 @@
 // 协议层：19v6-01 §1–§4 期望字节的 TS 镜像。U1 只定义，U2–U5 消费。
+// **信封层（doc/40）**：`request` 是唯一拆包入口——成功剥出 `data`，失败抛 `ApiError`（带 code/message）。
+// 下面的返回类型不用改：信封里的 `data` 就是原来那个业务体，字段名一个没动。
 // 命名类型在 TS 里只是别名、不拦传参——「两种游标别混」靠参数名分开
 // （eventOffset / runlogOffset 各是各端点的参数，不存在统一 cursor 抽象）。
 import { authFetch } from './auth'
@@ -84,29 +86,52 @@ export type LogResponse = {
   nextOffset: number
 }
 
-export type ApiErrorBody = { error: string }
+// 信封（doc/40）：所有 JSON 接口统一回 {code,message,data}。
+// 成功：code=0、message 空串、data 是业务体；失败：code 是数字业务码、message 是弹窗文案、
+// data 为 null（或放诊断细节，如 413 的 limit/tokens、400 的 reason）。
+export type Envelope<T> = { code: number; message: string; data: T | null }
 
+// 业务码（doc/40 §4）。页面靠 code 分支，不靠拆 message 的句子。
+export const CODE_SESSION_MISSING = 112001 // 找不到这场会话
+export const CODE_RUN_MISSING = 112002 // 找不到这次运行
+export const CODE_SESSION_RUNNING = 112101 // 这场会话正在跑，等它跑完再发
+export const CODE_NOT_RESUMABLE = 112102 // 这场 run 已经定稿，没有可续的
+export const CODE_RUN_ALIVE = 112103 // 这场 run 还活着，别抢
+export const CODE_RESUME_EXHAUSTED = 112104 // 续跑次数用完了，重新发一轮
+
+// ApiError 是失败信封的载体：code 给分支用，message 直接就是弹窗文案（Error 自带的 message），
+// data 是可选的诊断细节。
 export class ApiError extends Error {
+  readonly code: number
+  readonly data: unknown
   constructor(
     readonly status: number,
-    readonly body: ApiErrorBody | null,
+    readonly envelope: Envelope<unknown>,
   ) {
-    super(`api ${status}: ${JSON.stringify(body)}`)
+    super(envelope.message || `api ${status}`)
+    this.name = 'ApiError'
+    this.code = envelope.code
+    this.data = envelope.data
   }
 }
 
+// request 是前端**唯一**的拆包入口：成功剥出 data，失败抛 ApiError。
+// 各接口的返回类型不用改——信封里的 data 就是原来那个业务体，字段名一个没动。
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await authFetch(url, init)
-  if (!res.ok) {
-    let body: ApiErrorBody | null = null
-    try {
-      body = (await res.json()) as ApiErrorBody
-    } catch {
-      // 非 JSON 错误体（契约外），body 保持 null
-    }
-    throw new ApiError(res.status, body)
+  let body: Envelope<T> | null = null
+  try {
+    body = (await res.json()) as Envelope<T>
+  } catch {
+    // 非 JSON 响应（代理错误页等），body 保持 null
   }
-  return (await res.json()) as T
+  if (!res.ok || !body || body.code !== 0) {
+    throw new ApiError(
+      res.status,
+      body ?? { code: -1, message: `请求失败（HTTP ${res.status}）`, data: null },
+    )
+  }
+  return body.data as T
 }
 
 // 入口图（doc/32 A1）：随 POST /api/runs 上行，服务端落盘换占位行——对话里只有 path。
@@ -166,7 +191,7 @@ export function postRuns(
   })
 }
 
-// GET /api/sessions/{sessionId}（19v6-01 §4）：404 = session_not_found。
+// GET /api/sessions/{sessionId}（19v6-01 §4）：404 = 找不到这场会话（code 112001）。
 export function getSession(sessionId: SessionID): Promise<SessionStatus> {
   return request<SessionStatus>(`/api/sessions/${encodeURIComponent(sessionId)}`)
 }
@@ -186,17 +211,17 @@ export function getLog(sessionId: SessionID, runlogOffset: number): Promise<LogR
 }
 
 // GET /api/runs/{runId}：读单场 run 的派生状态（doc/30 §10.1）。未知 run 是 404
-// {"error":"run_not_found"}；其余状态原样透出（complete/error/stopped）。
+// （code 112002）；其余状态原样透出（complete/error/stopped）。
 export function getRun(runId: RunID): Promise<RunState> {
   return request<RunState>(`/api/runs/${encodeURIComponent(runId)}`)
 }
 
 // POST /api/runs/{runId}/resume：接管一场崩溃的 run（doc/30 §8.2）。**无请求体**。
 //
-// 409 的三种语义要分开处置，调用方按 body.error 分支（doc/30 §10.2）：
-//   - 'run_alive'        → 已经有人在续了（多 tab / 刷新并发）：不是失败，转去重建帧面；
-//   - 'not_resumable'    → 这场已定稿或已终止，没有可续的东西；
-//   - 'resume_exhausted' → 续跑次数用尽（服务端 -resume-max，默认 3）。
+// 409 的三种语义要分开处置，调用方按 **code** 分支（doc/40 §4.2，doc/30 §10.2）：
+//   - CODE_RUN_ALIVE (112103)        → 已经有人在续了（多 tab / 刷新并发）：不是失败，转去重建帧面；
+//   - CODE_NOT_RESUMABLE (112102)    → 这场已定稿或已终止，没有可续的东西；
+//   - CODE_RESUME_EXHAUSTED (112104) → 续跑次数用尽（服务端 -resume-max，默认 3）。
 export function postResume(runId: RunID): Promise<ResumeResult> {
   return request<ResumeResult>(`/api/runs/${encodeURIComponent(runId)}/resume`, { method: 'POST' })
 }

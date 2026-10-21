@@ -2,6 +2,11 @@ import { ref } from 'vue'
 import { readTenant } from './auth'
 import {
   ApiError,
+  CODE_NOT_RESUMABLE,
+  CODE_RESUME_EXHAUSTED,
+  CODE_RUN_ALIVE,
+  CODE_SESSION_MISSING,
+  CODE_SESSION_RUNNING,
   getFrames,
   getLog,
   getRun,
@@ -194,7 +199,8 @@ export function useChat() {
         if (token === pollToken) pending.value.unshift(p)
       } else {
         assistant.state = 'error'
-        assistant.text = e instanceof ApiError ? `投递失败：${e.body?.error ?? e.status}` : '投递失败'
+        // message 就是信封里的弹窗文案（doc/40），不用再拼错误串。
+        assistant.text = e instanceof ApiError ? `投递失败：${e.message}` : '投递失败'
       }
     } finally {
       if (token === pollToken) busy.value = false
@@ -288,23 +294,24 @@ export function useChat() {
         await postResume(runId)
       } catch (e) {
         if (token !== pollToken) return
-        const code = e instanceof ApiError ? e.body?.error : ''
-        if (code === 'run_alive') {
+        // 三种 409 按业务码分支（doc/40 §4.2），不再比对文案。
+        const code = e instanceof ApiError ? e.code : 0
+        if (code === CODE_RUN_ALIVE) {
           // 别人已经在续：跟着重建帧面，不报错。
           await pollFrames(runId, b, 0, token)
           return
         }
-        if (code === 'not_resumable') {
+        if (code === CODE_NOT_RESUMABLE) {
           await closeOut(runId, b, null)
           return
         }
-        if (code === 'resume_exhausted') {
+        if (code === CODE_RESUME_EXHAUSTED) {
           b.state = 'interrupted'
           b.resumable = false
           return
         }
         b.state = 'error'
-        b.text = e instanceof ApiError ? `续跑失败：${e.body?.error ?? e.status}` : '续跑失败'
+        b.text = e instanceof ApiError ? `续跑失败：${e.message}` : '续跑失败'
         return
       }
       if (token !== pollToken) return
@@ -617,14 +624,14 @@ export function useChat() {
   return { sessionId, bubbles, draft, attachments, busy, pending, loadingOlder, atStart, send, reconcile, loadOlder, newSession, showTenantSession, resumeRun }
 }
 
-// 409 = 闸被占（19v6-01 §1），处置是排队；404 session_not_found = 本地 sid 已成僵尸，处置是懒建重投。
-// 只认 error 码不认 HTTP 状态：500 与 404 都可能是别的原因。
+// 409 = 闸被占（19v6-01 §1），处置是排队；404 找不到这场会话（112001）= 本地 sid 已成僵尸，处置是懒建重投。
+// 只认业务码不认 HTTP 状态：500 与 404 都可能是别的原因（doc/40 §4）。
 function isBusy(e: unknown): boolean {
-  return e instanceof ApiError && e.body?.error === 'session_busy'
+  return e instanceof ApiError && e.code === CODE_SESSION_RUNNING
 }
 
 function isNotFound(e: unknown): boolean {
-  return e instanceof ApiError && e.body?.error === 'session_not_found'
+  return e instanceof ApiError && e.code === CODE_SESSION_MISSING
 }
 
 function sleep(ms: number) {

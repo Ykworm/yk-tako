@@ -312,15 +312,18 @@ func (w *Worker) startArchiveSweeper() {
 
 // devCleanSweep 同步跑一轮清扫。dev 组才挂这条路由，不带登录。
 // 没抢到租约也是 200，swept 为 0，这样两个进程对打时输的一方有明确字节。
+// 信封（doc/40 A7-6，D1 已拍 dev 端点一起换）：
+// 200 {"code":0,"message":"","data":{"swept":N,"watermark":"…"}}
+// 500 {"code":111901,"message":"服务暂时不可用，请再试一次","data":null}
 func (s *Server) devCleanSweep(c *gin.Context) {
 	if s.worker == nil || s.store == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "sweep_failed"})
+		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
 		return
 	}
 	ttl := s.worker.archiveTTL
 	if ttl <= 0 {
 		log.Printf("POST /api/dev/clean-sweep: archive ttl 未配置")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "sweep_failed"})
+		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
 		return
 	}
 	swept, wm, err := s.store.SweepArchived(c.Request.Context(), ttl, archiveSweepBatch, s.worker.workspace)
@@ -330,10 +333,10 @@ func (s *Server) devCleanSweep(c *gin.Context) {
 	}
 	if err != nil {
 		log.Printf("POST /api/dev/clean-sweep: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "sweep_failed"})
+		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
+	writeEnvelope(c, http.StatusOK, codeOK, "", gin.H{
 		"swept":     swept,
 		"watermark": wm.UTC().Format(time.RFC3339Nano),
 	})

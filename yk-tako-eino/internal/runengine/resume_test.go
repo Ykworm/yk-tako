@@ -118,19 +118,19 @@ func TestResumeHandlerErrorMapping(t *testing.T) {
 		return w, body
 	}
 
-	// 404：未知 run（账本读空，落到 claim 的 errRunNotFound）。
-	if w, body := call("r_a5_missing"); w.Code != http.StatusNotFound || body["error"] != "run_not_found" {
-		t.Fatalf("未知 run = %d %v, want 404 run_not_found", w.Code, body)
+	// 404：未知 run（账本读空，落到 claim 的 errRunNotFound）。信封：code=112002。
+	if w, body := call("r_a5_missing"); w.Code != http.StatusNotFound || body["code"] != float64(codeRunMissing) {
+		t.Fatalf("未知 run = %d %v, want 404 code %d", w.Code, body, codeRunMissing)
 	}
 
-	// 409 not_resumable：已定稿的 run 没有可续的东西；行状态原样不动。
+	// 409 not_resumable：已定稿的 run 没有可续的东西；行状态原样不动。信封：code=112102。
 	sid, rid := SessionID("s_a5_map"), RunID("r_a5_map")
 	s.mustAcquire(t, sid, rid, "m_a5_map", "hi")
 	if _, _, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, nil, nil); err != nil || !ok {
 		t.Fatalf("EndRun = (ok=%v, err=%v), want ok", ok, err)
 	}
-	if w, body := call(rid); w.Code != http.StatusConflict || body["error"] != "not_resumable" {
-		t.Fatalf("complete run resume = %d %v, want 409 not_resumable", w.Code, body)
+	if w, body := call(rid); w.Code != http.StatusConflict || body["code"] != float64(codeNotResumable) {
+		t.Fatalf("complete run resume = %d %v, want 409 code %d", w.Code, body, codeNotResumable)
 	}
 	var epoch int64
 	if err := s.db.WithContext(ctx).Raw(`SELECT lease_epoch FROM runs WHERE id = ?`, rid).Scan(&epoch).Error; err != nil {
@@ -142,7 +142,7 @@ func TestResumeHandlerErrorMapping(t *testing.T) {
 }
 
 // TestResumeDeletedSession 钉已删会话的 run 不能复活。
-// resume 先走 viewRun → SessionAccess。deleted_at 非空时这里回 404 run_not_found，ClaimResume 不跑。
+// resume 先走 viewRun → SessionAccess。deleted_at 非空时这里回 404（code 112002），ClaimResume 不跑。
 func TestResumeDeletedSession(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t, testLease, testTTL)
@@ -168,8 +168,8 @@ func TestResumeDeletedSession(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 		t.Fatalf("响应不是 JSON: %q", w.Body.String())
 	}
-	if w.Code != http.StatusNotFound || body["error"] != "run_not_found" {
-		t.Fatalf("已删会话 resume = %d %v, want 404 run_not_found", w.Code, body)
+	if w.Code != http.StatusNotFound || body["code"] != float64(codeRunMissing) {
+		t.Fatalf("已删会话 resume = %d %v, want 404 code %d", w.Code, body, codeRunMissing)
 	}
 	if !s.sqlBool(t, `SELECT lease_epoch = 1 AND status = 'running' FROM runs WHERE id = ?`, rid) {
 		t.Fatal("拒掉后 run 的 epoch 或 status 变了")
