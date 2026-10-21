@@ -207,6 +207,11 @@ npm run build                     # vue-tsc -b && vite build
 - 单元测试不打模型，不需要 API Key。
 - 每拍收尾跑 `go test ./internal/runengine` + `go vet ./internal/runengine`；改前端再加 `npm run typecheck`。
 - 依赖与手动启动方式见根 `README.md`。
+- **`DELETE /api/dev/reset` 是全库 TRUNCATE**（`store.go` 的 `Reset`：清 15 张表 + `SCAN tk:*` 全删 Redis 键）。
+  它只在 `-dev` 模式注册、且**无认证**——但没有「只清某个租户」的参数，**清不掉单个测试账号**。
+  **别拿它清测试数据**：开发库 5433 里的会话历史、账号、租户配置会一起没（2026-10-21 出过一次）。
+  要删自己的测试数据，用它自己那张表的 `DELETE`（如 `DELETE FROM memory_items WHERE tenant_id=$1`），
+  或起一个一次性实例跑。台账里「不要调 `/api/dev/reset`」这条规矩就是为它写的。
 
 ## 环境
 
