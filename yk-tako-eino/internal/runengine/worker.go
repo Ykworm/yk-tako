@@ -121,7 +121,9 @@ type Worker struct {
 	workspace     string
 	compactWindow int
 	compactLimit  int // = compactLimitFor(window)（window=0 时 0）：触发线 / 准入线两处共用，不各自重算；摘要预算帽自 A7 起归 summarizeCeiling 分档
-	counter       TokenCounter
+	// archiveTTL 是 -archive-ttl。清扫器和 resume 过期判断读同一个值。
+	archiveTTL time.Duration
+	counter    TokenCounter
 	// runCancels 是手动停止（doc/17 §4）的进程内取消注册表：runID → *runCancel。
 	// stop 端点赢竞态后查它，命中（本进程在跑这场 run）即 cancel、不等续约 tick（用户停止永远最大，
 	// 不看 epoch）；跨副本传播走 watchdog：续约 CAS 0 行 → 查它、**epoch 相同才** cancel
@@ -174,7 +176,7 @@ type runCancel struct {
 //
 // mediaSend 是 TAKO_MEDIA_SEND（默认开，字面 off 才关）。关时不挂媒体包壳，模型输入与占位逐字节相同。
 func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, system, workspace, agentsDir string, leaseRenew time.Duration,
-	compactWindow int, modelRef string, maxOutput int, subagentConcurrency, subagentReturnCap int, resolver ModelResolver, counter TokenCounter, mediaSend bool) (*Worker, error) {
+	compactWindow int, modelRef string, maxOutput int, subagentConcurrency, subagentReturnCap int, resolver ModelResolver, counter TokenCounter, mediaSend bool, archiveTTL time.Duration) (*Worker, error) {
 	// file_effect 启动 lint（C5-A4，fileops.go）：F1 起注册表非空（write_file 首条），
 	// lint 从空转变成真检查——此后任何文件工具漏声明 = 启动失败。
 	if err := lintFileEffects(firstPartyFileEffects); err != nil {
@@ -256,7 +258,7 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		&mcpToolHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, confPath: defaultMcpConfPath},
 		newAgentSpecHandler(agentsDir, store, workspace, chat, modelRef, translate, resolver,
 			make(chan struct{}, subagentConcurrency), subagentReturnCap,
-			counter, compactWindow, compactLimit, sum.summarize, firstPartyFileEffects),
+			counter, compactWindow, compactLimit, sum.summarize, firstPartyFileEffects, archiveTTL),
 		// 工具目录分级（T4/T5，toolsearch.go）：排在 mcp 与 agentSpec 之后——BeforeAgent 建的完整目录
 		// 要含两者 append 的工具；tool_search 自己在本 handler 里入池，不进子代理入口快照。
 		// BeforeModelRewriteState 每轮用完整目录重建声明面（mcp__ 只留已激活项）。
@@ -284,13 +286,14 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 	// 子代理入口快照在此前已完成，拿的是未包壳工具，内部调用不记账。
 	handlers = append(handlers, &journalWrapHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, store: store})
 	w := &Worker{store: store, sum: sum, chat: chat, tools: pool, handlers: handlers, translate: translate, system: system,
-		rootRef: modelRef, leaseRenew: leaseRenew, workspace: workspace, compactWindow: compactWindow, compactLimit: compactLimit, counter: counter}
+		rootRef: modelRef, leaseRenew: leaseRenew, workspace: workspace, compactWindow: compactWindow, compactLimit: compactLimit, archiveTTL: archiveTTL, counter: counter}
 	// 启动时先建一次，配置坏了立刻退出。每场 run 再新建，避免多个租户共用一个 agent 实例时取消互相踩掉。
 	agent, err := w.newRunAgent(context.Background())
 	if err != nil {
 		return nil, err
 	}
 	w.agent = agent
+	w.startArchiveSweeper()
 	return w, nil
 }
 

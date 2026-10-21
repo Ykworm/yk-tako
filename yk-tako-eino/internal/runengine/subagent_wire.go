@@ -1,4 +1,4 @@
-// 本文件是子代理实例档案（doc/38）：每次委派一份 JSONL，
+// 本文件是子代理实例档案（doc/39）：每次委派一份 JSONL，
 // 落在 <会话目录>/.tako/subagents/<sa_id>.jsonl。
 // 挂载了项目的会话也写会话目录，不写项目目录——删会话时 .tako/ 一起清掉。
 //
@@ -122,7 +122,8 @@ func openSubagentWire(dir, saID, agentName, modelRef, runID, resumedFrom string)
 
 // beginDelegationWire 在内层开跑前铸实例。没有作业根、目录算不出、落盘失败都只记日志，
 // 委派照常跑——档案是增强，不是这次调用能不能完成的条件。
-func beginDelegationWire(ctx context.Context, agentName string) (context.Context, *subagentWire) {
+// resumedFrom 写进新档案的 metadata：普通委派是空字符串，resume 填被续上的那份 sa_id。
+func beginDelegationWire(ctx context.Context, agentName, resumedFrom string) (context.Context, *subagentWire) {
 	ref, ok := workspaceFrom(ctx)
 	if !ok {
 		return ctx, nil
@@ -145,7 +146,7 @@ func beginDelegationWire(ctx context.Context, agentName string) (context.Context
 	if target, ok := journalTargetFrom(ctx); ok {
 		runID = string(target.runID)
 	}
-	w, err := openSubagentWire(dir, saID, agentName, modelRef, runID, "")
+	w, err := openSubagentWire(dir, saID, agentName, modelRef, runID, resumedFrom)
 	if err != nil {
 		log.Printf("subagent wire %s: 开档失败: %v", saID, err)
 		return ctx, nil

@@ -79,6 +79,7 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 	r.PATCH("/api/sessions/:id/visibility", authn, s.patchSessionVisibility)
 	r.PATCH("/api/sessions/:id", authn, s.patchSessionWorkspace)
 	r.GET("/api/sessions/:id", authn, s.getSession)
+	r.DELETE("/api/sessions/:id", authn, s.deleteSession)
 	r.GET("/api/sessions/:id/subagents", authn, s.getSessionSubagents)
 	r.GET("/api/runs/:runId/frames", authn, s.getFrames)
 	r.GET("/api/runs/:runId/stream", authn, s.getRunStream)
@@ -143,6 +144,7 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 		r.POST("/api/dev/workspace/file", authn, s.postDevFile)
 		r.GET("/api/dev/workspace/file", authn, s.getDevFile)
 		r.POST("/api/dev/workspace/bash", authn, s.postDevBash)
+		r.POST("/api/dev/clean-sweep", s.devCleanSweep)
 	}
 	return r
 }

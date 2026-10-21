@@ -111,6 +111,7 @@ func main() {
 	leaseRenew := flag.Duration("lease-renew", durationEnv("TAKO_LEASE_RENEW", defaultLeaseRenew), "watchdog renew interval (must be < lease-ttl; env TAKO_LEASE_RENEW)")
 	compactWindow := flag.Int("compact-window", defaultCompactWindow, "context window in tokens for compaction; limit = window - min(window/5, 16384); 0 disables")
 	resumeMax := flag.Int("resume-max", 3, "max resumes per run (doc/30); resumeCount = lease_epoch-1, resumable while below it")
+	archiveTTL := flag.Duration("archive-ttl", 168*time.Hour, "how long compacted transcripts and soft-deleted session archives stay before the sweeper removes them")
 	agentsDir := flag.String("agents-dir", "agents", "directory of sub-agent specs (*.md + YAML frontmatter); scanned at each run start (relative to CWD)")
 	workspace := flag.String("workspace", "./workspace", "workspace root for first-party file tools; created at startup, tools are confined to it")
 	subagentConcurrency := flag.Int("subagent-concurrency", 8, "max concurrent subagent delegations (process-wide semaphore; must be >= 1)")
@@ -135,6 +136,9 @@ func main() {
 	// 手误与默认值混淆同款，启动即退（与上面的闸容量同一处置）。
 	if *resumeMax < 1 {
 		log.Fatalf("resume-max %d < 1：至少要 1 次续跑（0 = 崩溃后永远不可续）", *resumeMax)
+	}
+	if *archiveTTL <= 0 {
+		log.Fatalf("archive-ttl %s 必须大于 0（默认 168h）", *archiveTTL)
 	}
 
 	ctx := context.Background()
@@ -269,7 +273,7 @@ func main() {
 	// T3：agentsDir 只是规格目录位置（装载是 run 起手扫盘、失败降级为 log）——目录不存在不算启动错误。
 	mediaSend := envOn("TAKO_MEDIA_SEND")
 	log.Printf("media: send=%v", mediaSend)
-	worker, err := runengine.NewWorker(store, opened.Chat, runengine.TranslatorFor(string(opened.Protocol)), config.SystemPrompt(), wsAbs, *agentsDir, *leaseRenew, *compactWindow, opened.Ref, maxOutput, *subagentConcurrency, *subagentReturnCap, modelRegistryResolver{modelRegistry}, counter, mediaSend)
+	worker, err := runengine.NewWorker(store, opened.Chat, runengine.TranslatorFor(string(opened.Protocol)), config.SystemPrompt(), wsAbs, *agentsDir, *leaseRenew, *compactWindow, opened.Ref, maxOutput, *subagentConcurrency, *subagentReturnCap, modelRegistryResolver{modelRegistry}, counter, mediaSend, *archiveTTL)
 	if err != nil {
 		log.Fatalf("agent 装配: %v", err)
 	}
@@ -280,6 +284,7 @@ func main() {
 		log.Printf("compact off (-compact-window 0)")
 	}
 	log.Printf("subagents: concurrency %d, return cap %d B", *subagentConcurrency, *subagentReturnCap)
+	log.Printf("archive ttl %s", *archiveTTL)
 	r := runengine.NewRouter(store, *batch, *dev, worker, *resumeMax, auth)
 	log.Fatal(r.Run(*engine))
 }

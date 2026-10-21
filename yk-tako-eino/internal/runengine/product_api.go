@@ -238,6 +238,49 @@ func (s *Server) deleteWorkspace(c *gin.Context) {
 	}
 }
 
+// deleteSession 软删属主自己的一场会话。看不见走旧体 404，看得见但不是本人走 111204。
+// 有活 run 则 409，行和目录都留着。成功先提交，再只删会话目录下的 .tako 与 .media。
+// 产出文件和项目目录不动。目录删失败只记日志，响应仍是 deleted。
+func (s *Server) deleteSession(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	id := SessionID(c.Param("id"))
+	err := s.store.DeleteSession(c.Request.Context(), p.TenantID, p.UserID, id)
+	switch {
+	case errors.Is(err, ErrSessionNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": "session_not_found"})
+	case errors.Is(err, ErrSessionForbidden):
+		writeEnvelope(c, http.StatusForbidden, codeNotOwner, "只有本人能修改", nil)
+	case errors.Is(err, ErrSessionBusy):
+		writeEnvelope(c, http.StatusConflict, codeSessionBusy, "这场会话正在运行，等它跑完再删", nil)
+	case err != nil:
+		log.Printf("DELETE /api/sessions/%s: %v", id, err)
+		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
+	default:
+		removeSessionSystemArchives(s.mediaRoot, p.TenantID, id)
+		writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+			Status string `json:"status"`
+		}{Status: "deleted"})
+	}
+}
+
+// removeSessionSystemArchives 删这场会话目录里的系统档案。产出留在会话目录里。
+// .tako 是搜索截断和子代理 wire，.media 是旧媒体兜底。目录不存在算成功。
+func removeSessionSystemArchives(root, tenantID string, id SessionID) {
+	dir, err := sessionDir(root, tenantID, id)
+	if err != nil {
+		log.Printf("DELETE session %s: %v", id, err)
+		return
+	}
+	for _, name := range []string{".tako", ".media"} {
+		if err := os.RemoveAll(filepath.Join(dir, name)); err != nil {
+			log.Printf("DELETE session %s %s: %v", id, name, err)
+		}
+	}
+}
+
 func workspaceNameFrom(c *gin.Context) (string, bool) {
 	var req struct {
 		Name string `json:"name"`

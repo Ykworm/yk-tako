@@ -415,11 +415,12 @@ func TestAgentSpecModelBranches(t *testing.T) {
 	}
 	mainTranslate := claudeChunkText
 	h := newAgentSpecHandler(dir, newTestStore(t, time.Minute, time.Minute), "/tmp/agents-test-ws", &fakeModel{}, "main/ref", mainTranslate, resolver, make(chan struct{}, 8), 51200,
-		fakeCounter{f: func(string) int { return 0 }}, 0, 0, nil, nil)
+		fakeCounter{f: func(string) int { return 0 }}, 0, 0, nil, nil, subagentArchiveTTL)
 
 	ctx := withAgentModelTable(context.Background(), newAgentModelTable("main/ref", mainTranslate))
 	runCtx := &adk.ChatModelAgentContext{Tools: []tool.BaseTool{gt}}
-	if _, _, err := h.BeforeAgent(ctx, runCtx); err != nil {
+	gotCtx, _, err := h.BeforeAgent(ctx, runCtx)
+	if err != nil {
 		t.Fatalf("BeforeAgent 不返回错误（装载面全部降级为 log）: %v", err)
 	}
 
@@ -428,9 +429,9 @@ func TestAgentSpecModelBranches(t *testing.T) {
 		t.Fatalf("resolver 调用应为 [gpt-x nope/x]（关键词档不得进注册表）, 实得 %v", resolver.calls)
 	}
 
-	// 池 = 基座 1 + 装载成功 5（badref 拒载）。
-	if len(runCtx.Tools) != 6 {
-		t.Fatalf("工具池应 1+5=6，实得 %d", len(runCtx.Tools))
+	// 池 = 基座 1 + 装载成功 5（badref 拒载）+ resume_subagent。
+	if len(runCtx.Tools) != 7 {
+		t.Fatalf("工具池应 1+5+resume=7，实得 %d", len(runCtx.Tools))
 	}
 	names := map[string]bool{}
 	for _, tl := range runCtx.Tools {
@@ -440,10 +441,18 @@ func TestAgentSpecModelBranches(t *testing.T) {
 		}
 		names[info.Name] = true
 	}
-	for _, want := range []string{"get_time", "absent", "inherits", "capped", "zh", "okref"} {
+	for _, want := range []string{"get_time", "absent", "inherits", "capped", "zh", "okref", resumeSubagentToolName} {
 		if !names[want] {
 			t.Fatalf("池里应有 %q: %v", want, names)
 		}
+	}
+	asm := subagentAssemblyFrom(gotCtx)
+	if asm == nil || len(asm.base) != 1 {
+		t.Fatalf("子代理入口快照应只有基座: %#v", asm)
+	}
+	baseInfo, err := asm.base[0].Info(ctx)
+	if err != nil || baseInfo.Name != "get_time" {
+		t.Fatalf("入口快照 = %v %v，应是 get_time，不含委派和 resume", baseInfo, err)
 	}
 	if names["badref"] {
 		t.Fatal("badref 应被拒载，委派工具不得入池")

@@ -143,6 +143,7 @@ const (
 	codeWorkspaceBusy         = 114004
 	codeWorkspaceDefault      = 114005
 	codeWorkspaceBusyLive     = 114006
+	codeSessionBusy           = 114007
 	codeInternal              = 111901
 )
 

@@ -25,6 +25,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/cloudwego/eino/adk"
@@ -264,6 +265,7 @@ type agentSpecHandler struct {
 	foldLimit     int                                           // = compactLimit
 	foldSummarize func(context.Context, string) (string, error) // = w.sum.summarize
 	foldEffects   map[string]string                             // = firstPartyFileEffects
+	archiveTTL    time.Duration                                 // -archive-ttl，resume 过期与清扫器同一个数
 }
 
 // newAgentSpecHandler 组装载 handler。dir 是规格目录（相对 CWD 或绝对路径）；
@@ -273,11 +275,12 @@ type agentSpecHandler struct {
 // 是子代理折叠链（doc/17 §6）——全部沿用主 run 的实例，不另设旗标。
 func newAgentSpecHandler(dir string, store *Store, workspace string, m model.BaseChatModel, mainRef string, mainTranslate Translator,
 	r ModelResolver, sem chan struct{}, returnCap int,
-	counter TokenCounter, window, limit int, summarize func(context.Context, string) (string, error), fileEffects map[string]string) *agentSpecHandler {
+	counter TokenCounter, window, limit int, summarize func(context.Context, string) (string, error), fileEffects map[string]string, archiveTTL time.Duration) *agentSpecHandler {
 	return &agentSpecHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{},
 		dir: dir, store: store, workspace: workspace, model: m, modelRef: mainRef, translate: mainTranslate,
 		resolver: r, sem: sem, returnCap: returnCap,
-		foldCounter: counter, foldWindow: window, foldLimit: limit, foldSummarize: summarize, foldEffects: fileEffects}
+		foldCounter: counter, foldWindow: window, foldLimit: limit, foldSummarize: summarize, foldEffects: fileEffects,
+		archiveTTL: archiveTTL}
 }
 
 // delegationTool 是委派工具的预算包壳（T3-3）：并发闸（sem）+ 回传裁剪（capBytes），
@@ -304,45 +307,54 @@ func (d *delegationTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
 // 同属「终稿出不来」一类——转成错误文本当这次委派的工具结果，父 run 保持 complete；
 // 其余错误（含手动停止的 ctx 取消）维持裸上抛。
 func (d *delegationTool) InvokableRun(ctx context.Context, args string, opts ...tool.Option) (string, error) {
+	inner, ok := d.inner.(tool.InvokableTool)
+	if !ok {
+		return "", fmt.Errorf("委派工具 %s: 内层不可调用（装配错误）", d.name)
+	}
+	return runSubagentGuarded(ctx, d.store, d.sem, d.capBytes, d.name, "", func(ctx context.Context) (string, error) {
+		return inner.InvokableRun(ctx, args, opts...)
+	})
+}
+
+// runSubagentGuarded 是委派和 resume 共用的后半段：占闸、开新档案、跑内层、截断后接实例 id、写 terminal。
+// 调用方要在进这里之前做完会拒绝的检查。拒绝路径不占闸、不开档案。
+// resumedFrom 空字符串是普通委派；resume 填原 sa_id。agentName 是规格名，写进新档案的 agent_name。
+func runSubagentGuarded(ctx context.Context, store *Store, sem chan struct{}, capBytes int, agentName, resumedFrom string, call func(context.Context) (string, error)) (string, error) {
 	// 有 Redis 时租户槽就是闸：进程级 sem 会让 A 占满本进程后，B 即使自己还有额度也在这里等。
 	// 没有 Redis（单测）才用进程级 sem。
-	useProcessSem := d.store == nil || d.store.rdb == nil
-	if d.store != nil {
-		ok, err := d.store.trySubagentSlot(ctx)
+	useProcessSem := store == nil || store.rdb == nil
+	if store != nil {
+		ok, err := store.trySubagentSlot(ctx)
 		if err != nil {
 			return fmt.Sprintf("错误：子代理额度检查失败：%v", err), nil
 		}
 		if !ok {
 			return "错误：这个工作区的子代理额度用完了", nil
 		}
-		defer d.store.releaseSubagentSlot(context.WithoutCancel(ctx))
+		defer store.releaseSubagentSlot(context.WithoutCancel(ctx))
 	}
 	if useProcessSem {
 		select {
-		case d.sem <- struct{}{}:
-			defer func() { <-d.sem }()
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
 		case <-ctx.Done():
 			return "", ctx.Err()
 		}
 	}
-	inner, ok := d.inner.(tool.InvokableTool)
-	if !ok {
-		return "", fmt.Errorf("委派工具 %s: 内层不可调用（装配错误）", d.name)
-	}
-	// 档案在内层开跑前铸。开档失败时 wire 为 nil，回传不带实例 id，委派照旧。
-	ctx, wire := beginDelegationWire(ctx, d.name)
+	// 档案在内层开跑前铸。开档失败时 wire 为 nil，回传不带实例 id，调用照旧。
+	ctx, wire := beginDelegationWire(ctx, agentName, resumedFrom)
 	if wire != nil {
 		defer wire.close()
 	}
-	out, err := inner.InvokableRun(ctx, args, opts...)
+	out, err := call(ctx)
 	if err != nil {
 		if strings.Contains(err.Error(), foldChainErrorMark) {
-			text := withSubagentInstance(fmt.Sprintf("错误：子代理 %s 上下文折叠失败：%v", d.name, err), subagentWireID(wire))
+			text := withSubagentInstance(fmt.Sprintf("错误：子代理 %s 上下文折叠失败：%v", agentName, err), subagentWireID(wire))
 			wire.finish("error", text)
 			return text, nil
 		}
 		if IsOverflowError(err) {
-			text := withSubagentInstance(fmt.Sprintf("错误：子代理 %s 上下文窗口溢出：%v", d.name, err), subagentWireID(wire))
+			text := withSubagentInstance(fmt.Sprintf("错误：子代理 %s 上下文窗口溢出：%v", agentName, err), subagentWireID(wire))
 			wire.finish("error", text)
 			return text, nil
 		}
@@ -350,7 +362,7 @@ func (d *delegationTool) InvokableRun(ctx context.Context, args string, opts ...
 		return "", err
 	}
 	// 先按帽截断正文，再把实例 id 接在末尾，帽不会把 id 切掉。
-	text := withSubagentInstance(truncateDelegationReturn(out, d.capBytes), subagentWireID(wire))
+	text := withSubagentInstance(truncateDelegationReturn(out, capBytes), subagentWireID(wire))
 	wire.finish("complete", text)
 	return text, nil
 }
@@ -438,7 +450,10 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 		}
 	}
 	table := agentModelTableFrom(ctx) // 本 run 的身份表（worker.Run 建并塞 ctx）；写帧/drain 读它，见 worker.go
-	base := runCtx.Tools              // 入口快照：继承档取它（此刻无任何委派工具 = 禁嵌套）
+	// 拷一份入口快照。后面往 runCtx.Tools 追加的委派工具和 resume_subagent 不在这份里，
+	// 子代理继承它 = 拿不到委派，也拿不到 resume。
+	base := append([]tool.BaseTool(nil), runCtx.Tools...)
+	ctx = withSubagentAssembly(ctx, &subagentAssembly{base: base, snap: snap, specs: specs})
 	var loaded []string
 	for _, spec := range specs {
 		pool, err := resolveToolPool(ctx, spec, base)
@@ -448,47 +463,16 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 		}
 		// model 三写法分流（19v6-05 §4）：写法一/二（不写 / default|inherit|继承，大小写不敏感）
 		// = 继承主实例，不进注册表；写法三 = ref 档 → ModelResolver 解析，失败拒该条、其余照载。
-		subModel := h.model
-		entry := agentModelEntry{ref: h.modelRef, translate: h.translate}
-		resolver := h.resolver
-		if prof := profileFrom(ctx); prof != nil {
-			if prof.Model != nil {
-				subModel = prof.Model
-				entry = agentModelEntry{ref: prof.ModelRef, translate: prof.Translator}
-			}
-			if prof.Resolver != nil {
-				resolver = prof.Resolver
-			}
-		}
-		if ref := strings.TrimSpace(spec.Model); ref != "" && !isInheritRef(ref) {
-			inst, err := resolver.Get(ctx, ref)
-			if err != nil {
-				log.Printf("agents: %s: 拒载: model %q: %v", spec.Name, ref, err)
-				continue
-			}
-			subModel = inst.Chat
-			entry = agentModelEntry{ref: inst.Ref, translate: TranslatorFor(inst.Protocol)}
+		subModel, entry, err := h.resolveSpecModel(ctx, spec)
+		if err != nil {
+			log.Printf("agents: %s: 拒载: %v", spec.Name, err)
+			continue
 		}
 		instruction := spec.Prompt + "\n\n" + snap
 		// 子代理的目录分级（T4/T5 A2）：只有显式写进 tools: 才挂自己的 toolSearchHandler——
 		// 每条规格一份完整目录/激活集，tool_search 只搜自己的池。继承档与 exclude_tools 档
 		// 不自动加（2026-10-20 已拍），其 MCP 工具照旧全部 direct 声明。
 		wantSearch := specWantsToolSearch(spec)
-		handlers := []adk.ChatModelAgentMiddleware{
-			&callerStampMiddleware{
-				BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, name: spec.Name,
-			},
-		}
-		if wantSearch {
-			handlers = append(handlers, newToolSearchHandler())
-		}
-		// wire 紧挨折叠之前：折叠会换短 state.Messages，先把折前新增行追加进档案。
-		// handler 本身无调用态，写句柄在 ctx（doc/38，同 callerStampMiddleware）。
-		handlers = append(handlers, newWireAppendHandler())
-		// 子代理折叠（doc/17 §6）：追加进同一列表，按规格名造——handler 无状态
-		// （同 run 内并行同名委派共用一个实例），字段全是每规格常量。
-		handlers = append(handlers, newAgentFoldHandler(spec.Name, h.foldCounter, h.foldWindow, h.foldLimit,
-			h.foldSummarize, h.foldEffects))
 		sub, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
 			Name:        spec.Name,
 			Description: spec.Description,
@@ -500,7 +484,7 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 			ToolsConfig:   adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: pool}},
 			// 调用方身份标记（doc/22 §4）：web_search 按它查 agentModelTable 取该子代理自己的
 			// 生效 ref——不挂标记工具只能报错，挂主 ref 会把子代理的搜索打错厂商。
-			Handlers: handlers,
+			Handlers: h.subagentHandlers(spec.Name, wantSearch),
 		})
 		if err != nil {
 			log.Printf("agents: %s: 拒载: 子代理装配失败: %v", spec.Name, err)
@@ -531,7 +515,56 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 	} else {
 		log.Printf("agents: %d spec(s): %s", len(loaded), strings.Join(loaded, ", "))
 	}
+	// resume 挂在入口快照之后，子代理池里没有它。账本包壳在本 handler 之后，根上的这次调用会计账。
+	runCtx.Tools = append(runCtx.Tools, newResumeSubagentTool(h))
 	return ctx, runCtx, nil
+}
+
+// resolveSpecModel 按规格的 model 行选出这一场要用的模型。
+// 不写、或 default|inherit|继承：用当前 run 的主模型（租户 profile 优先于进程启动时的那份）。
+// 写了具体 ref：问当前解析器要实例。解析失败把原因交回去，调用方决定拒载还是回错误文本。
+func (h *agentSpecHandler) resolveSpecModel(ctx context.Context, spec AgentSpec) (model.BaseChatModel, agentModelEntry, error) {
+	subModel := h.model
+	entry := agentModelEntry{ref: h.modelRef, translate: h.translate}
+	resolver := h.resolver
+	if prof := profileFrom(ctx); prof != nil {
+		if prof.Model != nil {
+			subModel = prof.Model
+			entry = agentModelEntry{ref: prof.ModelRef, translate: prof.Translator}
+		}
+		if prof.Resolver != nil {
+			resolver = prof.Resolver
+		}
+	}
+	ref := strings.TrimSpace(spec.Model)
+	if ref == "" || isInheritRef(ref) {
+		return subModel, entry, nil
+	}
+	if resolver == nil {
+		return nil, agentModelEntry{}, fmt.Errorf("model %q: 没有模型注册表", ref)
+	}
+	inst, err := resolver.Get(ctx, ref)
+	if err != nil {
+		return nil, agentModelEntry{}, fmt.Errorf("model %q: %v", ref, err)
+	}
+	return inst.Chat, agentModelEntry{ref: inst.Ref, translate: TranslatorFor(inst.Protocol)}, nil
+}
+
+// subagentHandlers 是一条规格的 middleware。wire 紧挨折叠之前：折叠会换短 state.Messages，
+// 先把折前新增行追加进档案。这些 handler 无调用态，写句柄在 ctx。
+func (h *agentSpecHandler) subagentHandlers(name string, wantSearch bool) []adk.ChatModelAgentMiddleware {
+	handlers := []adk.ChatModelAgentMiddleware{
+		&callerStampMiddleware{
+			BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, name: name,
+		},
+	}
+	if wantSearch {
+		handlers = append(handlers, newToolSearchHandler())
+	}
+	handlers = append(handlers, newWireAppendHandler())
+	handlers = append(handlers, newAgentFoldHandler(name, h.foldCounter, h.foldWindow, h.foldLimit,
+		h.foldSummarize, h.foldEffects))
+	return handlers
 }
 
 // resolveToolPool 按规格的工具面四态解析子代理的工具池（操作定义真源 doc/26 §3）：

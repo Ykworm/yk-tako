@@ -21,11 +21,11 @@
 **按任务查：**
 
 - 改运行引擎、API、存储：先读 19-v6 四篇，再查本表第 1 节。
-- 加工具、改子代理：`19v6-05`、`19v6-08`、`doc/23`、`doc/25`、`doc/26`。
+- 加工具、改子代理：`19v6-05`、`19v6-08`、`doc/23`、`doc/25`、`doc/26`、`doc/39`。
 - 改上下文压缩：`19v6-07`、`19v6-09`、`19v6-10`。
 - 改登录、租户、会话归属：`doc/28`、`doc/34`、`doc/35`。
 - 改团队前端（切换器／成员管理／邀请落地页）：`doc/36`。
-- 改项目删除（连带删会话）：`doc/37`。
+- 改删除与档案清理（连带删会话、单场删除、保留窗口）：`doc/37`。
 - 改记忆、召回：`doc/29`。
 - 改崩溃续跑：`doc/30`。
 - 改 Redis 临时键（移除 draft）：`doc/38`。
@@ -68,10 +68,11 @@
 | 32 | [media_offload（对话只存 path）](32-media-offload.md) | 🔶 | `media.go`、`media_send.go`、`media_tokens.go`、`filetools.go`、`pdftext.go`、`pdftool.go`、`midfold.go`、`worker.go`、`guard.go`、`profile.go`、`compact.go`、`provider-catalog.json`、`media_test.go` | A1–A7 已落地（dcf3e6b）；A3-1 至 A3-5 已落地并活体验收（2026-10-20）。A3-5 按 DeepSeek v41 计价：800×800 为 422、100×100 为 184；窗口 940 上 814>752 进入折叠。A8-1 已施工并活体验收（2026-10-20，run `r_01M5CF1DFS9ZAD72GYQ5YXRYH8` complete，assistant 含 banana，user 行仍是占位，该 run 两表零 base64）。A8-2 边界已活体验收（2026-10-20）：第 3 页 run `r_01M5CH3GN1Y9KDKPMJ90R0NPCS` 含 orange；第 99 页 run `r_01M5CH3MM7HTQ2KDXA36YWW35M` 返回 pages=3 与超出范围；扫描件 run `r_01M5CH3RM7JY9GS0CX779Y5S0Y` 写明无文本层；音视频 run `r_01M5CH3WK609YQJBGFVCAQ4BDN` 上 `read_pdf_text` 拒绝非 PDF；`TAKO_MEDIA_SEND=off` 的 run `r_01M5CH5KCY1RQA6T7Z1QY0YW7Y` 仍读到 orange 且无 media send 行。这些 run 的两表零 base64。扫描件 OCR 不做 |
 | 33 | [MCP client](33-mcp-client.md) | ✅ | `mcp.go`、`mcpconf.go`、`mcpconf_test.go` | stdio 本地 server；工具直接进池 |
 | 34 | [租户运行时装配](34-租户运行时装配.md) | ✅ | `tenantmodel.go`、`agents.go`、`mcpconf.go`、`tenant_runtime_test.go`、`web/` | R1–R5＋U1 已落地并浏览器验收；commit 9c21b66 |
-| 35 | [项目目录（workspace）](35-项目目录.md) | 🔶 | `product_store.go`、`session_access.go`、`media.go`、`web/` | A1–A8c 已写并随 e30d1f9 入库，等收口验收；路径方案取代 doc/32 的 `sessions/<sid>/` 版 |
+| 35 | [项目目录（workspace）](35-项目目录.md) | 🔶 | `product_store.go`、`session_access.go`、`media.go`、`web/` | A1–A8c 已写并随 e30d1f9 入库，等收口验收；路径方案取代 doc/32 的 `sessions/<sid>/` 版。第 0 节第 3 条「删除只删空项目」已由 doc/37 改写（2026-10-21 已落地）：有会话改为连带软删，`114002` 退役，活 run 用 `114006`，单场删除用 `114007` |
 | 36 | [团队前端（切换器／成员／邀请）](36-团队前端.md) | ⬜ | `web/`；G0 小改在 `product_api.go` | 方案待点头；后端 API 见 doc/28 A6，Team 设置页已随 doc/34 U1 落地 |
-| 37 | [删除项目连带删会话](37-删除项目连带删会话.md) | ⬜ | `pgstore.go`、`product_api.go`、`session_access.go`、`store.go` | 方案待点头；改写 doc/35 的「删除只删空项目」语义，`114002` 本篇起退役 |
+| 37 | [删除与档案清理](37-删除与档案清理.md) | ✅ | `pgstore.go`、`product_api.go`、`session_access.go`、`store.go`、`server.go`、`worker.go`、`archive_sweep.go`、`auth.go`、`cmd/yktako/main.go` | 2026-10-21 已落地。D1、D2 随 0fd15c5 入库；D3、D4 在 8905 curl 验收后入库。改写 doc/35「删除只删空项目」；单场删除仅属主；清扫器持 `cleaner_state` 租约，`-archive-ttl` 默认 168h，探针 `POST /api/dev/clean-sweep`。`114002` 退役 |
 | 38 | [删除 tk:draft 键](38-删除draft键.md) | ✅ | `redisstore.go`、`store.go`、`server.go`、`worker.go`、`store_test.go` | 2026-10-20 已落地；定稿正文来自 turn，写口只认 runepoch |
+| 39 | [子代理持久化与 resume](39-子代理持久化与resume.md) | ✅ | `agents.go`、`subagent_wire.go`、`resume_subagent.go`、`archive_sweep.go`、`worker.go`、`server.go` | 2026-10-21 已落地。S1 随 e476749 入库；S2、S3 在 8905 curl 验收后入库。每实例追加式 wire（`.tako/subagents/`，无 PG 表）+ `resume_subagent`（只认完整档案；不做半截重接，对齐 doc/30）。第三类清扫挂在 doc/37 同一轮，只删过窗文件 |
 
 ## 2. 历史存档（`doc/`，不作施工面）
 

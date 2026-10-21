@@ -151,6 +151,17 @@ type Workspace struct {
 
 func (Workspace) TableName() string { return "workspaces" }
 
+// CleanerState 是清扫器的两行状态。key=lease 是多副本租约，key=archive 的 watermark 是下一轮的起点。
+// 两行在 autoMigrate 里种下，owner 空、时间是 epoch。闸在这张表上，不在进程里。
+type CleanerState struct {
+	Key       string    `gorm:"primaryKey;type:text"`
+	Owner     string    `gorm:"not null;default:'';type:text"`
+	ExpiresAt time.Time `gorm:"not null"`
+	Watermark time.Time `gorm:"not null"`
+}
+
+func (CleanerState) TableName() string { return "cleaner_state" }
+
 // CreateWorkspace 插入一行。id 用 ws_ 前缀。tenant 和 user 由调用方从 token 传入，不从请求体取。
 func (s *Store) CreateWorkspace(ctx context.Context, tenantID, userID, name string) (Workspace, error) {
 	id, err := newRowID("ws_")
@@ -222,6 +233,9 @@ func (s *Store) RenameWorkspace(ctx context.Context, tenantID, userID, id, name 
 
 // ErrWorkspaceBusy 表示项目上还有租约没过的 running run。删除整笔回滚，项目行和会话行都留着。
 var ErrWorkspaceBusy = errors.New("workspace busy")
+
+// ErrSessionBusy 表示这场会话自己还有租约没过的 running run。删除整笔回滚，会话行留着。
+var ErrSessionBusy = errors.New("session busy")
 
 // ErrWorkspaceDefault 表示这行是默认工作区，不能删。
 var ErrWorkspaceDefault = errors.New("default workspace")
@@ -353,6 +367,42 @@ func (s *Store) DeleteWorkspaceCascade(ctx context.Context, tenantID, userID, id
 	return sessionIDs, nil
 }
 
+// DeleteSession 软删属主自己的一场会话。锁的是 sessions 行，和 AcquireRun 抢同一把。
+// 看不见（没有、已删、跨租户、private 非本人）是 ErrSessionNotFound。
+// 同租户看得见但不是本人是 ErrSessionForbidden，tenant owner 也不豁免。
+// 活 run 的谓词与读侧相同：status='running' AND lease_until > now()。数到就整笔回滚。
+// 这里不删 runs / runlog，也不碰目录。目录由调用方在提交之后只清 .tako 与 .media。
+func (s *Store) DeleteSession(ctx context.Context, tenantID, userID string, id SessionID) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var rows []Session
+		if err := tx.Raw(
+			`SELECT id, tenant_id, user_id, visibility FROM sessions WHERE id = ? AND deleted_at IS NULL FOR UPDATE`,
+			id).Scan(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return ErrSessionNotFound
+		}
+		kind := decideAccess(rows[0], principal{TenantID: tenantID, UserID: userID})
+		if kind == accessNone {
+			return ErrSessionNotFound
+		}
+		if kind != accessOwner {
+			return ErrSessionForbidden
+		}
+		var n int64
+		if err := tx.Raw(
+			`SELECT COUNT(*) FROM runs WHERE session_id = ? AND status = 'running' AND lease_until > now()`,
+			id).Scan(&n).Error; err != nil {
+			return err
+		}
+		if n > 0 {
+			return ErrSessionBusy
+		}
+		return tx.Exec(`UPDATE sessions SET deleted_at = now() WHERE id = ?`, id).Error
+	})
+}
+
 // VisibleWorkspace 认当前用户在 active tenant 里看得见的项目：自己创建的，或 visibility=tenant 的。
 // 对不上与不存在相同。跨租户看不见。
 func (s *Store) VisibleWorkspace(ctx context.Context, id, tenantID, userID string) (Workspace, error) {
@@ -449,7 +499,7 @@ func autoMigrate(db *gorm.DB) error {
 		&MemoryItem{}, &MemoryJob{}, &DialogueChunk{},
 		&User{}, &Tenant{}, &TenantMember{}, &RefreshToken{}, &AuditLog{}, &TenantUsageDaily{},
 		&TenantInvitation{}, &TenantAgent{}, &AgentDefault{}, &TenantSetting{}, &TenantStorage{},
-		&Workspace{}); err != nil {
+		&Workspace{}, &CleanerState{}); err != nil {
 		return err
 	}
 	_ = db.Exec(`DROP INDEX IF EXISTS memory_items_dedup`).Error
@@ -468,6 +518,22 @@ WHERE workspace_id IS NOT NULL AND status = 'running'`).Error; err != nil {
 	if err := db.Exec(`CREATE INDEX IF NOT EXISTS sessions_owner_alive
 ON sessions (tenant_id, user_id)
 WHERE deleted_at IS NULL`).Error; err != nil {
+		return err
+	}
+	// 清扫按 deleted_at 找过窗软删会话。列表用的 sessions_owner_alive 只含还活着的行，帮不上这支。
+	if err := db.Exec(`CREATE INDEX IF NOT EXISTS sessions_deleted_at
+ON sessions (deleted_at)
+WHERE deleted_at IS NOT NULL`).Error; err != nil {
+		return err
+	}
+	// 清扫过窗 run 时先滤 compacted 再按 run_id 找终态。小表上 EXPLAIN 仍是 seq scan，索引留给行数上来。
+	if err := db.Exec(`CREATE INDEX IF NOT EXISTS run_model_messages_compacted_run
+ON run_model_messages (compacted, run_id)`).Error; err != nil {
+		return err
+	}
+	if err := db.Exec(`INSERT INTO cleaner_state (key, owner, expires_at, watermark)
+VALUES ('lease', '', 'epoch', 'epoch'), ('archive', '', 'epoch', 'epoch')
+ON CONFLICT (key) DO NOTHING`).Error; err != nil {
 		return err
 	}
 	return db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS one_default_workspace_per_user
