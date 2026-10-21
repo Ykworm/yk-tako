@@ -323,10 +323,11 @@ index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型�
 - **统一搜索规则（2026-10-08）**：任何 agent（主或子）的 tool_search 只搜**自己 tools node 里注册的
   deferred 项**——搜索范围 = 可执行范围的子集，越界激活物理上不存在；主 agent 的 node 不含子代理
   专属工具，互相不可见。一条规则覆盖主从（子代理挂 search 见 §4 规格字段）。
-- Eino 原生 `WithDeferredTools` + `WithToolSearchTool` 留作 provider 支持时的升级路——
+- Eino 原生 `WithDeferredTools` + `WithToolSearchTool`（provider 托管的 hosted mode）——
   **支持度已查证（2026-10-08，矩阵与机制见 19v6-06 §4–5）**：eino-ext claude 组件 ✅ / openai 组件 ❌；
   Anthropic·OpenAI·DeepSeek·Kimi 各形态 ✅，Gemini/Qwen/豆包/GLM ❌。
-  client 过滤（本条）为默认底座不变，原生通道按家适配时再接。
+  **2026-10-21 用户裁定：client 过滤（本条）为终态底座，hosted mode 不接**（理由三条见 `19v6-06` §6：
+  覆盖面对不上 / 缓存损失有界 / 对 provider 零要求）。`19v6-06` 降为纯背景篇，不作施工面、不进待办。
 
 ## 6. 表新增汇总
 

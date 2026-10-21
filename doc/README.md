@@ -1,7 +1,7 @@
 # doc/ 文档索引
 
 > 性质：**索引**，不是方案。本文只回答「这篇文档是什么、能不能照着施工、代码在哪、被谁取代」。
-> 最后核对：2026-10-20。
+> 最后核对：2026-10-21。
 > 状态口径：✅ 已落地 · 🔶 部分落地／待收口 · ⬜ 未做 · 存档 = 历史材料，不作施工面。
 > 代码路径均相对 `yk-tako-eino/`。
 
@@ -48,7 +48,7 @@
 | 19v6-03 | [存储形态与生命周期](19-v6/19v6-03-存储形态与生命周期.md) | ✅ | `pgstore.go`、`redisstore.go`、`store.go` | 四表 + 两键（runlive / runepoch）、真源划分、多副本 |
 | 19v6-04 | [验收（curl 手打）](19-v6/19v6-04-验收-curl.md) | ✅ | —（被测端点见 19v6-01） | 改契约字节必须同步改本篇并重跑 |
 | 19v6-05 | [tool loop（T 系列）](19-v6/19v6-05-tool-loop.md) | ✅ | `tools.go`、`agents.go`、`agentlog.go`、`midfold.go`、`toolsearch.go`、`profile.go` | T1–T3 已落地；T4/T5（分级 + BM25 `tool_search`）2026-10-20 落地（A1 `ad1ab6b`、A2 `a190f4d`；A3 寿命验收、A4 回归收口） |
-| 19v6-06 | [工具分级与 deferred tools](19-v6/19v6-06-deferred-tools与缓存机制.md) | 🔶 | —（机制背景，provider 原生 deferred 未落） | 非契约篇；各厂商支持矩阵与升级路素材 |
+| 19v6-06 | [工具分级与 deferred tools](19-v6/19v6-06-deferred-tools与缓存机制.md) | ✅ | —（纯机制背景篇，无代码落点） | 非契约篇；client mode 已是终态底座，hosted mode 2026-10-21 裁定不接；厂商矩阵与链路留作背景 |
 | 19v6-07 | [compact（v6 形态）](19-v6/19v6-07-compact.md) | ✅ | `compact.go`、`compact_test.go` | C1–C4 已落地 |
 | 19v6-08 | [文件工具族（F 系列）](19-v6/19v6-08-file-tools.md) | ✅ | `fileops.go`、`filetools.go`、`media.go` | 文件工具机制与契约真源 |
 | 19v6-09 | [溢出修复层](19-v6/19v6-09-溢出修复层.md) | ✅ | `overflow.go`、`overflow_test.go` | 一期／二期／三期均已落地 |
