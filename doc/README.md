@@ -24,6 +24,7 @@
 - 加工具、改子代理：`19v6-05`、`19v6-08`、`doc/23`、`doc/25`、`doc/26`、`doc/39`。
 - 改上下文压缩：`19v6-07`、`19v6-09`、`19v6-10`。
 - 改登录、租户、会话归属：`doc/28`、`doc/34`、`doc/35`。
+- 改响应信封／业务码表：`doc/40`（规则在根 `AGENTS.md`，码表在 doc/40 §4）。
 - 改团队前端（切换器／成员管理／邀请落地页）：`doc/36`。
 - 改删除与档案清理（连带删会话、单场删除、保留窗口）：`doc/37`。
 - 改记忆、召回：`doc/29`。
@@ -61,11 +62,11 @@
 | 25 | [子代理进程内折叠](25-子代理折叠.md) | ✅ | `midfold.go`、`agentfold_test.go` | 取代 doc/17 §6；A1–A3 已验收 |
 | 26 | [researcher 的工具护栏](26-researcher工具护栏.md) | ✅ | `agents.go`、`agents/researcher.md`、`agents/coder.md` | `exclude_tools` 四态；排除清单只剩 `bash` |
 | 27 | [用量可见化](27-用量可见.md) | ✅ | `product_api.go`、`server.go`、`worker.go`、`web/src/` | usage 帧／页面阈值／runlog 历史行 |
-| 28 | [多租户运行时](28-多租户.md) | ✅ | `auth.go`、`identity_store.go`、`members_store.go`、`tenant_api.go`、`scope.go`、`pgstore.go` | 2026-10-21 收口。A0–A6 共 30 拍已落地并 curl 验收，随 `9c21b66` 入库。团队前端不在本篇（doc/36 已落地）；A7 那一档（旧成功体换信封、计费、API key、SSO）未开工 |
+| 28 | [多租户运行时](28-多租户.md) | ✅ | `auth.go`、`identity_store.go`、`members_store.go`、`tenant_api.go`、`scope.go`、`pgstore.go` | 2026-10-21 收口。A0–A6 共 30 拍已落地并 curl 验收，随 `9c21b66` 入库。团队前端不在本篇（doc/36 已落地）；A7 那一档里「旧成功体换信封」已由 [doc/40](40-响应信封统一.md) 于 2026-10-22 落地，计费、API key、SSO、组织共享仍未开工 |
 | 29 | [长期记忆与对话召回](29-长期记忆.md) | ✅ | `memory.go`、`recall.go`、`dialogue.go` | A1–B4 全落地；两条加工线共用 runlog |
-| 30 | [崩溃续跑](30-崩溃续跑.md) | 🔶 | `journal.go`、`worker.go`、`resume_test.go`、`web/src/api.ts`、`web/src/chat.ts`、`web/src/App.vue` | A1–A5 已落地；A6 自动巡检 2026-10-21 裁为客户端触发式恢复（server 巡检不做）；**A8 前端 reattach 已落地并验收**（interrupted 琥珀提示 +「继续这一轮」按钮，2026-10-21）；A7 回归收口已跑（`go test -count=1` 25.3s 绿、vet 干净、`19v6-04` 矩阵重放全过）。残余：`19v6-04` 的期望字节停在 doc/28 之前，待补 |
+| 30 | [崩溃续跑](30-崩溃续跑.md) | 🔶 | `journal.go`、`worker.go`、`resume_test.go`、`web/src/api.ts`、`web/src/chat.ts`、`web/src/App.vue` | A1–A5 已落地；A6 自动巡检 2026-10-21 裁为客户端触发式恢复（server 巡检不做）；**A8 前端 reattach 已落地并验收**（interrupted 琥珀提示 +「继续这一轮」按钮，2026-10-21）；A7 回归收口已跑（`go test -count=1` 25.3s 绿、vet 干净、`19v6-04` 矩阵重放全过）。**2026-10-22**：§10.1/§10.2/§10.4 的期望字节已随 [doc/40](40-响应信封统一.md) 换信封（404 `112002`、409 三态 `112102`/`112103`/`112104`） |
 | 31 | [SSE 流式端点](31-sse流式端点.md) | ✅ | `server.go`、`redisstore.go`、`stream_test.go` | 同一帧面的第二种运输方式；拉是正确性、流是优化 |
-| 32 | [media_offload（对话只存 path）](32-media-offload.md) | ✅ | `media.go`、`media_send.go`、`media_tokens.go`、`filetools.go`、`pdftext.go`、`pdftool.go`、`midfold.go`、`worker.go`、`guard.go`、`profile.go`、`compact.go`、`provider-catalog.json`、`media_test.go` | 2026-10-21 收口，两个半边都落地（存储纪律 A1–A2；模型可见 A3 五拍）。A1–A7 已落地（dcf3e6b）；A3-1 至 A3-5 已落地并活体验收（2026-10-20）。A3-5 按 DeepSeek v41 计价：800×800 为 422、100×100 为 184；窗口 940 上 814>752 进入折叠。A8-1 已施工并活体验收（2026-10-20，run `r_01M5CF1DFS9ZAD72GYQ5YXRYH8` complete，assistant 含 banana，user 行仍是占位，该 run 两表零 base64）。A8-2 边界已活体验收（2026-10-20）：第 3 页 run `r_01M5CH3GN1Y9KDKPMJ90R0NPCS` 含 orange；第 99 页 run `r_01M5CH3MM7HTQ2KDXA36YWW35M` 返回 pages=3 与超出范围；扫描件 run `r_01M5CH3RM7JY9GS0CX779Y5S0Y` 写明无文本层；音视频 run `r_01M5CH3WK609YQJBGFVCAQ4BDN` 上 `read_pdf_text` 拒绝非 PDF；`TAKO_MEDIA_SEND=off` 的 run `r_01M5CH5KCY1RQA6T7Z1QY0YW7Y` 仍读到 orange 且无 media send 行。这些 run 的两表零 base64。扫描件 OCR 不做 |
+| 32 | [media_offload（对话只存 path）](32-media-offload.md) | ✅ | `media.go`、`media_send.go`、`media_tokens.go`、`filetools.go`、`pdftext.go`、`pdftool.go`、`midfold.go`、`worker.go`、`guard.go`、`profile.go`、`compact.go`、`provider-catalog.json`、`media_test.go` | 2026-10-21 收口，两个半边都落地（存储纪律 A1–A2；模型可见 A3 五拍）。A1–A7 已落地（dcf3e6b）；A3-1 至 A3-5 已落地并活体验收（2026-10-20）。A3-5 按 DeepSeek v41 计价：800×800 为 422、100×100 为 184；窗口 940 上 814>752 进入折叠。A8-1 已施工并活体验收（2026-10-20，run `r_01M5CF1DFS9ZAD72GYQ5YXRYH8` complete，assistant 含 banana，user 行仍是占位，该 run 两表零 base64）。A8-2 边界已活体验收（2026-10-20）：第 3 页 run `r_01M5CH3GN1Y9KDKPMJ90R0NPCS` 含 orange；第 99 页 run `r_01M5CH3MM7HTQ2KDXA36YWW35M` 返回 pages=3 与超出范围；扫描件 run `r_01M5CH3RM7JY9GS0CX779Y5S0Y` 写明无文本层；音视频 run `r_01M5CH3WK609YQJBGFVCAQ4BDN` 上 `read_pdf_text` 拒绝非 PDF；`TAKO_MEDIA_SEND=off` 的 run `r_01M5CH5KCY1RQA6T7Z1QY0YW7Y` 仍读到 orange 且无 media send 行。这些 run 的两表零 base64。扫描件 OCR 不做。**2026-10-22**：media 的 404 按 [doc/40](40-响应信封统一.md) 拆成三个码（`114001` 项目看不见／`114101` 文件不存在／`114102` 路径不对），成功体仍是图片字节、不进信封 |
 | 33 | [MCP client](33-mcp-client.md) | ✅ | `mcp.go`、`mcpconf.go`、`mcpconf_test.go` | stdio 本地 server；工具直接进池 |
 | 34 | [租户运行时装配](34-租户运行时装配.md) | ✅ | `tenantmodel.go`、`agents.go`、`mcpconf.go`、`tenant_runtime_test.go`、`web/` | R1–R5＋U1 已落地并浏览器验收；commit 9c21b66 |
 | 35 | [项目目录（workspace）](35-项目目录.md) | ✅ | `product_store.go`、`session_access.go`、`media.go`、`web/` | 2026-10-21 收口。A1–A8c 共 13 拍已落地并 curl 验收，随 e30d1f9 入库；路径方案取代 doc/32 的 `sessions/<sid>/` 版。第 0 节第 3 条「删除只删空项目」已由 doc/37 改写（2026-10-21 已落地）：有会话改为连带软删，`114002` 退役，活 run 用 `114006`，单场删除用 `114007` |
@@ -73,6 +74,7 @@
 | 37 | [删除与档案清理](37-删除与档案清理.md) | ✅ | `pgstore.go`、`product_api.go`、`session_access.go`、`store.go`、`server.go`、`worker.go`、`archive_sweep.go`、`auth.go`、`cmd/yktako/main.go` | 2026-10-21 已落地。D1、D2 随 0fd15c5 入库；D3、D4 在 8905 curl 验收后入库。改写 doc/35「删除只删空项目」；单场删除仅属主；清扫器持 `cleaner_state` 租约，`-archive-ttl` 默认 168h，探针 `POST /api/dev/clean-sweep`。`114002` 退役 |
 | 38 | [删除 tk:draft 键](38-删除draft键.md) | ✅ | `redisstore.go`、`store.go`、`server.go`、`worker.go`、`store_test.go` | 2026-10-20 已落地；定稿正文来自 turn，写口只认 runepoch |
 | 39 | [子代理持久化与 resume](39-子代理持久化与resume.md) | ✅ | `agents.go`、`subagent_wire.go`、`resume_subagent.go`、`archive_sweep.go`、`worker.go`、`server.go` | 2026-10-21 已落地。S1 随 e476749 入库；S2、S3 在 8905 curl 验收后入库。每实例追加式 wire（`.tako/subagents/`，无 PG 表）+ `resume_subagent`（只认完整档案；不做半截重接，对齐 doc/30）。第三类清扫挂在 doc/37 同一轮，只删过窗文件 |
+| 40 | [响应信封统一](40-响应信封统一.md) | ✅ | `auth.go`、`server.go`、`mcp.go`、`product_api.go`、`archive_sweep.go`、`envelope_test.go`、`web/src/api.ts`、`web/src/chat.ts` | 2026-10-22 落地，随 `cd85050` 入库。A7-1…A7-8 共 8 拍：后端六拍（curl 逐字节）+ 前端一拍（Playwright 活体）+ 收口一拍。runs／sessions／mcp／media／memory 五组旧接口整包换 `{code,message,data}`；**不动存储、不动帧格式、不动 HTTP 状态码**；media 的二进制成功体与 SSE 帧面不进信封。台账 `tmp/A7-信封迁移/`（不入库） |
 
 ## 2. 历史存档（`doc/`，不作施工面）
 
