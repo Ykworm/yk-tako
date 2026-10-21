@@ -4,8 +4,10 @@ import {
   ApiError,
   getFrames,
   getLog,
+  getRun,
   getSession,
   parseMedia,
+  postResume,
   postRuns,
   type MediaRef,
   type PostImage,
@@ -23,10 +25,14 @@ export type Bubble = {
   // 媒体引用（doc/32 A5）：从行内占位行解析；图片渲染成 <img>（GET /api/media 换字节流），
   // 其他媒体给文件片。text 是剥掉占位行后的正文——占位行是模型/存储的坐标，不上页面。
   media?: MediaRef[]
-  state: 'queued' | 'streaming' | 'offline' | 'done' | 'error' | 'stopped'
+  // 'interrupted' = 这场 run 崩了，但账本还在、可以被接管（doc/30 §8）。
+  // 它不是失败：失败没有可续的东西，中断有。
+  state: 'queued' | 'streaming' | 'offline' | 'done' | 'error' | 'stopped' | 'interrupted'
   usage?: Usage
   // 本 tab 亲历收尾却全程无 usage 帧（厂商不报账单）→ 显示「用量 ?」，不静默。
   usageUnknown?: boolean
+  // interrupted 态专用：还能不能续（续跑次数没耗尽）。false = 次数用尽，只能重发。
+  resumable?: boolean
 }
 
 // 附件（composer 选用）：name 供 chip 显示，img 随 postRuns 上行。
@@ -230,7 +236,11 @@ export function useChat() {
       }
       let terminalStatus: string | null = null
       for (const f of resp.frames) {
-        if (f.kind === 'delta' && f.text) assistant.text += f.text
+        if (f.kind === 'resume') {
+          // resume 帧（doc/30 §8.3）的 text 是**账本里已产出的整段正文**，不是增量片段——
+          // 语义跟 delta 正好相反：这里是**替换**，用 += 会把崩溃前的正文重复拼一遍。
+          assistant.text = f.text ?? ''
+        } else if (f.kind === 'delta' && f.text) assistant.text += f.text
         // usage 帧（doc/27 §4a）：每枪一帧，多枪取最后一帧（= 下一枪的基线）；
         // 子代理帧（agent 非空）第一版不渲染，跳过。
         if (f.kind === 'usage' && !f.agent) {
@@ -252,6 +262,55 @@ export function useChat() {
         if (token === pollToken) await closeOut(runId, assistant, null)
         return
       }
+    }
+  }
+
+  // 续跑（doc/30 §8）：接管一场崩溃的 run。
+  //
+  // 202 = 已有执行者接管并在跑（不等于跑完）。接着**从 eventOffset=0 重拉帧**——
+  // seedResume 把 runlive 整个删掉重建了（redisstore.go:102），客户端手上的旧游标
+  // 全部作废，拿旧游标去拉只会拉到空。
+  //
+  // 三个 409 分开处置（doc/30 §10.2），这是最容易做错的地方：
+  //   run_alive        → 已经有人在续了（多 tab / 刷新并发）：**不是失败**，跟着重建帧面；
+  //   not_resumable    → 这场已定稿或已终止：回 log 收口（多半是别人替它跑完了）；
+  //   resume_exhausted → 续跑次数用尽：告诉用户重发，不再给按钮。
+  async function resumeRun(b: Bubble) {
+    const runId = b.runId
+    if (!runId) return
+    const token = pollToken
+    b.state = 'streaming'
+    b.text = ''
+    // 续跑期间会话闸被占着：置 busy 让队列里的新消息等它收口再投（POST 会撞 409）。
+    busy.value = true
+    try {
+      try {
+        await postResume(runId)
+      } catch (e) {
+        if (token !== pollToken) return
+        const code = e instanceof ApiError ? e.body?.error : ''
+        if (code === 'run_alive') {
+          // 别人已经在续：跟着重建帧面，不报错。
+          await pollFrames(runId, b, 0, token)
+          return
+        }
+        if (code === 'not_resumable') {
+          await closeOut(runId, b, null)
+          return
+        }
+        if (code === 'resume_exhausted') {
+          b.state = 'interrupted'
+          b.resumable = false
+          return
+        }
+        b.state = 'error'
+        b.text = e instanceof ApiError ? `续跑失败：${e.body?.error ?? e.status}` : '续跑失败'
+        return
+      }
+      if (token !== pollToken) return
+      await pollFrames(runId, b, 0, token)
+    } finally {
+      if (token === pollToken) busy.value = false
     }
   }
 
@@ -302,7 +361,19 @@ export function useChat() {
       assistant.state = 'done'
       return
     }
-    // 没有定稿行：error 收尾与 stopped 收尾在 log 里长得一样（都没有 assistant 行）——
+    // 没有定稿行。三种收尾在 log 里长得一样（都没有 assistant 行），靠 run 的状态分辨：
+    //   interrupted = 崩了、但账本还在 → 这场能被接管（doc/30 §8），**不是失败**；
+    //   stopped    = 用户停的 → 保留半截；
+    //   别的        = 真失败。
+    // 先问单场 run：它给的是派生状态（running + 租约过期 → interrupted），比
+    // getSession 的 lastRunStatus 更准（后者说的是「最新一场」，未必是本场）。
+    const st = await getRun(runId).catch(() => null)
+    if (st && st.status === 'interrupted') {
+      assistant.state = 'interrupted'
+      assistant.resumable = st.resumable
+      return
+    }
+    // error 收尾与 stopped 收尾在 log 里长得一样（都没有 assistant 行）——
     // 查 getSession 的 lastRunStatus 分辨「已停止」与「失败」，猜不出来才转错误。
     const sid = sessionId.value
     if (sid) {
@@ -399,6 +470,29 @@ export function useChat() {
       pollFrames(status.liveRunId, assistant, 0, token).finally(() => {
         if (token === pollToken) busy.value = false
       })
+    } else if (status.lastRunStatus === 'interrupted' && status.lastRunId) {
+      // 崩了、但账本还在：这场 run 可以被接管（doc/30 §8）。气泡正文先空着——
+      // 崩溃前已产出的正文在账本里，点「继续」后随 resume 帧一起回来（doc/30 §8.3）。
+      // 这里不占闸：闸空（liveRunId 为空）正是「执行者没了」的样子。
+      const assistant = push({
+        key: `${status.lastRunId}:live`,
+        runId: status.lastRunId,
+        role: 'assistant',
+        text: '',
+        state: 'interrupted',
+      })
+      void markResumable(assistant)
+    }
+  }
+
+  // 还能不能续：问单场 run 的派生状态。次数用尽时 resumable=false——
+  // 那时不该给一个点了必然 409 的按钮，而是提示重新发一条（doc/30 §8.2 的 409 resume_exhausted）。
+  async function markResumable(b: Bubble) {
+    if (!b.runId) return
+    try {
+      b.resumable = (await getRun(b.runId)).resumable
+    } catch {
+      b.resumable = false
     }
   }
 
@@ -520,7 +614,7 @@ export function useChat() {
     renderedMessageIds.clear()
   }
 
-  return { sessionId, bubbles, draft, attachments, busy, pending, loadingOlder, atStart, send, reconcile, loadOlder, newSession, showTenantSession }
+  return { sessionId, bubbles, draft, attachments, busy, pending, loadingOlder, atStart, send, reconcile, loadOlder, newSession, showTenantSession, resumeRun }
 }
 
 // 409 = 闸被占（19v6-01 §1），处置是排队；404 session_not_found = 本地 sid 已成僵尸，处置是懒建重投。

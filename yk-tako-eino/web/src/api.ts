@@ -8,7 +8,9 @@ export type RunID = string
 
 export type Frame = {
   eventOffset?: number
-  kind: 'start' | 'delta' | 'usage' | 'terminal'
+  // 'resume' = 续跑种子帧（doc/30 §8.3）：**text 是整段已产出正文**，不是增量片段——
+  // 它的语义跟 'delta' 相反，别用同一套追加逻辑（见 chat.ts 的 resume 分支）。
+  kind: 'start' | 'delta' | 'usage' | 'terminal' | 'resume'
   agent?: string
   model?: string
   messageId?: string
@@ -47,6 +49,28 @@ export type SessionStatus = {
   liveRunId: RunID
   runlogOffset: number
   lastRunStatus: string
+  // doc/30 §10.3：最新一场 run 的 id（无 run 时是空串）。lastRunStatus='interrupted' 时
+  // 它就是「崩溃后可被接管的那一场」——续跑的入口就靠这两个字段。
+  lastRunId: RunID
+}
+
+// GET /api/runs/{runId}（doc/30 §10.1）：读侧派生，不新增存储状态。
+// status='interrupted' = 行还挂着 running 但租约已过期（执行者没了，账本还在）；
+// resumable = 中断且续跑次数未用尽（次数上限由服务端 -resume-max 定，前端不显示）。
+export type RunState = {
+  runId: RunID
+  sessionId: SessionID
+  status: string
+  resumeCount: number
+  resumable: boolean
+}
+
+// POST /api/runs/{runId}/resume 的 202 响应（无请求体）。202 = 已有执行者接管并在跑，
+// 不等于跑完了；客户端接着去拉 frames（从 eventOffset=0——旧帧已被 seedResume 删掉）。
+export type ResumeResult = {
+  runId: RunID
+  status: string
+  resumeCount: number
 }
 
 export type FramesResponse = {
@@ -159,4 +183,20 @@ export function getLog(sessionId: SessionID, runlogOffset: number): Promise<LogR
   return request<LogResponse>(
     `/api/sessions/${encodeURIComponent(sessionId)}/log?runlogOffset=${runlogOffset}`,
   )
+}
+
+// GET /api/runs/{runId}：读单场 run 的派生状态（doc/30 §10.1）。未知 run 是 404
+// {"error":"run_not_found"}；其余状态原样透出（complete/error/stopped）。
+export function getRun(runId: RunID): Promise<RunState> {
+  return request<RunState>(`/api/runs/${encodeURIComponent(runId)}`)
+}
+
+// POST /api/runs/{runId}/resume：接管一场崩溃的 run（doc/30 §8.2）。**无请求体**。
+//
+// 409 的三种语义要分开处置，调用方按 body.error 分支（doc/30 §10.2）：
+//   - 'run_alive'        → 已经有人在续了（多 tab / 刷新并发）：不是失败，转去重建帧面；
+//   - 'not_resumable'    → 这场已定稿或已终止，没有可续的东西；
+//   - 'resume_exhausted' → 续跑次数用尽（服务端 -resume-max，默认 3）。
+export function postResume(runId: RunID): Promise<ResumeResult> {
+  return request<ResumeResult>(`/api/runs/${encodeURIComponent(runId)}/resume`, { method: 'POST' })
 }

@@ -30,7 +30,7 @@ const page = ref<Page>(readPage())
 watch(page, (value) => sessionStorage.setItem('tako.page', value))
 const configPage = computed<'agents' | 'team'>(() => (page.value === 'team' ? 'team' : 'agents'))
 
-const { bubbles, draft, attachments, pending, loadingOlder, atStart, busy, send, reconcile, loadOlder, newSession, showTenantSession } = useChat()
+const { bubbles, draft, attachments, pending, loadingOlder, atStart, busy, send, reconcile, loadOlder, newSession, showTenantSession, resumeRun } = useChat()
 
 const listEl = ref<HTMLElement | null>(null)
 const composerEl = ref<HTMLTextAreaElement | null>(null)
@@ -716,6 +716,15 @@ async function onScroll() {
                 <p v-if="b.state === 'offline'" class="note">拉不到帧，改看会话状态</p>
                 <p v-if="b.state === 'queued'" class="note">会话忙，这条还在排队</p>
                 <p v-if="b.state === 'stopped'" class="note">已停止，没有写进历史</p>
+                <p v-if="b.state === 'interrupted'" class="note">
+                  {{ b.resumable === false ? '这次运行中断了，已不能再续，请重新发一条' : '这次运行中断了' }}
+                </p>
+                <button
+                  v-if="b.state === 'interrupted' && b.resumable !== false"
+                  type="button"
+                  class="resume-btn"
+                  @click="resumeRun(b)"
+                >继续这一轮</button>
                 <p v-if="b.state === 'error'" class="note">失败，没有写进历史</p>
                 <span v-if="b.role === 'assistant' && b.usage" class="usage" :class="usageClass(b.usage)">{{ usageText(b.usage) }}</span>
                 <span v-else-if="b.role === 'assistant' && b.usageUnknown" class="usage">用量 ?</span>
@@ -1338,6 +1347,33 @@ async function onScroll() {
   color: var(--danger);
   box-shadow: none;
 }
+/* 中断（可续）不是失败：用琥珀色，跟 error 的红、正常态的白都区分开。
+   页面上一眼看得出「这场还能接」，而不是「这场炸了」。 */
+.bubble.interrupted .bubble-main {
+  background: var(--warn-soft);
+  border-color: #fed7aa;
+  color: var(--warn);
+  box-shadow: none;
+}
+/* 「继续这一轮」：只出现在中断且还能续的气泡上。 */
+.resume-btn {
+  display: inline-block;
+  margin-top: 0.45rem;
+  padding: 0.3rem 0.9rem;
+  border: 1px solid var(--warn);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--warn);
+  font-size: 0.8rem;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.resume-btn:hover { background: #fff; }
+.resume-btn:focus-visible {
+  outline: none;
+  border-color: var(--warn);
+  box-shadow: 0 0 0 3px rgba(154, 52, 18, 0.14);
+}
 .copy {
   display: block;
   width: fit-content;
@@ -1378,6 +1414,7 @@ async function onScroll() {
   color: var(--muted);
 }
 .bubble.error .note { color: var(--danger); }
+.bubble.interrupted .note { color: var(--warn); }
 .bubble-file {
   gap: 0.4rem;
   flex-wrap: wrap;
