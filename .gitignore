@@ -23,3 +23,6 @@ yk-tako-eino/workspace/
 
 # MCP 本地配置：仓库只提交 mcp.example.json，真配置按机器各自复制
 yk-tako-eino/mcp.json
+
+# Python 字节码（scripts/acceptance 的工具跑起来会生成）
+__pycache__/

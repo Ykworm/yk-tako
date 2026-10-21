@@ -91,6 +91,8 @@ yk-tako-eino/          Go 引擎 + Vue 前端
 doc/                   当前方案与实现真源；索引见 doc/README.md
 docs/                  历史交接与文章，不是施工真源
 scripts/dev.sh         一键开发环境
+scripts/check-master-plan.sh   检查 doc/16 总纲有没有漏掉 doc/README.md 里的现行真源
+scripts/acceptance/    可机器重跑的验收：机器真源 expected.json + 断言器 + 活体抽验
 tmp/                   本地执行台账（已忽略，不入库）
 ```
 

@@ -18,6 +18,8 @@ yk-tako/
     19-v6/                 运行引擎架构文档集
   docs/                    历史交接与文章，不作施工真源
   scripts/dev.sh           一键开发环境（Redis / Postgres / 引擎 / Vite）
+  scripts/check-master-plan.sh  检查 doc/16 总纲有没有漏掉 doc/README.md 的现行真源
+  scripts/acceptance/      可机器重跑的验收：机器真源 expected.json + 断言器 + 活体抽验
   tmp/                     本地执行台账（不入库，验收后清理）
   AGENTS.md                协作与施工纪律
   README.md                项目门面与快速开始
@@ -31,6 +33,7 @@ yk-tako/
 
 - `doc/`：当前方案与实现真源。改代码前先看这里；与代码冲突时先判断哪一边过期，再同步。
 - `doc/README.md`：文档索引——现行真源 / 历史存档 / 非方案内容三张表、阅读顺序、新增文档规则。读任何一篇文档前先查这里。
+- `doc/16-能力复刻总规划.md`：**总纲（结论页）**——「tako 做什么、做到哪了、下一步做什么」的答案在它的 §0.1 现状快照与 §2 能力表。它与 `doc/README.md`（目录页）必须同批更新，只更其中一边就会让总纲的现状变成假的。
 - `doc/19-v6/`：运行引擎架构文档集，v6 契约与机制的真源。
 - `docs/`：历史交接与文章（早期 handoff、superpowers 记录等），**不作施工真源**；引用前先确认结论是否已被 `doc/` 取代。
 - `tmp/`：本地执行台账（planning.md / todos.md），验收后清理，不进版本库。
@@ -42,6 +45,9 @@ yk-tako/
 2. 头注写清状态：方案（待点头）/ 已落地 / 部分落地（列出未做的拍）/ 归档。
 3. 落地后回头改头注，写 commit 或验收结论；「未 commit」这类临时状态在提交后必须清掉。
 4. 同一批更新 `doc/README.md` 的状态与代码落点，别让索引和正文各说一套。
+   **动了产品能力的增减或状态翻转，同批还要更新 `doc/16` 总纲**（§2 能力表 + §2c 横切契约 + 头注基线日期）：README 是目录页，doc/16 是结论页，两个都得更。
+   只更目录会怎样：下一场会话按 README 的「第一次进仓库」顺序读，读完总纲以为新落地的几篇现行真源不存在，得再翻索引才看到结论——总纲最值钱的那一格（现状）废了，而且废在最能省事的地方。
+   收尾跑 `scripts/check-master-plan.sh`：它比对 `doc/README.md` §1 的现行真源编号与 `doc/16` 的引用，漏引即失败。
 5. 被取代的文档在头注标「已取代」并指向新真源，不删原文。
 
 ## 协作模式：用例驱动 loop
@@ -139,6 +145,30 @@ loop 内的顺序固定为 **契约 → 数据需求 → 存储 → 实现**：
 - `todos.md`：每个 action 的四要素——改什么 / 为什么 / 怎么验收（curl 命令 + 期望字节）/ 这一拍回答什么问题。
 - **验收标准写成 curl 命令与期望字节，不写「页面上看到 X」。**
 - `tmp/` 加进 `.gitignore`。
+- **可机器重跑的验收必须入库，不许只留在 `tmp/`。** `tmp/` 是台账（不入库），验收脚本放那儿等于没有——
+  下一轮谁还记得去 tmp/ 里翻？机器真源在 `scripts/acceptance/`（见下节）。
+
+## 验收：两台机器，各管一段
+
+契约字节的验收分两层，**两层都要有**：
+
+| 层 | 在哪 | 跑什么 | 什么时候跑 |
+|---|---|---|---|
+| **快闸** | `yk-tako-eino/internal/runengine/contract_test.go` | 信封字节序、session/frames/log 的响应字节、帧 kind 词表、业务码值、工具分档现状。不打模型、不用 API Key、不依赖 PG/Redis | 每拍收尾的 `go test ./internal/runengine` 顺带跑 |
+| **活体** | `scripts/acceptance/` | 真起引擎、真跑一轮：认证前置、未知 id、游标越界、忙时拒绝、多租户可见性、项目目录、media 落盘 | 改了契约字节 / 存储形态 / 可见性时 |
+
+规矩：
+
+1. **期望字节要有机器可读的真源，并能自己判红。**
+   机器真源 = `scripts/acceptance/expected.json`；人读版 = `doc/19-v6/19v6-04-验收-curl.md`。
+   两份**同批改**，`scripts/acceptance/check-expected.sh` 守两边的用例号集合一致。
+2. **改了契约字节，「重跑」是一句命令**（`scripts/acceptance/assert_contract.py`），不是「照着散文手打三十条 curl」。
+   散文期望跑歪了不会红——红的是机器真源。
+3. **快闸的期望字节不许手写**：先 curl 实跑一次，把真实字节抄进测试。
+   手写的期望只是把手写散文换了个文件名。
+4. **不许假装覆盖**：暂不断言的用例要在 `expected.json` 的 `declared_not_asserted` 里登记原因
+   （例：模型行为不稳、要特殊起引擎才造得出的场景）。
+5. 活体脚本要**参数化**（`TAKO_BASE` / `TAKO_ENV` / `TAKO_PG_DSN`），不许写死本机路径与端口。
 
 ## 前端
 
@@ -206,6 +236,14 @@ npm run build                     # vue-tsc -b && vite build
 
 - 单元测试不打模型，不需要 API Key。
 - 每拍收尾跑 `go test ./internal/runengine` + `go vet ./internal/runengine`；改前端再加 `npm run typecheck`。
+- **改了契约字节**（端点的请求/响应/帧格式/业务码）→ 额外跑活体验收：
+  ```bash
+  # 起一个隔离引擎（别拿开发库当靶子），起法见 scripts/acceptance/README.md
+  TAKO_BASE=http://127.0.0.1:8943 TAKO_ENV=yk-tako-eino/.env \
+    python3 scripts/acceptance/assert_contract.py     # 红了退出码非零
+  bash scripts/acceptance/check-expected.sh            # 散文 ↔ 机器真源一致
+  ```
+  改了存储形态 / 游标语义 / 多租户可见性 → 再跑 `bash scripts/acceptance/spotcheck.sh`。
 - 依赖与手动启动方式见根 `README.md`。
 - **`DELETE /api/dev/reset` 是全库 TRUNCATE**（`store.go` 的 `Reset`：清 15 张表 + `SCAN tk:*` 全删 Redis 键）。
   它只在 `-dev` 模式注册、且**无认证**——但没有「只清某个租户」的参数，**清不掉单个测试账号**。

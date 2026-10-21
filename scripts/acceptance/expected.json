@@ -1,0 +1,577 @@
+{
+  "version": "2026-10-22",
+  "source": "doc/19-v6/19v6-04-验收-curl.md",
+  "note": [
+    "本文件是契约字节的**机器真源**；doc/19-v6/19v6-04-验收-curl.md 是同一份内容的人读版。",
+    "两份**同批改**。check-expected.sh 守两边的用例号集合一致。",
+    "tier=core 的用例不需要模型，必须全过；tier=model 需要真实跑一轮（要 API Key 与网络）。",
+    "expect 字段：http / code / message / data（子集比对：只断点名的键，值写 \"$any\" 是通配）/ data_keys（data 对象的键集与键序必须逐字相同）/ frame_kinds_contains / rows_len_equals。",
+    "step 字段：method / path / body / auth / sql（请求前先跑的 SQL）/ capture（把响应里的值存成变量）/ op=signup（建账号+租户+配模型）/ op=wait_terminal（等这一场跑完）。"
+  ],
+  "cases": [
+    {
+      "id": "0-signup",
+      "case": "用例 0",
+      "tier": "core",
+      "desc": "注册 → 账号/租户/成员/accessToken 一并回来",
+      "steps": [
+        {
+          "op": "signup",
+          "expect": {
+            "http": 201,
+            "code": 0,
+            "message": "",
+            "data_keys": [
+              "user",
+              "tenant",
+              "membership",
+              "accessToken",
+              "tokenType",
+              "expiresIn",
+              "refreshToken"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "0-runtime-config",
+      "case": "用例 0",
+      "tier": "core",
+      "desc": "租户配模型密钥 → 密钥回显成掩码",
+      "steps": [
+        {
+          "op": "signup",
+          "expect": {
+            "http": 201,
+            "code": 0,
+            "message": ""
+          }
+        },
+        {
+          "method": "PUT",
+          "path": "/api/tenants/{ten}/runtime-config",
+          "body": {
+            "modelRef": "deepseek/deepseek-flash",
+            "mcpServers": {},
+            "secrets": {
+              "DEEPSEEK_API_KEY": "{key}"
+            },
+            "sandbox": {
+              "network": false
+            }
+          },
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": ""
+          }
+        }
+      ]
+    },
+    {
+      "id": "0-auth-required-runs",
+      "case": "用例 0",
+      "tier": "core",
+      "desc": "业务四端点不带 Authorization 一律 401 信封",
+      "steps": [
+        {
+          "method": "POST",
+          "path": "/api/runs",
+          "body": {
+            "messageId": "m_x",
+            "text": "hi"
+          },
+          "auth": false,
+          "expect": {
+            "http": 401,
+            "code": 111102,
+            "message": "请先登录",
+            "data": null
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/sessions/s_nope",
+          "auth": false,
+          "expect": {
+            "http": 401,
+            "code": 111102,
+            "message": "请先登录",
+            "data": null
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/runs/r_nope/frames",
+          "auth": false,
+          "expect": {
+            "http": 401,
+            "code": 111102,
+            "message": "请先登录",
+            "data": null
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/sessions/s_nope/log",
+          "auth": false,
+          "expect": {
+            "http": 401,
+            "code": 111102,
+            "message": "请先登录",
+            "data": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "0-model-not-configured",
+      "case": "用例 0",
+      "tier": "core",
+      "desc": "租户没配模型密钥 → POST /api/runs 回 409 111408，run 起不来",
+      "steps": [
+        {
+          "op": "signup",
+          "no_model": true,
+          "expect": {
+            "http": 201,
+            "code": 0,
+            "message": ""
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/runs",
+          "body": {
+            "messageId": "m_1",
+            "text": "hi"
+          },
+          "expect": {
+            "http": 409,
+            "code": 111408,
+            "message": "这个工作区的模型还不可用",
+            "data": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "1-post-runs",
+      "case": "用例 1",
+      "tier": "model",
+      "desc": "投递 → 202 + sessionId/runId/messageId",
+      "steps": [
+        {
+          "method": "POST",
+          "path": "/api/runs",
+          "body": {
+            "messageId": "m_v6",
+            "text": "只回复 ok"
+          },
+          "capture": {
+            "sid": "data.sessionId",
+            "rid": "data.runId"
+          },
+          "expect": {
+            "http": 202,
+            "code": 0,
+            "message": "",
+            "data_keys": [
+              "sessionId",
+              "runId",
+              "messageId"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "1-session-while-running",
+      "case": "用例 1",
+      "tier": "model",
+      "desc": "跑中 GET /api/sessions/{sid} → 五个字段，顺序固定",
+      "steps": [
+        {
+          "method": "POST",
+          "path": "/api/runs",
+          "body": {
+            "messageId": "m_v6",
+            "text": "只回复 ok"
+          },
+          "capture": {
+            "sid": "data.sessionId",
+            "rid": "data.runId"
+          },
+          "expect": {
+            "http": 202,
+            "code": 0,
+            "message": "",
+            "data_keys": [
+              "sessionId",
+              "runId",
+              "messageId"
+            ]
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/sessions/{sid}",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data_keys": [
+              "liveRunId",
+              "runlogOffset",
+              "lastRunStatus",
+              "lastRunId",
+              "workspaceId"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "1-frames-and-log",
+      "case": "用例 1",
+      "tier": "model",
+      "desc": "定稿后：frames 有 start/terminal，log 有 user+assistant 两行，session 变 complete",
+      "steps": [
+        {
+          "method": "POST",
+          "path": "/api/runs",
+          "body": {
+            "messageId": "m_v6",
+            "text": "只回复 ok"
+          },
+          "capture": {
+            "sid": "data.sessionId",
+            "rid": "data.runId"
+          },
+          "expect": {
+            "http": 202,
+            "code": 0,
+            "message": "",
+            "data_keys": [
+              "sessionId",
+              "runId",
+              "messageId"
+            ]
+          }
+        },
+        {
+          "op": "wait_terminal",
+          "run": "{rid}",
+          "timeout": 90
+        },
+        {
+          "op": "wait_settled",
+          "session": "{sid}",
+          "timeout": 30
+        },
+        {
+          "method": "GET",
+          "path": "/api/runs/{rid}/frames?eventOffset=0",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data_keys": [
+              "frames",
+              "nextOffset",
+              "status"
+            ],
+            "frame_kinds_contains": [
+              "start",
+              "terminal"
+            ]
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/sessions/{sid}",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data_keys": [
+              "liveRunId",
+              "runlogOffset",
+              "lastRunStatus",
+              "lastRunId",
+              "workspaceId"
+            ],
+            "data": {
+              "liveRunId": "",
+              "lastRunStatus": "complete"
+            }
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/sessions/{sid}/log?runlogOffset=0",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data_keys": [
+              "rows",
+              "nextOffset"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "2-log-offset-out-of-range",
+      "case": "用例 2",
+      "tier": "model",
+      "desc": "runlog 游标越界 → 空 rows，nextOffset 原样回",
+      "steps": [
+        {
+          "method": "POST",
+          "path": "/api/runs",
+          "body": {
+            "messageId": "m_v6",
+            "text": "只回复 ok"
+          },
+          "capture": {
+            "sid": "data.sessionId",
+            "rid": "data.runId"
+          },
+          "expect": {
+            "http": 202,
+            "code": 0,
+            "message": ""
+          }
+        },
+        {
+          "op": "wait_terminal",
+          "run": "{rid}",
+          "timeout": 90
+        },
+        {
+          "op": "wait_settled",
+          "session": "{sid}",
+          "timeout": 30
+        },
+        {
+          "method": "GET",
+          "path": "/api/sessions/{sid}/log?runlogOffset=999",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data": {
+              "rows": [],
+              "nextOffset": 999
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "2-frames-offset-out-of-range",
+      "case": "用例 2",
+      "tier": "model",
+      "desc": "frames 游标越界 → 空 frames，nextOffset 原样回（status 随 runlive TTL 变，不钉）",
+      "steps": [
+        {
+          "method": "POST",
+          "path": "/api/runs",
+          "body": {
+            "messageId": "m_v6",
+            "text": "只回复 ok"
+          },
+          "capture": {
+            "sid": "data.sessionId",
+            "rid": "data.runId"
+          },
+          "expect": {
+            "http": 202,
+            "code": 0,
+            "message": ""
+          }
+        },
+        {
+          "op": "wait_terminal",
+          "run": "{rid}",
+          "timeout": 90
+        },
+        {
+          "op": "wait_settled",
+          "session": "{sid}",
+          "timeout": 30
+        },
+        {
+          "method": "GET",
+          "path": "/api/runs/{rid}/frames?eventOffset=999",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data": {
+              "frames": [],
+              "nextOffset": 999
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "3-unknown-session",
+      "case": "用例 3",
+      "tier": "core",
+      "desc": "未知 sessionId：三个端点一律 404 112001",
+      "steps": [
+        {
+          "method": "POST",
+          "path": "/api/runs",
+          "body": {
+            "sessionId": "s_nope",
+            "messageId": "m_9",
+            "text": "hi"
+          },
+          "expect": {
+            "http": 404,
+            "code": 112001,
+            "message": "找不到这场会话",
+            "data": null
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/sessions/s_nope",
+          "expect": {
+            "http": 404,
+            "code": 112001,
+            "message": "找不到这场会话",
+            "data": null
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/sessions/s_nope/log",
+          "expect": {
+            "http": 404,
+            "code": 112001,
+            "message": "找不到这场会话",
+            "data": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "3-unknown-run-frames",
+      "case": "用例 3",
+      "tier": "core",
+      "desc": "未知 run 在 frames 上仍不是 404——200 + 空 frames + gone",
+      "steps": [
+        {
+          "method": "GET",
+          "path": "/api/runs/r_nope/frames",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data": {
+              "frames": [],
+              "nextOffset": 0,
+              "status": "gone"
+            },
+            "data_keys": [
+              "frames",
+              "nextOffset",
+              "status"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "4-busy-rejected",
+      "case": "用例 4",
+      "tier": "model",
+      "needs": "pg",
+      "desc": "忙时诚实拒绝：409 112101，且忙拒在 runlog 里零痕迹",
+      "steps": [
+        {
+          "method": "POST",
+          "path": "/api/runs",
+          "body": {
+            "messageId": "m_v6",
+            "text": "只回复 ok"
+          },
+          "capture": {
+            "sid": "data.sessionId",
+            "rid": "data.runId"
+          },
+          "expect": {
+            "http": 202,
+            "code": 0,
+            "message": ""
+          }
+        },
+        {
+          "op": "wait_terminal",
+          "run": "{rid}",
+          "timeout": 90
+        },
+        {
+          "op": "wait_settled",
+          "session": "{sid}",
+          "timeout": 30
+        },
+        {
+          "method": "GET",
+          "path": "/api/sessions/{sid}/log?runlogOffset=0",
+          "capture": {
+            "rows_before": "data.rows"
+          },
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": ""
+          }
+        },
+        {
+          "sql": "UPDATE runs SET status='running', lease_until=now()+interval '5 minutes', finished_at=NULL WHERE id='{rid}'"
+        },
+        {
+          "method": "POST",
+          "path": "/api/runs",
+          "body": {
+            "sessionId": "{sid}",
+            "messageId": "m_busy",
+            "text": "急"
+          },
+          "expect": {
+            "http": 409,
+            "code": 112101,
+            "message": "这场会话正在跑，等它跑完再发",
+            "data": null
+          }
+        },
+        {
+          "sql": "UPDATE runs SET status='complete', lease_until=NULL, finished_at=now() WHERE id='{rid}'"
+        },
+        {
+          "method": "GET",
+          "path": "/api/sessions/{sid}/log?runlogOffset=0",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "rows_len_equals": "{rows_before}"
+          }
+        }
+      ]
+    }
+  ],
+  "declared_not_asserted": {
+    "用例 5": "单批上限 W —— 要用 -batch-window 3 特殊起引擎才造得出截断，默认 W=200 下这条断言没有意义；改引擎起法后手工重放",
+    "用例 6": "工具循环（get_time）—— 断模型会不会真的去调工具，换个模型就飘；帧 kind 全集由 go test 的契约测试钉住",
+    "用例 7": "委派子代理 —— 同上，模型是否委派不稳定；回传裁剪的机制断言在 doc/39 的活体抽验里"
+  }
+}
