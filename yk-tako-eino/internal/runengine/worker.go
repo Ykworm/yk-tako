@@ -1,6 +1,6 @@
 // 本文件：真 LLM worker（新 A6 转正）+ Translator 归一层（planning §5 第 7 条）。
 //
-// Translator 是 provider chunk → 归一 delta 文本的唯一翻译点；Worker.Run 是 AppendDelta 的唯一调用方：
+// Translator 是 provider chunk → 归一 delta 文本的唯一翻译点；Worker.Run 是 AppendFrame 的唯一调用方：
 // runlive 的帧协议（19v6-01 §2 {kind,messageId,text,status}）不随厂商变——厂商差异全部收在这一层，
 // 兼容性由它承担，不是由存储侧承担。claude / openai / 原生 eino 各一个 translator：
 // 现在同读 schema.Message.Content（思考与推理在 ReasoningContent，不属于回复正文、不进 delta 帧），
@@ -886,11 +886,11 @@ func usageFrame(bill *UsageBill, agent, model string) Frame {
 
 // drain 排干一条模型输出流：chunk → Translator → delta 帧；EOF 时把全部 chunk 合并成完整消息返回
 // （T2：merged.ToolCalls 是 tool_call 帧的来源、merged.Content 是本轮 assistant 行）。
-// T3：agent = "" 走 AppendDelta（root 正文帧）；子代理文本走 AppendFrame
-// （delta 帧带 agent——收口锚「Σ root delta」不被子代理文本污染；定稿只认 turn）。
+// T3：root 与子代理的正文都走 AppendFrame，Agent 字段区分两者（root 为空串，子代理带名字）——
+// 收口锚「Σ root delta」不被子代理文本污染；定稿只认 turn。
 // T3-1b：drain 的 translator 与 model 值都取自 entry（该 agent 的模型身份）——继承档 = 主 translator/主 ref，
 // 写值档 = 按该模型协议选的 translator / 其生效 ref；root 与子代理共用同一条排干逻辑。
-// A2：帧计数（裁定 7：AppendDelta/AppendFrame 成功次数总和，不分 root/子代理）——救援谓词的
+// A2：帧计数（裁定 7：AppendFrame 成功次数总和，不分 root/子代理）——救援谓词的
 // 零帧判据；只有 err==nil && accepted 才 +1（令牌拒写/失败没写进 runlive，不算发过帧）。B1 起计数
 // 收编 foldBox（D12）——guard 与 worker 读同一个数。
 // 返回 accepted=false = 本执行者已不是当前一代（该收摊，不是错误）；err != nil = 错误结局。
@@ -913,12 +913,11 @@ func (w *Worker) drain(ctx context.Context, runID RunID, epoch int64, agent stri
 		}
 		chunks = append(chunks, chunk)
 		if text, ok := entry.translate(chunk); ok {
+			// root 与子代理的正文走同一个写口：Agent 字段区分两者——root 为空串，
+			// 收口锚「Σ root delta」只认空 Agent 的那些（worker.go 顶层注释 T3 帧路由）。
 			var accepted bool
-			if agent == "" {
-				_, accepted, err = w.store.AppendDelta(ctx, runID, epoch, entry.ref, text)
-			} else {
-				accepted, err = w.store.AppendFrame(ctx, runID, epoch, Frame{Kind: "delta", Agent: agent, Model: entry.ref, Text: text})
-			}
+			accepted, err = w.store.AppendFrame(ctx, runID, epoch,
+				Frame{Kind: "delta", Agent: agent, Model: entry.ref, Text: text})
 			if err != nil {
 				return nil, false, err
 			}
@@ -934,7 +933,7 @@ func (w *Worker) drain(ctx context.Context, runID RunID, epoch int64, agent stri
 // 闸已易主 / 已放 / 已到期 / 已被接管）= 本 run 被判死 → 记日志、cancel 本场 run（doc/17 §4
 // 手动停止：stop 端点翻 stopped 后由此传播取消；自然过期同样掐流——2026-10-15 用户拍，
 // 原「不杀流」语义废）。
-// 主循环的 AppendDelta 还会因令牌缺失或不等自然停写（返 !accepted）、EndRun 被守卫挡住
+// 主循环的 AppendFrame 还会因令牌缺失或不等自然停写（返 !accepted）、EndRun 被守卫挡住
 // 走「闸已不在，空转」。
 // epoch 匹配才 cancel（doc/30 §7）：接管者已注册新一代的 cancel，旧 watchdog 的判死
 // 不许误伤它。ctx 由 Run 在退出前 cancel，watchdog 随即返回；wg.Wait() 保证它完全退出后

@@ -201,7 +201,7 @@ commit → Redis terminal + DEL epoch → 客户端 log。
 
 ### 5.4 删除后的故障行为
 
-- **生成中 Redis 写失败**：`AppendDelta` 返回错误，worker 照旧走 error 出口。这是既有行为，
+- **生成中 Redis 写失败**：`AppendFrame` 返回错误，worker 照旧走 error 出口。这是既有行为，
   不因删除 draft 改变。删除 draft 不承诺「Redis 挂了 run 还能继续生成」。
 - **定稿时 Redis 不可用**：EndRun 的 PG 事务照常提交，runlog 有完整正文；commit 后的
   terminal/删 epoch 失败，`runlive` 靠 lease/300s 收敛成 gone，客户端从 log 拿全文。这是删除
@@ -224,6 +224,12 @@ commit → Redis terminal + DEL epoch → 客户端 log。
 | `drain` 的局部与返回 | `live bool` / `!live` | `accepted bool` / `!accepted` | 同上；不再是「run 活不活」 |
 | worker 四处帧写出口的局部 | `live` | `accepted` | tool_result / drain / usage / tool_call |
 | 相关注释 | 「run 判死」「liveness 由 draft 承载」 | 「本执行者已不是当前一代」「令牌缺失/不等」 | 删掉 draft 时代语言 |
+
+> **现状（2026-10-21）**：`AppendDelta` 与 `AppendFrame` 已合并为**唯一的 `AppendFrame`**——
+> 两个写口的 Lua 本就逐字节相同（同一段「比对 runepoch → RPUSH → 返 LLEN」），
+> 所谓 root-only 护栏实际在调用方的 `agent == ""` 分支上，不在存储层。
+> 上表是 doc/38 当时的改动记录（「今天」列指**删除 draft 之前**的状态，那时确实有两个写口），
+> 保留原样作历史；现在只有一个帧写口，返回值仍是 `accepted bool`。
 
 只改名字，不改行为：四个 `!accepted` 出口仍然直接 `return`，不把 status 改成 error（见 §5.4）。
 `search.go` 的结果计数、`product_api.go` 的活 run 数、`SessionStatus` 的 `liveRunId` 是别的

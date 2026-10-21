@@ -194,9 +194,9 @@ func (s *Store) mustAcquire(t *testing.T, sid SessionID, rid RunID, msgID, text 
 func (s *Store) mustDelta(t *testing.T, ctx context.Context, rid RunID, text string) {
 	t.Helper()
 	// model 传空串：多数用例验的是生命周期语义、不关心 model 值（帧上恒在字段，无 omitempty）。
-	// model 值的序列化往返另有专测（TestAppendDeltaThenRead）。
-	if _, accepted, err := s.AppendDelta(ctx, rid, 1, "", text); err != nil || !accepted {
-		t.Fatalf("AppendDelta(%s): accepted=%v err=%v", rid, accepted, err)
+	// model 值的序列化往返另有专测（TestAppendFrameDeltaThenRead）。
+	if accepted, err := s.AppendFrame(ctx, rid, 1, Frame{Kind: "delta", Text: text}); err != nil || !accepted {
+		t.Fatalf("AppendFrame delta(%s): accepted=%v err=%v", rid, accepted, err)
 	}
 }
 
@@ -275,19 +275,16 @@ func TestReadFramesStartFrameAndBeyondEnd(t *testing.T) {
 }
 
 // 3. delta 追加后从上一游标续读，offset 连续；model 值随帧序列化往返（T3-1b 帧上的恒在字段）。
-func TestAppendDeltaThenRead(t *testing.T) {
+func TestAppendFrameDeltaThenRead(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t, testLease, testTTL)
 	sid, rid := SessionID("s_1"), RunID("r_1")
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 
-	for i, want := range []int{2, 3} {
-		n, accepted, err := s.AppendDelta(ctx, rid, 1, "deepseek/deepseek-v4-flash", "你好")
+	for i := 0; i < 2; i++ {
+		accepted, err := s.AppendFrame(ctx, rid, 1, Frame{Kind: "delta", Model: "deepseek/deepseek-v4-flash", Text: "你好"})
 		if err != nil || !accepted {
-			t.Fatalf("AppendDelta #%d: accepted=%v err=%v", i, accepted, err)
-		}
-		if n != want {
-			t.Errorf("AppendDelta #%d eventOffset = %d, want %d", i, n, want)
+			t.Fatalf("AppendFrame delta #%d: accepted=%v err=%v", i, accepted, err)
 		}
 	}
 
@@ -1596,17 +1593,17 @@ func TestAppendStillRejectsWrongEpoch(t *testing.T) {
 	sid, rid := SessionID("s_epoch"), RunID("r_epoch")
 	s.mustAcquire(t, sid, rid, "m_epoch", "hi")
 	before := s.llen(t, ctx, keyRunlive(rid))
-	if _, accepted, err := s.AppendDelta(ctx, rid, 2, "", "x"); err != nil || accepted {
-		t.Fatalf("错 epoch AppendDelta accepted=%v err=%v, want false", accepted, err)
+	if accepted, err := s.AppendFrame(ctx, rid, 2, Frame{Kind: "delta", Text: "x"}); err != nil || accepted {
+		t.Fatalf("错 epoch AppendFrame(delta) accepted=%v err=%v, want false", accepted, err)
 	}
 	if accepted, err := s.AppendFrame(ctx, rid, 2, Frame{Kind: "tool_call"}); err != nil || accepted {
-		t.Fatalf("错 epoch AppendFrame accepted=%v err=%v, want false", accepted, err)
+		t.Fatalf("错 epoch AppendFrame(tool_call) accepted=%v err=%v, want false", accepted, err)
 	}
 	if got := s.llen(t, ctx, keyRunlive(rid)); got != before {
 		t.Fatalf("拒写后 LLEN = %d, want %d", got, before)
 	}
-	if _, accepted, err := s.AppendDelta(ctx, rid, 1, "", "x"); err != nil || !accepted {
-		t.Fatalf("本代 AppendDelta accepted=%v err=%v, want true", accepted, err)
+	if accepted, err := s.AppendFrame(ctx, rid, 1, Frame{Kind: "delta", Text: "x"}); err != nil || !accepted {
+		t.Fatalf("本代 AppendFrame(delta) accepted=%v err=%v, want true", accepted, err)
 	}
 	if got := s.llen(t, ctx, keyRunlive(rid)); got != before+1 {
 		t.Fatalf("本代写入后 LLEN = %d, want %d", got, before+1)
@@ -1677,17 +1674,17 @@ func TestSeedResumeLeavesOnlyRunliveAndEpoch(t *testing.T) {
 		t.Fatalf("seed 后 runepoch TTL = %v, want > 0（SET 之后要补 PEXPIRE）", ttl)
 	}
 	before := s.llen(t, ctx, keyRunlive(rid))
-	if _, accepted, err := s.AppendDelta(ctx, rid, 1, "", "x"); err != nil || accepted {
-		t.Fatalf("旧 epoch AppendDelta accepted=%v err=%v, want false", accepted, err)
+	if accepted, err := s.AppendFrame(ctx, rid, 1, Frame{Kind: "delta", Text: "x"}); err != nil || accepted {
+		t.Fatalf("旧 epoch AppendFrame(delta) accepted=%v err=%v, want false", accepted, err)
 	}
 	if accepted, err := s.AppendFrame(ctx, rid, 1, Frame{Kind: "tool_call"}); err != nil || accepted {
-		t.Fatalf("旧 epoch AppendFrame accepted=%v err=%v, want false", accepted, err)
+		t.Fatalf("旧 epoch AppendFrame(tool_call) accepted=%v err=%v, want false", accepted, err)
 	}
 	if got := s.llen(t, ctx, keyRunlive(rid)); got != before {
 		t.Fatalf("旧令牌拒写后 LLEN = %d, want %d", got, before)
 	}
-	if _, accepted, err := s.AppendDelta(ctx, rid, claim.Epoch, "", "新"); err != nil || !accepted {
-		t.Fatalf("新 epoch AppendDelta accepted=%v err=%v, want true", accepted, err)
+	if accepted, err := s.AppendFrame(ctx, rid, claim.Epoch, Frame{Kind: "delta", Text: "新"}); err != nil || !accepted {
+		t.Fatalf("新 epoch AppendFrame(delta) accepted=%v err=%v, want true", accepted, err)
 	}
 	if accepted, err := s.AppendFrame(ctx, rid, claim.Epoch, Frame{Kind: "tool_result", Output: "ok"}); err != nil || !accepted {
 		t.Fatalf("新 epoch AppendFrame accepted=%v err=%v, want true", accepted, err)

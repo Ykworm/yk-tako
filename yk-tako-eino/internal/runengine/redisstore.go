@@ -1,6 +1,6 @@
 // 本文件是存储层的 Redis 半：临时态只剩 tk:runlive 与 tk:runepoch 两键（doc/38）。
 //
-// 热路径（AppendDelta，每 delta 一次）与 ReadFrames 零变化；跨存储的方法（AcquireRun / EndRun /
+// 热路径（AppendFrame，每 delta 一次）与 ReadFrames 零变化；跨存储的方法（AcquireRun / EndRun /
 // RenewLease / Reset）在 store.go，它们经由本文件的 runliveStart / runliveFinish 两个出生/收尾助手
 // 触碰 Redis——两处都是单条 Lua：要么整段生效要么整段没写，让「PG 事务持有跨 Redis 写」的
 // 失败形状保持「零痕迹」（planning §8.4）。
@@ -59,18 +59,9 @@ redis.call('PEXPIRE', KEYS[2], ARGV[1])  -- KEYS[2]=tk:runepoch:<run> ARGV[1]=le
 return 1
 `)
 
-// appendDeltaScript：写口只问令牌。缺失或与本执行者不等 = 返回 0（本执行者已不是当前一代）。
-// KEYS: runlive runepoch；ARGV: deltaFrameJSON epoch。
-var appendDeltaScript = redis.NewScript(`
-if redis.call('GET', KEYS[2]) ~= ARGV[2] then -- KEYS[2]=tk:runepoch  ARGV[2]=本执行者 epoch
-  return 0
-end
-redis.call('RPUSH', KEYS[1], ARGV[1])       -- KEYS[1]=tk:runlive:<run>  ARGV[1]=delta 帧 JSON
-return redis.call('LLEN', KEYS[1])          -- KEYS[1]=tk:runlive:<run>  返回新帧的 eventOffset
-`)
-
-// appendFrameScript：归一层追加一帧非 delta 帧（tool_call / tool_result / usage / 子代理 delta）。
-// 守卫与 appendDelta 同式（令牌相等）：旧执行者的帧不许混进接管者的现场。
+// appendFrameScript：帧写口，只问令牌。缺失或与本执行者不等 = 返回 0（本执行者已不是当前一代）。
+// 承载全部帧种：root 正文 delta（Agent 为空）、子代理 delta（Agent 带名字）、tool_call /
+// tool_result / usage —— 都是同一个键上的 RPUSH。守卫只看令牌（旧执行者的帧不许混进接管者的现场）。
 // KEYS: runlive runepoch；ARGV: frameJSON epoch。
 var appendFrameScript = redis.NewScript(`
 if redis.call('GET', KEYS[2]) ~= ARGV[2] then -- KEYS[2]=tk:runepoch  ARGV[2]=本执行者 epoch
@@ -184,33 +175,11 @@ func (s *Store) ReadFrames(ctx context.Context, runID RunID, from, w int) (frame
 	return frames, nextOffset, exists, nil
 }
 
-// AppendDelta 追加一帧 root delta（19v6-03「生命周期」）——每 delta 一次的热路径。
-// model 是产出该 delta 的模型生效 ref（T3-1b）：本口只服务 root 正文（子代理 delta 走 AppendFrame）。
+// AppendFrame 追加一帧（T2 归一层写口，唯一的帧写口）。承载全部帧种：root 正文 delta
+// （Agent 为空）、子代理 delta（Agent 带名字）、tool_call / tool_result / usage。
 // accepted=false = 令牌缺失或与本执行者不等（本执行者已不是当前一代，doc/30 §7：
 // 旧进程的帧不许混进接管者的现场）。这不是「run 已死」：PG 租约可能仍有效。
-func (s *Store) AppendDelta(ctx context.Context, runID RunID, epoch int64, model, text string) (eventOffset int, accepted bool, err error) {
-	// 帧本身在写侧不填 EventOffset——读时 ReadFrames 按 LIST index+1 统一注入，写侧只读 LLEN 当返回值。
-	frameJSON, err := json.Marshal(Frame{Kind: "delta", Model: model, Text: text})
-	if err != nil {
-		return 0, false, err
-	}
-	// KEYS[1]=tk:runlive —— 帧流（RPUSH 帧 JSON）
-	// KEYS[2]=tk:runepoch —— 令牌守卫
-	// ARGV[1]=delta 帧 JSON；ARGV[2]=epoch
-	n, err := appendDeltaScript.Run(ctx, s.rdb,
-		[]string{keyRunlive(runID), keyRunepoch(runID)}, frameJSON, epoch).Int64()
-	if err != nil {
-		return 0, false, err
-	}
-	// 返回 0 = 令牌缺失或不等 → accepted=false，上层 worker 停止推送。
-	if n == 0 {
-		return 0, false, nil
-	}
-	return int(n), true, nil
-}
-
-// AppendFrame 追加一帧非 delta 帧（T2 归一层写口）。accepted=false = 令牌缺失或不等
-// （与 AppendDelta 同一口径）。EventOffset 写侧不设——读时按 LIST index+1 注入（同 delta/start/terminal）。
+// EventOffset 写侧不设——读时按 LIST index+1 注入（同 delta/start/terminal）。
 func (s *Store) AppendFrame(ctx context.Context, runID RunID, epoch int64, frame Frame) (accepted bool, err error) {
 	// 注意：frame 由调用方（worker）填 Kind（tool_call / tool_result / usage / 子代理 delta）和 payload 字段，
 	// 这里只做 JSON 序列化——存储层不关心帧内部长什么样。
