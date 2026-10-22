@@ -63,7 +63,7 @@
 | 25 | [子代理进程内折叠](25-子代理折叠.md) | ✅ | `midfold.go`、`agentfold_test.go` | 取代 doc/17 §6；A1–A3 已验收 |
 | 26 | [researcher 的工具护栏](26-researcher工具护栏.md) | ✅ | `agents.go`、`agents/researcher.md`、`agents/coder.md` | `exclude_tools` 四态；排除清单只剩 `bash` |
 | 27 | [用量可见化](27-用量可见.md) | ✅ | `product_api.go`、`server.go`、`worker.go`、`web/src/` | usage 帧／页面阈值／runlog 历史行 |
-| 28 | [多租户运行时](28-多租户.md) | ✅ | `auth.go`、`identity_store.go`、`members_store.go`、`tenant_api.go`、`scope.go`、`pgstore.go` | 2026-10-21 收口。A0–A6 共 30 拍已落地并 curl 验收，随 `9c21b66` 入库。团队前端不在本篇（doc/36 已落地）；A7 那一档里「旧成功体换信封」已由 [doc/40](40-响应信封统一.md) 于 2026-10-22 落地，计费、API key、SSO、组织共享仍未开工 |
+| 28 | [多租户运行时](28-多租户.md) | ✅ | `auth.go`、`identity_store.go`、`members_store.go`、`tenant_api.go`、`scope.go`、`pgstore.go` | 2026-10-21 收口。A0–A6 共 30 拍已落地并 curl 验收，随 `9c21b66` 入库。团队前端不在本篇（doc/36 已落地）；A7 那一档里「旧成功体换信封」已由 [doc/40](40-响应信封统一.md) 于 2026-10-22 落地，**计费、API key、SSO、组织共享、审计导出整批已拍不做**（2026-10-22 用户裁，与运行时关系不大的商业化、合规项，§15；2026-10-23 复核维持） |
 | 29 | [长期记忆与对话召回](29-长期记忆.md) | ✅ | `memory.go`、`recall.go`、`dialogue.go`、`worker.go` | A1–B4 全落地；两条加工线共用 runlog。**2026-10-22**：召回块改进「本轮输入」并写回 mh 的 seq=1（runlog 仍纯原话）→ mid-run 折叠不再抹掉它；块带 created time；计入折叠预算。折叠链本身未改 |
 | 30 | [崩溃续跑](30-崩溃续跑.md) | 🔶 | `journal.go`、`worker.go`、`resume_test.go`、`web/src/api.ts`、`web/src/chat.ts`、`web/src/App.vue` | A1–A5 已落地；A6 自动巡检 2026-10-21 裁为客户端触发式恢复（server 巡检不做）；**A8 前端 reattach 已落地并验收**（interrupted 琥珀提示 +「继续这一轮」按钮，2026-10-21）；A7 回归收口已跑（`go test -count=1` 25.3s 绿、vet 干净、`19v6-04` 矩阵重放全过）。**2026-10-22**：§10.1/§10.2/§10.4 的期望字节已随 [doc/40](40-响应信封统一.md) 换信封（404 `112002`、409 三态 `112102`/`112103`/`112104`） |
 | 31 | [SSE 流式端点](31-sse流式端点.md) | ✅ | `server.go`、`redisstore.go`、`stream_test.go` | 同一帧面的第二种运输方式；拉是正确性、流是优化 |
