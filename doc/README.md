@@ -76,6 +76,8 @@
 | 38 | [删除 tk:draft 键](38-删除draft键.md) | ✅ | `redisstore.go`、`store.go`、`server.go`、`worker.go`、`store_test.go` | 2026-10-20 已落地；定稿正文来自 turn，写口只认 runepoch |
 | 39 | [子代理持久化与 resume](39-子代理持久化与resume.md) | ✅ | `agents.go`、`subagent_wire.go`、`resume_subagent.go`、`archive_sweep.go`、`worker.go`、`server.go` | 2026-10-21 已落地。S1 随 e476749 入库；S2、S3 在 8905 curl 验收后入库。每实例追加式 wire（`.tako/subagents/`，无 PG 表）+ `resume_subagent`（只认完整档案；不做半截重接，对齐 doc/30）。第三类清扫挂在 doc/37 同一轮，只删过窗文件 |
 | 40 | [响应信封统一](40-响应信封统一.md) | ✅ | `auth.go`、`server.go`、`mcp.go`、`product_api.go`、`archive_sweep.go`、`envelope_test.go`、`web/src/api.ts`、`web/src/chat.ts` | 2026-10-22 落地，随 `cd85050` 入库。A7-1…A7-8 共 8 拍：后端六拍（curl 逐字节）+ 前端一拍（Playwright 活体）+ 收口一拍。runs／sessions／mcp／media／memory 五组旧接口整包换 `{code,message,data}`；**不动存储、不动帧格式、不动 HTTP 状态码**；media 的二进制成功体与 SSE 帧面不进信封。台账 `tmp/A7-信封迁移/`（不入库） |
+| 41 | [任务看板与人工审批（方案）](41-任务看板与人工审批.md) | ⬜（方案待点头） | —（未施工） | 三合一独立方案：v6 看板重建（tasktracker 四工具 + `run_tasks` 表）、PII 脱敏三挂载点、interrupt 审批挂起回路（`run_approvals` 表 + `approval`/`task` 新帧 kind，词表 7→9）。对应 doc/16 §5.1 第 1、2 项与 §2 表 #2/#3/#7；点头后按篇内 §6 拆 loop |
+| 42 | [产品形态收窄与共享项目退役（方案）](42-产品形态收窄与共享项目退役.md) | ⬜（方案待点头） | —（未施工） | 形态定稿：tako = 多租户的 AI 工作台，**一个员工 = 一个项目**，**项目文件由多 session 共享**，团队共享账号/额度/审计、**不共享文件**（不做协同编辑）。退役两样：跨成员共享项目（`visibility='tenant'` 路径 + `PATCH /api/workspaces/:id/visibility` 端点 + `scope=tenant` 列举）、项目闸（`one_live_run_per_workspace` 索引 + 409 `114004`）。六个开放问题 2026-10-22 已全部拍完 |
 
 ## 2. 历史存档（`doc/`，不作施工面）
 

@@ -656,6 +656,99 @@ func (s *Server) getDevFile(c *gin.Context) {
 	}{Path: path, Content: string(b), SessionID: sid})
 }
 
+// devFileFingerprint 是同文件并发写底座的观测口（脚手架：验收通过后转只读诊断口）。
+// 打出目标文件此刻的指纹（mtime + size + sha256；>64MB 只出 mtime+size 并标 weak）。
+//
+//	POST /api/dev/file-fingerprint {"path":"a.md"}
+//	200 {"code":0,"message":"","data":{"path":"a.md","mtime":…,"size":…,"sha256":"…","hasHash":true,"weak":false}}
+func (s *Server) devFileFingerprint(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Path) == "" {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	dir, _, ok := s.devWorkspaceDir(c, p)
+	if !ok {
+		return
+	}
+	full, err := resolveInWorkspace(dir, req.Path)
+	if err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "路径不对", nil)
+		return
+	}
+	fp, err := fingerprintOf(full)
+	if err != nil {
+		writeEnvelope(c, http.StatusNotFound, codeAgentMissing, "找不到这个文件", nil)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		Path    string    `json:"path"`
+		Mtime   time.Time `json:"mtime"`
+		Size    int64     `json:"size"`
+		SHA256  string    `json:"sha256"`
+		HasHash bool      `json:"hasHash"`
+		Weak    bool      `json:"weak"`
+	}{Path: req.Path, Mtime: fp.Mtime, Size: fp.Size, SHA256: fp.SHA256, HasHash: fp.SHA256 != "", Weak: fp.weak()})
+}
+
+// devFileLockCheck 是写锁的观测口（脚手架）：拿一把路径锁、持锁 holdMs、报实际等了多久。
+// 两个并发打它 → 第二个的 waitedMs ≥ 前一个的 holdMs = **串行**（不是并行）。
+//
+//	POST /api/dev/file-lock-check {"path":"a.md","holdMs":1500}
+//	200 {"code":0,"message":"","data":{"acquired":true,"waitedMs":1502}}
+func (s *Server) devFileLockCheck(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	var req struct {
+		Path   string `json:"path"`
+		HoldMs int    `json:"holdMs"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Path) == "" {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	dir, _, ok := s.devWorkspaceDir(c, p)
+	if !ok {
+		return
+	}
+	full, err := resolveInWorkspace(dir, req.Path)
+	if err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "路径不对", nil)
+		return
+	}
+	// 锁目录与工具层同一处：租户根下的 .tako/locks（工具层走 ctx 的 workspace ref）。
+	lockDir := filepath.Join(s.mediaRoot, "tenants", p.TenantID, ".tako", "locks")
+	start := time.Now()
+	unlock, err := lockPaths(lockDir, []string{full})
+	if err != nil {
+		if errors.Is(err, errLockTimeout) {
+			writeEnvelope(c, http.StatusConflict, codeWorkspaceBusyLive, "这个文件正被另一个 agent 写，稍后重试", nil)
+			return
+		}
+		internal(c, err)
+		return
+	}
+	waited := time.Since(start)
+	if req.HoldMs > 0 {
+		time.Sleep(time.Duration(req.HoldMs) * time.Millisecond)
+	}
+	unlock()
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		Acquired  bool  `json:"acquired"`
+		WaitedMs  int64 `json:"waitedMs"`
+		HoldMs    int   `json:"holdMs"`
+		LockPath  string `json:"lockPath"`
+	}{Acquired: true, WaitedMs: waited.Milliseconds(), HoldMs: req.HoldMs, LockPath: lockPathFor(lockDir, full)})
+}
+
 func (s *Server) postDevBash(c *gin.Context) {
 	p, ok := s.requirePrincipal(c)
 	if !ok {

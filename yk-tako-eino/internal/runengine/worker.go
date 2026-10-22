@@ -536,6 +536,10 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 		return
 	}
 	ctx = withNoteBox(ctx, newNoteBox(sessionID, runID, userSeq))
+	// 同文件并发写的基准表（filefp.go）：「谁读到的是哪一版」——run 级内存，read_file 记、
+	// 写后刷新。write_file 的写前判据靠它（整份覆盖语义 → 必须整体是最新版）。
+	// 键带 agent 名：子代理不借用主代理的「读过」。
+	ctx = withFileBaseline(ctx, newFileBaseline())
 
 	// 系统提示在抢闸之后才定：带了 profile 就用装配时定下的 spec，摘要也换到租户模型。
 	// 没带 profile 的单测仍读会话上的助手行。放在 EndRun 的 defer 之后，查不到助手时 return 仍会放闸。

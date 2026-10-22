@@ -115,14 +115,49 @@ type writeFileInput struct {
 func newWriteFileTool(root string) (tool.BaseTool, error) {
 	return utils.InferTool("write_file",
 		"在 workspace 内创建或覆盖写入一个文件（整文件覆盖）。path 是相对 workspace 根的路径（如 notes/todo.txt）；"+
-			"父目录不存在会自动创建；文件已存在则覆盖、返回文本会标注「（覆盖）」。返回格式：已写入 <path>（<n> 字节）。",
+			"父目录不存在会自动创建；文件已存在则覆盖、返回文本会标注「（覆盖）」。返回格式：已写入 <path>（<n> 字节）。"+
+			"【覆盖已有文件前必须先用 read_file 读它】——没读过会被拒（避免凭记忆整份回写、抹掉别人刚落盘的改动）；"+
+			"读过但文件在此期间被别人改过，也会被拒：请重新 read_file，或改用 edit_file 做局部替换"+
+			"（edit_file 按内容精确替换，并会保留别人已落盘的改动）。",
 		func(ctx context.Context, in writeFileInput) (string, error) {
 			full, err := resolveInWorkspace(activeRoot(ctx, root), in.Path)
 			if err != nil {
 				return "", err
 			}
+			// 取写锁（粒度=文件）。**比对必须在锁内做**——否则「检查—写」之间有缝，
+			// 另一个写者能在缝里落盘，锁就白加了（filefp.go 的三层分工）。
+			unlock, err := lockPaths(lockDirFor(ctx, root), []string{full})
+			if err != nil {
+				if errors.Is(err, errLockTimeout) {
+					return "", fmt.Errorf("这个文件正被另一个 agent 写，稍后重试")
+				}
+				return "", err
+			}
+			defer unlock()
+			// 写之前必须知道「我读到的是哪一版」：基准表里没有这一行 = 本 run 从没读过它。
+			// write_file 是整份覆盖语义 → 必须整体是最新版，否则会把读之后的改动抹回旧版。
+			base := fileBaselineFrom(ctx)
+			agent := agentNameOf(ctx)
+			known, hasBase := base.get(agent, full)
 			_, statErr := os.Stat(full)
 			existed := statErr == nil
+			switch {
+			case existed && !hasBase:
+				return "", fmt.Errorf("你还没用 read_file 读它——先 read_file 读一遍再写（%s）", in.Path)
+			case existed && hasBase:
+				cur, ferr := fingerprintOf(full)
+				if ferr != nil {
+					return "", fmt.Errorf("读取 %s 的现状失败：%v", in.Path, ferr)
+				}
+				if !cur.equal(known) {
+					if cur.weak() || known.weak() {
+						return "", fmt.Errorf("它跟你读到的不一样了（%s）——先 read_file 重新读取；要做局部修改请用 edit_file（它按内容精确替换，会带上别人已落盘的改动）。（该文件用弱判据：mtime+size）", in.Path)
+					}
+					return "", fmt.Errorf("它跟你读到的不一样了（%s）——先 read_file 重新读取；要做局部修改请用 edit_file（它按内容精确替换，会带上别人已落盘的改动）", in.Path)
+				}
+			case !existed && hasBase:
+				return "", fmt.Errorf("它刚被删或被移走，别重建——先确认现在的状态（%s）", in.Path)
+			}
 			release, err := reserveStorage(ctx, len(in.Content))
 			if err != nil {
 				return "", err
@@ -133,6 +168,10 @@ func newWriteFileTool(root string) (tool.BaseTool, error) {
 			}
 			if err := os.WriteFile(full, []byte(in.Content), 0o644); err != nil {
 				return "", fmt.Errorf("写入失败：%v", err)
+			}
+			// 写后刷新基准：同一 run 内连续改同一个文件不误报。
+			if fp, ferr := fingerprintOf(full); ferr == nil {
+				base.set(agent, full, fp)
 			}
 			if existed {
 				return fmt.Sprintf("已写入 %s（%d 字节）（覆盖）", in.Path, len(in.Content)), nil
@@ -203,6 +242,12 @@ func buildReadTool(name, desc, root string) (tool.BaseTool, error) {
 			if err != nil {
 				return "", fmt.Errorf("读取失败：%v", err)
 			}
+			// 记基准：「我读到的是哪一版」——write_file 的写前判据靠它（filefp.go）。
+			// 记的是**整份文件**的指纹（raw 是全文，head/tail 只是截给人看的），因为
+			// write_file 是整份覆盖语义 → 尾部的改动同样会被它抹掉，同样算冲突。
+			// bash 读不记（它不走 read_file）→ bash 改过的文件，write_file 会拒并要求重读。
+			base := fileBaselineFrom(ctx)
+			base.set(agentNameOf(ctx), full, fingerprintOfBytes(fi, raw))
 			text := string(raw)
 			if in.Head == nil && in.Tail == nil {
 				return text, nil
@@ -235,6 +280,8 @@ func newEditFileTool(root string) (tool.BaseTool, error) {
 	return utils.InferTool("edit_file",
 		"在 workspace 内编辑文本文件：把 old_text 精确替换成 new_text。path 是相对 workspace 根的路径；"+
 			"old_text 必须与文件中某段逐字符一致。默认只替换恰好一处命中——0 处或多处命中都会报错；多处时请补足前后文让它唯一，或显式 replace_all:true 全部替换。"+
+			"【做局部修改请用本工具，而不是 write_file】——它在编辑那一刻重新读文件，"+
+			"所以别人在这期间落盘的其它改动会被原样保留（write_file 是整份覆盖，会把它们抹掉）。"+
 			"返回格式：已编辑 <path>（替换 n 处）。",
 		func(ctx context.Context, in editFileInput) (string, error) {
 			full, err := resolveInWorkspace(activeRoot(ctx, root), in.Path)
@@ -244,6 +291,17 @@ func newEditFileTool(root string) (tool.BaseTool, error) {
 			if in.OldText == "" {
 				return "", fmt.Errorf("old_text 不能为空")
 			}
+			// 取写锁（粒度=文件）。edit_file 不查基准表做拒绝判断——OldText 锚点本身就是
+			// 「我读到的那一段」，它是 edit 的基准；但锁仍然要取：它保证下面的「现读」读到的是
+			// 完整的一版（不会读到别人写了一半的文件），并让「读—改—写」成为原子的一段。
+			unlock, err := lockPaths(lockDirFor(ctx, root), []string{full})
+			if err != nil {
+				if errors.Is(err, errLockTimeout) {
+					return "", fmt.Errorf("这个文件正被另一个 agent 写，稍后重试")
+				}
+				return "", err
+			}
+			defer unlock()
 			fi, err := os.Stat(full)
 			if err != nil {
 				if os.IsNotExist(err) {
@@ -270,6 +328,13 @@ func newEditFileTool(root string) (tool.BaseTool, error) {
 			if err := os.WriteFile(full, []byte(out), fi.Mode().Perm()); err != nil {
 				return "", fmt.Errorf("写入失败：%v", err)
 			}
+			// 写后刷新基准（若有这一行）：让表跟磁盘保持一致，否则下一次 write_file 会因为
+			// 基准过期而误拒（我们刚自己改过它，内容变了但那是合法的）。
+			base := fileBaselineFrom(ctx)
+			agent := agentNameOf(ctx)
+			if fp, ferr := fingerprintOf(full); ferr == nil {
+				base.set(agent, full, fp)
+			}
 			return fmt.Sprintf("已编辑 %s（替换 %d 处）", in.Path, count), nil
 		})
 }
@@ -295,6 +360,16 @@ func newMoveFileTool(root string) (tool.BaseTool, error) {
 			if err != nil {
 				return "", err
 			}
+			// 取写锁：move 动的是两个路径（源与目标）→ 两把锁。lockPaths 内部去重 + 按字典序取
+			// （防 AB-BA 死锁）；源与目标同路径时只取一把（取两次同一把锁 = 自己等自己）。
+			unlock, err := lockPaths(lockDirFor(ctx, root), []string{src, dst})
+			if err != nil {
+				if errors.Is(err, errLockTimeout) {
+					return "", fmt.Errorf("这个文件正被另一个 agent 写，稍后重试")
+				}
+				return "", err
+			}
+			defer unlock()
 			if _, err := os.Stat(src); err != nil {
 				if os.IsNotExist(err) {
 					return "", fmt.Errorf("源不存在：%s", in.Path)

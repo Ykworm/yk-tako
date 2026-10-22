@@ -144,6 +144,8 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 		r.POST("/api/dev/workspace/file", authn, s.postDevFile)
 		r.GET("/api/dev/workspace/file", authn, s.getDevFile)
 		r.POST("/api/dev/workspace/bash", authn, s.postDevBash)
+		r.POST("/api/dev/file-fingerprint", authn, s.devFileFingerprint)
+		r.POST("/api/dev/file-lock-check", authn, s.devFileLockCheck)
 		r.POST("/api/dev/clean-sweep", s.devCleanSweep)
 	}
 	return r

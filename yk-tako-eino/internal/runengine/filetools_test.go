@@ -54,6 +54,9 @@ func TestResolveInWorkspace(t *testing.T) {
 }
 
 // write_file 行为：写 → 磁盘对字节；覆盖 → 返回带「（覆盖）」且磁盘是新内容。
+//
+// 基准表随 run 挂（worker.run 装配点）：write_file 覆盖**已存在**的文件前要确认「我读到的是哪一版」
+// （同文件并发写底座，filefp.go）。首次写入是新建 → 写后刷新基准 → 第二次覆盖因此放行。
 func TestWriteFileToolBasicAndOverwrite(t *testing.T) {
 	root := t.TempDir()
 	raw, err := newWriteFileTool(root)
@@ -61,7 +64,7 @@ func TestWriteFileToolBasicAndOverwrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	it := raw.(tool.InvokableTool)
-	ctx := context.Background()
+	ctx := withFileBaseline(context.Background(), newFileBaseline())
 
 	out, err := it.InvokableRun(ctx, `{"path":"sub/hello.txt","content":"tako f1"}`)
 	if err != nil {

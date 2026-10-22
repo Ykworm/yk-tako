@@ -7,6 +7,10 @@
 > **2026-10-20**：文件工具新增 `read_pdf_text`（doc/32 A8-1）。
 > `fileEffectToolNames` 那份目录名单不变。`read_pdf_text` 只登记 `firstPartyFileEffects`，不进那份名单。
 > **2026-10-20 A8-2**：页码超出、无文本层、加密或损坏、非 PDF，都降级成正常结果或「错误：…」，run 继续。`TAKO_MEDIA_SEND=off` 时这把工具仍可读。PDF 正文里印着的回执行不附图。
+> **2026-10-22**：同文件并发写底座落地（`filefp.go`）——`write_file` 的「先读后写」纪律、
+> `edit_file` 的现读带过、`write_file`/`edit_file`/`move_file` 的 flock 写锁。成功体与既有错误
+> 分支**不变**；新增的拒绝是**工具结果文本**（走既有 `wrapToolErrors` 通道），不是 HTTP 业务码。
+> 机制与边界见 [doc/42](../../doc/42-产品形态收窄与共享项目退役.md) §2.4，施工台账 `tmp/文件写入并发/`。
 
 ## §0 立项由来：两个「空转」等这拍转正
 
@@ -77,9 +81,9 @@
 
 | 工具 | 声明 | 入参（JSON） | 返回文本（成功） | 错误分支 |
 |---|---|---|---|---|
-| `write_file` | write | `path`,`content` | `已写入 <path>（<n> 字节）` | 越界 |
+| `write_file` | write | `path`,`content` | `已写入 <path>（<n> 字节）` | 越界；**没读过就写**（覆盖已存在文件前必须先 `read_file`）；**内容与读到的不一致**（被 bash 或另一个 agent 改过）；**读过但文件已没了**（被删/被移走）；拿不到写锁（30s 内被占） |
 | `read_text_file` | read | `path`,`head?`(行数),`tail?` | 文件文本原文（纯文本直出） | 不存在；>200KB 且无 head/tail（提示截读） |
-| `edit_file` | edit | `path`,`old_text`,`new_text`,`replace_all?`(默认 false) | `已编辑 <path>（替换 n 处）` | 越界；`old_text` 找不到；多处出现且未置 `replace_all` |
+| `edit_file` | edit | `path`,`old_text`,`new_text`,`replace_all?`(默认 false) | `已编辑 <path>（替换 n 处）` | 越界；`old_text` 找不到；多处出现且未置 `replace_all`；拿不到写锁 |
 | `read_file` | read | 同 `read_text_file` | 同 `read_text_file` | 同 |
 | `move_file` | edit | `path`(源),`destination` | `已移动 <path> → <destination>` | 越界（任一端）；目标已存在（不覆盖） |
 | `create_directory` | write | `path` | `已建目录 <path>`（已存在 = 幂等成功，返回「已存在」） | 越界 |
@@ -94,9 +98,26 @@
 
 - **`write_file` 覆盖语义**：文件已存在 → 照写覆盖（返回行带「（覆盖）」标记）。MCP 原版
   靠提示词劝谨慎，v1 用标记代替劝告——模型在工具结果里看得见自己覆盖了什么。
+- **`write_file` 的「先读后写」纪律（2026-10-22 落地）**：覆盖**已存在**的文件前必须先
+  `read_file` 读它。**没读过 → 拒**；读过但文件在此期间被改过（bash、另一个 agent）→ **拒**，
+  并在错误文案里引导「先 read_file 重读；要做局部修改请用 edit_file」；读过但文件被删/被移走
+  → 拒（别重建）。理由：`write_file` 是**整份覆盖**语义，凭记忆整份回写会把读之后的改动**静默**
+  抹回旧版（两道 run 都报「成功」，没有一方收到错误）。这与 Kimi 的 "Read before overwriting an
+  existing file" 同款，但 Kimi 那条只是**工具描述里的一句话**（prompt 级），tako 做成**程序级**。
+  判据 = 从磁盘现算的 `sha256`（内容级；>64MB 降级为 mtime+size 并显式标注弱判据）。
+  底座见 [doc/42](../../doc/42-产品形态收窄与共享项目退役.md) §2.4 与 `tmp/文件写入并发/`。
 - **`edit_file` = 精确串替换**（不做 MCP 的 pattern-matching 多编辑阵）：`replace_all=false`
   时原文必须**恰好一处**命中（0 处或 >1 处都报错，>1 处错误文本带出现次数）——把
   「编辑哪一处」的决定权留在模型手里，程序不做模糊匹配。
+- **`edit_file` 是局部修改的首选**：它在**编辑那一刻现读**磁盘、写回时用的也是它 → 别的写者
+  在你读之后落盘的改动会被**原样带过去**（不会丢）。所以「改一处」用 `edit_file`、「整份替换」
+  用 `write_file`，两者语义不同、判据不同（前者看锚点、后者看整份指纹）。
+- **同文件写锁（2026-10-22 落地）**：`write_file`／`edit_file`／`move_file` 的写路径取
+  **flock 排它锁**（粒度=文件，锁文件在 `tenants/<tid>/.tako/locks/<sha16(绝对路径)>.lock`）。
+  同机跨进程、跨副本都串；跨机看共享盘是否支持 POSIX 锁（CephFS / NFSv4 支持，NFS 崩溃后要等
+  lease 过期 ~30s）。**比对在锁内做**——锁让「检查—写」成为原子的一段，否则检查与写之间有缝。
+  flock 是 **advisory** 的：bash（`rm`／`sed -i`／`>` 重定向）绕过它 → 不守规矩的写者由
+  人工审批闸兜（[doc/41](../../doc/41-任务看板与人工审批.md)）。
 - **`read_file` 与 `read_text_file` 同体**：OpenHands / Open Interpreter 系的惯用名
   （19v6-07 §5 出处），同参同行为，仅名字与描述不同。两个都落地的原因：目录名单照单
   全收，别名让两系生态的 prompt/习惯在 tako 上直接可跑。
