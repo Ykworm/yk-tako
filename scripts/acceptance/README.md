@@ -11,6 +11,7 @@
 | `assert_contract.py` | 读 `expected.json` 逐条打引擎比对，红打 ❌、失败非零退出 | 核心用例不要；model 层要 |
 | `matrix.py` | 19v6-04 用例矩阵**实跑**：逐字节打印真实响应，供人肉对齐期望字节 | 要 |
 | `spotcheck.sh` | doc/28 多租户 / doc/35 项目目录 / doc/32 media_offload 的**活体抽验**（shell + jq） | 要 |
+| `taskboard_crash.sh` | doc/41 任务看板**活得过崩溃**的活体验收：`kill -9` 引擎 → 重启 → `resume` → 崩前建的看板行一条没丢、续跑在同一张表继续建行、run 收到 terminal 帧 | 要 |
 | `check-expected.sh` | 守「19v6-04 散文」与「`expected.json`」的用例号集合一致 | — |
 | `harness.py` | 三个脚本共用的底座：HTTP 调用、.env 取密钥、psql 补丁、断言计数 | — |
 
@@ -74,6 +75,23 @@ bash scripts/acceptance/check-expected.sh
 | `TAKO_MODEL` | `deepseek/deepseek-flash` | 租户里配的模型 ref（只有 `matrix.py` 用） |
 | `TAKO_PG_DSN` | 空 | 直连 PG 的 DSN。**`4-busy-rejected` 那条要它**（要造「running + 活租约」的忙闸）；不给就跳过并明说，不假装跑过 |
 | `TAKO_PSQL` | `psql` | psql 可执行文件路径 |
+
+`taskboard_crash.sh` 自己还多要三个（没有就不跑）：
+
+| 变量 | 说明 |
+|---|---|
+| `TAKO_ENGINE_PIDS` | 要 `kill -9` 的引擎进程 PID（空格分隔）——**只指隔离实例**，别指 dev.sh 起的那个 |
+| `TAKO_ENGINE_RESTART` | 重启引擎的命令（一行 shell 片段，后台起） |
+| `TAKO_LEASE_WAIT` | 等租约过期的秒数，默认 35（引擎 lease TTL 30s） |
+
+```bash
+TAKO_BASE=http://127.0.0.1:8943 TAKO_ENV=yk-tako-eino/.env \
+TAKO_PG_DSN="host=127.0.0.1 port=5433 dbname=tako_acc sslmode=disable" \
+TAKO_PSQL="$PGBIN/psql" \
+TAKO_ENGINE_PIDS="$(pgrep -f 'yktako -engine 127.0.0.1:8943' | tr '\n' ' ')" \
+TAKO_ENGINE_RESTART='cd <仓库根>/yk-tako-eino && nohup go run ./cmd/yktako -engine 127.0.0.1:8943 ... &' \
+  bash scripts/acceptance/taskboard_crash.sh
+```
 
 依赖：`python3`、`curl`、`jq`；`psql` 只在要造忙闸时用。
 

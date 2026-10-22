@@ -373,15 +373,22 @@ func newRowFromMessage(run RunID, seq int, m *schema.Message) ModelMessage {
 func toSchemaMessages(history []ModelMessage) []*schema.Message {
 	msgs := make([]*schema.Message, 0, len(history))
 	for _, h := range history {
+		// ② PII 打码（模型输入方向，doc/41 §3.2）：**这里是「mh 形状 → 模型输入形状」的唯一转换口**
+		// ——首轮装配（worker.go 的 prepareInput）、mid-run fold、救援采用、guard 的重试重建
+		// 全部走它。打在这里 → 三条路一次覆盖。
+		//
+		// 为什么不能只挂 prepareInput：折叠的原料是 **mh 原文**（user 行按设计存原文给页面显示）
+		// → 只管首轮的话，折叠一次 PII 就复活（短对话安全、长对话漏，越重要的对话越漏）。
+		// 工具产出的那几行在入库前已打码（①），这里再打一次是无害的幂等操作。
 		switch h.Role {
 		case "assistant":
 			// ToolCalls 回放：带 tool_calls 的 assistant 行原样还给模型（OpenAI 协议要求
 			// 其后紧跟对应的 tool 行）；老行无 tool_calls，nil 即原样。
-			msgs = append(msgs, schema.AssistantMessage(h.Text, h.ToolCalls))
+			msgs = append(msgs, schema.AssistantMessage(MaskPIIKeepUserMasked(h.Text), h.ToolCalls))
 		case "tool":
-			msgs = append(msgs, schema.ToolMessage(h.Text, h.ToolCallID))
+			msgs = append(msgs, schema.ToolMessage(MaskPIIKeepUserMasked(h.Text), h.ToolCallID))
 		default:
-			msgs = append(msgs, schema.UserMessage(h.Text))
+			msgs = append(msgs, schema.UserMessage(MaskPIIKeepUserMasked(h.Text)))
 		}
 	}
 	return msgs

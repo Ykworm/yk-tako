@@ -36,6 +36,14 @@ func testPGDSN(db string) string {
 // cleanup（LIFO 无关，本函数内显式排序）：先关 Store 连接、再 DROP 库。
 func newTestStore(t *testing.T, leaseTTL, ttl time.Duration) *Store {
 	t.Helper()
+	store, _ := newTestStoreWithDSN(t, leaseTTL, ttl)
+	return store
+}
+
+// newTestStoreWithDSN 同 newTestStore，但把 PG 的 DSN 一并交出来：要在**同一个库**上再开一个
+// Store 实例（= 另一个进程读同一份持久化数据）时用。
+func newTestStoreWithDSN(t *testing.T, leaseTTL, ttl time.Duration) (*Store, string) {
+	t.Helper()
 	ctx := context.Background()
 	rowID, err := newRowID("t")
 	if err != nil {
@@ -49,7 +57,8 @@ func newTestStore(t *testing.T, leaseTTL, ttl time.Duration) *Store {
 	if err := admin.Exec("CREATE DATABASE " + dbName).Error; err != nil {
 		t.Fatalf("CREATE DATABASE %s: %v", dbName, err)
 	}
-	store, err := OpenStore(ctx, testRedisURL, testPGDSN(dbName), ttl, leaseTTL)
+	dsn := testPGDSN(dbName)
+	store, err := OpenStore(ctx, testRedisURL, dsn, ttl, leaseTTL)
 	if err != nil {
 		t.Fatalf("OpenStore: %v", err)
 	}
@@ -63,7 +72,7 @@ func newTestStore(t *testing.T, leaseTTL, ttl time.Duration) *Store {
 		}
 	})
 	store.resetRedisKeys(t)
-	return store
+	return store, dsn
 }
 
 // resetRedisKeys 清 db1 的 tk:* 键（不 FLUSHDB——db1 理论上只有我们，但按前缀纪律行事）。

@@ -146,7 +146,7 @@ func TestContractBusinessCodes(t *testing.T) {
 	}
 }
 
-// TestContractFrameKindVocabulary 钉住帧 kind 的**词表**：七种，不多不少。
+// TestContractFrameKindVocabulary 钉住帧 kind 的**词表**：八种，不多不少。
 //
 // kind 是事件流的基本词汇表（19v6-01 §2）：客户端按 kind 分派渲染。
 // 加一种 kind 而不同步契约文档，客户端就会撞上没见过的分支——所以这里扫生产代码里
@@ -156,7 +156,7 @@ func TestContractBusinessCodes(t *testing.T) {
 var frameKindRE = regexp.MustCompile(`Frame\{Kind:\s*"([a-z_]+)"`)
 
 func TestContractFrameKindVocabulary(t *testing.T) {
-	want := []string{"delta", "resume", "start", "terminal", "tool_call", "tool_result", "usage"}
+	want := []string{"delta", "resume", "start", "task", "terminal", "tool_call", "tool_result", "usage"}
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("读包目录失败：%v", err)

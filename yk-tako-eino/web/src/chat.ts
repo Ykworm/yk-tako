@@ -38,6 +38,9 @@ export type Bubble = {
   usageUnknown?: boolean
   // interrupted 态专用：还能不能续（续跑次数没耗尽）。false = 次数用尽，只能重发。
   resumable?: boolean
+  // board 是任务看板的结构态（doc/41 §5.2 的 kind=task 帧）：紧凑视图文本。
+  // 它是**结构**（前端按行解析渲染状态色），不是让前端去猜自然语言回执。
+  board?: string
 }
 
 // 附件（composer 选用）：name 供 chip 显示，img 随 postRuns 上行。
@@ -255,6 +258,10 @@ export function useChat() {
             completionTokens: f.completionTokens ?? 0,
             window: f.window ?? 0,
           }
+        }
+        if (f.kind === 'task' && !f.agent) {
+          // 看板帧：text = 当前全量看板的紧凑视图（模型的眼睛同一份文本，前端按行渲染）。
+          assistant.board = f.text ?? ''
         }
         if (f.kind === 'terminal') terminalStatus = f.status ?? 'complete'
       }

@@ -244,6 +244,18 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		return nil, err
 	}
 	pool = append(pool, wrapToolErrors(ws))
+	// 任务看板四把工具入池（C1，doc/41 §3.3）：静态注册——每个 run 都是干活 run，
+	// 没有「只在有看板语义下才有意义」的状态。正本是 PG 表 run_tasks（活得过崩溃）。
+	// 位置：web_search 之后、摘要器之前（不影响任何既有顺序约定）。
+	for _, mk := range []func(*Store) (tool.BaseTool, error){
+		newTaskCreateTool, newTaskUpdateTool, newTaskListTool, newTaskGetTool,
+	} {
+		t, err := mk(store)
+		if err != nil {
+			return nil, err
+		}
+		pool = append(pool, wrapToolErrors(t))
+	}
 	// 摘要器在 agent 装配前构造（A4，planning 裁定 9）：midfoldHandler 要拿它的 summarize 方法值——
 	// mid-run 折叠与 prepareInput 的 Run fold 共用同一个摘要器、同一顶帽（C5-A7 分档）。
 	compactLimit := CompactLimitFor(compactWindow)
@@ -286,6 +298,9 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 	// 一手池、MCP（mcpToolHandler）、委派（agentSpecHandler）与以后新增的工具一处覆盖。
 	// 子代理入口快照在此前已完成，拿的是未包壳工具，内部调用不记账。
 	handlers = append(handlers, &journalWrapHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, store: store})
+	// 看板使用约定静态拼进系统提示（doc/41 §3.3）：约定写在提示词里，不写状态机——
+	// 「提示词和工具，一个都不能少」。子代理的规格文件（agents/*.md）自带各自的约定。
+	system = system + "\n\n" + taskBoardPrompt
 	w := &Worker{store: store, sum: sum, chat: chat, tools: pool, handlers: handlers, translate: translate, system: system,
 		rootRef: modelRef, leaseRenew: leaseRenew, workspace: workspace, compactWindow: compactWindow, compactLimit: compactLimit, archiveTTL: archiveTTL, counter: counter}
 	// 启动时先建一次，配置坏了立刻退出。每场 run 再新建，避免多个租户共用一个 agent 实例时取消互相踩掉。
@@ -542,6 +557,8 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 	// 写后刷新。write_file 的写前判据靠它（整份覆盖语义 → 必须整体是最新版）。
 	// 键带 agent 名：子代理不借用主代理的「读过」。
 	ctx = withFileBaseline(ctx, newFileBaseline())
+	// 看板的 run 身份（C1）：一场 run 一块看板，四把工具从 ctx 取 run/session。
+	ctx = withTaskBox(ctx, newTaskBox(sessionID, runID))
 
 	// 系统提示在抢闸之后才定：带了 profile 就用装配时定下的 spec，摘要也换到租户模型。
 	// 没带 profile 的单测仍读会话上的助手行。放在 EndRun 的 defer 之后，查不到助手时 return 仍会放闸。
@@ -689,6 +706,11 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 						return // 同 drain 的拒写出口：本执行者已不是当前一代，该收摊
 					}
 					box.addFrames(1) // A2 帧计数（裁定 7：不分 root/子代理——有帧后重跑同样造成帧重复；B1 收编进 box）
+					// 看板写操作后补一条 task 帧（C2，doc/41 §5.2）：结构态给前端渲染看板，
+					// 不必让前端去解析自然语言回执（换个提示词措辞就渲染错）。
+					if name == "TaskCreate" || name == "TaskUpdate" {
+						w.emitTaskFrame(ctx, runID, epoch, name, entry.ref)
+					}
 				}
 				continue
 			}
@@ -1079,8 +1101,10 @@ func (w *Worker) recallBlock(ctx context.Context, sessionID SessionID, runID Run
 // 「切两半」是 doc/29 §6.1 修订后的读侧纪律（planning §3 拍板 2）：mh 严格是历史，
 // 只有 user input 没有 reply 的那行不算历史——它是「本轮输入」，单独拎出来。
 // 召回块拼在**本轮输入**上（不是 history 上），于是：
-//   ① 块随本轮输入进 base → countInput 自然数得到它（计预算，拍板 3）；
-//   ② 折叠重建时该行文本从 base 取 → 块活过折叠（不丢）。
+//
+//	① 块随本轮输入进 base → countInput 自然数得到它（计预算，拍板 3）；
+//	② 折叠重建时该行文本从 base 取 → 块活过折叠（不丢）。
+//
 // 切分后本轮 user 行仍排在 base 末位（mh 全序按 run_id,seq 排，本轮 run 的 ULID 最大），
 // 坐标（seq=1）天然稳——不碰 convertState / nextRunSeq / foldInput 的钉死规则。
 func (w *Worker) prepareInput(ctx context.Context, sessionID SessionID, runID RunID) ([]*schema.Message, error) {
@@ -1120,8 +1144,9 @@ func splitCurrentInput(runID RunID, history []ModelMessage) []ModelMessage {
 //
 // 召回查询的词源 = 本轮输入的原文（不是 history 里的任何一行）——查询词和数据源同一个对象。
 // 块拼在本轮输入上（不是 history 上），于是：
-//   ① 块随本轮输入进 base → countInput 自然数得到它（计预算，拍板 3）；
-//   ② 折叠重建时该行文本从 base 取 → 块活过折叠（不丢）。
+//
+//	① 块随本轮输入进 base → countInput 自然数得到它（计预算，拍板 3）；
+//	② 折叠重建时该行文本从 base 取 → 块活过折叠（不丢）。
 func (w *Worker) recallIntoCurrentInput(ctx context.Context, sessionID SessionID, runID RunID, history []ModelMessage) []ModelMessage {
 	var hist []ModelMessage
 	var current []ModelMessage

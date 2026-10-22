@@ -47,7 +47,17 @@ func newGetTimeTool() (tool.BaseTool, error) {
 // Go error，包装层转成字符串结果、error 不再上抛（interrupt 类错误原样透传，不挡未来 HITL）。
 // 统一在装配点包（NewWorker 的池内 wrap、子代理继承的也是包装后的实例），一条语义管全部工具。
 func wrapToolErrors(t tool.BaseTool) tool.BaseTool {
-	return utils.WrapToolWithErrorHandler(t, toolErrorText)
+	wrapped := utils.WrapToolWithErrorHandler(t, toolErrorText)
+	// ① PII 打码（出工具方向，doc/41 §3.2）：这里是**所有工具结果的唯一必经之路**——
+	// 自家工具、media/pdf、tool_search、**MCP 工具**都走它（mcp.go 的装配点也是本函数）。
+	// 打在这里 → 出来的文本已是打码后的 → 再被外层的 journalTool 记账、再成帧、再进 mh/runlog
+	// → **落库的就是打码后的**。
+	// 错误路径同样打得到：error handler 已把 error 变成「错误：…」文本结果，那也是成功返回。
+	// （挂在「每个工具自己内侧」会漏掉 MCP 工具——那是最不可信的一路，见 doc/41 §3.2。）
+	if _, ok := wrapped.(tool.InvokableTool); ok {
+		return piiToolWrapper{inner: wrapped}
+	}
+	return wrapped
 }
 
 // toolErrorText 是错误回注文本的唯一出口：契约「错误文本一律『错误：』开头」（19v6-08 §3）

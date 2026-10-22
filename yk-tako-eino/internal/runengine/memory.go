@@ -160,12 +160,13 @@ type extractedItem struct {
 
 // extractStats 是一次 job 的观测计数（日志三行的 done 行）。
 type extractStats struct {
-	Episode int
-	Items   int
-	Dup     int
-	TokIn   int
-	TokOut  int
-	Replay  bool // 重放闸命中：本 run 已有记忆行，未调模型
+	Episode  int
+	Items    int
+	Dup      int
+	Rejected int // ③ PII：密钥类整条拒收（不进记忆库）
+	TokIn    int
+	TokOut   int
+	Replay   bool // 重放闸命中：本 run 已有记忆行，未调模型
 }
 
 // claimedMemoryJob 是 claim 成功后的任务现场（attempts 已含本次）。
@@ -544,6 +545,18 @@ func (s *Store) writeMemoryJobResult(ctx context.Context, job *claimedMemoryJob,
 	episode string, items []extractedItem) (extractStats, error) {
 	var stats extractStats
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// ③ PII 打码（doc/41 §3.2）：记忆入库前最后一道。
+		// 密钥类（api_key / secret）→ **整条拒收**（记忆要可信的完整事实，密钥不该进库）；
+		// 证件类 → 打码后入库（可复用、不可直接利用）。
+		// 注：工具输出那一路在入库前已打码（pii.go 的 ①），这里主要兜**用户消息**那一路。
+		if episode != "" {
+			if masked, hits := MaskPII(episode); hasSecretPII(hits) {
+				stats.Rejected++
+				episode = ""
+			} else {
+				episode = masked
+			}
+		}
 		if episode != "" {
 			id, err := newRowID("mem_")
 			if err != nil {
@@ -562,6 +575,12 @@ func (s *Store) writeMemoryJobResult(ctx context.Context, job *claimedMemoryJob,
 			stats.Episode = int(res.RowsAffected)
 		}
 		for _, it := range items {
+			masked, hits := MaskPII(it.Content)
+			if hasSecretPII(hits) {
+				stats.Rejected++
+				continue
+			}
+			it.Content = masked
 			id, err := newRowID("mem_")
 			if err != nil {
 				return err

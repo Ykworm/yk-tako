@@ -12,7 +12,8 @@ export type Frame = {
   eventOffset?: number
   // 'resume' = 续跑种子帧（doc/30 §8.3）：**text 是整段已产出正文**，不是增量片段——
   // 它的语义跟 'delta' 相反，别用同一套追加逻辑（见 chat.ts 的 resume 分支）。
-  kind: 'start' | 'delta' | 'usage' | 'terminal' | 'resume'
+  // 'task' = 看板结构帧（doc/41 §5.2）：text 是当前全量看板的紧凑视图，name 是触发它的工具名。
+  kind: 'start' | 'delta' | 'usage' | 'terminal' | 'resume' | 'task'
   agent?: string
   model?: string
   messageId?: string

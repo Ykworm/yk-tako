@@ -410,6 +410,18 @@ function mediaLabel(m: MediaRef): string {
   return `${m.mime} ${fmtSize(m.size)}`
 }
 
+// boardRows 把看板紧凑视图解析成行（doc/41 §5.2）：
+// 文本形状是引擎侧定的「看板：\n#序号 [状态] 主题」——解析失败就整段不渲染（不硬猜）。
+type BoardRow = { no: string; status: string; subject: string }
+function boardRows(board: string): BoardRow[] {
+  const rows: BoardRow[] = []
+  for (const line of board.split('\n')) {
+    const m = /^#(\d+)\s+\[(\w+)\]\s*(.*)$/.exec(line.trim())
+    if (m) rows.push({ no: m[1], status: m[2], subject: m[3] })
+  }
+  return rows
+}
+
 function fmtSize(n: number): string {
   if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)}MB`
   if (n >= 1024) return `${Math.round(n / 1024)}KB`
@@ -710,6 +722,15 @@ async function onScroll() {
                   </template>
                 </template>
                 <p v-if="b.text" class="bubble-text">{{ b.text }}</p>
+                <!-- 任务看板（doc/41 §5.2 的 kind=task 帧）：结构态 → 状态色随 TaskUpdate 翻转，
+                     不靠解析自然语言回执（换个提示词措辞就渲染错）。 -->
+                <ul v-if="b.board" class="board" aria-label="任务看板">
+                  <li v-for="(row, i) in boardRows(b.board)" :key="i" :class="['board-row', row.status]">
+                    <span class="board-no">#{{ row.no }}</span>
+                    <span class="board-status">{{ row.status }}</span>
+                    <span class="board-subject">{{ row.subject }}</span>
+                  </li>
+                </ul>
                 <span v-else-if="b.state === 'streaming' || b.state === 'offline'" class="typing" aria-label="正在生成">
                   <i></i><i></i><i></i>
                 </span>
@@ -1620,4 +1641,26 @@ async function onScroll() {
   .thread { width: min(100% - 1.2rem, 46rem); }
   .hint:not(.live):not(.queue) { display: none; }
 }
+
+/* 任务看板（doc/41 §5.2）：状态色随 TaskUpdate 翻转 */
+.board {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--line, rgba(127, 127, 127, 0.25));
+  border-radius: 0.5rem;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+.board-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+.board-no { opacity: 0.55; font-variant-numeric: tabular-nums; }
+.board-status { opacity: 0.7; font-size: 0.78rem; }
+.board-row.completed .board-subject { text-decoration: line-through; opacity: 0.55; }
+.board-row.in_progress .board-status { color: #2f7d5b; }
+.board-row.completed .board-status { color: #2f7d5b; }
+.board-row.deleted .board-subject { opacity: 0.4; }
 </style>

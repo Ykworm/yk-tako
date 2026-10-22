@@ -507,7 +507,7 @@ func autoMigrate(db *gorm.DB) error {
 		&MemoryItem{}, &MemoryJob{}, &DialogueChunk{},
 		&User{}, &Tenant{}, &TenantMember{}, &RefreshToken{}, &AuditLog{}, &TenantUsageDaily{},
 		&TenantInvitation{}, &TenantAgent{}, &AgentDefault{}, &TenantSetting{}, &TenantStorage{},
-		&Workspace{}, &CleanerState{}); err != nil {
+		&Workspace{}, &CleanerState{}, &RunTask{}); err != nil {
 		return err
 	}
 	_ = db.Exec(`DROP INDEX IF EXISTS memory_items_dedup`).Error
