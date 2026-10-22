@@ -37,6 +37,9 @@ var (
 	errNotResumable    = errors.New("not_resumable")
 	errRunAlive        = errors.New("run_alive")
 	errResumeExhausted = errors.New("resume_exhausted")
+	// errTenantFull = 租户并发闸满了（同一租户同时在跑的场数到上限，doc/43）。
+	// 与 errGateBusy 分开：会话忙回 409，租户满回 429（字节见 server.go 的 postRuns）。
+	errTenantFull = errors.New("tenant concurrent runs full")
 )
 
 // Store 是四个 API 的存储后端（A4-3 裁：具体结构体，不抽接口；名字不再带介质——它跨两存储）。
@@ -226,6 +229,12 @@ func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID
 				return err
 			}
 		}
+		// 租户并发闸（doc/43）：数活 run 与插 run 行在同一笔事务里，中间持一把所有副本
+		// 共享的 DB 锁 → 并发下不可能超发。位置在死行清扫之后、INSERT 之前：会话归属
+		// （404/403）先判，闸只对「这场 run 真要开跑」生效。
+		if err := s.lockTenantGate(tx, p.TenantID); err != nil {
+			return err
+		}
 		// 抢闸 = 本 INSERT（AGENTS.md「闸放数据库不放进程」）；lease_until 走 DB 时钟——
 		// 多副本对租约的判定共用一个时钟。lease_epoch 显式写 1（doc/30 §7 出生令牌）：
 		// 列默认值只是存量行兜底，出生点自己把话说死。
@@ -280,9 +289,65 @@ func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID
 		if errors.Is(err, errProjectBusy) {
 			return false, errProjectBusy
 		}
+		if errors.Is(err, errTenantFull) {
+			return false, errTenantFull
+		}
 		return false, err
 	}
 	return true, nil
+}
+
+// lockTenantGate 是**租户并发闸**（doc/43）：同一个租户内同时最多跑几场 run
+// （tenants.max_concurrent_runs，默认 8）。它护的是共享资源——模型供应商的配额与账单、
+// 同一批机器的 CPU/内存。
+//
+// 为什么必须落在 DB 里（AGENTS.md「闸放数据库不放进程」）：数活 run 与插 run 行之间必须有
+// 一把**所有副本共享**的锁。以前这两步分属两笔独立的事（API 层数一遍 → 抢闸事务插一行），
+// 并发下两个请求都读到「7 < 8」就都放行 → 实际 9 场在跑，理论上没有上限。
+//
+// 三条语句，顺序不能换（PG 的 READ COMMITTED）：
+//
+//	① SELECT pg_advisory_xact_lock(...)  拿租户互斥（事务级锁：提交/回滚自动释放，
+//	   进程死了不留残留；所有副本共用同一个 PG → 互斥跨副本成立）
+//	② SELECT COUNT(*) ...                数活 run —— 必须在 ① 之后**另起一条语句**
+//	③ INSERT INTO runs ...               放行（由 AcquireRun 在本函数之后执行）
+//
+// 为什么 ② 不能与 ① 合成一条 SQL：READ COMMITTED 下**一条语句只拿一次快照**。
+// 合成一条 → 快照在等锁**之前**就定了 → 等前一个事务提交后，我们仍然数不到它那行
+// → 少数 → 照超发。分两条，② 在拿到锁之后才开始，取到新快照，看得见已提交的那行。
+//
+// 上限口径与 TenantQuota 相同（缺行或 ≤0 → 8）；计数口径与 CountLiveRuns 逐字相同
+// （status='running' AND lease_until > now()）——租约已过的僵尸行不算活，所以这道闸
+// 不会误拒（崩掉的 run 不占额）。
+func (s *Store) lockTenantGate(tx *gorm.DB, tenantID string) error {
+	if tenantID == "" {
+		return nil
+	}
+	// ① 互斥。hashtextextended 是 64 位哈希：撞了只是两个租户互相多等一下，
+	// 方向是安全的（绝不会放多）。
+	if err := tx.Exec(`SELECT pg_advisory_xact_lock(hashtextextended(?, 0))`, tenantID).Error; err != nil {
+		return err
+	}
+	// ② 上限：tenants.max_concurrent_runs（缺行 → 0 → 下面落回默认 8）。
+	var quota struct {
+		MaxConcurrentRuns int
+	}
+	if err := tx.Raw(`SELECT max_concurrent_runs FROM tenants WHERE id = ?`, tenantID).Scan(&quota).Error; err != nil {
+		return err
+	}
+	maxRuns := quota.MaxConcurrentRuns
+	if maxRuns <= 0 {
+		maxRuns = 8
+	}
+	// ③ 数活 run（另起一条语句 → 拿锁之后的新快照 → 看得见已提交的那场）。
+	live, err := countLiveRuns(tx, tenantID)
+	if err != nil {
+		return err
+	}
+	if live >= maxRuns {
+		return errTenantFull
+	}
+	return nil
 }
 
 // toolCallPayload / toolResultPayload 是 runlog 扩展行 payload 列的 JSON 形状（T2）——

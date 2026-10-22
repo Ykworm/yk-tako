@@ -1,7 +1,7 @@
 # doc/ 文档索引
 
 > 性质：**索引**，不是方案。本文只回答「这篇文档是什么、能不能照着施工、代码在哪、被谁取代」。
-> 最后核对：2026-10-22。
+> 最后核对：2026-10-23。
 > 状态口径：✅ 已落地 · 🔶 部分落地／待收口 · ⬜ 未做 · 存档 = 历史材料，不作施工面。
 > 代码路径均相对 `yk-tako-eino/`。
 
@@ -78,6 +78,7 @@
 | 40 | [响应信封统一](40-响应信封统一.md) | ✅ | `auth.go`、`server.go`、`mcp.go`、`product_api.go`、`archive_sweep.go`、`envelope_test.go`、`web/src/api.ts`、`web/src/chat.ts` | 2026-10-22 落地，随 `cd85050` 入库。A7-1…A7-8 共 8 拍：后端六拍（curl 逐字节）+ 前端一拍（Playwright 活体）+ 收口一拍。runs／sessions／mcp／media／memory 五组旧接口整包换 `{code,message,data}`；**不动存储、不动帧格式、不动 HTTP 状态码**；media 的二进制成功体与 SSE 帧面不进信封。台账 `tmp/A7-信封迁移/`（不入库） |
 | 41 | [任务看板与人工审批](41-任务看板与人工审批.md) | ✅ | `pii.go`、`pii_test.go`、`pii_mount_test.go`、`tasktools.go`、`tasktools_test.go`、`tools.go`、`midfold.go`、`memory.go`、`worker.go`、`pgstore.go`、`server.go`、`contract_test.go`、`store_test.go`、`web/src/{api.ts,chat.ts,App.vue}`、`scripts/acceptance/taskboard_crash.sh` | 2026-10-23 落地。**B（PII 脱敏）+ C（任务看板）两线全施工**；**Loop A（人审回路）整条不做**（bash 与 MCP 的越界都由沙箱围栏硬挡 → 没有需要挂起问人的场景，§3.1 与 §6 的 A1–A7 留档备查）。PII 三处挂载点：工具统一出口 `wrapToolErrors`（含 MCP）＋ 模型输入唯一转换口 `toSchemaMessages`（覆盖折叠后）＋ 记忆入库前（密钥拒收 / 证件打码）。看板：PG 表 `run_tasks` + 四把工具 + `kind=task` 帧（词表 7→8）+ 前端看板块；**活得过崩溃**（kill -9 → 重启 → resume，崩前建的行一条没丢且续跑里继续更新）。task 帧字节在 doc/19-v6-04「用例 8」登记为暂不断言（模型行为不稳）。对应 doc/16 §5.1 第 1、2 项与 §2 表 #2/#3 |
 | 42 | [产品形态收窄与共享项目退役](42-产品形态收窄与共享项目退役.md) | ✅ | `pgstore.go`、`store.go`、`product_store.go`、`product_api.go`、`server.go`、`auth.go`、`filetools.go` | 2026-10-22 落地，随 `44cf7ca` 入库。形态定稿：tako = 多租户的 AI 工作台，**一个员工 = 一个项目**，**项目文件由多 session 共享**，团队共享账号/额度/审计、**不共享文件**（不做协同编辑）。退役两样：跨成员共享项目（可见性判定只剩属主；`PATCH /api/workspaces/:id/visibility` 端点留着路由恒回 404 `114001`；`114004` 退役）、项目闸（`one_live_run_per_workspace` 索引 DROP，同项目并发不再被 409 挡）。另：不再有游离会话——每场 run 自动挂默认项目 |
+| 43 | [租户并发闸入 DB](43-租户并发闸入DB.md) | ✅ | `store.go`、`scope.go`、`server.go`、`product_api.go`、`store_test.go`、`scripts/acceptance/tenant_gate.sh` | 2026-10-23 落地。**租户并发上限**（`tenants.max_concurrent_runs`，默认 8）那道闸原来在 API 层「数一遍 → 比上限 → 放行」，数与放行是两次独立的事 → 并发下超发（活体实测：上限 2，并发四打进来 4 场）。**现在数与放行收进同一笔 PG 事务**，中间持一把所有副本共享的顾问锁（`pg_advisory_xact_lock`）→ 并发下不可能超发。**无 DDL、无存量迁移**、计数口径逐字不变（僵尸行不算活，不误拒）、**契约字节不变**（满租户仍回 429 `113001`）。回归网：存储层 `TestTenantGateConcurrent`（摘掉闸即红）+ 活体 `tenant_gate.sh`。对应 doc/16 §2c「闸在数据库」 |
 | 44 | [前端三处欠账](44-前端三处欠账.md) | ✅ | `web/src/{api.ts,chat.ts,App.vue,ProjectsView.vue,ConfirmDialog.vue}` | 2026-10-23 落地。三处前端入口：**个人项目页**（列表／新建／改名／删除／项目下会话／开新对话）、**项目与单场会话删除 + 确认弹窗**（服务端 409 文案原样显示）、**当前会话的子代理列表与「继续」**（把带 `sa_id` 的指令追加进输入框，由父 agent 调 `resume_subagent`，不新增 HTTP 端点）。**后端零改动**。当前项目按租户存 `localStorage['tako.workspaceId.<tid>']`，`workspaceId` 只随新会话的 `POST /api/runs` 发送。对应 doc/16 §5.1 第 2 项与 §2 表 #5b/#12/#13 |
 | 45 | [场景化 Eval 框架（方案）](45-场景化Eval框架.md) | ⬜（方案待点头） | —（未施工） | 2026-10-23 立项。给「**活有没有干完**」建一层可机器重跑的回归——前两层（快闸 `contract_test.go` + 契约 `scripts/acceptance/`）只断"接口有没有按约定回"，断不了"活干完了没有"（2026-10-23 PII 挂载点选错时两层全绿）。场景 = 准备/动作/判定/证据四件套；判定分 **A 硬断言 / B 模型判分（带抖动容忍）/ C 只登记不断言** 三档；语料 = 这一周手工验过的活体固化。**不改 `internal/runengine/` 生产代码**——Eval 站在引擎外面看它。预计落点 `scripts/eval/`（复用 `scripts/acceptance/harness.py`，不另起 HTTP 底座）。对应 doc/16 §2b 第 6 行与 §2c「验收可机器重跑」第三层 |
 

@@ -23,6 +23,13 @@ func (s *Server) requirePrincipal(c *gin.Context) (principal, bool) {
 	return p, true
 }
 
+// overQuota 是抢闸**之前**的两道预检：日 token 配额（真闸，读-判-写，本批不动）
+// ＋ 租户并发满的**快速失败提示**。
+//
+// 并发那段的地位要说准（2026-10-23，doc/43）：**它不是闸**。闸在 Store.AcquireRun 里——
+// 数活 run 与插 run 行在同一笔 PG 事务里，中间持一把所有副本共享的 DB 锁
+// （lockTenantGate）。这里保留一次读，只为**早点拒**：满租户的请求不该走到 media 落盘、
+// MCP 连接之后。它**只能拒、不能放**（数到 ≥ 上限就 429），所以它不构成超发路径。
 func (s *Server) overQuota(c *gin.Context, p principal) bool {
 	if p.TenantID == "" {
 		return false
@@ -33,6 +40,7 @@ func (s *Server) overQuota(c *gin.Context, p principal) bool {
 		internal(c, err)
 		return true
 	}
+	// 提示用的读（不是闸的判定）：闸在 AcquireRun 的事务里，见上面的说明。
 	live, err := s.store.CountLiveRuns(ctx, p.TenantID)
 	if err != nil {
 		internal(c, err)
@@ -49,6 +57,7 @@ func (s *Server) overQuota(c *gin.Context, p principal) bool {
 			return true
 		}
 	}
+	// 提示：并发看起来满了 → 早退。**权威判定在 AcquireRun**（DB 锁下），这里只抢先拒。
 	if live >= maxRuns {
 		writeEnvelope(c, http.StatusTooManyRequests, codeQuota, "这个工作区的额度用完了", nil)
 		return true

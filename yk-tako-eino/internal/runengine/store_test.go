@@ -2,8 +2,10 @@ package runengine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1700,5 +1702,87 @@ func TestSeedResumeLeavesOnlyRunliveAndEpoch(t *testing.T) {
 	}
 	if accepted, err := s.AppendFrame(ctx, rid, claim.Epoch, Frame{Kind: "tool_result", Output: "ok"}); err != nil || !accepted {
 		t.Fatalf("新 epoch AppendFrame accepted=%v err=%v, want true", accepted, err)
+	}
+}
+
+// TestTenantGateConcurrent：租户并发闸的存储级证据（doc/43）。
+//
+// 场景：同一个租户（max_concurrent_runs=2），8 个请求**同时**开跑，每个都是不同的
+// 会话 → 会话闸（one_live_run_per_session）不参与，只考租户闸。
+//
+// 闸在 DB 里（Store.lockTenantGate）：数活 run 与插 run 行在同一笔 PG 事务里，中间持一把
+// 所有副本共享的顾问锁 → 并发下**恰好放行上限那么多**，其余被闸拒（errTenantFull，
+// 调用方回 429）。
+//
+// 这条用例就是那把锁的回归网：把锁去掉（退回 API 层「数一遍 → 比上限 → 放行」）→
+// 8 个请求都数到「还没人提交」→ 全部放行 → 放行数变 8，本用例立刻红。
+//
+// 顺带钉住两件事：① 被闸拒的请求**零痕迹**（它插的会话行随整笔事务回滚）；
+// ② 库里活着的场数恰好等于上限（不是小于，是等于）。
+func TestTenantGateConcurrent(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+
+	// 一个真的租户行：闸要读它的 max_concurrent_runs（缺行会落回默认 8，那是另一条分支）。
+	if err := s.db.Create(&Tenant{
+		ID: "t_gate", Kind: "personal", Name: "gate", Status: "active", Plan: "free",
+		CreatedBy: "u_test", MaxConcurrentRuns: 2,
+	}).Error; err != nil {
+		t.Fatalf("建租户行: %v", err)
+	}
+
+	const n = 8
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	ok, full, other := 0, 0, 0
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sid := SessionID(fmt.Sprintf("s_gate_%d", i))
+			rid := RunID(fmt.Sprintf("r_gate_%d", i))
+			acquired, err := s.AcquireRun(ctx, sid, rid,
+				Row{RunID: rid, Role: "user", MessageID: fmt.Sprintf("m_g%d", i), Text: "hi"},
+				principal{UserID: "u_test", TenantID: "t_gate", Role: "owner"}, "")
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil && acquired:
+				ok++
+			case errors.Is(err, errTenantFull):
+				full++
+			default:
+				other++
+				t.Logf("第 %d 个请求：意外结果 acquired=%v err=%v", i, acquired, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	t.Logf("放行=%d 闸拒=%d 其他=%d（上限 2，并发 %d）", ok, full, other, n)
+	if ok != 2 {
+		t.Errorf("放行 %d 场，上限 2 —— 超发或误拒", ok)
+	}
+	if full != n-2 {
+		t.Errorf("闸拒 %d 个，应为 %d", full, n-2)
+	}
+	if other != 0 {
+		t.Errorf("%d 个请求既没放行也没被闸拒（不该有别的结局）", other)
+	}
+	// 活着的场数恰好等于上限。
+	live, err := s.CountLiveRuns(ctx, "t_gate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live != 2 {
+		t.Errorf("库里活 run %d 场，上限 2", live)
+	}
+	// 被闸拒的请求零痕迹：会话行与 run 行都只有放行的那两场。
+	if got := s.count(t, &Session{}, "tenant_id = ?", "t_gate"); got != 2 {
+		t.Errorf("sessions 行数 = %d, want 2（被闸拒的请求不得留下会话行）", got)
+	}
+	if got := s.count(t, &Run{}, "status = ?", "running"); got != 2 {
+		t.Errorf("runs 活行数 = %d, want 2", got)
 	}
 }

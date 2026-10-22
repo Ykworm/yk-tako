@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 type ctxKey int
@@ -155,13 +157,22 @@ func directoryBytes(root string) int64 {
 	return n
 }
 
-func (s *Store) CountLiveRuns(ctx context.Context, tenantID string) (int, error) {
+// countLiveRuns 数这个租户当前活着的 run（闸口径：status='running' AND lease_until > now()）。
+//
+// 收成一个函数是因为它有两处调用：读侧（CountLiveRuns，走 s.db）与抢闸
+// （lockTenantGate，走事务内的 tx）。**两处口径必须逐字相同**——否则读侧说「7 场在跑」、
+// 闸里说「8 场在跑」，同一时刻两个数打架。
+func countLiveRuns(db *gorm.DB, tenantID string) (int, error) {
 	var n int64
-	err := s.db.WithContext(ctx).Raw(`
+	err := db.Raw(`
 SELECT COUNT(*) FROM runs r
   JOIN sessions s ON s.id = r.session_id
  WHERE s.tenant_id = ? AND r.status = 'running' AND r.lease_until > now()`, tenantID).Scan(&n).Error
 	return int(n), err
+}
+
+func (s *Store) CountLiveRuns(ctx context.Context, tenantID string) (int, error) {
+	return countLiveRuns(s.db.WithContext(ctx), tenantID)
 }
 
 func (s *Store) TenantQuota(ctx context.Context, tenantID string) (maxRuns, maxSub int, dailyTokens, maxStorage int64, err error) {

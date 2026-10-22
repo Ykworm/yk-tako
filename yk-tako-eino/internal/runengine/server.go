@@ -435,6 +435,13 @@ func (s *Server) postRuns(c *gin.Context) {
 		writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
 		return
 	}
+	// 租户并发闸满了（doc/43）：同一租户同时在跑的场数到上限 → 429。
+	// 字节与「日 token 配额用完」相同（同一个码、同一句文案）——把两者分开是
+	// doc/42 §4.3 第 2 条的事，不同批做。
+	if errors.Is(err, errTenantFull) {
+		writeEnvelope(c, http.StatusTooManyRequests, codeQuota, "这个工作区的额度用完了", nil)
+		return
+	}
 	// errProjectBusy（项目忙 409）已随项目闸退役（doc/42，2026-10-22）——同项目并发不再被拒。
 	if err != nil {
 		internal(c, err)

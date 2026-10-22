@@ -12,6 +12,7 @@
 | `matrix.py` | 19v6-04 用例矩阵**实跑**：逐字节打印真实响应，供人肉对齐期望字节 | 要 |
 | `spotcheck.sh` | doc/28 多租户 / doc/35 项目目录 / doc/32 media_offload 的**活体抽验**（shell + jq） | 要 |
 | `taskboard_crash.sh` | doc/41 任务看板**活得过崩溃**的活体验收：`kill -9` 引擎 → 重启 → `resume` → 崩前建的看板行一条没丢、续跑在同一张表继续建行、run 收到 terminal 帧 | 要 |
+| `tenant_gate.sh` | doc/43 租户并发闸的**活体验收**：上限 2 的租户并发打 4 次 `POST /api/runs` → 恰好 2 个 `202` + 2 个 `429`（响应体逐字 `{"code":113001,…}`），库里 run 行数与会话行数都 = 上限 | 要 |
 | `check-expected.sh` | 守「19v6-04 散文」与「`expected.json`」的用例号集合一致 | — |
 | `harness.py` | 三个脚本共用的底座：HTTP 调用、.env 取密钥、psql 补丁、断言计数 | — |
 
