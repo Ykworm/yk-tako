@@ -73,6 +73,44 @@ func sandboxProfile(root string) string {
 `, root)
 }
 
+// sandboxWrap 把一条命令包进 seatbelt 围栏（root = 围栏根；root 为空 = 不包）。
+//
+// 用途：MCP server 是宿主上的子进程（mcp.go 的 exec.Command），继承宿主权限 → 不围栏它，
+// 它能读所有租户的目录。租户自己配的 MCP 一律包围栏（根 = 该租户的存储根）。
+// 平台的系统 MCP（引擎自己的 mcp.json）不包——那是平台自己配的。
+func sandboxWrap(cmd *exec.Cmd, root string) *exec.Cmd {
+	if root == "" {
+		return cmd
+	}
+	args := append([]string{"-p", sandboxProfile(root)}, cmd.Args...)
+	return exec.Command("sandbox-exec", args...)
+}
+
+// commandInsideRoot 判定一条待执行的命令是否落在围栏根内（绝对路径判定）。
+// 用途：围栏只允许写围栏根 → `npx` 这类要把依赖下到 ~/.npm 的启动方式在围栏里必然失败。
+// 与其让它在启动时莫名失败，不如在启动前说清「依赖必须预装在租户目录内」。
+func commandInsideRoot(command, root string) bool {
+	if command == "" {
+		return false
+	}
+	if !filepath.IsAbs(command) {
+		return false // 相对路径按 cwd 解析，cwd 不保证在围栏根内 → 不认
+	}
+	real, err := filepath.EvalSymlinks(command)
+	if err != nil {
+		real = command
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		realRoot = root
+	}
+	rel, err := filepath.Rel(realRoot, real)
+	if err != nil {
+		return false
+	}
+	return rel == "." || !strings.HasPrefix(rel, "..")
+}
+
 // startBash 准备一条命令。requireSandbox 为真且本机没有能 apply 的 sandbox-exec 时直接失败，不退回裸 bash。
 // 返回的 runCtx 是套了时长帽的那个 context。沙箱里的进程被杀掉时，cmd.Run 往往给出退出码 -1，
 // 不再带 DeadlineExceeded；调用方要看 runCtx 才知道是超时。

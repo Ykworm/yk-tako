@@ -47,6 +47,16 @@ type mcpServersResponse struct {
 	Count   int               `json:"count"`
 }
 
+// mcpFenceRoot 决定一个 MCP server 要不要进围栏、围栏根是谁：
+//   - 租户自己配的（custom）→ 进围栏，根 = 该租户的存储根 → 它只能读写**这个租户**的文件；
+//   - 平台系统配的（引擎自己的 mcp.json）→ 不围栏（平台自己配的，平台自己负责）。
+func mcpFenceRoot(srv mergedServer, tenantRoot string) string {
+	if srv.custom {
+		return tenantRoot
+	}
+	return ""
+}
+
 // mcpToolName 是暴露名的唯一拼装点：mcp__<短名>__<工具名>（doc/33 §4.1）。
 func mcpToolName(server, tool string) string {
 	return "mcp__" + server + "__" + tool
@@ -55,8 +65,11 @@ func mcpToolName(server, tool string) string {
 // mcpServerConn 是一个已握手的 stdio server 连接：session 与按其翻译出的工具绑定同生命周期，
 // conf 留底用于「配置没变就复用连接」的判定。
 type mcpServerConn struct {
-	name      string
-	conf      McpServerConfig
+	name string
+	conf McpServerConfig
+	// root 是这个连接的围栏根（空 = 没围栏，平台的系统 MCP）。**它必须进缓存键**：
+	// 同一份配置在两个租户下要连两次、围栏根不同——复用同一个连接就等于围栏串了。
+	root      string
 	session   io.Closer
 	tools     []tool.BaseTool
 	toolNames []string
@@ -86,10 +99,24 @@ func mcpNoticeHandler(server string) func(ctx context.Context, name string, resu
 
 // connectMcpServer 拉起子进程 → initialize 握手 → GetTools 翻译（探针实证的接线，doc/33 §2.3）。
 // 命名经 ToolNameMapper 在翻译期落 ExposedName，server 报什么名就拼成 mcp__短名__什么名。
-func connectMcpServer(ctx context.Context, name string, sc McpServerConfig) (*mcpServerConn, error) {
+func connectMcpServer(ctx context.Context, name string, sc McpServerConfig, root string) (*mcpServerConn, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	cmd := exec.Command(sc.Command, sc.Args...)
+	if root != "" {
+		// 租户自己配的 MCP server → 进围栏（根 = 该租户的存储根）。
+		// 不围栏的后果：这个子进程以宿主权限运行，能读所有租户的目录
+		// （tenants/<别人的tid>/… 都在同一个 workspace 根下），而它的工具直接进模型工具池
+		// → 读到的别人的文件内容会进 tool_result → 进 mh / runlog / 记忆抽取。
+		// 没有沙箱 → **拒绝启动**（fail closed），不假装已经隔离（同 bash 的口径）。
+		if !sandboxAvailable() {
+			return nil, fmt.Errorf("这台机器没有可用的沙箱，租户 MCP server 不能启动（不能假装已隔离）")
+		}
+		if !commandInsideRoot(sc.Command, root) {
+			return nil, fmt.Errorf("租户 MCP server 的 command 必须在该租户的项目目录内（当前 %q）——围栏不允许在租户目录之外启动程序；依赖请预装到租户目录里再指向它", sc.Command)
+		}
+		cmd = sandboxWrap(cmd, root)
+	}
 	cmd.Env = append(os.Environ(), envPairs(sc.Env)...)
 	client := mcp.NewClient(&mcp.Implementation{Name: "yktako", Version: "v0"}, nil)
 	sess, err := client.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
@@ -118,7 +145,7 @@ func connectMcpServer(ctx context.Context, name string, sc McpServerConfig) (*mc
 		names = append(names, info.Name)
 	}
 	sort.Strings(names)
-	return &mcpServerConn{name: name, conf: sc, session: sess, tools: tools, toolNames: names}, nil
+	return &mcpServerConn{name: name, conf: sc, root: root, session: sess, tools: tools, toolNames: names}, nil
 }
 
 func envPairs(env map[string]string) []string {
@@ -151,7 +178,7 @@ func mcpConfEqual(a, b McpServerConfig) bool {
 // ensureMcpConn 按「配置没变就复用、变了就换、失败不缓存」维护连接。失败不缓存：诊断端点
 // 每次 curl 都重试拉起——command 修好后下一发 curl 自愈，不用重启引擎。
 // 临时语义：连接跟引擎进程同生命周期；A3 起 run 走自己的连接，端点这套只服务诊断面。
-func (s *Server) ensureMcpConn(name string, sc McpServerConfig) (*mcpServerConn, error) {
+func (s *Server) ensureMcpConn(name string, sc McpServerConfig, root string) (*mcpServerConn, error) {
 	connect := s.mcpConnect
 	if connect == nil {
 		connect = connectMcpServer
@@ -161,10 +188,11 @@ func (s *Server) ensureMcpConn(name string, sc McpServerConfig) (*mcpServerConn,
 	if s.mcpConns == nil {
 		s.mcpConns = map[string]*mcpServerConn{}
 	}
-	if cur := s.mcpConns[name]; cur != nil && mcpConfEqual(cur.conf, sc) {
+	// 缓存键含围栏根：同一份配置在两个租户下围栏根不同 → 必须各连一次。
+	if cur := s.mcpConns[name]; cur != nil && mcpConfEqual(cur.conf, sc) && cur.root == root {
 		return cur, nil
 	}
-	conn, err := connect(context.Background(), name, sc)
+	conn, err := connect(context.Background(), name, sc, root)
 	if err != nil {
 		return nil, err
 	}
@@ -216,11 +244,12 @@ func (s *Server) getMcpStatus(c *gin.Context) {
 		System []item `json:"system"`
 		Custom []item `json:"custom"`
 	}{System: []item{}, Custom: []item{}}
+	tenantRoot := tenantStorageRoot(s.mediaRoot, p.TenantID)
 	for _, srv := range mergeServers(sys.McpServers, tenantServers) {
 		it := item{Name: srv.name, Tools: []string{}}
 		if strings.TrimSpace(srv.conf.Command) == "" {
 			it.State = "disabled"
-		} else if conn, cerr := connect(c.Request.Context(), srv.name, srv.conf); cerr != nil {
+		} else if conn, cerr := connect(c.Request.Context(), srv.name, srv.conf, mcpFenceRoot(srv, tenantRoot)); cerr != nil {
 			if srv.custom {
 				it.State = "failed"
 			} else {
@@ -254,7 +283,8 @@ func (s *Server) getMcpServers(c *gin.Context) {
 	for _, name := range names {
 		sc := cfg.McpServers[name]
 		status := mcpServerStatus{Name: name, Command: sc.Command, Tools: []string{}}
-		conn, err := s.ensureMcpConn(name, sc)
+		// 这是**系统** mcp.json 的状态端点 → 平台自己配的 server → 不围栏（root 空）。
+		conn, err := s.ensureMcpConn(name, sc, "")
 		if err != nil {
 			status.State = "failed"
 			status.Reason = err.Error()
@@ -275,7 +305,10 @@ type mcpToolHandler struct {
 	*adk.BaseChatModelAgentMiddleware
 	confPath string
 	// connect 可注入替身，单测不真拉子进程；生产 = connectMcpServer。
-	connect func(ctx context.Context, name string, sc McpServerConfig) (*mcpServerConn, error)
+	connect func(ctx context.Context, name string, sc McpServerConfig, root string) (*mcpServerConn, error)
+	// fenceRoot 是围栏根（空 = 不围栏）。这条路径读的是**系统** mcp.json（平台自己配的）→ 不围栏；
+	// 租户自己配的 MCP 走 profile.go 的 connectRunMCP，围栏根 = 该租户的存储根。
+	fenceRoot string
 }
 
 func (h *mcpToolHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelAgentContext) (context.Context, *adk.ChatModelAgentContext, error) {
@@ -299,7 +332,7 @@ func (h *mcpToolHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelA
 	var conns []*mcpServerConn
 	var loaded []string
 	for _, name := range sortedServerNames(cfg) {
-		conn, err := connect(ctx, name, cfg.McpServers[name])
+		conn, err := connect(ctx, name, cfg.McpServers[name], h.fenceRoot)
 		if err != nil {
 			// 外围故障不当致命（doc/33 §5）：记观测行、该 server 工具不进本轮池、run 照常走。
 			log.Printf("mcp: server %s 启动失败: %v", name, err)

@@ -34,7 +34,7 @@ type Server struct {
 	// mcp 连接缓存与互斥（mcp.go ensureMcpConn）；mcpConnect 可注入替身，单测不真拉子进程。
 	mcpMu      sync.Mutex
 	mcpConns   map[string]*mcpServerConn
-	mcpConnect func(ctx context.Context, name string, sc McpServerConfig) (*mcpServerConn, error)
+	mcpConnect func(ctx context.Context, name string, sc McpServerConfig, root string) (*mcpServerConn, error)
 	// resumeMax 是单场 run 的续跑上限（-resume-max，doc/30 A1）：GET /api/runs/{id} 的
 	// resumable = interrupted && resumeCount < resumeMax。A1 只读侧用它，A4a 的 claim 同值裁决。
 	resumeMax int

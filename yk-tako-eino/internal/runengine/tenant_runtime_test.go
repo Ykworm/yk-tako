@@ -145,7 +145,7 @@ func TestCustomMCPFailureClosesEarlierConn(t *testing.T) {
 	sys := &flagCloser{}
 	s := &Server{
 		mcpConfPath: path,
-		mcpConnect: func(_ context.Context, name string, _ McpServerConfig) (*mcpServerConn, error) {
+		mcpConnect: func(_ context.Context, name string, _ McpServerConfig, _ string) (*mcpServerConn, error) {
 			if name == "aaa" {
 				return &mcpServerConn{name: name, session: sys}, nil
 			}
@@ -155,7 +155,7 @@ func TestCustomMCPFailureClosesEarlierConn(t *testing.T) {
 	cfg := runtimeConfig{McpServers: map[string]McpServerConfig{
 		"zzz": {Command: "/bin/false"},
 	}}
-	conns, _, aerr := s.connectRunMCP(context.Background(), cfg, nil)
+	conns, _, aerr := s.connectRunMCP(context.Background(), principal{TenantID: "ten_1"}, cfg, nil)
 	if aerr == nil || aerr.Code != codeMcpDown {
 		t.Fatalf("自定义连不上应 503，得到 %#v", aerr)
 	}
@@ -174,11 +174,11 @@ func TestSystemMCPFailureDegrades(t *testing.T) {
 	}
 	s := &Server{
 		mcpConfPath: path,
-		mcpConnect: func(context.Context, string, McpServerConfig) (*mcpServerConn, error) {
+		mcpConnect: func(context.Context, string, McpServerConfig, string) (*mcpServerConn, error) {
 			return nil, errors.New("down")
 		},
 	}
-	conns, tools, aerr := s.connectRunMCP(context.Background(), runtimeConfig{}, nil)
+	conns, tools, aerr := s.connectRunMCP(context.Background(), principal{TenantID: "ten_1"}, runtimeConfig{}, nil)
 	if aerr != nil {
 		t.Fatalf("系统 MCP 失败应降级，得到 %v", aerr)
 	}

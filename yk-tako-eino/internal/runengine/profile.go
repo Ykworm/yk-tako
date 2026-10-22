@@ -134,7 +134,7 @@ func (s *Server) assembleRun(ctx context.Context, p principal, agentID string) (
 	log.Printf("assemble model tenant=%s ref=%s provider=%s keyfp=%s cache=%s", p.TenantID, built.Ref, built.Provider, built.KeyFP, cacheKey)
 
 	pool := append([]tool.BaseTool{}, s.worker.tools...)
-	conns, mcpTools, aerr := s.connectRunMCP(ctx, cfg, secrets)
+	conns, mcpTools, aerr := s.connectRunMCP(ctx, p, cfg, secrets)
 	if aerr != nil {
 		closeMCP(conns)
 		return nil, aerr
@@ -186,7 +186,7 @@ func closeMCP(conns []*mcpServerConn) {
 
 // connectRunMCP 把系统 mcp.json 和租户 mcpServers 合成一份。同名时租户盖住系统，盖住的那条算自定义。
 // 自定义连不上就整场失败；系统连不上就少它的工具，run 还能继续。
-func (s *Server) connectRunMCP(ctx context.Context, cfg runtimeConfig, secrets map[string]string) ([]*mcpServerConn, []tool.BaseTool, *assembleError) {
+func (s *Server) connectRunMCP(ctx context.Context, p principal, cfg runtimeConfig, secrets map[string]string) ([]*mcpServerConn, []tool.BaseTool, *assembleError) {
 	sys, err := loadMcpConfig(s.mcpConfPath)
 	if err != nil {
 		log.Printf("mcp: 系统配置拒载，本场没有系统 MCP: %v", err)
@@ -202,8 +202,9 @@ func (s *Server) connectRunMCP(ctx context.Context, cfg runtimeConfig, secrets m
 	}
 	var conns []*mcpServerConn
 	var tools []tool.BaseTool
+	tenantRoot := tenantStorageRoot(s.mediaRoot, p.TenantID)
 	for _, srv := range mergeServers(sys.McpServers, tenantServers) {
-		conn, cerr := connect(ctx, srv.name, srv.conf)
+		conn, cerr := connect(ctx, srv.name, srv.conf, mcpFenceRoot(srv, tenantRoot))
 		if cerr != nil {
 			if srv.custom {
 				log.Printf("mcp: custom %s 启动失败: %v", srv.name, cerr)

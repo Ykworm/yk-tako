@@ -111,7 +111,7 @@ func TestGetMcpServersShape(t *testing.T) {
 	if err := os.WriteFile(conf, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{mcpConfPath: conf, mcpConnect: func(_ context.Context, name string, _ McpServerConfig) (*mcpServerConn, error) {
+	s := &Server{mcpConfPath: conf, mcpConnect: func(_ context.Context, name string, _ McpServerConfig, _ string) (*mcpServerConn, error) {
 		names := []string{mcpToolName(name, "zebra"), mcpToolName(name, "apple")}
 		sort.Strings(names)
 		return &mcpServerConn{name: name, toolNames: names}, nil
@@ -137,7 +137,7 @@ func TestGetMcpServersFailedShape(t *testing.T) {
 	if err := os.WriteFile(conf, []byte(`{"mcpServers":{"fs":{"command":"nope"}}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{mcpConfPath: conf, mcpConnect: func(_ context.Context, _ string, _ McpServerConfig) (*mcpServerConn, error) {
+	s := &Server{mcpConfPath: conf, mcpConnect: func(_ context.Context, _ string, _ McpServerConfig, _ string) (*mcpServerConn, error) {
 		return nil, errors.New("exec: not found")
 	}}
 	w := testMcpRequest(t, s)
@@ -156,22 +156,22 @@ func TestEnsureMcpConnReuseAndReplace(t *testing.T) {
 	s := &Server{}
 	calls := 0
 	closed := 0
-	s.mcpConnect = func(_ context.Context, _ string, sc McpServerConfig) (*mcpServerConn, error) {
+	s.mcpConnect = func(_ context.Context, _ string, sc McpServerConfig, _ string) (*mcpServerConn, error) {
 		calls++
 		return &mcpServerConn{name: "fs", conf: sc, session: &fakeSession{onClose: func() { closed++ }}, toolNames: []string{}}, nil
 	}
 	sc1 := McpServerConfig{Command: "npx"}
-	if _, err := s.ensureMcpConn("fs", sc1); err != nil {
+	if _, err := s.ensureMcpConn("fs", sc1, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ensureMcpConn("fs", sc1); err != nil {
+	if _, err := s.ensureMcpConn("fs", sc1, ""); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 1 {
 		t.Fatalf("配置没变应复用，connect 调了 %d 次", calls)
 	}
 	sc2 := McpServerConfig{Command: "node"}
-	if _, err := s.ensureMcpConn("fs", sc2); err != nil {
+	if _, err := s.ensureMcpConn("fs", sc2, ""); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 2 || closed != 1 {
@@ -224,7 +224,7 @@ func TestMcpToolHandlerAppendsAndClosesOnCtxDone(t *testing.T) {
 		t.Fatal(err)
 	}
 	closed := 0
-	h := &mcpToolHandler{confPath: conf, connect: func(_ context.Context, name string, sc McpServerConfig) (*mcpServerConn, error) {
+	h := &mcpToolHandler{confPath: conf, connect: func(_ context.Context, name string, sc McpServerConfig, _ string) (*mcpServerConn, error) {
 		return &mcpServerConn{
 			name: name, conf: sc, session: &fakeSession{onClose: func() { closed++ }},
 			tools:     []tool.BaseTool{&fakeMcpTool{name: mcpToolName(name, "read_file")}},
@@ -274,7 +274,7 @@ func TestMcpToolHandlerConnectFailureDegrades(t *testing.T) {
 	if err := os.WriteFile(conf, []byte(`{"mcpServers":{"fs":{"command":"nope"}}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	h := &mcpToolHandler{confPath: conf, connect: func(_ context.Context, _ string, _ McpServerConfig) (*mcpServerConn, error) {
+	h := &mcpToolHandler{confPath: conf, connect: func(_ context.Context, _ string, _ McpServerConfig, _ string) (*mcpServerConn, error) {
 		return nil, errors.New("exec: not found")
 	}}
 	runCtx := &adk.ChatModelAgentContext{}
