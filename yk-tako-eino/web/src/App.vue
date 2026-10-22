@@ -564,6 +564,11 @@ function fmtDateTime(iso: string): string {
 
 function continueSubagent(sa: SubagentItem) {
   const line = `请用 resume_subagent 继续子代理 ${sa.saId}（${sa.agentName}）：接着它刚才的任务继续做下去，完成后把结果告诉我。`
+  // 同一个实例的指令已经在输入框里就不再追加（连点防护）。
+  if (draft.value.includes(`resume_subagent 继续子代理 ${sa.saId}`)) {
+    focusComposer()
+    return
+  }
   const current = draft.value.trimEnd()
   draft.value = current ? `${current}\n\n${line}` : line
   focusComposer()

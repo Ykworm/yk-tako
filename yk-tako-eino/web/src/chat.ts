@@ -523,6 +523,9 @@ export function useChat() {
   // reconcile（19v6-02 四步）：查状态 → 窗口化补历史 → 有活 run 则 frames(0) 重建半截气泡。
   // 返回是否真的打开了一场会话（项目页「打开」据此判断，失败时对话页保持空）。
   async function reconcile(): Promise<boolean> {
+    // 连点防护：openSession/showTenantSession/newSession 都会 pollToken++ 后清空气泡，
+    // 中途进来的那次 reconcile 必须在每个 await 之后认令牌失效就退场，否则历史会重复渲染。
+    const token = pollToken
     // 当前项目按当前租户的存储重读：登录/切租户后不能留着上一个租户的项目 id。
     activeWorkspaceId.value = readStoredWorkspace()
     const sid = readStoredSession()
@@ -531,15 +534,18 @@ export function useChat() {
     try {
       status = await getSession(sid)
     } catch (e) {
+      if (token !== pollToken) return false
       if (isNotFound(e)) dropSession()
       return false
     }
+    if (token !== pollToken) return false
     sessionId.value = sid
     // 打开已有会话时当前项目跟着它走：之后「新对话」自然落在同一个项目。
     if (status.workspaceId) setActiveWorkspace(status.workspaceId)
     runlogOffset = Math.max(0, status.runlogOffset - HISTORY_WINDOW)
     for (;;) {
       const resp = await getLog(sid, runlogOffset)
+      if (token !== pollToken) return false
       if (resp.rows.length === 0) break
       appendRows(resp.rows)
       runlogOffset = resp.nextOffset

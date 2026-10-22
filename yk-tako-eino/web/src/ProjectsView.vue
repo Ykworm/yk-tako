@@ -151,13 +151,12 @@ const preparingId = ref('')
 
 async function askDeleteProject(p: ProjectRow) {
   confirmError.value = ''
-  if (p.sessions === null) {
-    // 用户确认前就知道「有几场对话会一起删」，删除后也能判断当前会话是否被连带删掉。
-    preparingId.value = p.workspace.id
-    await loadSessions(p)
-    preparingId.value = ''
-    if (p.error) return
-  }
+  // 总是重拉，不用缓存快照：级联文案和「当前会话是否被连带删掉」的判断都必须用最新列表
+  // （另一个 tab 可能刚在这个项目里建/删了会话）。
+  preparingId.value = p.workspace.id
+  await loadSessions(p)
+  preparingId.value = ''
+  if (p.error) return
   target.value = {
     kind: 'workspace',
     project: p,
