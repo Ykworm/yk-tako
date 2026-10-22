@@ -343,20 +343,23 @@ export function useChat() {
 
   // 收口（doc/19-v6 index 概念表「收口」）：定稿后权威内容以 runlog 为准，按 run 整条替换半截气泡；
   // 拉 log 经过的别人的定稿行顺带补渲染（drainLog）。
-  // error 终态不进 runlog（新 A6 已裁）——不拉 log，气泡转错误态。
-  // stopped 终态（doc/17 §4）同样不进 runlog——保留已流出的字、标停止、不拉 log 不转错误。
+  //
+  // error / stopped 终态（失败留痕，2026-10-22）：这一轮可能已经说了话、干了活 → 服务端把
+  // **已产出的内容**落进了 runlog（半截回答 + 工具行）。所以这里也要拉一次 log：
+  //  1) 刷新页面后从历史面重建时，那半截还在（不再"刷新即消失"）；
+  //  2) 客户端的 runlogOffset 与服务端对齐，不留游标空洞。
+  // 屏上流出来的半截**不替换**（它可能是本轮最后一段、还没进 turn 的流）——只有气泡空着
+  // 时才用 log 里的行补上。终态帧是 PG 事务提交后才推的（EndRun → runliveFinish），
+  // 所以看到终态帧时 log 里的行已经在库里。
   async function closeOut(runId: RunID, assistant: Bubble, terminalStatus: string | null) {
-    if (terminalStatus === 'error') {
-      assistant.state = 'error'
+    if (terminalStatus === 'error' || terminalStatus === 'stopped') {
+      const row = await drainLog(runId, assistant)
+      if (row && !assistant.text) assistant.text = row.text
+      assistant.state = terminalStatus === 'stopped' ? 'stopped' : 'error'
       return
     }
     // 本 tab 亲历的收尾：全程没见过 usage 帧 = 厂商没报账单，标出来（error 态不标——失败气泡本就有说明行）。
     if (!assistant.usage) assistant.usageUnknown = true
-    if (terminalStatus === 'stopped') {
-      // 半截文本原样保留（不替换）：没有定稿行可拉，人看见的就是停那一刻已流出的内容。
-      assistant.state = 'stopped'
-      return
-    }
     const row = await drainLog(runId, assistant)
     if (row) {
       assistant.text = row.text

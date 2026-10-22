@@ -496,13 +496,15 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 	}
 	defer func() {
 		// mh 写入源 = 折后 state 派生（A4）：RunID==currentRun 且 Seq≥2 的行、按位置从 2 连续
-		// 重编（mid-fold 折走单位留下的 seq 空洞在此闭合）。final 为空 = 不可达态（成功终态
-		// AfterAgent 恒已填），一行守卫兜回 turn 派生——error/取消本就不落库，兜底值不上账。
+		// 重编（mid-fold 折走单位留下的 seq 空洞在此闭合）。final 为空 = 非成功终态
+		// （成功终态 AfterAgent 恒已填）→ 走 turn 派生，并**配平**（balanceToolResults）：
+		// 失败终态这一轮可能「说了话、调了工具、没拿到结果」，那条 tool 行补上，
+		// 否则下一枪的模型输入里 assistant 的 tool_calls 后面缺 tool 结果 → provider 拒（400）。
 		var mhRows []ModelMessage
 		if final := box.finalRows(); final != nil {
 			mhRows = mhRowsFromFold(runID, final)
 		} else {
-			mhRows = mhRowsFromTurn(runID, turn)
+			mhRows = balanceToolResults(mhRowsFromTurn(runID, turn))
 		}
 		// WithoutCancel（doc/17 §4 D4）：stop 判死后本 ctx 已取消，但 stopped 收尾还要写
 		// 已配对工具行——收尾的 PG/Redis 调用不能吃取消；foldBox 等 ctx 值仍要带上。
@@ -854,6 +856,50 @@ func mhRowsFromTurn(runID RunID, turn []TurnEntry) []ModelMessage {
 		seq++
 	}
 	return rows
+}
+
+// failedToolResultText 是「这次工具调用没拿到结果」的合成回注（失败终态专用）。
+//
+// 与账本重放用的 interruptedResultText（journal.go）同族、措辞不同：那边是「进程被中断」，
+// 这边是「本场运行失败」——模型看到的是事实陈述，不是编造的结果。
+const failedToolResultText = "错误：这次工具调用在本次运行失败前没有拿到结果；引擎不会自动重跑这次调用。需要的话请重新发起。"
+
+// balanceToolResults 给「assistant 带 tool_calls、但没有对应 tool 行」的调用补一条合成结果行。
+//
+// 为什么必须配平：下一枪的模型输入里，assistant 的 tool_calls 后面必须紧跟对应的 tool 结果
+// （OpenAI 协议如此），少一条就会被 provider 拒（400）。
+// 什么时候会缺：run 在工具执行途中失败（error 终态），调用被杀在途、没拿到结果。
+// 补的内容只说事实（没拿到结果、不会自动重跑），不编造结果。
+//
+// 顺带把 seq 重编成连续（mh 是 (run_id, seq) 唯一，合成行插在中间会撞号）。
+func balanceToolResults(rows []ModelMessage) []ModelMessage {
+	have := map[string]bool{}
+	for _, r := range rows {
+		if r.Role == "tool" && r.ToolCallID != "" {
+			have[r.ToolCallID] = true
+		}
+	}
+	out := make([]ModelMessage, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r)
+		if r.Role != "assistant" || len(r.ToolCalls) == 0 {
+			continue
+		}
+		for _, tc := range r.ToolCalls {
+			if tc.ID == "" || have[tc.ID] {
+				continue
+			}
+			have[tc.ID] = true
+			out = append(out, ModelMessage{RunID: r.RunID, Seq: r.Seq, Role: "tool",
+				Text: failedToolResultText, ToolCallID: tc.ID})
+		}
+	}
+	seq := 2
+	for i := range out {
+		out[i].Seq = seq
+		seq++
+	}
+	return out
 }
 
 // usageBill 从排干合并后的回执消息取 provider 账单（doc/27 §4a）。ok=false = 账单缺失

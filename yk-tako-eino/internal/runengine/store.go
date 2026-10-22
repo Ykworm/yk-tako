@@ -370,6 +370,141 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, ep
 			}
 			return nil
 		}
+		// writeMHRows 把本 run 的模型侧消息行落进 mh（下一枪的模型输入读它）。
+		//
+		// complete 与失败终态（error/stopped）**共用这一份**——差别不在「写不写」，而在「这一轮说了什么」：
+		// complete 写终稿；失败终态写已说出的那半截（turn 里有什么写什么，不编）。
+		// 失败且无产出时 rows 为空 → 一行不写（与改造前同形）。
+		//
+		// 逐轮落 mh（写入源 = mhRows，Seq 由生产方赋值）：assistant 轮带 tool_calls、tool 轮带
+		// tool_call_id——下一轮 prepareInput 就按这两列重建 OpenAI 工具消息。两列「缺席即 NULL」
+		// （与 message_id 同约定）：assistant 轮的 tool_call_id、tool 轮的 tool_calls、无调用的终轮
+		// 两列，一律不写字面空串。旧「遍历 turn 跳子代理」的 root-only 分拣已上移 worker
+		// （转换知识不进存储层）——mhRows 已全是本 run 该进模型输入的行，此处只做机械搬运。
+		writeMHRows := func(rows []ModelMessage) error {
+			for _, m := range rows {
+				var callsSQL, callIDSQL any // nil = NULL
+				if len(m.ToolCalls) > 0 {
+					b, err := json.Marshal(m.ToolCalls)
+					if err != nil {
+						return err
+					}
+					callsSQL = string(b)
+				}
+				if m.ToolCallID != "" {
+					callIDSQL = m.ToolCallID
+				}
+				msgID, err := newRowID("msg_")
+				if err != nil {
+					return err
+				}
+				if err := tx.Exec(
+					`INSERT INTO run_model_messages (id, session_id, run_id, seq, role, text, tool_calls, tool_call_id, compacted, created_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, false, now())`,
+					msgID, sessionID, runID, m.Seq, m.Role, m.Text, callsSQL, callIDSQL).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+
+		// rootUsage 是本 run root 最后一枪的账单（complete 分支的租户用量记账要用它；
+		// 失败终态不用记账——失败那轮花掉的 token 另案算，见 doc 的遗留项）。
+		var rootUsage *UsageBill
+
+		// writeTurnRows 把 turn 落成 runlog 行（历史面）：工具结果行 / 工具调用行 / assistant 文本行。
+		//
+		// complete 与失败终态共用：complete 写终稿（Σ root 正文），失败终态写已说出的那半截。
+		// rootAlways=true → root 的 assistant 行恒写（complete：那是定稿锚，空正文也写）；
+		// rootAlways=false → 只在真说了话时写（失败终态：没说就一行不写，不制造空行）。
+		//
+		// 行形状与改造前逐字一致（agent NULL + model=主 ref 的终稿行、子代理各归各的调用、
+		// payload 列随行落账单）——失败终态复用同一套写口，不另开形状。
+		writeTurnRows := func(rootAlways bool) error {
+			pending := map[string]string{} // agent 名 → 该 agent 已出的 assistant 文本累计（root 键 = ""）
+			for _, e := range turn {
+				if e.Role == "tool" {
+					if err := insertToolResult(e); err != nil {
+						return err
+					}
+					continue
+				}
+				pending[e.Agent] += e.Text
+				if e.Agent != "" && len(e.ToolCalls) == 0 {
+					logID, err := newRowID("rl_")
+					if err != nil {
+						return err
+					}
+					// 子代理终稿行随行落本枪账单（doc/27 A3）：payload 列 = usage JSON；账单缺失
+					// （Usage nil = 厂商没报）不写列（payload NULL）。
+					var usageSQL any
+					if e.Usage != nil {
+						b, err := json.Marshal(e.Usage)
+						if err != nil {
+							return err
+						}
+						usageSQL = string(b)
+					}
+					if err := tx.Exec(
+						`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, payload, created_at)
+						 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
+						         ?, 'assistant', ?, ?, NULL, ?, ?, now())`,
+						logID, sessionID, sessionID, runID, nullable(e.Agent), nullable(e.Model), pending[e.Agent], usageSQL).Error; err != nil {
+						return err
+					}
+					pending[e.Agent] = ""
+					continue
+				}
+				if err := insertToolCalls(e, e.ToolCalls); err != nil {
+					return err
+				}
+			}
+			if !rootAlways && pending[""] == "" {
+				// 这一轮一个字都没说成 → 不写空的 root 行（不留空壳）。
+				return nil
+			}
+			// root 模型生效 ref（行的 model 值）：取自 root 条目的 Model（turn 全空 = 无模型产物，
+			// 照旧 NULL）。root 账单 = 最后一个带 Usage 的 root 条目（多枪工具循环取最后一枪）。
+			rootModel := ""
+			rootUsage = nil
+			for _, e := range turn {
+				if e.Agent == "" && e.Model != "" {
+					rootModel = e.Model
+					break
+				}
+			}
+			for _, e := range turn {
+				if e.Agent == "" && e.Usage != nil {
+					rootUsage = e.Usage
+				}
+			}
+			logID, err := newRowID("rl_")
+			if err != nil {
+				return err
+			}
+			// assistant 文本行（text=pending[""]）：与旧形状逐字节一致（agent NULL + model=主 ref），
+			// 「Σ root turn 正文 == 定稿全文」的收口锚。payload 列随行落 root 最后一枪账单
+			// （doc/27 A3；账单缺失 = 厂商没报，不写列）。
+			// RETURNING 拿回本行 seq 即 runlogOffset（旧 Lua 的 LLEN 语义）。
+			var usageSQL any
+			if rootUsage != nil {
+				b, err := json.Marshal(rootUsage)
+				if err != nil {
+					return err
+				}
+				usageSQL = string(b)
+			}
+			if err := tx.Raw(
+				`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, payload, created_at)
+				 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
+				         ?, 'assistant', NULL, ?, NULL, ?, ?, now())
+				 RETURNING seq`,
+				logID, sessionID, sessionID, runID, nullable(rootModel), pending[""], usageSQL).Scan(&nextSeq).Error; err != nil {
+				return err
+			}
+			return nil
+		}
+
 		res := tx.Exec(
 			`UPDATE runs SET status = ?, finished_at = now(), lease_until = NULL
 			 WHERE id = ? AND session_id = ? AND status = 'running' AND lease_until > now()
@@ -396,31 +531,16 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, ep
 				return errGateLost
 			}
 			stopped = true
-			// stopped 收尾：不写 assistant 行（root 终稿与子代理终稿都不写——不假装说完）、
-			// 不写 mh、不翻转 compacted；半截未返回的调用不补假结果——tool_call 只在 turn 里有
-			// 同 id 回指的 tool 行时才落（配对判据），被杀在途的调用留给 frames 里的现场。
-			answ := map[string]bool{}
-			for _, e := range turn {
-				if e.Role == "tool" && e.ToolCallID != "" {
-					answ[e.ToolCallID] = true
-				}
+			// stopped 收尾：**写这一轮已产出的内容**（工具行 + 已说出的那半截文本），与 error
+			// 终态同待遇——两者都是「这一轮做了一半」，差别只在 stopped 是人按的。
+			// 不翻转 compacted、不写摘要行、不登记记忆任务；被杀在途的调用由 worker 侧配平
+			// （balanceToolResults）补一条「没拿到结果」的合成行，不编造结果。
+			// turn 为空（一个字都没说成）→ 一行不写，与改造前同形。
+			if err := writeMHRows(mhRows); err != nil {
+				return err
 			}
-			for _, e := range turn {
-				if e.Role == "tool" {
-					if err := insertToolResult(e); err != nil {
-						return err
-					}
-					continue
-				}
-				var calls []schema.ToolCall
-				for _, tc := range e.ToolCalls {
-					if answ[tc.ID] {
-						calls = append(calls, tc)
-					}
-				}
-				if err := insertToolCalls(e, calls); err != nil {
-					return err
-				}
+			if err := writeTurnRows(false); err != nil {
+				return err
 			}
 			// runlogOffset 仍返回当前高水位（与下方非 complete 分支同式）。
 			if err := tx.Raw(
@@ -488,117 +608,14 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, ep
 					return err
 				}
 			}
-			// 本 run 的模型侧消息逐轮落 mh（写入源 = mhRows，Seq 由生产方赋值）：assistant 轮带
-			// tool_calls、tool 轮带 tool_call_id——下一轮 prepareInput 就按这两列重建 OpenAI 工具消息。
-			// 两列「缺席即 NULL」（与 message_id 同约定）：assistant 轮的 tool_call_id、tool 轮的
-			// tool_calls、无调用的终轮两列，一律不写字面空串。
-			// 旧「遍历 turn 跳子代理」的 root-only 分拣已上移 worker（planning 裁定 3：转换知识不进
-			// 存储层）——mhRows 已全是本 run 该进模型输入的行，此处只做机械搬运。
-			for _, m := range mhRows {
-				var callsSQL, callIDSQL any // nil = NULL
-				if len(m.ToolCalls) > 0 {
-					b, err := json.Marshal(m.ToolCalls)
-					if err != nil {
-						return err
-					}
-					callsSQL = string(b)
-				}
-				if m.ToolCallID != "" {
-					callIDSQL = m.ToolCallID
-				}
-				msgID, err := newRowID("msg_")
-				if err != nil {
-					return err
-				}
-				if err := tx.Exec(
-					`INSERT INTO run_model_messages (id, session_id, run_id, seq, role, text, tool_calls, tool_call_id, compacted, created_at)
-					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, false, now())`,
-					msgID, sessionID, runID, m.Seq, m.Role, m.Text, callsSQL, callIDSQL).Error; err != nil {
-					return err
-				}
-			}
-			// runlog 全量行（T3-2，消息粒度）：root 与子代理都写——tool 条目 → tool_result 行；
-			// assistant 条目 → tool_call 行 + 文本进该 agent 的暂存。子代理遇无 tool_calls 的末轮 =
-			// 它的终稿：落一行 assistant（agent=名、model=其生效 ref），与 root 终稿=pending[""] 同构；
-			// root 的暂存不落行（它的终稿行在下面——pending[""]）。会话内同一 agent 二次委派 = 暂存清空重算
-			// （终稿各归各的调用）。各行的 agent/model 两列空值照「缺省即 NULL」惯例（读侧归一成 ""）。
-			// 与 assistant 定稿行同笔：要么整轮可见，要么整笔没写。
-			pending := map[string]string{} // agent 名 → 该 agent 已出的 assistant 文本累计（root 键 = ""）
-			for _, e := range turn {
-				if e.Role == "tool" {
-					if err := insertToolResult(e); err != nil {
-						return err
-					}
-					continue
-				}
-				pending[e.Agent] += e.Text
-				if e.Agent != "" && len(e.ToolCalls) == 0 {
-					logID, err := newRowID("rl_")
-					if err != nil {
-						return err
-					}
-					// 子代理终稿行随行落本枪账单（doc/27 A3）：payload 列 = usage JSON；账单缺失
-					// （Usage nil = 厂商没报）不写列（payload NULL）。
-					var usageSQL any
-					if e.Usage != nil {
-						b, err := json.Marshal(e.Usage)
-						if err != nil {
-							return err
-						}
-						usageSQL = string(b)
-					}
-					if err := tx.Exec(
-						`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, payload, created_at)
-						 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
-						         ?, 'assistant', ?, ?, NULL, ?, ?, now())`,
-						logID, sessionID, sessionID, runID, nullable(e.Agent), nullable(e.Model), pending[e.Agent], usageSQL).Error; err != nil {
-						return err
-					}
-					pending[e.Agent] = ""
-					continue
-				}
-				if err := insertToolCalls(e, e.ToolCalls); err != nil {
-					return err
-				}
-			}
-			// root 模型生效 ref（终稿行的 model 值）：取自 root 条目的 Model（T3-1b 起每条都带；
-			// turn 全空 = 无模型产物，照旧 NULL）。root 账单 = 最后一个带 Usage 的 root 条目
-			// （多枪工具循环取最后一枪 = 下一轮的基线，doc/27 §4b）。
-			rootModel := ""
-			var rootUsage *UsageBill
-			for _, e := range turn {
-				if e.Agent == "" && e.Model != "" {
-					rootModel = e.Model
-					break
-				}
-			}
-			for _, e := range turn {
-				if e.Agent == "" && e.Usage != nil {
-					rootUsage = e.Usage
-				}
-			}
-			logID, err := newRowID("rl_")
-			if err != nil {
+			// 本 run 的模型侧消息逐轮落 mh（写入源 = mhRows，Seq 由生产方赋值）——
+			// 与失败终态共用同一个写口（见上面的 writeMHRows）。
+			if err := writeMHRows(mhRows); err != nil {
 				return err
 			}
-			// 终稿 assistant 行（text=pending[""]）：与旧形状逐字节一致（agent NULL + model=主 ref），
-			// 「Σ root turn 正文 == 定稿全文」的收口锚。payload 列随行落 root 最后一枪账单（doc/27 A3；
-			// 账单缺失 = 厂商没报，不写列）。
-			// RETURNING 拿回本行 seq 即 runlogOffset（旧 Lua 的 LLEN 语义）。
-			var usageSQL any
-			if rootUsage != nil {
-				b, err := json.Marshal(rootUsage)
-				if err != nil {
-					return err
-				}
-				usageSQL = string(b)
-			}
-			if err := tx.Raw(
-				`INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, payload, created_at)
-				 VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
-				         ?, 'assistant', NULL, ?, NULL, ?, ?, now())
-				 RETURNING seq`,
-				logID, sessionID, sessionID, runID, nullable(rootModel), pending[""], usageSQL).Scan(&nextSeq).Error; err != nil {
+			// runlog 全量行（T3-2，消息粒度）：root 与子代理都写——tool 条目 → tool_result 行；
+			// assistant 条目 → tool_call 行 + 文本进该 agent 的暂存。与失败终态共用同一个写口。
+			if err := writeTurnRows(true); err != nil {
 				return err
 			}
 			// 线一 outbox（doc/29 §4.1）：**与 run 定稿同一笔事务**登记抽取任务——run 定稿 ⇒
@@ -646,7 +663,17 @@ ON CONFLICT (tenant_id, day) DO UPDATE SET tokens = tenant_usage_daily.tokens + 
 				}
 			}
 		} else {
-			// 非 complete 不定稿：runlogOffset 仍返回当前高水位（旧 Lua 的 LLEN 语义原样）。
+			// error 终态：**写这一轮已产出的内容**（工具行 + 已说出的那半截文本）。
+			// 「失败且无产出」→ turn 为空 → 一行不写（与改造前同形）；
+			// 「失败但有产出」→ 落库，页面刷新后仍看得见这半截，模型的下一枪也接得上。
+			// 不翻转 compacted、不写摘要行、不登记记忆任务（记忆只吃 complete 的可信结果）。
+			if err := writeMHRows(mhRows); err != nil {
+				return err
+			}
+			if err := writeTurnRows(false); err != nil {
+				return err
+			}
+			// runlogOffset 仍返回当前高水位（旧 Lua 的 LLEN 语义原样）。
 			if err := tx.Raw(
 				`SELECT COALESCE(MAX(seq), 0) FROM runlog_entries WHERE session_id = ?`,
 				sessionID).Scan(&nextSeq).Error; err != nil {

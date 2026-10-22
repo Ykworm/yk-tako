@@ -818,7 +818,9 @@ func TestLateEndRunWithTextStillBlockedByLease(t *testing.T) {
 
 // 16. EndRun(error) 的形状（kill -9 冒烟 ⓒ 的活体孪生）：放闸 + terminal 帧，但**不定稿**——
 // runlog 无 assistant 行、mh 只留 user 半、runlogOffset = 当前高水位（旧 Lua 的 LLEN 语义）。
-func TestEndRunErrorKeepsLogUntouched(t *testing.T) {
+// 失败留痕（2026-10-22）：error 终态现在会写「这一轮已产出的内容」（半截回答 + 工具行）。
+// 本用例覆盖的是**失败且无产出**那一档（turn 空 = 还没说出话就失败）→ 与改造前同形：一行不写。
+func TestEndRunErrorWithoutOutputKeepsLogUntouched(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t, testLease, testTTL)
 	sid, rid := SessionID("s_1"), RunID("r_1")
@@ -839,10 +841,10 @@ func TestEndRunErrorKeepsLogUntouched(t *testing.T) {
 		t.Error("runs 行应为 error + finished_at + lease_until NULL（放闸）")
 	}
 	if got := s.count(t, &RunlogEntry{}, "session_id = ? AND role = 'assistant'", sid); got != 0 {
-		t.Errorf("assistant 行数 = %d, want 0（error 不定稿）", got)
+		t.Errorf("assistant 行数 = %d, want 0（失败且无产出 → 不写）", got)
 	}
 	if got := s.count(t, &RunModelMessage{}, "session_id = ?", sid); got != 1 {
-		t.Errorf("mh 行数 = %d, want 1（只留 user 半）", got)
+		t.Errorf("mh 行数 = %d, want 1（失败且无产出 → 只留 user 半）", got)
 	}
 	s.mustGone(t, ctx, keyRunepoch(rid))
 	last, _, exists, err := s.ReadFrames(ctx, rid, 2, 200)
@@ -1208,7 +1210,8 @@ func TestEndRunErrorWithStagedZeroWrite(t *testing.T) {
 	if n := s.count(t, &RunModelMessage{}, "session_id = ? AND seq = 0", sid); n != 0 {
 		t.Errorf("error 结局：seq0 摘要行 %d 行，want 0（零写入家族）", n)
 	}
-	// error 的 run2 只留 user 半（与「error run 只留 user 那半」同形）。
+	// run2 是「失败且无产出」那一档 → 只留 user 半（与改造前同形）；
+	// 「失败但有产出」那一档见 failtrace_test.go 的 TestEndRunErrorLeavesTrace。
 	if n := s.count(t, &RunModelMessage{}, "session_id = ? AND run_id = ?", sid, r2); n != 1 {
 		t.Errorf("run2 mh 行数 = %d, want 1（只 user 半）", n)
 	}

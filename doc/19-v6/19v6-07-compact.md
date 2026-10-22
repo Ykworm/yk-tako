@@ -78,8 +78,9 @@ defer EndRun（唯一出口）：complete → 同一笔 PG 事务
 
 ## §2 折叠算法（foldInput，compact.go）
 
-- **单位**：旧线「轮」= v6 run。「已完成」= 非当前 run 的行；**error run 只留 user 半（assistant
-  半本就不存在——§4 零写入家族），照压**。
+- **单位**：旧线「轮」= v6 run。「已完成」= 非当前 run 的行；**error run 若无产出只留 user 半（assistant
+  半本就不存在——§4 零写入家族），照压**；失败留痕后 error run 可能有 assistant/tool 行，**它们照压**
+  （可见集只增不减这条不变）。
 - **分组**：mh 全序按 (run_id, seq) 分组；当前 run 行原样跟尾（tail），不进 keep/drop 划分；
   seq=0 行 = 旧摘要（重压时并入，见下）。
 - **n 降序循环**（doc/12 §9）：keep = 最近 n 个已完成 run（n 从 20 起，实现内常量），drop =

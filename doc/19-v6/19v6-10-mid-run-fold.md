@@ -170,7 +170,8 @@ After 循环被跳过）——超窗场景恰恰是这次调用会被 provider �
 - 闸在 PG 唯一索引上：run 活着期间，别的副本对这个会话的一切写入 409；没有任何 API
   在 run 中途读 mh（frames 读 Redis，log 读 runlog，session 读 runs 表）；
 - 进程死（kill -9）：turn 本来就蒸发，折叠跟着一起蒸发——mh 原样，下轮 Run fold 从
-  原文重压，零写入家族原样成立；
+  原文重压，零写入家族原样成立（闸失/进程死；「失败且无产出」的 error 同理——失败留痕只让
+**有产出**的 error 落已产出的内容，不改 staged 的落库条件）；
 - error 结局：staged 被 complete 分支条件丢弃（现状如此），mid-run 折过的痕迹全在
   内存，随 run 死光。「error 只留 user 半」的可见集语义不动。
 
