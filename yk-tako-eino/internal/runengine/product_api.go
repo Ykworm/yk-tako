@@ -116,8 +116,8 @@ type workspaceListData struct {
 	Workspaces []workspaceBody `json:"workspaces"`
 }
 
-// listWorkspaces 默认只列当前用户在 active tenant 里创建的项目。
-// ?scope=tenant 列本租户里 visibility=tenant 的项目。其他 scope 仍走默认。
+// listWorkspaces 只列当前用户在 active tenant 里创建的项目。
+// 2026-10-22（doc/42）：`?scope=tenant` 退役——跨成员共享项目取消，它现在与不传同形。
 func (s *Server) listWorkspaces(c *gin.Context) {
 	p, ok := s.requirePrincipal(c)
 	if !ok {
@@ -159,41 +159,14 @@ func (s *Server) patchWorkspace(c *gin.Context) {
 	writeEnvelope(c, http.StatusOK, codeOK, "", workspaceData{Workspace: toWorkspaceBody(row, p.UserID)})
 }
 
-// patchWorkspaceVisibility 只让创建者把项目改成 private 或 tenant。
-// 不塞进改名的 PATCH，避免一个 body 同时表示两件事。
+// patchWorkspaceVisibility 已退役（2026-10-22，doc/42 形态收窄）：跨成员共享项目取消，
+// 项目可见性恒为 private，没有「改成 tenant」这件事了。
+//
+// **端点留着但恒回 404**（与「目标不存在」同形，code 114001）——不直接摘掉路由：摘掉会让
+// gin's 默认 404 接手，那是一段 HTML/裸 JSON，前端的信封拆包器接不住（doc/40 的拦截器
+// 靠 code 分支）。留着恒 404 → 客户端拿到的仍是合规信封。
 func (s *Server) patchWorkspaceVisibility(c *gin.Context) {
-	p, ok := s.requirePrincipal(c)
-	if !ok {
-		return
-	}
-	var req struct {
-		Visibility *string `json:"visibility"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
-		return
-	}
-	if req.Visibility == nil || (*req.Visibility != "private" && *req.Visibility != "tenant") {
-		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "可见性只能是 private 或 tenant", nil)
-		return
-	}
-	err := s.store.SetWorkspaceVisibility(c.Request.Context(), p.TenantID, p.UserID, c.Param("id"), *req.Visibility)
-	if errors.Is(err, ErrBadVisibility) {
-		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "可见性只能是 private 或 tenant", nil)
-		return
-	}
-	if errors.Is(err, ErrWorkspaceNotFound) {
-		writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
-		return
-	}
-	if err != nil {
-		log.Printf("PATCH /api/workspaces/%s/visibility: %v", c.Param("id"), err)
-		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
-		return
-	}
-	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
-		Visibility string `json:"visibility"`
-	}{Visibility: *req.Visibility})
+	writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
 }
 
 // deleteWorkspace 删创建者自己的项目，并软删挂在上面的会话。

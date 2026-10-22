@@ -133,7 +133,8 @@ func TestContractBusinessCodes(t *testing.T) {
 		{"不可续跑", codeNotResumable, 112102},
 		{"续跑次数用尽", codeResumeExhausted, 112104},
 		{"找不到项目", codeWorkspaceMissing, 114001},
-		{"项目正忙", codeWorkspaceBusy, 114004},
+		// 114004「项目正忙」已退役（2026-10-22，项目闸随跨成员共享项目一起取消，doc/42）——
+		// 同项目并发不再被拒，改由文件级防护兜（flock + 写前指纹比对）。
 		{"默认项目不能删", codeWorkspaceDefault, 114005},
 		{"活 run 不能删", codeSessionBusy, 114007},
 		{"内部错误", codeInternal, 111901},

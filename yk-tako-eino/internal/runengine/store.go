@@ -249,10 +249,11 @@ func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID
 				sessionID, runID).Scan(&n).Error; qerr != nil {
 				return qerr
 			}
-			if n > 0 || runWorkspace == nil {
-				return errGateBusy
-			}
-			return errProjectBusy
+			// 项目闸已退役（2026-10-22，doc/42）：`one_live_run_per_workspace` 索引已删，
+			// 这里只保留**兜底**——多副本滚动升级期间，老副本可能还在往那个已删的索引上插
+			// （或新代码先上、索引后删），撞了就回「忙」而不是 500。
+			// 索引删干净后，这条分支永远不会触发。
+			return errGateBusy
 		}
 		if err := tx.Exec(
 			`INSERT INTO run_model_messages (id, session_id, run_id, seq, role, text, compacted, created_at)

@@ -164,7 +164,8 @@ const (
 	// 114002 退役。删除项目不再因为「还有会话」拒绝。码位留着，没有任何路径返回它。
 	codeWorkspaceNotEmpty     = 114002
 	codeWorkspaceNameRequired = 114003
-	codeWorkspaceBusy         = 114004
+	// codeWorkspaceBusy（114004「项目正在另一场会话里运行」）已退役：2026-10-22 项目闸
+	// 随跨成员共享项目一起取消（doc/42）。同名项目并发不再被拒——改由文件级防护兜。
 	codeWorkspaceDefault      = 114005
 	codeWorkspaceBusyLive     = 114006
 	codeSessionBusy           = 114007

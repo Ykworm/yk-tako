@@ -53,9 +53,10 @@ type Run struct {
 	LeaseEpoch int64     `gorm:"not null;default:1"`
 	CreatedAt  time.Time `gorm:"not null"`
 	FinishedAt *time.Time
-	// WorkspaceID 是这场 run 要写的项目。空 = 游离会话，不进项目闸。
-	// 活行上的部分唯一索引 one_live_run_per_workspace 保证同一项目同时只有一场 running。
-	// 终态行留着这一列，靠 status 退出索引，下一场才能再抢。
+	// WorkspaceID 是这场 run 要写的项目。2026-10-22 起不再有「空 = 游离会话」：
+	// 每场会话都挂一个项目（没指定就用该成员的默认项目），产出落项目目录。
+	// 原「活行上的部分唯一索引 one_live_run_per_workspace 保证同一项目同时只有一场 running」
+	// 已随项目闸退役而删除（doc/42）。
 	WorkspaceID *string
 }
 
@@ -178,37 +179,41 @@ func (s *Store) CreateWorkspace(ctx context.Context, tenantID, userID, name stri
 // ErrWorkspaceNotFound 表示这行不存在，或当前用户看不见。两种情况对调用方一样。
 var ErrWorkspaceNotFound = errors.New("workspace not found")
 
-// ListWorkspaces：scope 为 tenant 时返回本租户里 visibility=tenant 的项目，含自己共享出去的。
-// 其他 scope 只返回这个用户在当前 tenant 下创建的项目。两种都按创建时间再按 id。
+// ListWorkspaces：只返回这个用户在当前 tenant 下创建的项目，按创建时间再按 id。
+//
+// 2026-10-22（doc/42 形态收窄）：跨成员共享项目退役 → **scope 参数不再有任何作用**
+// （`?scope=tenant` 曾经列全租户可见的项目，现在与不传同形）。参数保留是为了不打断
+// 已在用这个 query 的客户端；它已退役，不是「无效但静默」的新坑。
 func (s *Store) ListWorkspaces(ctx context.Context, tenantID, userID, scope string) ([]Workspace, error) {
-	q := s.db.WithContext(ctx).Where("tenant_id = ?", tenantID)
-	if scope == "tenant" {
-		q = q.Where("visibility = ?", "tenant")
-	} else {
-		q = q.Where("user_id = ?", userID)
-	}
+	q := s.db.WithContext(ctx).Where("tenant_id = ?", tenantID).Where("user_id = ?", userID)
 	var rows []Workspace
 	err := q.Order("created_at, id").Find(&rows).Error
 	return rows, err
 }
 
-// SetWorkspaceVisibility 只改创建者自己的项目。对不上就当没有这个项目。
-// visibility 只接受 private 与 tenant。
-func (s *Store) SetWorkspaceVisibility(ctx context.Context, tenantID, userID, id, visibility string) error {
-	if visibility != "private" && visibility != "tenant" {
-		return ErrBadVisibility
-	}
-	res := s.db.WithContext(ctx).Model(&Workspace{}).
-		Where("id = ? AND tenant_id = ? AND user_id = ?", id, tenantID, userID).
-		Update("visibility", visibility)
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return ErrWorkspaceNotFound
-	}
-	return nil
-}
+// SetWorkspaceVisibility 已退役（2026-10-22，doc/42 形态收窄）：跨成员共享项目取消，
+// 项目可见性恒为 private（`visibility` 列保留但不写别的值，见 pgstore.go 的 Workspace）。
+// 端点 `PATCH /api/workspaces/:id/visibility` 同批退役（回 404，与「目标不存在」同形）。
+//
+// 原实现留档：
+//
+//	SetWorkspaceVisibility 只改创建者自己的项目。对不上就当没有这个项目。
+//	visibility 只接受 private 与 tenant。
+//	func (s *Store) SetWorkspaceVisibility(ctx context.Context, tenantID, userID, id, visibility string) error {
+//		if visibility != "private" && visibility != "tenant" {
+//			return ErrBadVisibility
+//		}
+//		res := s.db.WithContext(ctx).Model(&Workspace{}).
+//			Where("id = ? AND tenant_id = ? AND user_id = ?", id, tenantID, userID).
+//			Update("visibility", visibility)
+//		if res.Error != nil {
+//			return res.Error
+//		}
+//		if res.RowsAffected == 0 {
+//			return ErrWorkspaceNotFound
+//		}
+//		return nil
+//	}
 
 // RenameWorkspace 只改创建者自己的那一行。对不上就当没有这个项目。
 func (s *Store) RenameWorkspace(ctx context.Context, tenantID, userID, id, name string) (Workspace, error) {
@@ -243,13 +248,15 @@ var ErrWorkspaceDefault = errors.New("default workspace")
 // lockOwnedWorkspace 锁住创建者自己的项目行。删除和 PATCH 挪进仍走这把锁。
 // 新建会话改走 lockVisibleWorkspace：同租户里 visibility=tenant 的项目，成员也能挂上新会话。
 func lockOwnedWorkspace(tx *gorm.DB, id, tenantID, userID string) error {
-	return lockWorkspace(tx, id, tenantID, userID, false)
+	return lockWorkspace(tx, id, tenantID, userID)
 }
 
 // lockVisibleWorkspace 锁住当前用户看得见的项目行：创建者自己的，或本租户 visibility=tenant 的。
 // 新建会话写入 workspace_id 之前拿这把锁，和删除排队。
+// lockVisibleWorkspace 与 lockOwnedWorkspace 现在同形（跨成员共享项目已退役，doc/42）——
+// 保留这个名字是因为调用点的语义是「看一眼这个项目在不在我名下」，不是「可见即可」。
 func lockVisibleWorkspace(tx *gorm.DB, id, tenantID, userID string) error {
-	return lockWorkspace(tx, id, tenantID, userID, true)
+	return lockWorkspace(tx, id, tenantID, userID)
 }
 
 // seeVisibleWorkspace 在已经锁着会话行的事务里再看一次项目。不加 FOR UPDATE：
@@ -258,8 +265,9 @@ func seeVisibleWorkspace(tx *gorm.DB, id, tenantID, userID string) error {
 	var rows []struct {
 		ID string
 	}
+	// 2026-10-22（doc/42）：跨成员共享项目退役 → 只认属主（`visibility='tenant'` 分支已删）。
 	err := tx.Raw(
-		`SELECT id FROM workspaces WHERE id = ? AND tenant_id = ? AND (user_id = ? OR visibility = 'tenant')`,
+		`SELECT id FROM workspaces WHERE id = ? AND tenant_id = ? AND user_id = ?`,
 		id, tenantID, userID).Scan(&rows).Error
 	if err != nil {
 		return err
@@ -284,16 +292,15 @@ func workspaceOwned(db *gorm.DB, id, tenantID, userID string) (bool, error) {
 	return len(rows) > 0, nil
 }
 
-func lockWorkspace(tx *gorm.DB, id, tenantID, userID string, visible bool) error {
+// lockWorkspace 锁项目行（FOR UPDATE）。2026-10-22（doc/42）：跨成员共享项目退役 →
+// 只认属主，原来的「visible」变体（带 `OR visibility='tenant'`）已删。
+func lockWorkspace(tx *gorm.DB, id, tenantID, userID string) error {
 	var rows []struct {
 		ID string
 	}
-	q := `SELECT id FROM workspaces WHERE id = ? AND tenant_id = ? AND user_id = ? FOR UPDATE`
-	args := []any{id, tenantID, userID}
-	if visible {
-		q = `SELECT id FROM workspaces WHERE id = ? AND tenant_id = ? AND (user_id = ? OR visibility = 'tenant') FOR UPDATE`
-	}
-	err := tx.Raw(q, args...).Scan(&rows).Error
+	err := tx.Raw(
+		`SELECT id FROM workspaces WHERE id = ? AND tenant_id = ? AND user_id = ? FOR UPDATE`,
+		id, tenantID, userID).Scan(&rows).Error
 	if err != nil {
 		return err
 	}
@@ -407,8 +414,9 @@ func (s *Store) DeleteSession(ctx context.Context, tenantID, userID string, id S
 // 对不上与不存在相同。跨租户看不见。
 func (s *Store) VisibleWorkspace(ctx context.Context, id, tenantID, userID string) (Workspace, error) {
 	var row Workspace
+	// 2026-10-22（doc/42）：跨成员共享项目退役 → 只认属主。
 	err := s.db.WithContext(ctx).
-		Where("id = ? AND tenant_id = ? AND (user_id = ? OR visibility = ?)", id, tenantID, userID, "tenant").
+		Where("id = ? AND tenant_id = ? AND user_id = ?", id, tenantID, userID).
 		Take(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return Workspace{}, ErrWorkspaceNotFound
@@ -508,12 +516,14 @@ ON memory_items (tenant_id, user_id, workspace, kind, content)
 WHERE kind <> 'episode'`).Error; err != nil {
 		return err
 	}
-	// 活行的 status 值是 running。写成 live 的话，索引里一行都不会有，闸等于没装。
-	if err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS one_live_run_per_workspace
-ON runs (workspace_id)
-WHERE workspace_id IS NOT NULL AND status = 'running'`).Error; err != nil {
-		return err
-	}
+	// 项目闸退役（2026-10-22，doc/42 形态收窄）：「同一项目同时只跑一场」这道整层排队取消
+	// ——项目变成个人的之后，它挡的「两个员工互相删产物」场景不存在了；跨用户同时改同一个文件
+	// 改由**文件级**防护兜（flock 写锁 + 写前指纹比对，见 filefp.go）。
+	// 原索引 `one_live_run_per_workspace` 在此 DROP（幂等，每次启动跑一遍）。
+	//
+	// 为什么 DROP 而不是留着：留着它就会**继续**挡「同一项目两场并发」——那正是形态收窄要放开的
+	//（团队里一人起长跑，别人在自己的会话里投消息会被 409 挡）。
+	_ = db.Exec(`DROP INDEX IF EXISTS one_live_run_per_workspace`).Error
 	// 会话列表按 tenant_id + user_id 查还活着的行。软删行不进这支索引。
 	if err := db.Exec(`CREATE INDEX IF NOT EXISTS sessions_owner_alive
 ON sessions (tenant_id, user_id)

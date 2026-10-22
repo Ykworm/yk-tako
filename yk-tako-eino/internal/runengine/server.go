@@ -266,15 +266,25 @@ func (s *Server) postRuns(c *gin.Context) {
 	// 已有会话即使带了合法的 workspaceId，AcquireRun 也不改 workspace_id。
 	// 已经挂上的项目被收回时，AcquireRun 按会话行上的列再看一次，这一发也不建 run。
 	workspaceID := strings.TrimSpace(req.WorkspaceID)
-	if workspaceID != "" {
-		if _, err := s.store.VisibleWorkspace(ctx, workspaceID, p.TenantID, p.UserID); err != nil {
-			if errors.Is(err, ErrWorkspaceNotFound) {
-				writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
-				return
-			}
-			internal(c, err)
+	if workspaceID == "" {
+		// 形态收窄（2026-10-22，doc/42）：**不再有「游离会话」**——每场会话都挂一个项目，
+		// 没指定就用该成员的默认项目（没有就当场建，doc/35 §0 第 6 条）。
+		// 为什么必须挂：产出文件落项目目录、会话目录只放会话自己的档案（子代理 wire / .media）
+		// → 删会话不再留孤儿文件（原来的孤儿是「产出留在会话目录里」造成的）。
+		ws, werr := s.store.EnsureDefaultWorkspace(ctx, p.TenantID, p.UserID)
+		if werr != nil {
+			internal(c, werr)
 			return
 		}
+		workspaceID = ws.ID
+	}
+	if _, err := s.store.VisibleWorkspace(ctx, workspaceID, p.TenantID, p.UserID); err != nil {
+		if errors.Is(err, ErrWorkspaceNotFound) {
+			writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
+			return
+		}
+		internal(c, err)
+		return
 	}
 	// 归属预检在 AdmitText / 落盘之前：别人用超长 text 或坏图不能靠 413/400 探到会话是否存在。
 	var bound Session
@@ -293,6 +303,14 @@ func (s *Server) postRuns(c *gin.Context) {
 		if kind != accessOwner {
 			writeEnvelope(c, http.StatusForbidden, codeNotOwner, "只有本人能修改", nil)
 			return
+		}
+		// 存量游离会话归位（2026-10-22，doc/42）：改造前建的会话 workspace_id 为空 →
+		// 它的产出仍落会话目录（删会话会留孤儿文件）。本场 run 把它挂到默认项目，之后
+		// 产出就落项目目录了（会话目录只剩会话自己的档案）。
+		if bound.WorkspaceID == nil || *bound.WorkspaceID == "" {
+			if err := s.store.SetSessionWorkspace(ctx, sessionID, p, workspaceID); err != nil {
+				log.Printf("attach default workspace %s: %v", sessionID, err)
+			}
 		}
 	}
 	// 本场要用的助手：请求里的 agentId 优先；没带就沿用会话上已经记下的。
@@ -416,10 +434,7 @@ func (s *Server) postRuns(c *gin.Context) {
 		writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
 		return
 	}
-	if errors.Is(err, errProjectBusy) {
-		writeEnvelope(c, http.StatusConflict, codeWorkspaceBusy, "项目正在另一场会话里运行", nil)
-		return
-	}
+	// errProjectBusy（项目忙 409）已随项目闸退役（doc/42，2026-10-22）——同项目并发不再被拒。
 	if err != nil {
 		internal(c, err)
 		return
