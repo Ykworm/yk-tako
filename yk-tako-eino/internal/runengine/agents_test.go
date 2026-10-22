@@ -588,3 +588,91 @@ func TestDelegationRedisSkipsProcessSem(t *testing.T) {
 		t.Fatalf("租户槽应放行、进程 sem 不应挡住，得到 out=%q err=%v calls=%d", out, err, inner.calls)
 	}
 }
+
+
+// TestSubagentShellLoadsAndRuns 钉壳化（doc/25 §7 翻案，2026-10-23）的装载-调用全链：
+// BeforeAgent 只产壳不起实例（内层 = *subagentShell）；Info 静态可用、不碰模型/解析器
+// （声明字节在装载点定稿，钉「观测面与拒载时机维持 run 级」）；真调 InvokableRun 时
+// 壳在调用点装配实例并跑通子代理循环（stubChatModel 回终稿）；同一壳连调两次都通
+// （每次调用重新装配，壳可复用）。
+func TestSubagentShellLoadsAndRuns(t *testing.T) {
+	dir := t.TempDir()
+	writeSpec(t, dir, "a_rich.md", "---\nname: rich\ndescription: 富代理\ntools: []\nmodel: gpt-x\n---\nRICH 人设\n")
+
+	sub := &stubChatModel{genMsg: schema.AssistantMessage("子代理报告", nil)}
+	resolver := &fakeResolver{
+		ok: map[string]ModelInstance{"gpt-x": {Chat: sub, Ref: "prov/gpt-x", Protocol: "openai"}},
+	}
+	gt, err := newGetTimeTool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newAgentSpecHandler(dir, newTestStore(t, time.Minute, time.Minute), t.TempDir(), &fakeModel{}, "main/ref", claudeChunkText, resolver, make(chan struct{}, 8), 51200,
+		fakeCounter{f: func(string) int { return 0 }}, 0, 0, nil, nil, subagentArchiveTTL)
+
+	ctx := withAgentModelTable(context.Background(), newAgentModelTable("main/ref", claudeChunkText))
+	runCtx := &adk.ChatModelAgentContext{Tools: []tool.BaseTool{gt}}
+	if _, _, err := h.BeforeAgent(ctx, runCtx); err != nil {
+		t.Fatalf("BeforeAgent 不返回错误: %v", err)
+	}
+
+	var dt *delegationTool
+	for _, tl := range runCtx.Tools {
+		if d, ok := tl.(*delegationTool); ok && d.name == "rich" {
+			dt = d
+		}
+	}
+	if dt == nil {
+		t.Fatal("池里应有 rich 委派工具")
+	}
+	if _, ok := dt.inner.(*subagentShell); !ok {
+		t.Fatalf("委派内层应是 *subagentShell（壳化），实得 %T", dt.inner)
+	}
+
+	// Info 静态：连调两次，解析器调用次数停在装载期的一次（Info 不再触发解析/装配）。
+	for i := 0; i < 2; i++ {
+		info, err := dt.Info(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Name != "rich" || info.Desc != "富代理" {
+			t.Fatalf("Info = %q %q", info.Name, info.Desc)
+		}
+		js, err := info.ParamsOneOf.ToJSONSchema()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if js == nil || js.Properties == nil {
+			t.Fatalf("静态声明应带参数 schema（对齐 eino defaultAgentToolParam）: %#v", js)
+		}
+		prop, ok := js.Properties.Get("request")
+		if !ok || prop.Type != string(schema.String) {
+			t.Fatalf("声明里应有 string request 参数: %#v", prop)
+		}
+		required := false
+		for _, r := range js.Required {
+			if r == "request" {
+				required = true
+			}
+		}
+		if !required {
+			t.Fatalf("request 应为必填: %v", js.Required)
+		}
+	}
+	if !reflect.DeepEqual(resolver.calls, []string{"gpt-x"}) {
+		t.Fatalf("Info 不得触发解析，resolver 调用 = %v", resolver.calls)
+	}
+
+	// 真调：壳在调用点装配实例并跑通子代理循环；连调两次（每次重新装配，壳可复用）。
+	// 注：「每次委派一份实例」是结构性质（dt.inner 是壳、装配在 InvokableRun 内），
+	// 顺序调用下两种形态行为相同，无可观测差异——竞态面由 doc/25 §6 登记，不在此钉。
+	for i := 0; i < 2; i++ {
+		out, err := dt.InvokableRun(ctx, `{"request":"查一下"}`)
+		if err != nil {
+			t.Fatalf("第 %d 次委派应跑通: %v", i+1, err)
+		}
+		if !strings.Contains(out, "子代理报告") {
+			t.Fatalf("第 %d 次委派回传应含终稿，实得 %q", i+1, out)
+		}
+	}
+}

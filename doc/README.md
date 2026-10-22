@@ -60,7 +60,7 @@
 | 22 | [网络搜索](22-网络搜索.md) | ✅ | `websearch.go`、`websearch_test.go` | 已切 DeepSeek `/v1/tools/search`；结果始终落盘再给描述段 |
 | 23 | [coder 规格](23-coder规格.md) | ✅ | `agents/coder.md`、`agents.go` | §2 已逐字落盘；`tools:` 白名单挡 `search_history`／`web_search` |
 | 24 | [用量账单、滤思考与折叠触发](24-用量计数.md) | ✅ | `compact.go`、`agentlog.go`、`worker.go` | 计数、滤思考、Usage mid-run 触发 |
-| 25 | [子代理进程内折叠](25-子代理折叠.md) | ✅ | `midfold.go`、`agentfold_test.go` | 取代 doc/17 §6；A1–A3 已验收 |
+| 25 | [子代理进程内折叠](25-子代理折叠.md) | ✅ | `midfold.go`、`agentfold_test.go`、`agents.go`（壳化装配） | 取代 doc/17 §6；A1–A3 已验收；2026-10-23 翻案落地壳化装配（per-delegation 重装的壳化变体：装载输入/观测面 run 级不动，实例每次委派新建，#1177 委派路径消除） |
 | 26 | [researcher 的工具护栏](26-researcher工具护栏.md) | ✅ | `agents.go`、`agents/researcher.md`、`agents/coder.md` | `exclude_tools` 四态；排除清单只剩 `bash` |
 | 27 | [用量可见化](27-用量可见.md) | ✅ | `product_api.go`、`server.go`、`worker.go`、`web/src/` | usage 帧／页面阈值／runlog 历史行 |
 | 28 | [多租户运行时](28-多租户.md) | ✅ | `auth.go`、`identity_store.go`、`members_store.go`、`tenant_api.go`、`scope.go`、`pgstore.go` | 2026-10-21 收口。A0–A6 共 30 拍已落地并 curl 验收，随 `9c21b66` 入库。团队前端不在本篇（doc/36 已落地）；A7 那一档里「旧成功体换信封」已由 [doc/40](40-响应信封统一.md) 于 2026-10-22 落地，**计费、API key、SSO、组织共享、审计导出整批已拍不做**（2026-10-22 用户裁，与运行时关系不大的商业化、合规项，§15；2026-10-23 复核维持） |

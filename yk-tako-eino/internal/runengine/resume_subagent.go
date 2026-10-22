@@ -14,7 +14,6 @@ import (
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/components/tool/utils"
-	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 )
 
@@ -157,26 +156,10 @@ func (h *agentSpecHandler) buildResumeAgent(ctx context.Context, spec AgentSpec,
 	if table := agentModelTableFrom(ctx); table != nil {
 		table.set(spec.Name, entry)
 	}
-	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
-		Name:          spec.Name,
-		Description:   spec.Description,
-		Instruction:   spec.Prompt + "\n\n" + asm.snap,
-		Model:         subModel,
-		MaxIterations: agentMaxIterations,
-		ToolsConfig:   adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: pool}},
-		Handlers:      h.subagentHandlers(spec.Name, specWantsToolSearch(spec)),
-		GenModelInput: func(context.Context, string, *adk.AgentInput) ([]*schema.Message, error) {
+	return h.assembleSubagentTool(ctx, spec, subModel, pool, spec.Prompt+"\n\n"+asm.snap, specWantsToolSearch(spec),
+		func(context.Context, string, *adk.AgentInput) ([]*schema.Message, error) {
 			return resumeModelInput(history, instruction)
-		},
-	})
-	if err != nil {
-		return nil, "错误：子代理 " + spec.Name + " 当前无法装配：" + err.Error()
-	}
-	inner, ok := adk.NewAgentTool(ctx, agent).(tool.InvokableTool)
-	if !ok {
-		return nil, "错误：子代理 " + spec.Name + " 当前无法装配：内层不可调用"
-	}
-	return inner, ""
+		})
 }
 
 // resumeModelInput 是 resume 喂给模型的整表：档案消息原样在前，新指令作最后一条 user。

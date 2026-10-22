@@ -2,9 +2,11 @@
 // （YAML frontmatter 四字段 + 正文 = system prompt）。
 //
 // 装载时点 = run 起手的扫盘（BeforeAgent 每 Run 调一次）：改文件 → 下一条消息生效；run 中途不变。
-// 装载路线 = BeforeAgent 换列表（不重建主 agent）：handler 把每条规格装配成 ChatModelAgent、
-// 包成 adk.NewAgentTool 后 append 进 runCtx.Tools；ADK 随后把该列表重建进 toolInfos
-// （声明面 model.WithTools）与 toolsNodeConf（执行面 WithToolList）——两处都按本次调用生效。
+// 装载路线 = BeforeAgent 换列表（不重建主 agent）：handler 逐条规格解析装配输入（工具池 / 模型 /
+// 快照段）缓存进 subagentShell（静态壳，Info 直接给声明）后 append 进 runCtx.Tools；ADK 随后把
+// 该列表重建进 toolInfos（声明面 model.WithTools）与 toolsNodeConf（执行面 WithToolList）。
+// eino 实例（NewChatModelAgent）不在起手建：模型真正调用委派时才装配、每次委派新建即弃
+// （动机与语义见 subagentShell 注释——#1177 保险，装载/观测面全部维持 run 级）。
 // runCtx.Tools 每 run 从冻结基座克隆（chatmodel.go applyBeforeAgent），append 不跨 run 累积。
 //
 // T3-1b：model: 行按 ref 生效（19v6-05 §4 三种写法）——不写 / default|inherit|继承 = 继承主实例，
@@ -241,7 +243,8 @@ func agentModelTableFrom(ctx context.Context) *agentModelTable {
 	return t
 }
 
-// agentSpecHandler 是装载 handler：BeforeAgent 每 Run 扫一次盘，把规格装配成委派工具追加进 runCtx.Tools。
+// agentSpecHandler 是装载 handler：BeforeAgent 每 Run 扫一次盘，把规格的装配输入解析进壳
+// （subagentShell，实例推迟到每次委派）追加进 runCtx.Tools。
 // 入口快照 base = runCtx.Tools：此刻池里只有基座工具（本 handler 是唯一往池里加委派工具的），
 // 子代理继承父池时取它 = 天然禁嵌套。
 // T3-3 起委派工具出池前过 delegationTool 包壳（并发闸 + 回传裁剪）——sem/returnCap 由 NewWorker 造好注入。
@@ -283,8 +286,79 @@ func newAgentSpecHandler(dir string, store *Store, workspace string, m model.Bas
 		archiveTTL: archiveTTL}
 }
 
+// subagentShell 是委派工具的静态壳（doc/25 §7 翻案，2026-10-23 拍板落地）：run 起手只缓存
+// 装配输入（规格 / 工具池 / 模型 / 快照段），不建 eino 实例；模型真正调用时（InvokableRun）
+// 才 NewChatModelAgent + NewAgentTool，跑完即弃。装载时点、run 内冻结、拒载时机、
+// agent tools / agent system 观测面全部维持 run 级不动；变的是实例生命周期——每场委派一份
+// 实例 ⇒ 实例级共享可写状态（msgConf.cancelCtx，上游 #1177）不跨委派存活，将来启用 adk 取消
+// 作用域也没有并发同名委派的写字竞态。形态照 resume 的 buildResumeAgent（resume_subagent.go）：
+// 调用点装配的先例已在库里（resume 因 GenModelInput 按调用参数化而被迫如此，普通委派这里
+// 是主动选择——两者共用 assembleSubagentTool 一个装配核）。
+type subagentShell struct {
+	h           *agentSpecHandler   // 装配工厂：handler 链 / 折叠链 / 模型从它拿
+	spec        AgentSpec           // 规格原文（Name / Description / Prompt）
+	pool        []tool.BaseTool     // run 起手定死的工具池（入口快照解析产物，run 内冻结）
+	subModel    model.BaseChatModel // run 起手解析的模型
+	instruction string              // = spec.Prompt + "\n\n" + 快照段（run 内冻结）
+	wantSearch  bool                // 规格显式要 tool_search 才挂目录分级（2026-10-20 拍）
+	toolInfo    *schema.ToolInfo    // 静态工具声明：壳不建实例，Info 不再从实例取
+}
+
+// subagentShellRequestParams 复刻 eino 的 defaultAgentToolParam（agent_tool.go 私有，壳的
+// Info 不经过实例，得自己给）：委派工具唯一入参 = 必填 string request。形状漂移会改模型可见
+// 的声明字节（活体验收的契约面），改它要跟 eino 版本对一遍。
+func subagentShellRequestParams() *schema.ParamsOneOf {
+	return schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+		"request": {Desc: "request to be processed", Required: true, Type: schema.String},
+	})
+}
+
+func (s *subagentShell) Info(context.Context) (*schema.ToolInfo, error) { return s.toolInfo, nil }
+
+// InvokableRun：调用点装配（每次委派新实例）→ 内层照跑。装配失败回错误文本（与 resume 同政策），
+// 壳在 delegationTool/runSubagentGuarded 内层，占闸、开档案、回传裁剪都在更外层，语义不变。
+// opts 原样透传：EmitInternalEvents 的子代理事件转发与 cancel 派生都走 opts（delegationTool 注释）。
+func (s *subagentShell) InvokableRun(ctx context.Context, args string, opts ...tool.Option) (string, error) {
+	inner, errText := s.h.assembleSubagentTool(ctx, s.spec, s.subModel, s.pool, s.instruction, s.wantSearch, nil)
+	if errText != "" {
+		return errText, nil
+	}
+	return inner.InvokableRun(ctx, args, opts...)
+}
+
+// assembleSubagentTool 拿解析好的装配输入造一场委派用的子代理实例并包成可调用工具，
+// 壳（每次委派）与 resume（每次续跑）共用这一个装配核。genInput 非 nil = resume 形态
+// （档案历史 + 新指令作模型输入）；nil = 默认模型输入。失败回 (nil, 错误文本)——
+// 调用方这时还没占闸、也还没开档案。
+func (h *agentSpecHandler) assembleSubagentTool(ctx context.Context, spec AgentSpec, subModel model.BaseChatModel, pool []tool.BaseTool, instruction string, wantSearch bool, genInput adk.GenModelInput) (tool.InvokableTool, string) {
+	cfg := &adk.ChatModelAgentConfig{
+		Name:          spec.Name,
+		Description:   spec.Description,
+		Instruction:   instruction,
+		Model:         subModel,
+		// 子代理与主代理同一条上限（agentMaxIterations，2026-10-16 用户裁定放开到 50）。
+		MaxIterations: agentMaxIterations,
+		ToolsConfig:   adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: pool}},
+		// handler 每次调用新造（callerStamp / toolSearch / wireAppend / fold 链上均无
+		// per-delegation 字段——2026-10-16 禁令二，新造无副作用）。
+		Handlers: h.subagentHandlers(spec.Name, wantSearch),
+	}
+	if genInput != nil {
+		cfg.GenModelInput = genInput
+	}
+	agent, err := adk.NewChatModelAgent(ctx, cfg)
+	if err != nil {
+		return nil, "错误：子代理 " + spec.Name + " 当前无法装配：" + err.Error()
+	}
+	inner, ok := adk.NewAgentTool(ctx, agent).(tool.InvokableTool)
+	if !ok {
+		return nil, "错误：子代理 " + spec.Name + " 当前无法装配：内层不可调用"
+	}
+	return inner, ""
+}
+
 // delegationTool 是委派工具的预算包壳（T3-3）：并发闸（sem）+ 回传裁剪（capBytes），
-// 套在 adk.NewAgentTool 的产物外面。它必须实现与 AgentTool 相同的调用面（Info + InvokableRun
+// 套在委派壳（subagentShell）外面。它必须实现与 AgentTool 相同的调用面（Info + InvokableRun
 // 带 opts），且把 ctx/args/opts 原样递给 inner——EmitInternalEvents 的子代理事件转发靠 opts 里
 // 携带的 event generator（eino v0.9.21 agent_tool.go 的 getEmitGeneratorAndEnableStreaming 从
 // opts 读它），扣下 opts 等于把子代理的帧全掐掉；cancel 派生（extractAndDeriveAgentToolCancelCtx）
@@ -473,39 +547,32 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 		// 每条规格一份完整目录/激活集，tool_search 只搜自己的池。继承档与 exclude_tools 档
 		// 不自动加（2026-10-20 已拍），其 MCP 工具照旧全部 direct 声明。
 		wantSearch := specWantsToolSearch(spec)
-		sub, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
-			Name:        spec.Name,
-			Description: spec.Description,
-			Instruction: instruction,
-			Model:       subModel,
-			// 子代理与主代理同一条上限（agentMaxIterations，2026-10-16 用户裁定放开到 50）——
-			// 同一类模型循环不用两套上限，子代理折叠（doc/17 §6）将来同样吃这个值。
-			MaxIterations: agentMaxIterations,
-			ToolsConfig:   adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: pool}},
-			// 调用方身份标记（doc/22 §4）：web_search 按它查 agentModelTable 取该子代理自己的
-			// 生效 ref——不挂标记工具只能报错，挂主 ref 会把子代理的搜索打错厂商。
-			Handlers: h.subagentHandlers(spec.Name, wantSearch),
-		})
-		if err != nil {
-			log.Printf("agents: %s: 拒载: 子代理装配失败: %v", spec.Name, err)
-			continue
-		}
 		// 装载观测面（doc/26 §6）：这条规格这一场**实际**拿到的有效名单。exclude_tools 形状下规格
 		// 文件里只写着例外，实际名单是「父池减去排除项」算出来的、父池一变就变——没这行，想知道某条
 		// 子代理能干什么只能人脑跑一遍四态，护栏验收就退化成模型自觉（doc/21 §5 明写不靠模型自觉）。
-		// 放在装配成功之后 ⇒ 拒载的规格打不出这行，日志里出现的名单都是真生效的；一行明细排在
-		// 下面那段多行 system dump 之前，grep "agent tools" 直接出逐条名单。
+		// 壳只缓存装配输入，不再起实例 ⇒ 不存在「装配成功才打日志」的先后关系，拒载只有解析面
+		// （坏池/坏模型）一种；NewChatModelAgent 的失败面移到调用点（错误文本，见 subagentShell）。
 		_, toolNames := poolIndex(ctx, pool)
 		if wantSearch {
 			toolNames = append(toolNames, toolSearchToolName) // handler 在 BeforeAgent 末尾装入，排在池尾
 		}
 		log.Printf("agent tools %s: %s", spec.Name, strings.Join(toolNames, ", "))
 		// 子代理 system 全文日志（M5 观测面，转正点 planning §7）：装载时打拼接后 Instruction——
-		// 快照句在规格正文之后的活体证据就靠它。
+		// 快照句在规格正文之后的活体证据就靠它。instruction 在 run 起手冻结，调用点装配用的就是
+		// 这一份，日志与实跑一致。
 		log.Printf("agent system %s:\n%s", spec.Name, instruction)
-		// 委派工具出池前过预算包壳（T3-3）：并发闸 + 回传裁剪；Info/调用面透传，声明字节不变。
+		// 委派工具出池前过预算包壳（T3-3）：并发闸 + 回传裁剪；内层 = 壳（静态声明 + 调用点装配）。
 		runCtx.Tools = append(runCtx.Tools, &delegationTool{
-			inner: adk.NewAgentTool(ctx, sub), sem: h.sem, capBytes: h.returnCap, name: spec.Name, store: h.store,
+			inner: &subagentShell{
+				h: h, spec: spec, pool: pool, subModel: subModel,
+				instruction: instruction, wantSearch: wantSearch,
+				toolInfo: &schema.ToolInfo{
+					Name:        spec.Name,
+					Desc:        spec.Description,
+					ParamsOneOf: subagentShellRequestParams(),
+				},
+			},
+			sem: h.sem, capBytes: h.returnCap, name: spec.Name, store: h.store,
 		})
 		table.set(spec.Name, entry)
 		loaded = append(loaded, spec.Name)
