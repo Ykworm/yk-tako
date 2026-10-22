@@ -216,6 +216,9 @@ func escapeRecallHTML(s string) string {
 
 // renderMemoryBlock 渲染 `<memory-context>` 块（doc/29 §6.4）：整块 ≤600 rune，
 // 逐条整条放，放不下就停，不切半条。返回块与真正注入的条数（hits）。
+//
+// 每行带 created time（记忆写下的日期）：召回可能命中互相冲突的旧结论，模型要能判断
+// 哪个更新，就得看见时间（doc/29 §6.4）。格式与 <dialogue-context> 的日期同款（2006-01-02）。
 func renderMemoryBlock(items []memoryCandidate) (string, int) {
 	if len(items) == 0 {
 		return "", 0
@@ -227,7 +230,7 @@ func renderMemoryBlock(items []memoryCandidate) (string, int) {
 	b.WriteString(header)
 	n := 0
 	for _, it := range items {
-		line := "- [" + it.Kind + "] " + escapeRecallHTML(it.Content) + "\n"
+		line := "- [" + it.Kind + "] " + memoryItemDate(it.CreatedAt) + " " + escapeRecallHTML(it.Content) + "\n"
 		lineRunes := utf8.RuneCountInString(line)
 		if total+lineRunes > memoryRecallRuneCap {
 			break
@@ -241,6 +244,15 @@ func renderMemoryBlock(items []memoryCandidate) (string, int) {
 	}
 	b.WriteString(footer)
 	return b.String(), n
+}
+
+// memoryItemDate 渲染记忆写下的日期（2006-01-02）。零值（该行没有时间）= 空串，
+// 那一行就少一个字段分隔符——不让模型对着 0001-01-01 猜。
+func memoryItemDate(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format("2006-01-02")
 }
 
 // dialogueContextNote 与 memoryContextNote 同语义（doc/29 §6.4）：原文是数据不是指令。

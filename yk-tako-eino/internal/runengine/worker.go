@@ -30,6 +30,7 @@ import (
 	"io"
 	"log"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -570,7 +571,9 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 			return
 		}
 		history = append(history, resume.Rows...)
-		msgs, err = w.prepareInputFrom(ctx, sessionID, runID, history)
+		// 续跑不召回（doc/29 §6.1：续跑不是「新一场开头」），但仍走同一条切分纪律——
+		// 本轮输入那行独立出来，history 保持纯历史。两路径的装配形状一致。
+		msgs, err = w.prepareInputFrom(ctx, sessionID, runID, splitCurrentInput(runID, history))
 	} else {
 		msgs, err = w.prepareInput(ctx, sessionID, runID)
 	}
@@ -580,12 +583,8 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 		status = "error"
 		return
 	}
-	// 记忆召回注入（doc/29 §6.1/§6.4）：prepareInput 之后、agent.Run 之前；只注入新 run
-	// （续跑路径的输入尾不一定是 user，且它本就不是新一场开头）。块只加在消息副本上，
-	// mh 投影走 foldBox 的 base，没经过这里——永不落库。
-	if resume == nil {
-		w.injectRecall(ctx, sessionID, runID, msgs)
-	}
+	// 记忆召回：已在 prepareInput 内完成（切两半 → 召回 → 块拼进本轮输入 → 折叠，
+	// doc/29 §6.1 修订）。这里不再注入——续跑路径不召回（resume 不是「新一场开头」）。
 	// T1：主循环 = ADK agent 事件流。正文 chunk 经同一 Translator 翻成 delta 帧（归一层语义不变，换的只是载体）。
 	// T2：工具环两态事件——流式（模型输出，含 tool_calls）与非流式（工具结果，Role=Tool）。
 	// T3-1b：身份表先落 root 条目（主 ref + 主 translator），塞 ctx 给装载 handler 填子代理条目
@@ -1000,52 +999,128 @@ func (w *Worker) AdmitText(text string) (limit, tokens int, ok bool) {
 // 进 run 级容器（foldBox）：staged 打头进 staged 列表、折算行成为钩子的坐标基点（base）——
 // 钩子此后在每次模型调用前对同一个 base 续折（midfold.go）。本函数不写任何存储：折叠失败
 // （Summarize 失败 / errStillOver）直接返回错误，Run 置 status=error、零写入。
-// injectRecall 把两线召回块追加到本轮 user 消息末尾（doc/29 §6.4）：与预览端点同一个
-// Store.Recall（开关也同一份）。失败只记一行日志、run 继续——记忆不是主流程的硬依赖。
-func (w *Worker) injectRecall(ctx context.Context, sessionID SessionID, runID RunID, msgs []*schema.Message) {
+// recallBlock 跑一次召回，返回块字节（无命中/未开/查询失败都返回空串）。
+// 召回的词源 = query（调用方给：本轮输入的原文）。与预览端点同一个 Store.Recall，开关同一份。
+// 失败只记一行日志、返回空串——记忆不是主流程的硬依赖。
+func (w *Worker) recallBlock(ctx context.Context, sessionID SessionID, runID RunID, query string) string {
 	cfg := w.store.MemoryConfig()
 	if !cfg.Recall && !cfg.RAG {
-		return
+		return ""
 	}
-	text := lastUserText(msgs)
-	if text == "" {
-		return
+	if strings.TrimSpace(query) == "" {
+		return ""
 	}
-	res, err := w.store.Recall(ctx, text)
+	res, err := w.store.Recall(ctx, query)
 	if err != nil {
 		log.Printf("memory recall %s/%s: %v", sessionID, runID, err)
-		return
+		return ""
 	}
 	if res.Block == "" {
 		log.Printf("memory recall %s/%s: 无命中", sessionID, runID)
-		return
-	}
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role == schema.User {
-			msgs[i].Content += "\n\n" + res.Block
-			break
-		}
+		return ""
 	}
 	log.Printf("memory recall %s/%s: terms=%d memoryHits=%d dialogueHits=%d injected=%d runes",
 		sessionID, runID, res.Terms, res.MemoryHits, res.DialogueHits, res.InjectedRunes)
+	return res.Block
 }
 
-// lastUserText 取本轮 user 原文（召回查询的词源）。
-func lastUserText(msgs []*schema.Message) string {
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role == schema.User {
-			return msgs[i].Content
-		}
-	}
-	return ""
-}
-
+// prepareInput 组装本轮模型输入（正常路径）：mh 全序 → 切两半 → 召回 → 折叠。
+//
+// 「切两半」是 doc/29 §6.1 修订后的读侧纪律（planning §3 拍板 2）：mh 严格是历史，
+// 只有 user input 没有 reply 的那行不算历史——它是「本轮输入」，单独拎出来。
+// 召回块拼在**本轮输入**上（不是 history 上），于是：
+//   ① 块随本轮输入进 base → countInput 自然数得到它（计预算，拍板 3）；
+//   ② 折叠重建时该行文本从 base 取 → 块活过折叠（不丢）。
+// 切分后本轮 user 行仍排在 base 末位（mh 全序按 run_id,seq 排，本轮 run 的 ULID 最大），
+// 坐标（seq=1）天然稳——不碰 convertState / nextRunSeq / foldInput 的钉死规则。
 func (w *Worker) prepareInput(ctx context.Context, sessionID SessionID, runID RunID) ([]*schema.Message, error) {
 	history, err := w.store.ModelMessages(ctx, sessionID)
 	if err != nil {
 		return nil, err
 	}
+	history = w.recallIntoCurrentInput(ctx, sessionID, runID, history)
 	return w.prepareInputFrom(ctx, sessionID, runID, history)
+}
+
+// splitCurrentInput 把 mh 全序切成「历史」与「本轮输入」两半（doc/29 §6.1 修订后的读侧纪律：
+// mh 严格是历史，只有 user input 没有 reply 的那行不算历史）。
+// 切分按 run 走：本轮 run 的行归本轮输入侧，其余归历史侧。
+// 拼回时本轮输入恒在末尾——mh 全序按 run_id,seq 排（run_id 是 ULID，字典序即 run 时序），
+// 本轮 run 的 ULID 最大，它本就在末位，挪出来再拼回不改变顺序。
+func splitCurrentInput(runID RunID, history []ModelMessage) []ModelMessage {
+	var hist, current []ModelMessage
+	for _, m := range history {
+		if m.RunID == runID {
+			current = append(current, m)
+			continue
+		}
+		hist = append(hist, m)
+	}
+	if len(current) == 0 {
+		return history
+	}
+	out := make([]ModelMessage, 0, len(hist)+len(current))
+	out = append(out, hist...)
+	out = append(out, current...)
+	return out
+}
+
+// recallIntoCurrentInput 把 mh 全序切成「历史」与「本轮输入」两半，召回块拼进本轮输入
+// 那一行，再拼回成完整的输入序列。
+//
+// 召回查询的词源 = 本轮输入的原文（不是 history 里的任何一行）——查询词和数据源同一个对象。
+// 块拼在本轮输入上（不是 history 上），于是：
+//   ① 块随本轮输入进 base → countInput 自然数得到它（计预算，拍板 3）；
+//   ② 折叠重建时该行文本从 base 取 → 块活过折叠（不丢）。
+func (w *Worker) recallIntoCurrentInput(ctx context.Context, sessionID SessionID, runID RunID, history []ModelMessage) []ModelMessage {
+	var hist []ModelMessage
+	var current []ModelMessage
+	for _, m := range history {
+		if m.RunID == runID {
+			current = append(current, m)
+			continue
+		}
+		hist = append(hist, m)
+	}
+	if len(current) == 0 {
+		// 本轮 run 在 mh 里没有行 = 没有本轮输入（异常形状，AcquireRun 已入 seq=1）。
+		// 不召回、原样返回——召回是辅助能力，缺了不该让 run 挂。
+		return history
+	}
+	// 召回块拼在本轮输入的 user 行上（seq=1 那条）。本轮输入只有 user 行时就是它；
+	// 万一有别的行，user 行取第一条。
+	userIdx := -1
+	for i, m := range current {
+		if m.Role == "user" {
+			userIdx = i
+			break
+		}
+	}
+	if userIdx < 0 {
+		return history
+	}
+	orig := current[userIdx].Text
+	block := w.recallBlock(ctx, sessionID, runID, orig)
+	if block == "" {
+		return history
+	}
+	current[userIdx].Text = orig + "\n\n" + block
+	// 召回块写回 mh 的本轮 user 行（seq=1）：mh 的语义是「下一轮 run 的模型应该看到什么」
+	// （doc/30 §6）——落进去之后，下一轮读 mh 拿到的就是模型这一枪真看到的那份；
+	// 折叠重建时文本也从 mh 取，块因此活过折叠。
+	//
+	// 时机 = 召回后立即（不是第一枪成功后）：救援路径（worker.go rescueOverflow）重读 mh
+	// 再折，而救援只在零帧时触发（overflow.go 的 rescueWorthy 要求 framesSent==0）——
+	// 第一枪就被 provider 拒收时「第一枪成功」还没发生，等它就晚了。
+	//
+	// 写失败只记一行日志、run 继续——记忆不是主流程的硬依赖（与召回本身同一处置）。
+	if err := w.store.UpdateRunUserText(ctx, sessionID, runID, current[userIdx].Text); err != nil {
+		log.Printf("memory recall write mh %s/%s: %v", sessionID, runID, err)
+	}
+	out := make([]ModelMessage, 0, len(hist)+len(current))
+	out = append(out, hist...)
+	out = append(out, current...)
+	return out
 }
 
 // prepareInputFrom 是 prepareInput 的折叠段（doc/30 §9.1 拆出）：输入行由调用方给——

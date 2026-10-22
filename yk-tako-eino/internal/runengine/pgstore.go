@@ -747,6 +747,28 @@ func (s *Store) ModelMessages(ctx context.Context, sessionID SessionID) ([]Model
 	return out, nil
 }
 
+// UpdateRunUserText 改写某 run 的 user 行（seq=1）的正文——召回块写回 mh 用（doc/29 §6.1 修订）。
+//
+// 为什么需要它：mh 的语义是「下一轮 run 的模型应该看到什么」（doc/30 §6）。召回块是本轮
+// 输入的一部分，落进 mh 后，下一轮读 mh 拿到的就是模型这一枪真看到的那份；折叠重建时
+// 文本也从 mh 取（convertState 的 base 段），块因此活过折叠。
+//
+// 只改 seq=1 的 user 行，不碰 runlog（runlog 是用户看到的定稿历史，append-only，
+// doc/30 §6 表格三行）——页面上不该冒出「用户说：…<memory-context>…」这种混合文本。
+// 行不存在（不该发生：AcquireRun 已入 seq=1）时返回错误，调用方按「记忆不是硬依赖」降级。
+func (s *Store) UpdateRunUserText(ctx context.Context, sessionID SessionID, runID RunID, text string) error {
+	res := s.db.WithContext(ctx).Model(&RunModelMessage{}).
+		Where("session_id = ? AND run_id = ? AND seq = 1", sessionID, runID).
+		Update("text", text)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("mh 里没有 %s 的 user 行（seq=1）", runID)
+	}
+	return nil
+}
+
 // runlogUserSeq 返回某 run 的 user 行在 runlog 的 seq（笔记的 source_seq 来源，M1）。
 // AcquireRun 保证每 run 恰一条 user 行；查不到时落 0（违例态，但不必在这条读路径上拦截——
 // 它只喂笔记行的溯源列，不参与任何判定）。
