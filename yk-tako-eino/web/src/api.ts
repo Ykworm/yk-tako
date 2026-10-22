@@ -48,6 +48,44 @@ export type PostRunsResponse = {
   messageId: string
 }
 
+// 项目（doc/35）：服务端只回这五个字段；默认项目不单独标 isDefault，删除时靠 409 message。
+export type Workspace = {
+  id: string
+  name: string
+  createdAt: string
+  visibility: string
+  owner: boolean
+}
+
+export type WorkspaceListResponse = { workspaces: Workspace[] }
+export type WorkspaceResponse = { workspace: Workspace }
+
+// GET /api/sessions?workspaceId= 的一行。workspaceId=null 是存量游离会话（新形态下每场都会挂项目）。
+export type SessionListItem = {
+  id: SessionID
+  title: string
+  visibility: string
+  owner: boolean
+  createdAt: string
+  workspaceId: string | null
+}
+
+export type SessionListResponse = { sessions: SessionListItem[] }
+
+// GET /api/sessions/:id/subagents 的一行（doc/39）：有 terminal 行是 complete，没有是 interrupted。
+export type SubagentItem = {
+  saId: string
+  agentName: string
+  status: string
+  createdAt: string
+  finishedAt?: string
+}
+
+export type SubagentListResponse = { subagents: SubagentItem[] }
+
+// DELETE 两个端点成功后都回 {status:"deleted"}。
+export type DeleteStatus = { status: string }
+
 export type SessionStatus = {
   liveRunId: RunID
   runlogOffset: number
@@ -55,6 +93,8 @@ export type SessionStatus = {
   // doc/30 §10.3：最新一场 run 的 id（无 run 时是空串）。lastRunStatus='interrupted' 时
   // 它就是「崩溃后可被接管的那一场」——续跑的入口就靠这两个字段。
   lastRunId: RunID
+  // doc/35 A4：会话挂着的项目；存量游离会话是 null。
+  workspaceId: string | null
 }
 
 // GET /api/runs/{runId}（doc/30 §10.1）：读侧派生，不新增存储状态。
@@ -173,23 +213,66 @@ export function mediaUrl(path: string): string {
 }
 
 // POST /api/runs（19v6-01 §1）：sessionId 省略 = 懒建会话；带上 = 只认登记过的。
+// workspaceId 只对新会话生效：已有会话带项目 id 不会改绑定，反而让一个被删项目在预检上把这一发挡掉。
 export function postRuns(
   messageId: string,
   text: string,
   sessionId?: SessionID,
   images?: PostImage[],
+  workspaceId?: string,
 ): Promise<PostRunsResponse> {
   return request<PostRunsResponse>('/api/runs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(
-      images?.length
-        ? { sessionId, messageId, text, images }
-        : sessionId
-          ? { sessionId, messageId, text }
-          : { messageId, text },
-    ),
+    body: JSON.stringify({
+      ...(sessionId ? { sessionId } : {}),
+      ...(!sessionId && workspaceId ? { workspaceId } : {}),
+      messageId,
+      text,
+      ...(images?.length ? { images } : {}),
+    }),
   })
+}
+
+// 项目（doc/35）：空间只有属主可见；顺序由服务端定（created_at,id 升序）。
+export function listWorkspaces(): Promise<WorkspaceListResponse> {
+  return request<WorkspaceListResponse>('/api/workspaces')
+}
+
+export function createWorkspace(name: string): Promise<WorkspaceResponse> {
+  return request<WorkspaceResponse>('/api/workspaces', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
+}
+
+export function renameWorkspace(id: string, name: string): Promise<WorkspaceResponse> {
+  return request<WorkspaceResponse>(`/api/workspaces/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
+}
+
+export function deleteWorkspace(id: string): Promise<DeleteStatus> {
+  return request<DeleteStatus>(`/api/workspaces/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+export function listSessions(workspaceId?: string): Promise<SessionListResponse> {
+  const query = workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : ''
+  return request<SessionListResponse>(`/api/sessions${query}`)
+}
+
+export function deleteSession(sessionId: SessionID): Promise<DeleteStatus> {
+  return request<DeleteStatus>(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
+}
+
+// 子代理档案（doc/39）：wire 目录不存在时是空数组。
+export function getSessionSubagents(sessionId: SessionID): Promise<SubagentListResponse> {
+  return request<SubagentListResponse>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/subagents`,
+  )
 }
 
 // GET /api/sessions/{sessionId}（19v6-01 §4）：404 = 找不到这场会话（code 112001）。

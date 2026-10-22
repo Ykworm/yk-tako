@@ -1,17 +1,25 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useChat } from './chat'
-import { mediaUrl, type MediaRef, type Usage } from './api'
+import {
+  ApiError,
+  getSessionSubagents,
+  mediaUrl,
+  type MediaRef,
+  type SubagentItem,
+  type Usage,
+} from './api'
 import Configure from './Configure.vue'
 import InviteLanding from './InviteLanding.vue'
 import PendingInvites from './PendingInvites.vue'
+import ProjectsView from './ProjectsView.vue'
 import { authFetch, authState, clearAuth, loginWithPassword, switchTenant, tenantState } from './auth'
 
-type Page = 'chat' | 'agents' | 'team'
+type Page = 'chat' | 'projects' | 'agents' | 'team'
 
 function readPage(): Page {
   const saved = sessionStorage.getItem('tako.page')
-  return saved === 'agents' || saved === 'team' ? saved : 'chat'
+  return saved === 'projects' || saved === 'agents' || saved === 'team' ? saved : 'chat'
 }
 
 function tokenFromLocation(): string {
@@ -30,7 +38,12 @@ const page = ref<Page>(readPage())
 watch(page, (value) => sessionStorage.setItem('tako.page', value))
 const configPage = computed<'agents' | 'team'>(() => (page.value === 'team' ? 'team' : 'agents'))
 
-const { bubbles, draft, attachments, pending, loadingOlder, atStart, busy, send, reconcile, loadOlder, newSession, showTenantSession, resumeRun } = useChat()
+const {
+  sessionId, bubbles, draft, attachments, pending, loadingOlder, atStart, busy,
+  activeWorkspaceId,
+  send, reconcile, loadOlder, newSession, showTenantSession, resumeRun,
+  setActiveWorkspace, openSession,
+} = useChat()
 
 const listEl = ref<HTMLElement | null>(null)
 const composerEl = ref<HTMLTextAreaElement | null>(null)
@@ -193,11 +206,26 @@ function logout() {
   clearAuth()
 }
 
+// undefined = 没有待切换的项目（普通「新对话」，沿用当前落点）；null = 明确回默认项目。
+const pendingWorkspace = ref<string | null | undefined>(undefined)
+
+function hasDirtyChat(): boolean {
+  return bubbles.value.length > 0 || draft.value.trim() !== '' || attachments.value.length > 0
+}
+
+function focusComposer() {
+  void nextTick(() => {
+    fitComposer()
+    composerEl.value?.focus()
+  })
+}
+
 function requestNewSession() {
-  const dirty = bubbles.value.length > 0 || draft.value.trim() !== '' || attachments.value.length > 0
-  if (!dirty) {
+  pendingWorkspace.value = undefined
+  if (!hasDirtyChat()) {
     newSession()
     page.value = 'chat'
+    focusComposer()
     return
   }
   askNew.value = true
@@ -205,8 +233,47 @@ function requestNewSession() {
 
 function confirmNewSession() {
   askNew.value = false
+  if (pendingWorkspace.value !== undefined) setActiveWorkspace(pendingWorkspace.value)
+  pendingWorkspace.value = undefined
   newSession()
   page.value = 'chat'
+  focusComposer()
+}
+
+function cancelNewSession() {
+  askNew.value = false
+  pendingWorkspace.value = undefined
+}
+
+// 项目页「开新对话」：先切落点，再判断当前对话要不要确认丢弃。
+function startChatInProject(workspaceId: string | null) {
+  if (!hasDirtyChat()) {
+    setActiveWorkspace(workspaceId)
+    newSession()
+    page.value = 'chat'
+    focusComposer()
+    return
+  }
+  pendingWorkspace.value = workspaceId
+  askNew.value = true
+}
+
+async function openSessionFromProjects(id: string) {
+  page.value = 'chat'
+  await openSession(id)
+  await nextTick()
+  scrollBottom()
+}
+
+// 删的正是当前会话：清空对话页（落点不变，下一场新对话还落同一个项目）。
+function onSessionDeleted(id: string) {
+  if (sessionId.value === id) newSession()
+}
+
+// 删项目连带的会话：当前项目清空、当前会话若在名单里也清空。
+function onWorkspaceDeleted(payload: { id: string; sessionIds: string[] }) {
+  if (activeWorkspaceId.value === payload.id) setActiveWorkspace(null)
+  if (sessionId.value && payload.sessionIds.includes(sessionId.value)) newSession()
 }
 
 function applyStarter(text: string) {
@@ -263,7 +330,7 @@ function onWindowKey(ev: KeyboardEvent) {
     createOpen.value = false
     return
   }
-  askNew.value = false
+  cancelNewSession()
 }
 
 const MAX_ATTACH = 4
@@ -449,6 +516,71 @@ function usageClass(u: Usage): string {
   return pct > 90 ? 'hot' : pct > 70 ? 'warm' : ''
 }
 
+// 子代理档案条（doc/44 §2.4）：只列当前会话；complete 才给「继续」。
+// 继续不是 HTTP 调用——把带 sa_id 的意图写进输入框，交给父 agent 调 resume_subagent。
+const subagents = ref<SubagentItem[]>([])
+const subagentsOpen = ref(false)
+const subagentsLoading = ref(false)
+const subagentsError = ref('')
+let subagentsToken = 0
+
+async function loadSubagents() {
+  const sid = sessionId.value
+  const token = ++subagentsToken
+  if (!sid) {
+    subagents.value = []
+    subagentsLoading.value = false
+    subagentsError.value = ''
+    return
+  }
+  subagentsLoading.value = true
+  subagentsError.value = ''
+  try {
+    const res = await getSessionSubagents(sid)
+    if (token !== subagentsToken) return
+    subagents.value = res.subagents
+  } catch (e) {
+    if (token !== subagentsToken) return
+    subagentsError.value = e instanceof ApiError ? e.message : '子代理列表加载失败'
+  } finally {
+    if (token === subagentsToken) subagentsLoading.value = false
+  }
+}
+
+function toggleSubagents() {
+  subagentsOpen.value = !subagentsOpen.value
+  if (subagentsOpen.value) void loadSubagents()
+}
+
+function subagentStatus(status: string): string {
+  return status === 'complete' ? '已完成' : '未完成'
+}
+
+function fmtDateTime(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  return d.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+}
+
+function continueSubagent(sa: SubagentItem) {
+  const line = `请用 resume_subagent 继续子代理 ${sa.saId}（${sa.agentName}）：接着它刚才的任务继续做下去，完成后把结果告诉我。`
+  const current = draft.value.trimEnd()
+  draft.value = current ? `${current}\n\n${line}` : line
+  focusComposer()
+}
+
+// 会话切换：旧会话的档案不能留在新会话的条上；切到有 id 的会话才拉。
+watch(sessionId, () => {
+  subagents.value = []
+  subagentsOpen.value = false
+  void loadSubagents()
+}, { immediate: true })
+
+// 一轮 run 收口后刷新：子代理 wire 的 terminal 行是跑完才写的，忙时不重拉。
+watch(busy, (now, prev) => {
+  if (prev && !now) void loadSubagents()
+})
+
 function scrollBottom() {
   const el = listEl.value
   if (el) el.scrollTop = el.scrollHeight
@@ -494,7 +626,7 @@ watch(
 watch(authState, async (ok) => {
   if (!ok) {
     newSession()
-    askNew.value = false
+    cancelNewSession()
     menuOpen.value = false
     return
   }
@@ -578,7 +710,7 @@ async function onScroll() {
           <p id="new-chat-title">新开一段会忘掉浏览器里记住的当前对话。</p>
           <div class="pop-actions">
             <button type="button" class="pop-go" @click="confirmNewSession">仍然新开</button>
-            <button type="button" class="pop-stay" @click="askNew = false">取消</button>
+            <button type="button" class="pop-stay" @click="cancelNewSession">取消</button>
           </div>
         </div>
       </div>
@@ -587,6 +719,10 @@ async function onScroll() {
         <button type="button" :class="{ on: page === 'chat' }" :aria-current="page === 'chat' ? 'page' : undefined" @click="page = 'chat'">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 3.5h10v7.2H6.2L3 13z" stroke-linejoin="round" /></svg>
           对话
+        </button>
+        <button type="button" :class="{ on: page === 'projects' }" :aria-current="page === 'projects' ? 'page' : undefined" @click="page = 'projects'">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2.5 4.5h4l1.2 1.5h5.8v6.5h-11z" stroke-linejoin="round" /></svg>
+          项目
         </button>
         <button type="button" :class="{ on: page === 'agents' }" :aria-current="page === 'agents' ? 'page' : undefined" @click="page = 'agents'">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="5.2" r="2.2" /><path d="M3.4 13.2c.7-2.2 2.4-3.2 4.6-3.2s3.9 1 4.6 3.2" stroke-linecap="round" /></svg>
@@ -683,9 +819,49 @@ async function onScroll() {
       </form>
 
       <template v-else>
-        <Configure v-if="page !== 'chat'" :key="tenant.id" :page="configPage" />
+        <Configure v-if="page === 'agents' || page === 'team'" :key="tenant.id" :page="configPage" />
+        <ProjectsView
+          v-else-if="page === 'projects'"
+          :key="tenant.id"
+          :active-workspace-id="activeWorkspaceId"
+          @open-session="openSessionFromProjects"
+          @new-chat="startChatInProject"
+          @set-active="setActiveWorkspace"
+          @session-deleted="onSessionDeleted"
+          @workspace-deleted="onWorkspaceDeleted"
+          @clear-active="setActiveWorkspace(null)"
+        />
 
         <div v-show="page === 'chat'" class="thread">
+          <div v-if="sessionId" class="subagents">
+            <button type="button" class="subagent-bar" :aria-expanded="subagentsOpen" @click="toggleSubagents">
+              <span>子代理 {{ subagents.length }}</span>
+              <span v-if="subagentsLoading" class="spinner" aria-hidden="true"></span>
+              <span class="sub-toggle">{{ subagentsOpen ? '收起' : '展开' }}</span>
+            </button>
+            <div v-if="subagentsOpen" class="subagent-panel">
+              <p v-if="subagentsError" class="subagent-note error" role="alert">
+                {{ subagentsError }}
+                <button type="button" class="subagent-retry" @click="loadSubagents">重试</button>
+              </p>
+              <p v-else-if="subagentsLoading && !subagents.length" class="subagent-note">正在加载子代理档案…</p>
+              <p v-else-if="!subagents.length" class="subagent-note">这场对话还没有子代理档案。</p>
+              <ul v-else>
+                <li v-for="sa in subagents" :key="sa.saId">
+                  <div class="subagent-main">
+                    <strong>{{ sa.agentName }}</strong>
+                    <span class="subagent-id">{{ sa.saId }}</span>
+                    <span class="subagent-time">{{ fmtDateTime(sa.createdAt) }}</span>
+                  </div>
+                  <span class="subagent-status" :class="sa.status">{{ subagentStatus(sa.status) }}</span>
+                  <button v-if="sa.status === 'complete'" type="button" class="subagent-go" @click="continueSubagent(sa)">
+                    继续
+                  </button>
+                </li>
+              </ul>
+            </div>
+          </div>
+
           <section ref="listEl" class="list" @scroll="onScroll">
             <div v-if="!bubbles.length" class="empty">
               <p class="empty-kicker">对话</p>
@@ -1236,6 +1412,123 @@ async function onScroll() {
   display: flex;
   flex-direction: column;
   padding-bottom: 1rem;
+}
+
+/* 子代理档案条（doc/44 §2.4）：默认收起，只占一行；展开是列表，不挤压对话的滚动区。 */
+.subagents {
+  flex: none;
+  padding: 0.85rem 0.2rem 0;
+}
+.subagent-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  border: 1px solid var(--line);
+  background: var(--bg-raised);
+  border-radius: 999px;
+  padding: 0.28rem 0.7rem;
+  font-size: 0.78rem;
+  color: var(--ink-soft);
+}
+.subagent-bar:hover {
+  border-color: var(--line-strong);
+}
+.sub-toggle {
+  margin-left: 0.2rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+.subagent-panel {
+  margin-top: 0.4rem;
+  max-height: 14rem;
+  overflow: auto;
+  border: 1px solid var(--line);
+  background: var(--bg-raised);
+  border-radius: 14px;
+  padding: 0.4rem;
+}
+.subagent-panel ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.subagent-panel li {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.5rem;
+  border-radius: 10px;
+}
+.subagent-panel li:hover {
+  background: var(--bg);
+}
+.subagent-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+.subagent-main strong {
+  font-size: 0.82rem;
+}
+.subagent-id {
+  color: var(--muted);
+  font-size: 0.68rem;
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.subagent-time {
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+.subagent-status {
+  flex: none;
+  border-radius: 999px;
+  padding: 0.05rem 0.5rem;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+.subagent-status.complete {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+.subagent-status.interrupted {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.subagent-go {
+  flex: none;
+  border: 1px solid var(--line-strong);
+  background: #fff;
+  border-radius: 999px;
+  padding: 0.2rem 0.7rem;
+  font-size: 0.76rem;
+}
+.subagent-go:hover {
+  border-color: #b7d7cc;
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+.subagent-note {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.25rem 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+.subagent-note.error {
+  color: var(--danger);
+}
+.subagent-retry {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  font-size: 0.76rem;
+  text-decoration: underline;
 }
 .list {
   flex: 1;

@@ -48,9 +48,17 @@ export type Attachment = { name: string; img: PostImage }
 
 // 一条待投投递 = 已渲染的 user 气泡 + 它那条 assistant 气泡 + 请求前就定下的 messageId
 // （19v6-01 §1 情形 3：重发不换 id）。
-type Pending = { messageId: string; text: string; assistant: Bubble; images?: PostImage[] }
+// workspaceId 只在懒建会话时用：发送那一刻决定这条消息落哪个项目（doc/35）。
+type Pending = {
+  messageId: string
+  text: string
+  assistant: Bubble
+  images?: PostImage[]
+  workspaceId?: string | null
+}
 
 const LS_SESSION = 'tako.sessionId'
+const LS_WORKSPACE = 'tako.workspaceId'
 
 // 每个工作区各记自己的会话。切走再切回来要能把原来的对话拉出来，不能共用一个键。
 function tenantSessionKey(tenantId: string): string {
@@ -74,6 +82,21 @@ function writeStoredSession(id: SessionID, tenantId: string) {
   localStorage.setItem(tenantSessionKey(tenantId), id)
   if (localStorage.getItem(LS_SESSION) === id) localStorage.removeItem(LS_SESSION)
 }
+
+// 当前项目也只属当前租户：切走再切回来，各看各的落点（doc/35：服务端不保存「我正在看哪个项目」）。
+function tenantWorkspaceKey(tenantId: string): string {
+  return tenantId ? `${LS_WORKSPACE}.${tenantId}` : LS_WORKSPACE
+}
+
+function readStoredWorkspace(): string | null {
+  return localStorage.getItem(tenantWorkspaceKey(readTenant().id))
+}
+
+function writeStoredWorkspace(id: string | null, tenantId: string) {
+  const key = tenantWorkspaceKey(tenantId)
+  if (id) localStorage.setItem(key, id)
+  else localStorage.removeItem(key)
+}
 const POLL_MS = 400
 // 冗余信号核对节奏：每 STATUS_EVERY 拍 frames 顺带查一次 session（≈2s 一次 GET）。
 // 放闸与定稿是同一笔 PG 事务（19v6-03 D1：UPDATE runs 落终态 + assistant 行入 runlog），
@@ -94,6 +117,8 @@ export function useChat() {
   const pending = ref<Pending[]>([])
   const loadingOlder = ref(false)
   const atStart = ref(true)
+  // 新对话落点（doc/44 §2.2）：null = 让服务端挂默认项目。
+  const activeWorkspaceId = ref<string | null>(readStoredWorkspace())
 
   // 对齐游标：只在拉 log 时前进（19v6-02 不变量）。翻页游标是 loadOlder 里的临时值，不碰它。
   let runlogOffset = 0
@@ -128,8 +153,38 @@ export function useChat() {
     renderedMessageIds.add(messageId)
     push({ key: `${messageId}:user`, runId: null, role: 'user', text, state: 'done' })
     const assistant = push({ key: `${messageId}:assistant`, runId: null, role: 'assistant', text: '', state: 'queued' })
-    pending.value.push({ messageId, text, assistant, images: imgs.length ? imgs : undefined })
+    pending.value.push({
+      messageId,
+      text,
+      assistant,
+      images: imgs.length ? imgs : undefined,
+      workspaceId: sessionId.value ? undefined : activeWorkspaceId.value,
+    })
     void pump()
+  }
+
+  // 切当前项目只改「下一场新对话落哪」；已经打开的会话不跟着换项目。
+  function setActiveWorkspace(id: string | null) {
+    activeWorkspaceId.value = id
+    writeStoredWorkspace(id, readTenant().id)
+  }
+
+  // 打开项目页里的一场会话：丢掉屏幕上的旧对话，按同一个 reconcile 四步重建。
+  async function openSession(id: SessionID) {
+    pollToken++
+    sessionId.value = null
+    pending.value = []
+    bubbles.value = []
+    draft.value = ''
+    attachments.value = []
+    busy.value = false
+    loadingOlder.value = false
+    renderedMessageIds.clear()
+    runlogOffset = 0
+    oldestOffset = 0
+    atStart.value = true
+    writeStoredSession(id, readTenant().id)
+    return reconcile()
   }
 
   // 队列泵（19v6-01 §1「409 = 客户端本地排队、本轮收口后补投」）：本 tab 有 run 在跑、
@@ -215,12 +270,16 @@ export function useChat() {
   // 丢掉本地值、不带 sid 重投一次走懒建。只重投这一次，不把 500 之类拖进循环。
   async function postWithFreshSession(p: Pending) {
     const sid = sessionId.value
+    // p.workspaceId 是发送那一刻定下的落点；null 表示「明确用默认项目」，不能被事后切换的项目覆盖。
+    const targetWorkspace = p.workspaceId !== undefined ? p.workspaceId : activeWorkspaceId.value
+    // 已有会话永远不带 workspaceId（带也不会改绑定，反而会被一个已删项目在预检上挡掉）。
+    const workspaceId = sid ? undefined : targetWorkspace ?? undefined
     try {
-      return await postRuns(p.messageId, p.text, sid ?? undefined, p.images)
+      return await postRuns(p.messageId, p.text, sid ?? undefined, p.images, workspaceId)
     } catch (e) {
       if (sid && isNotFound(e)) {
         dropSession()
-        return await postRuns(p.messageId, p.text, undefined, p.images)
+        return await postRuns(p.messageId, p.text, undefined, p.images, targetWorkspace ?? undefined)
       }
       throw e
     }
@@ -462,17 +521,22 @@ export function useChat() {
   }
 
   // reconcile（19v6-02 四步）：查状态 → 窗口化补历史 → 有活 run 则 frames(0) 重建半截气泡。
-  async function reconcile() {
+  // 返回是否真的打开了一场会话（项目页「打开」据此判断，失败时对话页保持空）。
+  async function reconcile(): Promise<boolean> {
+    // 当前项目按当前租户的存储重读：登录/切租户后不能留着上一个租户的项目 id。
+    activeWorkspaceId.value = readStoredWorkspace()
     const sid = readStoredSession()
-    if (!sid) return
+    if (!sid) return false
     let status
     try {
       status = await getSession(sid)
     } catch (e) {
       if (isNotFound(e)) dropSession()
-      return
+      return false
     }
     sessionId.value = sid
+    // 打开已有会话时当前项目跟着它走：之后「新对话」自然落在同一个项目。
+    if (status.workspaceId) setActiveWorkspace(status.workspaceId)
     runlogOffset = Math.max(0, status.runlogOffset - HISTORY_WINDOW)
     for (;;) {
       const resp = await getLog(sid, runlogOffset)
@@ -500,6 +564,7 @@ export function useChat() {
       })
       void markResumable(assistant)
     }
+    return true
   }
 
   // 还能不能续：问单场 run 的派生状态。次数用尽时 resumable=false——
@@ -631,7 +696,12 @@ export function useChat() {
     renderedMessageIds.clear()
   }
 
-  return { sessionId, bubbles, draft, attachments, busy, pending, loadingOlder, atStart, send, reconcile, loadOlder, newSession, showTenantSession, resumeRun }
+  return {
+    sessionId, bubbles, draft, attachments, busy, pending, loadingOlder, atStart,
+    activeWorkspaceId,
+    send, reconcile, loadOlder, newSession, showTenantSession, resumeRun,
+    setActiveWorkspace, openSession,
+  }
 }
 
 // 409 = 闸被占（19v6-01 §1），处置是排队；404 找不到这场会话（112001）= 本地 sid 已成僵尸，处置是懒建重投。
