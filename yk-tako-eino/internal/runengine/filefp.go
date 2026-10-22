@@ -188,14 +188,24 @@ func lockDirFor(ctx context.Context, root string) string {
 	return filepath.Join(root, ".tako", "locks")
 }
 
-// lockPathFor 算某个绝对路径对应的锁文件：sha256(绝对路径) 前 16 位 + ".lock"。
+// lockBuckets 是锁文件的桶数。锁键 = sha256(路径) 首字节 % 桶数 → **锁文件数恒 ≤ 桶数**。
+//
+// 为什么不「一个路径一个锁文件」：一个项目写几千个文件就会在锁目录堆几千个空文件
+// （ext4 的大目录会退化、e2fsck 会告警），而**清理又不能随便做**——unlink 一个正被持有的锁文件，
+// 后来者会 open 到**新 inode** → 两边同时以为自己独占了 → 互斥失效；要清只能在租户删除时连目录清，
+// 那又太迟。桶锁把目录大小钉死在常数级，两个问题一起消失。
+//
+// 代价：不同路径可能撞同一桶（1/256）→ 假串行（多等一会儿），无正确性问题。
+const lockBuckets = 256
+
+// lockPathFor 算某个绝对路径对应的锁文件：桶号 + ".lock"。
 //
 // 用哈希不用路径原文：路径里有分隔符、可能中文、可能超长。锁**文件**而不是目标文件：目标可能
 // 还不存在（新建场景没法锁）；且 flock 锁的是 inode——目标文件被删掉又重建 → inode 变 → 锁失效，
 // 而锁文件我们从不删 → 锁稳定。
 func lockPathFor(lockDir, absPath string) string {
 	sum := sha256.Sum256([]byte(absPath))
-	return filepath.Join(lockDir, hex.EncodeToString(sum[:])[:16]+".lock")
+	return filepath.Join(lockDir, fmt.Sprintf("%02x.lock", int(sum[0])%lockBuckets))
 }
 
 // lockPaths 取这些路径的排它写锁（粒度=文件），返回释放函数。

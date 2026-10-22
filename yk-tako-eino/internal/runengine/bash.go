@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/cloudwego/eino/components/tool"
@@ -113,5 +114,11 @@ func runBash(ctx context.Context, workspace, command string, timeout time.Durati
 		}
 		code = ee.ExitCode()
 	}
-	return fmt.Sprintf("退出码：%d\n%s", code, outputSections(stdout, stderr)), nil
+	out := fmt.Sprintf("退出码：%d\n%s", code, outputSections(stdout, stderr))
+	// 围栏被触发的信号：macOS 沙箱的拒绝文案是 "Operation not permitted"。
+	// 裸给模型看这句它多半不懂「为什么」→ 补一句人话：只能在项目目录内读写，越界已被拒。
+	if strings.Contains(out, "Operation not permitted") || strings.Contains(out, "not permitted") {
+		out += fmt.Sprintf("\n（沙箱围栏：只能在项目目录 %s 内读写；越出这个范围的路径已被拒绝——请改用项目内的路径。）", workspace)
+	}
+	return out, nil
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -37,7 +38,25 @@ var sandboxProbe struct {
 	ok   bool
 }
 
+// sandboxProfile 是 bash 的围栏：**写只在工作区根（项目目录）内**，读是「工作区根 + 系统路径白名单」。
+//
+// 2026-10-22 核过一遍围栏的真实行为（`sandbox-exec` 实测，不是推测）：
+//   - 读 /etc/hosts → Operation not permitted ✓（`literal "/"` 只匹配根目录本身，不是全盘）
+//   - 读 ~/.ssh、~/.zshrc → Operation not permitted ✓
+//   - 写工作区外 → Operation not permitted ✓
+//
+// → **越界读与越界写本来就被硬挡**（不是问人）→ bash 不需要人工审批回路。
+//
+// ⚠️ root 必须用**解析后的真实路径**：seatbelt 的 subpath 匹配走真实路径，而 macOS 的
+// `/tmp` 是指向 `/private/tmp` 的符号链接 → 若把 root 写成 `/tmp/xxx`，(subpath root)
+// 匹配不上，agent 会连**自己项目里的文件都读不到**（Operation not permitted）。
 func sandboxProfile(root string) string {
+	// 真实路径（symlink 解析）：root 可能带 symlink（macOS 的 /tmp、挂载点软链等）。
+	real := root
+	if r, err := filepath.EvalSymlinks(root); err == nil {
+		real = r
+	}
+	root = real
 	return fmt.Sprintf(`(version 1)
 (deny default)
 (allow process-exec)

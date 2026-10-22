@@ -506,6 +506,29 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, ep
 			return nil
 		}
 
+		// accountUsage 把本 run 的 token 记进租户的日用量表。
+		//
+		// 2026-10-22：从「只在 complete 分支记」改成**三个终态都记**——失败那一轮照样花了
+		// 厂商的 token，租户照样付了钱，统计却不记 → 用量偏低（将来按用量计费就会少收）。
+		// rootUsage 由 writeTurnRows 算好（最后一枪 root 的账单）。
+		accountUsage := func() error {
+			if rootUsage == nil || rootUsage.TotalTokens == 0 {
+				return nil
+			}
+			var tid string
+			if err := tx.Raw(`SELECT tenant_id FROM sessions WHERE id = ?`, sessionID).Scan(&tid).Error; err != nil {
+				return err
+			}
+			if tid == "" {
+				return nil
+			}
+			day := time.Now().UTC().Format("2006-01-02")
+			return tx.Exec(`
+INSERT INTO tenant_usage_daily (tenant_id, day, tokens) VALUES (?, ?, ?)
+ON CONFLICT (tenant_id, day) DO UPDATE SET tokens = tenant_usage_daily.tokens + EXCLUDED.tokens`,
+				tid, day, rootUsage.TotalTokens).Error
+		}
+
 		res := tx.Exec(
 			`UPDATE runs SET status = ?, finished_at = now(), lease_until = NULL
 			 WHERE id = ? AND session_id = ? AND status = 'running' AND lease_until > now()
@@ -547,6 +570,10 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, ep
 			if err := tx.Raw(
 				`SELECT COALESCE(MAX(seq), 0) FROM runlog_entries WHERE session_id = ?`,
 				sessionID).Scan(&nextSeq).Error; err != nil {
+				return err
+			}
+			// 用量记账：被停的那一轮也花了 token。
+			if err := accountUsage(); err != nil {
 				return err
 			}
 			// stopped 终态即删账本（doc/30 §6.3）：本场不再续跑，现场没人要了。
@@ -648,20 +675,9 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, ep
 					return err
 				}
 			}
-			if rootUsage != nil && rootUsage.TotalTokens > 0 {
-				var tid string
-				if err := tx.Raw(`SELECT tenant_id FROM sessions WHERE id = ?`, sessionID).Scan(&tid).Error; err != nil {
-					return err
-				}
-				if tid != "" {
-					day := time.Now().UTC().Format("2006-01-02")
-					if err := tx.Exec(`
-INSERT INTO tenant_usage_daily (tenant_id, day, tokens) VALUES (?, ?, ?)
-ON CONFLICT (tenant_id, day) DO UPDATE SET tokens = tenant_usage_daily.tokens + EXCLUDED.tokens`,
-						tid, day, rootUsage.TotalTokens).Error; err != nil {
-						return err
-					}
-				}
+			// 用量记账：三个终态都记（失败那轮也花了钱）。
+			if err := accountUsage(); err != nil {
+				return err
 			}
 		} else {
 			// error 终态：**写这一轮已产出的内容**（工具行 + 已说出的那半截文本）。
@@ -672,6 +688,10 @@ ON CONFLICT (tenant_id, day) DO UPDATE SET tokens = tenant_usage_daily.tokens + 
 				return err
 			}
 			if err := writeTurnRows(false); err != nil {
+				return err
+			}
+			// 用量记账：失败那轮也花了 token（2026-10-22，从只在 complete 记改成三终态都记）。
+			if err := accountUsage(); err != nil {
 				return err
 			}
 			// runlogOffset 仍返回当前高水位（旧 Lua 的 LLEN 语义原样）。
