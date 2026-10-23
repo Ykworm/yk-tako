@@ -193,6 +193,26 @@ func TestParseAgentSpecRejectsToolsAndExclude(t *testing.T) {
 	}
 }
 
+// TestParseAgentSpecRejectsBadName 钉名字的外形约束：名字同时是厂商请求里的
+// tools[i].function.name，空格/中文会被厂商整场 400（2026-10-23 走查的 P0）。
+// 解析层拒载 = 文件路与导入路共用同一道闸；装配层另有一道（存量行）。
+func TestParseAgentSpecRejectsBadName(t *testing.T) {
+	bad := []byte("---\nname: qa 空格\ndescription: 丁\n---\n正文\n")
+	if _, err := parseAgentSpec(bad); !errors.Is(err, errBadAgentName) {
+		t.Fatalf("名字含空格应在前按 errBadAgentName 拒载，实得: %v", err)
+	}
+	for _, name := range []string{"coder", "qa-ok", "qa_ok", strings.Repeat("a", 64)} {
+		src := []byte("---\nname: " + name + "\ndescription: 丁\n---\n正文\n")
+		if _, err := parseAgentSpec(src); err != nil {
+			t.Fatalf("%q 是合法名字，实得拒载: %v", name, err)
+		}
+	}
+	tooLong := []byte("---\nname: " + strings.Repeat("a", 65) + "\ndescription: 丁\n---\n正文\n")
+	if _, err := parseAgentSpec(tooLong); !errors.Is(err, errBadAgentName) {
+		t.Fatalf("65 个字符应拒载，实得: %v", err)
+	}
+}
+
 // TestShippedAgentSpecToolGuards 钉**仓库出厂配置**（`agents/*.md`）与 doc/26 的一致性——机制在上面
 // 两支，这支盯的是配置。它把三件「文档里写了很久、删掉却没有任何东西会红」的事转成检查：
 //   - doc/22 §7「researcher 的名单必须含 web_search」→ 金样逐名逐序比对，把它写进排除项就红；
@@ -221,14 +241,19 @@ func TestShippedAgentSpecToolGuards(t *testing.T) {
 		"get_time", "write_file", "read_text_file", "read_file", "edit_file", "move_file",
 		"create_directory", "list_directory", "directory_tree", "get_file_info", "search_files",
 		"read_media_file", "read_pdf_text", "bash", "memory", "search_history", "web_search",
+		"ask_user", "enter_plan_mode", "submit_plan",
 	}
 	// 名字宇宙从注册表派生（不另抄一份名单，两份会各自腐化）：父池加一把登记过 file_effect 的
 	// 新工具 ⇒ 集合与写死的池序不等 ⇒ 红。get_time 按 fileops.go:86 的说明不进注册表，显式并进来。
-	universe := make(map[string]bool, len(firstPartyFileEffects)+1)
+	universe := make(map[string]bool, len(firstPartyFileEffects)+2)
 	for name := range firstPartyFileEffects {
 		universe[name] = true
 	}
+	// 不进 file_effect 注册表的一手工具（不碰文件），显式并进来。
 	universe["get_time"] = true
+	universe["ask_user"] = true
+	universe["enter_plan_mode"] = true
+	universe["submit_plan"] = true
 	if len(universe) != len(poolOrder) {
 		t.Fatalf("注册表派生的名字宇宙 %d 名 ≠ 写死的池序 %d 名——父池加/减了工具？两处同步改（doc/26 §7）",
 			len(universe), len(poolOrder))
@@ -250,7 +275,8 @@ func TestShippedAgentSpecToolGuards(t *testing.T) {
 	golden := map[string][]string{
 		"researcher": {"get_time", "write_file", "read_text_file", "read_file", "edit_file", "move_file",
 			"create_directory", "list_directory", "directory_tree", "get_file_info", "search_files",
-			"read_media_file", "read_pdf_text", "memory", "search_history", "web_search"},
+			"read_media_file", "read_pdf_text", "memory", "search_history", "web_search", "ask_user",
+			"enter_plan_mode", "submit_plan"},
 		"coder": {"write_file", "read_text_file", "edit_file", "list_directory", "search_files", "memory", "bash"},
 	}
 	// inheritOK：出厂规格默认必须写 tools: 或 exclude_tools: 之一——两行都不写 = 整份继承，
@@ -588,7 +614,6 @@ func TestDelegationRedisSkipsProcessSem(t *testing.T) {
 		t.Fatalf("租户槽应放行、进程 sem 不应挡住，得到 out=%q err=%v calls=%d", out, err, inner.calls)
 	}
 }
-
 
 // TestSubagentShellLoadsAndRuns 钉壳化（doc/25 §7 翻案，2026-10-23）的装载-调用全链：
 // BeforeAgent 只产壳不起实例（内层 = *subagentShell）；Info 静态可用、不碰模型/解析器

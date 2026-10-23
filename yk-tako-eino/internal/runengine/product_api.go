@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
@@ -96,6 +98,9 @@ type workspaceBody struct {
 	CreatedAt  time.Time `json:"createdAt"`
 	Visibility string    `json:"visibility"`
 	Owner      bool      `json:"owner"`
+	// IsDefault 标记这是「当前租户 × 这个用户」的默认项目。默认项目不可删
+	//（doc/37 的 114005）——页面据此把「删除 / 重命名」藏起来，别让用户点一个必然失败的按钮。
+	IsDefault bool `json:"isDefault"`
 }
 
 type workspaceData struct {
@@ -143,6 +148,111 @@ func (s *Server) listWorkspaces(c *gin.Context) {
 		items = append(items, toWorkspaceBody(row, p.UserID))
 	}
 	writeEnvelope(c, http.StatusOK, codeOK, "", workspaceListData{Workspaces: items})
+}
+
+// workspaceInternalDirs 是用户不看、也不列的内部目录。
+//
+//	.media —— 入口媒体的落盘处（doc/32）
+//	.tako  —— 搜索截断落盘（doc/21 H3：<项目>/.tako/search/*.md）
+//
+// 子代理 wire 不在项目目录（它在会话目录 .tako/subagents/，doc/39），这里碰不到。
+var workspaceInternalDirs = map[string]bool{".media": true, ".tako": true}
+
+// fileEntry 是列目录的一行：目录只给名字与种类，文件额外给字节数与修改时间。
+// size / modifiedAt 用指针 + omitempty：目录没有这两个字段（不是 0），空文件要有 size:0。
+type fileEntry struct {
+	Name       string     `json:"name"`
+	Kind       string     `json:"kind"`
+	Size       *int64     `json:"size,omitempty"`
+	ModifiedAt *time.Time `json:"modifiedAt,omitempty"`
+}
+
+type workspaceFilesData struct {
+	Path    string      `json:"path"`
+	Entries []fileEntry `json:"entries"`
+}
+
+// listWorkspaceFiles 列项目目录下的直接子项（doc/48 B1）。
+//
+// 为什么要有这个端点：agent 写出的文件落在项目目录里，此前 UI 只能看见聊天里那行文字——
+// 用户既看不到目录、也拿不到字节。字节出口 GET /api/media 今天就能读项目内文件
+// （getMedia 的 root 就是项目目录），缺的只有「列目录」这一半。
+//
+// 两道锁，一道都不能少：
+//   - 可见性先判（VisibleWorkspace）：看不见的项目回 404 114001，不泄露别人的项目存不存在。
+//   - 路径再判（resolveInWorkspace）：与 agent 工具层同一把锁（含符号链接逃逸检查），
+//     绝对路径与越界一律 400 111002「路径不对」。
+func (s *Server) listWorkspaceFiles(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	wid := strings.TrimSpace(c.Param("id"))
+	if _, err := s.store.VisibleWorkspace(c.Request.Context(), wid, p.TenantID, p.UserID); err != nil {
+		if errors.Is(err, ErrWorkspaceNotFound) {
+			writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
+			return
+		}
+		internal(c, err)
+		return
+	}
+	root, err := workspaceDir(s.mediaRoot, p.TenantID, wid)
+	if err != nil {
+		writeEnvelope(c, http.StatusNotFound, codeMediaMissing, "找不到这个文件", nil)
+		return
+	}
+	rel := strings.TrimSpace(c.Query("path"))
+	if rel == "" {
+		rel = "."
+	}
+	full, err := resolveInWorkspace(root, rel)
+	if err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "路径不对", nil)
+		return
+	}
+	des, err := os.ReadDir(full)
+	if err != nil {
+		// 目录不存在 / 不是目录 / 读不动，一律 404「找不到这个文件」。
+		writeEnvelope(c, http.StatusNotFound, codeMediaMissing, "找不到这个文件", nil)
+		return
+	}
+	items := make([]fileEntry, 0, len(des))
+	for _, de := range des {
+		name := de.Name()
+		if workspaceInternalDirs[name] {
+			continue
+		}
+		// 符号链接不列：它可能指向项目外，列出来等于泄露「那边有什么」，
+		// 而点进去 resolveInWorkspace 也会挡住——列了是坏体验，不列是安全。
+		if de.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		if de.IsDir() {
+			items = append(items, fileEntry{Name: name, Kind: "dir"})
+			continue
+		}
+		if !de.Type().IsRegular() {
+			continue // 套接字、设备文件之类不是文件，不列
+		}
+		info, err := de.Info()
+		if err != nil {
+			continue // 拿不到元信息就跳过，不让一条坏条目毁掉整份清单
+		}
+		size := info.Size()
+		mod := info.ModTime()
+		items = append(items, fileEntry{Name: name, Kind: "file", Size: &size, ModifiedAt: &mod})
+	}
+	// 目录在前，同类按名升序（os.ReadDir 本来就按名升序，跨类型要再排一次）。
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].Kind != items[j].Kind {
+			return items[i].Kind == "dir"
+		}
+		return items[i].Name < items[j].Name
+	})
+	writeEnvelope(c, http.StatusOK, codeOK, "", workspaceFilesData{
+		Path:    filepath.ToSlash(filepath.Clean(rel)),
+		Entries: items,
+	})
 }
 
 // patchWorkspace 改名。不是创建者，或这行不存在，都回 404，不透露别人有没有这个项目。
@@ -279,13 +389,22 @@ func workspaceNameFrom(c *gin.Context) (string, bool) {
 		writeEnvelope(c, http.StatusBadRequest, codeWorkspaceNameRequired, "请填写项目名称", nil)
 		return "", false
 	}
+	// 名字有边：侧栏/卡片靠 CSS 截断只是把问题藏到布局里，换个地方（导出、通知、日志）就溢出来。
+	// 按字符（rune）算，不是字节——中文项目名按 100 个汉字收。
+	if utf8.RuneCountInString(name) > workspaceNameMax {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "项目名最多 100 个字符", nil)
+		return "", false
+	}
 	return name, true
 }
+
+const workspaceNameMax = 100
 
 func toWorkspaceBody(row Workspace, userID string) workspaceBody {
 	return workspaceBody{
 		ID: row.ID, Name: row.Name, CreatedAt: row.CreatedAt,
 		Visibility: row.Visibility, Owner: row.UserID == userID,
+		IsDefault: row.IsDefault,
 	}
 }
 
@@ -878,8 +997,11 @@ func validAgentKind(kind string) bool {
 func writeAgentFields(c *gin.Context, row *TenantAgent, req agentWrite) bool {
 	if err := applyAgentWrite(row, req); err != nil {
 		msg := "工具策略不合法"
-		if errors.Is(err, ErrBadVisibility) {
+		switch {
+		case errors.Is(err, ErrBadVisibility):
 			msg = "助手的名字或 kind 不对"
+		case errors.Is(err, errBadAgentName):
+			msg = agentNameRuleMessage
 		}
 		writeEnvelope(c, http.StatusBadRequest, codeBadInput, msg, nil)
 		return false
@@ -889,6 +1011,9 @@ func writeAgentFields(c *gin.Context, row *TenantAgent, req agentWrite) bool {
 
 func applyAgentWrite(row *TenantAgent, req agentWrite) error {
 	if name := strings.TrimSpace(req.Name); name != "" {
+		if !validAgentName(name) {
+			return errBadAgentName
+		}
 		row.Name = name
 	}
 	if req.Kind != "" {
@@ -955,6 +1080,10 @@ func (s *Server) createAgent(c *gin.Context) {
 	req.Name = strings.TrimSpace(req.Name)
 	if req.Name == "" || !validAgentKind(req.Kind) {
 		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "助手的名字或 kind 不对", nil)
+		return
+	}
+	if !validAgentName(req.Name) {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, agentNameRuleMessage, nil)
 		return
 	}
 	if _, err := s.store.TenantAgentByName(c.Request.Context(), p.TenantID, req.Name); err == nil {
@@ -1090,7 +1219,11 @@ func (s *Server) importAgents(c *gin.Context) {
 	for _, file := range req.Files {
 		spec, err := parseAgentSpec([]byte(file.Content))
 		if err != nil {
-			writeEnvelope(c, http.StatusBadRequest, codeBadInput, "有一份规格格式不对", nil)
+			msg := "有一份规格格式不对"
+			if errors.Is(err, errBadAgentName) {
+				msg = agentNameRuleMessage
+			}
+			writeEnvelope(c, http.StatusBadRequest, codeBadInput, msg, nil)
 			return
 		}
 		if _, ok := seen[spec.Name]; ok {
@@ -1117,7 +1250,9 @@ func (s *Server) importAgents(c *gin.Context) {
 				DefaultID: def.ID, Name: def.Name, Kind: def.Kind, Visibility: "tenant", Source: "override",
 			}
 		} else if errors.Is(err, ErrAgentNotFound) {
-			row = TenantAgent{Name: spec.Name, Kind: "subagent", Visibility: "tenant", Source: "custom"}
+			// 与手工新建同默认（仅自己）：两条入口在同一个页面上，导入的人不该因为「文件里没写可见性」
+			// 就把助手发给全团队。要共享，导入后显式改成团队可见。
+			row = TenantAgent{Name: spec.Name, Kind: "subagent", Visibility: "private", Source: "custom"}
 		} else {
 			internal(c, err)
 			return

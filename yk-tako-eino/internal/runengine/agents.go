@@ -20,10 +20,12 @@ package runengine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -51,6 +53,19 @@ type AgentSpec struct {
 	Model        string    // frontmatter model: 行原文——parse 只认语法，写法分流在装配层（19v6-05 §4）
 	Prompt       string    // 正文 = system prompt
 }
+
+// agentNamePattern 是助手名的唯一合法形状。名字不只是标签：它同时是 AgentTool 的工具名、
+// runlog 的 agent 值、厂商请求里 tools[i].function.name——厂商只收 [A-Za-z0-9_-]，
+// 一个空格就让这一租户装配出的每次请求被 400 打回（2026-10-23 走查的 P0）。
+var agentNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// errBadAgentName 是「名字形状不合法」的哨兵：导入把解析错误统一说成「格式不对」，
+// 只有这一种要翻成点名规则的文案。
+var errBadAgentName = errors.New("bad agent name")
+
+const agentNameRuleMessage = "助手名字只能用字母、数字、下划线、连字符（1–64 个字符）"
+
+func validAgentName(name string) bool { return agentNamePattern.MatchString(name) }
 
 // agentSpecFront 是 frontmatter 的 YAML 形状。Model 原样带出：写了/没写、是关键词还是 ref，
 // 都在装配层分流——parse 层不做语义判断（19v6-05 §4）。
@@ -137,6 +152,9 @@ func parseAgentSpec(raw []byte) (AgentSpec, error) {
 	f.Description = strings.TrimSpace(f.Description)
 	if f.Name == "" {
 		return AgentSpec{}, fmt.Errorf("缺必填字段 name")
+	}
+	if !validAgentName(f.Name) {
+		return AgentSpec{}, fmt.Errorf("%w：%s", errBadAgentName, agentNameRuleMessage)
 	}
 	if f.Description == "" {
 		return AgentSpec{}, fmt.Errorf("缺必填字段 description（模型决定委派与否的唯一入口）")
@@ -530,6 +548,12 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 	ctx = withSubagentAssembly(ctx, &subagentAssembly{base: base, snap: snap, specs: specs})
 	var loaded []string
 	for _, spec := range specs {
+		// 存量行也要挡：写入口校验是 2026-10-23 才加的，之前落库的坏名字（如带空格）仍在表里，
+		// 装进池就是这一租户每场 run 都被厂商 400——一条坏规格只该失效它自己。
+		if !validAgentName(spec.Name) {
+			log.Printf("agents: %q: 拒载: %s", spec.Name, agentNameRuleMessage)
+			continue
+		}
 		pool, err := resolveToolPool(ctx, spec, base)
 		if err != nil {
 			log.Printf("agents: %s: 拒载: %v", spec.Name, err)

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,6 +43,27 @@ type Server struct {
 	auth *Auth
 }
 
+// 访问日志脱敏（doc/49 A12）：EventSource 只能把 access token 放查询串，而默认的 gin 访问日志
+// 原样打印整条 URL——日志一旦被采集/外送，凭证就跟着出去了。只打码这一个键，其余 query 照旧保留。
+var accessTokenQuery = regexp.MustCompile(`access_token=[^&\s]+`)
+
+func redactAccessToken(query string) string {
+	return accessTokenQuery.ReplaceAllString(query, "access_token=***")
+}
+
+// accessLogLine 复刻 gin 默认访问日志的形状（gin v1.12 的 Path 已含查询串），只把 access_token 抹掉。
+func accessLogLine(p gin.LogFormatterParams) string {
+	return fmt.Sprintf("[GIN] %v | %3d | %13v | %15s | %-7s %#v\n%s",
+		p.TimeStamp.Format("2006/01/02 - 15:04:05"),
+		p.StatusCode,
+		p.Latency,
+		p.ClientIP,
+		p.Method,
+		redactAccessToken(p.Path),
+		p.ErrorMessage,
+	)
+}
+
 // NewRouter 挂 v6 第一步的全部四个 API（19v6-01 §0）。整张面的心智模型就一条循环：
 // **投一条消息，轮询看着回复一点点生成、定稿**。四个端点各管一段，两条游标别混：
 //
@@ -62,7 +84,8 @@ type Server struct {
 // 无推送、无 heartbeat。两个拉取端点一律有界：单批上限 W（-batch-window，dev 默认 200）。
 func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMax int, auth *Auth) *gin.Engine {
 	s := &Server{store: store, w: batchWindow, worker: worker, mediaRoot: worker.Workspace(), mcpConfPath: defaultMcpConfPath, resumeMax: resumeMax, auth: auth}
-	r := gin.Default()
+	r := gin.New()
+	r.Use(gin.LoggerWithFormatter(accessLogLine), gin.Recovery())
 	r.POST("/api/auth/signup", s.auth.Signup)
 	r.POST("/api/auth/login", s.auth.Login)
 	r.POST("/api/auth/refresh", s.auth.Refresh)
@@ -75,6 +98,9 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 	r.POST("/api/runs/:runId/stop", authn, s.stopRun)
 	r.POST("/api/runs/:runId/resume", authn, s.resumeRun)
 	r.GET("/api/runs/:runId", authn, s.getRunStatus)
+	// 等人机器（doc/47）：挂起中的问题/方案行。列表按 run 可见性；答案端点按行找到 run 再判权。
+	r.GET("/api/runs/:runId/questions", authn, s.listQuestions)
+	r.POST("/api/questions/:id/answer", authn, s.answerQuestion)
 	r.GET("/api/sessions", authn, s.listSessions)
 	r.PATCH("/api/sessions/:id/visibility", authn, s.patchSessionVisibility)
 	r.PATCH("/api/sessions/:id", authn, s.patchSessionWorkspace)
@@ -94,6 +120,9 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 	r.POST("/api/tenants", authn, s.createTenant)
 	r.POST("/api/workspaces", authn, s.postWorkspaces)
 	r.GET("/api/workspaces", authn, s.listWorkspaces)
+	// 项目目录里的文件清单（doc/48 B1）：agent 写出的文件落在项目目录，字节出口 GET /api/media
+	// 今天就能读，缺的只有「列目录」这一半。
+	r.GET("/api/workspaces/:id/files", authn, s.listWorkspaceFiles)
 	r.PATCH("/api/workspaces/:id", authn, s.patchWorkspace)
 	r.PATCH("/api/workspaces/:id/visibility", authn, s.patchWorkspaceVisibility)
 	r.DELETE("/api/workspaces/:id", authn, s.deleteWorkspace)
@@ -148,6 +177,8 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 		r.POST("/api/dev/file-fingerprint", authn, s.devFileFingerprint)
 		r.POST("/api/dev/file-lock-check", authn, s.devFileLockCheck)
 		r.POST("/api/dev/pii-check", authn, s.devPiiCheck)
+		r.POST("/api/dev/question-check", authn, s.devQuestionCheck)
+		r.POST("/api/dev/plan-gate-check", authn, s.devPlanGateCheck)
 		r.POST("/api/dev/clean-sweep", s.devCleanSweep)
 	}
 	return r
@@ -627,7 +658,15 @@ func (s *Server) resumeRun(c *gin.Context) {
 		internal(c, err)
 		return
 	}
-	replay, err := replayJournal(runID, claim.Rows)
+	// 第三分支的现场：挂起中的问/方案行（doc/47 §3.3）。读失败同样放弃认领——
+	// 拿不到行就无法判断「在等什么」，宁可让下一发立刻可接。
+	questions, err := s.store.ListQuestions(ctx, runID, "")
+	if err != nil {
+		_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
+		internal(c, err)
+		return
+	}
+	replay, err := replayJournal(runID, claim.Rows, questions)
 	if err != nil {
 		_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
 		internal(c, err)

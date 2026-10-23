@@ -256,6 +256,25 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		}
 		pool = append(pool, wrapToolErrors(t))
 	}
+	// 追问工具（Q2，doc/47 §3.3）：tasktools 之后 append。挂起现场落 run_questions 行，
+	// 答案按工具契约注回同一轮；researcher 走排除路会继承它（金样同步）。
+	ask, err := newAskUserTool(store)
+	if err != nil {
+		return nil, err
+	}
+	pool = append(pool, wrapToolErrors(ask))
+	// 计划模式的进入工具（doc/47 §3.2）：置位 runs.plan_mode + 本 run 的守卫快照。
+	enterPlan, err := newEnterPlanModeTool(store)
+	if err != nil {
+		return nil, err
+	}
+	pool = append(pool, wrapToolErrors(enterPlan))
+	// 方案提交工具（doc/47 §3.4）：复用等人机器（kind=plan），批准侧置 plan_mode=false。
+	submitPlan, err := newSubmitPlanTool(store)
+	if err != nil {
+		return nil, err
+	}
+	pool = append(pool, wrapToolErrors(submitPlan))
 	// 摘要器在 agent 装配前构造（A4，planning 裁定 9）：midfoldHandler 要拿它的 summarize 方法值——
 	// mid-run 折叠与 prepareInput 的 Run fold 共用同一个摘要器、同一顶帽（C5-A7 分档）。
 	compactLimit := CompactLimitFor(compactWindow)
@@ -298,9 +317,12 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 	// 一手池、MCP（mcpToolHandler）、委派（agentSpecHandler）与以后新增的工具一处覆盖。
 	// 子代理入口快照在此前已完成，拿的是未包壳工具，内部调用不记账。
 	handlers = append(handlers, &journalWrapHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, store: store})
+	// 计划模式守卫（doc/47 §3.2）：append 在账本之后 = 运行时包在账本外层——拒绝发生在
+	// 记账与执行之前（被拒调用不落 intent）。它只看 run 级 ctx 里的快照，无跨 run 状态。
+	handlers = append(handlers, &planGuardHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}})
 	// 看板使用约定静态拼进系统提示（doc/41 §3.3）：约定写在提示词里，不写状态机——
 	// 「提示词和工具，一个都不能少」。子代理的规格文件（agents/*.md）自带各自的约定。
-	system = system + "\n\n" + taskBoardPrompt
+	system = system + "\n\n" + taskBoardPrompt + "\n\n" + askUserPrompt + "\n\n" + planPrompt
 	w := &Worker{store: store, sum: sum, chat: chat, tools: pool, handlers: handlers, translate: translate, system: system,
 		rootRef: modelRef, leaseRenew: leaseRenew, workspace: workspace, compactWindow: compactWindow, compactLimit: compactLimit, archiveTTL: archiveTTL, counter: counter}
 	// 启动时先建一次，配置坏了立刻退出。每场 run 再新建，避免多个租户共用一个 agent 实例时取消互相踩掉。
@@ -472,6 +494,9 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 	// A3 起所有写点都带它）。这里塞进的是 agent.Run 与全部工具调用共用的 ctx——工具包装层的
 	// intent/result 都读它。
 	ctx = withJournalTarget(ctx, journalTarget{runID: runID, epoch: epoch})
+	// 计划模式快照（doc/47 §3.2）：PG 是真源，resume 时从这里恢复——批准前崩溃再接管，
+	// 守卫仍然是「开」的；批准后崩溃则读到 false，放行。
+	ctx = withPlanGate(ctx, seedPlanGate(ctx, w.store, runID))
 	if p, ok := principalFromCtx(ctx); ok {
 		ctx = withScope(ctx, dataScope{TenantID: p.TenantID, UserID: p.UserID, Scope: "user"})
 		if p.TenantID != "" {
@@ -542,6 +567,16 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 		w.watchdog(leaseCtx, sessionID, runID, epoch)
 	}()
 	defer func() { cancelLease(); wg.Wait() }()
+
+	// resume 第三分支（doc/47 §3.3）：挂起中的问/方案行接回现场。必须在 watchdog 起跑之后——
+	// 继续等人期间租约照续，否则一次长等就把 run 判死。
+	if resume != nil {
+		if err := reconcileResumeWaits(ctx, w.store, runID, epoch, resume); err != nil {
+			log.Printf("resume waits %s/%s: %v", sessionID, runID, err)
+			status = "error"
+			return
+		}
+	}
 
 	// 笔记的 run 身份（M1，notes.go）：本 run user 行的 runlog seq——AcquireRun 已入该行；
 	// 工具写 notes 时以 (run id, seq) 填 source 两列（对质入口：从笔记行找回原话现场）。

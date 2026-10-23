@@ -3,6 +3,7 @@ package runengine
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/cloudwego/eino/adk"
@@ -166,7 +167,7 @@ func TestReplayJournal(t *testing.T) {
 			{Role: "tool_result", ToolCallID: "call_1", ToolName: "bash", Text: "one"},
 			{Role: "assistant", Text: "完成", Model: "m2"},
 		}
-		got, err := replayJournal("r_replay", rows)
+		got, err := replayJournal("r_replay", rows, nil)
 		if err != nil {
 			t.Fatalf("replayJournal: %v", err)
 		}
@@ -200,7 +201,7 @@ func TestReplayJournal(t *testing.T) {
 			{Role: "tool_call", ToolCallID: "call_1", ToolName: "bash", Args: c1.Function.Arguments},
 			{Role: "tool_result", ToolCallID: "call_1", ToolName: "bash", Text: "one"},
 		}
-		got, err := replayJournal("r_replay", rows)
+		got, err := replayJournal("r_replay", rows, nil)
 		if err != nil {
 			t.Fatalf("replayJournal: %v", err)
 		}
@@ -223,7 +224,7 @@ func TestReplayJournal(t *testing.T) {
 			{Role: "tool_result", ToolCallID: "call_o", ToolName: "bash", Text: "out"},
 			{Role: "assistant", Text: "完", Model: "m"},
 		}
-		got, err := replayJournal("r_replay", rows)
+		got, err := replayJournal("r_replay", rows, nil)
 		if err != nil {
 			t.Fatalf("replayJournal: %v", err)
 		}
@@ -246,7 +247,7 @@ func TestReplayJournal(t *testing.T) {
 			{Role: "assistant", ToolCalls: callsJSON(c1), Model: "m"},
 			{Role: "tool_call", ToolCallID: "call_1", ToolName: "bash", Args: c1.Function.Arguments},
 		}
-		got, err := replayJournal("r_replay", rows)
+		got, err := replayJournal("r_replay", rows, nil)
 		if err != nil {
 			t.Fatalf("缺 result 不许报错（不重跑，回注中断文本）: %v", err)
 		}
@@ -262,6 +263,100 @@ func TestReplayJournal(t *testing.T) {
 		}
 		if got.Turn[1].ToolName != "bash" || got.Turn[1].Model != "m" {
 			t.Fatalf("合成 tool turn = %+v, want 工具名与模型身份随行", got.Turn[1])
+		}
+	})
+}
+
+// TestReplayJournalWaitRows 钉 doc/47 §3.3 的 resume 第三分支：缺结果的「等人」调用按
+// ToolCallID 对 run_questions 行——pending 交给 worker 重发帧继续等，answered 直接注回，
+// 无行 / stale 维持 interruptedResultText（at-most-once）。
+func TestReplayJournalWaitRows(t *testing.T) {
+	call := schema.ToolCall{ID: "call_q", Type: "function",
+		Function: schema.FunctionCall{Name: "ask_user", Arguments: `{"question":"文件名？","options":["a.txt"]}`}}
+	callsJSON := func() string {
+		b, err := json.Marshal([]schema.ToolCall{call})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	rows := func() []RunJournal {
+		return []RunJournal{
+			{Role: "assistant", ToolCalls: callsJSON(), Model: "m"},
+			{Role: "tool_call", ToolCallID: "call_q", ToolName: "ask_user", Args: call.Function.Arguments},
+		}
+	}
+	row := func(kind, status, answer string) RunQuestion {
+		return RunQuestion{ID: "qs_1", ToolCallID: "call_q", Kind: kind, Status: status,
+			Question: "文件名？", Args: call.Function.Arguments, Answer: answer}
+	}
+
+	t.Run("pending 记进 Waits，行文本仍是中断文本", func(t *testing.T) {
+		got, err := replayJournal("r_wait", rows(), []RunQuestion{row(questionKindQuestion, questionStatusPending, "")})
+		if err != nil {
+			t.Fatalf("replayJournal: %v", err)
+		}
+		if len(got.Waits) != 1 || got.Waits[0].ID != "qs_1" || got.Waits[0].ToolCallID != "call_q" {
+			t.Fatalf("Waits = %+v, want 一行 qs_1/call_q", got.Waits)
+		}
+		if got.Rows[1].Text != interruptedResultText {
+			t.Fatalf("pending 行重放文本 = %q, want 中断文本（worker 等完再换）", got.Rows[1].Text)
+		}
+	})
+
+	t.Run("answered 注回答案原文", func(t *testing.T) {
+		got, err := replayJournal("r_wait", rows(), []RunQuestion{row(questionKindQuestion, questionStatusAnswered, "a.txt")})
+		if err != nil {
+			t.Fatalf("replayJournal: %v", err)
+		}
+		if len(got.Waits) != 0 || got.PlanApproved {
+			t.Fatalf("Waits=%d PlanApproved=%v, want 0 / false", len(got.Waits), got.PlanApproved)
+		}
+		if got.Rows[1].Text != "a.txt" || got.Turn[1].Text != "a.txt" {
+			t.Fatalf("注回文本 = %q / turn %q, want a.txt", got.Rows[1].Text, got.Turn[1].Text)
+		}
+	})
+
+	t.Run("answered plan 注回批准文并标记退出 plan mode", func(t *testing.T) {
+		got, err := replayJournal("r_wait", rows(),
+			[]RunQuestion{row(questionKindPlan, questionStatusAnswered, "改成 b.txt")})
+		if err != nil {
+			t.Fatalf("replayJournal: %v", err)
+		}
+		want := "方案已批准，按方案执行。\n用户的修改：\n改成 b.txt"
+		if got.Rows[1].Text != want {
+			t.Fatalf("批准文本 = %q, want %q", got.Rows[1].Text, want)
+		}
+		if !got.PlanApproved {
+			t.Fatal("PlanApproved = false, want true（worker 要补写 runs.plan_mode=false）")
+		}
+	})
+
+	t.Run("answered plan 驳回注回驳回文且不退出 plan mode", func(t *testing.T) {
+		rejected := row(questionKindPlan, questionStatusAnswered, "先备份再删")
+		rejected.Decision = questionDecisionRevise
+		got, err := replayJournal("r_wait", rows(), []RunQuestion{rejected})
+		if err != nil {
+			t.Fatalf("replayJournal: %v", err)
+		}
+		if got.PlanApproved {
+			t.Fatal("PlanApproved = true, want false（驳回不能解除计划模式）")
+		}
+		if !strings.Contains(got.Rows[1].Text, "方案被驳回") || !strings.Contains(got.Rows[1].Text, "先备份再删") {
+			t.Fatalf("驳回注回文本 = %q", got.Rows[1].Text)
+		}
+		if strings.Contains(got.Rows[1].Text, "已批准") {
+			t.Fatalf("驳回文本混进了批准语义: %q", got.Rows[1].Text)
+		}
+	})
+
+	t.Run("stale 维持中断文本", func(t *testing.T) {
+		got, err := replayJournal("r_wait", rows(), []RunQuestion{row(questionKindQuestion, questionStatusStale, "")})
+		if err != nil {
+			t.Fatalf("replayJournal: %v", err)
+		}
+		if len(got.Waits) != 0 || got.Rows[1].Text != interruptedResultText {
+			t.Fatalf("Waits=%d text=%q, want 0 / 中断文本", len(got.Waits), got.Rows[1].Text)
 		}
 	})
 }

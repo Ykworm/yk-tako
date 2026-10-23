@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { api, type AgentRow, type McpItem, type McpServer, type RuntimeConfig, type ToolPolicy } from './configureApi'
 import { authState, loginWithPassword, readTenant, readToken } from './auth'
+import ConfirmDialog from './ConfirmDialog.vue'
 import MembersView from './MembersView.vue'
 
 const props = defineProps<{ page: 'agents' | 'team' }>()
@@ -28,8 +29,10 @@ function flash(message: string) {
 // 登录态是共享的：对话页登录过，这里直接是已登录；这里退出，对话页也退回登录表单。
 const loggedIn = computed(() => authState.value)
 
-function show(status: number, message: string, code: number) {
-  banner.value = code === 0 ? '' : status + '：' + (message || '请求失败')
+// status 只决定「是不是失败」（code !== 0 已说明），不进文案：用户不需要 409/400 这些网关语义，
+// 「这个名字已经有一份配置」本身就是完整的一句话。
+function show(_status: number, message: string, code: number) {
+  banner.value = code === 0 ? '' : message || '请求失败'
 }
 
 async function login() {
@@ -38,7 +41,7 @@ async function login() {
   try {
     const res = await loginWithPassword(email.value, password.value)
     if (!res.ok) {
-      banner.value = res.status ? `${res.status}：${res.message}` : res.message
+      banner.value = res.message
       return
     }
     token.value = readToken()
@@ -128,6 +131,16 @@ function policyFromForm(): ToolPolicy {
   return { mode, names: mode === 'allow' || mode === 'exclude' ? names : [] }
 }
 
+// 新建撞名要硬拦：服务端对「与内置同名」会建一份 override，并用请求里的空说明/空规格覆盖内置那份，
+// 用户看到的是一具空壳；而「编辑内置」本来就走左侧选中它（PUT），不需要从新建进。
+// 两侧都要查——root 与 subagent 是同一个名字空间的不同视图，撞另一侧同样会被服务端当同类处理。
+async function nameTaken(name: string): Promise<boolean> {
+  if (agents.value.some((a) => a.name === name)) return true
+  const other = tab.value === 'root' ? 'subagent' : 'root'
+  const res = await api<{ agents: AgentRow[] }>('GET', `/api/tenants/${tenant.value.id}/agents?kind=${other}`)
+  return res.body.code === 0 && !!res.body.data?.agents.some((a) => a.name === name)
+}
+
 async function inferKind(name: string): Promise<string> {
   const other = tab.value === 'root' ? 'subagent' : 'root'
   const res = await api<{ agents: AgentRow[] }>('GET', `/api/tenants/${tenant.value.id}/agents?kind=${other}`)
@@ -141,6 +154,17 @@ async function saveAgent() {
   busy.value = true
   banner.value = ''
   try {
+    if (creating.value) {
+      const name = row.name.trim()
+      if (!name) {
+        show(0, '请填写助手名字', 1)
+        return
+      }
+      if (await nameTaken(name)) {
+        show(0, `「${name}」已经是内置或已有助手，要改它请在左侧选中后编辑`, 1)
+        return
+      }
+    }
     const toolPolicy = policyFromForm()
     const fields = {
       name: row.name,
@@ -210,7 +234,8 @@ async function onImport(ev: Event) {
     }
     banner.value = ''
     await loadAgents()
-    flash('已导入')
+    // 导入的默认可见性与手工新建一致（仅自己）；不写出来，用户会以为已经共享给团队。
+    flash('已导入（默认仅自己可见，要共享请打开后改成团队可见）')
   } finally {
     busy.value = false
   }
@@ -218,7 +243,22 @@ async function onImport(ev: Event) {
 
 const modelRef = ref('')
 const network = ref(false)
-const secretRows = ref<{ name: string; value: string; masked: boolean }[]>([])
+
+// 密钥行（doc/48 C2）：value 一律是**用户新填的值**，空 = 不改动。
+//
+// 服务端回的是掩码 '••••'，那不是真值。以前它直接躺在输入框的 value 里，
+// 用户一改就成了 '•••sk-xxx' 这种带占位符前缀的垃圾串——保存进去密钥当场失效，
+// 而界面照样弹「已保存」。现在：输入框里**只放用户自己填的东西**，
+// 服务端有没有这把钥匙用 hasValue 记，「留空」从此只有一种含义。
+type SecretRow = {
+  name: string
+  value: string
+  hasValue: boolean // 服务端那边这把密钥存在（值是掩码还是真值都算）
+  removed: boolean // 标记删除（保存后生效）
+}
+const secretRows = ref<SecretRow[]>([])
+const showSecret = ref(false)
+const removeSecretName = ref('')
 const originalSecrets = ref<string[]>([])
 const mcpRows = ref<{ name: string; command: string; args: string; envText: string }[]>([])
 const systemMcp = ref<McpItem[]>([])
@@ -248,11 +288,18 @@ async function loadConfig() {
     return
   }
   const cfg = res.body.data.config
+  savedConfig = cfg
   modelRef.value = cfg.modelRef || ''
   network.value = !!cfg.sandbox?.network
   const secrets = cfg.secrets || {}
   originalSecrets.value = Object.keys(secrets)
-  secretRows.value = Object.keys(secrets).sort().map((name) => ({ name, value: secrets[name] || '', masked: secrets[name] === '••••' }))
+  // 服务端只回掩码 '••••'——那不是真值，不该躺在输入框里（见 SecretRow 的注释）。
+  secretRows.value = Object.keys(secrets).sort().map((name) => ({
+    name,
+    value: '',
+    hasValue: true,
+    removed: false,
+  }))
   mcpRows.value = Object.keys(cfg.mcpServers || {}).sort().map((name) => {
     const sc: McpServer = cfg.mcpServers[name]
     return { name, command: sc.command || '', args: (sc.args || []).join(' '), envText: envText(sc.env) }
@@ -261,57 +308,138 @@ async function loadConfig() {
 }
 
 function addSecret() {
-  secretRows.value.push({ name: '', value: '', masked: false })
+  secretRows.value.push({ name: '', value: '', hasValue: false, removed: false })
 }
 
 function addMcp() {
   mcpRows.value.push({ name: '', command: '', args: '', envText: '' })
 }
 
-async function saveConfig() {
+// 删一把密钥：先标记、**保存后才生效**，并要一次确认。
+// 「移除」这个词听起来只是「从列表里拿掉」，可它删的是真密钥——所以改名 + 确认。
+function askRemoveSecret(row: SecretRow) {
+  removeSecretName.value = row.name
+}
+
+function cancelRemoveSecret() {
+  removeSecretName.value = ''
+}
+
+function confirmRemoveSecret() {
+  const row = secretRows.value.find((r) => r.name === removeSecretName.value)
+  if (row) {
+    row.removed = true
+    row.value = ''
+  }
+  removeSecretName.value = ''
+}
+
+// 最近一次从服务端读到的完整配置（**已保存的值**）。
+//
+// 保存某张卡片时，其它卡片用这份「已保存的值」而不是「当前编辑中的值」——
+// 否则在「模型」卡片点保存，会把「密钥」卡片里还没保存的编辑一起提交，
+// 「每张卡片各有各的保存」就名存实亡了（用户只想存模型，密钥却被改了）。
+let savedConfig: RuntimeConfig | null = null
+
+// secretsPayload 把这张表拼成请求体里的 secrets。三条规则（doc/48 C2）：
+//   ① 标记删除的 → ''（服务端 = 删掉这把）
+//   ② 填了新值的 → 新值
+//   ③ 没动过的（留空、但服务端有）→ '••••'（服务端认这个占位符 = 保留原值）
+// 「留空」从此**只有一种含义：不改动**。之前它还兼着「删除」，一个状态两种含义最容易出事。
+function secretsPayload(): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const row of secretRows.value) {
+    const name = row.name.trim()
+    if (!name) continue
+    if (row.removed) {
+      out[name] = ''
+      continue
+    }
+    if (row.value) {
+      out[name] = row.value
+      continue
+    }
+    if (row.hasValue) out[name] = '••••'
+  }
+  // 表里没有的原有 key = 用户把那一行删掉或改名了 → 显式删掉（与服务端整体 PUT 的效果一致）。
+  for (const name of originalSecrets.value) {
+    if (!(name in out)) out[name] = ''
+  }
+  return out
+}
+
+// 名字空着、却填了值的行会被 secretsPayload 静默丢掉：用户点保存、横幅说「密钥已保存」，
+// 刷新后这行没了。保存前先拦，让它当场说清楚。
+function secretNameMissing(): boolean {
+  return secretRows.value.some((row) => !row.name.trim() && row.value.trim() !== '')
+}
+
+// mcpPayload 拼 MCP 配置；环境写错（不是 KEY=VALUE）时返回 null，由调用方报错。
+function mcpPayload(): Record<string, McpServer> | null {
+  const out: Record<string, McpServer> = {}
+  for (const row of mcpRows.value) {
+    const name = row.name.trim()
+    if (!name) continue
+    const env = parseEnv(row.envText)
+    if (!env) return null
+    out[name] = {
+      command: row.command.trim(),
+      args: row.args.split(' ').map((s) => s.trim()).filter(Boolean),
+      env,
+    }
+  }
+  return out
+}
+
+// 三张卡片各有自己的保存（doc/48 C3）。原来整页只有一个「保存」，藏在最后一张卡片（MCP）里——
+// 改个默认模型要点到页面最底才找得到；而「测试连接」紧挨着表单内容，用户理所当然以为它测的是
+// **正在编辑的内容**，它其实测的是服务端已存的配置。
+//
+// 服务端是**整体 PUT**：只传自己那块会把别的块清空 → 每次保存都带上完整配置。
+async function saveConfig(what: 'model' | 'secrets' | 'mcp') {
+  if (busy.value) return
   busy.value = true
   banner.value = ''
   try {
-    const secrets: Record<string, string> = {}
-    const seen = new Set<string>()
-    for (const row of secretRows.value) {
-      const name = row.name.trim()
-      if (!name) continue
-      seen.add(name)
-      secrets[name] = row.masked ? '••••' : row.value
+    if (what === 'secrets' && secretNameMissing()) {
+      banner.value = '密钥名不能为空'
+      return
     }
-    for (const name of originalSecrets.value) {
-      if (!seen.has(name)) secrets[name] = ''
+    const mcpServers = what === 'mcp' ? mcpPayload() : (savedConfig?.mcpServers ?? {})
+    if (what === 'mcp' && !mcpServers) {
+      banner.value = 'MCP 环境要写成 KEY=VALUE，一行一个'
+      return
     }
-    const mcpServers: Record<string, McpServer> = {}
-    for (const row of mcpRows.value) {
-      const name = row.name.trim()
-      if (!name) continue
-      const env = parseEnv(row.envText)
-      if (!env) {
-        banner.value = '400：MCP 环境要写成 KEY=VALUE，一行一个'
-        return
-      }
-      mcpServers[name] = {
-        command: row.command.trim(),
-        args: row.args.split(' ').map((s) => s.trim()).filter(Boolean),
-        env,
-      }
+    // 只提交**这张卡片**的编辑结果；其它块用服务端已保存的值原样带回
+    // （secrets 里是掩码 '••••'，服务端认它 = 保留原值）。
+    const body = {
+      modelRef: what === 'model' ? modelRef.value.trim() : (savedConfig?.modelRef ?? ''),
+      mcpServers: mcpServers ?? {},
+      secrets: what === 'secrets' ? secretsPayload() : (savedConfig?.secrets ?? {}),
+      sandbox: what === 'model' ? { network: network.value } : (savedConfig?.sandbox ?? { network: false }),
     }
-    const res = await api<{ config: RuntimeConfig }>('PUT', `/api/tenants/${tenant.value.id}/runtime-config`, {
-      modelRef: modelRef.value.trim(),
-      mcpServers,
-      secrets,
-      sandbox: { network: network.value },
-    })
+    const res = await api<{ config: RuntimeConfig }>('PUT', `/api/tenants/${tenant.value.id}/runtime-config`, body)
     if (res.body.code !== 0) {
       show(res.status, res.body.message, res.body.code)
       return
     }
-    await loadConfig()
-    // 状态是探针结果，不是配置本身：保存后旧结果已失效，当场重测（否则要再点一次「测试连接」）。
-    await testMcp()
-    if (!banner.value) flash('已保存，并重新测过连接')
+    // **不要整份 loadConfig()**：那会把用户在**其它卡片**里还没保存的编辑一起冲掉
+    // （在「密钥」卡片点保存 → 「模型」卡片里刚填的模型被覆盖回旧值 = 用户白填了）。
+    // 这里只更新「已保存值」里刚提交的那一块，编辑框保持原样。
+    savedConfig = {
+      ...((savedConfig ?? {}) as RuntimeConfig),
+      ...(what === 'model' ? { modelRef: body.modelRef, sandbox: body.sandbox } : {}),
+      ...(what === 'secrets' ? { secrets: body.secrets } : {}),
+      ...(what === 'mcp' ? { mcpServers: body.mcpServers } : {}),
+    }
+    // 已标记删除的行：删除已经生效，把它从表里去掉（「撤销删除」在保存后已无意义——
+    // 服务端那边已经是空值了，再撤销也回不来）。
+    if (what === 'secrets') {
+      secretRows.value = secretRows.value.filter((r) => !r.removed)
+    }
+    // **不再自动重测连接**：保存这个动作不该顺带拉起 MCP 子进程、也不该变慢。
+    // 连接状态是探针结果，用户想看就点「测试已保存的配置」。
+    flash(what === 'model' ? '模型已保存' : what === 'secrets' ? '密钥已保存' : 'MCP 已保存')
   } finally {
     busy.value = false
   }
@@ -438,8 +566,8 @@ onMounted(() => {
             <button type="button" class="text" @click="closeEditor">收起</button>
           </div>
           <div class="fields">
-            <label>名字<input v-model="selected.name" :disabled="selected.source === 'default' || selected.source === 'override'" required /></label>
-            <label>说明<input v-model="selected.description" /></label>
+            <label>名字<input v-model="selected.name" maxlength="64" :disabled="selected.source === 'default' || selected.source === 'override'" required /></label>
+            <label>说明<textarea v-model="selected.description" rows="3"></textarea></label>
             <label>模型<input v-model="selected.modelRef" placeholder="留空则继承工作区模型" /></label>
             <label>可见性
               <select v-model="selected.visibility">
@@ -455,9 +583,9 @@ onMounted(() => {
                 <option value="none">不用工具</option>
               </select>
             </label>
-            <label v-if="selected.toolPolicy.mode === 'allow' || selected.toolPolicy.mode === 'exclude'">工具名<input v-model="namesText" placeholder="用逗号分开" /></label>
+            <label v-if="selected.toolPolicy.mode === 'allow' || selected.toolPolicy.mode === 'exclude'">工具名<textarea v-model="namesText" rows="2" placeholder="用逗号分开"></textarea></label>
           </div>
-          <label>规格<textarea v-model="selected.spec" rows="12"></textarea></label>
+          <label>规格<textarea v-model="selected.spec" rows="16" class="spec-area"></textarea></label>
           <div class="row">
             <button type="submit" class="primary" :disabled="busy">{{ selected.source === 'default' ? '保存为覆盖' : (busy ? '正在保存…' : '保存') }}</button>
             <template v-if="selected.source === 'override' || (selected.source === 'custom' && selected.id)">
@@ -478,45 +606,76 @@ onMounted(() => {
 
       <MembersView v-else-if="teamSub === 'members'" />
 
-      <form v-else class="stack" @submit.prevent="saveConfig">
-        <section class="card">
-          <h3>模型</h3>
-          <label>默认模型<input v-model="modelRef" placeholder="deepseek/deepseek-v4-flash" /></label>
-          <label class="check"><input v-model="network" type="checkbox" />沙箱允许出网</label>
-        </section>
+      <template v-else>
+        <!-- 三张卡片各有自己的保存（doc/48 C3）。原来整页只有一个「保存」按钮，
+             藏在最后一张卡片（MCP）底部——改个默认模型要点到页面最底才找得到。 -->
+        <form class="stack" @submit.prevent="saveConfig('model')">
+          <section class="card">
+            <h3>模型</h3>
+            <label>默认模型<input v-model="modelRef" placeholder="deepseek/deepseek-v4-flash" /></label>
+            <label class="check"><input v-model="network" type="checkbox" />沙箱允许出网</label>
+            <div class="row">
+              <button type="submit" class="primary" :disabled="busy">{{ busy ? '正在保存…' : '保存模型设置' }}</button>
+            </div>
+          </section>
+        </form>
 
-        <section class="card">
-          <h3>密钥</h3>
-          <p class="muted">格子里仍是 •••• 时，保存不会改这把密钥。把格子清空再保存，会删掉它。</p>
-          <div v-for="(row, i) in secretRows" :key="'s' + i" class="pair">
-            <input v-model="row.name" aria-label="密钥名" placeholder="DEEPSEEK_API_KEY" />
-            <input v-model="row.value" aria-label="密钥值" @input="row.masked = false" />
-            <button type="button" @click="secretRows.splice(i, 1)">移除</button>
-          </div>
-          <button type="button" @click="addSecret">加一把密钥</button>
-        </section>
+        <form class="stack" @submit.prevent="saveConfig('secrets')">
+          <section class="card">
+            <h3>密钥</h3>
+            <p class="muted">
+              留空表示不改这把钥匙。要换值就填新值；要删就点「删除这把密钥」——标记后保存才生效。
+            </p>
+            <div v-for="(row, i) in secretRows" :key="'s' + i" class="pair" :class="{ removed: row.removed }">
+              <input v-model="row.name" aria-label="密钥名" placeholder="DEEPSEEK_API_KEY" :disabled="row.removed" />
+              <span class="secret">
+                <input
+                  v-model="row.value"
+                  :type="showSecret ? 'text' : 'password'"
+                  aria-label="密钥值"
+                  :placeholder="row.hasValue ? '已保存（留空则不改动）' : '填入密钥值'"
+                  :disabled="row.removed"
+                  autocomplete="off"
+                />
+                <button type="button" class="text" @click="showSecret = !showSecret">{{ showSecret ? '隐藏' : '显示' }}</button>
+              </span>
+              <button v-if="!row.removed" type="button" @click="askRemoveSecret(row)">删除这把密钥</button>
+              <button v-else type="button" @click="row.removed = false">撤销删除</button>
+            </div>
+            <div class="row">
+              <button type="button" @click="addSecret">加一把密钥</button>
+              <button type="submit" class="primary" :disabled="busy">{{ busy ? '正在保存…' : '保存密钥' }}</button>
+            </div>
+          </section>
+        </form>
 
-        <section class="card">
-          <h3>自定义 MCP</h3>
-          <p v-if="!mcpRows.length" class="muted">还没有自定义 MCP。</p>
-          <div v-for="(row, i) in mcpRows" :key="'m' + i" class="mcp">
+        <form class="stack" @submit.prevent="saveConfig('mcp')">
+          <section class="card">
             <div class="row spread">
-              <strong>{{ row.name || '未命名' }}</strong>
-              <button type="button" @click="mcpRows.splice(i, 1)">移除</button>
+              <h3>自定义 MCP</h3>
+              <!-- 「测试连接」测的是**服务端已存的配置**，不是正在编辑的内容——
+                   名字里写清楚，免得用户以为测的是自己刚改的东西。 -->
+              <button type="button" :disabled="busy" @click="testMcp">测试已保存的配置</button>
             </div>
-            <div class="fields">
-              <label>短名<input v-model="row.name" placeholder="短名" /></label>
-              <label>命令<input v-model="row.command" placeholder="command" /></label>
+            <p v-if="!mcpRows.length" class="muted">还没有自定义 MCP。</p>
+            <div v-for="(row, i) in mcpRows" :key="'m' + i" class="mcp">
+              <div class="row spread">
+                <strong>{{ row.name || '未命名' }}</strong>
+                <button type="button" @click="mcpRows.splice(i, 1)">移除</button>
+              </div>
+              <div class="fields">
+                <label>短名<input v-model="row.name" placeholder="短名" /></label>
+                <label>命令<input v-model="row.command" placeholder="command" /></label>
+              </div>
+              <label>参数<input v-model="row.args" placeholder="args，空格分开" /></label>
+              <label>环境<textarea v-model="row.envText" rows="3" placeholder="KEY=secret://DEEPSEEK_API_KEY"></textarea></label>
             </div>
-            <label>参数<input v-model="row.args" placeholder="args，空格分开" /></label>
-            <label>环境<textarea v-model="row.envText" rows="3" placeholder="KEY=secret://DEEPSEEK_API_KEY"></textarea></label>
-          </div>
-          <div class="row">
-            <button type="button" @click="addMcp">加一台 MCP</button>
-            <button type="button" :disabled="busy" @click="testMcp">测试连接</button>
-            <button type="submit" class="primary" :disabled="busy">{{ busy ? '正在保存…' : '保存' }}</button>
-          </div>
-        </section>
+            <div class="row">
+              <button type="button" @click="addMcp">加一台 MCP</button>
+              <button type="submit" class="primary" :disabled="busy">{{ busy ? '正在保存…' : '保存 MCP' }}</button>
+            </div>
+          </section>
+        </form>
 
         <section class="card">
           <h3>连接状态</h3>
@@ -540,7 +699,16 @@ onMounted(() => {
             </li>
           </ul>
         </section>
-      </form>
+
+        <ConfirmDialog
+          v-if="removeSecretName"
+          title="删除这把密钥？"
+          :body="`删掉 ${removeSecretName}？保存后它不再可用，模型调用会失败。`"
+          :busy="busy"
+          @confirm="confirmRemoveSecret"
+          @cancel="cancelRemoveSecret"
+        />
+      </template>
     </template>
   </section>
 </template>
@@ -550,35 +718,44 @@ onMounted(() => {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 1.4rem 1.4rem 2.5rem;
+  padding: 28px 32px 40px;
+  /* 宽屏限宽（doc/48 D1）：输入框拉满 1400px 时，一行字占半米宽。
+     **width + max-width 都要**：父级是 column 方向的 flex（.stage），
+     margin:auto 会吃掉交叉轴剩余空间、让本项按内容宽度收缩——
+     只写 max-width 时，内容少的页面（如成员页）会自动缩成半宽。 */
+  width: 100%;
+  max-width: 53.75rem;
+  margin: 0 auto;
 }
 .page-head {
   display: flex;
   align-items: flex-end;
   justify-content: space-between;
   gap: 1rem;
-  margin-bottom: 0.9rem;
+  margin-bottom: 1.2rem;
 }
 .kicker {
   margin: 0;
-  color: var(--accent-ink);
-  font-size: 0.75rem;
-  letter-spacing: 0.14em;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
 }
 h2 {
   margin: 0.15rem 0 0;
-  font-size: 1.55rem;
-  font-weight: 620;
-  letter-spacing: -0.03em;
+  font-size: var(--text-xl);
+  font-weight: 600;
+  letter-spacing: -0.02em;
 }
 h3, h4 { margin: 0; }
-h3 { font-size: 1rem; }
-h4 { margin-top: 0.4rem; font-size: 0.82rem; color: var(--ink-soft); font-weight: 600; }
+h3 { font-size: var(--text-lg); }
+h4 { margin-top: 0.4rem; font-size: var(--text-sm); color: var(--ink-soft); font-weight: 600; }
 .card, .pane, .login {
   background: var(--bg-raised);
   border: 1px solid var(--line);
-  border-radius: 18px;
-  padding: 1rem;
+  border-radius: var(--radius-card);
+  padding: 1.25rem;
 }
 .login, .card, .editor, .stack, .mcp {
   display: flex;
@@ -620,42 +797,53 @@ label {
   color: var(--ink-soft);
 }
 .secret { position: relative; display: block; }
+/* 「显示」按钮浮在输入框右侧 → 值框要给它留出位置，别把 placeholder 挡住。 */
+.secret input { padding-right: 2.9rem; }
+/* 被标记删除的密钥行：划掉 + 变淡，别让它看起来还能用。 */
+.pair.removed { opacity: 0.55; }
+.pair.removed input { text-decoration: line-through; }
+/* 规格（子代理系统提示词）：给足高度，别让最后一行被裁成半行（doc/48 D2）。 */
+.spec-area { min-height: 18rem; line-height: 1.6; }
 input, select, textarea {
   width: 100%;
+  height: 36px;
   border: 1px solid var(--line-strong);
-  border-radius: 12px;
-  padding: 0.55rem 0.7rem;
-  background: #fff;
-  font-size: 0.92rem;
+  border-radius: var(--radius-control);
+  padding: 0 0.7rem;
+  background: var(--bg-raised);
+  font-size: var(--text-sm);
 }
-textarea { resize: vertical; line-height: 1.55; }
+textarea { height: auto; padding: 0.5rem 0.7rem; resize: vertical; line-height: 1.55; }
 input:focus, select:focus, textarea:focus {
   outline: none;
-  border-color: #8fbfb0;
-  box-shadow: 0 0 0 3px rgba(15, 110, 86, 0.12);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 button, .file {
+  height: 32px;
   border: 1px solid var(--line-strong);
-  background: #fff;
-  border-radius: 999px;
-  padding: 0.38rem 0.8rem;
-  font-size: 0.8rem;
+  background: var(--bg-raised);
+  border-radius: var(--radius-control);
+  padding: 0 0.8rem;
+  font-size: var(--text-sm);
+  font-weight: 500;
 }
 .card > button { align-self: flex-start; }
-.file { display: inline-flex; cursor: pointer; }
-button:hover:not(:disabled), .file:hover { border-color: #cfc6b6; }
+.file { display: inline-flex; align-items: center; cursor: pointer; }
+button:hover:not(:disabled), .file:hover { background: var(--hover); }
 .primary {
   border: 0;
-  background: var(--ink);
-  color: #f6f1e7;
+  background: var(--accent);
+  color: #fff;
 }
-.primary:hover:not(:disabled) { background: #292524; }
+.primary:hover:not(:disabled) { background: var(--accent-ink); }
 .primary:disabled { opacity: 0.55; }
 .danger {
-  border-color: #fecdd3;
-  background: var(--danger-soft);
+  border-color: var(--danger);
+  background: var(--bg-raised);
   color: var(--danger);
 }
+.danger:hover:not(:disabled) { background: var(--danger-soft); }
 .text {
   border: 0;
   background: transparent;
@@ -665,19 +853,19 @@ button:hover:not(:disabled), .file:hover { border-color: #cfc6b6; }
 .tabs {
   padding: 0.18rem;
   background: var(--bg);
-  border-radius: 999px;
+  border-radius: var(--radius-control);
   border: 1px solid var(--line);
 }
-.subnav { margin: 0 0 0.9rem; align-self: flex-start; }
+.subnav { margin: 0 0 1.2rem; align-self: flex-start; }
 .tabs button {
   border: 0;
   background: transparent;
   color: var(--ink-soft);
+  border-radius: calc(var(--radius-control) - 2px);
 }
 .tabs button.on {
   background: var(--bg-raised);
-  color: var(--ink);
-  box-shadow: 0 1px 2px rgba(68, 48, 24, 0.06);
+  color: var(--accent-ink);
 }
 .list, .status {
   list-style: none;
@@ -689,8 +877,9 @@ button:hover:not(:disabled), .file:hover { border-color: #cfc6b6; }
 }
 .item {
   width: 100%;
+  height: auto;
   text-align: left;
-  border-radius: 14px;
+  border-radius: var(--radius-control);
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -698,12 +887,12 @@ button:hover:not(:disabled), .file:hover { border-color: #cfc6b6; }
   padding: 0.7rem 0.75rem;
 }
 .item.on {
-  border-color: #8fbfb0;
+  border-color: var(--accent);
   background: var(--accent-soft);
 }
 .desc {
   color: var(--ink-soft);
-  font-size: 0.8rem;
+  font-size: var(--text-sm);
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
@@ -715,33 +904,34 @@ button:hover:not(:disabled), .file:hover { border-color: #cfc6b6; }
   padding: 0.05rem 0.45rem;
 }
 .badge { background: var(--accent-soft); color: var(--accent-ink); }
-.muted { color: var(--muted); font-size: 0.78rem; margin: 0; }
+.muted { color: var(--muted); font-size: var(--text-sm); margin: 0; }
 .banner, .toast {
   margin: 0 0 0.8rem;
-  border-radius: 12px;
+  border-radius: var(--radius-control);
   padding: 0.5rem 0.7rem;
-  font-size: 0.82rem;
+  font-size: var(--text-sm);
 }
 .banner { color: var(--danger); background: var(--danger-soft); }
 .toast { margin: 0; color: var(--accent-ink); background: var(--accent-soft); }
 .pair input { width: auto; flex: 1; min-width: 8rem; }
 .mcp { border-top: 1px solid var(--line); padding-top: 0.8rem; }
 .mcp:first-of-type { border-top: 0; padding-top: 0; }
-.check { flex-direction: row; align-items: center; font-size: 0.88rem; }
-.check input { width: auto; }
-.confirm { color: var(--ink-soft); font-size: 0.8rem; }
-.st-ok { color: #047857; background: #ecfdf5; }
-.st-warn { color: #a16207; background: #fef9c3; }
-.st-bad { color: #be123c; background: #ffe4e6; }
+.check { flex-direction: row; align-items: center; font-size: var(--text-sm); }
+.check input { width: auto; height: auto; }
+.confirm { color: var(--ink-soft); font-size: var(--text-sm); }
+.st-ok { color: var(--accent-ink); background: var(--accent-soft); }
+.st-warn { color: var(--warn); background: var(--warn-soft); }
+.st-bad { color: var(--danger); background: var(--danger-soft); }
 .st-muted { color: var(--muted); background: var(--bg); }
 .secret .text {
   position: absolute;
   right: 0.45rem;
   top: 50%;
+  height: 24px;
   transform: translateY(-50%);
   background: var(--bg);
-  border-radius: 999px;
-  padding: 0.15rem 0.45rem;
+  border-radius: var(--radius-control);
+  padding: 0 0.45rem;
 }
 @media (max-width: 980px) {
   .split, .fields { grid-template-columns: 1fr; }

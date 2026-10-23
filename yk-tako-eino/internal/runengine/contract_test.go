@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 这个文件是**契约字节的快闸**：钉住信封、session/frames/log 三个响应体、帧 kind 词表、
@@ -133,6 +134,8 @@ func TestContractBusinessCodes(t *testing.T) {
 		{"不可续跑", codeNotResumable, 112102},
 		{"续跑次数用尽", codeResumeExhausted, 112104},
 		{"找不到项目", codeWorkspaceMissing, 114001},
+		{"找不到提问", codeQuestionMissing, 115002},
+		{"提问已答过", codeQuestionAnswered, 115101},
 		// 114004「项目正忙」已退役（2026-10-22，项目闸随跨成员共享项目一起取消，doc/42）——
 		// 同项目并发不再被拒，改由文件级防护兜（flock + 写前指纹比对）。
 		{"默认项目不能删", codeWorkspaceDefault, 114005},
@@ -156,7 +159,7 @@ func TestContractBusinessCodes(t *testing.T) {
 var frameKindRE = regexp.MustCompile(`Frame\{Kind:\s*"([a-z_]+)"`)
 
 func TestContractFrameKindVocabulary(t *testing.T) {
-	want := []string{"delta", "resume", "start", "task", "terminal", "tool_call", "tool_result", "usage"}
+	want := []string{"delta", "question", "resume", "start", "task", "terminal", "tool_call", "tool_result", "usage"}
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("读包目录失败：%v", err)
@@ -235,5 +238,43 @@ func TestContractStreamEventBytes(t *testing.T) {
 	const want = `{"seq":"1792737898948-0","type":"session_deleted","id":"s_01M5J5VGJ6VWG1DBCW0R8WA4JG","at":"2026-10-23T06:44:58Z"}`
 	if got != want {
 		t.Fatalf("事件帧字节 = %s\nwant %s", got, want)
+	}
+}
+
+// TestContractWorkspaceFilesBytes 钉住 GET /api/workspaces/{id}/files 的 data 字段序
+//（doc/48 B1）：path → entries；entry = name → kind →（**只有文件**才有）size → modifiedAt。
+//
+// 目录**不出现** size / modifiedAt 这两个键（不是 0）——加字段忘了同步、或把目录写成 0，
+// 这里就红。下面的字节不是手写的，是 2026-10-23 从活引擎实跑抄下来的。
+func TestContractWorkspaceFilesBytes(t *testing.T) {
+	size := int64(14)
+	mod := time.Date(2026, 10, 23, 0, 7, 12, 0, time.UTC)
+	got := mustJSON(t, workspaceFilesData{
+		Path: ".",
+		Entries: []fileEntry{
+			{Name: "sub", Kind: "dir"},
+			{Name: "hello.txt", Kind: "file", Size: &size, ModifiedAt: &mod},
+		},
+	})
+	const want = `{"path":".","entries":[{"name":"sub","kind":"dir"},{"name":"hello.txt","kind":"file","size":14,"modifiedAt":"2026-10-23T00:07:12Z"}]}`
+	if got != want {
+		t.Fatalf("文件清单字节序漂移：\n得到 %s\n期望 %s", got, want)
+	}
+}
+
+// TestContractWorkspaceBodyBytes 钉住项目对象的字段序（doc/48 C1）。
+//
+// isDefault 加在**最后**（既有字段序不动）。默认项目不可删（服务端 114005）——
+// 页面靠这个字段把删除按钮藏起来，别让用户点一个必然失败的按钮。
+// 下面的字节不是手写的，是 2026-10-23 从活引擎实跑抄下来的。
+func TestContractWorkspaceBodyBytes(t *testing.T) {
+	got := mustJSON(t, workspaceBody{
+		ID: "ws_01M5J00E5X3AH3DVKX5QA0647Q", Name: "验收项目",
+		CreatedAt:  time.Date(2026, 10, 22, 14, 24, 0, 0, time.UTC),
+		Visibility: "private", Owner: true, IsDefault: false,
+	})
+	const want = `{"id":"ws_01M5J00E5X3AH3DVKX5QA0647Q","name":"验收项目","createdAt":"2026-10-22T14:24:00Z","visibility":"private","owner":true,"isDefault":false}`
+	if got != want {
+		t.Fatalf("项目对象字节序漂移：\n得到 %s\n期望 %s", got, want)
 	}
 }

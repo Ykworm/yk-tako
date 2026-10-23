@@ -5,7 +5,7 @@
     "本文件是契约字节的**机器真源**；doc/19-v6/19v6-04-验收-curl.md 是同一份内容的人读版。",
     "两份**同批改**。check-expected.sh 守两边的用例号集合一致。",
     "tier=core 的用例不需要模型，必须全过；tier=model 需要真实跑一轮（要 API Key 与网络）。",
-    "expect 字段：http / code / message / data（子集比对：只断点名的键，值写 \"$any\" 是通配）/ data_keys（data 对象的键集与键序必须逐字相同）/ frame_kinds_contains / rows_len_equals。",
+    "expect 字段：http / code / message / data（子集比对：只断点名的键，值写 \"$any\" 是通配）/ data_keys（data 对象的键集与键序必须逐字相同）/ frame_kinds_contains / rows_len_equals / data_items_some（数组里**至少有一项**满足条件，如 {\"path\":\"workspaces\",\"match\":{\"id\":\"{wid}\",\"isDefault\":false}}——expect 里也能写 {var}）。",
     "step 字段：method / path / body / auth / sql（请求前先跑的 SQL）/ capture（把响应里的值存成变量）/ op=signup（建账号+租户+配模型）/ op=wait_terminal（等这一场跑完）。"
   ],
   "cases": [
@@ -567,6 +567,215 @@
           }
         }
       ]
+    },
+    {
+      "id": "10-question-codes",
+      "case": "用例 10",
+      "tier": "core",
+      "desc": "人审与问答码段：未知 run 的列表 404 112002；未知行答题 404 115002；无鉴权 401 111102",
+      "steps": [
+        {
+          "method": "GET",
+          "path": "/api/runs/r_nope/questions?status=pending",
+          "expect": {
+            "http": 404,
+            "code": 112002,
+            "message": "找不到这次运行",
+            "data": null
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/questions/qs_nope/answer",
+          "body": {
+            "answer": "x"
+          },
+          "expect": {
+            "http": 404,
+            "code": 115002,
+            "message": "找不到这个提问",
+            "data": null
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/questions/qs_nope/answer",
+          "body": {
+            "answer": "x"
+          },
+          "auth": false,
+          "expect": {
+            "http": 401,
+            "code": 111102,
+            "message": "请先登录",
+            "data": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "12-workspace-files",
+      "case": "用例 12",
+      "tier": "core",
+      "desc": "项目文件清单：目录在前、内部目录与符号链接不列、越界与绝对路径 400 111002、看不见的项目 404 114001",
+      "steps": [
+        {
+          "method": "POST",
+          "path": "/api/workspaces",
+          "body": {
+            "name": "acc-files"
+          },
+          "capture": {
+            "wid": "data.workspace.id"
+          },
+          "expect": {
+            "http": 201,
+            "code": 0,
+            "message": ""
+          }
+        },
+        {
+          "op": "seed_ws",
+          "workspace": "{wid}",
+          "files": {
+            "hello.txt": "Hello, world!\n",
+            ".media/pic.png": "x",
+            ".tako/search/r1_1.md": "x"
+          },
+          "dirs": [
+            "sub"
+          ],
+          "symlinks": [
+            "link-out"
+          ]
+        },
+        {
+          "method": "GET",
+          "path": "/api/workspaces/{wid}/files?path=.",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data": {
+              "path": ".",
+              "entries": [
+                {
+                  "name": "sub",
+                  "kind": "dir"
+                },
+                {
+                  "name": "hello.txt",
+                  "kind": "file",
+                  "size": 14
+                }
+              ]
+            }
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/workspaces/{wid}/files?path=sub",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data": {
+              "path": "sub",
+              "entries": []
+            }
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/workspaces/{wid}/files?path=../../etc",
+          "expect": {
+            "http": 400,
+            "code": 111002,
+            "message": "路径不对",
+            "data": null
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/workspaces/{wid}/files?path=/etc/passwd",
+          "expect": {
+            "http": 400,
+            "code": 111002,
+            "message": "路径不对",
+            "data": null
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/workspaces/ws_nope/files",
+          "expect": {
+            "http": 404,
+            "code": 114001,
+            "message": "找不到这个项目",
+            "data": null
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/workspaces/{wid}/files?path=nope",
+          "expect": {
+            "http": 404,
+            "code": 114101,
+            "message": "找不到这个文件",
+            "data": null
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/workspaces/{wid}/files",
+          "auth": false,
+          "expect": {
+            "http": 401,
+            "code": 111102,
+            "message": "请先登录",
+            "data": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "13-workspace-isdefault",
+      "case": "用例 13",
+      "tier": "core",
+      "desc": "项目列表带 isDefault：新建的项目是 false（默认项目不能删，服务端 114005）",
+      "steps": [
+        {
+          "method": "POST",
+          "path": "/api/workspaces",
+          "body": {
+            "name": "acc-isdefault"
+          },
+          "capture": {
+            "wid": "data.workspace.id"
+          },
+          "expect": {
+            "http": 201,
+            "code": 0,
+            "message": ""
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/workspaces",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data_items_some": {
+              "path": "workspaces",
+              "match": {
+                "id": "{wid}",
+                "isDefault": false
+              }
+            }
+          }
+        }
+      ]
     }
   ],
   "declared_not_asserted": {
@@ -574,6 +783,7 @@
     "用例 6": "工具循环（get_time）—— 断模型会不会真的去调工具，换个模型就飘；帧 kind 全集由 go test 的契约测试钉住",
     "用例 7": "委派子代理 —— 同上，模型是否委派不稳定；回传裁剪的机制断言在 doc/39 的活体抽验里",
     "用例 8": "任务看板的 task 帧 —— 要模型真的去调 TaskCreate/TaskUpdate 才造得出这条帧，模型行为不稳（换个模型就飘）；帧 kind 词表由 go test 的契约测试钉住，看板的持久化由 TestTaskBoardSurvivesProcessRestart 钉住（另一个 Store 实例读回同一批行）",
-    "用例 9": "变更事件流（doc/46）—— SSE 长连接读取进不了短连接断言器：挂读/续传/双副本的活体断言由 scripts/acceptance/events_live.sh 判红；帧 data 字节由 go test 的 TestContractStreamEventBytes 钉住；游标语义（Last-Event-ID 续传、不带则从 $ 起不回放历史）见 doc/46 §3.3"
+    "用例 9": "变更事件流（doc/46）—— SSE 长连接读取进不了短连接断言器：挂读/续传/双副本的活体断言由 scripts/acceptance/events_live.sh 判红；帧 data 字节由 go test 的 TestContractStreamEventBytes 钉住；游标语义（Last-Event-ID 续传、不带则从 $ 起不回放历史）见 doc/46 §3.3",
+    "用例 11": "question 帧与同轮注回（ask_user / submit_plan）—— 要模型真的调 ask_user 才造得出 question 帧与待答行，模型行为不稳（换个模型就飘）；帧 kind 词表由 go test 的契约测试钉住，挂起→答题→同轮继续与一答终答（409 115101）、崩溃续跑第三分支由 scripts/acceptance/question_crash.sh 判红"
   }
 }

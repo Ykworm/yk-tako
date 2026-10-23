@@ -208,6 +208,7 @@ func (w *Worker) emitTaskFrame(ctx context.Context, runID RunID, epoch int64, na
 const taskBoardPrompt = `## 任务看板
 
 活儿多的时候建一张看板，跟踪进度：≥3 步、或用户列了多件事时才建；一步任务不要建。
+计划模式里也可以建/改看板——它是方案的一部分，不算工作区修改；先建看板再 submit_plan。
 - TaskCreate 建条目（主题写成祈使句一句话，如「列出工作区文件」）。
 - 动手前 TaskUpdate 把那条标 in_progress；同时进行的只留一条。
 - 做完立刻标 completed；测试红、做了一半、报错没解，**不准**标 completed。

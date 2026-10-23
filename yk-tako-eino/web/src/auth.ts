@@ -30,6 +30,9 @@ function hasSession(): boolean {
 
 // 响应式登录态：api.ts 刷新失败会 clearAuth，页面据此退回登录表单。
 export const authState = ref(hasSession())
+// 被登出的原因：true = token 续不上（过期/刷新令牌也失效），登录表单要说一句「登录已过期」。
+// 用户自己点「退出」不置这个标记——同一张表单，两种来路不能长成一模一样。
+export const authExpired = ref(false)
 // 当前工作区单独做成响应式：切换时人已经登录，authState 仍是 true，顶栏要靠这里改名字和角色。
 export const tenantState = ref(readTenant())
 
@@ -46,6 +49,7 @@ export function saveAuth(
   sessionStorage.setItem(tenantNameKey, tenantName)
   sessionStorage.setItem(roleKey, role)
   tenantState.value = { id: tenantID, name: tenantName, role }
+  authExpired.value = false
   authState.value = hasSession()
 }
 
@@ -65,13 +69,15 @@ export function updateTokens(accessToken: string, refreshToken: string) {
   authState.value = hasSession()
 }
 
-export function clearAuth() {
+// reason='expired' = 系统把用户登出（续不上），不是用户自己要退。表单据此解释来路。
+export function clearAuth(reason?: 'expired') {
   sessionStorage.removeItem(tokenKey)
   sessionStorage.removeItem(refreshKey)
   sessionStorage.removeItem(tenantKey)
   sessionStorage.removeItem(tenantNameKey)
   sessionStorage.removeItem(roleKey)
   tenantState.value = { id: '', name: '', role: '' }
+  authExpired.value = reason === 'expired'
   authState.value = false
 }
 
@@ -198,7 +204,7 @@ async function doRefresh(): Promise<boolean> {
     data?: { accessToken?: string; refreshToken?: string }
   } | null
   if (!res.ok || !body || body.code !== 0 || !body.data?.accessToken) {
-    clearAuth()
+    clearAuth('expired')
     return false
   }
   updateTokens(body.data.accessToken, body.data.refreshToken || rt)
@@ -218,7 +224,7 @@ export async function authFetch(url: string, init?: RequestInit): Promise<Respon
   if (res.status !== 401) return res
   if (!readRefreshToken()) {
     // 旧会话只有 access token（U1 时期登录）：过期后无法续，退回登录表单。
-    clearAuth()
+    clearAuth('expired')
     return res
   }
   if (!(await refreshAccessToken())) return res

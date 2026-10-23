@@ -6,13 +6,18 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
-    "typecheck": "vue-tsc -b"
+    "typecheck": "vue-tsc -b",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
+    "dompurify": "^3.4.17",
     "heic2any": "^0.0.4",
+    "marked": "^18.1.1",
     "vue": "^3.5.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.64.1",
     "@types/node": "^26.6.4",
     "@vitejs/plugin-vue": "^6.0.0",
     "typescript": "~5.9.0",

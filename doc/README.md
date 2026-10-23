@@ -1,7 +1,7 @@
 # doc/ 文档索引
 
 > 性质：**索引**，不是方案。本文只回答「这篇文档是什么、能不能照着施工、代码在哪、被谁取代」。
-> 最后核对：2026-10-23。
+> 最后核对：2026-10-24。
 > 状态口径：✅ 已落地 · 🔶 部分落地／待收口 · ⬜ 未做 · 存档 = 历史材料，不作施工面。
 > 代码路径均相对 `yk-tako-eino/`。
 
@@ -27,6 +27,9 @@
 - 改响应信封／业务码表：`doc/40`（规则在根 `AGENTS.md`，码表在 doc/40 §4）。
 - 改契约字节、要重跑验收：`doc/19-v6/19v6-04`（人读版）、`scripts/acceptance/`（机器真源与断言器）、`yk-tako-eino/internal/runengine/contract_test.go`（快闸）。
 - 改团队前端（切换器／成员管理／邀请落地页）：`doc/36`。
+- 改界面可用性（markdown 渲染／会话历史入口／停止按钮／文件可达／破坏性操作与文案）：`doc/48`。
+- 改侧栏项目树（项目 → 对话二级、10 条上限、展示全部）：`doc/50`。
+- 改视觉（配色／字阶／间距／圆角／侧栏三段／手机抽屉／气泡）：`doc/51`。
 - 改删除与档案清理（连带删会话、单场删除、保留窗口）：`doc/37`。
 - 改记忆、召回：`doc/29`。
 - 改崩溃续跑：`doc/30`。
@@ -42,7 +45,7 @@
 
 | 编号 | 文档 | 状态 | 代码落点 | 说明／替代关系 |
 |---|---|---|---|---|
-| 16 | [能力复刻总规划](16-能力复刻总规划.md) | 🔶 | 全仓；分篇见本表 | 产品能力总纲。**2026-10-22 已按 doc/35–40 六篇重基线**：新增 §0.1 现状快照、§2 表补 5b（子代理持久档案与 resume）/ 9b（团队协作前端）/ 12（项目目录）/ 13（删除与档案清理）、§2c 横切契约（响应信封 doc/40、临时键 doc/38）、§5.1 当前待做；§6 索引补齐 doc/23、24、35–40 与 v6 文档集。🔶＝总纲自身仍列着 ⬜ 未做能力（产品外围） |
+| 16 | [能力复刻总规划](16-能力复刻总规划.md) | 🔶 | 全仓；分篇见本表 | 产品能力总纲。**2026-10-23 已按 doc/35–49 重基线**：§0.1 现状快照、§2 表补 5b（子代理持久档案与 resume）/ 9b（团队协作前端）/ 12（项目目录）/ 13（删除与档案清理）、§2c 横切契约（响应信封 doc/40、临时键 doc/38）、§5.1 当前待做、§6 索引补齐 doc/23、24、35–49 与 v6 文档集；doc/48 与 doc/49 已落地并从欠账里划掉。🔶＝总纲自身仍列着 ⬜ 未做能力（IM/cron、多 agent 协作、场景化 Eval） |
 | 17 | [后续计划：代码子代理与记忆](17-后续计划-代码子代理与记忆.md) | 🔶 | `internal/runengine/notes.go`、`bash.go`、`agents/`、`web/` | 笔记／执行／停止／搜索／子代理折叠已落地；§5 由 doc/22 取代，§6 由 doc/25 取代 |
 | 19-v6 | [运行引擎架构 v6（index）](19-v6/19-运行引擎架构-v6.md) | ✅ | `cmd/yktako/`、`internal/runengine/`、`web/` | v6 文档集总入口；取代 v5 |
 | 19v6-01 | [契约：四个 API](19-v6/19v6-01-契约-四个API.md) | ✅ | `server.go`、`types.go`、`product_api.go` | 端点字节真源；含 SSE 端点（doc/31）的翻案标注。2026-10-21 校准：帧 kind 断言改七种（补 `usage` / `resume`）、session 响应补 `lastRunStatus`/`lastRunId`/`workspaceId` |
@@ -82,6 +85,11 @@
 | 44 | [前端三处欠账](44-前端三处欠账.md) | ✅ | `web/src/{api.ts,chat.ts,App.vue,ProjectsView.vue,ConfirmDialog.vue}` | 2026-10-23 落地。三处前端入口：**个人项目页**（列表／新建／改名／删除／项目下会话／开新对话）、**项目与单场会话删除 + 确认弹窗**（服务端 409 文案原样显示）、**当前会话的子代理列表与「继续」**（把带 `sa_id` 的指令追加进输入框，由父 agent 调 `resume_subagent`，不新增 HTTP 端点）。**后端零改动**。当前项目按租户存 `localStorage['tako.workspaceId.<tid>']`，`workspaceId` 只随新会话的 `POST /api/runs` 发送。对应 doc/16 §5.1 第 2 项与 §2 表 #5b/#12/#13 |
 | 45 | [场景化 Eval 框架（方案）](45-场景化Eval框架.md) | ⬜（方案待点头） | —（未施工） | 2026-10-23 立项。给「**活有没有干完**」建一层可机器重跑的回归——前两层（快闸 `contract_test.go` + 契约 `scripts/acceptance/`）只断"接口有没有按约定回"，断不了"活干完了没有"（2026-10-23 PII 挂载点选错时两层全绿）。场景 = 准备/动作/判定/证据四件套；判定分 **A 硬断言 / B 模型判分（带抖动容忍）/ C 只登记不断言** 三档；语料 = 这一周手工验过的活体固化。**不改 `internal/runengine/` 生产代码**——Eval 站在引擎外面看它。预计落点 `scripts/eval/`（复用 `scripts/acceptance/harness.py`，不另起 HTTP 底座）。对应 doc/16 §2b 第 6 行与 §2c「验收可机器重跑」第三层 |
 | 46 | [变更同步与事件通道](46-变更同步与事件通道.md) | ✅ | `yk-tako-eino/internal/runengine/{events.go,server.go,auth.go,product_api.go,contract_test.go}`、`web/src/{mutation.ts,api.ts,chat.ts,App.vue,ProjectsView.vue}`、`scripts/acceptance/events_live.sh` | 2026-10-23 落地。多 tab 失效通知的根治：**Loop A** BroadcastChannel 同机广播 + 统一失效函数（清落点/重拉列表/会话已删横幅）+ 投递 114001 自愈；**Loop B** 账号级 SSE `GET /api/events`（Redis Stream `tk:events:<tid>` 第三临时键，`XADD` 写口=变更端点横切契约；`Last-Event-ID` 续传、新连接从 `$` 起；`?access_token=` 兜底鉴权）——doc/16 #8b 前置。前端 EventSource 与广播并存、同喂一个 dispatch。活体：B2 七条 + B3 三条全过；用例 9 进 `expected.json` declared_not_asserted（`events_live.sh` 判红）+ `TestContractStreamEventBytes` 快闸。doc/16 §2c 扩两行 |
+| 47 | [Plan 审核与追问澄清](47-Plan审核与追问澄清.md) | ✅ | `runengine/{questions.go,waittools.go,plangate.go,journal.go,worker.go,server.go}`、`web/src/chat.ts`、`scripts/acceptance/question_crash.sh` | 2026-10-23 立项并落地。**Q（ask_user）**：`run_questions` 表 + `kind=question` 帧（词表 8→9）+ 三拍（落行/发帧/轮询）+ CAS 一答终答 + resume 重放第三分支 + options 快捷选项；**P（plan gate，A 形态=kimi 式运行时守卫）**：模型自主调 `enter_plan_mode`，`planGuardHandler` 黑名单硬 deny 写/执行，`submit_plan` 复用等人机器过人审（可编辑方案卡），批准注回并放行。P/Q 共用一张表（kind 列）一种帧一套 resume 分支；新增 `15` 人审与问答段（115002/115101）。`question_crash.sh` 16 条断言验「挂起中 kill -9 → resume → 答 → complete」；`seed-question` 脚手架已转只读 `question-check`。翻 doc/41 §7「不做 Plan 层人审 gate」之案（用户 2026-10-23 拍） |
+| 48 | [前端可用性欠账（方案）](48-前端可用性欠账.md) | ✅（2026-10-23 全部 17 拍落地） | `yk-tako-eino/web/{playwright.config.ts,e2e/,test/,src/{App.vue,ProjectsView.vue,Configure.vue,MembersView.vue,api.ts,chat.ts,markdown.ts}}`、`yk-tako-eino/internal/runengine/{product_api.go,server.go,contract_test.go}`、`scripts/acceptance/{expected.json,harness.py,assert_contract.py}`（**新增**：文件清单端点 `GET /api/workspaces/:id/files`、项目对象的 `isDefault` 字段；markdown 渲染走 `marked` + `dompurify`） | 2026-10-23 立项。2026-10-23 浏览器走查（四个页面 × 两种视口宽度 + 只读 API 交叉核对）逐条验出 **17 条界面现象（归并为 14 项修复）**：**markdown 渲染是 v6 契约违背**（19v6-03:118 写明「客户端按 markdown 渲染」，代码是纯文本插值）；**后端早有的能力前端没入口**（停止端点 `POST /api/runs/:id/stop` 一次没调 / 跨项目会话列表 `GET /api/sessions` 前端从不裸调 / 文件字节出口 `GET /api/media` 只有图片在用）；**agent 产出的文件用户拿不走**（项目页不列文件、文件片不可点）。分 4 个 loop 17 个 action，**只有 2 条动后端**（B1 新增 `GET /api/workspaces/:id/files`、C1 响应体加 `isDefault` 字段）。台账 `tmp/48-前端可用性欠账/`（不入库） |
+| 49 | [走查缺陷修复](49-走查缺陷修复.md) | ✅（已落地，2026-10-23） | `internal/runengine/{agents.go,product_api.go,server.go,accesslog_test.go,agents_test.go}`、`web/src/{chat.ts,App.vue,Configure.vue,ProjectsView.vue,InviteLanding.vue,markdown.ts,auth.ts}`、`web/test/markdown.test.ts` | 2026-10-23 立项并于同日落地。doc/48 落地后的**第二次**全站走查：Playwright 逐页点击 + 真停止 + 跨标签页 + 窄屏 + 引擎日志对读，逐条验出 **12 项**。**1 项 P0**：子代理名字含空格/中文 → 厂商 `tools[i].function.name` 400 → **整个租户所有 run 失败**（保存/导入/落盘三个入口都没校验）；**5 项 P1**：停止/失败刷新后整轮消失、等人面板被别端停掉后卡死输入框且等待期间无停止入口、删除会话事件不剪侧栏（死链点进空对话）、新建同名内置助手静默清空说明/规格/工具、导入默认可见性（团队）与手工新建（仅自己）相反；**6 项 P2/P3**：报错带 HTTP 状态码、refresh 失效静默登出、邀请页印错邮箱、复制失败无反馈、密钥空名行谎报成功、灯箱不能关/不放大、名字无长度上限、自动链接吞中文标点、项目页两句话与行为不符、访问日志含完整 `access_token`。四问按推荐值落地（§14），落地与验收记录见 §15。台账 `tmp/49-走查缺陷修复/`（不入库） |
+| 50 | [侧栏项目树（方案）](50-侧栏项目树.md) | 🔶（A1–A4 已落地 2026-10-24；A5 待做） | `web/src/App.vue`（只此一处） | 2026-10-24 立项。侧栏从「最近 10 条扁平会话 + 内部滚动条」改为**全部项目 → 各自对话**的二级树（手风琴、默认全展开、空项目显示「还没有对话」）：整栏合计 10 条、超出点「展示更多」就地 +10、全展开后变「收起」；**每个项目再限 10 条**，项目内超出时该项目下出「展示全部」，点开只放开这一个项目；项目名前是文件夹图标（开口=展开、合口=折叠）。列表内滚动条已删。**后端零改动**（`GET /api/workspaces` + `GET /api/sessions` 现有字段够拼）。A1 数据层／A2 树与空态／A3 展示更多／A4 双层上限与图标均已浏览器验收；**A5（`workspace_renamed`/`workspace_deleted` 事件重载、窄屏、文档回填）未开工**。台账 `tmp/50-侧栏项目树/`（不入库） |
+| 51 | [UI 视觉重做](51-UI视觉重做.md) | ✅（已落地，2026-10-24） | `web/src/base.css` + `web/src/App.vue` + `web/src/{ProjectsView,Configure,MembersView,ConfirmDialog,InviteLanding,PendingInvites,PlanDoc}.vue`（样式段；后端零改动） | 2026-10-24 立项并于同日 U1–U7 落地。**token 层先行**（8 个组件 150 处硬编码颜色 → `base.css` 变量），中性现代风（浅灰白 + 单一蓝强调、白卡细边、无暖阴影）；侧栏三段式修掉 900px 高时底栏压住树；三页骨架/弹层统一 860px 列、22px 标题、12px 卡片、28/32 控件；对话列 720px、气泡 ≤86% 且用量/复制移到气泡下方；≤860px 顶栏 52px + 280px 抽屉（遮罩 / `Esc` / 开会话三法关闭，焦点往返、`aria-modal`）；四档 1440/1024/700/390 收口：无横向溢出、正文 16.88:1、次要 4.51:1、控件高 28/32、行高 30/34。**不改后端契约、不改交互流程、不改 doc/50 的树逻辑**。台账 `tmp/51-UI重做/`（不入库） |
 
 ## 2. 历史存档（`doc/`，不作施工面）
 

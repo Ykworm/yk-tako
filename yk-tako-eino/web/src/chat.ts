@@ -3,6 +3,7 @@ import { readTenant } from './auth'
 import {
   ApiError,
   CODE_NOT_RESUMABLE,
+  CODE_QUESTION_ANSWERED,
   CODE_RESUME_EXHAUSTED,
   CODE_RUN_ALIVE,
   CODE_SESSION_MISSING,
@@ -10,13 +11,18 @@ import {
   CODE_WORKSPACE_MISSING,
   getFrames,
   getLog,
+  getQuestions,
   getRun,
   getSession,
   parseMedia,
+  postAnswer,
   postResume,
   postRuns,
+  type Frame,
   type MediaRef,
   type PostImage,
+  type QuestionDecision,
+  type QuestionRow,
   type Row,
   type RunID,
   type SessionID,
@@ -42,6 +48,22 @@ export type Bubble = {
   // board 是任务看板的结构态（doc/41 §5.2 的 kind=task 帧）：紧凑视图文本。
   // 它是**结构**（前端按行解析渲染状态色），不是让前端去猜自然语言回执。
   board?: string
+  // questions 是这一轮里的等人记录（doc/47 §5.2 的 kind=question 帧）：问题与方案审批
+  // 都落在这里。驳回后模型重交方案会产生新 id，所以是数组而不是单字段。
+  // 面板的草稿/选中态是纯视图状态，留在 App.vue，不污染对话数据。
+  questions?: AskQuestion[]
+}
+
+export type AskQuestion = {
+  id: string
+  kind: 'question' | 'plan'
+  text: string
+  options: string[]
+  status: 'pending' | 'answered' | 'stale'
+  // 方案行：approve = 批准（submitted 非空 = 人改写过全文）；revise = 驳回要求修改。
+  decision?: 'approve' | 'revise'
+  submitted?: string
+  error?: string
 }
 
 // 附件（composer 选用）：name 供 chip 显示，img 随 postRuns 上行。
@@ -109,6 +131,66 @@ const STATUS_EVERY = 5
 const HISTORY_WINDOW = 10
 const PAGE = 10
 
+// 等帧的 options 藏在 args 的原始参数 JSON 里（doc/47 §5.2）；坏 JSON 只是没有快捷按钮。
+function frameOptions(args?: string): string[] {
+  if (!args) return []
+  try {
+    const parsed = JSON.parse(args) as { options?: unknown }
+    return Array.isArray(parsed.options)
+      ? parsed.options.filter((x): x is string => typeof x === 'string')
+      : []
+  } catch {
+    return []
+  }
+}
+
+function questionFromFrame(f: Frame): AskQuestion {
+  return {
+    id: f.messageId ?? '',
+    kind: f.name === 'submit_plan' ? 'plan' : 'question',
+    text: f.text ?? '',
+    options: frameOptions(f.args),
+    status: 'pending',
+  }
+}
+
+function questionFromRow(row: QuestionRow): AskQuestion {
+  return {
+    id: row.questionId,
+    kind: row.kind,
+    text: row.question,
+    options: frameOptions(row.args),
+    status: row.status,
+    decision: row.decision,
+  }
+}
+
+// upsertQuestion 按行 id 合并：帧会重发（resume/Runlive 重建），同一行不能画两遍；
+// 已在本地答过的记录不被旧帧打回 pending。
+function upsertQuestion(b: Bubble, q: AskQuestion) {
+  // **别写成 `b.questions ?? (b.questions = [])`**：赋值表达式的值是**原始数组**（raw），
+  // 不是 reactive proxy——后面的 `list.push()` / `list[i] = …` 就绕过了响应式 set 拦截器。
+  //
+  // 精确的触发条件是「赋值与改值之间**隔着 await**」：赋值标脏 → await 期间 Vue 渲染一次
+  // （读到当时的值）→ 之后的 raw 赋值不再标脏 → 界面停在 await 那会儿的样子
+  // （`ProjectsView.vue` 的 `loadFiles` 就栽在这：文件列表永远空白）。
+  //
+  // **这里赋值后紧接着 push、中间没有 await，所以它今天并没有真的坏**
+  // （`web/test/reactive-trap.test.ts` 的第三条断言把这点钉住了）。
+  // 仍然改成「先判空、再从对象里读出来用」，是防将来有人在这里插一个 await 时静默坏掉。
+  if (!b.questions) {
+    b.questions = []
+  }
+  const list = b.questions
+  const i = list.findIndex((x) => x.id === q.id)
+  if (i < 0) {
+    list.push(q)
+    return
+  }
+  if (list[i].status === 'answered' || list[i].status === 'stale') return
+  list[i] = { ...list[i], ...q }
+}
+
 export function useChat() {
   const sessionId = ref<SessionID | null>(null)
   const bubbles = ref<Bubble[]>([])
@@ -132,9 +214,11 @@ export function useChat() {
   // 服务端原样回写的那个（19v6-01 §1）。
   const renderedMessageIds = new Set<string>()
 
+  // 返回值必须是数组里的**响应式**元素：poll 循环直接改这个对象的字段（text/questions/state），
+  // 拿原始对象改不会触发重渲染（send 经 pending 拿到的正好是代理，reconcile 重建的不会）。
   function push(b: Bubble): Bubble {
     bubbles.value.push(b)
-    return b
+    return bubbles.value[bubbles.value.length - 1]
   }
 
   function newMessageId(): string {
@@ -311,6 +395,21 @@ export function useChat() {
   // 19v6-01 §2：delta 按 eventOffset 顺序追加，本地游标 = nextOffset。
   // terminal 帧 / status:gone / liveRunId 易主，三者任一即停轮询并收口（19v6-02 第 4 步），不押注单一信号。
   async function pollFrames(runId: RunID, assistant: Bubble, eventOffset: number, token: number) {
+    // 等人行的 PG 真源先拉一次：刷新后帧面里可能带着已答过的旧 question 帧，
+    // 行状态才说明它是不是还在等；帧丢了（runlive 重建）也能把 pending 行补成卡。
+    const questionRows = new Map<string, QuestionRow>()
+    try {
+      const rows = await getQuestions(runId)
+      if (token !== pollToken) return
+      for (const row of rows) questionRows.set(row.questionId, row)
+      for (const row of rows) {
+        // answered 行不补建记录：list 不返回答案，画出来只有半截；本 tab 亲历的
+        // 记录已在 upsertQuestion 里留住。
+        if (row.status === 'pending') upsertQuestion(assistant, questionFromRow(row))
+      }
+    } catch {
+      // 列表拉不到不挡帧面：question 帧自己带全文与 args。
+    }
     let ticks = 0
     for (;;) {
       if (token !== pollToken) return
@@ -344,6 +443,11 @@ export function useChat() {
         if (f.kind === 'task' && !f.agent) {
           // 看板帧：text = 当前全量看板的紧凑视图（模型的眼睛同一份文本，前端按行渲染）。
           assistant.board = f.text ?? ''
+        }
+        if (f.kind === 'question' && !f.agent) {
+          // 行已 answered 的旧帧不再立卡（刷新场景）；pending / 无行（列表没拉到）才立。
+          const row = f.messageId ? questionRows.get(f.messageId) : undefined
+          if (!row || row.status === 'pending') upsertQuestion(assistant, questionFromFrame(f))
         }
         if (f.kind === 'terminal') terminalStatus = f.status ?? 'complete'
       }
@@ -407,6 +511,32 @@ export function useChat() {
       await pollFrames(runId, b, 0, token)
     } finally {
       if (token === pollToken) busy.value = false
+    }
+  }
+
+  // 提交等人记录：快捷选项、自由文本、方案批准/驳回都走同一个 answer 端点
+  // （doc/47 §5.4）。decision 只给方案行。成功/已被别的入口答过都标 answered；
+  // 失败把信封文案留在记录上，不吞。返回是否已收口，调用方据此清掉面板草稿。
+  async function answerQuestion(
+    q: AskQuestion,
+    answer: string,
+    decision?: QuestionDecision,
+  ): Promise<boolean> {
+    if (q.status !== 'pending') return false
+    q.error = ''
+    try {
+      await postAnswer(q.id, answer, decision)
+      q.status = 'answered'
+      q.submitted = answer
+      q.decision = decision
+      return true
+    } catch (e) {
+      if (e instanceof ApiError && e.code === CODE_QUESTION_ANSWERED) {
+        q.status = 'answered'
+        return true
+      }
+      q.error = e instanceof ApiError ? e.message : '提交失败，请重试'
+      return false
     }
   }
 
@@ -593,6 +723,20 @@ export function useChat() {
         state: 'interrupted',
       })
       void markResumable(assistant)
+    } else if ((status.lastRunStatus === 'stopped' || status.lastRunStatus === 'error') && status.lastRunId) {
+      // 停止/失败在 log 里都不留 assistant 行（closeOut 的收尾注释）——只认 live 与 interrupted 的话，
+      // 刷新后这一轮等于「没发生过」，用户会以为没发出去、重发一遍。
+      // 有定稿行就不补：那是真跑完了（比如停之前已经收到结果），补一条空气泡反而多出个假失败。
+      const lastRunId = status.lastRunId
+      if (!bubbles.value.some((b) => b.runId === lastRunId && b.role === 'assistant')) {
+        push({
+          key: `${lastRunId}:live`,
+          runId: lastRunId,
+          role: 'assistant',
+          text: '',
+          state: status.lastRunStatus === 'stopped' ? 'stopped' : 'error',
+        })
+      }
     }
     return true
   }
@@ -731,7 +875,7 @@ export function useChat() {
     sessionId, bubbles, draft, attachments, busy, pending, loadingOlder, atStart,
     activeWorkspaceId, sessionGone,
     send, reconcile, loadOlder, newSession, showTenantSession, resumeRun,
-    setActiveWorkspace, openSession, closeOnDeleted,
+    setActiveWorkspace, openSession, closeOnDeleted, answerQuestion,
   }
 }
 

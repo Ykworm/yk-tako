@@ -141,45 +141,48 @@ async function go() {
 .pending { margin-bottom: 0.25rem; }
 .head {
   width: 100%;
+  height: 30px;
   text-align: left;
   border: 0;
-  border-radius: 10px;
+  border-radius: var(--radius-control);
   background: var(--accent-soft);
   color: var(--accent-ink);
-  font-size: 0.82rem;
-  font-weight: 650;
-  padding: 0.45rem 0.55rem;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  padding: 0 var(--space-2);
 }
 .list {
   display: flex;
   flex-direction: column;
-  gap: 0.35rem;
-  padding: 0.35rem 0.2rem 0.2rem;
+  gap: var(--space-1);
+  padding: var(--space-2) 0 var(--space-1) var(--space-1);
 }
 .item {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.25rem 0.4rem;
+  gap: var(--space-1) var(--space-2);
   align-items: center;
-  font-size: 0.75rem;
+  font-size: var(--text-xs);
   color: var(--ink-soft);
 }
-.item strong { color: var(--ink); font-size: 0.8rem; }
+.item strong { color: var(--ink); font-size: var(--text-sm); }
 .when { color: var(--muted); }
-.actions { display: flex; gap: 0.3rem; }
+.actions { display: flex; gap: var(--space-1); }
 .actions button, .yes {
+  height: 24px;
   border: 1px solid var(--line-strong);
-  background: #fff;
-  border-radius: 999px;
-  padding: 0.15rem 0.5rem;
-  font-size: 0.72rem;
+  background: var(--bg-raised);
+  border-radius: var(--radius-control);
+  padding: 0 var(--space-2);
+  font-size: var(--text-xs);
 }
-.ask { margin: 0; font-size: 0.78rem; color: var(--ink); }
+.actions button:hover:not(:disabled), .yes:hover:not(:disabled) { background: var(--hover); }
+.ask { margin: 0; font-size: var(--text-sm); color: var(--ink); }
 .banner {
   margin: 0;
-  border-radius: 8px;
-  padding: 0.35rem 0.45rem;
-  font-size: 0.75rem;
+  border-radius: var(--radius-control);
+  padding: var(--space-2);
+  font-size: var(--text-xs);
   color: var(--danger);
   background: var(--danger-soft);
 }

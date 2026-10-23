@@ -30,6 +30,38 @@ const transferTarget = ref('')
 const confirmLeave = ref(false)
 const confirmArchive = ref(false)
 
+const teamName = ref('')
+const teamBusy = ref(false)
+const teamError = ref('')
+
+// 建一个团队工作区：个人工作区不搞成员制（服务端 tenant.kind=personal 没有成员表），
+// 要和人一起用就建一个团队工作区。POST /api/tenants 建的就是团队租户（CreateTeamTenant）。
+async function createTeamWorkspace() {
+  if (teamBusy.value) return
+  const name = teamName.value.trim()
+  if (!name) {
+    teamError.value = '给团队工作区起个名字'
+    return
+  }
+  teamBusy.value = true
+  teamError.value = ''
+  try {
+    const res = await api<{ tenant?: { id?: string } }>('POST', '/api/tenants', { name })
+    if (res.body.code !== 0 || !res.body.data?.tenant?.id) {
+      teamError.value = res.body.message || '创建失败'
+      return
+    }
+    const switched = await switchTenant(res.body.data.tenant.id)
+    if (!switched.ok) {
+      teamError.value = switched.message
+      return
+    }
+    teamName.value = ''
+  } finally {
+    teamBusy.value = false
+  }
+}
+
 const isOwner = computed(() => myRole.value === 'owner')
 const others = computed(() => members.value.filter((m) => m.userId !== meId.value))
 
@@ -292,7 +324,20 @@ function archive() {
 <template>
   <div class="stack">
     <p v-if="phase === 'loading'" class="muted">正在加载…</p>
-    <p v-else-if="phase === 'personal'" class="card" data-personal-empty>个人工作区没有成员</p>
+    <!-- 个人工作区没有成员制（doc/48 C4）。原先写「个人工作区没有成员」——
+         那句在 owner 视角下自相矛盾（你就是所有者），用户会当成 bug。
+         改成说清楚「这是你一个人的」+ 给一条出路（建团队工作区）。 -->
+    <section v-else-if="phase === 'personal'" class="card" data-personal-empty>
+      <h3>这是你一个人的工作区</h3>
+      <p class="muted">个人工作区不用邀请成员。要和人一起用，建一个团队工作区。</p>
+      <div class="team-create">
+        <input v-model="teamName" type="text" placeholder="团队工作区名称" autocomplete="off" />
+        <button type="button" class="primary" :disabled="teamBusy" @click="createTeamWorkspace">
+          {{ teamBusy ? '正在创建…' : '+ 创建团队工作区' }}
+        </button>
+      </div>
+      <p v-if="teamError" class="banner" role="alert">{{ teamError }}</p>
+    </section>
     <p v-if="banner" class="banner" role="alert" data-banner>{{ banner }}</p>
 
     <template v-if="phase === 'team'">
@@ -394,84 +439,100 @@ function archive() {
 </template>
 
 <style scoped>
-.stack { display: flex; flex-direction: column; gap: 0.85rem; }
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
 .card {
   background: var(--bg-raised);
   border: 1px solid var(--line);
-  border-radius: 18px;
-  padding: 1rem;
+  border-radius: var(--radius-card);
+  padding: var(--space-5);
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
+  gap: var(--space-3);
 }
-h3 { margin: 0; font-size: 1rem; }
+h3 { margin: 0; font-size: var(--text-lg); font-weight: 600; }
 .people {
   list-style: none;
   margin: 0;
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.45rem;
+  gap: var(--space-2);
 }
 .person {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.45rem;
+  gap: var(--space-2);
   align-items: center;
 }
 .email { font-weight: 600; }
-.role, .muted { color: var(--muted); font-size: 0.82rem; }
+.role, .muted { color: var(--muted); font-size: var(--text-sm); }
 .muted { margin: 0; }
-.own { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
+.own { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; }
 .invite {
   display: grid;
   grid-template-columns: minmax(0, 1.4fr) minmax(8rem, 0.6fr) auto;
-  gap: 0.7rem;
+  gap: var(--space-3);
   align-items: end;
 }
 label {
   display: flex;
   flex-direction: column;
-  gap: 0.3rem;
-  font-size: 0.78rem;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
   color: var(--ink-soft);
 }
 input, select {
   width: 100%;
+  height: 36px;
   border: 1px solid var(--line-strong);
-  border-radius: 12px;
-  padding: 0.55rem 0.7rem;
-  background: #fff;
-  font-size: 0.92rem;
+  border-radius: var(--radius-control);
+  padding: 0 var(--space-3);
+  background: var(--bg-raised);
+  font-size: var(--text-sm);
 }
-.person select, .own select { width: auto; min-width: 7rem; padding: 0.35rem 0.55rem; }
+.person select, .own select { width: auto; min-width: 7rem; height: 32px; padding: 0 var(--space-2); }
 input:focus, select:focus {
   outline: none;
-  border-color: #8fbfb0;
-  box-shadow: 0 0 0 3px rgba(15, 110, 86, 0.12);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 button {
+  height: 32px;
   border: 1px solid var(--line-strong);
-  background: #fff;
-  border-radius: 999px;
-  padding: 0.38rem 0.8rem;
-  font-size: 0.8rem;
+  background: var(--bg-raised);
+  border-radius: var(--radius-control);
+  padding: 0 var(--space-3);
+  font-size: var(--text-sm);
+  font-weight: 500;
 }
-button:hover:not(:disabled) { border-color: #cfc6b6; }
-.primary { border: 0; background: var(--ink); color: #f6f1e7; }
+button:hover:not(:disabled) { background: var(--hover); }
+.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+.primary:hover:not(:disabled) { border-color: var(--accent-ink); background: var(--accent-ink); }
 .primary:disabled, button:disabled { opacity: 0.55; }
-.danger { border-color: #fecdd3; background: var(--danger-soft); color: var(--danger); }
+.danger { border-color: var(--danger); background: var(--bg-raised); color: var(--danger); }
+.danger:hover:not(:disabled) { background: var(--danger-soft); }
 .banner {
   margin: 0;
-  border-radius: 12px;
-  padding: 0.5rem 0.7rem;
-  font-size: 0.82rem;
+  border-radius: var(--radius-control);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
   color: var(--danger);
   background: var(--danger-soft);
 }
-.link-box { display: flex; gap: 0.45rem; align-items: end; }
+.link-box { display: flex; gap: var(--space-2); align-items: end; }
 .link-box label { flex: 1; }
-.danger-zone { border-color: #fecdd3; }
+.team-create {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  flex-wrap: wrap;
+}
+.team-create input { flex: 1; min-width: 10rem; }
+.danger-zone { border-color: var(--danger); }
 @media (max-width: 720px) {
   .invite { grid-template-columns: 1fr; }
 }

@@ -1,19 +1,27 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useChat } from './chat'
+import { useChat, type AskQuestion, type Bubble } from './chat'
 import {
   ApiError,
   getSessionSubagents,
+  listSessions,
+  listWorkspaces,
   mediaUrl,
+  stopRun,
   type MediaRef,
+  type RunID,
+  type SessionListItem,
   type SubagentItem,
   type Usage,
+  type Workspace,
 } from './api'
+import { renderSafe } from './markdown'
 import Configure from './Configure.vue'
 import InviteLanding from './InviteLanding.vue'
+import PlanDoc from './PlanDoc.vue'
 import PendingInvites from './PendingInvites.vue'
 import ProjectsView from './ProjectsView.vue'
-import { authFetch, authState, clearAuth, loginWithPassword, switchTenant, tenantState } from './auth'
+import { authExpired, authFetch, authState, clearAuth, loginWithPassword, switchTenant, tenantState } from './auth'
 import { onMutation, ensureEventStream, closeEventStream } from './mutation'
 
 type Page = 'chat' | 'projects' | 'agents' | 'team'
@@ -43,13 +51,196 @@ const {
   sessionId, bubbles, draft, attachments, pending, loadingOlder, atStart, busy,
   activeWorkspaceId, sessionGone,
   send, reconcile, loadOlder, newSession, showTenantSession, resumeRun,
-  setActiveWorkspace, openSession, closeOnDeleted,
+  setActiveWorkspace, openSession, closeOnDeleted, answerQuestion,
 } = useChat()
+
+// —— 等人面板（doc/47 §5.2，2026-10-23 按 kimi 交互重做）——
+// 待答记录可能不止一条（驳回方案后模型会重新提交；并行 ask_user 也会有多条），
+// 面板按 pending 排序展示，默认停在最新一条。
+// 只算「这一轮还活着」的待答：run 被别的端停掉/崩掉后，行里的 status 仍是 pending（没人去改它），
+// 只看 q.status 会让面板永远顶着输入框。气泡已经收口（stopped/error/done）就说明这段等待已经作废。
+const pendingAsks = computed(() => {
+  const out: { bubble: Bubble; q: AskQuestion }[] = []
+  for (const b of bubbles.value) {
+    if (b.state !== 'streaming' && b.state !== 'offline') continue
+    for (const q of b.questions ?? []) {
+      if (q.status === 'pending') out.push({ bubble: b, q })
+    }
+  }
+  return out
+})
+const askIndex = ref(0)
+const ask = computed(() => pendingAsks.value[Math.min(askIndex.value, pendingAsks.value.length - 1)] ?? null)
+// 面板的草稿/选中/编辑态只属于当前这一条：换条就清空（对话数据里不存 UI 状态）。
+const askPick = ref(-1)
+const askDraft = ref('')
+const askMode = ref<'answer' | 'edit' | 'revise'>('answer')
+const askBusy = ref(false)
+const askEl = ref<HTMLElement | null>(null)
+const askTextEl = ref<HTMLTextAreaElement | null>(null)
+
+watch(
+  () => pendingAsks.value.length,
+  (n, prev) => {
+    if (n > prev) askIndex.value = n - 1
+    else if (askIndex.value >= n) askIndex.value = Math.max(0, n - 1)
+    if (n > prev) {
+      void nextTick(() => {
+        scrollBottom()
+        askEl.value?.focus()
+      })
+    }
+  },
+)
+watch(
+  () => ask.value?.q.id ?? '',
+  (id) => {
+    askPick.value = -1
+    askDraft.value = ''
+    askMode.value = 'answer'
+    void nextTick(() => {
+      if (id) askEl.value?.focus()
+      else composerEl.value?.focus()
+    })
+  },
+)
+
+function moveAsk(delta: number) {
+  const n = pendingAsks.value.length
+  if (!n) return
+  askIndex.value = Math.min(Math.max(askIndex.value + delta, 0), n - 1)
+}
+
+const askAnswerReady = computed(() => {
+  const t = ask.value
+  if (!t) return false
+  if (t.q.kind === 'plan') return true
+  return askPick.value >= 0 || askDraft.value.trim() !== ''
+})
+
+function pickOption(i: number) {
+  askPick.value = i
+  askDraft.value = ''
+}
+
+function focusOther() {
+  askPick.value = -1
+  void nextTick(() => askTextEl.value?.focus())
+}
+
+function startPlanEdit() {
+  askMode.value = 'edit'
+  askDraft.value = ask.value?.q.text ?? ''
+  void nextTick(() => askTextEl.value?.focus())
+}
+
+function startPlanRevise() {
+  askMode.value = 'revise'
+  askDraft.value = ''
+  void nextTick(() => askTextEl.value?.focus())
+}
+
+async function submitAsk() {
+  const target = ask.value
+  if (!target || askBusy.value) return
+  const q = target.q
+  askBusy.value = true
+  try {
+    if (q.kind === 'plan') {
+      if (askMode.value === 'revise') {
+        await answerQuestion(q, askDraft.value.trim(), 'revise')
+      } else if (askMode.value === 'edit') {
+        const edited = askDraft.value.trim()
+        if (!edited) return
+        await answerQuestion(q, edited === q.text.trim() ? '' : edited, 'approve')
+      } else {
+        await answerQuestion(q, '', 'approve')
+      }
+      return
+    }
+    const answer = askPick.value >= 0 ? q.options[askPick.value] ?? '' : askDraft.value.trim()
+    if (!answer) return
+    await answerQuestion(q, answer)
+  } finally {
+    askBusy.value = false
+  }
+}
+
+// 数字键选选项、Enter 提交（不抢输入框的按键——输入框自己的 keydown 负责）。
+function onAskKeydown(ev: KeyboardEvent) {
+  const target = ask.value
+  if (!target || ev.isComposing || ev.keyCode === 229) return
+  const el = ev.target as HTMLElement | null
+  if (el?.tagName === 'INPUT' || el?.tagName === 'TEXTAREA') return
+  if (ev.key === 'Enter' && askAnswerReady.value) {
+    ev.preventDefault()
+    void submitAsk()
+    return
+  }
+  if (target.q.kind !== 'question') return
+  if (!/^[1-9]$/.test(ev.key)) return
+  const i = Number(ev.key) - 1
+  if (i < target.q.options.length) {
+    ev.preventDefault()
+    pickOption(i)
+  }
+}
+
+// 面板输入框的 Enter 提交（中文输入法选词的 Enter 只是上屏）。
+function onAskTextKeydown(ev: KeyboardEvent) {
+  if (ev.key !== 'Enter' || ev.shiftKey || ev.isComposing || ev.keyCode === 229) return
+  ev.preventDefault()
+  void submitAsk()
+}
+
+function askStatusLabel(q: AskQuestion): string {
+  if (q.status === 'stale') return '已失效'
+  if (q.status === 'pending') return q.kind === 'plan' ? '待批准' : '待回答'
+  if (q.kind === 'plan') return q.decision === 'revise' ? '已驳回' : '已批准'
+  return '已回答'
+}
+
+// 看板是 run 的实时进度（doc/41 §5.2），按 kimi 的 TodoPanel 挂在输入区上方：
+// 取对话里最后一条看板帧；完成数/总数与折叠都在前端算。
+const board = computed(() => {
+  for (let i = bubbles.value.length - 1; i >= 0; i--) {
+    const text = bubbles.value[i].board
+    if (text) return boardRows(text)
+  }
+  return []
+})
+const todoRows = computed(() => board.value.filter((r) => r.status !== 'deleted'))
+const todoDone = computed(() => todoRows.value.filter((r) => r.status === 'completed').length)
+const todoOpen = ref(true)
+const todoExpanded = ref(false)
+const TODO_VISIBLE = 5
+const todoShown = computed(() =>
+  todoExpanded.value ? todoRows.value : todoRows.value.slice(0, TODO_VISIBLE),
+)
+const todoHidden = computed(() => todoRows.value.length - todoShown.value.length)
+const todoPercent = computed(() =>
+  todoRows.value.length ? Math.round((todoDone.value / todoRows.value.length) * 100) : 0,
+)
+
+function todoIcon(status: string): string {
+  if (status === 'completed') return '✓'
+  if (status === 'in_progress') return '●'
+  return '○'
+}
+
+function todoLabel(status: string): string {
+  if (status === 'completed') return '已完成'
+  if (status === 'in_progress') return '进行中'
+  if (status === 'pending') return '待办'
+  return status
+}
 
 // 变更同步（doc/46 Loop A）：别的窗口删了会话/项目——本地当场失效（气泡作废 / 落点清回默认），
 // 失效永远跟重拉，事件本身不携带状态。
 onMutation((evt) => {
   if (evt.type === 'session_deleted') {
+    // 侧栏只在切会话/收尾时重拉，剪掉这一条否则死链一直躺着（点进去是空对话 + 404）。
+    removeSessionFromTree(evt.id)
     closeOnDeleted(evt.id)
   } else if (evt.type === 'workspace_deleted' && activeWorkspaceId.value === evt.id) {
     setActiveWorkspace(null)
@@ -78,6 +269,11 @@ const fileEl = ref<HTMLInputElement | null>(null)
 const askNew = ref(false)
 const copiedKey = ref('')
 const lightbox = ref('')
+const lightboxZoom = ref(false)
+// 换图/关灯箱都要回到适应窗口，否则上一张的放大态会带过来。
+watch(lightbox, () => {
+  lightboxZoom.value = false
+})
 const showPassword = ref(false)
 
 const loggedIn = computed(() => authState.value)
@@ -103,7 +299,8 @@ function roleLabel(role: string): string {
 }
 
 function kindLabel(kind: string): string {
-  if (kind === 'personal') return '个人'
+  // 「个人」→「我的」：租户是**用户自己的那一个**（注册时自动建），说「个人」像在说类别。
+  if (kind === 'personal') return '我的'
   if (kind === 'team') return '团队'
   return kind
 }
@@ -112,6 +309,13 @@ type TenantItem = { id: string; name: string; kind: string; role: string; status
 
 const switcherEl = ref<HTMLElement | null>(null)
 const menuOpen = ref(false)
+// 窄屏抽屉（doc/51 §5）：桌面端 .rail-body 是常驻的 display:contents，
+// ≤860px 时同一份 DOM 变成抽屉，导航、树、账户的状态都不复制。
+const isMobile = ref(false)
+const drawerOpen = ref(false)
+const drawerEl = ref<HTMLElement | null>(null)
+const menuBtnEl = ref<HTMLButtonElement | null>(null)
+let mobileMq: MediaQueryList | null = null
 const tenants = ref<TenantItem[]>([])
 const switching = ref(false)
 const switchError = ref('')
@@ -132,6 +336,163 @@ async function loadTenants() {
     return
   }
   tenants.value = body.data?.tenants ?? []
+}
+
+// 侧栏（doc/48 A2 → doc/50）：数据是「项目 → 对话」两层。
+//
+// 数据 = GET /api/workspaces + GET /api/sessions（**不带 workspaceId**，服务端返回本人全部
+// 会话，每行自带 workspaceId）——按 workspaceId 挂到项目下，零后端改动。
+//
+// 两条实测约束（doc/50 §2）：① 默认项目不保证排第一（服务端按 created_at 升序，本账号
+// 「验收项目」比「默认」早 107 ms）→ 客户端把 isDefault 排前；② 存量会话的 workspaceId
+// 可能是 null → 只在存在时多出一组「未归项目」。
+type SidebarGroup = { workspace: Workspace; sessions: SessionListItem[] }
+
+// A3 起模板渲染这棵树。loose（未归项目）不是真的 Workspace，用 key 区分，模板只认
+// name / isDefault / sessions。
+type TreeGroup = { key: string; name: string; isDefault: boolean; sessions: SessionListItem[] }
+
+const sidebarGroups = ref<SidebarGroup[]>([])
+const looseSessions = ref<SessionListItem[]>([])
+const recentLoading = ref(false)
+const recentError = ref('')
+
+// 只记**被收起**的项目：首屏默认全展开，不需要初始化。
+const collapsed = ref<Set<string>>(new Set())
+
+const treeGroups = computed<TreeGroup[]>(() => {
+  const groups: TreeGroup[] = sidebarGroups.value.map((g) => ({
+    key: g.workspace.id,
+    name: g.workspace.name,
+    isDefault: !!g.workspace.isDefault,
+    sessions: g.sessions,
+  }))
+  if (looseSessions.value.length) {
+    groups.push({ key: 'loose', name: '未归项目', isDefault: false, sessions: looseSessions.value })
+  }
+  return groups
+})
+
+function toggleProject(key: string) {
+  const next = new Set(collapsed.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  collapsed.value = next
+}
+
+const byCreatedDesc = (a: SessionListItem, b: SessionListItem) =>
+  a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0
+
+// 整栏 10 条上限（doc/50 §3）：所有会话先排成一条全局时间倒序列表，取前 N 条，
+// 分组只渲染这 N 条里属于它的——「展示更多」+10，「收起」回到 10。
+const visibleCount = ref(10)
+const allSessionsDesc = computed(() => treeGroups.value.flatMap((g) => g.sessions).sort(byCreatedDesc))
+const visibleIds = computed(
+  () => new Set(allSessionsDesc.value.slice(0, visibleCount.value).map((s) => s.id)),
+)
+const truncated = computed(() => allSessionsDesc.value.length > visibleCount.value)
+
+// 项目内再限 10 条（用户 2026-10-24 定）：项目自己的「展示全部」只放开它自己，
+// 别的项目仍受整栏上限——「收起」把各自放开的部分也一并收回。
+const PER_PROJECT_LIMIT = 10
+const expandedProjects = ref<Set<string>>(new Set())
+
+// 被截光的分组不应渲染出一条空 <ul>（那会凭空多一段竖线）。
+function visibleSessions(g: TreeGroup): SessionListItem[] {
+  if (expandedProjects.value.has(g.key)) return g.sessions
+  return g.sessions.filter((s) => visibleIds.value.has(s.id)).slice(0, PER_PROJECT_LIMIT)
+}
+
+function projectHasMore(g: TreeGroup): boolean {
+  return !expandedProjects.value.has(g.key) && g.sessions.length > visibleSessions(g).length
+}
+
+function toggleProjectAll(g: TreeGroup) {
+  const next = new Set(expandedProjects.value)
+  if (next.has(g.key)) next.delete(g.key)
+  else next.add(g.key)
+  expandedProjects.value = next
+}
+
+function collapseAll() {
+  visibleCount.value = 10
+  expandedProjects.value = new Set()
+}
+
+function removeSessionFromTree(id: string) {
+  for (const g of sidebarGroups.value) g.sessions = g.sessions.filter((s) => s.id !== id)
+  looseSessions.value = looseSessions.value.filter((s) => s.id !== id)
+}
+
+async function loadSidebarTree() {
+  if (!loggedIn.value) {
+    sidebarGroups.value = []
+    looseSessions.value = []
+    return
+  }
+  recentLoading.value = true
+  recentError.value = ''
+  try {
+    // 一起等：一条成功一条失败时宁可不显示，也不显示半棵树。
+    const [wsRes, sessRes] = await Promise.all([listWorkspaces(), listSessions()])
+    const byWorkspace = new Map<string, SessionListItem[]>()
+    const loose: SessionListItem[] = []
+    for (const s of [...sessRes.sessions].sort(byCreatedDesc)) {
+      if (!s.workspaceId) {
+        loose.push(s)
+        continue
+      }
+      const bucket = byWorkspace.get(s.workspaceId)
+      if (bucket) bucket.push(s)
+      else byWorkspace.set(s.workspaceId, [s])
+    }
+    const workspaces = [...wsRes.workspaces].sort((a, b) => Number(b.isDefault) - Number(a.isDefault))
+    sidebarGroups.value = workspaces.map((workspace) => ({
+      workspace,
+      sessions: byWorkspace.get(workspace.id) ?? [],
+    }))
+    looseSessions.value = loose
+  } catch (e) {
+    recentError.value = e instanceof ApiError ? e.message : '会话列表加载失败'
+  } finally {
+    recentLoading.value = false
+  }
+}
+
+async function openRecentSession(id: string) {
+  // 打开任意会话就收起抽屉（doc/51 §5）：焦点不回菜单按钮——用户已经选了下一步。
+  void closeDrawer(false)
+  if (id === sessionId.value) return
+  page.value = 'chat'
+  await openSession(id)
+  await nextTick()
+  scrollBottom()
+}
+
+function syncMobile() {
+  isMobile.value = mobileMq?.matches ?? false
+  if (!isMobile.value) drawerOpen.value = false
+}
+
+async function openDrawer() {
+  if (!isMobile.value || drawerOpen.value) return
+  menuOpen.value = false
+  drawerOpen.value = true
+  await nextTick()
+  drawerEl.value?.querySelector<HTMLElement>('.nav button')?.focus()
+}
+
+async function closeDrawer(returnFocus = true) {
+  if (!drawerOpen.value) return
+  drawerOpen.value = false
+  if (!returnFocus) return
+  await nextTick()
+  menuBtnEl.value?.focus()
+}
+
+function goPage(next: Page) {
+  page.value = next
+  void closeDrawer(false)
 }
 
 async function toggleMenu() {
@@ -219,7 +580,8 @@ async function doLogin() {
   try {
     const res = await loginWithPassword(email.value, password.value)
     if (!res.ok) {
-      authError.value = res.status ? `${res.status}：${res.message}` : res.message
+      // 状态码是给网关分类的，用户只需要知道哪不对（409：… 这种前缀只会让人去搜错误码）。
+      authError.value = res.message
       return
     }
     password.value = ''
@@ -315,6 +677,30 @@ function onSend() {
   })
 }
 
+// 叫停这一轮（doc/48 A3）：引擎的 POST /api/runs/:id/stop 早就有（server.go:75），
+// 前端一次没调过——方向错了只能刷新页面，那场 run 还在服务端跑着、token 还在烧。
+const stopping = ref(false)
+const stopError = ref('')
+
+// target 给等人面板用：面板顶掉输入框时气泡可能是 offline（拉不到帧），按 streaming 找会找不到。
+async function stopCurrent(target?: Bubble) {
+  if (stopping.value) return
+  const b = target ?? bubbles.value.find((x) => x.state === 'streaming' && x.runId)
+  if (!b || !b.runId) return
+  stopping.value = true
+  stopError.value = ''
+  try {
+    await stopRun(b.runId as RunID)
+    // 服务端幂等（停了再调仍回 stopped）。这里先本地落定，界面立刻有反应；
+    // 轮询随后收到 terminal 帧会再收口一次（两边一致，不会打架）。
+    b.state = 'stopped'
+  } catch (e) {
+    stopError.value = e instanceof ApiError ? e.message : '叫停失败'
+  } finally {
+    stopping.value = false
+  }
+}
+
 // 中文输入法选词时 Enter 只是上屏，不能当成发送。
 function onDraftKeydown(ev: KeyboardEvent) {
   if (ev.key !== 'Enter' || ev.shiftKey || ev.isComposing || ev.keyCode === 229) return
@@ -333,15 +719,23 @@ watch(draft, () => {
   void nextTick(fitComposer)
 })
 
+// 剪贴板在非安全上下文 / 权限被拒时会失败。以前静默吞掉，用户以为复制成功、粘出来是空的。
+const copyFailedKey = ref('')
+
 async function copyBubble(key: string, text: string) {
   try {
     await navigator.clipboard.writeText(text)
     copiedKey.value = key
+    copyFailedKey.value = ''
     window.setTimeout(() => {
       if (copiedKey.value === key) copiedKey.value = ''
     }, 1400)
   } catch {
     copiedKey.value = ''
+    copyFailedKey.value = key
+    window.setTimeout(() => {
+      if (copyFailedKey.value === key) copyFailedKey.value = ''
+    }, 1400)
   }
 }
 
@@ -349,6 +743,10 @@ function onWindowKey(ev: KeyboardEvent) {
   if (ev.key !== 'Escape') return
   if (lightbox.value) {
     lightbox.value = ''
+    return
+  }
+  if (drawerOpen.value) {
+    void closeDrawer()
     return
   }
   if (menuOpen.value) {
@@ -605,6 +1003,28 @@ watch(sessionId, () => {
   subagents.value = []
   subagentsOpen.value = false
   void loadSubagents()
+  void loadSidebarTree()
+}, { immediate: true })
+
+// 打开某条会话时展开它所属项目，并保证它没被上限截掉：否则人会「打开了一个在
+// 侧栏里看不见的会话」。被截时只放开**这一个项目**，不动整栏上限。也监听
+// treeGroups——首屏 sessionId 先到、树后到，只盯 sessionId 会错过这一次。
+// expandedProjects 不是监听源，所以用户主动「收起」之后不会被这里立刻顶回去。
+watch([sessionId, treeGroups], () => {
+  const id = sessionId.value
+  if (!id) return
+  const group = treeGroups.value.find((g) => g.sessions.some((s) => s.id === id))
+  if (!group) return
+  if (collapsed.value.has(group.key)) {
+    const next = new Set(collapsed.value)
+    next.delete(group.key)
+    collapsed.value = next
+  }
+  if (!visibleSessions(group).some((s) => s.id === id)) {
+    const next = new Set(expandedProjects.value)
+    next.add(group.key)
+    expandedProjects.value = next
+  }
 }, { immediate: true })
 
 // 一轮 run 收口后刷新：子代理 wire 的 terminal 行是跑完才写的，忙时不重拉。
@@ -614,7 +1034,14 @@ watch(busy, (now, prev) => {
 
 function scrollBottom() {
   const el = listEl.value
-  if (el) el.scrollTop = el.scrollHeight
+  if (!el) return
+  // **空列表时不要滚**：.list 里装的是「从一句话开始」的空态，滚到底会把开头
+  // （小标题 + 大标题）推出视野——窄屏上尤其明显（对话区被顶栏挤矮了）。
+  if (!bubbles.value.length) {
+    el.scrollTop = 0
+    return
+  }
+  el.scrollTop = el.scrollHeight
 }
 
 function jumpBottom() {
@@ -661,7 +1088,13 @@ watch(authState, async (ok) => {
     menuOpen.value = false
     return
   }
+  // 登录后把页面滚回顶部：窄屏下登录页会把密码框滚进视野，登录后那个滚动位置
+  // 会一直留着（body 的 overflow:hidden 挡不住程序化滚动）→ 用户看到半截界面。
+  document.body.scrollTop = 0
+  document.documentElement.scrollTop = 0
+  window.scrollTo(0, 0)
   await loadTenants()
+  await loadSidebarTree()
   await reconcile()
   await nextTick()
   scrollBottom()
@@ -682,6 +1115,9 @@ watch(
 )
 
 onMounted(async () => {
+  mobileMq = window.matchMedia('(max-width: 860px)')
+  syncMobile()
+  mobileMq.addEventListener('change', syncMobile)
   window.addEventListener('keydown', onWindowKey)
   window.addEventListener('pointerdown', onDocPointer)
   if (!loggedIn.value) return
@@ -693,6 +1129,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  mobileMq?.removeEventListener('change', syncMobile)
   window.removeEventListener('keydown', onWindowKey)
   window.removeEventListener('pointerdown', onDocPointer)
   for (const url of Object.values(mediaSrc.value)) URL.revokeObjectURL(url)
@@ -721,7 +1158,7 @@ async function onScroll() {
     @dragleave="onDragLeave"
     @drop="onDrop"
   >
-    <aside v-if="loggedIn" class="rail">
+    <aside v-if="loggedIn" class="rail" :class="{ 'drawer-open': drawerOpen }">
       <div class="brand">
         <span class="mark" aria-hidden="true">t</span>
         <div>
@@ -746,24 +1183,105 @@ async function onScroll() {
         </div>
       </div>
 
+      <button
+        ref="menuBtnEl"
+        type="button"
+        class="menu-btn"
+        aria-label="打开菜单"
+        aria-controls="rail-drawer"
+        :aria-expanded="drawerOpen"
+        @click="openDrawer"
+      >
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+          <path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11" />
+        </svg>
+      </button>
+
+      <div v-if="drawerOpen" class="drawer-backdrop" aria-hidden="true" @click="closeDrawer()"></div>
+
+      <div
+        id="rail-drawer"
+        ref="drawerEl"
+        class="rail-body"
+        :role="isMobile ? 'dialog' : undefined"
+        :aria-modal="isMobile && drawerOpen ? 'true' : undefined"
+        :aria-hidden="isMobile && !drawerOpen ? 'true' : undefined"
+        :aria-label="isMobile ? '导航与项目' : undefined"
+      >
       <nav class="nav" aria-label="页面">
-        <button type="button" :class="{ on: page === 'chat' }" :aria-current="page === 'chat' ? 'page' : undefined" @click="page = 'chat'">
+        <button type="button" :class="{ on: page === 'chat' }" :aria-current="page === 'chat' ? 'page' : undefined" @click="goPage('chat')">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 3.5h10v7.2H6.2L3 13z" stroke-linejoin="round" /></svg>
           对话
         </button>
-        <button type="button" :class="{ on: page === 'projects' }" :aria-current="page === 'projects' ? 'page' : undefined" @click="page = 'projects'">
+        <button type="button" :class="{ on: page === 'projects' }" :aria-current="page === 'projects' ? 'page' : undefined" @click="goPage('projects')">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2.5 4.5h4l1.2 1.5h5.8v6.5h-11z" stroke-linejoin="round" /></svg>
           项目
         </button>
-        <button type="button" :class="{ on: page === 'agents' }" :aria-current="page === 'agents' ? 'page' : undefined" @click="page = 'agents'">
+        <button type="button" :class="{ on: page === 'agents' }" :aria-current="page === 'agents' ? 'page' : undefined" @click="goPage('agents')">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="5.2" r="2.2" /><path d="M3.4 13.2c.7-2.2 2.4-3.2 4.6-3.2s3.9 1 4.6 3.2" stroke-linecap="round" /></svg>
           助手
         </button>
-        <button type="button" :class="{ on: page === 'team' }" :aria-current="page === 'team' ? 'page' : undefined" @click="page = 'team'">
+        <button type="button" :class="{ on: page === 'team' }" :aria-current="page === 'team' ? 'page' : undefined" @click="goPage('team')">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="2.5" y="2.5" width="11" height="11" rx="2" /><path d="M5 8h6M8 5v6" stroke-linecap="round" /></svg>
           团队
         </button>
       </nav>
+
+      <!-- 侧栏（doc/50）：项目 → 对话两层树。项目行整行点击收起/展开，默认全展开
+           （collapsed 只记被收起的，所以首屏不用初始化）。 -->
+      <section v-if="loggedIn" class="recent" aria-label="会话">
+        <div class="recent-head">
+          <span>项目</span>
+          <button v-if="recentError" type="button" class="recent-retry" @click="loadSidebarTree">重试</button>
+        </div>
+        <p v-if="recentLoading && !treeGroups.length" class="recent-note">正在加载…</p>
+        <p v-else-if="recentError" class="recent-note error" role="alert">{{ recentError }}</p>
+        <p v-else-if="!treeGroups.length" class="recent-note">还没有项目。</p>
+        <div v-else class="tree">
+          <div v-for="g in treeGroups" :key="g.key" class="tree-group">
+            <button
+              type="button"
+              class="tree-project"
+              :aria-expanded="!collapsed.has(g.key)"
+              @click="toggleProject(g.key)"
+            >
+              <svg v-if="!collapsed.has(g.key)" class="tree-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M6 14l1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2" />
+              </svg>
+              <svg v-else class="tree-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
+              </svg>
+              <span class="tree-name">{{ g.name }}</span>
+              <span v-if="g.isDefault" class="tree-badge">默认</span>
+            </button>
+            <ul v-if="!collapsed.has(g.key) && visibleSessions(g).length" class="recent-list tree-sessions">
+              <li v-for="s in visibleSessions(g)" :key="s.id">
+                <button
+                  type="button"
+                  class="recent-item"
+                  :class="{ on: s.id === sessionId }"
+                  :title="s.title || '未命名对话'"
+                  @click="openRecentSession(s.id)"
+                >
+                  <span class="recent-title">{{ s.title || '未命名对话' }}</span>
+                  <span class="recent-time">{{ fmtDateTime(s.createdAt) }}</span>
+                </button>
+              </li>
+            </ul>
+            <p v-if="!collapsed.has(g.key) && !g.sessions.length" class="recent-note tree-empty">还没有对话</p>
+            <button
+              v-if="!collapsed.has(g.key) && (expandedProjects.has(g.key) || projectHasMore(g))"
+              type="button"
+              class="tree-more"
+              @click="toggleProjectAll(g)"
+            >{{ expandedProjects.has(g.key) ? '收起' : '展示全部' }}</button>
+          </div>
+        </div>
+        <!-- 就地展开比跳去项目页更近一步（doc/50 §3）：原来那条「在项目页看全部 →」不再需要，
+             侧栏本身已是全量目录，项目页走导航的「项目」。 -->
+        <button v-if="truncated" type="button" class="recent-more" @click="visibleCount += 10">展示更多</button>
+        <button v-else-if="allSessionsDesc.length > 10" type="button" class="recent-more" @click="collapseAll">收起</button>
+      </section>
 
       <div class="rail-foot">
         <span class="avatar" aria-hidden="true">{{ initial }}</span>
@@ -803,11 +1321,13 @@ async function onScroll() {
                 <span class="tag">{{ roleLabel(row.role) }}</span>
               </button>
               <p v-if="switchError" class="auth-error" role="alert">{{ switchError }}</p>
-              <button type="button" class="switch-create" @click="openCreate">+ 创建工作区</button>
+              <!-- POST /api/tenants 建的是**团队**租户（CreateTeamTenant），说「创建工作区」
+                   会让人以为能再建一个自己的——说清楚。 -->
+              <button type="button" class="switch-create" @click="openCreate">+ 创建团队工作区</button>
             </template>
             <form v-else class="switch-create-form" @submit.prevent="createWorkspace">
               <label>
-                工作区名称
+                团队工作区名称
                 <input v-model="createName" type="text" autocomplete="off" />
               </label>
               <p v-if="createError" class="auth-error" role="alert">{{ createError }}</p>
@@ -819,6 +1339,7 @@ async function onScroll() {
           </div>
         </div>
         <button type="button" class="logout" @click="logout">退出</button>
+      </div>
       </div>
     </aside>
 
@@ -833,6 +1354,8 @@ async function onScroll() {
         </div>
         <div class="gate-card">
           <h2>登录</h2>
+          <!-- 被系统踢回来 vs 自己退出：同一张表单，得说清是哪一种。 -->
+          <p v-if="authExpired" class="auth-note">登录已过期，请重新登录</p>
           <label>
             邮箱
             <input v-model="email" type="email" autocomplete="username" required autofocus />
@@ -865,7 +1388,13 @@ async function onScroll() {
 
         <div v-show="page === 'chat'" class="thread">
           <p v-if="sessionGone" class="session-gone" role="alert">{{ sessionGone }}</p>
-          <div v-if="sessionId" class="subagents">
+          <!-- 有子代理才显示这条（doc/48 A4）：没有子代理时它白占一行，
+               还带一个「展开」按钮诱导用户去点空的。
+               列表在会话建立时就拉了（见下面 watch(sessionId)），所以这里判断得准。 -->
+          <div
+            v-if="sessionId && (subagents.length || subagentsLoading || subagentsError)"
+            class="subagents"
+          >
             <button type="button" class="subagent-bar" :aria-expanded="subagentsOpen" @click="toggleSubagents">
               <span>子代理 {{ subagents.length }}</span>
               <span v-if="subagentsLoading" class="spinner" aria-hidden="true"></span>
@@ -909,52 +1438,62 @@ async function onScroll() {
             </div>
             <div v-else-if="bubbles.length && !atStart" class="older muted">上滚查看更早的记录</div>
 
-            <article v-for="b in bubbles" :key="b.key" :class="['bubble', b.role, b.state]">
-              <div class="bubble-main">
-                <template v-if="b.media?.length">
-                  <template v-for="(m, i) in b.media" :key="`${b.key}:m${i}`">
-                    <button
-                      v-if="isImage(m) && mediaSrc[m.path]"
-                      type="button"
-                      class="media-btn"
-                      :aria-label="`查看 ${mediaLabel(m)}`"
-                      @click="lightbox = mediaSrc[m.path]"
-                    >
-                      <img class="bubble-media" :src="mediaSrc[m.path]" :alt="mediaLabel(m)" />
-                    </button>
-                    <p v-else class="bubble-file">
-                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M4 2.5h5l3 3V13.5H4z" stroke-linejoin="round" /><path d="M9 2.5V6h3.2" /></svg>
-                      <span>{{ mediaLabel(m) }}</span>
-                      <span class="file-meta">{{ m.mime }} · {{ fmtSize(m.size) }}</span>
-                    </p>
+            <article v-for="b in bubbles" :key="b.key" class="turn" :class="b.role">
+              <div :class="['bubble', b.role, b.state]">
+                <div class="bubble-main">
+                  <template v-if="b.media?.length">
+                    <template v-for="(m, i) in b.media" :key="`${b.key}:m${i}`">
+                      <button
+                        v-if="isImage(m) && mediaSrc[m.path]"
+                        type="button"
+                        class="media-btn"
+                        :aria-label="`查看 ${mediaLabel(m)}`"
+                        @click="lightbox = mediaSrc[m.path]"
+                      >
+                        <img class="bubble-media" :src="mediaSrc[m.path]" :alt="mediaLabel(m)" />
+                      </button>
+                      <p v-else class="bubble-file">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M4 2.5h5l3 3V13.5H4z" stroke-linejoin="round" /><path d="M9 2.5V6h3.2" /></svg>
+                        <span>{{ mediaLabel(m) }}</span>
+                        <span class="file-meta">{{ m.mime }} · {{ fmtSize(m.size) }}</span>
+                      </p>
+                    </template>
                   </template>
-                </template>
-                <p v-if="b.text" class="bubble-text">{{ b.text }}</p>
-                <!-- 任务看板（doc/41 §5.2 的 kind=task 帧）：结构态 → 状态色随 TaskUpdate 翻转，
-                     不靠解析自然语言回执（换个提示词措辞就渲染错）。 -->
-                <ul v-if="b.board" class="board" aria-label="任务看板">
-                  <li v-for="(row, i) in boardRows(b.board)" :key="i" :class="['board-row', row.status]">
-                    <span class="board-no">#{{ row.no }}</span>
-                    <span class="board-status">{{ row.status }}</span>
-                    <span class="board-subject">{{ row.subject }}</span>
-                  </li>
-                </ul>
-                <span v-else-if="b.state === 'streaming' || b.state === 'offline'" class="typing" aria-label="正在生成">
-                  <i></i><i></i><i></i>
-                </span>
-                <p v-if="b.state === 'offline'" class="note">拉不到帧，改看会话状态</p>
-                <p v-if="b.state === 'queued'" class="note">会话忙，这条还在排队</p>
-                <p v-if="b.state === 'stopped'" class="note">已停止，没有写进历史</p>
-                <p v-if="b.state === 'interrupted'" class="note">
-                  {{ b.resumable === false ? '这次运行中断了，已不能再续，请重新发一条' : '这次运行中断了' }}
-                </p>
-                <button
-                  v-if="b.state === 'interrupted' && b.resumable !== false"
-                  type="button"
-                  class="resume-btn"
-                  @click="resumeRun(b)"
-                >继续这一轮</button>
-                <p v-if="b.state === 'error'" class="note">失败，没有写进历史</p>
+                  <!-- markdown 渲染（doc/48 A1）：v6 契约写明「客户端按 markdown 渲染」，
+                       此前是纯文本插值——模型的标题、表格、代码块全变成字面符号。
+                       用 div 不用 p：markdown 会产出块级元素，<p> 装块级元素会被 HTML 解析器拆开。
+                       v-memo：正文没变就别重算——否则流式输出时每个 token 到达都要把
+                       **所有**气泡的 markdown 重新 parse + sanitize 一遍。 -->
+                  <div v-if="b.text" class="bubble-text" v-html="renderSafe(b.text)" v-memo="[b.text]" />
+                  <span
+                    v-if="(b.state === 'streaming' || b.state === 'offline') && !pendingAsks.length"
+                    class="typing"
+                    aria-label="正在生成"
+                  >
+                    <i></i><i></i><i></i>
+                  </span>
+                  <p v-if="b.state === 'offline'" class="note">拉不到帧，改看会话状态</p>
+                  <p v-if="b.state === 'queued'" class="note">会话忙，这条还在排队</p>
+                  <p v-if="b.state === 'stopped'" class="note">已停止，没有写进历史</p>
+                  <p v-if="b.state === 'interrupted'" class="note">
+                    {{ b.resumable === false ? '这次运行中断了，已不能再续，请重新发一条' : '这次运行中断了' }}
+                  </p>
+                  <button
+                    v-if="b.state === 'interrupted' && b.resumable !== false"
+                    type="button"
+                    class="resume-btn"
+                    @click="resumeRun(b)"
+                  >继续这一轮</button>
+                  <p v-if="b.state === 'error'" class="note">失败，没有写进历史</p>
+                </div>
+              </div>
+              <!-- 用量与复制是这一轮的元信息，不是正文（doc/51 §6）：
+                   放进气泡里会跟着气泡宽度走，读起来像脚注；放外面两者都不再挤正文。 -->
+              <div
+                v-if="b.text || (b.role === 'assistant' && (b.usage || b.usageUnknown))"
+                class="bubble-meta"
+                :class="b.role"
+              >
                 <span v-if="b.role === 'assistant' && b.usage" class="usage" :class="usageClass(b.usage)">{{ usageText(b.usage) }}</span>
                 <span v-else-if="b.role === 'assistant' && b.usageUnknown" class="usage">用量 ?</span>
                 <button
@@ -962,13 +1501,192 @@ async function onScroll() {
                   type="button"
                   class="copy"
                   @click="copyBubble(b.key, b.text)"
-                >{{ copiedKey === b.key ? '已复制' : '复制' }}</button>
+                >{{ copyFailedKey === b.key ? '复制失败' : copiedKey === b.key ? '已复制' : '复制' }}</button>
+              </div>
+
+              <!-- 问答记录（doc/47 §5.2）：互动本身在底部 dock，这里留的是可回看的档案。
+                   方案按文档渲染（标题/列表/代码），问题连同选项与答案一起留档。 -->
+              <div v-if="b.questions?.length" class="qa-stack">
+                <div
+                  v-for="q in b.questions"
+                  :key="q.id"
+                  :class="['qa-card', q.kind, q.status]"
+                >
+                  <header class="qa-head">
+                    <span class="qa-kind">{{ q.kind === 'plan' ? 'Plan' : '问题' }}</span>
+                    <span :class="['qa-chip', q.status, q.decision]">{{ askStatusLabel(q) }}</span>
+                  </header>
+                  <template v-if="q.kind === 'plan'">
+                    <PlanDoc v-if="q.text" :text="q.text" />
+                  </template>
+                  <template v-else>
+                    <p class="qa-question">{{ q.text }}</p>
+                    <ul v-if="q.options.length" class="qa-opts">
+                      <li
+                        v-for="(opt, i) in q.options"
+                        :key="`${q.id}:o${i}`"
+                        :class="{ picked: q.status === 'answered' && q.submitted === opt }"
+                      >
+                        <span class="qa-num">{{ i + 1 }}</span>
+                        <span>{{ opt }}</span>
+                      </li>
+                    </ul>
+                  </template>
+                  <p v-if="q.status === 'answered'" class="qa-answer">
+                    <template v-if="q.kind === 'plan' && q.decision === 'revise'">已退回修改{{ q.submitted ? `：${q.submitted}` : '' }}</template>
+                    <template v-else-if="q.kind === 'plan'">已批准执行{{ q.submitted ? '（按你改写后的方案）' : '' }}</template>
+                    <template v-else>你的回答：{{ q.submitted || '（空）' }}</template>
+                  </p>
+                  <p v-else-if="q.status === 'stale'" class="qa-note">这条已经失效，引擎重启后没有恢复等待。</p>
+                  <p v-if="q.error" class="qa-note error">{{ q.error }}</p>
+                </div>
               </div>
             </article>
           </section>
 
           <p v-if="attachNotice" class="attach-notice" role="alert">{{ attachNotice }}</p>
-          <form class="composer" @submit.prevent="onSend">
+
+          <!-- 看板（doc/41 §5.2）：跟 kimi 的 Todo 面板一样挂在输入区上方，
+               完成数/总数/折叠都在前端算，模型的眼睛仍看同一份紧凑文本。 -->
+          <section v-if="todoRows.length" class="todo-dock" aria-label="任务看板">
+            <button type="button" class="todo-head" :aria-expanded="todoOpen" @click="todoOpen = !todoOpen">
+              <span class="todo-title">Todo</span>
+              <span class="todo-count">{{ todoDone }}/{{ todoRows.length }}</span>
+              <span class="todo-meter" aria-hidden="true"><i :style="{ width: `${todoPercent}%` }"></i></span>
+              <span class="todo-chev">{{ todoOpen ? '收起' : '展开' }}</span>
+            </button>
+            <ul v-if="todoOpen">
+              <li v-for="row in todoShown" :key="row.no" :class="['todo-row', row.status]">
+                <span class="todo-icon" aria-hidden="true">{{ todoIcon(row.status) }}</span>
+                <span class="todo-subject">{{ row.subject }}</span>
+                <span class="todo-status">{{ todoLabel(row.status) }}</span>
+              </li>
+              <li v-if="todoHidden > 0 || todoExpanded" class="todo-more">
+                <button type="button" @click="todoExpanded = !todoExpanded">
+                  {{ todoExpanded ? '收起' : `+${todoHidden} 项` }}
+                </button>
+              </li>
+            </ul>
+          </section>
+
+          <!-- 等人面板（doc/47 §5.2）：run 挂起在这一行时顶掉输入框——提问就是这一轮的输入。
+               问题：编号选项 + 其他（自由文本）；方案：批准 / 编辑后批准 / 退回修改。 -->
+          <aside
+            v-if="ask"
+            ref="askEl"
+            :class="['ask-dock', ask.q.kind]"
+            tabindex="-1"
+            @keydown="onAskKeydown"
+          >
+            <header class="ask-dock-head">
+              <span class="ask-kicker">{{ ask.q.kind === 'plan' ? '方案审核' : '需要你确认' }}</span>
+              <span :class="['qa-chip', ask.q.status, ask.q.decision]">{{ askStatusLabel(ask.q) }}</span>
+              <div v-if="pendingAsks.length > 1" class="ask-nav">
+                <button type="button" :disabled="askIndex <= 0" aria-label="上一条" @click="moveAsk(-1)">‹</button>
+                <span>{{ askIndex + 1 }} / {{ pendingAsks.length }}</span>
+                <button type="button" :disabled="askIndex >= pendingAsks.length - 1" aria-label="下一条" @click="moveAsk(1)">›</button>
+              </div>
+              <!-- 等待期间 composer 被这个面板顶掉，没有出口就只剩等。 -->
+              <button
+                v-if="ask.bubble.runId"
+                type="button"
+                class="stop-btn ask-stop"
+                :disabled="stopping"
+                @click="stopCurrent(ask.bubble)"
+              >{{ stopping ? '正在停止…' : '停止' }}</button>
+            </header>
+
+            <template v-if="ask.q.kind === 'question'">
+              <p class="ask-question">{{ ask.q.text }}</p>
+              <ol v-if="ask.q.options.length" class="ask-options">
+                <li v-for="(opt, i) in ask.q.options" :key="`${ask.q.id}:o${i}`">
+                  <button
+                    type="button"
+                    :class="['ask-option', { on: askPick === i }]"
+                    :aria-pressed="askPick === i"
+                    @click="pickOption(i)"
+                  >
+                    <span class="ask-num">→ [{{ i + 1 }}]</span>
+                    <span class="ask-opt-text">{{ opt }}</span>
+                    <span class="ask-check" aria-hidden="true">{{ askPick === i ? '✓' : '' }}</span>
+                  </button>
+                </li>
+              </ol>
+              <div class="ask-other" :class="{ on: askPick < 0 && askDraft.trim() !== '' }">
+                <span class="ask-num">{{ ask.q.options.length ? '其他' : '回答' }}</span>
+                <textarea
+                  ref="askTextEl"
+                  v-model="askDraft"
+                  rows="2"
+                  :placeholder="ask.q.options.length ? '都不是？直接写你的回答…' : '写你的回答…'"
+                  @focus="askPick = -1"
+                  @keydown="onAskTextKeydown"
+                ></textarea>
+              </div>
+              <p v-if="ask.q.error" class="ask-error" role="alert">{{ ask.q.error }}</p>
+              <footer class="ask-foot">
+                <span class="ask-hint">数字键选择 · Enter 提交 · Shift+Enter 换行</span>
+                <button type="button" class="ask-btn primary" :disabled="!askAnswerReady || askBusy" @click="submitAsk">
+                  {{ askBusy ? '正在提交…' : '提交' }}
+                </button>
+              </footer>
+            </template>
+
+            <template v-else>
+              <p class="ask-lede">方案在上方。批准后开始执行；退回修改会按你的意见重写方案再提交。</p>
+
+              <template v-if="askMode === 'edit'">
+                <textarea
+                  ref="askTextEl"
+                  v-model="askDraft"
+                  class="ask-textarea"
+                  rows="12"
+                  @keydown="onAskTextKeydown"
+                ></textarea>
+                <footer class="ask-foot">
+                  <span class="ask-hint">在原文上改；Enter 批准 · Shift+Enter 换行</span>
+                  <button type="button" class="ask-btn ghost" @click="askMode = 'answer'">取消</button>
+                  <button
+                    type="button"
+                    class="ask-btn primary"
+                    :disabled="!askDraft.trim() || askBusy"
+                    @click="submitAsk"
+                  >按改后的方案批准</button>
+                </footer>
+              </template>
+
+              <template v-else-if="askMode === 'revise'">
+                <textarea
+                  ref="askTextEl"
+                  v-model="askDraft"
+                  class="ask-textarea"
+                  rows="4"
+                  placeholder="哪里要改？（可以留空，只退回重做）"
+                  @keydown="onAskTextKeydown"
+                ></textarea>
+                <p v-if="ask.q.error" class="ask-error" role="alert">{{ ask.q.error }}</p>
+                <footer class="ask-foot">
+                  <span class="ask-hint">Enter 退回 · Shift+Enter 换行</span>
+                  <button type="button" class="ask-btn ghost" @click="askMode = 'answer'">取消</button>
+                  <button type="button" class="ask-btn danger" :disabled="askBusy" @click="submitAsk">
+                    {{ askBusy ? '正在提交…' : '退回修改' }}
+                  </button>
+                </footer>
+              </template>
+
+              <footer v-else class="ask-foot">
+                <span v-if="ask.q.error" class="ask-error" role="alert">{{ ask.q.error }}</span>
+                <span v-else class="ask-hint">Enter 批准</span>
+                <button type="button" class="ask-btn ghost" @click="startPlanRevise">退回修改</button>
+                <button type="button" class="ask-btn ghost" @click="startPlanEdit">编辑后批准</button>
+                <button type="button" class="ask-btn primary" :disabled="askBusy" @click="submitAsk">
+                  {{ askBusy ? '正在提交…' : '批准执行' }}
+                </button>
+              </footer>
+            </template>
+          </aside>
+
+          <form v-else class="composer" @submit.prevent="onSend">
             <input
               ref="fileEl"
               type="file"
@@ -1010,6 +1728,14 @@ async function onScroll() {
               <span v-if="pending.length" class="hint queue">排队 {{ pending.length }}</span>
               <span v-else-if="busy" class="hint live">正在回复</span>
               <span v-else class="hint">Enter 发送 · Shift+Enter 换行 · 可粘贴图片</span>
+              <!-- 叫停这一轮（doc/48 A3）：引擎端点早就有，前端一直没接。 -->
+              <button
+                v-if="busy"
+                type="button"
+                class="stop-btn"
+                :disabled="stopping"
+                @click="stopCurrent()"
+              >{{ stopping ? '正在停止…' : '停止' }}</button>
               <button type="submit" class="send" :disabled="!draft.trim() && !attachments.length" aria-label="发送">
                 <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
                   <path d="M10 16.2V4.4M5.2 8.8 10 4l4.8 4.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none" />
@@ -1017,15 +1743,22 @@ async function onScroll() {
               </button>
             </div>
           </form>
-          <button v-if="!pinned && bubbles.length" type="button" class="jump" @click="jumpBottom">回到最新</button>
+          <button v-if="!pinned && bubbles.length && !ask" type="button" class="jump" @click="jumpBottom">回到最新</button>
         </div>
       </template>
     </div>
 
+    <!-- 灯箱：Esc 之外要有能点的出口（触屏没有 Esc）；点图在「适应窗口 / 原始大小」间切换。 -->
     <div v-if="lightbox" class="lightbox" role="dialog" aria-label="查看图片" @click="lightbox = ''">
-      <img :src="lightbox" alt="" />
+      <img
+        :src="lightbox"
+        alt=""
+        :class="{ zoomed: lightboxZoom }"
+        @click.stop="lightboxZoom = !lightboxZoom"
+      />
+      <button type="button" class="lightbox-close" aria-label="关闭" @click="lightbox = ''">×</button>
     </div>
-    <span class="sr-only" aria-live="polite">{{ copiedKey ? '已复制' : '' }}</span>
+    <span class="sr-only" aria-live="polite">{{ copyFailedKey ? '复制失败' : copiedKey ? '已复制' : '' }}</span>
   </div>
 </template>
 
@@ -1033,21 +1766,27 @@ async function onScroll() {
 .app {
   height: 100%;
   display: flex;
-  background:
-    radial-gradient(42rem 24rem at 100% -8rem, rgba(15, 110, 86, 0.08), transparent 60%),
-    var(--bg);
+  background: var(--bg);
 }
 
+/* 三段式（doc/51 §4）：head（品牌/新对话/导航）、tree（唯一可伸缩）、foot（账户钉底）。
+   底栏不再用 margin-top:auto——那会在树比视口高时把账户卡叠在会话上。 */
 .rail {
   width: 15.5rem;
   flex: none;
-  display: flex;
-  flex-direction: column;
-  gap: 0.85rem;
-  padding: 1.1rem 0.85rem 0.9rem;
-  background: rgba(232, 226, 214, 0.72);
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  gap: 0.7rem;
+  padding: 0.95rem 0.85rem 0.8rem;
+  background: var(--sidebar);
   border-right: 1px solid var(--line);
 }
+
+/* 桌面端抽屉外壳透明：nav / 树 / 账户仍是 .rail 网格的直接成员。
+   窄屏才把同一份 DOM 变成浮层（doc/51 §5）。 */
+.rail-body { display: contents; }
+.menu-btn,
+.drawer-backdrop { display: none; }
 
 .brand,
 .rail-foot,
@@ -1064,7 +1803,7 @@ async function onScroll() {
 
 .brand {
   gap: 0.65rem;
-  padding: 0.15rem 0.35rem 0.2rem;
+  padding: 0 0.35rem;
 }
 .brand strong {
   display: block;
@@ -1084,9 +1823,9 @@ async function onScroll() {
   height: 1.85rem;
   display: grid;
   place-items: center;
-  border-radius: 0.6rem;
+  border-radius: var(--radius-control);
   background: var(--ink);
-  color: #f6f1e7;
+  color: var(--on-ink);
   font-weight: 650;
   letter-spacing: -0.03em;
 }
@@ -1102,16 +1841,18 @@ async function onScroll() {
 .send,
 .pop-go {
   border: 0;
-  background: var(--ink);
-  color: #f6f1e7;
+  background: var(--accent);
+  color: #fff;
 }
 .new-wrap { position: relative; }
 .new-chat {
   gap: 0.4rem;
   justify-content: center;
-  border-radius: 999px;
-  padding: 0.55rem 0.8rem;
-  font-size: 0.86rem;
+  height: 32px;
+  border-radius: var(--radius-control);
+  padding: 0 0.8rem;
+  font-size: var(--text-sm);
+  font-weight: 500;
 }
 .new-chat svg {
   width: 0.9rem;
@@ -1120,7 +1861,7 @@ async function onScroll() {
 .new-chat:hover,
 .primary:hover:not(:disabled),
 .send:hover:not(:disabled) {
-  background: #292524;
+  background: var(--accent-ink);
 }
 
 .pop {
@@ -1131,7 +1872,7 @@ async function onScroll() {
   width: 16rem;
   background: var(--bg-raised);
   border: 1px solid var(--line-strong);
-  border-radius: 14px;
+  border-radius: var(--radius-panel);
   padding: 0.75rem;
   box-shadow: var(--shadow);
 }
@@ -1150,19 +1891,20 @@ async function onScroll() {
 .icon-btn,
 .jump,
 .ghost-link {
-  border-radius: 999px;
-  font-size: 0.78rem;
+  border-radius: var(--radius-control);
+  font-size: var(--text-sm);
 }
 .pop-go,
 .pop-stay {
   border: 0;
-  padding: 0.35rem 0.7rem;
+  height: 28px;
+  padding: 0 0.7rem;
 }
 .pop-stay,
 .logout,
 .icon-btn,
 .jump {
-  background: transparent;
+  background: var(--bg-raised);
   color: var(--ink-soft);
   border: 1px solid var(--line-strong);
 }
@@ -1170,25 +1912,26 @@ async function onScroll() {
 .logout:hover,
 .icon-btn:hover:not(:disabled),
 .jump:hover {
-  background: #fff;
-  border-color: #cfc6b6;
+  background: var(--hover);
+  border-color: var(--line-strong);
 }
 
 .nav {
   display: flex;
   flex-direction: column;
-  gap: 0.2rem;
+  gap: 0.05rem;
 }
 .nav button {
   gap: 0.55rem;
   width: 100%;
+  height: 32px;
   text-align: left;
   border: 0;
   background: transparent;
   color: var(--ink-soft);
-  border-radius: 12px;
-  padding: 0.5rem 0.65rem;
-  font-size: 0.9rem;
+  border-radius: var(--radius-control);
+  padding: 0 0.65rem;
+  font-size: var(--text-sm);
 }
 .nav button svg {
   width: 1rem;
@@ -1196,20 +1939,20 @@ async function onScroll() {
   flex: none;
 }
 .nav button.on {
-  background: var(--bg-raised);
-  color: var(--ink);
-  box-shadow: 0 1px 2px rgba(68, 48, 24, 0.06);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
 }
 .nav button:hover:not(.on) {
-  background: rgba(255, 253, 248, 0.55);
+  background: var(--hover);
 }
 
 .rail-foot {
-  margin-top: auto;
+  margin-top: 0;
   gap: 0.55rem;
-  padding: 0.45rem;
-  border-radius: 14px;
-  background: rgba(255, 253, 248, 0.55);
+  padding: 0.55rem 0.2rem 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
 }
 .avatar {
   width: 1.9rem;
@@ -1227,7 +1970,6 @@ async function onScroll() {
   min-width: 0;
   flex: 1;
 }
-.who strong,
 .chip-name {
   display: block;
   overflow: hidden;
@@ -1235,8 +1977,201 @@ async function onScroll() {
   white-space: nowrap;
   font-size: 0.82rem;
 }
+/* 工作区名**不截断**（doc/48 A5）：它是用户区分「我在哪个工作区」的唯一标识，
+   截成 a7-envelope... 之后多开一个工作区就分不出来了。换成换行显示，不撑破侧边栏。 */
+.who strong {
+  display: block;
+  font-size: 0.82rem;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+/* 最近会话（doc/48 A2） */
+.recent {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  min-height: 0;
+  overflow: hidden;
+}
+.recent-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0 0.45rem;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  letter-spacing: 0.08em;
+}
+.recent-retry {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  font-size: var(--text-xs);
+  color: var(--accent-ink);
+}
+.recent-note {
+  margin: 0;
+  padding: 0 0.45rem;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+.recent-note.error {
+  color: var(--danger);
+}
+.recent-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  /* 行高固定 30px，行间不留缝：10 条正好 300px（doc/51 §4 的预算）。 */
+  gap: 0;
+  /* 列表内不再出现滚动条（doc/50 §3）：高度由 10 条上限 + 折叠控制。 */
+}
+/* 项目 → 对话两层树（doc/50）：项目行整行可点，会话缩进并挂一条细竖线。 */
+.tree {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+}
+.tree-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+.tree-project {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  width: 100%;
+  height: 34px;
+  border: 0;
+  background: transparent;
+  border-radius: var(--radius-control);
+  padding: 0 0.45rem;
+  text-align: left;
+}
+.tree-project:hover {
+  background: var(--hover);
+}
+/* 展开/折叠两态各用一个文件夹图标：项目行与会话行字号接近，靠图标认层级。 */
+.tree-folder {
+  flex: none;
+  width: 0.92rem;
+  height: 0.92rem;
+  color: var(--accent);
+}
+.tree-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--ink);
+}
+.tree-badge {
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 0.3rem;
+  font-size: 0.68rem;
+  line-height: 1.35;
+  color: var(--muted);
+}
+.tree-sessions {
+  margin-left: 0.72rem;
+  padding-left: 0.3rem;
+  border-left: 1px solid var(--line);
+}
+.tree-empty {
+  padding-left: 0.75rem;
+  font-size: var(--text-xs);
+}
+/* 项目自己的「展示全部」（doc/50 §3）：缩进对齐到会话行文字。 */
+.tree-more {
+  align-self: flex-start;
+  border: 0;
+  background: transparent;
+  margin-left: 1.02rem;
+  padding: 0.05rem 0.45rem;
+  font-size: var(--text-xs);
+  color: var(--muted);
+}
+.tree-more:hover {
+  color: var(--accent-ink);
+}
+/* 会话行单行（doc/51 §4）：标题左、时间右，行高 30px；标题与时间不再上下叠。 */
+.recent-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  height: 30px;
+  border: 0;
+  background: transparent;
+  border-radius: var(--radius-control);
+  padding: 0 0.45rem;
+  text-align: left;
+}
+.recent-item:hover {
+  background: var(--hover);
+}
+.recent-item.on {
+  background: var(--accent-soft);
+}
+.recent-title {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--text-sm);
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.recent-time {
+  flex: none;
+  font-size: var(--text-xs);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.recent-more {
+  align-self: flex-start;
+  border: 0;
+  background: transparent;
+  padding: 0.1rem 0.45rem;
+  font-size: var(--text-xs);
+  color: var(--muted);
+}
+.recent-more:hover {
+  color: var(--accent-ink);
+}
+
+/* 叫停这一轮（doc/48 A3） */
+.stop-btn {
+  border: 1px solid var(--line-strong);
+  background: #fff;
+  border-radius: 999px;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.75rem;
+  color: var(--ink-soft);
+}
+.stop-btn:hover:not(:disabled) {
+  border-color: #fecdd3;
+  color: var(--danger);
+}
+.stop-btn:disabled {
+  opacity: 0.55;
+}
 .logout {
-  padding: 0.28rem 0.55rem;
+  height: 28px;
+  padding: 0 0.55rem;
 }
 
 .switcher {
@@ -1272,7 +2207,7 @@ async function onScroll() {
   overflow: auto;
   background: var(--bg-raised);
   border: 1px solid var(--line-strong);
-  border-radius: 14px;
+  border-radius: var(--radius-panel);
   box-shadow: var(--shadow);
   padding: 0.35rem;
 }
@@ -1285,7 +2220,7 @@ async function onScroll() {
   border: 0;
   background: transparent;
   color: var(--ink);
-  border-radius: 10px;
+  border-radius: var(--radius-control);
   padding: 0.45rem 0.55rem;
   text-align: left;
   font-size: 0.82rem;
@@ -1308,7 +2243,7 @@ async function onScroll() {
 }
 .switcher-row:hover:not(:disabled),
 .switch-create:hover {
-  background: rgba(255, 253, 248, 0.9);
+  background: var(--hover);
 }
 .switcher-row:disabled { opacity: 0.6; }
 .switch-create {
@@ -1331,12 +2266,13 @@ async function onScroll() {
   color: var(--muted);
 }
 .switch-create-form input {
+  height: 36px;
   border: 1px solid var(--line-strong);
-  border-radius: 10px;
-  background: #fff;
+  border-radius: var(--radius-control);
+  background: var(--bg-raised);
   color: var(--ink);
-  padding: 0.4rem 0.55rem;
-  font-size: 0.86rem;
+  padding: 0 0.55rem;
+  font-size: var(--text-sm);
 }
 .switcher-pop .auth-error { margin: 0.3rem 0.4rem; }
 
@@ -1344,6 +2280,10 @@ async function onScroll() {
   position: relative;
   flex: 1;
   min-width: 0;
+  /* **必须有 min-height: 0**：窄屏下 .app 变成 column 方向，flex item 的默认
+     min-height:auto 会让它不肯收缩到内容以下 → .stage 被对话内容撑高 → body 溢出 →
+     页面能滚（登录时聚焦密码框就把页面滚下半截，顶部的导航全被推出视口）。 */
+  min-height: 0;
   display: flex;
   flex-direction: column;
 }
@@ -1435,9 +2375,18 @@ async function onScroll() {
   background: var(--danger-soft);
   padding: 0.55rem 0.7rem;
 }
+.auth-note {
+  margin: 0;
+  padding: 0.55rem 0.7rem;
+  border-radius: 12px;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  color: var(--warn);
+  background: var(--warn-soft);
+}
 
 .thread {
-  width: min(46rem, calc(100% - 2rem));
+  width: min(45rem, calc(100% - 2rem));
   margin: 0 auto;
   flex: 1;
   min-height: 0;
@@ -1576,7 +2525,7 @@ async function onScroll() {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 0.85rem;
+  gap: var(--space-4);
   padding: 1.4rem 0.2rem 1rem;
   scrollbar-width: thin;
   scrollbar-color: var(--line-strong) transparent;
@@ -1588,44 +2537,48 @@ async function onScroll() {
 }
 .empty-kicker {
   margin: 0 0 0.4rem;
-  color: var(--accent-ink);
-  font-size: 0.75rem;
-  letter-spacing: 0.14em;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
 }
 .empty h2 {
   margin: 0;
-  font-size: 2rem;
-  font-weight: 620;
-  letter-spacing: -0.03em;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
 }
 .empty-hint {
   margin: 0.55rem 0 1.2rem;
   color: var(--muted);
+  font-size: var(--text-sm);
 }
 .starters {
   display: flex;
-  flex-direction: column;
-  gap: 0.45rem;
+  flex-wrap: wrap;
+  gap: var(--space-2);
 }
 .starters button {
+  height: 32px;
   text-align: left;
   border: 1px solid var(--line);
-  background: rgba(255, 253, 248, 0.8);
-  border-radius: 14px;
-  padding: 0.75rem 0.9rem;
+  background: var(--bg-raised);
+  border-radius: 999px;
+  padding: 0 var(--space-3);
   color: var(--ink-soft);
+  font-size: var(--text-sm);
 }
 .starters button:hover {
-  border-color: #b7d7cc;
-  background: #fff;
+  border-color: var(--line-strong);
+  background: var(--hover);
   color: var(--ink);
 }
 
 .older {
   align-self: center;
   gap: 0.4rem;
-  font-size: 0.75rem;
+  font-size: var(--text-xs);
   color: var(--ink-soft);
   background: var(--bg-raised);
   border: 1px solid var(--line);
@@ -1641,14 +2594,24 @@ async function onScroll() {
   width: 0.75rem;
   height: 0.75rem;
   border-radius: 50%;
-  border: 2px solid #d5ddd6;
+  border: 2px solid var(--line-strong);
   border-top-color: var(--accent);
   animation: spin 0.8s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* 一轮 = 气泡 + 它带出的问答记录（方案卡是独立文档块，不塞进气泡里） */
+.turn {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.turn.user { align-items: flex-end; }
+.turn.assistant { align-items: flex-start; }
+
 .bubble {
-  max-width: min(100%, 40rem);
+  max-width: 86%;
   display: flex;
   align-items: flex-end;
   gap: 0.35rem;
@@ -1658,24 +2621,24 @@ async function onScroll() {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: none; }
 }
-.bubble.user { align-self: flex-end; flex-direction: row-reverse; }
-.bubble.assistant { align-self: flex-start; }
+.bubble.user { flex-direction: row-reverse; }
+.bubble.assistant .bubble-main { flex: 0 1 auto; }
 .bubble-main {
-  padding: 0.72rem 0.95rem;
+  padding: var(--space-3) var(--space-4);
   line-height: 1.65;
   white-space: pre-wrap;
   word-break: break-word;
 }
 .bubble p { margin: 0; }
 .bubble.user .bubble-main {
-  color: #f6f1e7;
+  color: var(--on-ink);
   background: var(--ink);
-  border-radius: 1.15rem 1.15rem 0.4rem 1.15rem;
+  border-radius: 14px 14px 4px 14px;
 }
 .bubble.assistant .bubble-main {
   background: var(--bg-raised);
   border: 1px solid var(--line);
-  border-radius: 0.4rem 1.15rem 1.15rem 1.15rem;
+  border-radius: 14px 14px 14px 4px;
 }
 .bubble.assistant.streaming .bubble-main {
   box-shadow: inset 2px 0 0 var(--accent);
@@ -1691,6 +2654,111 @@ async function onScroll() {
   vertical-align: text-bottom;
   animation: caret 1s steps(1) infinite;
 }
+
+/* 气泡正文的 markdown 排版（doc/48 A1）。
+   **v-html 注入的内容没有 scoped 的 data-v 属性** → 这些规则必须走 :deep()，
+   否则一条都不生效（写普通后代选择器是最容易踩的坑）。 */
+.bubble-text {
+  margin: 0;
+}
+.bubble-text :deep(h1),
+.bubble-text :deep(h2),
+.bubble-text :deep(h3),
+.bubble-text :deep(h4) {
+  margin: 0.65rem 0 0.3rem;
+  line-height: 1.35;
+  font-weight: 650;
+}
+.bubble-text :deep(h1) { font-size: 1.22rem; }
+.bubble-text :deep(h2) { font-size: 1.1rem; }
+.bubble-text :deep(h3) { font-size: 1rem; }
+.bubble-text :deep(h4) { font-size: 0.93rem; }
+.bubble-text :deep(p) { margin: 0.32rem 0; }
+.bubble-text :deep(ul),
+.bubble-text :deep(ol) {
+  margin: 0.32rem 0;
+  padding-left: 1.35rem;
+}
+.bubble-text :deep(li) { margin: 0.12rem 0; }
+.bubble-text :deep(code) {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0.05rem 0.28rem;
+  font-size: 0.86em;
+}
+.bubble-text :deep(pre) {
+  margin: 0.45rem 0;
+  padding: 0.55rem 0.65rem;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow-x: auto;
+}
+.bubble-text :deep(pre code) {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font-size: 0.82rem;
+}
+/* 用户气泡是深色底（--ink + --on-ink 字）：上面那套是给浅色助手气泡写的，
+   浅底深字的 code / pre / 表头搬进深色气泡就变成白字浅底＝隐形（doc/49 补记 #13）。
+   这里只把「浅底深字」的几项在深色气泡里反过来，助手气泡不动。 */
+.bubble.user .bubble-text :deep(code) {
+  background: rgba(245, 247, 250, 0.16);
+  border-color: rgba(245, 247, 250, 0.3);
+  color: var(--on-ink);
+}
+.bubble.user .bubble-text :deep(pre) {
+  background: rgba(0, 0, 0, 0.28);
+  border-color: rgba(245, 247, 250, 0.22);
+}
+.bubble.user .bubble-text :deep(th) {
+  background: rgba(245, 247, 250, 0.12);
+}
+.bubble.user .bubble-text :deep(th),
+.bubble.user .bubble-text :deep(td) {
+  border-color: rgba(245, 247, 250, 0.22);
+}
+.bubble.user .bubble-text :deep(blockquote) {
+  color: rgba(245, 247, 250, 0.78);
+  border-left-color: rgba(245, 247, 250, 0.3);
+}
+.bubble.user .bubble-text :deep(a) {
+  color: #a5c8ff;
+}
+.bubble.user .bubble-text :deep(hr) {
+  border-top-color: rgba(245, 247, 250, 0.22);
+}
+.bubble-text :deep(blockquote) {
+  margin: 0.4rem 0;
+  padding: 0.05rem 0 0.05rem 0.7rem;
+  border-left: 3px solid var(--line-strong);
+  color: var(--ink-soft);
+}
+.bubble-text :deep(table) {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.45rem 0;
+  font-size: 0.86rem;
+}
+.bubble-text :deep(th),
+.bubble-text :deep(td) {
+  border: 1px solid var(--line);
+  padding: 0.28rem 0.45rem;
+  text-align: left;
+}
+.bubble-text :deep(th) {
+  background: var(--bg);
+  font-weight: 650;
+}
+.bubble-text :deep(a) { color: var(--accent-ink); }
+.bubble-text :deep(hr) {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 0.55rem 0;
+}
+.bubble-text :deep(img) { max-width: 100%; }
 @keyframes caret {
   50% { opacity: 0; }
 }
@@ -1729,19 +2797,26 @@ async function onScroll() {
   border-color: var(--warn);
   box-shadow: 0 0 0 3px rgba(154, 52, 18, 0.14);
 }
+/* 用量与复制：气泡下方一行，12px --muted，gap 8px（doc/51 §6）。 */
+.bubble-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-2);
+}
+.bubble-meta.user { justify-content: flex-end; }
+.bubble-meta.assistant { justify-content: flex-start; }
 .copy {
   display: block;
   width: fit-content;
-  margin-top: 0.4rem;
+  margin: 0;
   padding: 0;
   border: 0;
   background: transparent;
   color: var(--muted);
-  font-size: 0.72rem;
+  font-size: var(--text-xs);
 }
-.bubble.user .copy { color: rgba(246, 241, 231, 0.72); }
 .copy:hover { color: var(--ink); }
-.bubble.user .copy:hover { color: #f6f1e7; }
 
 .typing {
   display: inline-flex;
@@ -1753,7 +2828,7 @@ async function onScroll() {
   width: 0.36rem;
   height: 0.36rem;
   border-radius: 50%;
-  background: #b7b0a4;
+  background: var(--muted);
   animation: blink 1.2s ease-in-out infinite;
 }
 .typing i:nth-child(2) { animation-delay: 0.15s; }
@@ -1765,7 +2840,7 @@ async function onScroll() {
 .note {
   gap: 0.3rem;
   margin-top: 0.4rem !important;
-  font-size: 0.75rem;
+  font-size: var(--text-xs);
   color: var(--muted);
 }
 .bubble.error .note { color: var(--danger); }
@@ -1795,13 +2870,13 @@ async function onScroll() {
   background: #fff;
 }
 .usage {
-  display: block;
-  margin-top: 0.4rem;
-  font-size: 0.72rem;
+  display: inline;
+  margin: 0;
+  font-size: var(--text-xs);
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
-.usage.warm { color: #b45309; }
+.usage.warm { color: var(--warn); }
 .usage.hot { color: var(--danger); }
 
 .attach-notice {
@@ -1828,14 +2903,14 @@ async function onScroll() {
   flex-direction: column;
   gap: 0.35rem;
   background: var(--bg-raised);
-  border: 1px solid var(--line-strong);
-  border-radius: 22px;
-  padding: 0.7rem 0.7rem 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  padding: var(--space-3);
   box-shadow: var(--shadow);
 }
 .composer:focus-within {
-  border-color: #8fbfb0;
-  box-shadow: 0 0 0 4px rgba(15, 110, 86, 0.1), var(--shadow);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow);
 }
 .composer textarea {
   width: 100%;
@@ -1843,11 +2918,11 @@ async function onScroll() {
   border: 0;
   outline: none;
   background: transparent;
-  padding: 0.25rem 0.35rem 0;
+  padding: 0.15rem var(--space-1) 0;
   line-height: 1.55;
   max-height: 10.5rem;
 }
-.composer textarea::placeholder { color: #a8a29e; }
+.composer textarea::placeholder { color: var(--muted); }
 .chips {
   display: flex;
   flex-wrap: wrap;
@@ -1878,11 +2953,11 @@ async function onScroll() {
   line-height: 1;
 }
 .chip-x:hover { color: var(--danger); }
-.composer-bar { gap: 0.55rem; padding-left: 0.1rem; }
+.composer-bar { gap: var(--space-2); padding-left: 0.1rem; }
 .icon-btn,
 .send {
-  width: 2.15rem;
-  height: 2.15rem;
+  width: 32px;
+  height: 32px;
   display: grid;
   place-items: center;
   flex: none;
@@ -1897,11 +2972,11 @@ async function onScroll() {
   min-width: 0;
 }
 .hint.live { color: var(--accent-ink); }
-.hint.queue { color: #b45309; }
+.hint.queue { color: var(--warn); }
 .send { border-radius: 50%; }
 .send:disabled {
-  background: #e7e0d4;
-  color: #a8a29e;
+  background: var(--hover);
+  color: var(--muted);
 }
 
 .jump {
@@ -1919,7 +2994,9 @@ async function onScroll() {
   inset: 0;
   z-index: 40;
   display: grid;
-  place-items: center;
+  /* safe center：放大到超出视口时可滚动，且滚动范围从图片左上角开始（普通 center 会切掉顶边）。 */
+  place-items: safe center;
+  overflow: auto;
   padding: 2rem;
   background: rgba(28, 25, 23, 0.78);
 }
@@ -1927,31 +3004,92 @@ async function onScroll() {
   max-width: min(92vw, 64rem);
   max-height: 88vh;
   border-radius: 14px;
+  cursor: zoom-in;
+}
+.lightbox img.zoomed {
+  max-width: none;
+  max-height: none;
+  border-radius: 8px;
+  cursor: zoom-out;
+}
+.lightbox-close {
+  position: fixed;
+  top: 1rem;
+  right: 1rem;
+  width: 2.2rem;
+  height: 2.2rem;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+  font-size: 1.3rem;
+  line-height: 1;
+}
+.lightbox-close:hover {
+  background: rgba(255, 255, 255, 0.28);
 }
 
 @media (max-width: 860px) {
   .app { flex-direction: column; }
+  /* 顶栏（doc/51 §5）：≤860px 只留品牌 / 新对话 / 菜单，树与账户进抽屉。
+     doc/48 的五格顶栏在型号小的手机上会把聊天挤到 120px 高。 */
   .rail {
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto;
-    grid-template-areas:
-      "brand new foot"
-      "nav nav nav";
+    display: flex;
     align-items: center;
+    gap: var(--space-2);
     width: auto;
+    height: 52px;
+    flex: none;
+    padding: 0 var(--space-3);
     border-right: 0;
     border-bottom: 1px solid var(--line);
-    padding: 0.65rem 0.7rem 0.55rem;
-    gap: 0.45rem 0.55rem;
+    position: relative;
+    z-index: 30;
   }
-  .brand { grid-area: brand; }
-  .new-wrap { grid-area: new; }
-  .nav { grid-area: nav; flex-direction: row; }
-  .brand-sub,
-  .rail-foot .who span { display: none; }
-  .nav button { width: auto; padding: 0.4rem 0.55rem; }
-  .rail-foot { grid-area: foot; margin: 0; background: transparent; padding: 0; }
-  .who { max-width: 4.6rem; }
+  .brand { padding: 0; }
+  .brand-sub { display: none; }
+  .new-wrap { position: static; margin-left: auto; }
+  .new-chat { height: 32px; padding: 0 var(--space-3); }
+  .menu-btn {
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-control);
+    background: var(--bg-raised);
+    color: var(--ink);
+  }
+  .menu-btn:hover { background: var(--hover); }
+  .menu-btn svg { width: 1rem; height: 1rem; }
+
+  /* 抽屉 = 同一份 DOM 换个定位（doc/51 §5）：宽度固定，背后加遮罩。 */
+  .rail-body { display: none; }
+  .rail.drawer-open .rail-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 40;
+    width: 280px;
+    max-width: calc(100vw - 3rem);
+    padding: var(--space-4) var(--space-3);
+    padding-bottom: calc(var(--space-3) + env(safe-area-inset-bottom));
+    background: var(--sidebar);
+    border-right: 1px solid var(--line);
+    box-shadow: var(--shadow);
+  }
+  .rail.drawer-open .recent { flex: 1; }
+  .drawer-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 35;
+    background: rgba(16, 17, 20, 0.45);
+  }
+  .rail-foot { padding: 0.55rem 0.2rem 0; border-top: 1px solid var(--line); }
+  .who { max-width: none; }
   .switcher-pop {
     bottom: auto;
     top: calc(100% + 0.35rem);
@@ -1959,8 +3097,6 @@ async function onScroll() {
     right: 0;
     width: min(16.5rem, calc(100vw - 1.4rem));
   }
-  .rail { position: relative; }
-  .new-wrap { position: static; }
   .pop {
     top: calc(100% + 0.35rem);
     left: 0.7rem;
@@ -1972,29 +3108,434 @@ async function onScroll() {
     width: min(100% - 1.5rem, 28rem);
   }
   .gate-copy h1 { font-size: 1.8rem; }
-  .thread { width: min(100% - 1.2rem, 46rem); }
+  .thread {
+    width: min(100% - 1.2rem, 46rem);
+    padding-bottom: calc(0.75rem + env(safe-area-inset-bottom));
+  }
   .hint:not(.live):not(.queue) { display: none; }
 }
 
-/* 任务看板（doc/41 §5.2）：状态色随 TaskUpdate 翻转 */
-.board {
+/* 窄屏（手机，doc/48 D4）：全站原来只有 860px 一个断点，375px 上侧边栏挤成一团。
+   这里只做「压缩」不做「图标化」——四个没有文字的图标反而更难认。 */
+@media (max-width: 480px) {
+  .rail {
+    padding: 0 var(--space-2);
+    gap: var(--space-1);
+  }
+  .new-chat { padding: 0 var(--space-2); white-space: nowrap; }
+  .logout { padding: 0.2rem 0.4rem; font-size: 0.72rem; }
+  .recent-time { display: none; }
+  .composer { padding: var(--space-2) var(--space-3); }
+  .gate-card { padding: 0.9rem 0.85rem 1rem; }
+}
+
+/* 问答记录（doc/47 §5.2）：气泡下方留档，方案按文档块渲染 */
+.qa-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.qa-card {
+  border: 1px solid var(--line-strong);
+  border-radius: 16px;
+  background: var(--bg-raised);
+  padding: 0.72rem 0.9rem;
+  box-shadow: 0 1px 2px rgba(68, 48, 24, 0.04);
+}
+.qa-card.plan {
+  border-color: #bcd6c7;
+  background: #f7fbf8;
+}
+.qa-card.stale { opacity: 0.66; }
+.qa-head {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-bottom: 0.45rem;
+}
+.qa-kind {
+  font-size: 0.7rem;
+  font-weight: 650;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.qa-card.plan .qa-kind { color: #2f7d5b; }
+.qa-chip {
+  font-size: 0.7rem;
+  line-height: 1.5;
+  border-radius: 999px;
+  padding: 0.02rem 0.5rem;
+  background: var(--bg);
+  color: var(--muted);
+}
+.qa-chip.pending {
+  background: #fff4de;
+  color: #a05a00;
+}
+.qa-chip.answered.approve,
+.qa-chip.answered:not(.revise) {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+.qa-chip.answered.revise {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.qa-question {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+.qa-opts {
   list-style: none;
   margin: 0.5rem 0 0;
-  padding: 0.4rem 0.6rem;
-  border: 1px solid var(--line, rgba(127, 127, 127, 0.25));
-  border-radius: 0.5rem;
-  font-size: 0.85rem;
-  line-height: 1.5;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
 }
-.board-row {
+.qa-opts li {
   display: flex;
   gap: 0.5rem;
   align-items: baseline;
+  padding: 0.28rem 0.5rem;
+  border-radius: 8px;
+  background: var(--bg);
+  font-size: 0.84rem;
+  line-height: 1.55;
 }
-.board-no { opacity: 0.55; font-variant-numeric: tabular-nums; }
-.board-status { opacity: 0.7; font-size: 0.78rem; }
-.board-row.completed .board-subject { text-decoration: line-through; opacity: 0.55; }
-.board-row.in_progress .board-status { color: #2f7d5b; }
-.board-row.completed .board-status { color: #2f7d5b; }
-.board-row.deleted .board-subject { opacity: 0.4; }
+.qa-opts li.picked {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+.qa-num {
+  flex: none;
+  min-width: 1.1rem;
+  color: var(--muted);
+  font-size: 0.74rem;
+  font-variant-numeric: tabular-nums;
+}
+.qa-answer {
+  margin: 0.55rem 0 0;
+  font-size: 0.8rem;
+  line-height: 1.55;
+  color: var(--ink-soft);
+  white-space: pre-wrap;
+}
+.qa-note {
+  margin: 0.4rem 0 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+.qa-note.error { color: var(--danger); }
+
+/* 看板（doc/41 §5.2 / kimi TodoPanel）：输入区上方，超过 5 条折叠 */
+.todo-dock {
+  flex: none;
+  margin: 0 0 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 253, 248, 0.9);
+  padding: 0.3rem 0.45rem;
+}
+.todo-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--ink-soft);
+  padding: 0.25rem 0.3rem;
+  text-align: left;
+}
+.todo-title {
+  font-size: 0.76rem;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+}
+.todo-count {
+  flex: none;
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.todo-meter {
+  flex: 1;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--bg);
+  overflow: hidden;
+}
+.todo-meter i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+.todo-chev {
+  flex: none;
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+.todo-dock ul {
+  list-style: none;
+  margin: 0.1rem 0 0.1rem;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.05rem;
+}
+.todo-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
+  padding: 0.22rem 0.35rem;
+  border-radius: 8px;
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+.todo-row.in_progress { background: var(--accent-soft); }
+.todo-icon {
+  flex: none;
+  width: 0.9rem;
+  text-align: center;
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+.todo-row.completed .todo-icon,
+.todo-row.in_progress .todo-icon { color: var(--accent-ink); }
+.todo-subject {
+  flex: 1;
+  min-width: 0;
+}
+.todo-row.completed .todo-subject {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+.todo-status {
+  flex: none;
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+.todo-more { padding: 0 0.35rem; }
+.todo-more button {
+  border: 0;
+  background: transparent;
+  color: var(--accent-ink);
+  font-size: 0.74rem;
+  padding: 0.15rem 0;
+}
+
+/* 等人面板（doc/47 §5.2）：问题卡与方案卡共用外壳，plan 修饰类换色 */
+.ask-dock {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  outline: none;
+  border: 1px solid #cdbfa0;
+  border-radius: 20px;
+  background: linear-gradient(180deg, #fffdf7, #fbf8f0);
+  padding: 0.85rem 0.95rem 0.75rem;
+  box-shadow: var(--shadow);
+}
+.ask-dock:focus-visible,
+.ask-dock:focus {
+  border-color: #b7a67f;
+  box-shadow: 0 0 0 4px rgba(154, 138, 99, 0.12), var(--shadow);
+}
+.ask-dock.plan {
+  border-color: #bcd6c7;
+  background: linear-gradient(180deg, #fbfefc, #f4faf6);
+}
+.ask-dock.plan:focus-visible,
+.ask-dock.plan:focus {
+  border-color: #8fbfac;
+  box-shadow: 0 0 0 4px rgba(15, 110, 86, 0.1), var(--shadow);
+}
+.ask-dock-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.ask-kicker {
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #9a7b2e;
+}
+.ask-dock.plan .ask-kicker { color: #2f7d5b; }
+.ask-nav {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.ask-nav button {
+  border: 0;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 0.95rem;
+  line-height: 1;
+  padding: 0 0.2rem;
+}
+.ask-nav button:disabled { opacity: 0.28; }
+.ask-stop { margin-left: auto; }
+.ask-question {
+  margin: 0;
+  font-size: 0.95rem;
+  line-height: 1.62;
+  white-space: pre-wrap;
+}
+.ask-options {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+.ask-option {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fff;
+  padding: 0.5rem 0.65rem;
+  text-align: left;
+  font-size: 0.88rem;
+  line-height: 1.5;
+  color: var(--ink);
+}
+.ask-option:hover { border-color: #c3b18a; }
+.ask-option.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+.ask-opt-text {
+  flex: 1;
+  min-width: 0;
+}
+.ask-check {
+  flex: none;
+  width: 0.9rem;
+  text-align: center;
+  color: var(--accent-ink);
+}
+.ask-other {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fff;
+  padding: 0.45rem 0.55rem;
+}
+.ask-other.on {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(15, 110, 86, 0.08);
+}
+.ask-other .qa-num { padding-top: 0.22rem; }
+.ask-other textarea {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.88rem;
+  line-height: 1.55;
+  padding: 0.1rem 0;
+  resize: none;
+}
+.ask-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: #fff;
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.86rem;
+  line-height: 1.6;
+  padding: 0.6rem 0.7rem;
+  resize: vertical;
+}
+.ask-textarea:focus {
+  outline: none;
+  border-color: #8fbfb0;
+  box-shadow: 0 0 0 3px rgba(15, 110, 86, 0.1);
+}
+.ask-lede {
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.55;
+  color: var(--ink-soft);
+}
+.ask-foot {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+.ask-hint {
+  flex: 1;
+  min-width: 7rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+.ask-btn {
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--ink-soft);
+  font-size: 0.82rem;
+  line-height: 1.4;
+  padding: 0.42rem 0.9rem;
+}
+.ask-btn:hover:not(:disabled) {
+  border-color: #c3b18a;
+  color: var(--ink);
+}
+.ask-btn.ghost { background: transparent; }
+.ask-btn.primary {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: #f6f1e7;
+}
+.ask-btn.primary:hover:not(:disabled) {
+  background: #292524;
+  color: #f6f1e7;
+}
+.ask-btn.primary:disabled {
+  opacity: 0.42;
+}
+.ask-btn.danger {
+  background: #fff8f2;
+  border-color: #e7c3a8;
+  color: #9a3412;
+}
+.ask-btn.danger:hover:not(:disabled) {
+  background: #fff;
+  border-color: var(--warn);
+  color: var(--warn);
+}
+.ask-error {
+  margin: 0;
+  flex: 1;
+  min-width: 7rem;
+  font-size: 0.78rem;
+  color: var(--danger);
+}
 </style>

@@ -13,6 +13,8 @@
 | `spotcheck.sh` | doc/28 多租户 / doc/35 项目目录 / doc/32 media_offload 的**活体抽验**（shell + jq） | 要 |
 | `taskboard_crash.sh` | doc/41 任务看板**活得过崩溃**的活体验收：`kill -9` 引擎 → 重启 → `resume` → 崩前建的看板行一条没丢、续跑在同一张表继续建行、run 收到 terminal 帧 | 要 |
 | `tenant_gate.sh` | doc/43 租户并发闸的**活体验收**：上限 2 的租户并发打 4 次 `POST /api/runs` → 恰好 2 个 `202` + 2 个 `429`（响应体逐字 `{"code":113001,…}`），库里 run 行数与会话行数都 = 上限 | 要 |
+| `question_crash.sh` | doc/47 问/方案**挂起中活得过崩溃**的活体验收：`ask_user` 挂起 → `kill -9` → 重启 → `resume` → 帧重发（指回同一行）→ `answer` → run complete、runlog 里答案逐字注回；另钉一答终答 409 `115101` | 要 |
+| `sse_reconnect.sh` | **SSE 重连自愈**的活体验收（doc/46 §7.5）：对着一个 access token 只有 20 秒的隔离引擎，让页面静静不动直到 token 过期，再重启引擎制造断线 → 断线后 401 次数有界、事件流恢复。**自带引擎与 vite，不用手工准备**；未修复时判红退出 | — |
 | `check-expected.sh` | 守「19v6-04 散文」与「`expected.json`」的用例号集合一致 | — |
 | `harness.py` | 三个脚本共用的底座：HTTP 调用、.env 取密钥、psql 补丁、断言计数 | — |
 
@@ -76,8 +78,9 @@ bash scripts/acceptance/check-expected.sh
 | `TAKO_MODEL` | `deepseek/deepseek-flash` | 租户里配的模型 ref（只有 `matrix.py` 用） |
 | `TAKO_PG_DSN` | 空 | 直连 PG 的 DSN。**`4-busy-rejected` 那条要它**（要造「running + 活租约」的忙闸）；不给就跳过并明说，不假装跑过 |
 | `TAKO_PSQL` | `psql` | psql 可执行文件路径 |
+| `TAKO_WS_ROOT` | `<仓库根>/tmp/workspace-acc` | 引擎的 workspace 根；`op=seed_ws` 往项目目录造文件要用 |
 
-`taskboard_crash.sh` 自己还多要三个（没有就不跑）：
+`taskboard_crash.sh` 与 `question_crash.sh` 自己还多要三个（没有就不跑）：
 
 | 变量 | 说明 |
 |---|---|
@@ -133,6 +136,8 @@ TAKO_ENGINE_RESTART='cd <仓库根>/yk-tako-eino && nohup go run ./cmd/yktako -e
 
 步骤类型：`op=signup`（建账号+租户+配模型）、`op=wait_terminal`（等这场跑完出 terminal 帧）、
 `op=wait_settled`（等**会话落定**——terminal 帧比 DB 翻终态早一拍，只等帧会撞出假失败）、
+`op=seed_ws`（往**项目目录**里造文件/目录/符号链接——产出文件在文件系统上，SQL 造不出来；
+目录布局 = `<workspace根>/tenants/<tid>/workspaces/<wid>/`，根由 `TAKO_WS_ROOT` 给）、
 带 `sql` 的步骤（请求前先跑一句 SQL）。
 
 ## 什么时候必须跑

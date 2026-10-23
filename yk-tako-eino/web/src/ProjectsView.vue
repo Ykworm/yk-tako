@@ -7,10 +7,14 @@ import {
   deleteWorkspace,
   listSessions,
   listWorkspaces,
+  listWorkspaceFiles,
   renameWorkspace,
+  workspaceFileUrl,
   type SessionListItem,
   type Workspace,
+  type WorkspaceFileEntry,
 } from './api'
+import { authFetch } from './auth'
 import ConfirmDialog from './ConfirmDialog.vue'
 import { broadcastMutation, onMutation } from './mutation'
 
@@ -32,6 +36,39 @@ type ProjectRow = {
   open: boolean
   loading: boolean
   error: string
+  // 文件区（doc/48 B1）：null = 没拉过（展开时才拉）。
+  files: FileRow | null
+  filesOpen: boolean
+}
+
+// FileRow 是「当前所在目录」的一份清单。path 相对项目根（"." = 根）。
+// preview 记「文件名 → 图片 blob URL」；text 记「文件名 → 文本内容」。
+type FileRow = {
+  path: string
+  entries: WorkspaceFileEntry[]
+  loading: boolean
+  error: string
+  preview: Record<string, string>
+  text: Record<string, string>
+}
+
+// 能不能「预览」：服务端条目**不带 mime**（mime 是字节出口的事），所以按扩展名近似。
+// 判错的后果只是「少一个预览按钮」/「多按一次才提示」，不会出错内容。
+// 为什么不看 Content-Type：/api/media 的 mime 表（mediaMimeByExt）只覆盖图片/pdf/音视频，
+// .md / .csv / .txt 落到 application/octet-stream，blob.type 判断不出文本。
+const IMAGE_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico'])
+const TEXT_EXT = new Set([
+  'txt', 'md', 'markdown', 'csv', 'json', 'log', 'yml', 'yaml', 'toml',
+  'html', 'css', 'js', 'ts', 'go', 'py', 'sh', 'xml', 'ini', 'conf',
+])
+
+function extOf(name: string): string {
+  return name.split('.').pop()?.toLowerCase() ?? ''
+}
+
+function canPreview(name: string): boolean {
+  const ext = extOf(name)
+  return IMAGE_EXT.has(ext) || TEXT_EXT.has(ext)
 }
 
 const projects = ref<ProjectRow[]>([])
@@ -39,7 +76,7 @@ const loading = ref(true)
 const error = ref('')
 
 function rowOf(workspace: Workspace): ProjectRow {
-  return { workspace, sessions: null, open: false, loading: false, error: '' }
+  return { workspace, sessions: null, open: false, loading: false, error: '', files: null, filesOpen: false }
 }
 
 function errText(e: unknown, fallback: string): string {
@@ -55,6 +92,13 @@ function fmtTime(iso: string): string {
 const activeName = computed(
   () => projects.value.find((p) => p.workspace.id === props.activeWorkspaceId)?.workspace.name ?? '',
 )
+
+// 人已经站在默认项目上时，「回到默认项目」是个点了没反应的按钮——藏掉；
+// 列表还没加载出来（找不到这一项）时按「不是默认」处理，宁可多给一个出口。
+const activeIsDefault = computed(() => {
+  const p = projects.value.find((x) => x.workspace.id === props.activeWorkspaceId)
+  return !!p?.workspace.isDefault
+})
 
 async function load() {
   loading.value = true
@@ -155,6 +199,131 @@ async function toggleSessions(p: ProjectRow) {
   if (p.open && p.sessions === null) await loadSessions(p)
 }
 
+// ── 文件区（doc/48 B1）────────────────────────────────────────────────
+//
+// agent 写出的文件落在项目目录里。此前用户只能看见聊天里那行文字：看不到目录、
+// 拿不到字节。这一区把「列目录」和「取字节」接上：
+//   列表 = GET /api/workspaces/{id}/files?path=
+//   字节 = GET /api/media?path=workspaces/{wid}/<相对路径>（复用现成出口，不新开下载端点）
+//
+// 字节出口挂在 authn 上要 Bearer 头，所以**不能**直接塞进 <a href>——浏览器直接导航
+// 不带 Authorization（会 401）。取字节一律先 fetch 成 blob，再决定是预览还是下载。
+
+function fmtSize(n: number): string {
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)}MB`
+  if (n >= 1024) return `${Math.round(n / 1024)}KB`
+  return `${n}B`
+}
+
+async function loadFiles(p: ProjectRow, path = '.') {
+  // **别写成 `p.files ?? (p.files = {...})`**：赋值表达式的值是**原始对象**（raw），
+  // 不是 reactive proxy——后面 `row.entries = …` 就绕过了响应式 set 拦截器，
+  // 数据到了、DOM 不更新（列表永远是空的）。分开写，row 才是 proxy。
+  if (!p.files) {
+    p.files = { path, entries: [], loading: false, error: '', preview: {}, text: {} }
+  }
+  const row = p.files
+  row.loading = true
+  row.error = ''
+  try {
+    const res = await listWorkspaceFiles(p.workspace.id, path)
+    row.path = res.path
+    row.entries = res.entries
+  } catch (e) {
+    row.error = errText(e, '文件列表加载失败')
+    row.entries = []
+  } finally {
+    row.loading = false
+  }
+}
+
+async function toggleFiles(p: ProjectRow) {
+  p.filesOpen = !p.filesOpen
+  if (p.filesOpen && !p.files) await loadFiles(p, '.')
+}
+
+// filePathOf 把「当前目录 + 一个名字」拼成相对项目根的路径。
+function filePathOf(p: ProjectRow, name: string): string {
+  const base = p.files?.path ?? '.'
+  return base === '.' ? name : `${base}/${name}`
+}
+
+async function openDir(p: ProjectRow, entry: WorkspaceFileEntry) {
+  await loadFiles(p, filePathOf(p, entry.name))
+}
+
+// crumbs 是从项目根到当前目录的每一段（根是 "."，没有段）。
+function crumbs(p: ProjectRow): string[] {
+  const path = p.files?.path ?? '.'
+  if (path === '.') return []
+  return path.split('/').filter(Boolean)
+}
+
+async function gotoCrumb(p: ProjectRow, idx: number) {
+  const parts = crumbs(p).slice(0, idx + 1)
+  await loadFiles(p, parts.length ? parts.join('/') : '.')
+}
+
+// 取字节：一次 fetch 拿 blob，图片内联预览，其他触发下载。
+async function fetchBlob(p: ProjectRow, entry: WorkspaceFileEntry): Promise<Blob | null> {
+  const row = p.files
+  if (!row) return null
+  row.error = ''
+  const rel = filePathOf(p, entry.name)
+  try {
+    const res = await authFetch(workspaceFileUrl(p.workspace.id, rel))
+    if (!res.ok) {
+      row.error = `取不到 ${entry.name}`
+      return null
+    }
+    return await res.blob()
+  } catch {
+    row.error = `取不到 ${entry.name}`
+    return null
+  }
+}
+
+// 预览：图片出缩略图，文本出内容，其他类型告诉用户去下载。
+const TEXT_PREVIEW_MAX = 2000
+
+async function previewFile(p: ProjectRow, entry: WorkspaceFileEntry) {
+  const row = p.files
+  if (!row) return
+  const blob = await fetchBlob(p, entry)
+  if (!blob) return
+  const ext = extOf(entry.name)
+  if (IMAGE_EXT.has(ext)) {
+    const url = URL.createObjectURL(blob)
+    const old = row.preview[entry.name]
+    row.preview[entry.name] = url
+    if (old) URL.revokeObjectURL(old)
+    return
+  }
+  if (TEXT_EXT.has(ext)) {
+    const text = await blob.text()
+    row.text[entry.name] =
+      text.length > TEXT_PREVIEW_MAX
+        ? `${text.slice(0, TEXT_PREVIEW_MAX)}\n…（还有 ${text.length - TEXT_PREVIEW_MAX} 个字，用「下载」拿全文）`
+        : text
+    return
+  }
+  row.error = `${entry.name} 不能直接看，用「下载」拿走。`
+}
+
+async function downloadFile(p: ProjectRow, entry: WorkspaceFileEntry) {
+  const blob = await fetchBlob(p, entry)
+  if (!blob) return
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = entry.name
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  // 留一会儿再回收：浏览器还在读这个 blob，立刻 revoke 会让下载拿到空文件。
+  window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
+}
+
 type DeleteTarget =
   | { kind: 'workspace'; project: ProjectRow; sessionIds: string[] }
   | { kind: 'session'; project: ProjectRow; session: SessionListItem }
@@ -194,13 +363,15 @@ const dialogBody = computed(() => {
   if (!t) return ''
   if (t.kind === 'workspace') {
     const n = t.sessionIds.length
+    // 不写死天数：保留窗口由服务端的 -archive-ttl 决定（默认 168h = 7 天，可配）。
+    // 用户真正需要知道的是「删除 ≠ 立刻消失」——那正是他不敢点删除的原因。
     const sessions = n
-      ? `项目里的 ${n} 场对话会一起删除（保留窗口内仍可恢复）。`
+      ? `项目里的 ${n} 场对话会一起删除（之后一段时间内还能找回，但会被自动清理）。`
       : '项目里还没有对话。'
     return `“${t.project.workspace.name}”会被删除。${sessions}项目目录里的文件会清掉。`
   }
   const title = t.session.title || '未命名对话'
-  return `“${title}”的会话档案会被删除，保留窗口内仍可恢复；项目目录里的产出文件不受影响。`
+  return `“${title}”的会话档案会被删除（之后一段时间内还能找回，但会被自动清理）；项目目录里的产出文件不受影响。`
 })
 
 async function confirmDelete() {
@@ -253,11 +424,17 @@ function closeDialog() {
     </header>
 
     <section class="target card">
+      <!-- 「默认进入」读起来像一项配置，实际是「上一次待在哪」：新对话跟着当前落点走。 -->
       <div>
-        <span class="target-label">新对话落点</span>
-        <strong>{{ activeName || '默认项目' }}</strong>
+        <span class="target-label">新对话进入</span>
+        <strong>{{ activeName || '默认' }}</strong>
       </div>
-      <button v-if="props.activeWorkspaceId" type="button" class="text" @click="emit('set-active', null)">
+      <button
+        v-if="props.activeWorkspaceId && !activeIsDefault"
+        type="button"
+        class="text"
+        @click="emit('set-active', null)"
+      >
         回到默认项目
       </button>
     </section>
@@ -265,7 +442,7 @@ function closeDialog() {
     <form class="create card" @submit.prevent="onCreate">
       <label>
         新建项目
-        <input v-model="createName" type="text" placeholder="例如：Q4 调研" autocomplete="off" />
+        <input v-model="createName" type="text" maxlength="100" placeholder="例如：Q4 调研" autocomplete="off" />
       </label>
       <button type="submit" class="primary" :disabled="createBusy || !createName.trim()">
         {{ createBusy ? '正在创建…' : '创建' }}
@@ -287,7 +464,7 @@ function closeDialog() {
         <div class="project-head">
           <div class="project-title">
             <form v-if="editId === p.workspace.id" class="rename" @submit.prevent="saveRename(p)">
-              <input v-model="editName" type="text" autocomplete="off" :disabled="editBusy" />
+              <input v-model="editName" type="text" maxlength="100" autocomplete="off" :disabled="editBusy" />
               <button type="submit" class="primary" :disabled="editBusy || !editName.trim()">
                 {{ editBusy ? '保存中…' : '保存' }}
               </button>
@@ -296,7 +473,8 @@ function closeDialog() {
             </form>
             <template v-else>
               <strong>{{ p.workspace.name }}</strong>
-              <span v-if="p.workspace.id === props.activeWorkspaceId" class="badge">新对话落点</span>
+              <span v-if="p.workspace.isDefault" class="badge default">默认</span>
+              <span v-if="p.workspace.id === props.activeWorkspaceId" class="badge">默认进入</span>
               <span class="meta">创建于 {{ fmtTime(p.workspace.createdAt) }}</span>
             </template>
           </div>
@@ -305,8 +483,19 @@ function closeDialog() {
             <button type="button" @click="toggleSessions(p)">
               {{ p.open ? '收起对话' : (p.sessions ? `对话 ${p.sessions.length}` : '查看对话') }}
             </button>
-            <button type="button" @click="startRename(p)">重命名</button>
-            <button type="button" class="danger" :disabled="preparingId === p.workspace.id" @click="askDeleteProject(p)">
+            <button type="button" @click="toggleFiles(p)">
+              {{ p.filesOpen ? '收起文件' : '文件' }}
+            </button>
+            <!-- 默认项目不可删、也不该改名（服务端 409 114005）：藏掉这两个按钮，
+                 别让用户点一个必然失败的按钮、还先许诺「文件会清掉」。 -->
+            <button v-if="!p.workspace.isDefault" type="button" @click="startRename(p)">重命名</button>
+            <button
+              v-if="!p.workspace.isDefault"
+              type="button"
+              class="danger"
+              :disabled="preparingId === p.workspace.id"
+              @click="askDeleteProject(p)"
+            >
               {{ preparingId === p.workspace.id ? '正在读取…' : '删除' }}
             </button>
           </div>
@@ -324,12 +513,58 @@ function closeDialog() {
             <li v-for="s in p.sessions" :key="s.id" class="session">
               <div class="session-main">
                 <strong>{{ s.title || '未命名对话' }}</strong>
-                <span class="meta">{{ fmtTime(s.createdAt) }} · {{ s.id }}</span>
+                <!-- 内部 session id 不给用户看（doc/48 D3）：它读不出任何含义，
+                     却比时间更显眼。要查就放进 title 属性。 -->
+                <span class="meta" :title="s.id">{{ fmtTime(s.createdAt) }}</span>
               </div>
               <div class="actions">
                 <button type="button" @click="emit('open-session', s.id)">打开</button>
                 <button type="button" class="danger" @click="askDeleteSession(p, s)">删除</button>
               </div>
+            </li>
+          </ul>
+        </div>
+
+        <div v-if="p.filesOpen" class="files">
+          <div class="files-bar">
+            <nav class="crumbs" aria-label="目录位置">
+              <button type="button" class="crumb" @click="gotoCrumb(p, -1)">项目根</button>
+              <template v-for="(c, i) in crumbs(p)" :key="c + i">
+                <span class="crumb-sep" aria-hidden="true">/</span>
+                <button type="button" class="crumb" @click="gotoCrumb(p, i)">{{ c }}</button>
+              </template>
+            </nav>
+            <span v-if="p.files?.loading" class="muted">正在加载…</span>
+          </div>
+
+          <p v-if="p.files?.error" class="banner error" role="alert">{{ p.files.error }}</p>
+          <p v-else-if="p.files && !p.files.entries.length && !p.files.loading" class="placeholder">
+            这个目录是空的。
+          </p>
+          <ul v-else-if="p.files" class="file-list">
+            <li v-for="e in p.files.entries" :key="e.name" class="file">
+              <div class="file-main">
+                <button
+                  v-if="e.kind === 'dir'"
+                  type="button"
+                  class="file-name dir"
+                  @click="openDir(p, e)"
+                >{{ e.name }}/</button>
+                <span v-else class="file-name">{{ e.name }}</span>
+                <span class="meta">{{ e.kind === 'dir' ? '目录' : fmtSize(e.size ?? 0) }}</span>
+                <span v-if="e.modifiedAt" class="meta">{{ fmtTime(e.modifiedAt) }}</span>
+              </div>
+              <div v-if="e.kind === 'file'" class="actions">
+                <button v-if="canPreview(e.name)" type="button" @click="previewFile(p, e)">预览</button>
+                <button type="button" @click="downloadFile(p, e)">下载</button>
+              </div>
+              <img
+                v-if="p.files?.preview[e.name]"
+                class="file-preview"
+                :src="p.files.preview[e.name]"
+                :alt="e.name"
+              />
+              <pre v-if="p.files?.text[e.name]" class="file-text">{{ p.files.text[e.name] }}</pre>
             </li>
           </ul>
         </div>
@@ -353,37 +588,46 @@ function closeDialog() {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 1.4rem 1.4rem 2.5rem;
+  padding: 28px 32px 40px;
+  /* 宽屏限宽（doc/48 D1）：内容拉满 1400px+ 时输入框宽得离谱、中间全是空白。
+     **width + max-width 都要**：父级是 column 方向的 flex（.stage），
+     margin:auto 会吃掉交叉轴剩余空间、让本项按内容宽度收缩——
+     只写 max-width 时，内容少的页面（如成员页）会自动缩成半宽。 */
+  width: 100%;
+  max-width: 53.75rem;
+  margin: 0 auto;
 }
 .page-head {
   display: flex;
   align-items: flex-end;
   justify-content: space-between;
   gap: 1rem;
-  margin-bottom: 0.9rem;
+  margin-bottom: 1.2rem;
 }
 .kicker {
   margin: 0;
-  color: var(--accent-ink);
-  font-size: 0.75rem;
-  letter-spacing: 0.14em;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
 }
 h2 {
   margin: 0.15rem 0 0.2rem;
-  font-size: 1.55rem;
-  font-weight: 620;
-  letter-spacing: -0.03em;
+  font-size: var(--text-xl);
+  font-weight: 600;
+  letter-spacing: -0.02em;
 }
 .hint {
   margin: 0;
   color: var(--muted);
-  font-size: 0.82rem;
+  font-size: var(--text-sm);
 }
 .card {
   background: var(--bg-raised);
   border: 1px solid var(--line);
-  border-radius: 18px;
-  padding: 1rem;
+  border-radius: var(--radius-card);
+  padding: 1.25rem;
 }
 .target {
   display: flex;
@@ -418,42 +662,48 @@ h2 {
 }
 input {
   width: 100%;
+  height: 36px;
   border: 1px solid var(--line-strong);
-  border-radius: 12px;
-  padding: 0.55rem 0.7rem;
-  background: #fff;
-  font-size: 0.92rem;
+  border-radius: var(--radius-control);
+  padding: 0 0.7rem;
+  background: var(--bg-raised);
+  font-size: var(--text-sm);
 }
 input:focus {
   outline: none;
-  border-color: #8fbfb0;
-  box-shadow: 0 0 0 3px rgba(15, 110, 86, 0.12);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 button {
+  height: 32px;
   border: 1px solid var(--line-strong);
-  background: #fff;
-  border-radius: 999px;
-  padding: 0.38rem 0.8rem;
-  font-size: 0.8rem;
+  background: var(--bg-raised);
+  border-radius: var(--radius-control);
+  padding: 0 0.8rem;
+  font-size: var(--text-sm);
+  font-weight: 500;
 }
 button:hover:not(:disabled) {
-  border-color: #cfc6b6;
+  background: var(--hover);
 }
 button:disabled {
   opacity: 0.55;
 }
 .primary {
   border: 0;
-  background: var(--ink);
-  color: #f6f1e7;
+  background: var(--accent);
+  color: #fff;
 }
 .primary:hover:not(:disabled) {
-  background: #292524;
+  background: var(--accent-ink);
 }
 .danger {
-  border-color: #fecdd3;
-  background: var(--danger-soft);
+  border-color: var(--danger);
+  background: var(--bg-raised);
   color: var(--danger);
+}
+.danger:hover:not(:disabled) {
+  background: var(--danger-soft);
 }
 .text {
   border: 0;
@@ -473,8 +723,8 @@ button:disabled {
   gap: 0.7rem;
 }
 .project.active {
-  border-color: #8fbfb0;
-  box-shadow: 0 0 0 3px rgba(15, 110, 86, 0.08);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 .project-head {
   display: flex;
@@ -494,7 +744,7 @@ button:disabled {
 }
 .meta {
   color: var(--muted);
-  font-size: 0.74rem;
+  font-size: var(--text-xs);
 }
 .badge {
   align-self: flex-start;
@@ -503,6 +753,12 @@ button:disabled {
   border-radius: 999px;
   padding: 0.05rem 0.5rem;
   font-size: 0.72rem;
+}
+/* 「默认项目」与「默认进入」是两个意思，用底色分开（doc/48 C1/C4）。 */
+.badge.default {
+  color: var(--ink-soft);
+  background: var(--bg);
+  border: 1px solid var(--line-strong);
 }
 .actions {
   display: flex;
@@ -546,6 +802,106 @@ button:disabled {
   flex-direction: column;
   gap: 0.1rem;
   min-width: 0;
+}
+/* 文件区（doc/48 B1） */
+.files {
+  margin-top: 0.8rem;
+  border-top: 1px solid var(--line);
+  padding-top: 0.7rem;
+}
+.files-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.45rem;
+}
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: 0.15rem;
+  flex-wrap: wrap;
+}
+.crumb {
+  border: 0;
+  background: transparent;
+  padding: 0.1rem 0.25rem;
+  font-size: 0.78rem;
+  color: var(--accent-ink);
+}
+.crumb:hover {
+  text-decoration: underline;
+}
+.crumb-sep {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+.file-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.file {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.7rem;
+  padding: 0.4rem 0.5rem;
+  border-radius: 12px;
+  background: var(--bg);
+  flex-wrap: wrap;
+}
+.file-main {
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.file-name {
+  font-size: 0.86rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 26rem;
+}
+button.file-name {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: var(--accent-ink);
+  text-align: left;
+}
+button.file-name:hover {
+  text-decoration: underline;
+}
+.file-preview {
+  flex-basis: 100%;
+  max-width: 22rem;
+  max-height: 12rem;
+  object-fit: contain;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+}
+.file-text {
+  flex-basis: 100%;
+  max-height: 14rem;
+  overflow: auto;
+  margin: 0.2rem 0 0;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  font-size: 0.76rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .session-main strong {
   font-size: 0.86rem;

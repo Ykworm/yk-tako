@@ -47,8 +47,3 @@ export async function api<T>(method: string, path: string, body?: unknown): Prom
   const parsed = JSON.parse(text) as Envelope<T>
   return { status: res.status, body: parsed }
 }
-
-export function errorText(status: number, body: Envelope<unknown>): string {
-  const msg = body.message || '请求失败'
-  return status + '：' + msg
-}

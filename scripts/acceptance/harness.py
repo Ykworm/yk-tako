@@ -9,6 +9,7 @@
   TAKO_MODEL  租户里配的模型 ref，默认 deepseek/deepseek-flash
   TAKO_PG_DSN 直连 PG 的 DSN（造「忙」闸要用；没给就跳过需要它的用例并明说）
   TAKO_PSQL   psql 可执行文件，默认 psql
+  TAKO_WS_ROOT 引擎的 workspace 根（造项目目录里的文件要用），默认 <仓库根>/tmp/workspace-acc
 """
 import json
 import os
@@ -25,6 +26,9 @@ ENV_PATH = Path(os.environ.get("TAKO_ENV", REPO_ROOT / "yk-tako-eino" / ".env"))
 MODEL = os.environ.get("TAKO_MODEL", "deepseek/deepseek-flash")
 PG_DSN = os.environ.get("TAKO_PG_DSN", "")
 PSQL = os.environ.get("TAKO_PSQL", "psql")
+# 引擎的 workspace 根：项目目录在 <root>/tenants/<tid>/workspaces/<wid>/（scope.go）。
+# 「往项目目录里造文件」这类步骤要用它——产出文件在文件系统上，SQL 造不出来。
+WS_ROOT = Path(os.environ.get("TAKO_WS_ROOT", REPO_ROOT / "tmp" / "workspace-acc"))
 
 
 def api_key():

@@ -58,6 +58,9 @@ type Run struct {
 	// 原「活行上的部分唯一索引 one_live_run_per_workspace 保证同一项目同时只有一场 running」
 	// 已随项目闸退役而删除（doc/42）。
 	WorkspaceID *string
+	// PlanMode 是计划模式真源（doc/47 §5.1）：enter_plan_mode 置 true、方案批准置 false。
+	// 不出 API；resume 起手从这里播种进程内守卫快照。
+	PlanMode bool `gorm:"not null;default:false"`
 }
 
 func (Run) TableName() string { return "runs" }
@@ -507,7 +510,7 @@ func autoMigrate(db *gorm.DB) error {
 		&MemoryItem{}, &MemoryJob{}, &DialogueChunk{},
 		&User{}, &Tenant{}, &TenantMember{}, &RefreshToken{}, &AuditLog{}, &TenantUsageDaily{},
 		&TenantInvitation{}, &TenantAgent{}, &AgentDefault{}, &TenantSetting{}, &TenantStorage{},
-		&Workspace{}, &CleanerState{}, &RunTask{}); err != nil {
+		&Workspace{}, &CleanerState{}, &RunTask{}, &RunQuestion{}); err != nil {
 		return err
 	}
 	_ = db.Exec(`DROP INDEX IF EXISTS memory_items_dedup`).Error

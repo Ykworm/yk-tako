@@ -51,6 +51,9 @@ def check_step(expect, http, body, vars, tally, label):
     """比对一条期望。返回 True = 这条全过。"""
     bad = []
 
+    # 期望里也可以写 {var}（比如按 id 找数组里的那一项）。
+    expect = subst(expect, vars)
+
     def want(cond, why):
         if not cond:
             bad.append(why)
@@ -82,6 +85,13 @@ def check_step(expect, http, body, vars, tally, label):
             rows = data.get("rows", []) if isinstance(data, dict) else []
             n = len(w) if isinstance(w, list) else w
             want(len(rows) == n, f"runlog 行数 {len(rows)} ≠ {n}")
+        if "data_items_some" in expect:
+            # 数组里**至少有一项**满足条件（如「新建的项目 isDefault=false」）。
+            # 为什么不用 expect.data：那是逐位比对、长度必须相同——而列表长度会变。
+            spec = expect["data_items_some"]
+            items = data.get(spec["path"], []) if isinstance(data, dict) else []
+            hit = any(isinstance(it, dict) and harness.match(spec["match"], it) for it in items)
+            want(hit, f"数组 {spec['path']} 里没有满足 {spec['match']} 的项")
 
     if bad:
         tally.no(label, "；".join(bad))
@@ -164,6 +174,29 @@ def run_case(case, key, tally, only_print, seed):
             else:
                 tally.no(f"{label} 等定稿", f"{step.get('timeout', 30)}s 内会话没落定")
                 return False
+            continue
+
+        if op == "seed_ws":
+            # 往项目目录里造文件/目录/符号链接：产出文件在**文件系统**上，SQL 造不出来。
+            # 项目目录布局 = <workspace根>/tenants/<tid>/workspaces/<wid>/（scope.go）。
+            wid = resolve_path(step["workspace"], vars)
+            root = Path(harness.WS_ROOT) / "tenants" / vars["ten"] / "workspaces" / wid
+            try:
+                for rel, content in (step.get("files") or {}).items():
+                    f = root / rel
+                    f.parent.mkdir(parents=True, exist_ok=True)
+                    f.write_text(content)
+                for rel in (step.get("dirs") or []):
+                    (root / rel).mkdir(parents=True, exist_ok=True)
+                for rel in (step.get("symlinks") or []):
+                    link = root / rel
+                    if link.is_symlink() or link.exists():
+                        link.unlink()
+                    os.symlink("/etc", link)
+            except OSError as e:
+                tally.no(label, "造文件失败：%s" % e)
+                return False
+            tally.ok("%s 造文件 %s" % (label, wid))
             continue
 
         if "sql" in step and "method" not in step:

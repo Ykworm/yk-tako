@@ -115,10 +115,12 @@ eq "解绑 → code" "0" "$(echo "$UNB" | jq -r .code)"
 SESS2=$(curl -sS "$B/api/sessions?workspaceId=$WID" -H "Authorization: Bearer $ATOK")
 nothas "解绑后该项目不再列它" "$(echo "$SESS2" | jq -c .data)" "$WSID"
 
+# doc/42（2026-10-22）已把项目闸退役：同一项目可同时跑多场，不再回 409 114004。
 G1=$(curl -sS -X POST $B/api/runs -H "Authorization: Bearer $ATOK" -H "$J" -d '{"messageId":"m_g1","text":"写个文件","workspaceId":"'"$WID"'"}')
 G2=$(curl -sS -X POST $B/api/runs -H "Authorization: Bearer $ATOK" -H "$J" -d '{"messageId":"m_g2","text":"再来","workspaceId":"'"$WID"'"}')
-eq "同项目第二场 → HTTP 409" "409" "$(curl -sS -o /dev/null -w '%{http_code}' -X POST $B/api/runs -H "Authorization: Bearer $ATOK" -H "$J" -d '{"messageId":"m_g3","text":"第三场","workspaceId":"'"$WID"'"}')"
-eq "同项目第二场 → 业务码 114004" "114004" "$(echo "$G2" | jq -r .code)"
+G3=$(curl -sS -o /dev/null -w '%{http_code}' -X POST $B/api/runs -H "Authorization: Bearer $ATOK" -H "$J" -d '{"messageId":"m_g3","text":"第三场","workspaceId":"'"$WID"'"}')
+eq "同项目第二场 → code 0（项目闸已退役）" "0" "$(echo "$G2" | jq -r .code)"
+eq "同项目第三场 → HTTP 202" "202" "$G3"
 
 echo "═══ 三、doc/32 media_offload ═══"
 MR=$(curl -sS -X POST $B/api/runs -H "Authorization: Bearer $ATOK" -H "$J" -d '{"messageId":"m_m1","text":"这张图里有什么","images":[{"mime":"image/png","dataBase64":"'"$IMG"'","name":"t.png"}]}')

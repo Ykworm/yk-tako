@@ -4,7 +4,7 @@
 // **失效**（清落点 / 重拉列表 / 作废气泡），失效永远跟一次重拉——事件只带 {type, id}，
 // 不携带状态（doc/46 §3.1：拉是正确性，事件只是让对账早点发生）。Loop B 会把服务端
 // SSE 事件流的帧喂进同一个 handler 集合，这里已是它的形状。
-import { readTenant, readToken } from './auth'
+import { readTenant, readToken, refreshAccessToken } from './auth'
 
 export type MutationEvent = {
   type: 'session_deleted' | 'workspace_deleted' | 'workspace_renamed'
@@ -74,12 +74,21 @@ export function ensureEventStream() {
   }
   es.onerror = () => {
     // EventSource 原生重连用连接那一刻的 URL——access token 短效，过期后原样重连只会 401。
-    // 关掉、取最新 token 重建（3s 退避，网络抖动不至于狂刷）。api 层的刷新会持续改写
-    // sessionStorage 里的 token，重建时拿到的就是最新那对。
+    // 关掉、退避重建（3s，网络抖动不至于狂刷）。
     es?.close()
     es = null
     if (esTimer) clearTimeout(esTimer)
-    esTimer = setTimeout(ensureEventStream, 3000)
+    esTimer = setTimeout(() => {
+      // **重建前自己刷一次 token**（2026-10-23 修，doc/48 之后的复审发现）：
+      // 原先这里只「取最新 token 重建」，可**页面静止时没人调用 api 层，也就没人去刷新它**——
+      // sessionStorage 里那个 access token 就一直是过期的 → 服务端一律 401 →
+      // 3 秒一次无限重连，把引擎日志刷满（实测连续 401 刷屏）。
+      // 自己先刷：刷得到就用新 token 重建；刷不到（refresh token 也失效，clearAuth 已清）
+      // 就不再重建，等用户重新登录（App.vue 的 authState watch 会重新挂）。
+      void refreshAccessToken().finally(() => {
+        if (readToken()) ensureEventStream()
+      })
+    }, 3000)
   }
 }
 

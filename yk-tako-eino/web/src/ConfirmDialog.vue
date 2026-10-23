@@ -67,73 +67,76 @@ function onOverlay() {
   z-index: 60;
   display: grid;
   place-items: center;
-  padding: 1.5rem;
-  background: rgba(28, 25, 23, 0.45);
+  padding: var(--space-5);
+  background: rgba(16, 17, 20, 0.45);
 }
 
 .dialog {
   width: min(100%, 27rem);
   background: var(--bg-raised);
-  border: 1px solid var(--line-strong);
-  border-radius: var(--radius);
-  padding: 1.25rem 1.3rem 1.1rem;
-  box-shadow: 0 24px 60px rgba(28, 25, 23, 0.22);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  padding: var(--space-5);
+  box-shadow: var(--shadow);
 }
 
 h2 {
-  margin: 0 0 0.5rem;
-  font-size: 1.05rem;
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-lg);
+  font-weight: 600;
 }
 
 .body {
-  margin: 0 0 0.85rem;
+  margin: 0 0 var(--space-4);
   color: var(--ink-soft);
-  font-size: 0.86rem;
+  font-size: var(--text-base);
   line-height: 1.65;
   white-space: pre-wrap;
 }
 
 .error {
-  margin: 0 0 0.8rem;
+  margin: 0 0 var(--space-3);
   color: var(--danger);
   background: var(--danger-soft);
-  border-radius: 12px;
-  padding: 0.55rem 0.7rem;
-  font-size: 0.8rem;
+  border-radius: var(--radius-control);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
   line-height: 1.5;
 }
 
 .actions {
   display: flex;
   justify-content: flex-end;
-  gap: 0.5rem;
+  gap: var(--space-2);
 }
 
 button {
-  border-radius: 999px;
-  padding: 0.45rem 0.95rem;
-  font-size: 0.82rem;
+  height: 32px;
+  border-radius: var(--radius-control);
+  padding: 0 var(--space-4);
+  font-size: var(--text-sm);
+  font-weight: 500;
 }
 
 .cancel {
   border: 1px solid var(--line-strong);
-  background: transparent;
+  background: var(--bg-raised);
   color: var(--ink-soft);
 }
 
 .cancel:hover:not(:disabled) {
-  background: #fff;
-  border-color: #cfc6b6;
+  background: var(--hover);
 }
 
 .danger {
-  border: 0;
+  border: 1px solid var(--danger);
   background: var(--danger);
   color: #fff;
 }
 
 .danger:hover:not(:disabled) {
-  background: #881337;
+  border-color: #b42318;
+  background: #b42318;
 }
 
 button:disabled {

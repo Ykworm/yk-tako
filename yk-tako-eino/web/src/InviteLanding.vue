@@ -254,8 +254,10 @@ async function goTeam() {
         <p v-if="mode === 'ask'" data-invite-joined>{{ note }}。切换到 {{ preview.tenantName }}？</p>
         <p v-if="mode === 'already'" data-invite-already>{{ note }}</p>
         <p v-if="mode === 'login' && note" data-invite-login-note>{{ note }}</p>
+        <!-- 说的是「你（当前账号）」不是邀请目标，括号里就得印当前账号；
+             印 invited email 等于让用户拿邀请邮箱和邀请邮箱对比，永远对得上。 -->
         <p v-if="mode === 'pending' && myEmail && !sameAccount" data-invite-mismatch>
-          这个邀请不属于当前账号（{{ preview.email }}）
+          这个邀请不属于当前账号（{{ myEmail }}）
         </p>
 
         <div v-if="mode === 'pending' && sameAccount" class="actions">
@@ -304,78 +306,90 @@ async function goTeam() {
   min-height: 100vh;
   display: grid;
   place-items: center;
-  padding: 1.5rem;
+  padding: var(--space-5);
   background: var(--bg);
 }
 .card {
   width: min(100%, 28rem);
   background: var(--bg-raised);
   border: 1px solid var(--line);
-  border-radius: 18px;
-  padding: 1.3rem 1.2rem 1.4rem;
+  border-radius: var(--radius-panel);
+  padding: var(--space-5);
   display: flex;
   flex-direction: column;
-  gap: 0.8rem;
+  gap: var(--space-3);
 }
 .kicker {
   margin: 0;
-  color: var(--accent-ink);
-  font-size: 0.75rem;
-  letter-spacing: 0.14em;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.1em;
 }
 h1 {
   margin: 0;
-  font-size: 1.25rem;
-  font-weight: 620;
-  letter-spacing: -0.03em;
-  line-height: 1.45;
+  font-size: var(--text-xl);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.4;
 }
 .muted { margin: 0; color: var(--muted); }
-.form { display: flex; flex-direction: column; gap: 0.7rem; }
+.form { display: flex; flex-direction: column; gap: var(--space-3); }
 label {
   display: flex;
   flex-direction: column;
-  gap: 0.3rem;
-  font-size: 0.78rem;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
   color: var(--ink-soft);
 }
 input {
   width: 100%;
+  height: 36px;
   border: 1px solid var(--line-strong);
-  border-radius: 12px;
-  padding: 0.55rem 0.7rem;
-  background: #fff;
-  font-size: 0.92rem;
+  border-radius: var(--radius-control);
+  padding: 0 var(--space-3);
+  background: var(--bg-raised);
+  font-size: var(--text-sm);
 }
 input[readonly] { background: var(--bg); color: var(--ink-soft); }
 input:focus {
   outline: none;
-  border-color: #8fbfb0;
-  box-shadow: 0 0 0 3px rgba(15, 110, 86, 0.12);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 .secret { position: relative; display: block; }
+.secret input { padding-right: 3.4rem; }
 .secret .text {
   position: absolute;
-  right: 0.45rem;
+  right: 4px;
   top: 50%;
   transform: translateY(-50%);
+  height: 28px;
+  padding: 0 var(--space-2);
 }
-.actions { display: flex; flex-wrap: wrap; gap: 0.45rem; }
+.actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+/* 卡片是 flex 列：直系按钮会被拉成整卡宽，主按钮看着像一整行。 */
+.card > button { align-self: flex-start; }
 button {
+  height: 32px;
   border: 1px solid var(--line-strong);
-  background: #fff;
-  border-radius: 999px;
-  padding: 0.42rem 0.85rem;
-  font-size: 0.82rem;
+  background: var(--bg-raised);
+  border-radius: var(--radius-control);
+  padding: 0 var(--space-4);
+  font-size: var(--text-sm);
+  font-weight: 500;
 }
-.primary { border: 0; background: var(--ink); color: #f6f1e7; }
+button:hover:not(:disabled) { background: var(--hover); }
+.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+.primary:hover:not(:disabled) { border-color: var(--accent-ink); background: var(--accent-ink); }
 button:disabled { opacity: 0.55; }
 .text { border: 0; background: transparent; color: var(--muted); }
+.text:hover:not(:disabled) { background: var(--hover); }
 .banner {
   margin: 0;
-  border-radius: 12px;
-  padding: 0.5rem 0.7rem;
-  font-size: 0.82rem;
+  border-radius: var(--radius-control);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
   color: var(--danger);
   background: var(--danger-soft);
 }

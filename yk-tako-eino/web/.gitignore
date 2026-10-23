@@ -2,3 +2,8 @@ node_modules
 dist
 *.tsbuildinfo
 *.tsbuildinfo
+# playwright 的产物目录（失败时的 trace / screenshot / report）——不入库
+test-results
+playwright-report
+blob-report
+.playwright

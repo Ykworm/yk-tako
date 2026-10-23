@@ -111,9 +111,9 @@ type devTenantData struct {
 const (
 	codeOK = 0
 	// 码段口径（doc/40 §4）：前两位是模块——11 身份与参数，12 会话与运行，13 配额，
-	// 14 项目与工作区。1110xx 参数，1111xx 登录与 token，1112xx 权限，1114xx 冲突，
+	// 14 项目与工作区，15 人审与问答。1110xx 参数，1111xx 登录与 token，1112xx 权限，1114xx 冲突，
 	// 1119xx 这一模块的内部失败；1120xx 资源缺失，1121xx 会话与运行的冲突；
-	// 1130xx 配额与准入；1140xx 项目，1141xx 项目里的文件。
+	// 1130xx 配额与准入；1140xx 项目，1141xx 项目里的文件；1150xx 人审与问答。
 	codeBadJSON          = 111001
 	codeBadInput         = 111002
 	codeNameRequired     = 111003
@@ -173,7 +173,11 @@ const (
 	codeMediaMissing = 114101
 	// 114102：media 的 path 不是 workspaces/<wid>/… 格式，或越出工作区。
 	codeMediaPathBad = 114102
-	codeInternal     = 111901
+	// 115002：问题行不存在（doc/47 §5.3）。
+	codeQuestionMissing = 115002
+	// 115101：问题行已答过/已失效——CAS 影响 0 行（一答终答）。
+	codeQuestionAnswered = 115101
+	codeInternal         = 111901
 )
 
 var emailPattern = regexp.MustCompile(`^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$`)

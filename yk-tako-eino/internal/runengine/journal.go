@@ -122,11 +122,18 @@ func (t *journalInvokableTool) InvokableRun(ctx context.Context, argumentsInJSON
 
 // journalReplay 是账本重放的产物（doc/30 §9.1）：模型输入行、EndRun 的两个投影所用 turn、
 // resume 帧正文（所有 root assistant 正文拼接）、以及「最后一条 assistant 没有 tool_calls」的终点判定。
+//
+// Waits / PlanApproved 是 doc/47 §3.3 的 resume 第三分支：缺结果的「等人」调用按 ToolCallID
+// 对上 run_questions 行——pending 的记进 Waits（worker 重发帧继续等），answered 的答案已就地
+// 换进 tool 行；PlanApproved = 已答的 plan 行还欠一次「退出 plan mode」（崩溃发生在工具醒来前），
+// worker 起手补写 runs.plan_mode=false。
 type journalReplay struct {
-	Rows  []ModelMessage
-	Turn  []TurnEntry
-	Seed  string
-	Final bool
+	Rows         []ModelMessage
+	Turn         []TurnEntry
+	Seed         string
+	Final        bool
+	Waits        []RunQuestion
+	PlanApproved bool
 }
 
 // replayJournal 把账本规范重放成续跑所需的四样产物。纯函数（单测直测）。
@@ -136,12 +143,23 @@ type journalReplay struct {
 // 的规范形状。输出 Seq 从 2 连续排（user 占 1），RunID 固定当前 run。
 //
 // 缺结果的调用**不报错、不重跑**：回注 interruptedResultText（doc/30 §9.2，at-most-once）；
+// 但「等人」调用（ask_user / submit_plan）有 run_questions 行可对账（doc/47 §3.3）：
+//   - 行 pending  → 记进 Waits，worker 起手重发 question 帧并继续等；
+//   - 行 answered → 答案/批准文直接作为 tool_result（plan 行额外置 PlanApproved）；
+//   - 无行 / stale → 仍是 interruptedResultText（现场不可重建，维持 at-most-once）。
+//
 // 孤儿 intent/result（不属于任何 assistant 行的调用）按相邻出现归成一组，输出一条合成的
 // assistant 行让 tool 行在协议里有合法发起者——参数取 intent 的 args。
-func replayJournal(runID RunID, rows []RunJournal) (journalReplay, error) {
+func replayJournal(runID RunID, rows []RunJournal, questions []RunQuestion) (journalReplay, error) {
 	var out journalReplay
 	results := make(map[string]RunJournal, len(rows))
 	owned := make(map[string]bool)
+	waits := make(map[string]RunQuestion, len(questions))
+	for _, q := range questions {
+		if q.ToolCallID != "" {
+			waits[q.ToolCallID] = q
+		}
+	}
 	for _, r := range rows {
 		switch r.Role {
 		case "assistant":
@@ -176,11 +194,30 @@ func replayJournal(runID RunID, rows []RunJournal) (journalReplay, error) {
 		for _, c := range calls {
 			name := c.Function.Name
 			text := interruptedResultText
-			if res, ok := results[c.ID]; ok {
+			switch res, ok := results[c.ID]; {
+			case ok:
 				if name == "" {
 					name = res.ToolName
 				}
 				text = res.Text
+			default:
+				if q, ok := waits[c.ID]; ok {
+					switch q.Status {
+					case questionStatusPending:
+						out.Waits = append(out.Waits, q)
+					case questionStatusAnswered:
+						text = q.Answer
+						if q.Kind == questionKindPlan {
+							if q.Decision == questionDecisionRevise {
+								// 驳回：模型接着改方案重交，plan_mode 不清。
+								text = planRevisionText(q.Answer)
+							} else {
+								text = planApprovalText(q.Answer)
+								out.PlanApproved = true
+							}
+						}
+					}
+				}
 			}
 			appendTool(c.ID, name, text, model)
 		}
