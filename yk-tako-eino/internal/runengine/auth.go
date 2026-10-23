@@ -467,6 +467,13 @@ func (a *Auth) RequireAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		raw, ok := bearer(c.GetHeader("Authorization"))
 		if !ok {
+			// EventSource 带不了 Authorization 头（doc/46 §7 第 5 条）：/api/events 的浏览器
+			// 连接用 ?access_token=<jwt> 兜底。gin 默认日志只记 URL.Path 不带 query，token 短效、
+			// 不进持久日志；其余端点照旧走 Header，不受影响。
+			raw = strings.TrimSpace(c.Query("access_token"))
+			ok = raw != ""
+		}
+		if !ok {
 			writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
 			c.Abort()
 			return

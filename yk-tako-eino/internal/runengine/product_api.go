@@ -165,6 +165,7 @@ func (s *Server) patchWorkspace(c *gin.Context) {
 		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
 		return
 	}
+	s.publishEvent(c.Request.Context(), p.TenantID, eventWorkspaceRenamed, row.ID)
 	writeEnvelope(c, http.StatusOK, codeOK, "", workspaceData{Workspace: toWorkspaceBody(row, p.UserID)})
 }
 
@@ -214,6 +215,7 @@ func (s *Server) deleteWorkspace(c *gin.Context) {
 				log.Printf("DELETE /api/workspaces/%s session %s: %v", id, sid, rmErr)
 			}
 		}
+		s.publishEvent(c.Request.Context(), p.TenantID, eventWorkspaceDeleted, id)
 		writeEnvelope(c, http.StatusOK, codeOK, "", struct {
 			Status string `json:"status"`
 		}{Status: "deleted"})
@@ -242,6 +244,7 @@ func (s *Server) deleteSession(c *gin.Context) {
 		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
 	default:
 		removeSessionSystemArchives(s.mediaRoot, p.TenantID, id)
+		s.publishEvent(c.Request.Context(), p.TenantID, eventSessionDeleted, string(id))
 		writeEnvelope(c, http.StatusOK, codeOK, "", struct {
 			Status string `json:"status"`
 		}{Status: "deleted"})
@@ -405,6 +408,8 @@ func (s *Server) deleteTenant(c *gin.Context) {
 		internal(c, err)
 		return
 	}
+	// 租户归档：事件流键无 TTL（MAXLEN 只限长度），不删就成残留。
+	s.store.deleteEvents(c.Request.Context(), p.TenantID)
 	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
 		Status string `json:"status"`
 	}{Status: "archived"})

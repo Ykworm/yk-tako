@@ -7,6 +7,7 @@ import {
   CODE_RUN_ALIVE,
   CODE_SESSION_MISSING,
   CODE_SESSION_RUNNING,
+  CODE_WORKSPACE_MISSING,
   getFrames,
   getLog,
   getRun,
@@ -218,6 +219,22 @@ export function useChat() {
     atStart.value = true
   }
 
+  // 变更同步（doc/46 Loop A）：这场会话在别的窗口被删了。整页气泡作废、清存储键，
+  // 给页面一条可展示的死因；用户再发言会懒建新会话，不拦。
+  const sessionGone = ref('')
+  function closeOnDeleted(id: string) {
+    if (!sessionId.value || sessionId.value !== id) return
+    pollToken++
+    dropSession()
+    pending.value = []
+    bubbles.value = []
+    draft.value = ''
+    attachments.value = []
+    busy.value = false
+    renderedMessageIds.clear()
+    sessionGone.value = '这场会话已在其它窗口删除。'
+  }
+
   // gateIdle：闸空 = 会话没有活 run（19v6-01 §4）。404 = 本地 sid 已被 reset 清成僵尸，
   // 它必然不占闸——丢掉本地值连同游标，这一条改走懒建；其余查不到一律算「不空」，宁可下一拍再试。
   async function gateIdle(): Promise<boolean> {
@@ -280,6 +297,12 @@ export function useChat() {
       if (sid && isNotFound(e)) {
         dropSession()
         return await postRuns(p.messageId, p.text, undefined, p.images, targetWorkspace ?? undefined)
+      }
+      // 落点项目已被删（114001）：清落点、回落默认项目重试一次（doc/46 A2 自愈）。
+      // 只对「发送时定下的落点仍等于当前落点」下手——排队期间被人切过落点就不乱清；只重投这一次。
+      if (!sid && isWorkspaceMissing(e) && targetWorkspace && activeWorkspaceId.value === targetWorkspace) {
+        setActiveWorkspace(null)
+        return await postRuns(p.messageId, p.text, undefined, p.images, undefined)
       }
       throw e
     }
@@ -523,6 +546,7 @@ export function useChat() {
   // reconcile（19v6-02 四步）：查状态 → 窗口化补历史 → 有活 run 则 frames(0) 重建半截气泡。
   // 返回是否真的打开了一场会话（项目页「打开」据此判断，失败时对话页保持空）。
   async function reconcile(): Promise<boolean> {
+    sessionGone.value = ''
     // 连点防护：openSession/showTenantSession/newSession 都会 pollToken++ 后清空气泡，
     // 中途进来的那次 reconcile 必须在每个 await 之后认令牌失效就退场，否则历史会重复渲染。
     const token = pollToken
@@ -700,13 +724,14 @@ export function useChat() {
     attachments.value = []
     busy.value = false
     renderedMessageIds.clear()
+    sessionGone.value = ''
   }
 
   return {
     sessionId, bubbles, draft, attachments, busy, pending, loadingOlder, atStart,
-    activeWorkspaceId,
+    activeWorkspaceId, sessionGone,
     send, reconcile, loadOlder, newSession, showTenantSession, resumeRun,
-    setActiveWorkspace, openSession,
+    setActiveWorkspace, openSession, closeOnDeleted,
   }
 }
 
@@ -718,6 +743,11 @@ function isBusy(e: unknown): boolean {
 
 function isNotFound(e: unknown): boolean {
   return e instanceof ApiError && e.code === CODE_SESSION_MISSING
+}
+
+// 落点项目已被删（114001）：postRuns 带 workspaceId 的预检挡下的就是这个。
+function isWorkspaceMissing(e: unknown): boolean {
+  return e instanceof ApiError && e.code === CODE_WORKSPACE_MISSING
 }
 
 function sleep(ms: number) {

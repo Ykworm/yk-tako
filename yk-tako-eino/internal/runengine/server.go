@@ -81,6 +81,7 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 	r.GET("/api/sessions/:id", authn, s.getSession)
 	r.DELETE("/api/sessions/:id", authn, s.deleteSession)
 	r.GET("/api/sessions/:id/subagents", authn, s.getSessionSubagents)
+	r.GET("/api/events", authn, s.getEvents)
 	r.GET("/api/runs/:runId/frames", authn, s.getFrames)
 	r.GET("/api/runs/:runId/stream", authn, s.getRunStream)
 	r.GET("/api/sessions/:id/log", authn, s.getSessionLog)

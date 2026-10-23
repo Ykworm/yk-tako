@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
   ApiError,
   createWorkspace,
@@ -12,6 +12,7 @@ import {
   type Workspace,
 } from './api'
 import ConfirmDialog from './ConfirmDialog.vue'
+import { broadcastMutation, onMutation } from './mutation'
 
 const props = defineProps<{ activeWorkspaceId: string | null }>()
 
@@ -74,6 +75,19 @@ async function load() {
 
 onMounted(load)
 
+// 变更同步（doc/46 Loop A）：别的窗口删了会话/项目、改了名，本列表当场跟着变，
+// 不等人手动点「刷新」；load() 里还自带「落点项目没了就清落点」的自愈。
+const offMutation = onMutation((evt) => {
+  if (evt.type === 'session_deleted') {
+    for (const p of projects.value) {
+      if (p.sessions) p.sessions = p.sessions.filter((s) => s.id !== evt.id)
+    }
+    return
+  }
+  void load()
+})
+onUnmounted(offMutation)
+
 const createName = ref('')
 const createBusy = ref(false)
 const createError = ref('')
@@ -116,6 +130,7 @@ async function saveRename(p: ProjectRow) {
     const res = await renameWorkspace(p.workspace.id, editName.value.trim())
     p.workspace = res.workspace
     editId.value = ''
+    broadcastMutation({ type: 'workspace_renamed', id: p.workspace.id })
   } catch (e) {
     editError.value = errText(e, '改名失败')
   } finally {
@@ -196,6 +211,7 @@ async function confirmDelete() {
   try {
     if (t.kind === 'workspace') {
       await deleteWorkspace(t.project.workspace.id)
+      broadcastMutation({ type: 'workspace_deleted', id: t.project.workspace.id })
       projects.value = projects.value.filter((x) => x !== t.project)
       emit('workspace-deleted', {
         id: t.project.workspace.id,
@@ -203,6 +219,7 @@ async function confirmDelete() {
       })
     } else {
       await deleteSession(t.session.id)
+      broadcastMutation({ type: 'session_deleted', id: t.session.id })
       if (t.project.sessions) {
         t.project.sessions = t.project.sessions.filter((s) => s.id !== t.session.id)
       }

@@ -139,6 +139,7 @@ export const CODE_SESSION_RUNNING = 112101 // 这场会话正在跑，等它跑�
 export const CODE_NOT_RESUMABLE = 112102 // 这场 run 已经定稿，没有可续的
 export const CODE_RUN_ALIVE = 112103 // 这场 run 还活着，别抢
 export const CODE_RESUME_EXHAUSTED = 112104 // 续跑次数用完了，重新发一轮
+export const CODE_WORKSPACE_MISSING = 114001 // 找不到这个项目
 
 // ApiError 是失败信封的载体：code 给分支用，message 直接就是弹窗文案（Error 自带的 message），
 // data 是可选的诊断细节。

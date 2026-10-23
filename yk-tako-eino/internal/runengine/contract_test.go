@@ -214,3 +214,26 @@ func TestContractToolTiering(t *testing.T) {
 		}
 	}
 }
+
+// TestContractStreamEventBytes 钉住 SSE 事件帧的 data 字节（doc/46 §3.3 用例 9）。
+//
+// 键序 seq → type → id → at 是契约的一部分：前端 EventSource 收到后按 type 分派失效
+//（web/src/mutation.ts 的 dispatch）。下面的字节不是手写的，是 2026-10-23 从活引擎实跑抄的：
+//
+//	GET /api/events（curl -N 挂读）后 DELETE /api/sessions/{sid}，收到的帧：
+//	id: 1792737898948-0
+//	data: {"seq":"1792737898948-0","type":"session_deleted","id":"s_01M5J5VGJ6VWG1DBCW0R8WA4JG","at":"2026-10-23T06:44:58Z"}
+//
+// 挂读型端点的活体断言在 scripts/acceptance/events_live.sh；这里只钉可纯函数判定的字节。
+func TestContractStreamEventBytes(t *testing.T) {
+	got := mustJSON(t, streamEvent{
+		Seq:  "1792737898948-0",
+		Type: "session_deleted",
+		ID:   "s_01M5J5VGJ6VWG1DBCW0R8WA4JG",
+		At:   "2026-10-23T06:44:58Z",
+	})
+	const want = `{"seq":"1792737898948-0","type":"session_deleted","id":"s_01M5J5VGJ6VWG1DBCW0R8WA4JG","at":"2026-10-23T06:44:58Z"}`
+	if got != want {
+		t.Fatalf("事件帧字节 = %s\nwant %s", got, want)
+	}
+}

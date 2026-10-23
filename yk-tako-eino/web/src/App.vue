@@ -14,6 +14,7 @@ import InviteLanding from './InviteLanding.vue'
 import PendingInvites from './PendingInvites.vue'
 import ProjectsView from './ProjectsView.vue'
 import { authFetch, authState, clearAuth, loginWithPassword, switchTenant, tenantState } from './auth'
+import { onMutation, ensureEventStream, closeEventStream } from './mutation'
 
 type Page = 'chat' | 'projects' | 'agents' | 'team'
 
@@ -40,10 +41,35 @@ const configPage = computed<'agents' | 'team'>(() => (page.value === 'team' ? 't
 
 const {
   sessionId, bubbles, draft, attachments, pending, loadingOlder, atStart, busy,
-  activeWorkspaceId,
+  activeWorkspaceId, sessionGone,
   send, reconcile, loadOlder, newSession, showTenantSession, resumeRun,
-  setActiveWorkspace, openSession,
+  setActiveWorkspace, openSession, closeOnDeleted,
 } = useChat()
+
+// 变更同步（doc/46 Loop A）：别的窗口删了会话/项目——本地当场失效（气泡作废 / 落点清回默认），
+// 失效永远跟重拉，事件本身不携带状态。
+onMutation((evt) => {
+  if (evt.type === 'session_deleted') {
+    closeOnDeleted(evt.id)
+  } else if (evt.type === 'workspace_deleted' && activeWorkspaceId.value === evt.id) {
+    setActiveWorkspace(null)
+  }
+})
+
+// 服务端变更事件流（doc/46 B3）：登录后挂 EventSource，租户切换换一条流，退出关掉。
+// 与 BroadcastChannel 并存——后者是同机快路径，前者是跨机跨端的正路，两源同一份失效逻辑。
+watch(authState, (on) => {
+  if (on) ensureEventStream()
+  else closeEventStream()
+}, { immediate: true })
+watch(
+  () => tenantState.value.id,
+  () => {
+    if (!authState.value) return
+    closeEventStream()
+    ensureEventStream()
+  },
+)
 
 const listEl = ref<HTMLElement | null>(null)
 const composerEl = ref<HTMLTextAreaElement | null>(null)
@@ -838,6 +864,7 @@ async function onScroll() {
         />
 
         <div v-show="page === 'chat'" class="thread">
+          <p v-if="sessionGone" class="session-gone" role="alert">{{ sessionGone }}</p>
           <div v-if="sessionId" class="subagents">
             <button type="button" class="subagent-bar" :aria-expanded="subagentsOpen" @click="toggleSubagents">
               <span>子代理 {{ subagents.length }}</span>
@@ -1420,6 +1447,15 @@ async function onScroll() {
 }
 
 /* 子代理档案条（doc/44 §2.4）：默认收起，只占一行；展开是列表，不挤压对话的滚动区。 */
+.session-gone {
+  margin: 0 0 8px;
+  padding: 10px 14px;
+  border: 1px solid #fed7aa;
+  border-radius: 10px;
+  background: var(--warn-soft, #fff7ed);
+  color: var(--warn, #b45309);
+}
+
 .subagents {
   flex: none;
   padding: 0.85rem 0.2rem 0;
