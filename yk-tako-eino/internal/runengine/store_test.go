@@ -955,11 +955,11 @@ func TestEndRunLandsTurnRows(t *testing.T) {
 		t.Fatalf("runlog 行数 = %d, want 4", len(rows))
 	}
 	if rows[1].Role != "tool_call" || rows[1].Text != `get_time({"timezone":"Asia/Shanghai"})` ||
-		rows[1].Payload != `{"name":"get_time","args":"{\"timezone\":\"Asia/Shanghai\"}"}` {
+		rows[1].Payload != `{"name":"get_time","args":"{\"timezone\":\"Asia/Shanghai\"}","toolCallId":"call_1"}` {
 		t.Errorf("rows[1] = %+v, want tool_call 扩展行（text 可展示 + payload 结构化）", rows[1])
 	}
 	if rows[2].Role != "tool_result" || rows[2].Text != "2026-10-08 15:04:05 +0800 CST" ||
-		rows[2].Payload != `{"name":"get_time","output":"2026-10-08 15:04:05 +0800 CST"}` {
+		rows[2].Payload != `{"name":"get_time","output":"2026-10-08 15:04:05 +0800 CST","toolCallId":"call_1"}` {
 		t.Errorf("rows[2] = %+v, want tool_result 扩展行", rows[2])
 	}
 	if rows[3].Role != "assistant" || rows[3].Text != "我查一下，现在是 15:04" {
@@ -1056,10 +1056,10 @@ func TestEndRunLandsDelegationRows(t *testing.T) {
 			t.Errorf("rows[%d].RunlogOffset = %d, want %d", i, r.RunlogOffset, i+1)
 		}
 	}
-	if rows[1].Payload != `{"name":"researcher","args":"{\"request\":\"查时间\"}"}` {
+	if rows[1].Payload != `{"name":"researcher","args":"{\"request\":\"查时间\"}","toolCallId":"call_1"}` {
 		t.Errorf("rows[1].Payload = %s, want 委派调用结构化负载", rows[1].Payload)
 	}
-	if rows[5].Payload != `{"name":"researcher","output":"现在是 15:04。"}` {
+	if rows[5].Payload != `{"name":"researcher","output":"现在是 15:04。","toolCallId":"call_1"}` {
 		t.Errorf("rows[5].Payload = %s, want 回传结构化负载", rows[5].Payload)
 	}
 	// NULL 惯例（存储形态级）：user 行两列 NULL；root 行 agent NULL + model 非 NULL；

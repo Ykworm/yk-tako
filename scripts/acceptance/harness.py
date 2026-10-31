@@ -18,6 +18,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -59,6 +60,43 @@ def call(method, path, body=None, token=None, raw=False):
         code, payload = e.code, e.read()
     if raw:
         return code, payload
+    try:
+        return code, json.loads(payload)
+    except Exception:
+        return code, payload.decode("utf-8", "replace")
+
+
+def call_upload(path, filename, content, token=None, field="file", fields=None):
+    """打一次 multipart 上传（doc/52 C1 的技能包安装、D36 的工具上传）。
+
+    与 call 的差别只在请求体：包体是**二进制**，不能走 json.dumps。
+    手写 multipart 的边界串：标准库没有 client 侧的便捷封装，且这里只要一个文件字段，
+    引第三方库不值当（验收脚本要能在裸机 python3 上跑）。
+    fields 是额外的普通表单字段（工具上传要带 name，且 name 是用户给的而不是文件名）。
+    """
+    boundary = "----takoacc" + uuid.uuid4().hex
+    parts = []
+    for k, v in (fields or {}).items():
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{k}"\r\n\r\n'
+            f"{v}\r\n"
+        )
+    parts.append(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'
+        f"Content-Type: application/octet-stream\r\n\r\n"
+    )
+    body = "".join(parts).encode() + content + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(BASE + path, method="POST", data=body)
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(req) as r:
+            code, payload = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        code, payload = e.code, e.read()
     try:
         return code, json.loads(payload)
     except Exception:

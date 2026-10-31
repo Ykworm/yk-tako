@@ -848,10 +848,10 @@ func (s *Server) devFileLockCheck(c *gin.Context) {
 	}
 	unlock()
 	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
-		Acquired  bool  `json:"acquired"`
-		WaitedMs  int64 `json:"waitedMs"`
-		HoldMs    int   `json:"holdMs"`
-		LockPath  string `json:"lockPath"`
+		Acquired bool   `json:"acquired"`
+		WaitedMs int64  `json:"waitedMs"`
+		HoldMs   int    `json:"holdMs"`
+		LockPath string `json:"lockPath"`
 	}{Acquired: true, WaitedMs: waited.Milliseconds(), HoldMs: req.HoldMs, LockPath: lockPathFor(lockDir, full)})
 }
 
@@ -938,16 +938,17 @@ func (s *Server) listAgents(c *gin.Context) {
 }
 
 type effectiveAgentBody struct {
-	ID          string     `json:"id"`
-	DefaultID   string     `json:"defaultId"`
-	Source      string     `json:"source"`
-	Overridden  bool       `json:"overridden"`
-	Name        string     `json:"name"`
-	Description string     `json:"description"`
-	Spec        string     `json:"spec"`
-	ModelRef    string     `json:"modelRef"`
-	ToolPolicy  ToolPolicy `json:"toolPolicy"`
-	Visibility  string     `json:"visibility"`
+	ID          string      `json:"id"`
+	DefaultID   string      `json:"defaultId"`
+	Source      string      `json:"source"`
+	Overridden  bool        `json:"overridden"`
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	Spec        string      `json:"spec"`
+	ModelRef    string      `json:"modelRef"`
+	ToolPolicy  ToolPolicy  `json:"toolPolicy"`
+	SkillPolicy SkillPolicy `json:"skillPolicy"`
+	Visibility  string      `json:"visibility"`
 }
 
 func effectiveBodies(rows []EffectiveAgent) []effectiveAgentBody {
@@ -956,7 +957,8 @@ func effectiveBodies(rows []EffectiveAgent) []effectiveAgentBody {
 		out = append(out, effectiveAgentBody{
 			ID: row.ID, DefaultID: row.DefaultID, Source: row.Source, Overridden: row.Overridden,
 			Name: row.Name, Description: row.Description, Spec: row.Spec, ModelRef: row.ModelRef,
-			ToolPolicy: parseToolPolicy(row.ToolPolicy), Visibility: row.Visibility,
+			ToolPolicy: parseToolPolicy(row.ToolPolicy), SkillPolicy: parseSkillPolicy(row.SkillPolicy),
+			Visibility: row.Visibility,
 		})
 	}
 	return out
@@ -981,13 +983,14 @@ func agentBodies(rows []TenantAgent) []agentBody {
 }
 
 type agentWrite struct {
-	Name        string      `json:"name"`
-	Kind        string      `json:"kind"`
-	Description *string     `json:"description"`
-	Spec        *string     `json:"spec"`
-	ModelRef    *string     `json:"modelRef"`
-	ToolPolicy  *ToolPolicy `json:"toolPolicy"`
-	Visibility  *string     `json:"visibility"`
+	Name        string       `json:"name"`
+	Kind        string       `json:"kind"`
+	Description *string      `json:"description"`
+	Spec        *string      `json:"spec"`
+	ModelRef    *string      `json:"modelRef"`
+	ToolPolicy  *ToolPolicy  `json:"toolPolicy"`
+	SkillPolicy *SkillPolicy `json:"skillPolicy"`
+	Visibility  *string      `json:"visibility"`
 }
 
 func validAgentKind(kind string) bool {
@@ -1044,7 +1047,31 @@ func applyAgentWrite(row *TenantAgent, req agentWrite) error {
 		}
 		row.ToolPolicy = raw
 	}
+	if req.SkillPolicy != nil {
+		raw, err := skillPolicyJSON(*req.SkillPolicy)
+		if err != nil {
+			return err
+		}
+		row.SkillPolicy = raw
+	}
 	return nil
+}
+
+// skillScopeDeclared 报告一行的技能作用域是否真的收窄了（allow/exclude）。空串与坏值都是 inherit。
+func skillScopeDeclared(raw string) bool {
+	mode := parseSkillPolicy(raw).Mode
+	return mode == "allow" || mode == "exclude"
+}
+
+// rejectSubagentSkillScope 是「普通子代理写了技能作用域」的统一出口（doc/52 E1）：
+// 子代理没有技能目录，这两个字段对它们无意义——静默接受会让人以为配了就有目录。
+// kind 在写入口已知（请求或原行），所以这道判落在落库之前，不让坏配置进表。
+func rejectSubagentSkillScope(c *gin.Context, kind, raw string) bool {
+	if kind != "subagent" || !skillScopeDeclared(raw) {
+		return false
+	}
+	writeEnvelope(c, http.StatusBadRequest, codeBadInput, "skills:／exclude_skills: 只对主助手有效（普通子代理没有技能目录）", nil)
+	return true
 }
 
 func (s *Server) writeAgent(c *gin.Context, status int, row TenantAgent) {
@@ -1110,6 +1137,9 @@ func (s *Server) createAgent(c *gin.Context) {
 	if !writeAgentFields(c, &row, req) {
 		return
 	}
+	if rejectSubagentSkillScope(c, row.Kind, row.SkillPolicy) {
+		return
+	}
 	row.TenantID = p.TenantID
 	row.CreatedBy = p.UserID
 	saved, err := s.store.CreateAgent(c.Request.Context(), row)
@@ -1151,6 +1181,9 @@ func (s *Server) updateAgent(c *gin.Context) {
 		return
 	}
 	if !writeAgentFields(c, &row, req) {
+		return
+	}
+	if rejectSubagentSkillScope(c, row.Kind, row.SkillPolicy) {
 		return
 	}
 	if err := s.store.UpdateAgent(c.Request.Context(), row); errors.Is(err, ErrAgentExists) {
@@ -1257,10 +1290,19 @@ func (s *Server) importAgents(c *gin.Context) {
 			internal(c, err)
 			return
 		}
+		pSkill, perr := skillPolicyJSON(skillPolicyFromSpec(spec))
+		if perr != nil {
+			writeEnvelope(c, http.StatusBadRequest, codeBadInput, "有一份规格格式不对", nil)
+			return
+		}
+		if rejectSubagentSkillScope(c, row.Kind, pSkill) {
+			return
+		}
 		row.Description = spec.Description
 		row.Spec = spec.Prompt
 		row.ModelRef = spec.Model
 		row.ToolPolicy = pol
+		row.SkillPolicy = pSkill
 		row.TenantID = p.TenantID
 		row.CreatedBy = p.UserID
 		rows = append(rows, row)

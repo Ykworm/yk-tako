@@ -9,6 +9,7 @@ package runengine
 import (
 	"context"
 	"errors"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -17,10 +18,18 @@ import (
 	"gorm.io/gorm"
 )
 
-// 行的 kind 与 status 词表（doc/47 §5.1）。
+// 行的 kind 与 status 词表（doc/47 §5.1；doc/52 D20/D24 加 install）。
+//
+// **args 列按 kind 变义**（doc/52 §7 D24）：
+//   - question：ask_user 的原始参数 JSON（question、options）；
+//   - plan：submit_plan 的原始参数 JSON（plan 全文）；
+//   - install：skill_install 的**暂存提议**（skillInstallProposal：来源、`.staging` 路径、
+//     选中技能名、候选全表、warnings）。模型不能握写盘的手，所以这一行是「人点批准时
+//     程序去执行什么」的唯一凭据——approve 时由 answerQuestion 读它并落盘（§6.6）。
 const (
 	questionKindQuestion = "question"
 	questionKindPlan     = "plan"
+	questionKindInstall  = "install"
 
 	questionStatusPending  = "pending"
 	questionStatusAnswered = "answered"
@@ -29,9 +38,11 @@ const (
 	// 方案行的审批结论（doc/47 §5.3，2026-10-23 交互修订补）：
 	//   approve = 批准（可带改写后的方案全文）；
 	//   revise  = 驳回并要求修改（plan_mode 不解除，模型改完重新 submit_plan）。
+	// 安装行：approve = 装（程序执行），cancel = 不装（删掉暂存目录）。
 	// 问题行的 decision 恒为空串。
 	questionDecisionApprove = "approve"
 	questionDecisionRevise  = "revise"
+	questionDecisionCancel  = "cancel"
 )
 
 // RunQuestion = `run_questions` 表。P/Q 共用：kind=plan 时 question 列存方案全文，
@@ -129,6 +140,16 @@ func (s *Store) AnswerQuestion(ctx context.Context, id, answer, decision string)
 	return ErrQuestionAnswered
 }
 
+// SetQuestionAnswer 在 CAS 之后补写一行的 answer（安装行的「执行结果」）。
+//
+// 只按 id 写、不再判 status：调用方刚刚以 CAS 赢下这一行，此刻它就是 answered；
+// 再判一次 status 只会把「自己刚写的」当成并发。**不重写 decision**——那是
+// 「人点了什么」的记录，不是可覆盖字段。
+func (s *Store) SetQuestionAnswer(ctx context.Context, id, answer string) error {
+	return s.db.WithContext(ctx).Exec(
+		`UPDATE run_questions SET answer = ? WHERE id = ?`, answer, id).Error
+}
+
 // RunWorkspace 读这场 run 挂的项目（行不存在返回空串）。行落库时的 workspace 列取它。
 func (s *Store) RunWorkspace(ctx context.Context, runID RunID) (string, error) {
 	var rows []struct {
@@ -143,6 +164,9 @@ func (s *Store) RunWorkspace(ctx context.Context, runID RunID) (string, error) {
 
 // questionView 是 list 端点的响应行（doc/47 §5.3）。args 一并给出：刷新后前端靠
 // questions?status=pending 重建问题卡，options 只能从 args 解析（帧可能已过 TTL）。
+// answer 只给安装行（doc/52 C5）：它的结论是程序写的那句话（「已安装技能：x。」或失败原因），
+// 刷新后卡片要能复述，不能只剩一个「已处理」。其他 kind 的 answer 是人提交的原文，
+// 前端在帧里已经拿过，不回放。
 type questionView struct {
 	QuestionID string    `json:"questionId"`
 	RunID      RunID     `json:"runId"`
@@ -151,6 +175,7 @@ type questionView struct {
 	Args       string    `json:"args,omitempty"`
 	Status     string    `json:"status"`
 	Decision   string    `json:"decision,omitempty"`
+	Answer     string    `json:"answer,omitempty"`
 	CreatedAt  time.Time `json:"createdAt"`
 }
 
@@ -175,10 +200,14 @@ func (s *Server) listQuestions(c *gin.Context) {
 	}
 	views := make([]questionView, 0, len(rows))
 	for _, r := range rows {
-		views = append(views, questionView{
+		v := questionView{
 			QuestionID: r.ID, RunID: r.RunID, Kind: r.Kind, Question: r.Question,
 			Args: r.Args, Status: r.Status, Decision: r.Decision, CreatedAt: r.CreatedAt,
-		})
+		}
+		if r.Kind == questionKindInstall {
+			v.Answer = r.Answer
+		}
+		views = append(views, v)
 	}
 	writeEnvelope(c, http.StatusOK, codeOK, "", views)
 }
@@ -186,7 +215,14 @@ func (s *Server) listQuestions(c *gin.Context) {
 // answerQuestion（doc/47 §5.3）= POST /api/questions/:id/answer，
 // body {"answer":"…","decision":"approve|revise"}。
 // 空串是合法答案：plan 行「未编辑直接批准」就是 answer=""。decision 缺省 = approve
-// （老客户端与原契约不变）；问题行不接受 decision。权限跟 run 走：只有 run 的会话主人能答。
+// （老客户端与原契约不变）；问题行不接受 decision。
+//
+// 安装行（doc/52 D20/D24）是这里唯一的**有副作用**的回答：approve 不是「记一条答案」，
+// 而是人授权程序去落盘。所以：
+//   - 权限不是「会话主人」而是「租户 owner/admin」——安装授权是租户级的，任何管理员
+//     都能批自己看得见的 run 的提议；viewer 即便拥有这个会话也被 403 111203 拦住；
+//   - CAS 先赢，再装（一答终答是并发下的唯一买票口）；装的结果写回同一行的 answer，
+//     挂起中的工具读到的就是这段结果（`skill_install` 的 tool_result）。
 func (s *Server) answerQuestion(c *gin.Context) {
 	var req struct {
 		Answer   string `json:"answer"`
@@ -197,9 +233,9 @@ func (s *Server) answerQuestion(c *gin.Context) {
 		return
 	}
 	switch req.Decision {
-	case "", questionDecisionApprove, questionDecisionRevise:
+	case "", questionDecisionApprove, questionDecisionRevise, questionDecisionCancel:
 	default:
-		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "decision 只能是 approve / revise", nil)
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "decision 只能是 approve / revise / cancel", nil)
 		return
 	}
 	row, err := s.store.Question(c.Request.Context(), c.Param("id"))
@@ -211,19 +247,53 @@ func (s *Server) answerQuestion(c *gin.Context) {
 		internal(c, err)
 		return
 	}
-	if denyRunWrite(c, s.viewRun(c, row.RunID)) {
+	v := s.viewRun(c, row.RunID)
+	if row.Kind == questionKindInstall {
+		// 安装行：看得见 run 的租户管理员即可批（不是会话主人专属）。
+		if denyRunRead(c, v) {
+			return
+		}
+		if !v.P.SystemAdmin && roleRank(v.P.Role) < roleRank("admin") {
+			writeEnvelope(c, http.StatusForbidden, codeForbidden, "只有管理员能确认技能安装", nil)
+			return
+		}
+	} else if denyRunWrite(c, v) {
 		return
 	}
 	decision := req.Decision
-	if row.Kind == questionKindPlan {
+	switch row.Kind {
+	case questionKindPlan:
 		if decision == "" {
 			decision = questionDecisionApprove
 		}
-	} else if decision != "" {
-		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "只有方案审批能带 decision", nil)
-		return
+		if decision == questionDecisionCancel {
+			writeEnvelope(c, http.StatusBadRequest, codeBadInput, "方案审批不能取消，请用 revise 驳回", nil)
+			return
+		}
+	case questionKindInstall:
+		if decision == "" {
+			decision = questionDecisionApprove
+		}
+		if decision == questionDecisionRevise {
+			writeEnvelope(c, http.StatusBadRequest, codeBadInput, "安装确认只能装或不装（approve / cancel）", nil)
+			return
+		}
+	default:
+		if decision != "" {
+			writeEnvelope(c, http.StatusBadRequest, codeBadInput, "只有方案审批能带 decision", nil)
+			return
+		}
 	}
-	err = s.store.AnswerQuestion(c.Request.Context(), row.ID, req.Answer, decision)
+	answer := req.Answer
+	if row.Kind == questionKindInstall {
+		// approve 先留空串：装的结果由程序稍后写回（写回前空串 = 「正在装」）。
+		// cancel 直接写结果文案——它没有副作用要等。
+		answer = ""
+		if decision == questionDecisionCancel {
+			answer = skillInstallCanceledText
+		}
+	}
+	err = s.store.AnswerQuestion(c.Request.Context(), row.ID, answer, decision)
 	switch {
 	case errors.Is(err, ErrQuestionNotFound):
 		writeEnvelope(c, http.StatusNotFound, codeQuestionMissing, "找不到这个提问", nil)
@@ -232,8 +302,36 @@ func (s *Server) answerQuestion(c *gin.Context) {
 	case err != nil:
 		internal(c, err)
 	default:
-		writeEnvelope(c, http.StatusOK, codeOK, "", gin.H{"questionId": row.ID, "status": questionStatusAnswered})
+		data := gin.H{"questionId": row.ID, "status": questionStatusAnswered}
+		if row.Kind == questionKindInstall {
+			// 安装行的结果是**程序**写回 answer 的那句（已安装／已过期／冲突…）。装配成功
+			// 也带上它：CAS 赢下之后执行是同步的，这次响应就是最早能说「装成了什么」的地方——
+			// 不带它，卡片只能把「点过了」演成「装好了」。
+			data["answer"] = s.settleInstallAnswer(c.Request.Context(), row, decision)
+		}
+		writeEnvelope(c, http.StatusOK, codeOK, "", data)
 	}
+}
+
+// settleInstallAnswer 在 CAS 赢下安装行之后执行「人批准的那件事」，返回写回 answer 的那句话：
+//   - cancel：删掉暂存目录，提议作废；
+//   - approve：按行里的提议落盘（锁 → rename → 写行 → skills_changed），结果写进 answer。
+//
+// 为什么副作用在**端点**而不在工具里：工具可能已经随进程死掉。CAS 是唯一消费点，
+// 授权动作与执行动作绑在同一次「赢」上——输掉的那次一个字节都碰不到。
+// 崩在 CAS 与写回之间：answer 留空串，续跑对账（reconcileResumeWaits）会把它翻成
+// 「结果未知」，不会二次安装（宁可让人重发，不可暗中装两次）。
+func (s *Server) settleInstallAnswer(ctx context.Context, row RunQuestion, decision string) string {
+	ctx = withScope(ctx, dataScope{TenantID: row.TenantID, UserID: "", Scope: "tenant"})
+	if decision == questionDecisionCancel {
+		discardInstallProposal(s.store, s.mediaRoot, row.TenantID, row.Args)
+		return skillInstallCanceledText
+	}
+	text := s.installApprovedProposal(ctx, row)
+	if err := s.store.SetQuestionAnswer(ctx, row.ID, text); err != nil {
+		log.Printf("install answer %s: %v", row.ID, err)
+	}
+	return text
 }
 
 // devQuestionCheck（-dev only，只读诊断口）= Q1 的 seed-question 脚手架转正后的形态

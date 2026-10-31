@@ -5,6 +5,11 @@ const props = defineProps<{
   title: string
   body: string
   confirmText?: string
+  // 确认动作的语义色：删除用 danger，覆盖/替换这类不是坏事的动作用 primary
+  // （红色「替换」会让人以为要丢东西，实际旧版本进了 .trash）。
+  tone?: 'danger' | 'primary'
+  // 忙时的按钮文案；不传沿用删除场景的「正在删除…」。
+  busyText?: string
   busy?: boolean
   error?: string
 }>()
@@ -51,8 +56,8 @@ function onOverlay() {
           <button ref="cancelEl" type="button" class="cancel" :disabled="busy" @click="emit('cancel')">
             取消
           </button>
-          <button type="button" class="danger" :disabled="busy" @click="emit('confirm')">
-            {{ busy ? '正在删除…' : (confirmText || '删除') }}
+          <button type="button" :class="tone || 'danger'" :disabled="busy" @click="emit('confirm')">
+            {{ busy ? (busyText || '正在删除…') : (confirmText || '删除') }}
           </button>
         </div>
       </div>
@@ -137,6 +142,17 @@ button {
 .danger:hover:not(:disabled) {
   border-color: #b42318;
   background: #b42318;
+}
+
+.primary {
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+.primary:hover:not(:disabled) {
+  border-color: var(--accent-ink);
+  background: var(--accent-ink);
 }
 
 button:disabled {

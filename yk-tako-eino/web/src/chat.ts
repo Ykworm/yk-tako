@@ -24,6 +24,8 @@ import {
   type QuestionDecision,
   type QuestionRow,
   type Row,
+  type SkillPreviewEntry,
+  type SkillPreviewSource,
   type RunID,
   type SessionID,
   type Usage,
@@ -52,18 +54,56 @@ export type Bubble = {
   // 都落在这里。驳回后模型重交方案会产生新 id，所以是数组而不是单字段。
   // 面板的草稿/选中态是纯视图状态，留在 App.vue，不污染对话数据。
   questions?: AskQuestion[]
+  // tools 是本轮技能工具卡（doc/52 C5）：只收 read_skill / use_skill / read_skill_file。
+  // 别的工具（bash、read_file…）不进气泡——它们的账本行留在库里给模型用，页面不演终端。
+  tools?: ToolCard[]
 }
+
+// 一张技能工具卡。callId 是配对键（帧与 runlog 行同一个 toolCallId）；
+// output 是工具回执原文——模型看到的就是它（D33 之后是 marker，不是重新读盘）。
+export type ToolCard = { callId: string; name: string; args: string; output?: string }
 
 export type AskQuestion = {
   id: string
-  kind: 'question' | 'plan'
+  kind: 'question' | 'plan' | 'install'
   text: string
   options: string[]
   status: 'pending' | 'answered' | 'stale'
   // 方案行：approve = 批准（submitted 非空 = 人改写过全文）；revise = 驳回要求修改。
-  decision?: 'approve' | 'revise'
+  // 安装行：approve = 装；cancel 的结果（「用户取消了安装。」）由答案端点直接写进 submitted。
+  decision?: 'approve' | 'revise' | 'cancel'
   submitted?: string
+  // 安装提议（doc/52 C3/D24）：**只从 args 解析**，不从模型正文里找按钮或链接。
+  // 来源、候选全表、选中集都是程序解析出来的事实，卡片照它渲染。
+  install?: InstallProposal
   error?: string
+}
+
+export type InstallProposal = {
+  source: SkillPreviewSource
+  skills: string[]
+  candidates: SkillPreviewEntry[]
+  warnings: string[]
+}
+
+// installProposal 解 kind=install 行（或帧）的 args。坏 JSON / 少了 source 就当没有提议——
+// 卡片退化成「这条安装确认读不出来」，不给按钮（点不到的安装授权总比误装好）。
+function installProposal(args?: string): InstallProposal | undefined {
+  if (!args) return undefined
+  try {
+    const parsed = JSON.parse(args) as Partial<InstallProposal>
+    if (!parsed || typeof parsed !== 'object' || !parsed.source || !Array.isArray(parsed.candidates)) {
+      return undefined
+    }
+    return {
+      source: parsed.source,
+      skills: Array.isArray(parsed.skills) ? parsed.skills.filter((x): x is string => typeof x === 'string') : [],
+      candidates: parsed.candidates,
+      warnings: Array.isArray(parsed.warnings) ? parsed.warnings.filter((x): x is string => typeof x === 'string') : [],
+    }
+  } catch {
+    return undefined
+  }
 }
 
 // 附件（composer 选用）：name 供 chip 显示，img 随 postRuns 上行。
@@ -145,16 +185,19 @@ function frameOptions(args?: string): string[] {
 }
 
 function questionFromFrame(f: Frame): AskQuestion {
+  const install = f.name === 'skill_install' ? installProposal(f.args) : undefined
   return {
     id: f.messageId ?? '',
-    kind: f.name === 'submit_plan' ? 'plan' : 'question',
+    kind: f.name === 'submit_plan' ? 'plan' : f.name === 'skill_install' ? 'install' : 'question',
     text: f.text ?? '',
     options: frameOptions(f.args),
     status: 'pending',
+    ...(install ? { install } : {}),
   }
 }
 
 function questionFromRow(row: QuestionRow): AskQuestion {
+  const install = row.kind === 'install' ? installProposal(row.args) : undefined
   return {
     id: row.questionId,
     kind: row.kind,
@@ -162,6 +205,8 @@ function questionFromRow(row: QuestionRow): AskQuestion {
     options: frameOptions(row.args),
     status: row.status,
     decision: row.decision,
+    ...(row.answer ? { submitted: row.answer } : {}),
+    ...(install ? { install } : {}),
   }
 }
 
@@ -191,6 +236,55 @@ function upsertQuestion(b: Bubble, q: AskQuestion) {
   list[i] = { ...list[i], ...q }
 }
 
+// 技能工具名：卡片只认这三个（doc/52 C5）。skill_install 不在里面——它是等人卡，不是工具卡。
+const SKILL_TOOL_NAMES = new Set(['read_skill', 'use_skill', 'read_skill_file'])
+
+// toolFrameEvent 把一帧工具事件翻成卡片的增量；不是技能工具就返回 null（不进气泡）。
+function toolFrameEvent(f: Frame): { callId: string; name: string; args?: string; output?: string } | null {
+  if (f.kind !== 'tool_call' && f.kind !== 'tool_result') return null
+  if (!f.toolCallId || !f.name || !SKILL_TOOL_NAMES.has(f.name)) return null
+  return {
+    callId: f.toolCallId,
+    name: f.name,
+    args: f.kind === 'tool_call' ? (f.args ?? '') : undefined,
+    output: f.kind === 'tool_result' ? (f.output ?? '') : undefined,
+  }
+}
+
+// toolRowEvent 是同一条事件的 runlog 形态（刷新/翻页时用）：payload 是结构化 JSON，
+// text 是给人看的 `name(args)` 或结果原文——payload 缺了就退回 text。
+function toolRowEvent(r: Row): { callId: string; name: string; args?: string; output?: string } | null {
+  if (r.role !== 'tool_call' && r.role !== 'tool_result') return null
+  let p: { name?: string; args?: string; output?: string; toolCallId?: string } = {}
+  try {
+    p = r.payload ? (JSON.parse(r.payload) as typeof p) : {}
+  } catch {
+    return null
+  }
+  if (!p.name || !p.toolCallId || !SKILL_TOOL_NAMES.has(p.name)) return null
+  return {
+    callId: p.toolCallId,
+    name: p.name,
+    args: r.role === 'tool_call' ? (p.args ?? r.text) : undefined,
+    output: r.role === 'tool_result' ? (p.output ?? r.text) : undefined,
+  }
+}
+
+// mergeTool 把一次 call/result 叠到气泡的工具列表上（按 callId 配对；顺序按首次出现）。
+function mergeTool(b: Bubble, ev: { callId: string; name: string; args?: string; output?: string }) {
+  if (!b.tools) {
+    b.tools = []
+  }
+  const list = b.tools
+  const hit = list.find((x) => x.callId === ev.callId)
+  if (!hit) {
+    list.push({ callId: ev.callId, name: ev.name, args: ev.args ?? '', ...(ev.output !== undefined ? { output: ev.output } : {}) })
+    return
+  }
+  if (ev.args && !hit.args) hit.args = ev.args
+  if (ev.output !== undefined) hit.output = ev.output
+}
+
 export function useChat() {
   const sessionId = ref<SessionID | null>(null)
   const bubbles = ref<Bubble[]>([])
@@ -198,6 +292,9 @@ export function useChat() {
   const attachments = ref<Attachment[]>([])
   const busy = ref(false)
   const pending = ref<Pending[]>([])
+  // 工具行可能先于气泡到达（翻页时 tool_call 行排在它那场的 assistant 行之前）：
+  // 按 runId 排队的卡片事件，等那场的气泡出现再合并。
+  const pendingTools = new Map<RunID, { callId: string; name: string; args?: string; output?: string }[]>()
   const loadingOlder = ref(false)
   const atStart = ref(true)
   // 新对话落点（doc/44 §2.2）：null = 让服务端挂默认项目。
@@ -348,6 +445,7 @@ export function useChat() {
       if (token !== pollToken) return
       sessionId.value = resp.sessionId
       assistant.runId = resp.runId
+      flushPendingTools(assistant)
       await pollFrames(resp.runId, assistant, 0, token)
     } catch (e) {
       if (token !== pollToken) return
@@ -403,9 +501,13 @@ export function useChat() {
       if (token !== pollToken) return
       for (const row of rows) questionRows.set(row.questionId, row)
       for (const row of rows) {
-        // answered 行不补建记录：list 不返回答案，画出来只有半截；本 tab 亲历的
-        // 记录已在 upsertQuestion 里留住。
-        if (row.status === 'pending') upsertQuestion(assistant, questionFromRow(row))
+        // answered 的问题/方案行不补建记录：list 不带答案，画出来只有半截；本 tab 亲历
+        // 的记录已在 upsertQuestion 里留住。
+        // 安装行例外（doc/52 C5）：它的结论就是程序写回的 answer 文本，list 会带，
+        // 刷新后卡片能完整复述「已安装/失败原因」，不留一个空壳。
+        if (row.status === 'pending' || (row.kind === 'install' && row.answer)) {
+          upsertQuestion(assistant, questionFromRow(row))
+        }
       }
     } catch {
       // 列表拉不到不挡帧面：question 帧自己带全文与 args。
@@ -448,6 +550,11 @@ export function useChat() {
           // 行已 answered 的旧帧不再立卡（刷新场景）；pending / 无行（列表没拉到）才立。
           const row = f.messageId ? questionRows.get(f.messageId) : undefined
           if (!row || row.status === 'pending') upsertQuestion(assistant, questionFromFrame(f))
+        }
+        // 技能工具帧（doc/52 C5）：call 与 result 按 toolCallId 配成一张卡；子代理的跳过。
+        if (!f.agent) {
+          const tev = toolFrameEvent(f)
+          if (tev) mergeTool(assistant, tev)
         }
         if (f.kind === 'terminal') terminalStatus = f.status ?? 'complete'
       }
@@ -520,14 +627,16 @@ export function useChat() {
   async function answerQuestion(
     q: AskQuestion,
     answer: string,
-    decision?: QuestionDecision,
+    decision?: QuestionDecision | 'cancel',
   ): Promise<boolean> {
     if (q.status !== 'pending') return false
     q.error = ''
     try {
-      await postAnswer(q.id, answer, decision)
+      const res = await postAnswer(q.id, answer, decision)
       q.status = 'answered'
-      q.submitted = answer
+      // 安装行的结果由程序在 CAS 之后写回 answer（doc/52 C3），res.answer 就是那句话；
+      // 问题/方案行没有这个键，submitted 仍是人提交的原文。
+      q.submitted = res.answer ?? answer
       q.decision = decision
       return true
     } catch (e) {
@@ -667,6 +776,7 @@ export function useChat() {
     busy.value = false
     loadingOlder.value = false
     renderedMessageIds.clear()
+    pendingTools.clear()
     runlogOffset = 0
     oldestOffset = 0
     atStart.value = true
@@ -752,6 +862,31 @@ export function useChat() {
     }
   }
 
+  // attachToolRow 把一条技能工具账本行叠到它那场的 assistant 气泡上（按 runId 找）。
+  // 气泡还没出现就排队（翻页/首次渲染的顺序里 tool 行在前）。
+  function attachToolRow(r: Row) {
+    const ev = toolRowEvent(r)
+    if (!ev) return
+    for (let i = bubbles.value.length - 1; i >= 0; i--) {
+      const b = bubbles.value[i]
+      if (b.role === 'assistant' && b.runId === r.runId) {
+        mergeTool(b, ev)
+        return
+      }
+    }
+    const q = pendingTools.get(r.runId)
+    if (q) q.push(ev)
+    else pendingTools.set(r.runId, [ev])
+  }
+
+  function flushPendingTools(b: Bubble) {
+    if (b.role !== 'assistant' || !b.runId) return
+    const q = pendingTools.get(b.runId)
+    if (!q) return
+    pendingTools.delete(b.runId)
+    for (const ev of q) mergeTool(b, ev)
+  }
+
   // 一条 log 行 → 气泡，并记账「最老已渲染 offset」（loadOlder 的翻页基准）。
   // 占位行在这里解析成媒体引用、从正文剥掉（doc/32 A5）。
   // runlog 同时是工具执行账本（tool_call / tool_result），气泡只收对话两角色——
@@ -765,7 +900,7 @@ export function useChat() {
   function rowBubble(r: ChatRow): Bubble {
     noteRendered(r)
     const { media, display } = parseMedia(r.text)
-    return {
+    const b: Bubble = {
       key: `log:${r.runlogOffset}`,
       runId: r.runId,
       role: r.role,
@@ -774,6 +909,8 @@ export function useChat() {
       state: 'done',
       usage: r.usage,
     }
+    flushPendingTools(b)
+    return b
   }
 
   // 收口时认出自己的 user 行，按服务端真源回填乐观气泡的媒体与正文。
@@ -797,7 +934,10 @@ export function useChat() {
   // （收口检测与拉 log 之间别人的投递，竞态窗口）紧跟本轮气泡之后、排队气泡之前。
   function renderForeign(rows: Row[], assistant: Bubble, ownUserOffset: number) {
     for (const r of rows) {
-      if (!isChatRow(r)) continue
+      if (!isChatRow(r)) {
+        attachToolRow(r)
+        continue
+      }
       const idx = bubbles.value.indexOf(assistant)
       if (idx < 0) return // 列表已被 newSession 清空，整批作废
       const before = ownUserOffset > 0 && (r.runlogOffset ?? 0) < ownUserOffset
@@ -806,7 +946,10 @@ export function useChat() {
   }
 
   function appendRows(rows: Row[]) {
-    for (const r of rows) if (isChatRow(r)) push(rowBubble(r))
+    for (const r of rows) {
+      if (isChatRow(r)) push(rowBubble(r))
+      else attachToolRow(r)
+    }
   }
 
   // 翻页：临时游标只用于这一次请求，拉完 prepend，**不回退对齐游标**（19v6-02「两种游标别混」）。
@@ -821,17 +964,26 @@ export function useChat() {
       let upper = oldestOffset
       let floor = Math.max(0, upper - 1 - PAGE)
       const collected: ChatRow[] = []
+      // 技能工具账本行也收：它们属于这一页里某场的 assistant 气泡（C5 的技能工具卡）。
+      // 它们不计入「这一页有没有对话行」的判断——账本行不能把翻页卡住。
+      const collectedTools: Row[] = []
       for (;;) {
         const windowRows: ChatRow[] = []
+        const windowTools: Row[] = []
         for (let from = floor; ; ) {
           const resp = await getLog(sid, from)
-          windowRows.push(...resp.rows.filter((r): r is ChatRow => isChatRow(r) && (r.runlogOffset ?? 0) < upper))
+          for (const r of resp.rows) {
+            if ((r.runlogOffset ?? 0) >= upper) continue
+            if (isChatRow(r)) windowRows.push(r)
+            else if (r.role === 'tool_call' || r.role === 'tool_result') windowTools.push(r)
+          }
           const advanced = resp.nextOffset > from
           from = resp.nextOffset
           if (!advanced || from >= upper) break
         }
         // 窗口是从新到旧依次处理的：更早的一窗要放在已收集的前面。
         collected.unshift(...windowRows)
+        collectedTools.unshift(...windowTools)
         if (collected.length || floor === 0) break
         upper = floor
         floor = Math.max(0, upper - 1 - PAGE)
@@ -851,6 +1003,7 @@ export function useChat() {
             }
           }),
         )
+        for (const r of collectedTools) attachToolRow(r)
         oldestOffset = collected[0].runlogOffset ?? oldestOffset
       }
       atStart.value = oldestOffset <= 1
@@ -868,6 +1021,7 @@ export function useChat() {
     attachments.value = []
     busy.value = false
     renderedMessageIds.clear()
+    pendingTools.clear()
     sessionGone.value = ''
   }
 

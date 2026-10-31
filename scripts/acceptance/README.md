@@ -17,6 +17,7 @@
 | `sse_reconnect.sh` | **SSE 重连自愈**的活体验收（doc/46 §7.5）：对着一个 access token 只有 20 秒的隔离引擎，让页面静静不动直到 token 过期，再重启引擎制造断线 → 断线后 401 次数有界、事件流恢复。**自带引擎与 vite，不用手工准备**；未修复时判红退出 | — |
 | `check-expected.sh` | 守「19v6-04 散文」与「`expected.json`」的用例号集合一致 | — |
 | `harness.py` | 三个脚本共用的底座：HTTP 调用、.env 取密钥、psql 补丁、断言计数 | — |
+| `mcp_fetch_server.py` | doc/52 B3 的活体验收夹具：最小的 stdio MCP server（JSON-RPC 2.0，工具 `fetch_probe(url)`），在租户 MCP 的围栏里 `curl` 一个 URL 并回报 HTTP 码——用来打「租户 MCP 与 bash 同一条 profile、出站开、入站关」。配进租户 `mcp.json` 后由模型经 `tool_search` 激活再调用 | 要 |
 
 ## 怎么起一个隔离引擎（靶子）
 

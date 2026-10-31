@@ -466,19 +466,37 @@ func foldInput(ctx context.Context, system string, history []ModelMessage, curre
 	// 摘要末尾；三档检查见函数头）→ 定案 t（summary/assembled/staged，组装行与落库摘要同源）。
 	// 返回 errStillOver = 块收口失败（第 3 档），调用方按既有折叠失败链出口。
 	converge := func(t *foldTrial, drop []runRows, assembled []ModelMessage, summary string) error {
-		ops := mergeFileOps(inheritFileOps(oldSummaryTexts), extractFileOps(dropMessages(drop), fileEffects))
-		res := resolveOps(ops)
-		if block := renderFileOpsBlock(res); block != "" {
-			assembled[0].Text = summary + fileOpsBlockSep + block
+		msgs := dropMessages(drop)
+		res := resolveOps(mergeFileOps(inheritFileOps(oldSummaryTexts), extractFileOps(msgs, fileEffects)))
+		// 技能记录块（B8，doc/52 D31）：与 fileOps 块并排钉在摘要末尾，同一套继承与三档收口。
+		// 它记的是「这场用过/看过哪个技能」，不写看板任务号（任务号归看板回答，compact 不碰 DB）。
+		skillRes := resolveSkillOps(mergeSkillOps(inheritSkillOps(oldSummaryTexts), extractSkillOps(msgs)))
+		block := renderFileOpsBlock(res)
+		skillBlock := renderSkillOpsBlock(skillRes)
+		if block != "" || skillBlock != "" {
+			pin := func(fileBlock, skillBlock string) string {
+				out := summary
+				if fileBlock != "" {
+					out += fileOpsBlockSep + fileBlock
+				}
+				if skillBlock != "" {
+					out += fileOpsBlockSep + skillBlock
+				}
+				return out
+			}
+			full := pin(block, skillBlock)
+			assembled[0].Text = full
 			if countInput(counter, system, assembled) >= limit { // 第 1 档：全量钉不过收口
 				// 第 2 档减灾：两张表各砍 50（公平对待、无优先级），重渲染再验
 				cappedRes := resolvedOps{changed: capOps(res.changed), read: capOps(res.read)}
-				capped := renderFileOpsBlock(cappedRes)
-				assembled[0].Text = summary + fileOpsBlockSep + capped
+				cappedSkill := resolvedSkillOps{used: capSkillOps(skillRes.used), read: capSkillOps(skillRes.read)}
+				capped := pin(renderFileOpsBlock(cappedRes), renderSkillOpsBlock(cappedSkill))
+				assembled[0].Text = capped
 				if over := countInput(counter, system, assembled); over >= limit {
 					// 第 3 档：仍超 = fold 失败走干净 A（errStillOver 哨兵，C2 已有链）
-					return fmt.Errorf("%w（fileOps 块：全量 %d tok、砍 50 后 %d tok；发送合计 %d tok ≥ limit %d）",
-						errStillOver, counter.Count(block), counter.Count(capped), over, limit)
+					return fmt.Errorf("%w（fileOps/skillOps 块：全量 %d tok、砍 50 后 %d tok；发送合计 %d tok ≥ limit %d）",
+						errStillOver, counter.Count(block)+counter.Count(skillBlock),
+						counter.Count(renderFileOpsBlock(cappedRes))+counter.Count(renderSkillOpsBlock(cappedSkill)), over, limit)
 				}
 			}
 			summary = assembled[0].Text
@@ -636,18 +654,34 @@ func trimTrial(counter TokenCounter, window int, candidate []ModelMessage, syste
 // mh 原文行 / 容器 base）永不被 trim 改写，「库=模型所见」的差额只体现为候选与折后 state。
 // 返回（裁剪后候选，还原 r 条，夹 p 条，是否动手）：未动手（无工具行 / 未超预算）= 原候选原样。
 func trimCandidate(counter TokenCounter, window int, candidate []ModelMessage) ([]ModelMessage, int, int, bool) {
-	var idx []int
+	var idx, skillIdx []int
 	total := 0
 	for i := range candidate {
-		if candidate[i].Role == "tool" {
-			idx = append(idx, i)
-			total += countInput(counter, "", candidate[i:i+1])
+		if candidate[i].Role != "tool" {
+			continue
 		}
+		// 技能正文块不进预算、不进还原队列（doc/52 D30/B8）：它的去留由 D33 的 marker 决定，
+		// 在这里被夹成「头 1/4 + 尾 3/4」是静默的——模型看不出被切过、不会想到重读。
+		// 它也不该挤掉这场 run 里其它工具结果的还原额度：一份正文满额时，按预算算别人全变 marker。
+		// 真到动手时按 D30 做**整块替换**（下文），fold 与 trim 两条路看到同一种形态。
+		if isSkillBodyText(candidate[i].Text) {
+			skillIdx = append(skillIdx, i)
+			continue
+		}
+		idx = append(idx, i)
+		total += countInput(counter, "", candidate[i:i+1])
 	}
 	if len(idx) == 0 || total <= toolTrimBudget(window) {
 		return candidate, 0, 0, false
 	}
 	out := append([]ModelMessage(nil), candidate...)
+	// 技能块：整块换 marker，不参与下面的还原队列、不记账——它换完只剩几十 token，
+	// 把它算进预算只会白挤掉别人的还原额度。
+	for _, i := range skillIdx {
+		if marker, ok := skillSlimMarker(candidate[i].Text); ok {
+			out[i].Text = marker
+		}
+	}
 	baseCost := make(map[int]int, len(idx))
 	remaining := toolTrimBudget(window)
 	for _, i := range idx {
@@ -780,7 +814,15 @@ func renderFoldRow(b *strings.Builder, m ModelMessage, names map[string]string) 
 		b.WriteString("[Tool result ")
 		b.WriteString(name)
 		b.WriteString("]: ")
-		b.WriteString(truncateRunes(m.Text, foldToolResultMaxRunes))
+		text := truncateRunes(m.Text, foldToolResultMaxRunes)
+		// 技能正文被折时整块换 marker（doc/52 D30/B7）：截成 2000 runes 的正文进摘要，
+		// 比一条明写「已折叠、要细节重读」的 marker 更误导——模型会拿着半截步骤当真。
+		if name == "read_skill" || name == "use_skill" {
+			if marker, ok := skillSlimMarker(m.Text); ok {
+				text = marker
+			}
+		}
+		b.WriteString(text)
 		b.WriteString("\n")
 	default: // user（system 不进 mh 表；未知角色按 User 形态兜底不丢内容）
 		b.WriteString("[User]: ")

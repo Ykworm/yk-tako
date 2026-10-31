@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useChat, type AskQuestion, type Bubble } from './chat'
+import { useChat, type AskQuestion, type Bubble, type ToolCard } from './chat'
 import {
   ApiError,
   getSessionSubagents,
@@ -11,6 +11,7 @@ import {
   type MediaRef,
   type RunID,
   type SessionListItem,
+  type SkillPreviewSource,
   type SubagentItem,
   type Usage,
   type Workspace,
@@ -21,14 +22,23 @@ import InviteLanding from './InviteLanding.vue'
 import PlanDoc from './PlanDoc.vue'
 import PendingInvites from './PendingInvites.vue'
 import ProjectsView from './ProjectsView.vue'
+import SkillInstallCard from './SkillInstallCard.vue'
+import SkillsView from './SkillsView.vue'
+import ToolsView from './ToolsView.vue'
 import { authExpired, authFetch, authState, clearAuth, loginWithPassword, switchTenant, tenantState } from './auth'
 import { onMutation, ensureEventStream, closeEventStream } from './mutation'
 
-type Page = 'chat' | 'projects' | 'agents' | 'team'
+type Page = 'chat' | 'projects' | 'skills' | 'tools' | 'agents' | 'team'
 
 function readPage(): Page {
   const saved = sessionStorage.getItem('tako.page')
-  return saved === 'projects' || saved === 'agents' || saved === 'team' ? saved : 'chat'
+  return saved === 'projects' ||
+    saved === 'skills' ||
+    saved === 'tools' ||
+    saved === 'agents' ||
+    saved === 'team'
+    ? saved
+    : 'chat'
 }
 
 function tokenFromLocation(): string {
@@ -144,6 +154,8 @@ async function submitAsk() {
   const target = ask.value
   if (!target || askBusy.value) return
   const q = target.q
+  // 安装确认卡只有两个按钮，没有输入框可提交——按键路径也别把它当问题处理。
+  if (q.kind === 'install') return
   askBusy.value = true
   try {
     if (q.kind === 'plan') {
@@ -161,6 +173,43 @@ async function submitAsk() {
     const answer = askPick.value >= 0 ? q.options[askPick.value] ?? '' : askDraft.value.trim()
     if (!answer) return
     await answerQuestion(q, answer)
+  } finally {
+    askBusy.value = false
+  }
+}
+
+// 安装确认的点击权与技能页同一把尺：租户 owner/admin（端点也再核一次，403 111203）。
+const canApproveSkills = computed(() => {
+  const role = tenantState.value.role
+  return role === 'owner' || role === 'admin'
+})
+
+// 「此来源在本会话中未出现」是前端对**用户气泡文本**的核对：提议只存在模型侧的 args 里，
+// 没有服务端字段记录「用户原话里提过它」——用户说过 owner/repo 或链接就算出现过。
+// 没提过的来源正是提示注入最可能的样子（从 PDF/网页里读来一条安装串），所以卡片要顶一行提醒。
+function sourceSeenInSession(source?: SkillPreviewSource): boolean {
+  if (!source) return false
+  const needles = [
+    source.owner && source.repo ? `${source.owner}/${source.repo}` : '',
+    source.namespace && source.repo ? `${source.namespace}/${source.repo}` : '',
+    source.url,
+  ]
+    .filter((s) => s && !s.startsWith('multipart:'))
+    .map((s) => s.toLowerCase())
+  if (!needles.length) return false
+  return bubbles.value.some(
+    (b) => b.role === 'user' && needles.some((n) => b.text.toLowerCase().includes(n)),
+  )
+}
+
+// 安装卡的两个按钮：同一个 answer 端点，decision=approve/cancel。
+// 结果由端点在 CAS 后写回 answer 列/card（res.answer），不需要再拉一次列表。
+async function answerInstall(decision: 'approve' | 'cancel') {
+  const target = ask.value
+  if (!target || askBusy.value || !canApproveSkills.value) return
+  askBusy.value = true
+  try {
+    await answerQuestion(target.q, '', decision)
   } finally {
     askBusy.value = false
   }
@@ -193,10 +242,63 @@ function onAskTextKeydown(ev: KeyboardEvent) {
   void submitAsk()
 }
 
+// —— 技能工具卡（doc/52 C5）——
+// 卡片只认 read_skill / use_skill / read_skill_file（chat.ts 的 SKILL_TOOL_NAMES 已筛过）。
+// 措辞按工具名分（§2.3：读与用靠工具名区分，不靠返回内容），read_skill_file 单独一行。
+function toolArgsOf(t: ToolCard): { name?: string; path?: string } {
+  try {
+    const parsed = JSON.parse(t.args) as { name?: string; path?: string }
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function toolCardLabel(t: ToolCard): string {
+  const a = toolArgsOf(t)
+  const name = a.name || '（未知技能）'
+  if (t.name === 'use_skill') return `使用技能：${name}`
+  if (t.name === 'read_skill_file') return `查看技能文件：${name}${a.path ? ` / ${a.path}` : ''}`
+  return `查看技能：${name}`
+}
+
+// 失败回执是 JSON 信封（116001/116107/116114/116115/116116）；成功回执以 <skill 开头。
+// 卡片把 message 摆出来，code 不进正文——人只需要知道「为什么没读到」。
+function toolCardFail(t: ToolCard): string {
+  if (!t.output || t.output.startsWith('<skill')) return ''
+  try {
+    const parsed = JSON.parse(t.output) as { code?: unknown; message?: unknown }
+    if (typeof parsed.code === 'number' && parsed.code !== 0) {
+      return typeof parsed.message === 'string' && parsed.message
+        ? parsed.message
+        : `技能工具失败（${parsed.code}）`
+    }
+    return ''
+  } catch {
+    // 不是信封也不是 <skill：多半是工具层错误文本，按失败展示原文。
+    return t.output
+  }
+}
+
+function toolCardState(t: ToolCard, bubbleState: string): 'running' | 'failed' | 'done' {
+  if (toolCardFail(t)) return 'failed'
+  if (t.output === undefined) {
+    return bubbleState === 'streaming' || bubbleState === 'offline' ? 'running' : 'done'
+  }
+  return 'done'
+}
+
 function askStatusLabel(q: AskQuestion): string {
   if (q.status === 'stale') return '已失效'
-  if (q.status === 'pending') return q.kind === 'plan' ? '待批准' : '待回答'
+  if (q.status === 'pending') {
+    if (q.kind === 'plan') return '待批准'
+    if (q.kind === 'install') return '待确认'
+    return '待回答'
+  }
   if (q.kind === 'plan') return q.decision === 'revise' ? '已驳回' : '已批准'
+  // 安装行的结果文本由程序写（可能成功也可能过期/失败），标签只能说「已处理」；
+  // 取消是例外——decision 就是人的那个动作。
+  if (q.kind === 'install') return q.decision === 'cancel' ? '已取消' : '已处理'
   return '已回答'
 }
 
@@ -493,6 +595,13 @@ async function closeDrawer(returnFocus = true) {
 function goPage(next: Page) {
   page.value = next
   void closeDrawer(false)
+}
+
+// 技能详情里「上传工具」跳到工具区时预填命令名（doc/52 F3）。
+const toolsPrefill = ref('')
+function openToolsFor(name: string) {
+  toolsPrefill.value = name
+  goPage('tools')
 }
 
 async function toggleMenu() {
@@ -1221,6 +1330,14 @@ async function onScroll() {
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="5.2" r="2.2" /><path d="M3.4 13.2c.7-2.2 2.4-3.2 4.6-3.2s3.9 1 4.6 3.2" stroke-linecap="round" /></svg>
           助手
         </button>
+        <button type="button" :class="{ on: page === 'skills' }" :aria-current="page === 'skills' ? 'page' : undefined" @click="goPage('skills')">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M8 2.2l1.5 3.3 3.6.4-2.7 2.4.8 3.5L8 10l-3.2 1.8.8-3.5L2.9 5.9l3.6-.4z" stroke-linejoin="round" /></svg>
+          技能
+        </button>
+        <button type="button" :class="{ on: page === 'tools' }" :aria-current="page === 'tools' ? 'page' : undefined" @click="goPage('tools')">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M10.2 2.6a3.4 3.4 0 0 0-4.3 4.3L3 9.8l3.2 3.2 2.9-2.9a3.4 3.4 0 0 0 4.3-4.3l-2 2-1.6-.4-.4-1.6z" stroke-linejoin="round" /></svg>
+          工具
+        </button>
         <button type="button" :class="{ on: page === 'team' }" :aria-current="page === 'team' ? 'page' : undefined" @click="goPage('team')">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="2.5" y="2.5" width="11" height="11" rx="2" /><path d="M5 8h6M8 5v6" stroke-linecap="round" /></svg>
           团队
@@ -1374,6 +1491,8 @@ async function onScroll() {
 
       <template v-else>
         <Configure v-if="page === 'agents' || page === 'team'" :key="tenant.id" :page="configPage" />
+        <SkillsView v-else-if="page === 'skills'" :key="tenant.id" @upload-tool="openToolsFor" />
+        <ToolsView v-else-if="page === 'tools'" :key="tenant.id" :prefill-name="toolsPrefill" />
         <ProjectsView
           v-else-if="page === 'projects'"
           :key="tenant.id"
@@ -1485,6 +1604,27 @@ async function onScroll() {
                     @click="resumeRun(b)"
                   >继续这一轮</button>
                   <p v-if="b.state === 'error'" class="note">失败，没有写进历史</p>
+                  <!-- 技能工具卡（doc/52 C5）：模型读了什么，人看到同一份回执。
+                       展开出来的是当时进模型的原文（含 D33 的 <skill> 包裹标记），不重新读盘；
+                       失败把回执里的 message 直接摆出来，不用再展开找。 -->
+                  <div v-if="b.role === 'assistant' && b.tools?.length" class="tool-cards">
+                    <details
+                      v-for="t in b.tools"
+                      :key="t.callId"
+                      class="tool-card"
+                      :data-tool="t.name"
+                      :data-state="toolCardState(t, b.state)"
+                    >
+                      <summary>
+                        <span class="tool-name">{{ toolCardLabel(t) }}</span>
+                        <span v-if="toolCardState(t, b.state) === 'failed'" class="tool-chip fail">失败</span>
+                        <span v-else-if="toolCardState(t, b.state) === 'running'" class="tool-chip">执行中</span>
+                      </summary>
+                      <p v-if="toolCardFail(t)" class="tool-fail">{{ toolCardFail(t) }}</p>
+                      <pre v-if="t.output !== undefined" class="tool-out">{{ t.output }}</pre>
+                      <p v-else class="tool-wait">还没有回执。</p>
+                    </details>
+                  </div>
                 </div>
               </div>
               <!-- 用量与复制是这一轮的元信息，不是正文（doc/51 §6）：
@@ -1513,11 +1653,20 @@ async function onScroll() {
                   :class="['qa-card', q.kind, q.status]"
                 >
                   <header class="qa-head">
-                    <span class="qa-kind">{{ q.kind === 'plan' ? 'Plan' : '问题' }}</span>
+                    <span class="qa-kind">{{ q.kind === 'plan' ? 'Plan' : q.kind === 'install' ? '安装' : '问题' }}</span>
                     <span :class="['qa-chip', q.status, q.decision]">{{ askStatusLabel(q) }}</span>
                   </header>
                   <template v-if="q.kind === 'plan'">
                     <PlanDoc v-if="q.text" :text="q.text" />
+                  </template>
+                  <template v-else-if="q.kind === 'install'">
+                    <!-- 安装卡只从行 args 重建（D24）：刷新后仍能看清装的是什么、结果是什么。 -->
+                    <SkillInstallCard
+                      :q="q"
+                      :can-approve="canApproveSkills"
+                      :seen="sourceSeenInSession(q.install?.source)"
+                      :live="b.state === 'streaming' || b.state === 'offline'"
+                    />
                   </template>
                   <template v-else>
                     <p class="qa-question">{{ q.text }}</p>
@@ -1532,12 +1681,12 @@ async function onScroll() {
                       </li>
                     </ul>
                   </template>
-                  <p v-if="q.status === 'answered'" class="qa-answer">
+                  <p v-if="q.status === 'answered' && q.kind !== 'install'" class="qa-answer">
                     <template v-if="q.kind === 'plan' && q.decision === 'revise'">已退回修改{{ q.submitted ? `：${q.submitted}` : '' }}</template>
                     <template v-else-if="q.kind === 'plan'">已批准执行{{ q.submitted ? '（按你改写后的方案）' : '' }}</template>
                     <template v-else>你的回答：{{ q.submitted || '（空）' }}</template>
                   </p>
-                  <p v-else-if="q.status === 'stale'" class="qa-note">这条已经失效，引擎重启后没有恢复等待。</p>
+                  <p v-else-if="q.status === 'stale' && q.kind !== 'install'" class="qa-note">这条已经失效，引擎重启后没有恢复等待。</p>
                   <p v-if="q.error" class="qa-note error">{{ q.error }}</p>
                 </div>
               </div>
@@ -1579,7 +1728,7 @@ async function onScroll() {
             @keydown="onAskKeydown"
           >
             <header class="ask-dock-head">
-              <span class="ask-kicker">{{ ask.q.kind === 'plan' ? '方案审核' : '需要你确认' }}</span>
+              <span class="ask-kicker">{{ ask.q.kind === 'plan' ? '方案审核' : ask.q.kind === 'install' ? '安装确认' : '需要你确认' }}</span>
               <span :class="['qa-chip', ask.q.status, ask.q.decision]">{{ askStatusLabel(ask.q) }}</span>
               <div v-if="pendingAsks.length > 1" class="ask-nav">
                 <button type="button" :disabled="askIndex <= 0" aria-label="上一条" @click="moveAsk(-1)">‹</button>
@@ -1630,6 +1779,21 @@ async function onScroll() {
                   {{ askBusy ? '正在提交…' : '提交' }}
                 </button>
               </footer>
+            </template>
+
+            <!-- 安装确认（doc/52 D24）：程序卡片，只吃帧 args 的候选全表与选中集；
+                 模型正文里的任何「安装」按钮都不在这里出现。 -->
+            <template v-else-if="ask.q.kind === 'install'">
+              <SkillInstallCard
+                :q="ask.q"
+                :can-approve="canApproveSkills"
+                :seen="sourceSeenInSession(ask.q.install?.source)"
+                :busy="askBusy"
+                live
+                interactive
+                @approve="answerInstall('approve')"
+                @cancel="answerInstall('cancel')"
+              />
             </template>
 
             <template v-else>
@@ -3129,6 +3293,63 @@ async function onScroll() {
   .gate-card { padding: 0.9rem 0.85rem 1rem; }
 }
 
+/* 技能工具卡（doc/52 C5）：一行一句「读了什么」，展开看回执原文 */
+.tool-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-top: 0.55rem;
+}
+.tool-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  padding: 0.15rem 0.55rem;
+  font-size: 0.8rem;
+}
+.tool-card[data-state='failed'] { border-color: var(--danger-soft); }
+.tool-card summary {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  cursor: pointer;
+  list-style: none;
+  padding: 0.3rem 0;
+  color: var(--ink-soft);
+}
+.tool-card summary::-webkit-details-marker { display: none; }
+.tool-name { font-weight: 550; }
+.tool-chip {
+  margin-left: auto;
+  border-radius: 999px;
+  padding: 0 0.45rem;
+  background: var(--hover);
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+.tool-chip.fail { background: var(--danger-soft); color: var(--danger); }
+.tool-fail {
+  margin: 0 0 0.35rem;
+  color: var(--danger);
+  font-size: 0.76rem;
+  line-height: 1.5;
+}
+.tool-out {
+  margin: 0 0 0.5rem;
+  max-height: 18rem;
+  overflow: auto;
+  padding: 0.5rem 0.6rem;
+  border-radius: 8px;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tool-wait { margin: 0 0 0.4rem; color: var(--muted); font-size: 0.74rem; }
+
 /* 问答记录（doc/47 §5.2）：气泡下方留档，方案按文档块渲染 */
 .qa-stack {
   display: flex;
@@ -3146,6 +3367,11 @@ async function onScroll() {
   border-color: #bcd6c7;
   background: #f7fbf8;
 }
+/* 安装确认（doc/52 D24）：与方案卡同一种「程序卡片」，换一套冷色区分授权类动作。 */
+.qa-card.install {
+  border-color: #c7d4e6;
+  background: #f7fafd;
+}
 .qa-card.stale { opacity: 0.66; }
 .qa-head {
   display: flex;
@@ -3161,6 +3387,7 @@ async function onScroll() {
   color: var(--muted);
 }
 .qa-card.plan .qa-kind { color: #2f7d5b; }
+.qa-card.install .qa-kind { color: #2f5d8a; }
 .qa-chip {
   font-size: 0.7rem;
   line-height: 1.5;
@@ -3356,6 +3583,15 @@ async function onScroll() {
   border-color: #8fbfac;
   box-shadow: 0 0 0 4px rgba(15, 110, 86, 0.1), var(--shadow);
 }
+.ask-dock.install {
+  border-color: #c7d4e6;
+  background: linear-gradient(180deg, #fbfdff, #f4f8fd);
+}
+.ask-dock.install:focus-visible,
+.ask-dock.install:focus {
+  border-color: #9fb8d6;
+  box-shadow: 0 0 0 4px rgba(47, 93, 138, 0.1), var(--shadow);
+}
 .ask-dock-head {
   display: flex;
   align-items: center;
@@ -3369,6 +3605,7 @@ async function onScroll() {
   color: #9a7b2e;
 }
 .ask-dock.plan .ask-kicker { color: #2f7d5b; }
+.ask-dock.install .ask-kicker { color: #2f5d8a; }
 .ask-nav {
   margin-left: auto;
   display: flex;

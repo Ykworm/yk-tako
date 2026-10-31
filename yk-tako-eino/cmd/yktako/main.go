@@ -114,6 +114,7 @@ func main() {
 	archiveTTL := flag.Duration("archive-ttl", 168*time.Hour, "how long compacted transcripts and soft-deleted session archives stay before the sweeper removes them")
 	agentsDir := flag.String("agents-dir", "agents", "directory of sub-agent specs (*.md + YAML frontmatter); scanned at each run start (relative to CWD)")
 	workspace := flag.String("workspace", "./workspace", "workspace root for first-party file tools; created at startup, tools are confined to it")
+	systemSkillsDir := flag.String("system-skills-dir", "", "system skills root (doc/52 §4.2); default <workspace>/system-skills; the app only reads it, the release pipeline writes it")
 	subagentConcurrency := flag.Int("subagent-concurrency", 8, "max concurrent subagent delegations (process-wide semaphore; must be >= 1)")
 	subagentReturnCap := flag.Int("subagent-return-cap", 51200, "max bytes of a subagent's return text handed back to the parent; excess is truncated with a notice (<=0 disables)")
 	rebuildDialogue := flag.Bool("rebuild-dialogue", false, "clear dialogue_chunks at startup and let the indexer rebuild them from complete runs (requires TAKO_RAG=on)")
@@ -192,6 +193,24 @@ func main() {
 		log.Fatalf("workspace %q 创建: %v", wsAbs, err)
 	}
 	log.Printf("workspace %s", wsAbs)
+	// 系统技能根（doc/52 §4.2）：默认 <workspace>/system-skills。
+	// 旗标指到别处时用它（验收要给隔离实例指不同的根）。
+	//
+	// **根目录本身要建出来（可以是空的）**：rescan 读到「根不存在」按「这个归属下还没装
+	// 技能」处理（视同空），但读到「根读失败」按「盘没挂上」处理、整次重扫中止。
+	// 目录不存在与目录读不出来，在 unix 上是两件不同的事——前者是正常状态，后者是故障。
+	sysSkills := strings.TrimSpace(*systemSkillsDir)
+	if sysSkills == "" {
+		sysSkills = filepath.Join(wsAbs, "system-skills")
+	}
+	sysSkillsAbs, err := filepath.Abs(sysSkills)
+	if err != nil {
+		log.Fatalf("system-skills-dir %q 绝对化: %v", sysSkills, err)
+	}
+	if err := os.MkdirAll(sysSkillsAbs, 0o755); err != nil {
+		log.Fatalf("system-skills-dir %q 创建: %v", sysSkillsAbs, err)
+	}
+	log.Printf("system skills %s", sysSkillsAbs)
 	if n, err := runengine.ClearSessionMedia(wsAbs); err != nil {
 		log.Fatalf("清理会话旧媒体: %v", err)
 	} else if n > 0 {
@@ -285,6 +304,6 @@ func main() {
 	}
 	log.Printf("subagents: concurrency %d, return cap %d B", *subagentConcurrency, *subagentReturnCap)
 	log.Printf("archive ttl %s", *archiveTTL)
-	r := runengine.NewRouter(store, *batch, *dev, worker, *resumeMax, auth)
+	r := runengine.NewRouter(store, *batch, *dev, worker, *resumeMax, auth, sysSkillsAbs)
 	log.Fatal(r.Run(*engine))
 }

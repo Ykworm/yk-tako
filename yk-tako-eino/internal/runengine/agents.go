@@ -50,9 +50,18 @@ type AgentSpec struct {
 	Description  string
 	Tools        *[]string
 	ExcludeTools *[]string // 继承父池减去这些名字（doc/26）；与 Tools 互斥
-	Model        string    // frontmatter model: 行原文——parse 只认语法，写法分流在装配层（19v6-05 §4）
-	Prompt       string    // 正文 = system prompt
+	// Skills/ExcludeSkills 是技能作用域（doc/52 E1）：与 Tools/ExcludeTools 同形、只认主助手。
+	// 它们不改这只助手能看见哪些工具，只改 manager 的 <available_skills> 目录与三个技能工具
+	// 当场能解析到哪些名字——普通子代理没有技能目录，写了就拒载（product_store 的 seed/import 与
+	// 写入口三条路都判）。
+	Skills        *[]string
+	ExcludeSkills *[]string
+	Model         string // frontmatter model: 行原文——parse 只认语法，写法分流在装配层（19v6-05 §4）
+	Prompt        string // 正文 = system prompt
 }
+
+// hasSkillScope 报告这条规格是否声明了技能作用域。只用于「普通子代理规格不许写」的那道判。
+func (sp AgentSpec) hasSkillScope() bool { return sp.Skills != nil || sp.ExcludeSkills != nil }
 
 // agentNamePattern 是助手名的唯一合法形状。名字不只是标签：它同时是 AgentTool 的工具名、
 // runlog 的 agent 值、厂商请求里 tools[i].function.name——厂商只收 [A-Za-z0-9_-]，
@@ -70,11 +79,13 @@ func validAgentName(name string) bool { return agentNamePattern.MatchString(name
 // agentSpecFront 是 frontmatter 的 YAML 形状。Model 原样带出：写了/没写、是关键词还是 ref，
 // 都在装配层分流——parse 层不做语义判断（19v6-05 §4）。
 type agentSpecFront struct {
-	Name         string    `yaml:"name"`
-	Description  string    `yaml:"description"`
-	Tools        *[]string `yaml:"tools"`
-	ExcludeTools *[]string `yaml:"exclude_tools"`
-	Model        string    `yaml:"model"`
+	Name          string    `yaml:"name"`
+	Description   string    `yaml:"description"`
+	Tools         *[]string `yaml:"tools"`
+	ExcludeTools  *[]string `yaml:"exclude_tools"`
+	Skills        *[]string `yaml:"skills"`
+	ExcludeSkills *[]string `yaml:"exclude_skills"`
+	Model         string    `yaml:"model"`
 }
 
 // LoadAgentSpecs 扫 dir 下的 *.md（按文件名排序）逐个解析校验。拒载是逐条语义：
@@ -164,13 +175,18 @@ func parseAgentSpec(raw []byte) (AgentSpec, error) {
 	if f.Tools != nil && f.ExcludeTools != nil {
 		return AgentSpec{}, fmt.Errorf("tools: 与 exclude_tools: 不能同时写（前者是「只给这些」，后者是「继承父池减去这些」）——二选一")
 	}
+	if f.Skills != nil && f.ExcludeSkills != nil {
+		return AgentSpec{}, fmt.Errorf("skills: 与 exclude_skills: 不能同时写（前者是「只给这些」，后者是「从全集减去这些」）——二选一")
+	}
 	return AgentSpec{
-		Name:         f.Name,
-		Description:  f.Description,
-		Tools:        f.Tools,
-		ExcludeTools: f.ExcludeTools,
-		Model:        f.Model,
-		Prompt:       strings.TrimSpace(strings.Join(lines[end+1:], "\n")),
+		Name:          f.Name,
+		Description:   f.Description,
+		Tools:         f.Tools,
+		ExcludeTools:  f.ExcludeTools,
+		Skills:        f.Skills,
+		ExcludeSkills: f.ExcludeSkills,
+		Model:         f.Model,
+		Prompt:        strings.TrimSpace(strings.Join(lines[end+1:], "\n")),
 	}, nil
 }
 
@@ -350,10 +366,10 @@ func (s *subagentShell) InvokableRun(ctx context.Context, args string, opts ...t
 // 调用方这时还没占闸、也还没开档案。
 func (h *agentSpecHandler) assembleSubagentTool(ctx context.Context, spec AgentSpec, subModel model.BaseChatModel, pool []tool.BaseTool, instruction string, wantSearch bool, genInput adk.GenModelInput) (tool.InvokableTool, string) {
 	cfg := &adk.ChatModelAgentConfig{
-		Name:          spec.Name,
-		Description:   spec.Description,
-		Instruction:   instruction,
-		Model:         subModel,
+		Name:        spec.Name,
+		Description: spec.Description,
+		Instruction: instruction,
+		Model:       subModel,
 		// 子代理与主代理同一条上限（agentMaxIterations，2026-10-16 用户裁定放开到 50）。
 		MaxIterations: agentMaxIterations,
 		ToolsConfig:   adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: pool}},
@@ -438,6 +454,9 @@ func runSubagentGuarded(ctx context.Context, store *Store, sem chan struct{}, ca
 	if wire != nil {
 		defer wire.close()
 	}
+	// 子代理不吃爹的只读技能根（D25）：它池里没有 use_skill（四个保留名被剔掉），
+	// 给它空盒——否则爹 use_skill 过的目录会跟着 bash 一起进子代理。
+	ctx = withSkillBox(ctx, newSkillBox())
 	out, err := call(ctx)
 	if err != nil {
 		if strings.Contains(err.Error(), foldChainErrorMark) {
@@ -544,7 +563,9 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 	table := agentModelTableFrom(ctx) // 本 run 的身份表（worker.Run 建并塞 ctx）；写帧/drain 读它，见 worker.go
 	// 拷一份入口快照。后面往 runCtx.Tools 追加的委派工具和 resume_subagent 不在这份里，
 	// 子代理继承它 = 拿不到委派，也拿不到 resume。
-	base := append([]tool.BaseTool(nil), runCtx.Tools...)
+	// 技能四工具在这里剔掉（doc/52 §2.8）：子代理结构性看不见它们——继承档拿不到，
+	// 白名单档写了名字按「未知名」拒载（错误信息会列出可选名单，不含它们）。
+	base := dropSkillTools(ctx, append([]tool.BaseTool(nil), runCtx.Tools...))
 	ctx = withSubagentAssembly(ctx, &subagentAssembly{base: base, snap: snap, specs: specs})
 	var loaded []string
 	for _, spec := range specs {

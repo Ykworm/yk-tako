@@ -44,13 +44,19 @@ type Row struct {
 // Name/Args/Output 是工具帧（kind=tool_call/tool_result）的负载。
 // usage 帧（doc/27 §4a）五个数值列：每枪 provider 账单 + 窗配置值；账单缺失不发帧（不发 0）。
 type Frame struct {
-	EventOffset      int    `json:"eventOffset,omitempty"`
-	Kind             string `json:"kind"`
-	Agent            string `json:"agent"`
-	Model            string `json:"model"`
-	MessageID        string `json:"messageId,omitempty"`
-	Name             string `json:"name,omitempty"`
-	Args             string `json:"args,omitempty"`
+	EventOffset int    `json:"eventOffset,omitempty"`
+	Kind        string `json:"kind"`
+	Agent       string `json:"agent"`
+	Model       string `json:"model"`
+	MessageID   string `json:"messageId,omitempty"`
+	Name        string `json:"name,omitempty"`
+	// SkillName 只出现在 kind=task 帧（doc/52 B5）：触发这次写入的那条任务所属技能。
+	// 逐行归属看 text（每行带「（技能：名字）」）；这个字段给页面标「这次写的是哪个技能的活」。
+	SkillName string `json:"skillName,omitempty"`
+	Args      string `json:"args,omitempty"`
+	// ToolCallID 是 tool_call/tool_result 两帧的配对键（doc/52 B1）：模型给的调用 id，
+	// 同一个工具调用的两帧此值相同。前端据此把结果挂回调用，不再靠相邻性猜。
+	ToolCallID       string `json:"toolCallId,omitempty"`
 	Output           string `json:"output,omitempty"`
 	Text             string `json:"text,omitempty"`
 	Status           string `json:"status,omitempty"`

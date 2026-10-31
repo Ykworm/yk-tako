@@ -510,13 +510,20 @@ func autoMigrate(db *gorm.DB) error {
 		&MemoryItem{}, &MemoryJob{}, &DialogueChunk{},
 		&User{}, &Tenant{}, &TenantMember{}, &RefreshToken{}, &AuditLog{}, &TenantUsageDaily{},
 		&TenantInvitation{}, &TenantAgent{}, &AgentDefault{}, &TenantSetting{}, &TenantStorage{},
-		&Workspace{}, &CleanerState{}, &RunTask{}, &RunQuestion{}); err != nil {
+		&Workspace{}, &CleanerState{}, &RunTask{}, &RunQuestion{},
+		&SkillRow{}, &SkillDisable{}); err != nil {
 		return err
 	}
 	_ = db.Exec(`DROP INDEX IF EXISTS memory_items_dedup`).Error
 	if err := db.Exec(`CREATE UNIQUE INDEX memory_items_dedup
 ON memory_items (tenant_id, user_id, workspace, kind, content)
 WHERE kind <> 'episode'`).Error; err != nil {
+		return err
+	}
+	// 技能目录的部分唯一索引（doc/52 §4.7、D7）：(tenant_id, name) WHERE valid。
+	// 同一个桶内生效名字唯一——数据库层就是闸，插入失败本身就是拒装。
+	// 同名的 invalid 行可以并存（盘上有几份同名东西就记几条），所以必须是部分索引。
+	if err := skillRowsUniqueIdx(db); err != nil {
 		return err
 	}
 	// 项目闸退役（2026-10-22，doc/42 形态收窄）：「同一项目同时只跑一场」这道整层排队取消

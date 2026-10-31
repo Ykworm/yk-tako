@@ -193,6 +193,29 @@ func TestParseAgentSpecRejectsToolsAndExclude(t *testing.T) {
 	}
 }
 
+// TestParseAgentSpecSkillScope 钉技能作用域的解析（doc/52 E1）：与 tools: 同一套三态（不写 nil /
+// 空切片非 nil / 名单），两行同写在 parse 层拒载。拒载位置与 tools 同理——放到装配层，
+// 「实际作用域取决于两个分支的先后」又会回来。
+func TestParseAgentSpecSkillScope(t *testing.T) {
+	both := []byte("---\nname: x\ndescription: 丁\nskills:\n  - demo\nexclude_skills:\n  - other\n---\n正文\n")
+	if _, err := parseAgentSpec(both); err == nil || !strings.Contains(err.Error(), "二选一") {
+		t.Fatalf("skills: 与 exclude_skills: 同写应拒载，实得: %v", err)
+	}
+	empty := []byte("---\nname: x\ndescription: 丁\nskills: []\n---\n正文\n")
+	spec, err := parseAgentSpec(empty)
+	if err != nil || spec.Skills == nil || len(*spec.Skills) != 0 || !spec.hasSkillScope() {
+		t.Fatalf("skills: [] 应为非 nil 空切片且算声明: %v %v", spec.Skills, err)
+	}
+	absent := []byte("---\nname: x\ndescription: 丁\n---\n正文\n")
+	if spec, err = parseAgentSpec(absent); err != nil || spec.hasSkillScope() {
+		t.Fatalf("不写作用域应不报声明: %v %v", spec.Skills, err)
+	}
+	allow := []byte("---\nname: x\ndescription: 丁\nskills:\n  - demo\n---\n正文\n")
+	if spec, err = parseAgentSpec(allow); err != nil || spec.Skills == nil || (*spec.Skills)[0] != "demo" {
+		t.Fatalf("skills: [demo] 应解析出名字: %+v %v", spec.Skills, err)
+	}
+}
+
 // TestParseAgentSpecRejectsBadName 钉名字的外形约束：名字同时是厂商请求里的
 // tools[i].function.name，空格/中文会被厂商整场 400（2026-10-23 走查的 P0）。
 // 解析层拒载 = 文件路与导入路共用同一道闸；装配层另有一道（存量行）。

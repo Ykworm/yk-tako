@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log"
 	"sort"
 	"strings"
 	"time"
@@ -47,6 +48,7 @@ type TenantAgent struct {
 	ModelRef    string    `gorm:"not null;default:''"`
 	Tools       string    `gorm:"not null;default:''"`
 	ToolPolicy  string    `gorm:"not null;default:''"`
+	SkillPolicy string    `gorm:"not null;default:''"` // 技能作用域 JSON（E1）；空串 = inherit
 	Visibility  string    `gorm:"not null"`
 	Source      string    `gorm:"not null;default:''"`
 	IsBuiltin   bool      `gorm:"not null"`
@@ -63,6 +65,7 @@ type AgentDefault struct {
 	Spec        string    `gorm:"not null;default:''"`
 	ModelRef    string    `gorm:"not null;default:''"`
 	ToolPolicy  string    `gorm:"not null;default:''"`
+	SkillPolicy string    `gorm:"not null;default:''"`
 	Version     int       `gorm:"not null;default:1"`
 	CreatedAt   time.Time `gorm:"not null"`
 	UpdatedAt   time.Time `gorm:"not null"`
@@ -72,6 +75,15 @@ func (AgentDefault) TableName() string { return "agent_defaults" }
 
 // ToolPolicy 是工具策略的库存和响应形状。不写策略等于 inherit。
 type ToolPolicy struct {
+	Mode  string   `json:"mode"`
+	Names []string `json:"names"`
+}
+
+// SkillPolicy 是技能作用域（doc/52 E1）：形状与 ToolPolicy 逐字段相同，写法也相同——
+// inherit（不写）/ allow（skills:，只给这些）/ exclude（exclude_skills:，从全集减去）。
+// 为什么单独一个类型：两者语义无关，共用 ToolPolicy 会让「改工具策略」的手误改技能面。
+// 转换到 ToolPolicy 只为复用同一套 JSON 校验（两个字段集合同形、同一组 mode 值）。
+type SkillPolicy struct {
 	Mode  string   `json:"mode"`
 	Names []string `json:"names"`
 }
@@ -87,6 +99,7 @@ type EffectiveAgent struct {
 	Spec        string
 	ModelRef    string
 	ToolPolicy  string
+	SkillPolicy string
 	Visibility  string
 	Kind        string
 }
@@ -119,6 +132,35 @@ func policyFromSpec(sp AgentSpec) ToolPolicy {
 		return ToolPolicy{Mode: "exclude", Names: names}
 	}
 	return ToolPolicy{Mode: "inherit", Names: []string{}}
+}
+
+// skillPolicyFromSpec 把 md 的 skills / exclude_skills 收成一份技能作用域。两行都没写就是 inherit。
+func skillPolicyFromSpec(sp AgentSpec) SkillPolicy {
+	if sp.Skills != nil {
+		names := append([]string{}, (*sp.Skills)...)
+		if names == nil {
+			names = []string{}
+		}
+		return SkillPolicy{Mode: "allow", Names: names}
+	}
+	if sp.ExcludeSkills != nil {
+		names := append([]string{}, (*sp.ExcludeSkills)...)
+		if names == nil {
+			names = []string{}
+		}
+		return SkillPolicy{Mode: "exclude", Names: names}
+	}
+	return SkillPolicy{Mode: "inherit", Names: []string{}}
+}
+
+// skillPolicyJSON 与 policyJSON 同一套校验（两个类型的字段集与 mode 词表相同，直接转换复用）。
+func skillPolicyJSON(p SkillPolicy) (string, error) { return policyJSON(ToolPolicy(p)) }
+
+// parseSkillPolicy 与 parseToolPolicy 同一条降级：坏值/空串 = inherit（坏配置不该让整场 run 起不来）。
+// 额外过一遍 normalizeSkillPolicy：tool 的 parse 只挡空 mode，不认得的 mode 原样带出；
+// 技能作用域在装配与解析两处都要判，归一放在读入口比在每个消费点判一遍可靠。
+func parseSkillPolicy(raw string) SkillPolicy {
+	return normalizeSkillPolicy(SkillPolicy(parseToolPolicy(raw)))
 }
 
 func policyJSON(p ToolPolicy) (string, error) {
@@ -170,6 +212,16 @@ func (s *Store) SeedAgentDefaults(ctx context.Context, dir string) error {
 		if sp.Name == "coder" || sp.Name == "researcher" {
 			kind = "both"
 		}
+		// 普通子代理没有技能目录：写了作用域字段只说明作者以为它有，静默忽略会让这份规格
+		// 看起来「配了但没生效」。拒载这一条、其余照载（与坏文件的处理同一条线）。
+		if kind == "subagent" && sp.hasSkillScope() {
+			log.Printf("agents: %s: 拒载: skills:/exclude_skills: 只对主助手有效（普通子代理没有技能目录）", sp.Name)
+			continue
+		}
+		skillPolicy, err := skillPolicyJSON(skillPolicyFromSpec(sp))
+		if err != nil {
+			return err
+		}
 		var found []AgentDefault
 		err = s.db.WithContext(ctx).Where("name = ?", sp.Name).Limit(1).Find(&found).Error
 		if err != nil {
@@ -182,7 +234,7 @@ func (s *Store) SeedAgentDefaults(ctx context.Context, dir string) error {
 			}
 			row := AgentDefault{
 				ID: id, Name: sp.Name, Kind: kind, Description: sp.Description,
-				Spec: sp.Prompt, ModelRef: sp.Model, ToolPolicy: policy,
+				Spec: sp.Prompt, ModelRef: sp.Model, ToolPolicy: policy, SkillPolicy: skillPolicy,
 				Version: 1, CreatedAt: now, UpdatedAt: now,
 			}
 			if err := s.db.WithContext(ctx).Create(&row).Error; err != nil {
@@ -191,12 +243,12 @@ func (s *Store) SeedAgentDefaults(ctx context.Context, dir string) error {
 			continue
 		}
 		cur := found[0]
-		if cur.Kind == kind && cur.Description == sp.Description && cur.Spec == sp.Prompt && cur.ModelRef == sp.Model && cur.ToolPolicy == policy {
+		if cur.Kind == kind && cur.Description == sp.Description && cur.Spec == sp.Prompt && cur.ModelRef == sp.Model && cur.ToolPolicy == policy && cur.SkillPolicy == skillPolicy {
 			continue
 		}
 		if err := s.db.WithContext(ctx).Model(&AgentDefault{}).Where("id = ?", cur.ID).Updates(map[string]any{
 			"kind": kind, "description": sp.Description, "spec": sp.Prompt, "model_ref": sp.Model,
-			"tool_policy": policy, "version": cur.Version + 1, "updated_at": now,
+			"tool_policy": policy, "skill_policy": skillPolicy, "version": cur.Version + 1, "updated_at": now,
 		}).Error; err != nil {
 			return err
 		}
@@ -222,8 +274,8 @@ func (s *Store) ListEffectiveAgents(ctx context.Context, tenantID, userID, kind 
 		names = append(names, d.Name)
 		byName[d.Name] = EffectiveAgent{
 			ID: d.ID, DefaultID: d.ID, Source: "default", Name: d.Name, Description: d.Description,
-			Spec: d.Spec, ModelRef: d.ModelRef, ToolPolicy: d.ToolPolicy, Visibility: "tenant",
-			Kind: d.Kind,
+			Spec: d.Spec, ModelRef: d.ModelRef, ToolPolicy: d.ToolPolicy, SkillPolicy: d.SkillPolicy,
+			Visibility: "tenant", Kind: d.Kind,
 		}
 	}
 	for _, row := range rows {
@@ -252,7 +304,7 @@ func effectiveFromTenant(row TenantAgent) EffectiveAgent {
 	return EffectiveAgent{
 		ID: row.ID, DefaultID: row.DefaultID, Source: source, Overridden: source == "override",
 		Name: row.Name, Description: row.Description, Spec: row.Spec, ModelRef: row.ModelRef,
-		ToolPolicy: row.ToolPolicy, Visibility: row.Visibility, Kind: row.Kind,
+		ToolPolicy: row.ToolPolicy, SkillPolicy: row.SkillPolicy, Visibility: row.Visibility, Kind: row.Kind,
 	}
 }
 
@@ -348,7 +400,7 @@ func (s *Store) ResolveRunAgent(ctx context.Context, tenantID, userID, id string
 		return EffectiveAgent{
 			ID: def.ID, DefaultID: def.ID, Source: "default", Name: def.Name,
 			Description: def.Description, Spec: def.Spec, ModelRef: def.ModelRef,
-			ToolPolicy: def.ToolPolicy, Visibility: "tenant", Kind: def.Kind,
+			ToolPolicy: def.ToolPolicy, SkillPolicy: def.SkillPolicy, Visibility: "tenant", Kind: def.Kind,
 		}, nil
 	}
 	if !errors.Is(err, ErrAgentNotFound) {
@@ -470,6 +522,7 @@ func (s *Store) UpdateAgent(ctx context.Context, row TenantAgent) error {
 		Updates(map[string]any{
 			"name": row.Name, "kind": row.Kind, "description": row.Description, "spec": row.Spec,
 			"model_ref": row.ModelRef, "tools": row.Tools, "tool_policy": row.ToolPolicy,
+			"skill_policy": row.SkillPolicy,
 			"visibility": row.Visibility, "source": row.Source, "default_id": row.DefaultID,
 		})
 	if isUniqueViolation(res.Error) {

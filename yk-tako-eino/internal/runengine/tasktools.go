@@ -28,12 +28,15 @@ import (
 
 // RunTask 是看板正本（doc/41 §5.1）：一场 run 一块看板。
 type RunTask struct {
-	ID          string    `gorm:"primaryKey"`
-	TenantID    string    `gorm:"not null;index:run_tasks_scope,priority:1"`
-	RunID       RunID     `gorm:"not null;uniqueIndex:run_tasks_run_no,priority:1"`
-	TaskNo      int       `gorm:"not null;uniqueIndex:run_tasks_run_no,priority:2"`
-	SessionID   SessionID `gorm:"not null;index:run_tasks_scope,priority:2"`
-	Subject     string    `gorm:"not null"`
+	ID        string    `gorm:"primaryKey"`
+	TenantID  string    `gorm:"not null;index:run_tasks_scope,priority:1"`
+	RunID     RunID     `gorm:"not null;uniqueIndex:run_tasks_run_no,priority:1"`
+	TaskNo    int       `gorm:"not null;uniqueIndex:run_tasks_run_no,priority:2"`
+	SessionID SessionID `gorm:"not null;index:run_tasks_scope,priority:2"`
+	Subject   string    `gorm:"not null"`
+	// SkillName 是这条任务替哪个技能办的（doc/52 D32）：TaskCreate 时按本 run 最近一次
+	// use_skill 盖戳，空串 = 不是技能任务。归属只由「建任务」决定——read_skill 不盖戳。
+	SkillName   string    `gorm:"not null;default:''"`
 	Description string    `gorm:""`
 	ActiveForm  string    `gorm:""`
 	Status      string    `gorm:"not null;default:pending"`
@@ -80,8 +83,9 @@ func taskBoxFrom(ctx context.Context) *taskBox {
 }
 
 // CreateTask 记一行（task_no = run 内自增）。返回 task_no（= 旧线的 taskId）。
+// skillName 是盖在行上的技能归属（本 run 最近一次 use_skill；空串 = 不是技能任务）。
 func (s *Store) CreateTask(ctx context.Context, tenantID string, runID RunID, sessionID SessionID,
-	subject, description, activeForm string) (int, error) {
+	subject, description, activeForm, skillName string) (int, error) {
 	var no int
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&RunTask{}).
@@ -95,7 +99,7 @@ func (s *Store) CreateTask(ctx context.Context, tenantID string, runID RunID, se
 		}
 		row := RunTask{
 			ID: id, TenantID: tenantID, RunID: runID, TaskNo: no, SessionID: sessionID,
-			Subject: subject, Description: description, ActiveForm: activeForm,
+			Subject: subject, SkillName: skillName, Description: description, ActiveForm: activeForm,
 			Status: taskStatusPending, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		}
 		return tx.Create(&row).Error
@@ -144,8 +148,40 @@ func (s *Store) GetTask(ctx context.Context, runID RunID, taskNo int) (RunTask, 
 	return row, err
 }
 
+// PreviousBoardRun 找本会话里最近一个（排除当前 run）还有未删除任务的 run（doc/52 D34/D35）。
+// 走 (tenant_id, session_id) 复合索引，不加新列；只要「有任务」，不要求还有没做完的——
+// 全完成的上一场由调用方渲染成一行提示。
+func (s *Store) PreviousBoardRun(ctx context.Context, tenantID string, sessionID SessionID, current RunID) (RunID, error) {
+	var id string
+	err := s.db.WithContext(ctx).Model(&RunTask{}).
+		Where("tenant_id = ? AND session_id = ? AND run_id <> ? AND status <> ?",
+			tenantID, sessionID, current, taskStatusDeleted).
+		Order("created_at DESC").Limit(1).Pluck("run_id", &id).Error
+	return RunID(id), err
+}
+
+// ListOpenTasks 列一场 run 未完成的行（pending/in_progress），按 task_no 升序。
+func (s *Store) ListOpenTasks(ctx context.Context, runID RunID) ([]RunTask, error) {
+	var rows []RunTask
+	err := s.db.WithContext(ctx).
+		Where("run_id = ? AND status IN ?", runID, []string{taskStatusPending, taskStatusInProgress}).
+		Order("task_no").Find(&rows).Error
+	return rows, err
+}
+
+// TaskSkillNames 列一场 run 里建过任务、且任务未删除的技能名（doc/52 D35 执行权恢复用）。
+func (s *Store) TaskSkillNames(ctx context.Context, tenantID string, runID RunID) ([]string, error) {
+	var names []string
+	err := s.db.WithContext(ctx).Model(&RunTask{}).
+		Where("tenant_id = ? AND run_id = ? AND skill_name <> '' AND status <> ?",
+			tenantID, runID, taskStatusDeleted).
+		Distinct().Order("skill_name").Pluck("skill_name", &names).Error
+	return names, err
+}
+
 // taskBoardView 是看板的紧凑视图：模型的眼睛（也是 task 帧的 text）。
-// 每行「#序号 [状态] 主题」，末尾一句催更块。
+// 每行「#序号 [状态] 主题」，属于某个技能的行再带「（技能：名字）」——哪几条任务替哪个技能办，
+// 看板自己回答（D32）；末尾一句催更块。
 func taskBoardView(rows []RunTask) string {
 	if len(rows) == 0 {
 		return "看板：（空）"
@@ -153,7 +189,11 @@ func taskBoardView(rows []RunTask) string {
 	var b strings.Builder
 	b.WriteString("看板：\n")
 	for _, r := range rows {
-		fmt.Fprintf(&b, "#%d [%s] %s\n", r.TaskNo, r.Status, r.Subject)
+		fmt.Fprintf(&b, "#%d [%s] %s", r.TaskNo, r.Status, r.Subject)
+		if r.SkillName != "" {
+			fmt.Fprintf(&b, "（技能：%s）", r.SkillName)
+		}
+		b.WriteString("\n")
 	}
 	open := 0
 	for _, r := range rows {
@@ -174,6 +214,27 @@ func taskReceipt(op string, rows []RunTask) string {
 	return op + "\n" + taskBoardView(rows)
 }
 
+// previousBoardView 渲染 TaskList 独有的「上一场」段（doc/52 D34）：只列未完成行的
+// #N、主题与说明；全完成时只给一行提示。**写操作回执与 kind=task 帧不走这里**——
+// 那段说明只在显式 TaskList 时付一次 token（§2.5 成本边界）。
+func previousBoardView(prev RunID, rows []RunTask) string {
+	if prev == "" {
+		return ""
+	}
+	if len(rows) == 0 {
+		return fmt.Sprintf("上一场（%s）已全部完成", prev)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "上一场（%s）还有 %d 项没完成：\n", prev, len(rows))
+	for _, r := range rows {
+		fmt.Fprintf(&b, "#%d [%s] %s\n", r.TaskNo, r.Status, r.Subject)
+		if r.Description != "" {
+			fmt.Fprintf(&b, "说明：%s\n", r.Description)
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 // taskTenantOf 取当前租户（看板是租户内可见的资源）。
 func taskTenantOf(ctx context.Context) string {
 	if p, ok := principalFromCtx(ctx); ok {
@@ -184,7 +245,9 @@ func taskTenantOf(ctx context.Context) string {
 
 // emitTaskFrame 发一条 kind=task 帧（C2，doc/41 §5.2）：看板的结构态。
 // text = 当前全量看板的紧凑视图（与工具回执里的那段同源），name = 触发它的工具名。
-// 写不出看板（表还没建、DB 故障）时只记日志、不杀 run——看板是观测面，不是主流程。
+// skillName = 触发这次写入的那条任务所属技能（逐行归属看 text；这个字段只给页面标「这次写的是
+// 哪个技能的活」，空串省略）。写不出看板（表还没建、DB 故障）时只记日志、不杀 run——看板是观测面，
+// 不是主流程。
 func (w *Worker) emitTaskFrame(ctx context.Context, runID RunID, epoch int64, name, model string) {
 	rows, err := w.store.ListTasks(ctx, runID)
 	if err != nil {
@@ -193,7 +256,7 @@ func (w *Worker) emitTaskFrame(ctx context.Context, runID RunID, epoch int64, na
 	}
 	// 帧字面量写成 `Frame{Kind: "task", …}` 单行——契约快闸的词表测试按这个形状扫
 	// （`Frame\{Kind:\s*"([a-z_]+)"`，换行就扫不到 → 加一种 kind 而不同步词表会假绿）。
-	accepted, err := w.store.AppendFrame(ctx, runID, epoch, Frame{Kind: "task", Agent: "", Model: model, Name: name, Text: taskBoardView(rows)})
+	accepted, err := w.store.AppendFrame(ctx, runID, epoch, Frame{Kind: "task", Agent: "", Model: model, Name: name, SkillName: touchedSkill(rows), Text: taskBoardView(rows)})
 	if err != nil {
 		log.Printf("task frame %s: %v", runID, err)
 		return
@@ -204,12 +267,30 @@ func (w *Worker) emitTaskFrame(ctx context.Context, runID RunID, epoch int64, na
 	}
 }
 
+// touchedSkill 是 task 帧附带的那一个技能名：触发这帧的写操作刚更新过的那一行
+// （UpdatedAt 最新；同一时刻按 task_no 取大）。返回空串表示那条任务不是技能任务。
+func touchedSkill(rows []RunTask) string {
+	var latest *RunTask
+	for i := range rows {
+		r := &rows[i]
+		if latest == nil || r.UpdatedAt.After(latest.UpdatedAt) ||
+			(r.UpdatedAt.Equal(latest.UpdatedAt) && r.TaskNo > latest.TaskNo) {
+			latest = r
+		}
+	}
+	if latest == nil {
+		return ""
+	}
+	return latest.SkillName
+}
+
 // taskBoardPrompt 是看板的使用约定，静态拼进系统提示（doc/41 §3.3 继承 doc/01 的约束）。
 const taskBoardPrompt = `## 任务看板
 
 活儿多的时候建一张看板，跟踪进度：≥3 步、或用户列了多件事时才建；一步任务不要建。
 计划模式里也可以建/改看板——它是方案的一部分，不算工作区修改；先建看板再 submit_plan。
 - TaskCreate 建条目（主题写成祈使句一句话，如「列出工作区文件」）。
+- description 写「这一步具体做什么」（输入、要跑的脚本、产物）——下一场的你只能靠它续上。
 - 动手前 TaskUpdate 把那条标 in_progress；同时进行的只留一条。
 - 做完立刻标 completed；测试红、做了一半、报错没解，**不准**标 completed。
 - 卡住就 TaskCreate 建一条 blocker 记录，写清卡在哪。
@@ -219,7 +300,7 @@ const taskBoardPrompt = `## 任务看板
 
 type taskCreateInput struct {
 	Subject     string `json:"subject" jsonschema:"description=任务主题（一句话，祈使句，如「列出工作区文件」）"`
-	Description string `json:"description,omitempty" jsonschema:"description=可选补充说明"`
+	Description string `json:"description,omitempty" jsonschema:"description=这一步具体做什么。下一场（新 run）只能靠它续上：写清输入、要跑的脚本/命令与产物，别省步骤"`
 	ActiveForm  string `json:"active_form,omitempty" jsonschema:"description=可选：进行中的现在时短语（如「正在列出文件」）"`
 }
 
@@ -227,7 +308,7 @@ type taskUpdateInput struct {
 	TaskID      int    `json:"task_id" jsonschema:"description=任务号（TaskCreate 返回的那个整数）"`
 	Status      string `json:"status,omitempty" jsonschema:"description=状态：pending / in_progress / completed / deleted"`
 	Subject     string `json:"subject,omitempty" jsonschema:"description=可选：改主题"`
-	Description string `json:"description,omitempty" jsonschema:"description=可选：改说明"`
+	Description string `json:"description,omitempty" jsonschema:"description=可选：改说明（给下一场看的那份，写清输入、脚本与产物）"`
 	ActiveForm  string `json:"active_form,omitempty" jsonschema:"description=可选：改现在时短语"`
 }
 
@@ -240,14 +321,15 @@ type taskNoInput struct{}
 func newTaskCreateTool(store *Store) (tool.BaseTool, error) {
 	return utils.InferTool("TaskCreate",
 		"建一条任务并加进看板，返回任务号（run 内自增的整数）。"+
-			"**建表约定**：≥3 步、或用户列了多件事时才建看板；一步任务不建。主题用祈使句一句话。",
+			"**建表约定**：≥3 步、或用户列了多件事时才建看板；一步任务不建。主题用祈使句一句话。"+
+			"description 写「这一步具体做什么」——下一场（新 run）只能靠它续上，别省步骤。",
 		func(ctx context.Context, in taskCreateInput) (string, error) {
 			box := taskBoxFrom(ctx)
 			if box == nil {
 				return "", fmt.Errorf("看板不可用（没有 run 身份）")
 			}
 			no, err := store.CreateTask(ctx, taskTenantOf(ctx), box.run, box.session,
-				in.Subject, in.Description, in.ActiveForm)
+				in.Subject, in.Description, in.ActiveForm, usedSkillName(ctx))
 			if err != nil {
 				return "", err
 			}
@@ -281,14 +363,31 @@ func newTaskUpdateTool(store *Store) (tool.BaseTool, error) {
 
 func newTaskListTool(store *Store) (tool.BaseTool, error) {
 	return utils.InferTool("TaskList",
-		"列出本场 run 的看板（每条：#序号 [状态] 主题）。用它在动手前后自校准进度。",
+		"列出本场 run 的看板（每条：#序号 [状态] 主题）。用它在动手前后自校准进度。"+
+			"上一场（同会话的上一轮）还有没做完的任务时，输出末尾会多一段「上一场」：带主题与说明，"+
+			"用户说的「第 N 步」通常指那里。",
 		func(ctx context.Context, in taskNoInput) (string, error) {
 			box := taskBoxFrom(ctx)
 			if box == nil {
 				return "", fmt.Errorf("看板不可用（没有 run 身份）")
 			}
 			rows, _ := store.ListTasks(ctx, box.run)
-			return taskBoardView(rows), nil
+			view := taskBoardView(rows)
+			// D34：只在这一处追加「上一场」段；写回执与 task 帧不带（共用体不加参数）。
+			if tenantID := taskTenantOf(ctx); tenantID != "" {
+				prev, err := store.PreviousBoardRun(ctx, tenantID, box.session, box.run)
+				if err != nil {
+					log.Printf("task list %s: 上一场查询失败: %v", box.run, err)
+				} else if prev != "" {
+					open, err := store.ListOpenTasks(ctx, prev)
+					if err != nil {
+						log.Printf("task list %s: 上一场读行失败: %v", box.run, err)
+					} else if seg := previousBoardView(prev, open); seg != "" {
+						view += "\n\n" + seg
+					}
+				}
+			}
+			return view, nil
 		})
 }
 
@@ -307,8 +406,12 @@ func newTaskGetTool(store *Store) (tool.BaseTool, error) {
 				}
 				return "", err
 			}
-			return fmt.Sprintf("#%d [%s] %s\n说明：%s\n现在时：%s",
-				row.TaskNo, row.Status, row.Subject, row.Description, row.ActiveForm), nil
+			out := fmt.Sprintf("#%d [%s] %s\n说明：%s\n现在时：%s",
+				row.TaskNo, row.Status, row.Subject, row.Description, row.ActiveForm)
+			if row.SkillName != "" {
+				out += "\n技能：" + row.SkillName
+			}
+			return out, nil
 		})
 }
 

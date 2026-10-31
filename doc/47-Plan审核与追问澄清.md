@@ -186,6 +186,8 @@ P 和 Q 共用同一套「等人」机器，Q 先施工成底座：
 | decision | string | plan 行专用：`approve` / `revise`；question 行恒空串。approve 退出 plan mode，revise 保持 |
 | created_at / answered_at | — | 审计面 |
 
+**2026-10-27 补记（`stale` 没有生产者）**：`stale` 今天只存在于词表、查询过滤与读侧分支（`waittools.go:262`、`questions.go` 的 status 校验、journal 重放注释）；全仓 `UPDATE run_questions` 只有 `questions.go:114` 那一处 CAS（`pending → answered`），**没有任何代码把 `pending` 改写成 `stale`**。所以上表 `status` 一行写的「run 终态后清扫器收 stale」是设计口径、未实现：进程收摊或被 stop 的 run 会留一行永远 `pending`，`GET /api/runs/:id/questions?status=pending` 照常把它列出来。补法与 doc/37 §5.5 的会话级清理同一拍——run 终态时把该 run 的 pending 行收 `stale`，过窗随会话删行。
+
 ### 5.2 帧词表：8 → 9
 
 `contract_test.go` 词表测试同步改（快闸显式同步点）。新帧复用现有 Frame 字段不加列——P/Q 共用一个 kind，语义=「run 在等这人这一行」：

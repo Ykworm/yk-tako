@@ -44,6 +44,12 @@ func TestCommandInsideRoot(t *testing.T) {
 	if commandInsideRoot("", root) {
 		t.Errorf("空命令应判为在外")
 	}
+	// 相对根（`-workspace ../tmp/xxx` 起引擎时的真实现场）：要能判出根内。
+	if relRoot, err := filepath.Rel(".", root); err == nil {
+		if !commandInsideRoot(inside, relRoot) {
+			t.Errorf("相对根 %q 下的根内命令应判为在内：%s", relRoot, inside)
+		}
+	}
 }
 
 // TestMcpFenceRootByCustom：租户配的进围栏（根=租户根），平台系统配置不进围栏。

@@ -401,8 +401,8 @@ func TestFoldInputBlockStillOver(t *testing.T) {
 	if staged != nil {
 		t.Fatalf("第 3 档不应 Stage：%+v", staged)
 	}
-	if !strings.Contains(err.Error(), "fileOps 块") {
-		t.Fatalf("错误应点名 fileOps 块档位：%v", err)
+	if !strings.Contains(err.Error(), "fileOps/skillOps 块") {
+		t.Fatalf("错误应点名块档位：%v", err)
 	}
 }
 

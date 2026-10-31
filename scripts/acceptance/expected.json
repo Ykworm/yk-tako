@@ -1,5 +1,5 @@
 {
-  "version": "2026-10-22",
+  "version": "2026-10-28",
   "source": "doc/19-v6/19v6-04-验收-curl.md",
   "note": [
     "本文件是契约字节的**机器真源**；doc/19-v6/19v6-04-验收-curl.md 是同一份内容的人读版。",
@@ -181,6 +181,23 @@
               "sessionId",
               "runId",
               "messageId"
+            ]
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/runs/{rid}/skills",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data": {
+              "runId": "{rid}",
+              "loads": []
+            },
+            "data_keys": [
+              "runId",
+              "loads"
             ]
           }
         }
@@ -776,14 +793,1140 @@
           }
         }
       ]
+    },
+    {
+      "id": "14-skills-empty",
+      "case": "用例 14",
+      "tier": "core",
+      "desc": "技能列表：data 有 skills[] 与 invalid[] 两个键，元素字段序固定（name→description→source→path→enabled→bytes→requires→missing→updatedAt→valid）",
+      "steps": [
+        {
+          "op": "signup",
+          "expect": {
+            "http": 201,
+            "code": 0,
+            "message": ""
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/skills",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data_keys": [
+              "skills",
+              "invalid"
+            ]
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/skills",
+          "auth": false,
+          "expect": {
+            "http": 401,
+            "code": 111102,
+            "message": "请先登录",
+            "data": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "15-skills-rescan",
+      "case": "用例 15",
+      "tier": "core",
+      "desc": "技能重扫：盘上的技能目录进表（added）→ 列表看得见 → 重扫幂等；不带 token → 401",
+      "steps": [
+        {
+          "op": "signup",
+          "expect": {
+            "http": 201,
+            "code": 0,
+            "message": ""
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/skills/rescan",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data_keys": [
+              "added",
+              "updated",
+              "removed",
+              "invalid",
+              "roots"
+            ]
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/skills",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data_keys": [
+              "skills",
+              "invalid"
+            ]
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/skills/rescan",
+          "auth": false,
+          "expect": {
+            "http": 401,
+            "code": 111102,
+            "message": "请先登录",
+            "data": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "16-skills-rescan-tenant",
+      "case": "用例 16",
+      "tier": "core",
+      "desc": "技能重扫（租户视角）：roots[] 只含本租户根；不带 token → 401",
+      "steps": [
+        {
+          "op": "signup",
+          "expect": {
+            "http": 201,
+            "code": 0,
+            "message": ""
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/skills/rescan",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data_keys": [
+              "added",
+              "updated",
+              "removed",
+              "invalid",
+              "roots"
+            ]
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/skills/rescan",
+          "auth": false,
+          "expect": {
+            "http": 401,
+            "code": 111102,
+            "message": "请先登录",
+            "data": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "17-skills-detail",
+      "case": "用例 17",
+      "tier": "core",
+      "desc": "技能详情：名字按租户视界解析，data 键序 skill→body；未知名字与无 token 的拒绝路径",
+      "steps": [
+        {
+          "op": "signup",
+          "expect": {
+            "http": 201,
+            "code": 0,
+            "message": ""
+          }
+        },
+        {
+          "op": "seed_skill",
+          "name": "demo",
+          "skill_md": "---\nname: demo\ndescription: 演示技能\n---\n\n# 演示\n\n正文。\n"
+        },
+        {
+          "method": "POST",
+          "path": "/api/skills/rescan",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data_keys": [
+              "added",
+              "updated",
+              "removed",
+              "invalid",
+              "roots"
+            ]
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/skills/demo",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data_keys": [
+              "skill",
+              "body"
+            ]
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/skills/nope",
+          "expect": {
+            "http": 404,
+            "code": 116001,
+            "message": "找不到这个技能",
+            "data": null
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/skills/demo",
+          "auth": false,
+          "expect": {
+            "http": 401,
+            "code": 111102,
+            "message": "请先登录",
+            "data": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "18-run-skills-empty",
+      "case": "用例 18",
+      "tier": "core",
+      "desc": "本场技能动作清单（doc/52 B1；B4 起从 runlog 真派生）：未知 run 404 112002、未登录 401 111102；没调过技能工具的 run 仍是 loads:[]（用例 1 的末步与本拍实跑字节），非空形态见用例 21",
+      "steps": [
+        {
+          "method": "GET",
+          "path": "/api/runs/r_nope/skills",
+          "expect": {
+            "http": 404,
+            "code": 112002,
+            "message": "找不到这次运行",
+            "data": null
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/runs/r_nope/skills",
+          "auth": false,
+          "expect": {
+            "http": 401,
+            "code": 111102,
+            "message": "请先登录",
+            "data": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "25-skills-install",
+      "case": "用例 25",
+      "tier": "core",
+      "desc": "技能安装/更新/删除（doc/52 C1）：multipart 装上 → 列表出现 → 坏包三连（zip 穿越 116105、缺 description 116102、正文超限 116116）→ 同名再装 116106 → DELETE 回 deleted → 删不存在的 116001 → 删后重装 201",
+      "steps": [
+        {
+          "op": "signup",
+          "no_model": true
+        },
+        {
+          "op": "upload",
+          "path": "/api/skills/install",
+          "files": {
+            "demo/SKILL.md": "---\nname: demo\ndescription: 演示技能：安装验收用\nrequires: [python3]\n---\n正文\n",
+            "demo/notes.md": "resource\n"
+          },
+          "expect": {
+            "http": 201,
+            "code": 0,
+            "message": "",
+            "data": {
+              "installed": [
+                {
+                  "name": "demo",
+                  "dependencies": [
+                    {
+                      "name": "python3"
+                    }
+                  ],
+                  "warnings": []
+                }
+              ],
+              "warnings": []
+            }
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/skills",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data_items_some": {
+              "path": "skills",
+              "match": {
+                "name": "demo",
+                "source": "tenant",
+                "valid": true,
+                "requires": [
+                  "python3"
+                ],
+                "missing": []
+              }
+            }
+          }
+        },
+        {
+          "op": "upload",
+          "path": "/api/skills/install",
+          "files": {
+            "demo/SKILL.md": "---\nname: demo\ndescription: 穿越用例\n---\nx\n",
+            "../evil.md": "pwned\n"
+          },
+          "expect": {
+            "http": 400,
+            "code": 116105
+          }
+        },
+        {
+          "op": "upload",
+          "path": "/api/skills/install",
+          "files": {
+            "nodesc/SKILL.md": "---\nname: nodesc\n---\n正文\n"
+          },
+          "expect": {
+            "http": 400,
+            "code": 116102
+          }
+        },
+        {
+          "op": "upload",
+          "path": "/api/skills/install",
+          "files": {
+            "toobig/SKILL.md": "---\nname: toobig\ndescription: 正文超限\n---\n"
+          },
+          "fill_bytes": 140000,
+          "expect": {
+            "http": 413,
+            "code": 116116
+          }
+        },
+        {
+          "op": "upload",
+          "path": "/api/skills/install",
+          "files": {
+            "demo/SKILL.md": "---\nname: demo\ndescription: 演示技能：安装验收用\n---\n正文\n"
+          },
+          "expect": {
+            "http": 409,
+            "code": 116106
+          }
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/skills/demo",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data": {
+              "status": "deleted"
+            }
+          }
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/skills/demo",
+          "expect": {
+            "http": 404,
+            "code": 116001,
+            "message": "找不到这个技能",
+            "data": null
+          }
+        },
+        {
+          "op": "upload",
+          "path": "/api/skills/install",
+          "files": {
+            "demo/SKILL.md": "---\nname: demo\ndescription: 演示技能：删后重装\n---\n正文\n"
+          },
+          "expect": {
+            "http": 201,
+            "code": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "26-skills-preview",
+      "case": "用例 26",
+      "tier": "core",
+      "desc": "技能来源预览（doc/52 C2）：命令串只认 add（remove → 116109）；SSH、服务端本地路径、shell 元字符、私网/回环直链一律 116109；install 的 JSON 分支与 preview 同一套拒绝；无 token 401。成功抓取要公网（GitHub codeload / GitLab），由活体抽验与 19v6-04 用例 26 记录。",
+      "steps": [
+        {
+          "op": "signup",
+          "no_model": true
+        },
+        {
+          "method": "POST",
+          "path": "/api/skills/preview",
+          "body": {
+            "command": "npx skills remove x"
+          },
+          "expect": {
+            "http": 400,
+            "code": 116109,
+            "message": "只支持 add，不支持 \"remove\"（list/find/remove/update/check/init/use 都不认）",
+            "data": null
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/skills/preview",
+          "body": {
+            "source": "http://127.0.0.1/x.zip"
+          },
+          "expect": {
+            "http": 400,
+            "code": 116109,
+            "message": "来源地址不是公网地址（拒绝内网/回环/元数据地址）",
+            "data": null
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/skills/preview",
+          "body": {
+            "source": "git@github.com:o/r.git"
+          },
+          "expect": {
+            "http": 400,
+            "code": 116109
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/skills/preview",
+          "body": {
+            "source": "/tmp/x.zip"
+          },
+          "expect": {
+            "http": 400,
+            "code": 116109
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/skills/preview",
+          "body": {
+            "command": "npx skills add o/r; rm -rf /"
+          },
+          "expect": {
+            "http": 400,
+            "code": 116109
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/skills/install",
+          "body": {
+            "command": "npx skills remove x"
+          },
+          "expect": {
+            "http": 400,
+            "code": 116109
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/skills/preview",
+          "body": {
+            "source": "o/r",
+            "command": "npx skills add o/r"
+          },
+          "expect": {
+            "http": 400,
+            "code": 116109
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/skills/preview",
+          "body": {
+            "command": "npx skills add o/r"
+          },
+          "auth": false,
+          "expect": {
+            "http": 401,
+            "code": 111102,
+            "message": "请先登录",
+            "data": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "28-skills-check",
+      "case": "用例 28",
+      "tier": "core",
+      "desc": "依赖检查（doc/52 D1）：requires 现算 found/path、缺的不拦；名字按租户视界解析，无 token 401",
+      "steps": [
+        {
+          "op": "signup",
+          "no_model": true
+        },
+        {
+          "op": "seed_skill",
+          "name": "dep-check",
+          "skill_md": "---\nname: dep-check\ndescription: D1 契约用例\nrequires: [sh, no-such-tool-d1]\n---\n正文\n"
+        },
+        {
+          "method": "POST",
+          "path": "/api/skills/rescan",
+          "expect": {
+            "http": 200,
+            "code": 0
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/skills/dep-check/check",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data": {
+              "dependencies": [
+                {
+                  "name": "sh",
+                  "found": true
+                },
+                {
+                  "name": "no-such-tool-d1",
+                  "found": false
+                }
+              ],
+              "checkedOn": "host"
+            }
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/skills/dep-check",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data": {
+              "skill": {
+                "name": "dep-check",
+                "requires": [
+                  "sh",
+                  "no-such-tool-d1"
+                ],
+                "missing": [
+                  "no-such-tool-d1"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/skills/nope/check",
+          "expect": {
+            "http": 404,
+            "code": 116001,
+            "message": "找不到这个技能",
+            "data": null
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/skills/dep-check/check",
+          "auth": false,
+          "expect": {
+            "http": 401,
+            "code": 111102,
+            "message": "请先登录",
+            "data": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "29-agent-skill-scope",
+      "case": "用例 29",
+      "tier": "core",
+      "desc": "技能作用域（doc/52 E1）：manager 规格可收窄 skills:／exclude_skills:（JSON 面 skillPolicy），空名单=一个都不要；普通子代理写这两个字段一律 400（md 导入与 JSON 新建同判）；不写=inherit",
+      "steps": [
+        {
+          "op": "signup",
+          "no_model": true
+        },
+        {
+          "method": "POST",
+          "path": "/api/tenants/{ten}/agents",
+          "body": {
+            "name": "scope-mgr",
+            "kind": "root",
+            "spec": "你是主助手。",
+            "skillPolicy": {
+              "mode": "allow",
+              "names": [
+                "demo"
+              ]
+            }
+          },
+          "expect": {
+            "http": 201,
+            "code": 0,
+            "message": "",
+            "data": {
+              "agent": {
+                "name": "scope-mgr",
+                "skillPolicy": {
+                  "mode": "allow",
+                  "names": [
+                    "demo"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/tenants/{ten}/agents?kind=root",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data_items_some": {
+              "path": "agents",
+              "match": {
+                "name": "scope-mgr",
+                "skillPolicy": {
+                  "mode": "allow",
+                  "names": [
+                    "demo"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tenants/{ten}/agents",
+          "body": {
+            "name": "scope-sub",
+            "kind": "subagent",
+            "spec": "你是子代理。",
+            "skillPolicy": {
+              "mode": "inherit",
+              "names": []
+            }
+          },
+          "expect": {
+            "http": 201,
+            "code": 0,
+            "data": {
+              "agent": {
+                "name": "scope-sub",
+                "skillPolicy": {
+                  "mode": "inherit",
+                  "names": []
+                }
+              }
+            }
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tenants/{ten}/agents",
+          "body": {
+            "name": "scope-sub2",
+            "kind": "subagent",
+            "spec": "你是子代理。",
+            "skillPolicy": {
+              "mode": "allow",
+              "names": [
+                "demo"
+              ]
+            }
+          },
+          "expect": {
+            "http": 400,
+            "code": 111002,
+            "message": "skills:／exclude_skills: 只对主助手有效（普通子代理没有技能目录）",
+            "data": null
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tenants/{ten}/agents/import",
+          "body": {
+            "files": [
+              {
+                "name": "sub-skills.md",
+                "content": "---\nname: sub-skills\ndescription: 子代理写作用域\nskills:\n  - demo\n---\n正文\n"
+              }
+            ]
+          },
+          "expect": {
+            "http": 400,
+            "code": 111002,
+            "message": "skills:／exclude_skills: 只对主助手有效（普通子代理没有技能目录）",
+            "data": null
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/tenants/{ten}/agents/import",
+          "body": {
+            "files": [
+              {
+                "name": "coder.md",
+                "content": "---\nname: coder\ndescription: 带作用域的主助手规格\nexclude_skills:\n  - demo\n---\n正文\n"
+              }
+            ]
+          },
+          "expect": {
+            "http": 201,
+            "code": 0,
+            "data": {
+              "agents": [
+                {
+                  "name": "coder",
+                  "skillPolicy": {
+                    "mode": "exclude",
+                    "names": [
+                      "demo"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "30-skill-disable",
+      "case": "用例 30",
+      "tier": "core",
+      "desc": "技能禁用（doc/52 E2）：PATCH enabled=false 写 skill_disables、列表/详情回 enabled:false；enable 撤销；viewer 403 111203；DELETE 同事务清禁用行（重装后回 enabled:true 为证）",
+      "steps": [
+        {
+          "op": "signup",
+          "no_model": true
+        },
+        {
+          "op": "seed_skill",
+          "name": "demo-off",
+          "skill_md": "---\nname: demo-off\ndescription: 禁用验收用例\n---\n正文：一条测试技能。\n"
+        },
+        {
+          "method": "POST",
+          "path": "/api/skills/rescan",
+          "body": {},
+          "expect": {
+            "http": 200,
+            "code": 0
+          }
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/skills/demo-off",
+          "body": {
+            "enabled": false
+          },
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data": {
+              "skill": {
+                "name": "demo-off",
+                "enabled": false
+              }
+            }
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/skills",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data_items_some": {
+              "path": "skills",
+              "match": {
+                "name": "demo-off",
+                "enabled": false
+              }
+            }
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/skills/demo-off",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data": {
+              "skill": {
+                "name": "demo-off",
+                "enabled": false
+              }
+            }
+          }
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/skills/demo-off",
+          "body": {
+            "enabled": true
+          },
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data": {
+              "skill": {
+                "name": "demo-off",
+                "enabled": true
+              }
+            }
+          }
+        },
+        {
+          "op": "invite_viewer"
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/skills/demo-off",
+          "tokenVar": "viewerTok",
+          "body": {
+            "enabled": false
+          },
+          "expect": {
+            "http": 403,
+            "code": 111203,
+            "message": "没有权限做这件事",
+            "data": null
+          }
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/skills/demo-off",
+          "auth": false,
+          "body": {
+            "enabled": false
+          },
+          "expect": {
+            "http": 401,
+            "code": 111102,
+            "message": "请先登录",
+            "data": null
+          }
+        },
+        {
+          "method": "PATCH",
+          "path": "/api/skills/demo-off",
+          "body": {
+            "enabled": false
+          },
+          "expect": {
+            "http": 200,
+            "code": 0
+          }
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/skills/demo-off",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data": {
+              "status": "deleted"
+            }
+          }
+        },
+        {
+          "op": "seed_skill",
+          "name": "demo-off",
+          "skill_md": "---\nname: demo-off\ndescription: 禁用验收用例\n---\n正文：一条测试技能。\n"
+        },
+        {
+          "method": "POST",
+          "path": "/api/skills/rescan",
+          "body": {},
+          "expect": {
+            "http": 200,
+            "code": 0
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/skills",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data_items_some": {
+              "path": "skills",
+              "match": {
+                "name": "demo-off",
+                "enabled": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "31-tools-write",
+      "case": "用例 31",
+      "tier": "core",
+      "desc": "工具上传写面（doc/52 D36 F1）：上传单文件到租户工具根（staging→.trash→rename）、同名覆盖、坏名/预留名/空文件 116117、额度不足 429 113001、viewer 只读 403、删除回 deleted 且列表消失；工具根不进表，列表就是扫盘",
+      "steps": [
+        {
+          "op": "signup",
+          "no_model": true
+        },
+        {
+          "op": "upload_tool",
+          "path": "/api/tools",
+          "name": "hello",
+          "content": "#!/bin/sh\necho hi\n",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "message": "",
+            "data": {
+              "tool": {
+                "name": "hello",
+                "exe": true,
+                "bytes": 18
+              }
+            }
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/tools",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data_items_some": {
+              "path": "tools",
+              "match": {
+                "name": "hello",
+                "exe": true,
+                "bytes": 18
+              }
+            }
+          }
+        },
+        {
+          "op": "upload_tool",
+          "path": "/api/tools",
+          "name": "hello",
+          "content": "#!/bin/sh\necho version-two\n",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data": {
+              "tool": {
+                "name": "hello",
+                "bytes": 27
+              }
+            }
+          }
+        },
+        {
+          "op": "upload_tool",
+          "path": "/api/tools",
+          "name": "../evil",
+          "content": "x\n",
+          "expect": {
+            "http": 400,
+            "code": 116117,
+            "message": "工具名只能是小写字母、数字和连字符（64 字符以内）",
+            "data": null
+          }
+        },
+        {
+          "op": "upload_tool",
+          "path": "/api/tools",
+          "name": "bash",
+          "content": "x\n",
+          "expect": {
+            "http": 400,
+            "code": 116117,
+            "message": "\"bash\" 是保留名，不能用作工具名",
+            "data": null
+          }
+        },
+        {
+          "op": "upload_tool",
+          "path": "/api/tools",
+          "name": "Bash",
+          "content": "x\n",
+          "expect": {
+            "http": 400,
+            "code": 116117
+          }
+        },
+        {
+          "op": "upload_tool",
+          "path": "/api/tools",
+          "name": "empty",
+          "content": "",
+          "expect": {
+            "http": 400,
+            "code": 116117,
+            "message": "上传的文件是空的",
+            "data": null
+          }
+        },
+        {
+          "sql": "UPDATE tenants SET max_storage_bytes = 1 WHERE id = '{ten}'"
+        },
+        {
+          "op": "upload_tool",
+          "path": "/api/tools",
+          "name": "quota",
+          "content": "x\n",
+          "expect": {
+            "http": 429,
+            "code": 113001,
+            "message": "这个工作区的额度用完了",
+            "data": null
+          }
+        },
+        {
+          "sql": "UPDATE tenants SET max_storage_bytes = 0 WHERE id = '{ten}'"
+        },
+        {
+          "method": "GET",
+          "path": "/api/tools",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data_items_some": {
+              "path": "tools",
+              "match": {
+                "name": "hello",
+                "bytes": 27
+              }
+            }
+          }
+        },
+        {
+          "op": "invite_viewer"
+        },
+        {
+          "op": "upload_tool",
+          "path": "/api/tools",
+          "name": "hello",
+          "tokenVar": "viewerTok",
+          "content": "x\n",
+          "expect": {
+            "http": 403,
+            "code": 111203,
+            "message": "没有权限做这件事",
+            "data": null
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/tools",
+          "tokenVar": "viewerTok",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data_items_some": {
+              "path": "tools",
+              "match": {
+                "name": "hello"
+              }
+            }
+          }
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/tools/nope",
+          "expect": {
+            "http": 404,
+            "code": 116119,
+            "message": "找不到这个工具",
+            "data": null
+          }
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/tools/hello",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data": {
+              "status": "deleted"
+            }
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/tools",
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data": {
+              "tools": []
+            }
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/api/tools",
+          "auth": false,
+          "expect": {
+            "http": 401,
+            "code": 111102,
+            "message": "请先登录",
+            "data": null
+          }
+        }
+      ]
     }
   ],
   "declared_not_asserted": {
+    "用例 30": "禁用对 run 的生效面（doc/52 E2）——目录里消失、use_skill/read_skill 回 116107、正在跑的 run 盒子不回缩，都只在真跑模型时出现，core tier 没有 HTTP 入口；纯函数与存储侧由 go test 的 skills_test.go（SetSkillDisabled 幂等、ListSkillDisables）与 skilltools_test.go（116107 信封逐字）钉住，活体字节见 19v6-04 用例 30",
     "用例 5": "单批上限 W —— 要用 -batch-window 3 特殊起引擎才造得出截断，默认 W=200 下这条断言没有意义；改引擎起法后手工重放",
     "用例 6": "工具循环（get_time）—— 断模型会不会真的去调工具，换个模型就飘；帧 kind 全集由 go test 的契约测试钉住",
     "用例 7": "委派子代理 —— 同上，模型是否委派不稳定；回传裁剪的机制断言在 doc/39 的活体抽验里",
     "用例 8": "任务看板的 task 帧 —— 要模型真的去调 TaskCreate/TaskUpdate 才造得出这条帧，模型行为不稳（换个模型就飘）；帧 kind 词表由 go test 的契约测试钉住，看板的持久化由 TestTaskBoardSurvivesProcessRestart 钉住（另一个 Store 实例读回同一批行）",
     "用例 9": "变更事件流（doc/46）—— SSE 长连接读取进不了短连接断言器：挂读/续传/双副本的活体断言由 scripts/acceptance/events_live.sh 判红；帧 data 字节由 go test 的 TestContractStreamEventBytes 钉住；游标语义（Last-Event-ID 续传、不带则从 $ 起不回放历史）见 doc/46 §3.3",
-    "用例 11": "question 帧与同轮注回（ask_user / submit_plan）—— 要模型真的调 ask_user 才造得出 question 帧与待答行，模型行为不稳（换个模型就飘）；帧 kind 词表由 go test 的契约测试钉住，挂起→答题→同轮继续与一答终答（409 115101）、崩溃续跑第三分支由 scripts/acceptance/question_crash.sh 判红"
+    "用例 11": "question 帧与同轮注回（ask_user / submit_plan）—— 要模型真的调 ask_user 才造得出 question 帧与待答行，模型行为不稳（换个模型就飘）；帧 kind 词表由 go test 的契约测试钉住，挂起→答题→同轮继续与一答终答（409 115101）、崩溃续跑第三分支由 scripts/acceptance/question_crash.sh 判红",
+    "用例 19": "read_skill 的工具结果形态（doc/52 B2）—— 成功走 `<skill …>正文</skill>` XML、失败走 JSON 信封（116001／116107／116116），这些字节只在「模型真的调了 read_skill」的 run 里出现，core tier 没有对应的 HTTP 路径，换个模型就飘；纯函数侧（frontmatter 切分、转义往返、16,384/16,385 token 与 64KB/64KB+1 两条边界、三个信封逐字）由 go test 的 skilltools_test.go 钉住，活体字节见 19v6-04 用例 19",
+    "用例 20": "技能围栏（doc/52 B3）—— use_skill 打开本场技能根的只读读权、bash 写拒／脚本可跑、新 run 与隔壁技能不可见、子代理空盒、出站开入站关、租户 MCP 同一条 profile：这些都在真跑一轮的 bash/use_skill/MCP 工具结果里，core tier 没有对应 HTTP 路径；profile 字节与只读/可见性由 go test 的 skillfence_test.go、skillbox_test.go、mcpfence_test.go 钉住，活体字节见 19v6-04 用例 20",
+    "用例 21": "技能资源与加载清单（doc/52 B4）—— read_skill_file 的文件/目录成功体、116115（超限不带部分内容）、116114（越界/入口文件/平铺同文案）与 GET /api/runs/:id/skills 的非空 rows 都只在「模型真的调了这些工具」的 run 里出现，core tier 没有对应 HTTP 路径；纯函数侧（cleanSkillRel、文件/目录形态、软链越界、64KB/16,384 token 边界、loadsFromEntries 的配对与键序）由 go test 的 skillresource_test.go 钉住，活体字节见 19v6-04 用例 21",
+    "用例 22": "任务看板的技能归属（doc/52 B5）—— task 帧带 skillName、看板行带「（技能：名字）」要模型真的先 use_skill 再 TaskCreate 才造得出；run_tasks 没有读端点，core tier 无法断言。纯函数与存储侧由 go test 钉住（skill_name 落库、视图行形态、touchedSkill、skill box 的挪尾与 usedSkillName），活体字节见 19v6-04 用例 22",
+    "用例 23": "看板跨 run 续做与执行权恢复（doc/52 B6/D34/D35）——「上一场」段要模型真去调 TaskList、执行权恢复要真跑 bash、崩溃段要 kill -9 与租约过期，模型行为与进程时序都不稳；纯函数与存储侧由 go test 钉住（TestPreviousBoardRunAndSkillNames / TestPreviousBoardView / TestRestoreSkillRoots / TestSkillBoxLastUsedOrder），活体字节见 19v6-04 用例 23",
+    "用例 24": "技能正文折叠标记与技能记录块（doc/52 B7/B8，D33/D31/D30）—— marker 要模型先 use_skill 再 TaskCreate、记录块要真折一次才进摘要，「下一枪正文是 marker」「摘要里有 <!-- tako:skill-ops v1 -->」「trim 是整块替换」都只在真跑 + 真压的 run 里出现，core tier 没有 HTTP 路径；纯函数侧（marker 重写、slimSkillBlocks 的只读不换、extract/inherit/merge/render 逐字、与 D33 marker 共存、三档块收口）由 go test 的 skillslim_test.go / skillops_test.go / compact_test.go 钉住，活体清单元件见 19v6-04 用例 24",
+    "用例 27": "对话内安装（doc/52 C3，D20/D24）—— skill_install 全程只提议：pending 行要模型真的调这个工具才造得出（换模型就飘），approve/cancel 的落盘要看 pending 行 id，core tier 没有「造一条 kind=install 行」的 HTTP 入口；纯函数与存储侧由 go test 的 skillask_test.go 钉住（staging 路径包含/EvalSymlinks、按提案选择、过期、discard），活体字节（viewer 403 111203、owner 200、重复 approve 409 115101、三种文本、use_skill 的 <skill …>、SSE 的 skills_changed）见 19v6-04 用例 27",
+    "用例 31": "工具上传的超限分支（doc/52 D36 F1）——>128MB 要在 core tier 里现造 129MB 请求体（机器真源里每条用例都会重跑，代价不成比例），只做活体验证：413 116118，盘上无新增；max_storage_bytes 限额走 SQL 步真断言（429 113001）。staging 清理与 .trash 旧目录靠行为证明（覆盖后 bytes 变、.trash 多一个目录），活体字节见 19v6-04 用例 31"
   }
 }

@@ -100,6 +100,8 @@ tmp/                   本地执行台账（已忽略，不入库）
 
 - [doc/README.md](doc/README.md)：文档索引——哪些是现行真源、哪些是归档、`docs/` 里的历史文章怎么读。
 - [doc/19-v6/19-运行引擎架构-v6.md](doc/19-v6/19-运行引擎架构-v6.md)：运行引擎架构入口。
+- [doc/53-模块地图.md](doc/53-模块地图.md)：代码结构索引——每个模块落在哪些文件、对应哪篇方案、有哪些问题档案。
+- [doc/problems/README.md](doc/problems/README.md)：设计决策档案库（43 条）——当时遇到什么问题、桌上有哪些候选、为什么这么裁、今天还成不成立。
 - [AGENTS.md](AGENTS.md)：协作与施工纪律——用例驱动的 loop、todos 交审后才 coding、验收写成 curl 与期望字节。
 
 ## 仓库

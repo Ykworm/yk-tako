@@ -275,6 +275,16 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		return nil, err
 	}
 	pool = append(pool, wrapToolErrors(submitPlan))
+	// 技能工具入池（doc/52 B1/B2/B3/B4/C3）：只进 manager 池——普通子代理的入口快照会剔掉
+	// 这四个保留名（skilltools.go dropSkillTools）。前三个读/用真身，skill_install 只暂存
+	// 提议、由人批准后经端点落盘（workspace 是媒体/租户根，staging 建在它下面）。
+	skillTools, err := newSkillTools(store, workspace)
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range skillTools {
+		pool = append(pool, wrapToolErrors(t))
+	}
 	// 摘要器在 agent 装配前构造（A4，planning 裁定 9）：midfoldHandler 要拿它的 summarize 方法值——
 	// mid-run 折叠与 prepareInput 的 Run fold 共用同一个摘要器、同一顶帽（C5-A7 分档）。
 	compactLimit := CompactLimitFor(compactWindow)
@@ -571,7 +581,7 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 	// resume 第三分支（doc/47 §3.3）：挂起中的问/方案行接回现场。必须在 watchdog 起跑之后——
 	// 继续等人期间租约照续，否则一次长等就把 run 判死。
 	if resume != nil {
-		if err := reconcileResumeWaits(ctx, w.store, runID, epoch, resume); err != nil {
+		if err := reconcileResumeWaits(ctx, w.store, w.workspace, runID, epoch, resume); err != nil {
 			log.Printf("resume waits %s/%s: %v", sessionID, runID, err)
 			status = "error"
 			return
@@ -594,6 +604,16 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 	ctx = withFileBaseline(ctx, newFileBaseline())
 	// 看板的 run 身份（C1）：一场 run 一块看板，四把工具从 ctx 取 run/session。
 	ctx = withTaskBox(ctx, newTaskBox(sessionID, runID))
+	// 本场用过的技能根（B3，D25）：use_skill 写、bash 的围栏读。子代理拿空盒（agents.go）。
+	ctx = withSkillBox(ctx, newSkillBox())
+	// 技能作用域（E1）：manager 那一行的 skills:／exclude_skills:。放在恢复之前——
+	// 作用域外的技能不该借「看板里有任务」把根补回围栏（目录看不见、bash 也不该开）。
+	if prof := profileFrom(ctx); prof != nil {
+		ctx = withSkillScope(ctx, prof.SkillPolicy)
+	}
+	// 执行权恢复（B6，D35）：看板里已建过任务的技能，装配期把根补回盒子——续跑看本 run 已重放的行，
+	// 新 run 看上一场。续跑走同一条 run，所以只写这一处。
+	w.restoreSkillRoots(ctx, sessionID, runID, resume != nil)
 
 	// 系统提示在抢闸之后才定：带了 profile 就用装配时定下的 spec，摘要也换到租户模型。
 	// 没带 profile 的单测仍读会话上的助手行。放在 EndRun 的 defer 之后，查不到助手时 return 仍会放闸。
@@ -731,7 +751,7 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 					}
 					// T3-2：子代理条目也收（root 的委派回传事件 agent 为空——它属于 root 的循环）。
 					turn = append(turn, TurnEntry{Role: "tool", Agent: agent, Text: out, ToolCallID: callID, ToolName: name, Model: entry.ref})
-					accepted, err := w.store.AppendFrame(ctx, runID, epoch, Frame{Kind: "tool_result", Agent: agent, Model: entry.ref, Name: name, Output: out})
+					accepted, err := w.store.AppendFrame(ctx, runID, epoch, Frame{Kind: "tool_result", Agent: agent, Model: entry.ref, Name: name, Output: out, ToolCallID: callID})
 					if err != nil {
 						log.Printf("frame %s/%s: %v", sessionID, runID, err)
 						status = "error"
@@ -818,7 +838,7 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 			// ToolCalls 逐条压 tool_call 帧，args 取模型原始 JSON 原文。
 			turn = append(turn, TurnEntry{Role: "assistant", Agent: agent, Text: merged.Content, ToolCalls: merged.ToolCalls, Model: entry.ref, Usage: bill})
 			for _, tc := range merged.ToolCalls {
-				accepted, err := w.store.AppendFrame(ctx, runID, epoch, Frame{Kind: "tool_call", Agent: agent, Model: entry.ref, Name: tc.Function.Name, Args: tc.Function.Arguments})
+				accepted, err := w.store.AppendFrame(ctx, runID, epoch, Frame{Kind: "tool_call", Agent: agent, Model: entry.ref, Name: tc.Function.Name, Args: tc.Function.Arguments, ToolCallID: tc.ID})
 				if err != nil {
 					log.Printf("frame %s/%s: %v", sessionID, runID, err)
 					status = "error"

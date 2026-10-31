@@ -144,6 +144,41 @@ def run_case(case, key, tally, only_print, seed):
                 return False
             continue
 
+        if op == "invite_viewer":
+            # 造一个「有身份但权限不够」的 viewer 并登录（doc/52 E2 的角色闸负路径）。
+            # 401 代替不了 403：前者是「没登录」，后者是「登录了、但角色不够」——两道闸，
+            # 只有真拿 viewer token 打一次才证明第二道在。
+            # 邮箱带时间戳：users 表邮箱全局唯一，固定串在第二轮会撞 ErrEmailTaken。
+            email = f"viewer_{time.time_ns()}@tako.test"
+            code, body = harness.call("POST", f"/api/tenants/{vars['ten']}/invitations",
+                                      {"email": email, "role": "viewer"}, token=vars.get("tok"))
+            if code != 201 or not isinstance(body, dict) or body.get("code") != 0:
+                tally.no(label, f"发邀请失败：HTTP {code} {body!r}")
+                return False
+            invite_token = body["data"]["inviteToken"]
+            code, body = harness.call("POST", "/api/auth/register-by-invite",
+                                      {"token": invite_token, "email": email, "password": "changeme123"})
+            if code != 201:
+                tally.no(label, f"注册 viewer 失败：HTTP {code} {body!r}")
+                return False
+            code, body = harness.call("POST", "/api/auth/login",
+                                      {"email": email, "password": "changeme123"})
+            if code != 200 or not isinstance(body, dict) or body.get("code") != 0:
+                tally.no(label, f"登录 viewer 失败：HTTP {code} {body!r}")
+                return False
+            # 新用户同时有自己的个人工作区，登录的 active tenant 不一定是被邀请的那个；
+            # 不切过去的话，后面拿他的名字解析到的是**另一个租户**（实为 404 116001，不是 403）。
+            access = body["data"]["accessToken"]
+            code, body = harness.call("POST", "/api/auth/switch-tenant",
+                                      {"tenantId": vars["ten"],
+                                       "refreshToken": body["data"]["refreshToken"]}, token=access)
+            if code != 200 or not isinstance(body, dict) or body.get("code") != 0:
+                tally.no(label, f"切到邀请方租户失败：HTTP {code} {body!r}")
+                return False
+            vars["viewerTok"] = body["data"]["accessToken"]
+            tally.ok(f"{label} viewer 就位")
+            continue
+
         if op == "wait_terminal":
             rid = resolve_path(step["run"], vars)
             deadline = time.time() + int(step.get("timeout", 90))
@@ -199,6 +234,61 @@ def run_case(case, key, tally, only_print, seed):
             tally.ok("%s 造文件 %s" % (label, wid))
             continue
 
+        if op == "seed_skill":
+            # 往本租户的技能根里造一个技能目录（doc/52）：<WS_ROOT>/tenants/<tid>/skills/<name>/SKILL.md。
+            # 造完要跟一步 POST /api/skills/rescan 才进表——盘是正文，表是目录。
+            name = resolve_path(step["name"], vars)
+            root = Path(harness.WS_ROOT) / "tenants" / vars["ten"] / "skills" / name
+            try:
+                (root / "SKILL.md").parent.mkdir(parents=True, exist_ok=True)
+                (root / "SKILL.md").write_text(step.get("skill_md", ""))
+            except OSError as e:
+                tally.no(label, "造技能失败：%s" % e)
+                return False
+            tally.ok("%s 造技能 %s" % (label, name))
+            continue
+
+        if op == "upload_tool":
+            # 工具上传（doc/52 D36 F1）：multipart 的 name 是**用户给的字段**，不是文件名；
+            # 文件体就是那一个可执行文件的字节。坏名/预留名/空文件/额度都靠这一条路造。
+            if step.get("tokenVar"):
+                token = vars.get(step["tokenVar"])
+            else:
+                token = vars.get("tok") if step.get("auth", True) else None
+            content = subst(step.get("content", ""), vars).encode()
+            http, body = harness.call_upload(
+                resolve_path(step["path"], vars), "tool.bin", content, token,
+                fields={"name": subst(step.get("name", ""), vars)})
+            if only_print:
+                print(f"  {label} upload_tool {step['path']} → HTTP {http} {json.dumps(body, ensure_ascii=False)[:300]}")
+                continue
+            if not check_step(step.get("expect", {}), http, body, vars, tally, label):
+                return False
+            continue
+
+        if op == "upload":
+            # 技能包上传（doc/52 C1）：包体是二进制 zip，清单里只写包内文件表，这里现打一个包。
+            # 这样「zip 穿越 / 缺 description / 正文超限」这些坏包也能进机器真源——
+            # 它们的判据就是**包体内容**，不能靠手搓一个固定 zip 放仓库里。
+            import io
+            import zipfile
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as z:
+                for name, text in (step.get("files") or {}).items():
+                    text = subst(text, vars)
+                    if step.get("fill_bytes"):
+                        # 正文超限用例：在文件末尾追加填充，撑到指定字节数。
+                        text = text + "填" * (int(step["fill_bytes"]) // 3)
+                    z.writestr(name, text)
+            http, body = harness.call_upload(
+                resolve_path(step["path"], vars), "pkg.zip", buf.getvalue(), vars.get("tok"))
+            if only_print:
+                print(f"  {label} upload {step['path']} → HTTP {http} {json.dumps(body, ensure_ascii=False)[:300]}")
+                continue
+            if not check_step(step.get("expect", {}), http, body, vars, tally, label):
+                return False
+            continue
+
         if "sql" in step and "method" not in step:
             # 独立的一步：只跑 SQL（造闸 / 收尾），没有请求跟着
             ok, out = harness.psql(resolve_path(step["sql"], vars))
@@ -217,7 +307,11 @@ def run_case(case, key, tally, only_print, seed):
 
         path = resolve_path(step["path"], vars)
         body_in = subst(step.get("body"), vars)
-        token = vars.get("tok") if step.get("auth", True) else None
+        if step.get("tokenVar"):
+            # 用另一个身份的 token 打（如 viewer）：值由 invite_viewer 之类的前置步塞进 vars。
+            token = vars.get(step["tokenVar"])
+        else:
+            token = vars.get("tok") if step.get("auth", True) else None
         http, body = harness.call(step["method"], path, body_in, token)
 
         for name, expr in (step.get("capture") or {}).items():

@@ -3,7 +3,7 @@
 // tk:events:<tid> = Stream：租户级易失通知设施——doc/46 §4 登记的第三个临时键。
 // 删除/改名成功后 XADD 一条 {type,id,at}；SSE 端点（B2）XREAD 挂读推给在线 client。
 // MAXLEN ~1000 有界截断、不带 TTL：事件被挤出或 Redis 重启即丢——这是设计不是缺陷
-//（doc/46 §3.1：拉是正确性，丢了全量拉追回真相）。租户归档时 DEL（流键无 TTL，不清理成残留）。
+// （doc/46 §3.1：拉是正确性，丢了全量拉追回真相）。租户归档时 DEL（流键无 TTL，不清理成残留）。
 //
 // 与前两个临时键的分工（doc/16 §2c 待扩行）：runlive/runepoch 是「run 存活态」（随 run 生灭），
 // 本键是「租户级易失通知」（随租户生灭），真源都是 PG。
@@ -23,11 +23,17 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// 事件 type 词表（doc/46 §7）：只发删除/改名；created 与创建者自己有关，发了是噪音。
+// 事件 type 词表（doc/46 §7）：只发删除/改名/创建这种「别人该失效」的变更。
+// skills_changed（doc/52 D24）在安装/删除成功后发——技能目录是每个 run 拼进 system prompt
+// 的派生视图，别的标签页与别的人需要知道「该重拉了」。
 const (
 	eventSessionDeleted   = "session_deleted"
 	eventWorkspaceDeleted = "workspace_deleted"
 	eventWorkspaceRenamed = "workspace_renamed"
+	eventSkillsChanged    = "skills_changed"
+	// tools_changed（doc/52 D36）：工具根变了。与 skills_changed 分开是**故意的**——
+	// 客户端按 type 决定重拉哪一页；合一个类型会让技能页为一次工具上传白拉一遍。
+	eventToolsChanged = "tools_changed"
 )
 
 // eventsMaxLen：流的有界截断（doc/46 §7 开放问题第 3 条的拍定值）。
@@ -40,10 +46,16 @@ func keyEvents(tenantID string) string { return keyPrefix + "events:" + tenantID
 // publishEvent 追加一条变更事件。失败只记日志——事件是优化不是真源（doc/46 §3.1），
 // 删除/改名在 PG 早已提交，不能反过来让请求失败。
 func (s *Server) publishEvent(ctx context.Context, tenantID, typ, id string) {
+	s.store.PublishEvent(ctx, tenantID, typ, id)
+}
+
+// PublishEvent 是事件写入的真身：放 Store 上，因为**安装**（doc/52 C3）在端点、工具、
+// 续跑对账三处都可能收尾，并不总有一个 *Server。失败只记日志。
+func (st *Store) PublishEvent(ctx context.Context, tenantID, typ, id string) {
 	if tenantID == "" || id == "" {
 		return
 	}
-	if err := s.store.rdb.XAdd(ctx, &redis.XAddArgs{
+	if err := st.rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: keyEvents(tenantID),
 		MaxLen: eventsMaxLen,
 		Approx: true,
@@ -81,7 +93,7 @@ type streamEvent struct {
 // 游标语义：新连接不带 Last-Event-ID = 从 `$` 挂起，只推**之后**的新事件——历史对刚 reconcile
 // 完的客户端无意义（真源是重拉），推了反而让它做无用失效；带 Last-Event-ID = 从它之后续读，
 // 断线重连不丢窗口内事件。挂读是 XREAD BLOCK：任何副本写的事件任何副本的连接都读得到
-//（共享 Redis，doc/46 §3.3 的多副本理由）；BLOCK 超时就再挂一轮，无事件期间不写字节。
+// （共享 Redis，doc/46 §3.3 的多副本理由）；BLOCK 超时就再挂一轮，无事件期间不写字节。
 func (s *Server) getEvents(c *gin.Context) {
 	p, ok := principalFrom(c)
 	if !ok {

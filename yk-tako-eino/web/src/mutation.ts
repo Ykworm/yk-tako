@@ -7,7 +7,15 @@
 import { readTenant, readToken, refreshAccessToken } from './auth'
 
 export type MutationEvent = {
-  type: 'session_deleted' | 'workspace_deleted' | 'workspace_renamed'
+  // skills_changed：租户级技能目录变了（doc/52 C3 / doc/46 §7.6）。id 是技能名。
+  // tools_changed：租户工具根变了（doc/52 F1）。与技能分开是让客户端知道重拉哪一页；
+  // 两个事件都只通知、不带状态，收到就重拉。
+  type:
+    | 'session_deleted'
+    | 'workspace_deleted'
+    | 'workspace_renamed'
+    | 'skills_changed'
+    | 'tools_changed'
   id: string
 }
 

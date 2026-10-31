@@ -14,13 +14,27 @@ export type Frame = {
   // 它的语义跟 'delta' 相反，别用同一套追加逻辑（见 chat.ts 的 resume 分支）。
   // 'task' = 看板结构帧（doc/41 §5.2）：text 是当前全量看板的紧凑视图，name 是触发它的工具名。
   // 'question' = 等帧（doc/47 §5.2）：run 挂起等人，messageId 是 run_questions 行 id。
-  kind: 'start' | 'delta' | 'usage' | 'terminal' | 'resume' | 'task' | 'question'
+  // 'tool_call' / 'tool_result' = 工具帧（19v6-01 §2）：name + args / output，配对键 toolCallId。
+  // 对话页只用它们画技能工具卡（doc/52 C5），别的工具帧不进气泡。
+  kind:
+    | 'start'
+    | 'delta'
+    | 'usage'
+    | 'terminal'
+    | 'resume'
+    | 'task'
+    | 'question'
+    | 'tool_call'
+    | 'tool_result'
   agent?: string
   model?: string
   messageId?: string
-  // 等帧的发起工具名（ask_user / submit_plan）与原始参数 JSON（options 从这里解析）。
+  // 等帧的发起工具名（ask_user / submit_plan）与原始参数 JSON（options 从这里解析）；
+  // 工具帧的 name 同样是工具名，args/output 是参数与结果原文。
   name?: string
   args?: string
+  output?: string
+  toolCallId?: string
   text?: string
   status?: string
   // usage 帧（doc/27 §4a）负载：账单缺失时引擎不发帧，这里不会出现全 0。
@@ -38,10 +52,14 @@ export type Usage = { promptTokens: number; completionTokens: number; window: nu
 export type Row = {
   runlogOffset?: number
   runId: RunID
-  // 工具执行账本行（tool_call / tool_result）也在 runlog 里；对话界面只画 user/assistant。
+  // 工具执行账本行（tool_call / tool_result）也在 runlog 里；对话界面只画 user/assistant，
+  // 例外是技能工具（doc/52 C5）——它们的 payload 被解析成工具卡。
   role: 'user' | 'assistant' | 'tool_call' | 'tool_result'
   messageId?: string
   text: string
+  // 工具行的结构化负载（tool_call: {name,args,toolCallId}；tool_result: {name,output,toolCallId}）。
+  // assistant 行的 payload 被后端解成 usage 后清空，不会出现在这里。
+  payload?: string
   // assistant 行的 provider 账单（后端从 payload 列解出注入；user/tool 行不写该字段）。
   usage?: Usage
 }
@@ -139,12 +157,17 @@ export type LogResponse = {
 export type QuestionRow = {
   questionId: string
   runId: RunID
-  kind: 'question' | 'plan'
+  // kind=install 是对话内安装的确认行（doc/52 C3）：args 存程序解析出的候选全表与选中集。
+  kind: 'question' | 'plan' | 'install'
   question: string
   args: string
   status: 'pending' | 'answered' | 'stale'
   // 方案行的审批结论（doc/47 §5.3）：approve / revise；问题行与 pending 行不写。
-  decision?: 'approve' | 'revise'
+  // 安装行同用这两值：approve=装、cancel 由答案端点直接写成文字（这里不出现）。
+  decision?: 'approve' | 'revise' | 'cancel'
+  // 只给安装行（doc/52 C5）：程序在批准后写回的结果文本（「已安装技能：x。」或失败原因）。
+  // 刷新后卡片靠它复述结果；其他 kind 不返回。
+  answer?: string
   createdAt: string
 }
 
@@ -368,19 +391,19 @@ export function getQuestions(runId: RunID, status?: string): Promise<QuestionRow
 // POST /api/questions/{id}/answer：一答终答（CAS）。409 115101 = 已被别的入口答过。
 // decision 只给方案行：approve（可带改写全文）/ revise（驳回意见）。问题行不传。
 export type QuestionDecision = 'approve' | 'revise'
+// kind=install 的行**额外**回 answer：程序在 CAS 之后同步装盘，装的结果（已安装／已过期／
+// 同名冲突）就是这句话（doc/52 C3）。问题行与方案行不写这个键，契约不变。
+export type AnswerResult = { questionId: string; status: string; answer?: string }
 export function postAnswer(
   questionId: string,
   answer: string,
-  decision?: QuestionDecision,
-): Promise<{ questionId: string; status: string }> {
-  return request<{ questionId: string; status: string }>(
-    `/api/questions/${encodeURIComponent(questionId)}/answer`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ answer, ...(decision ? { decision } : {}) }),
-    },
-  )
+  decision?: QuestionDecision | 'cancel',
+): Promise<AnswerResult> {
+  return request<AnswerResult>(`/api/questions/${encodeURIComponent(questionId)}/answer`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ answer, ...(decision ? { decision } : {}) }),
+  })
 }
 
 // POST /api/runs/{runId}/stop：叫停一场正在跑的 run（doc/17 §4）。
@@ -403,3 +426,168 @@ export function stopRun(runId: RunID): Promise<{ status: string }> {
 export function postResume(runId: RunID): Promise<ResumeResult> {
   return request<ResumeResult>(`/api/runs/${encodeURIComponent(runId)}/resume`, { method: 'POST' })
 }
+
+// —— 技能（doc/52 §6.1）——
+// 字段序是契约（name→description→source→path→enabled→bytes→requires→missing→updatedAt→valid）。
+// enabled 是服务端从 skill_disables 派生的；missing 是**本副本此刻**按过滤后的 PATH 现算的
+// （doc/52 D1），不是表里的列——换一台副本可能就不一样。
+export type Skill = {
+  name: string
+  description: string
+  source: string
+  path: string
+  enabled: boolean
+  bytes: number
+  requires: string[]
+  missing: string[]
+  updatedAt: string
+  valid: boolean
+}
+
+export type InvalidSkill = { path: string; reason: string }
+export type SkillsResponse = { skills: Skill[]; invalid: InvalidSkill[] }
+export type SkillDetail = { skill: Skill; body: string }
+// 一条依赖的检查结果（doc/52 D1）：path 只在 found 时出现，且是**本副本**解析到的真实路径。
+export type SkillDependency = { name: string; found: boolean; path?: string }
+export type SkillCheckResponse = { dependencies: SkillDependency[]; checkedOn: string }
+export type SkillRootInfo = { path: string; scope: string; exists: boolean; count: number; error: string }
+export type SkillRescanResponse = {
+  added: string[]
+  updated: string[]
+  removed: string[]
+  invalid: InvalidSkill[]
+  roots: SkillRootInfo[]
+}
+export type SkillInstallResponse = {
+  installed: { name: string; dependencies: SkillDependency[]; warnings: string[] }[]
+  warnings: string[]
+}
+
+export function listSkills(): Promise<SkillsResponse> {
+  return request<SkillsResponse>('/api/skills')
+}
+
+export function getSkill(name: string): Promise<SkillDetail> {
+  return request<SkillDetail>(`/api/skills/${encodeURIComponent(name)}`)
+}
+
+// GET /api/skills/:name/check：在当前副本重查依赖（doc/52 D1）。只读，所有成员都能调。
+export function checkSkill(name: string): Promise<SkillCheckResponse> {
+  return request<SkillCheckResponse>(`/api/skills/${encodeURIComponent(name)}/check`)
+}
+
+// PATCH 只动 skill_disables，不碰正文与行；回整行（enabled 已是新值）。
+export function patchSkill(name: string, enabled: boolean): Promise<{ skill: Skill }> {
+  return request<{ skill: Skill }>(`/api/skills/${encodeURIComponent(name)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  })
+}
+
+export function deleteSkill(name: string): Promise<DeleteStatus> {
+  return request<DeleteStatus>(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' })
+}
+
+export function rescanSkills(): Promise<SkillRescanResponse> {
+  return request<SkillRescanResponse>('/api/skills/rescan', { method: 'POST' })
+}
+
+// 预览与安装（doc/52 §6.5 C2/C5）：三种输入——来源串、整条 npx 命令、本地包——走同两个端点。
+// preview 只解析不写盘；install 多做原子落盘。
+//
+// source.url 是**实际要抓的地址**（GitLab 默认分支已解析过），卡片上要能核对它到底去哪拿了东西。
+export type SkillPreviewSource = {
+  kind: string
+  owner: string
+  namespace: string
+  repo: string
+  ref: string
+  subpath: string
+  url: string
+}
+// 一行候选。bytes 是整个技能目录的字节和、files 是目录里的普通文件数（与装完列表里的
+// bytes 同一个口径）；description 是 frontmatter 原文，卡片上按需截断。
+export type SkillPreviewEntry = {
+  name: string
+  description: string
+  bytes: number
+  files: number
+  requires: string[]
+}
+// selected = 按这份输入会装哪几个（预览卡据此打勾，用户可改）；ambiguous = 多候选且输入没选。
+export type SkillPreviewResponse = {
+  source: SkillPreviewSource
+  skills: SkillPreviewEntry[]
+  selected: string[]
+  ambiguous: boolean
+  warnings: string[]
+}
+
+export type SkillInstallInput = { source?: string; command?: string; skills: string[] }
+
+export function previewSkills(input: { source?: string; command?: string }): Promise<SkillPreviewResponse> {
+  return request<SkillPreviewResponse>('/api/skills/preview', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  })
+}
+
+export function previewSkillPackage(file: File): Promise<SkillPreviewResponse> {
+  const fd = new FormData()
+  fd.append('file', file)
+  return request<SkillPreviewResponse>('/api/skills/preview', { method: 'POST', body: fd })
+}
+
+export function installSkills(input: SkillInstallInput): Promise<SkillInstallResponse> {
+  return request<SkillInstallResponse>('/api/skills/install', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  })
+}
+
+// 上传包的安装：文件与「装哪几个」一起上行（skills 逐个 append，all=true 表示全装）。
+export function installSkillPackage(
+  file: File,
+  skills: string[],
+  all = false,
+): Promise<SkillInstallResponse> {
+  const fd = new FormData()
+  fd.append('file', file)
+  if (all) fd.append('all', 'true')
+  for (const name of skills) fd.append('skills', name)
+  return request<SkillInstallResponse>('/api/skills/install', { method: 'POST', body: fd })
+}
+
+// —— 租户工具（doc/52 D36 F1/F2）——
+// 盘就是真源：`<tenant>/tools/<name>/bin/<name>`，不进表、没有 rescan。
+// exe 是服务端按文件模式位现算的（false = 装上了但没执行位，run 里会 command not found）；
+// path 是本副本盘上的真实路径，只在管理页核对用。
+export type TenantTool = {
+  name: string
+  exe: boolean
+  path: string
+  bytes: number
+  updatedAt: string
+}
+export type ToolsResponse = { tools: TenantTool[] }
+
+export function listTools(): Promise<ToolsResponse> {
+  return request<ToolsResponse>('/api/tools')
+}
+
+// 名字是用户字段、不是上传文件名：服务端白名单 `^[a-z0-9][a-z0-9-]{0,63}$` 且拒保留名。
+// 同名上传 = 覆盖（旧目录进 `.trash`，rename 原子），正在跑的 run 下一枪就用新字节。
+export function uploadTool(name: string, file: File): Promise<{ tool: TenantTool }> {
+  const fd = new FormData()
+  fd.append('name', name)
+  fd.append('file', file)
+  return request<{ tool: TenantTool }>('/api/tools', { method: 'POST', body: fd })
+}
+
+export function deleteTool(name: string): Promise<DeleteStatus> {
+  return request<DeleteStatus>(`/api/tools/${encodeURIComponent(name)}`, { method: 'DELETE' })
+}
+

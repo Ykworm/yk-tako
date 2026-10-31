@@ -24,6 +24,9 @@ type RunProfile struct {
 	Translator  Translator
 	Instruction string
 	Tools       []tool.BaseTool
+	// SkillPolicy 是这只 manager 的技能作用域（E1）：目录按它过滤，worker.Run 塞进 ctx
+	// 供三个技能工具在解析时判。零值 = inherit（不写就是全量）。
+	SkillPolicy SkillPolicy
 	ConfigVer   string
 	KeyFP       string
 	// Provider 是目录里的厂商 id。图片 token 目前只有 deepseek 有计算器。
@@ -155,6 +158,14 @@ func (s *Server) assembleRun(ctx context.Context, p principal, agentID string) (
 	if agent.ID != "" {
 		instruction = agent.Spec
 	}
+	// 技能目录拼在 manager 的 Instruction 之后（doc/52 §2.2）：只 manager 有——
+	// 子代理的 Instruction 来自规格文件，装配在 agents.go，不经这里。
+	// 读库失败只记日志、不拦 run：目录是「看得见有哪些技能」，少它不该让整场跑不起来
+	// （与记忆召回同一条线：横切支撑不是主流程硬依赖）。
+	skillPolicy := parseSkillPolicy(agent.SkillPolicy)
+	if catalog := s.skillCatalogBlock(ctx, p.TenantID, skillPolicy); catalog != "" {
+		instruction = instruction + "\n\n" + catalog
+	}
 	prof := &RunProfile{
 		TenantID:    p.TenantID,
 		UserID:      p.UserID,
@@ -164,6 +175,7 @@ func (s *Server) assembleRun(ctx context.Context, p principal, agentID string) (
 		Translator:  TranslatorFor(built.Protocol),
 		Instruction: instruction,
 		Tools:       filtered,
+		SkillPolicy: skillPolicy,
 		ConfigVer:   configVersion(raw),
 		KeyFP:       built.KeyFP,
 		Provider:    built.Provider,

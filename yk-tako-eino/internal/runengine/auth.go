@@ -114,12 +114,12 @@ const (
 	// 14 项目与工作区，15 人审与问答。1110xx 参数，1111xx 登录与 token，1112xx 权限，1114xx 冲突，
 	// 1119xx 这一模块的内部失败；1120xx 资源缺失，1121xx 会话与运行的冲突；
 	// 1130xx 配额与准入；1140xx 项目，1141xx 项目里的文件；1150xx 人审与问答。
-	codeBadJSON          = 111001
-	codeBadInput         = 111002
-	codeNameRequired     = 111003
+	codeBadJSON      = 111001
+	codeBadInput     = 111002
+	codeNameRequired = 111003
 	// 111004：入口图片不合法（mime 白名单外／base64 解不开／超 5MB／超 4 张）。
 	// 原因文字进 data.reason，不进 message（doc/40 §3 规则 3）。
-	codeBadMedia         = 111004
+	codeBadMedia = 111004
 	// 111005：mcp.json 读不出来。旧的 400 直接把 Go 原始错误串当 body 吐出来，
 	// 那是机器细节；现在固定 message，细节进 data.reason。
 	codeBadMcpConf       = 111005
@@ -145,7 +145,7 @@ const (
 	codeAgentTaken       = 111412
 	codeSessionMissing   = 112001
 	// 112002：run 不可见。doc/28 §5.4 早已定码，这里补上代码里的常量。
-	codeRunMissing = 112002
+	codeRunMissing   = 112002
 	codeAgentMissing = 112003
 	// 112101：这场会话已有活 run，发消息撞闸。
 	// ⚠️ 与 codeSessionBusy（114007）不是一回事：114007 是「删除会话时这场会话有活 run」
@@ -157,18 +157,18 @@ const (
 	codeRunAlive = 112103
 	// 112104：续跑次数用尽，提示重发。
 	codeResumeExhausted = 112104
-	codeQuota = 113001
+	codeQuota           = 113001
 	// 113003：单条消息超准入线。limit 与 tokens 进 data，message 只放人话。
-	codeMessageTooLarge = 113003
+	codeMessageTooLarge  = 113003
 	codeWorkspaceMissing = 114001
 	// 114002 退役。删除项目不再因为「还有会话」拒绝。码位留着，没有任何路径返回它。
 	codeWorkspaceNotEmpty     = 114002
 	codeWorkspaceNameRequired = 114003
 	// codeWorkspaceBusy（114004「项目正在另一场会话里运行」）已退役：2026-10-22 项目闸
 	// 随跨成员共享项目一起取消（doc/42）。同名项目并发不再被拒——改由文件级防护兜。
-	codeWorkspaceDefault      = 114005
-	codeWorkspaceBusyLive     = 114006
-	codeSessionBusy           = 114007
+	codeWorkspaceDefault  = 114005
+	codeWorkspaceBusyLive = 114006
+	codeSessionBusy       = 114007
 	// 114101：media 的文件真的不存在（旧的一个 not_found 字符串拆出来的四种语义之一）。
 	codeMediaMissing = 114101
 	// 114102：media 的 path 不是 workspaces/<wid>/… 格式，或越出工作区。
@@ -177,7 +177,45 @@ const (
 	codeQuestionMissing = 115002
 	// 115101：问题行已答过/已失效——CAS 影响 0 行（一答终答）。
 	codeQuestionAnswered = 115101
-	codeInternal         = 111901
+	// 116001：技能不存在（doc/52 §6.2）。
+	codeSkillMissing = 116001
+	// 116101：技能名/markdown 结构不合法。
+	codeSkillNameBad = 116101
+	// 116102：缺 description。
+	codeSkillNoDescription = 116102
+	// 116103：description 超过 1024 字符。
+	codeSkillDescriptionTooLong = 116103
+	// 116104：frontmatter 解析失败。
+	codeSkillFrontmatterBad = 116104
+	// 116105：安装包不合法（zip 穿越/软链/超限/坏 frontmatter）。
+	codeSkillPackageBad = 116105
+	// 116106：同名冲突（本租户视界内已有同名）或目标是系统技能（只读）。
+	codeSkillConflict = 116106
+	// 116107：技能已被本租户禁用（read_skill／use_skill 调用时）。
+	codeSkillDisabled = 116107
+	// 116108：来源里有多个技能，必须选（skills 或 all）。
+	codeSkillAmbiguous = 116108
+	// 116109：来源／命令不支持（未知子命令、shell 元字符、SSH、私网地址、服务端本地路径）。
+	codeSkillSourceBad = 116109
+	// 116110：拉取来源失败（网络、上游 4xx/5xx、超时）。
+	codeSkillFetchFailed = 116110
+	// 116111：包里没找到技能（没有含 SKILL.md 的目录）。
+	codeSkillPackageEmpty = 116111
+	// 116113：安装包超限（下载字节、解压总量、文件数、层级）。
+	codeSkillPackageTooLarge = 116113
+	// 116114：read_skill_file 读不到这个路径（入口文件请用 read_skill；含越界、平铺形态没有资源目录）。
+	codeSkillPathBad = 116114
+	// 116115：资源文件超过单次读取上限（16,384 token 或 64KB，不截断）。
+	codeSkillFileTooLarge = 116115
+	// 116116：正文超过上下文预算（16,384 token 或 64KB，不截断）。
+	codeSkillBodyTooLarge = 116116
+	// 116117：工具上传参数不合法（名字不合规则、预留名 bash/sh/env、空文件）。
+	codeToolBadInput = 116117
+	// 116118：工具文件超限（单文件 >128MB）。
+	codeToolTooLarge = 116118
+	// 116119：找不到这个工具。
+	codeToolMissing = 116119
+	codeInternal    = 111901
 )
 
 var emailPattern = regexp.MustCompile(`^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$`)

@@ -536,6 +536,10 @@ func newMidfoldHandler(counter TokenCounter, window, limit int,
 // 折叠失败（errStillOver / 摘要失败）与断言违例都返回错误：run 走 status=error、零写入（裁定 7）。
 func (h *midfoldHandler) BeforeModelRewriteState(ctx context.Context, state *adk.ChatModelAgentState, mc *adk.ModelContext) (context.Context, *adk.ChatModelAgentState, error) {
 	box := foldBoxFrom(ctx)
+	// 正文让位（B7，doc/52 D33）：放在最上面，五个出口（含休眠与未超线）自动全覆盖——
+	// 它不是压缩档，-compact-window=0 时照样执行；也必须排在数输入之前，否则数的是没换过的形状。
+	// 只吃 state.Messages 与容器里的 base，不查库、不动折叠算法。
+	slimSkillBlocks(box, state)
 	if box == nil {
 		return ctx, state, nil
 	}
@@ -556,6 +560,8 @@ func (h *midfoldHandler) BeforeModelRewriteState(ctx context.Context, state *adk
 		rewritten := append([]*schema.Message{state.Messages[0]}, toSchemaMessages(slot)...)
 		state.Messages = append(rewritten, state.Messages[rescuedLen:]...)
 		box.setBase(slot)
+		// 换上的 slot 是 guard 自己攒的旧 state，可能还带着没让位的正文——换完再判一次。
+		slimSkillBlocks(box, state)
 		stripReasoning(state.Messages)
 		return ctx, state, nil
 	}

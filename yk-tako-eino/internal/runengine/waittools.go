@@ -111,8 +111,11 @@ func emitQuestionFrame(ctx context.Context, store *Store, runID RunID, epoch int
 // questionToolName 从行 kind 还原发起工具名（帧 name）。kind 与工具当前是 1:1，表不另存列
 // （doc/47 §5.1）。
 func questionToolName(kind string) string {
-	if kind == questionKindPlan {
+	switch kind {
+	case questionKindPlan:
 		return "submit_plan"
+	case questionKindInstall:
+		return "skill_install"
 	}
 	return "ask_user"
 }
@@ -186,7 +189,7 @@ func planRevisionText(feedback string) string {
 //     答案回来后把重放里该调用的 tool 行换成答案/批准文。
 //
 // 调用点在 watchdog 起跑之后：继续等人期间租约照续，进程仍可再次被 kill、下次 resume 再接。
-func reconcileResumeWaits(ctx context.Context, store *Store, runID RunID, epoch int64, resume *journalReplay) error {
+func reconcileResumeWaits(ctx context.Context, store *Store, mediaRoot string, runID RunID, epoch int64, resume *journalReplay) error {
 	approve := func() error {
 		if err := store.SetPlanMode(ctx, runID, epoch, false); err != nil {
 			return fmt.Errorf("批准后解除计划模式失败: %w", err)
@@ -212,7 +215,8 @@ func reconcileResumeWaits(ctx context.Context, store *Store, runID RunID, epoch 
 			return fmt.Errorf("恢复等待 %s: %w", row.ID, err)
 		}
 		text := answered.Answer
-		if row.Kind == questionKindPlan {
+		switch row.Kind {
+		case questionKindPlan:
 			if answered.Decision == questionDecisionRevise {
 				text = planRevisionText(answered.Answer)
 			} else {
@@ -220,6 +224,17 @@ func reconcileResumeWaits(ctx context.Context, store *Store, runID RunID, epoch 
 				if err := approve(); err != nil {
 					return err
 				}
+			}
+		case questionKindInstall:
+			// 安装行的副作用已在回答端点做过（CAS 赢下后由程序落盘并把结果写回 answer）。
+			// 这里**不重跑安装**：answer 空串 = 端点崩在买票之后、落盘之前，宁可说
+			// 「结果未知」让人重发，也不在续跑里悄悄装第二次（重复安装 = 二次写盘）。
+			if answered.Decision == questionDecisionCancel {
+				text = skillInstallCanceledText
+				discardInstallProposal(store, mediaRoot, row.TenantID, row.Args)
+			} else if strings.TrimSpace(answered.Answer) == "" {
+				text = skillInstallUnknownText
+				discardInstallProposal(store, mediaRoot, row.TenantID, row.Args)
 			}
 		}
 		patchReplayToolText(resume, row.ToolCallID, text)
@@ -258,6 +273,11 @@ func waitForAnswer(ctx context.Context, store *Store, id string) (RunQuestion, e
 			}
 			switch row.Status {
 			case questionStatusAnswered:
+				// 安装行的「已答」分两段：端点先 CAS 买票（answer 空串 = 正在落盘），
+				// 装完才把结果写回 answer。空串再等一轮，不把「正在装」当结果交给模型。
+				if row.Kind == questionKindInstall && strings.TrimSpace(row.Answer) == "" {
+					continue
+				}
 				return row, nil
 			case questionStatusStale:
 				return RunQuestion{}, fmt.Errorf("这个问题已经失效（run 已结束或被清扫）")

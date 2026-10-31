@@ -356,11 +356,14 @@ func (s *Store) lockTenantGate(tx *gorm.DB, tenantID string) error {
 type toolCallPayload struct {
 	Name string `json:"name"`
 	Args string `json:"args"`
+	// ToolCallID 与帧同名字段同源（doc/52 B1）：历史行与帧用同一套配对键。
+	ToolCallID string `json:"toolCallId,omitempty"`
 }
 
 type toolResultPayload struct {
-	Name   string `json:"name"`
-	Output string `json:"output"`
+	Name       string `json:"name"`
+	Output     string `json:"output"`
+	ToolCallID string `json:"toolCallId,omitempty"`
 }
 
 // EndRun 是 run 侧动作的唯一入口（doc/19-v6 index 概念表「run 结束」；§8.4 endRun 行）：
@@ -401,7 +404,7 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, ep
 		// 两类工具行的 INSERT 构造（complete 与 stopped 两分支共用同一条 SQL，字段序一致）：
 		// seq 取会话内 MAX+1（与会话其他写行同式）。
 		insertToolResult := func(e TurnEntry) error {
-			payload, err := json.Marshal(toolResultPayload{Name: e.ToolName, Output: e.Text})
+			payload, err := json.Marshal(toolResultPayload{Name: e.ToolName, Output: e.Text, ToolCallID: e.ToolCallID})
 			if err != nil {
 				return err
 			}
@@ -418,7 +421,7 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, ep
 		insertToolCalls := func(e TurnEntry, calls []schema.ToolCall) error {
 			agentSQL, modelSQL := nullable(e.Agent), nullable(e.Model)
 			for _, tc := range calls {
-				payload, err := json.Marshal(toolCallPayload{Name: tc.Function.Name, Args: tc.Function.Arguments})
+				payload, err := json.Marshal(toolCallPayload{Name: tc.Function.Name, Args: tc.Function.Arguments, ToolCallID: tc.ID})
 				if err != nil {
 					return err
 				}

@@ -39,6 +39,10 @@ type Server struct {
 	// resumeMax 是单场 run 的续跑上限（-resume-max，doc/30 A1）：GET /api/runs/{id} 的
 	// resumable = interrupted && resumeCount < resumeMax。A1 只读侧用它，A4a 的 claim 同值裁决。
 	resumeMax int
+	// systemSkillsDir 是系统技能根（doc/52 §4.2）：默认 <workspace>/system-skills，
+	// 部署时由发布流程同步到这块卷上，应用只读。A2 只用它做全量 rescan 的扫描范围；
+	// 团队技能根由 -workspace 推导，不另设旗标。
+	systemSkillsDir string
 	// auth 是身份面。业务路由挂 RequireAuth；mcp/media/memory 在有归属模型前只放 system admin。
 	auth *Auth
 }
@@ -82,8 +86,8 @@ func accessLogLine(p gin.LogFormatterParams) string {
 // 不变量：两个**对齐游标**各自只在自己的端点前进；往上滚翻旧历史用的是**临时翻页游标**，
 // 拉完即弃，不回退对齐游标。实时性 = 客户端轮询节奏（dev 建议 300–500ms），服务端无长连接、
 // 无推送、无 heartbeat。两个拉取端点一律有界：单批上限 W（-batch-window，dev 默认 200）。
-func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMax int, auth *Auth) *gin.Engine {
-	s := &Server{store: store, w: batchWindow, worker: worker, mediaRoot: worker.Workspace(), mcpConfPath: defaultMcpConfPath, resumeMax: resumeMax, auth: auth}
+func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMax int, auth *Auth, systemSkillsDir string) *gin.Engine {
+	s := &Server{store: store, w: batchWindow, worker: worker, mediaRoot: worker.Workspace(), mcpConfPath: defaultMcpConfPath, resumeMax: resumeMax, systemSkillsDir: systemSkillsDir, auth: auth}
 	r := gin.New()
 	r.Use(gin.LoggerWithFormatter(accessLogLine), gin.Recovery())
 	r.POST("/api/auth/signup", s.auth.Signup)
@@ -110,6 +114,8 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 	r.GET("/api/events", authn, s.getEvents)
 	r.GET("/api/runs/:runId/frames", authn, s.getFrames)
 	r.GET("/api/runs/:runId/stream", authn, s.getRunStream)
+	// 技能加载记录（doc/52 B1）：本拍只证端点通（loads 恒空），B4 从 runlog 派生。
+	r.GET("/api/runs/:runId/skills", authn, s.getRunSkills)
 	r.GET("/api/sessions/:id/log", authn, s.getSessionLog)
 	r.GET("/api/mcp/servers", authn, sys, s.getMcpServers)
 	r.GET("/api/media", authn, s.getMedia)
@@ -117,6 +123,30 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 	r.GET("/api/memory/jobs", authn, s.getMemoryJobs)
 	r.GET("/api/memory/dialogue", authn, s.getMemoryDialogue)
 	r.GET("/api/memory/recall", authn, s.getMemoryRecall)
+	// 技能目录（doc/52 §6.1）。租户从 principal 取——端点没有 :tenantId 路径参数，
+	// 租户只能来自 token，否则就是个越权面。列表/详情：租户内所有成员可读。
+	r.GET("/api/skills", authn, s.getSkills)
+	// 详情（doc/52 §6.1 A4）：名字按租户视界解析；查不到与「别人的技能」同回 404 116001。
+	r.GET("/api/skills/:name", authn, s.getSkill)
+	r.GET("/api/skills/:name/check", authn, s.getSkillCheck)
+	r.PATCH("/api/skills/:name", authn, s.auth.RequireTenantRole("admin"), s.patchSkill)
+	// 重扫（doc/52 §6.1）：同一个端点两条路——系统管理员走全量（系统根 + 所有租户根），
+	// 租户 owner/admin 走本租户。系统管理员**不必**是某个租户的成员，所以这里不挂
+	// RequireTenantRole（它会把运维账号挡在外面）；角色判定在 handler 里按身份分支。
+	r.POST("/api/skills/rescan", authn, s.postSkillsRescan)
+	// 来源预览（doc/52 §6.1 / §6.5 C2）：只解析不写盘，任何成员可用——
+	// 它不产生任何持久状态，拦在读面只会让普通成员的「先看看要装什么」多一道门。
+	r.POST("/api/skills/preview", authn, s.postSkillsPreview)
+	// 安装 / 更新 / 删除（doc/52 §6.1 C1）：写面只给租户 owner/admin。
+	// 系统技能只读——系统根由发布流程同步，租户装不上也删不掉（handler 回 116106）。
+	r.POST("/api/skills/install", authn, s.auth.RequireTenantRole("admin"), s.postSkillsInstall)
+	r.POST("/api/skills/:name/update", authn, s.auth.RequireTenantRole("admin"), s.postSkillUpdate)
+	r.DELETE("/api/skills/:name", authn, s.auth.RequireTenantRole("admin"), s.postSkillDelete)
+	// 工具写面（doc/52 §6.1、D36 F1）：工具根不进表，列表就是扫盘。
+	// 所有成员可读；上传/删除只给 owner/admin（viewer 403 111203）。
+	r.GET("/api/tools", authn, s.getTools)
+	r.POST("/api/tools", authn, s.auth.RequireTenantRole("admin"), s.postTools)
+	r.DELETE("/api/tools/:name", authn, s.auth.RequireTenantRole("admin"), s.deleteTool)
 	r.POST("/api/tenants", authn, s.createTenant)
 	r.POST("/api/workspaces", authn, s.postWorkspaces)
 	r.GET("/api/workspaces", authn, s.listWorkspaces)
@@ -989,6 +1019,33 @@ func (s *Server) getRunStatus(c *gin.Context) {
 //
 // 未知 run **故意不返 404**：「从未存在」与「TTL 到期删除」不区分，都是 200 gone——
 // 客户端两种情况的动作本来相同（转拉 log），区分它没有价值。
+// getRunSkills = GET /api/runs/{runId}/skills（doc/52 §6.1）：这场 run 加载过哪些技能。
+//
+//	200 {"code":0,"message":"","data":{"runId":"r_…","loads":[{"toolCallId":"…","name":"demo","tool":"read_skill","agent":"","seq":7,"ok":true}]}}
+//	404 {"code":112002,"message":"找不到这次运行","data":null}
+//
+// B4 起从 runlog 的 read_skill/use_skill/read_skill_file 行派生（store.SkillLoads）。
+// 鉴权同 frames：按 run 的会话可见性判，看不见与不存在同字节。
+func (s *Server) getRunSkills(c *gin.Context) {
+	v := s.viewRun(c, RunID(c.Param("runId")))
+	if v.written {
+		return
+	}
+	if !v.Found || v.Kind == accessNone {
+		writeEnvelope(c, http.StatusNotFound, codeRunMissing, "找不到这次运行", nil)
+		return
+	}
+	loads, err := s.store.SkillLoads(c.Request.Context(), RunID(c.Param("runId")))
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", runSkillsData{
+		RunID: RunID(c.Param("runId")),
+		Loads: loads,
+	})
+}
+
 func (s *Server) getFrames(c *gin.Context) {
 	from := queryOffset(c, "eventOffset")
 	v := s.viewRun(c, RunID(c.Param("runId")))

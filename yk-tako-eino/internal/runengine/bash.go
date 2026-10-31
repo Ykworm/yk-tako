@@ -24,7 +24,10 @@ const bashOutputCap = 32 * 1024
 
 // bashEnvWhitelist 是子进程环境白名单：引擎进程里可能有厂商 API Key 等密钥，
 // tool_result 与 runlog 行是永久历史——env 全量透传 = 密钥进永久库。
-var bashEnvWhitelist = []string{"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"}
+//
+// PATH 不在这里：它由 subprocessPath 单独给（doc/52 D39），只留围栏读得到的目录。
+// 原样透传宿主的 PATH 会让 `~/.pyenv/shims/python3` 被找到、执行时被围栏拒成 EPERM。
+var bashEnvWhitelist = []string{"HOME", "TMPDIR", "LANG", "LC_ALL"}
 
 // bashIn 是 bash 的入参 schema：由 InferTool 按 struct tag 反射生成。
 type bashIn struct {
@@ -90,6 +93,7 @@ func runBash(ctx context.Context, workspace, command string, timeout time.Durati
 		return "", err
 	}
 	defer cleanup()
+	cmd.Env = append(cmd.Env, "PATH="+subprocessPath(workspace, toolsRootFor(ctx, workspace)))
 	for _, k := range bashEnvWhitelist {
 		if v, ok := os.LookupEnv(k); ok {
 			cmd.Env = append(cmd.Env, k+"="+v)
