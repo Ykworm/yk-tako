@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowReactive, shallowRef, watch } from 'vue'
 import { useChat, type AskQuestion, type Bubble, type ToolCard } from './chat'
+import { MAX_CHATS, pickEviction } from './chatpool'
 import {
   ApiError,
   getSessionSubagents,
@@ -10,6 +11,7 @@ import {
   stopRun,
   type MediaRef,
   type RunID,
+  type SessionID,
   type SessionListItem,
   type SkillPreviewSource,
   type SubagentItem,
@@ -57,12 +59,112 @@ const page = ref<Page>(readPage())
 watch(page, (value) => sessionStorage.setItem('tako.page', value))
 const configPage = computed<'agents' | 'team'>(() => (page.value === 'team' ? 'team' : 'agents'))
 
-const {
-  sessionId, bubbles, draft, attachments, pending, loadingOlder, atStart, busy,
-  activeWorkspaceId, sessionGone,
-  send, reconcile, loadOlder, newSession, showTenantSession, resumeRun,
-  setActiveWorkspace, openSession, closeOnDeleted, answerQuestion,
-} = useChat()
+type ChatInstance = ReturnType<typeof useChat>
+
+// 多会话并发（doc/60）：每个打开过的会话一个 useChat 实例，切走只是换 activeChat，
+// 旧实例的轮询、草稿、排队、游标都留在原地。模板与旧逻辑继续用同名变量，读写都落到 activeChat。
+const chatList = shallowReactive<ChatInstance[]>([])
+const activeChat = shallowRef<ChatInstance>(useChat())
+chatList.push(activeChat.value)
+// 实例最后被激活的时刻：上限淘汰按它挑「最久没看」的（A4）。
+const lastSeen = new WeakMap<ChatInstance, number>()
+
+const sessionId = computed(() => activeChat.value.sessionId.value)
+const bubbles = computed(() => activeChat.value.bubbles.value)
+const attachments = computed(() => activeChat.value.attachments.value)
+const pending = computed(() => activeChat.value.pending.value)
+const loadingOlder = computed(() => activeChat.value.loadingOlder.value)
+const atStart = computed(() => activeChat.value.atStart.value)
+const busy = computed(() => activeChat.value.busy.value)
+const activeWorkspaceId = computed(() => activeChat.value.activeWorkspaceId.value)
+const sessionGone = computed(() => activeChat.value.sessionGone.value)
+const draft = computed({
+  get: () => activeChat.value.draft.value,
+  set: (value: string) => {
+    activeChat.value.draft.value = value
+  },
+})
+
+const send = () => activeChat.value.send()
+const loadOlder = () => activeChat.value.loadOlder()
+const reconcile = () => activeChat.value.reconcile()
+const resumeRun = (b: Bubble) => activeChat.value.resumeRun(b)
+const answerQuestion = (q: AskQuestion, answer: string, decision?: 'approve' | 'revise' | 'cancel') =>
+  activeChat.value.answerQuestion(q, answer, decision)
+const setActiveWorkspace = (id: string | null) => activeChat.value.setActiveWorkspace(id)
+const showTenantSession = () => activeChat.value.showTenantSession()
+
+// 丢实例：停轮询、清队列、移出池。只给「切走空白实例 / 会话被删 / 换租户 / 超上限」用。
+function dropChat(c: ChatInstance) {
+  c.setActive(false)
+  c.dispose()
+  const i = chatList.indexOf(c)
+  if (i >= 0) chatList.splice(i, 1)
+  lastSeen.delete(c)
+}
+
+// 超过上限时淘汰「有 sid、不在跑、没草稿、最久没看」的实例；没有可淘汰的就先留着。
+function enforceCap() {
+  while (chatList.length > MAX_CHATS) {
+    const entries = chatList.map((c) => ({
+      sessionId: c.sessionId.value,
+      busy: c.busy.value,
+      dirty: c.draft.value.trim() !== '' || c.attachments.value.length > 0,
+      lastActiveAt: lastSeen.get(c) ?? 0,
+    }))
+    const i = pickEviction(entries, MAX_CHATS, chatList.indexOf(activeChat.value))
+    if (i < 0) return
+    dropChat(chatList[i])
+  }
+}
+
+// 切到指定实例。空白实例没有回到它的入口（无 sid、侧栏不列），切走即丢弃，不留在后台当幽灵。
+function activate(next: ChatInstance) {
+  const prev = activeChat.value
+  if (prev === next) {
+    lastSeen.set(next, Date.now())
+    return
+  }
+  prev.setActive(false)
+  next.setActive(true)
+  activeChat.value = next
+  lastSeen.set(next, Date.now())
+  if (!prev.sessionId.value) dropChat(prev)
+  enforceCap()
+}
+
+// 打开某场会话：本 tab 已经开着就只切过去（保留草稿/排队/正在流的气泡），否则新建实例拉一次。
+async function openChat(id: string) {
+  let inst = chatList.find((c) => c.sessionId.value === id)
+  if (!inst) {
+    inst = useChat()
+    chatList.push(inst)
+  }
+  activate(inst)
+  if (inst.sessionId.value !== id) await inst.openSession(id as SessionID)
+  await nextTick()
+  scrollBottom()
+}
+
+// 新对话：有 sid 的当前实例留后台继续跑；当前是空白实例时，activate 会把它丢掉（草稿按确认框的约定已确认丢弃）。
+function startNewChat(workspaceId?: string | null) {
+  const landing = workspaceId !== undefined ? workspaceId : activeChat.value.activeWorkspaceId.value
+  const next = useChat()
+  next.setActiveWorkspace(landing)
+  chatList.push(next)
+  activate(next)
+  page.value = 'chat'
+  focusComposer()
+}
+
+// 换租户 / 退出：本 tab 的旧会话全部作废，换一份干净实例。
+function resetAllChats() {
+  for (const c of [...chatList]) dropChat(c)
+  const fresh = useChat()
+  chatList.push(fresh)
+  activeChat.value = fresh
+  lastSeen.set(fresh, Date.now())
+}
 
 // —— 等人面板（doc/47 §5.2，2026-10-23 按 kimi 交互重做）——
 // 待答记录可能不止一条（驳回方案后模型会重新提交；并行 ask_user 也会有多条），
@@ -385,10 +487,9 @@ function todoLabel(status: string): string {
 onMutation((evt) => {
   if (evt.type === 'session_deleted') {
     // 侧栏只在切会话/收尾时重拉，剪掉这一条否则死链一直躺着（点进去是空对话 + 404）。
-    removeSessionFromTree(evt.id)
-    closeOnDeleted(evt.id)
-  } else if (evt.type === 'workspace_deleted' && activeWorkspaceId.value === evt.id) {
-    setActiveWorkspace(null)
+    onSessionDeleted(evt.id)
+  } else if (evt.type === 'workspace_deleted') {
+    onWorkspaceDeleted({ id: evt.id })
   }
 })
 
@@ -609,9 +710,7 @@ async function openRecentSession(id: string) {
   void closeDrawer(false)
   if (id === sessionId.value) return
   page.value = 'chat'
-  await openSession(id)
-  await nextTick()
-  scrollBottom()
+  await openChat(id)
 }
 
 function syncMobile() {
@@ -749,8 +848,10 @@ function logout() {
 // undefined = 没有待切换的项目（普通「新对话」，沿用当前落点）；null = 明确回默认项目。
 const pendingWorkspace = ref<string | null | undefined>(undefined)
 
-function hasDirtyChat(): boolean {
-  return bubbles.value.length > 0 || draft.value.trim() !== '' || attachments.value.length > 0
+// 多会话后「新开一段」不再丢掉有 sid 的对话——它留在侧栏后台继续跑。
+// 只有「还没发出去的一段」（无 sid 且有草稿/附件）真的会丢：这种实例不在侧栏里，没处点回来。
+function hasUnsentDraft(): boolean {
+  return !sessionId.value && (draft.value.trim() !== '' || attachments.value.length > 0)
 }
 
 function focusComposer() {
@@ -762,10 +863,8 @@ function focusComposer() {
 
 function requestNewSession() {
   pendingWorkspace.value = undefined
-  if (!hasDirtyChat()) {
-    newSession()
-    page.value = 'chat'
-    focusComposer()
+  if (!hasUnsentDraft()) {
+    startNewChat()
     return
   }
   askNew.value = true
@@ -773,11 +872,9 @@ function requestNewSession() {
 
 function confirmNewSession() {
   askNew.value = false
-  if (pendingWorkspace.value !== undefined) setActiveWorkspace(pendingWorkspace.value)
+  const landing = pendingWorkspace.value
   pendingWorkspace.value = undefined
-  newSession()
-  page.value = 'chat'
-  focusComposer()
+  startNewChat(landing)
 }
 
 function cancelNewSession() {
@@ -787,33 +884,62 @@ function cancelNewSession() {
 
 // 项目页「开新对话」：先切落点，再判断当前对话要不要确认丢弃。
 function startChatInProject(workspaceId: string | null) {
-  if (!hasDirtyChat()) {
-    setActiveWorkspace(workspaceId)
-    newSession()
-    page.value = 'chat'
-    focusComposer()
+  if (!hasUnsentDraft()) {
+    startNewChat(workspaceId)
     return
   }
   pendingWorkspace.value = workspaceId
   askNew.value = true
 }
 
+// 空对话的落点选择器（A3b）：列表直接复用侧栏的项目数据，不新增接口。
+// 默认项目可能从未写进 localStorage（null），渲染时把它显示成默认项目本身。
+const landingOptions = computed(() => sidebarGroups.value.map((g) => g.workspace))
+const landingValue = computed(
+  () =>
+    activeWorkspaceId.value ??
+    landingOptions.value.find((w) => w.isDefault)?.id ??
+    landingOptions.value[0]?.id ??
+    '',
+)
+function onPickLanding(ev: Event) {
+  const id = (ev.target as HTMLSelectElement).value
+  setActiveWorkspace(id || null)
+}
+
+// 侧栏「运行中」：本 tab 里正在跑的实例（本地 busy），收口后自动消失，不重拉列表。
+const runningIds = computed(
+  () => new Set(chatList.filter((c) => c.busy.value && c.sessionId.value).map((c) => c.sessionId.value as string)),
+)
+
 async function openSessionFromProjects(id: string) {
   page.value = 'chat'
-  await openSession(id)
-  await nextTick()
-  scrollBottom()
+  await openChat(id)
 }
 
-// 删的正是当前会话：清空对话页（落点不变，下一场新对话还落同一个项目）。
+// 删除一场会话：后台实例直接丢；正在看的那场保留实例、清成空白并显示死因横幅（落点不变）。
+function discardChat(id: string) {
+  const inst = chatList.find((c) => c.sessionId.value === id)
+  if (!inst) return
+  if (inst === activeChat.value) {
+    inst.closeOnDeleted(id)
+    return
+  }
+  dropChat(inst)
+}
+
 function onSessionDeleted(id: string) {
-  if (sessionId.value === id) newSession()
+  removeSessionFromTree(id)
+  discardChat(id)
 }
 
-// 删项目连带的会话：当前项目清空、当前会话若在名单里也清空。
-function onWorkspaceDeleted(payload: { id: string; sessionIds: string[] }) {
-  if (activeWorkspaceId.value === payload.id) setActiveWorkspace(null)
-  if (sessionId.value && payload.sessionIds.includes(sessionId.value)) newSession()
+// 删项目连带的会话：名单里的实例全丢；所有把它当落点的实例退回默认项目。
+// 跨窗口事件只带项目 id，没有 sessionIds——用「落点 = 该项目」认出本 tab 里属于它的会话。
+function onWorkspaceDeleted(payload: { id: string; sessionIds?: string[] }) {
+  const ids = new Set(payload.sessionIds ?? [])
+  for (const c of chatList) if (c.activeWorkspaceId.value === payload.id && c.sessionId.value) ids.add(c.sessionId.value)
+  for (const sid of ids) discardChat(sid)
+  for (const c of [...chatList]) if (c.activeWorkspaceId.value === payload.id) c.setActiveWorkspace(null)
 }
 
 function applyStarter(text: string) {
@@ -1235,7 +1361,7 @@ watch(
 
 watch(authState, async (ok) => {
   if (!ok) {
-    newSession()
+    resetAllChats()
     cancelNewSession()
     menuOpen.value = false
     return
@@ -1259,6 +1385,8 @@ watch(
   () => tenant.value.id,
   async (id, prev) => {
     if (!loggedIn.value || !id || !prev || id === prev) return
+    // 换租户：旧租户的所有实例（含后台轮询）立即作废，再按新租户的存储键重建一场。
+    resetAllChats()
     await showTenantSession()
     await loadTenants()
     await nextTick()
@@ -1327,7 +1455,7 @@ async function onScroll() {
           新对话
         </button>
         <div v-if="askNew" class="pop" role="dialog" aria-labelledby="new-chat-title">
-          <p id="new-chat-title">新开一段会忘掉浏览器里记住的当前对话。</p>
+          <p id="new-chat-title">这段还没发出去，新开后会丢。</p>
           <div class="pop-actions">
             <button type="button" class="pop-go" @click="confirmNewSession">仍然新开</button>
             <button type="button" class="pop-stay" @click="cancelNewSession">取消</button>
@@ -1399,6 +1527,7 @@ async function onScroll() {
         <p v-else-if="!treeGroups.length" class="recent-note">还没有项目。</p>
         <div v-else class="tree">
           <div v-for="g in treeGroups" :key="g.key" class="tree-group">
+            <div class="tree-project-row">
             <button
               type="button"
               class="tree-project"
@@ -1414,6 +1543,15 @@ async function onScroll() {
               <span class="tree-name">{{ g.name }}</span>
               <span v-if="g.isDefault" class="tree-badge">默认</span>
             </button>
+            <button
+              v-if="g.key !== 'loose'"
+              type="button"
+              class="tree-new"
+              :aria-label="`在 ${g.name} 新建对话`"
+              :title="`在「${g.name}」里开新对话`"
+              @click="startChatInProject(g.key)"
+            >＋</button>
+            </div>
             <ul v-if="!collapsed.has(g.key) && visibleSessions(g).length" class="recent-list tree-sessions">
               <li v-for="s in visibleSessions(g)" :key="s.id">
                 <button
@@ -1424,6 +1562,7 @@ async function onScroll() {
                   @click="openRecentSession(s.id)"
                 >
                   <span class="recent-title">{{ s.title || '未命名对话' }}</span>
+                  <span v-if="runningIds.has(s.id)" class="recent-run" title="运行中">运行中</span>
                   <span class="recent-time">{{ fmtDateTime(s.createdAt) }}</span>
                 </button>
               </li>
@@ -1925,6 +2064,20 @@ async function onScroll() {
               @paste="onPaste"
             />
             <div class="composer-bar">
+              <!-- 空对话的落点（A3b）：发过消息后会话已由服务端绑定项目，选择器收起。 -->
+              <label v-if="!sessionId && landingOptions.length" class="landing-pick">
+                <span>项目</span>
+                <select
+                  :value="landingValue"
+                  aria-label="新对话落在哪个项目"
+                  @change="onPickLanding"
+                  @keydown.enter.prevent
+                >
+                  <option v-for="w in landingOptions" :key="w.id" :value="w.id">
+                    {{ w.name }}{{ w.isDefault ? '（默认）' : '' }}
+                  </option>
+                </select>
+              </label>
               <button
                 type="button"
                 class="icon-btn"
@@ -2256,11 +2409,18 @@ async function onScroll() {
   flex-direction: column;
   gap: 0.1rem;
 }
+/* 项目行 = 折叠按钮 + 「＋」新对话；外层用 flex 是为了不把 button 套进 button。 */
+.tree-project-row {
+  display: flex;
+  align-items: center;
+  gap: 0.1rem;
+}
 .tree-project {
   display: flex;
   align-items: center;
   gap: 0.35rem;
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   height: 34px;
   border: 0;
   background: transparent;
@@ -2270,6 +2430,21 @@ async function onScroll() {
 }
 .tree-project:hover {
   background: var(--hover);
+}
+.tree-new {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.95rem;
+  line-height: 1;
+}
+.tree-new:hover {
+  background: var(--hover);
+  color: var(--accent-ink);
 }
 /* 展开/折叠两态各用一个文件夹图标：项目行与会话行字号接近，靠图标认层级。 */
 .tree-folder {
@@ -2352,6 +2527,16 @@ async function onScroll() {
   font-size: var(--text-xs);
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+}
+/* 本 tab 里这场还在跑（doc/60 A5）：显性文字，不用小圆点。 */
+.recent-run {
+  flex: none;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  padding: 0 0.3rem;
+  font-size: 0.68rem;
+  line-height: 1.35;
+  color: var(--accent-ink);
 }
 .recent-more {
   align-self: flex-start;
@@ -3166,6 +3351,25 @@ async function onScroll() {
 }
 .chip-x:hover { color: var(--danger); }
 .composer-bar { gap: var(--space-2); padding-left: 0.1rem; }
+/* 空对话的落点选择（doc/60 A3b）：跟发送按钮同一行，选中即写当前实例的落点。 */
+.landing-pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex: none;
+  font-size: var(--text-xs);
+  color: var(--muted);
+}
+.landing-pick select {
+  max-width: 9rem;
+  height: 26px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  color: var(--ink);
+  font-size: var(--text-xs);
+  padding: 0 0.3rem;
+}
 .icon-btn,
 .send {
   width: 32px;

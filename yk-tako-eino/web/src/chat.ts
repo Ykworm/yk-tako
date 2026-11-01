@@ -333,6 +333,14 @@ export function useChat() {
   // 新对话落点（doc/44 §2.2）：null = 让服务端挂默认项目。
   const activeWorkspaceId = ref<string | null>(readStoredWorkspace())
 
+  // 多会话并发（台账 60）：每个实例一份状态。active = 当前屏幕上显示的那个。
+  // 只有 active 实例能写「最后打开的会话/项目」两个存储键——后台实例收口时不许
+  // 把用户正在看的会话改回去。单实例阶段默认 true；管理器接入后用 setActive 切换。
+  const active = ref(true)
+  function setActive(v: boolean) {
+    active.value = v
+  }
+
   // 对齐游标：只在拉 log 时前进（19v6-02 不变量）。翻页游标是 loadOlder 里的临时值，不碰它。
   let runlogOffset = 0
   // 已渲染最老一行的 offset（含本 tab 乐观渲染的气泡所对应的行）；0 = 还没渲染任何历史。
@@ -381,7 +389,7 @@ export function useChat() {
   // 切当前项目只改「下一场新对话落哪」；已经打开的会话不跟着换项目。
   function setActiveWorkspace(id: string | null) {
     activeWorkspaceId.value = id
-    writeStoredWorkspace(id, readTenant().id)
+    if (active.value) writeStoredWorkspace(id, readTenant().id)
   }
 
   // 打开项目页里的一场会话：丢掉屏幕上的旧对话，按同一个 reconcile 四步重建。
@@ -398,8 +406,8 @@ export function useChat() {
     runlogOffset = 0
     oldestOffset = 0
     atStart.value = true
-    writeStoredSession(id, readTenant().id)
-    return reconcile()
+    if (active.value) writeStoredSession(id, readTenant().id)
+    return reconcile(id)
   }
 
   // 队列泵（19v6-01 §1「409 = 客户端本地排队、本轮收口后补投」）：本 tab 有 run 在跑、
@@ -426,8 +434,12 @@ export function useChat() {
   function dropSession() {
     const id = sessionId.value
     sessionId.value = null
-    localStorage.removeItem(tenantSessionKey(readTenant().id))
-    if (id && localStorage.getItem(LS_SESSION) === id) localStorage.removeItem(LS_SESSION)
+    // 后台实例不许动存储键：那个键属于用户正在看的会话。
+    if (active.value) {
+      const key = tenantSessionKey(readTenant().id)
+      if (localStorage.getItem(key) === id) localStorage.removeItem(key)
+      if (id && localStorage.getItem(LS_SESSION) === id) localStorage.removeItem(LS_SESSION)
+    }
     runlogOffset = 0
     oldestOffset = 0
     atStart.value = true
@@ -474,7 +486,7 @@ export function useChat() {
     busy.value = true
     try {
       const resp = await postWithFreshSession(p)
-      writeStoredSession(resp.sessionId, tenantAtSend)
+      if (active.value) writeStoredSession(resp.sessionId, tenantAtSend)
       if (token !== pollToken) return
       sessionId.value = resp.sessionId
       assistant.runId = resp.runId
@@ -817,14 +829,15 @@ export function useChat() {
 
   // reconcile（19v6-02 四步）：查状态 → 窗口化补历史 → 有活 run 则 frames(0) 重建半截气泡。
   // 返回是否真的打开了一场会话（项目页「打开」据此判断，失败时对话页保持空）。
-  async function reconcile(): Promise<boolean> {
+  async function reconcile(id?: SessionID): Promise<boolean> {
     sessionGone.value = ''
     // 连点防护：openSession/showTenantSession/newSession 都会 pollToken++ 后清空气泡，
     // 中途进来的那次 reconcile 必须在每个 await 之后认令牌失效就退场，否则历史会重复渲染。
     const token = pollToken
     // 当前项目按当前租户的存储重读：登录/切租户后不能留着上一个租户的项目 id。
-    activeWorkspaceId.value = readStoredWorkspace()
-    const sid = readStoredSession()
+    // 后台实例不读这个键——它属于用户正在看的那个实例。
+    if (active.value) activeWorkspaceId.value = readStoredWorkspace()
+    const sid = id ?? readStoredSession()
     if (!sid) return false
     let status
     try {
@@ -1063,6 +1076,15 @@ export function useChat() {
     }
   }
 
+  // 丢弃这个实例（会话被删 / 换租户 / 超上限淘汰）：停轮询、清队列；气泡随实例一起丢。
+  function dispose() {
+    pollToken++
+    pending.value = []
+    pendingTools.clear()
+    busy.value = false
+    loadingOlder.value = false
+  }
+
   function newSession() {
     pollToken++
     dropSession()
@@ -1078,9 +1100,10 @@ export function useChat() {
 
   return {
     sessionId, bubbles, draft, attachments, busy, pending, loadingOlder, atStart,
-    activeWorkspaceId, sessionGone,
+    activeWorkspaceId, sessionGone, active,
     send, reconcile, loadOlder, newSession, showTenantSession, resumeRun,
     setActiveWorkspace, openSession, closeOnDeleted, answerQuestion,
+    setActive, dispose,
   }
 }
 

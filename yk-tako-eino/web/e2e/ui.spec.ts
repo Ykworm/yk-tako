@@ -6,7 +6,7 @@ import { login } from './helpers'
 
 test('侧边栏有最近会话，能直接回到旧对话', async ({ page }) => {
   await login(page)
-  const recent = page.getByRole('region', { name: '最近会话' })
+  const recent = page.getByRole('region', { name: '会话' })
   await expect(recent).toBeVisible()
   // 列表里至少有一场（开发库里有历史会话）；标题不能是空
   const first = recent.locator('.recent-item').first()
