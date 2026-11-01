@@ -54,14 +54,20 @@ export type Bubble = {
   // 都落在这里。驳回后模型重交方案会产生新 id，所以是数组而不是单字段。
   // 面板的草稿/选中态是纯视图状态，留在 App.vue，不污染对话数据。
   questions?: AskQuestion[]
-  // tools 是本轮技能工具卡（doc/52 C5）：只收 read_skill / use_skill / read_skill_file。
-  // 别的工具（bash、read_file…）不进气泡——它们的账本行留在库里给模型用，页面不演终端。
+  // tools 是本轮的工具调用（doc/59）：每次调用一张卡，`web_search` / `web_fetch` /
+  // `read_file` / `bash` 与技能三件同一份；默认一行摘要，展开看参数与回执原文。
   tools?: ToolCard[]
+  // 第一张卡出现在正文之前 → 卡片画在正文上方。历史面恒为真：runlog 的 root 正文行
+  // 是整场 Σ 出来的一行、最后才写（store.go writeTurnRows），工具行全在它前面；
+  // 实时路径看工具帧是否早于第一个 delta。
+  toolsFirst?: boolean
+  // 历史气泡的行号（= key 里的 offset）。翻页时用来判定工具行是否早于它所属的气泡。
+  logOffset?: number
 }
 
-// 一张技能工具卡。callId 是配对键（帧与 runlog 行同一个 toolCallId）；
-// output 是工具回执原文——模型看到的就是它（D33 之后是 marker，不是重新读盘）。
-export type ToolCard = { callId: string; name: string; args: string; output?: string }
+// 一张工具卡。callId 是配对键（帧与 runlog 行同一个 toolCallId）；
+// output 是工具回执原文——模型看到的就是它（D33 之后技能正文是 marker，不是重新读盘）。
+export type ToolCard = { callId: string; name: string; args: string; output?: string; agent?: string }
 
 export type AskQuestion = {
   id: string
@@ -236,24 +242,26 @@ function upsertQuestion(b: Bubble, q: AskQuestion) {
   list[i] = { ...list[i], ...q }
 }
 
-// 技能工具名：卡片只认这三个（doc/52 C5）。skill_install 不在里面——它是等人卡，不是工具卡。
-const SKILL_TOOL_NAMES = new Set(['read_skill', 'use_skill', 'read_skill_file'])
+// 工具事件 → 工具卡的增量（doc/59）：帧与 runlog 两条路径共用这一个形状。
+// 不按工具名丢帧——`web_search` / `web_fetch` / `bash` 与技能三件一样进气泡；
+// 名字只影响标签措辞（App.vue 的 toolCardLabel）。
+type ToolEvent = { callId: string; name: string; args?: string; output?: string; agent?: string }
 
-// toolFrameEvent 把一帧工具事件翻成卡片的增量；不是技能工具就返回 null（不进气泡）。
-function toolFrameEvent(f: Frame): { callId: string; name: string; args?: string; output?: string } | null {
+function toolFrameEvent(f: Frame): ToolEvent | null {
   if (f.kind !== 'tool_call' && f.kind !== 'tool_result') return null
-  if (!f.toolCallId || !f.name || !SKILL_TOOL_NAMES.has(f.name)) return null
+  if (!f.toolCallId || !f.name) return null
   return {
     callId: f.toolCallId,
     name: f.name,
     args: f.kind === 'tool_call' ? (f.args ?? '') : undefined,
     output: f.kind === 'tool_result' ? (f.output ?? '') : undefined,
+    agent: f.agent || undefined,
   }
 }
 
 // toolRowEvent 是同一条事件的 runlog 形态（刷新/翻页时用）：payload 是结构化 JSON，
 // text 是给人看的 `name(args)` 或结果原文——payload 缺了就退回 text。
-function toolRowEvent(r: Row): { callId: string; name: string; args?: string; output?: string } | null {
+function toolRowEvent(r: Row): ToolEvent | null {
   if (r.role !== 'tool_call' && r.role !== 'tool_result') return null
   let p: { name?: string; args?: string; output?: string; toolCallId?: string } = {}
   try {
@@ -261,28 +269,53 @@ function toolRowEvent(r: Row): { callId: string; name: string; args?: string; ou
   } catch {
     return null
   }
-  if (!p.name || !p.toolCallId || !SKILL_TOOL_NAMES.has(p.name)) return null
+  if (!p.name || !p.toolCallId) return null
   return {
     callId: p.toolCallId,
     name: p.name,
     args: r.role === 'tool_call' ? (p.args ?? r.text) : undefined,
     output: r.role === 'tool_result' ? (p.output ?? r.text) : undefined,
+    agent: r.agent || undefined,
   }
 }
 
+// 一批行里只要有回执找不到同批的调用行，那张工具卡就只有输出、拿不到参数
+// （调用先于回执落账，它一定在更早一页）：调用方据此把窗口再往更早扩一页。
+function hasUnpairedToolResult(rows: Row[]): boolean {
+  const calls = new Set<string>()
+  for (const r of rows) {
+    const ev = toolRowEvent(r)
+    if (ev && r.role === 'tool_call') calls.add(ev.callId)
+  }
+  for (const r of rows) {
+    const ev = toolRowEvent(r)
+    if (ev && r.role === 'tool_result' && !calls.has(ev.callId)) return true
+  }
+  return false
+}
+
 // mergeTool 把一次 call/result 叠到气泡的工具列表上（按 callId 配对；顺序按首次出现）。
-function mergeTool(b: Bubble, ev: { callId: string; name: string; args?: string; output?: string }) {
+function mergeTool(b: Bubble, ev: ToolEvent) {
   if (!b.tools) {
     b.tools = []
   }
   const list = b.tools
   const hit = list.find((x) => x.callId === ev.callId)
   if (!hit) {
-    list.push({ callId: ev.callId, name: ev.name, args: ev.args ?? '', ...(ev.output !== undefined ? { output: ev.output } : {}) })
+    // 第一张卡到达时正文还一个字都没有 → 这次调用发生在任何文本之前，卡片排到正文上方。
+    if (!b.text) b.toolsFirst = true
+    list.push({
+      callId: ev.callId,
+      name: ev.name,
+      args: ev.args ?? '',
+      ...(ev.output !== undefined ? { output: ev.output } : {}),
+      ...(ev.agent ? { agent: ev.agent } : {}),
+    })
     return
   }
   if (ev.args && !hit.args) hit.args = ev.args
   if (ev.output !== undefined) hit.output = ev.output
+  if (ev.agent && !hit.agent) hit.agent = ev.agent
 }
 
 export function useChat() {
@@ -294,7 +327,7 @@ export function useChat() {
   const pending = ref<Pending[]>([])
   // 工具行可能先于气泡到达（翻页时 tool_call 行排在它那场的 assistant 行之前）：
   // 按 runId 排队的卡片事件，等那场的气泡出现再合并。
-  const pendingTools = new Map<RunID, { callId: string; name: string; args?: string; output?: string }[]>()
+  const pendingTools = new Map<RunID, ToolEvent[]>()
   const loadingOlder = ref(false)
   const atStart = ref(true)
   // 新对话落点（doc/44 §2.2）：null = 让服务端挂默认项目。
@@ -551,11 +584,10 @@ export function useChat() {
           const row = f.messageId ? questionRows.get(f.messageId) : undefined
           if (!row || row.status === 'pending') upsertQuestion(assistant, questionFromFrame(f))
         }
-        // 技能工具帧（doc/52 C5）：call 与 result 按 toolCallId 配成一张卡；子代理的跳过。
-        if (!f.agent) {
-          const tev = toolFrameEvent(f)
-          if (tev) mergeTool(assistant, tev)
-        }
+        // 工具帧（doc/59）：call 与 result 按 toolCallId 配成一张卡；子代理的也收，
+        // 卡片上用 agent 字段标出是谁调的。
+        const tev = toolFrameEvent(f)
+        if (tev) mergeTool(assistant, tev)
         if (f.kind === 'terminal') terminalStatus = f.status ?? 'complete'
       }
       eventOffset = resp.nextOffset
@@ -807,12 +839,21 @@ export function useChat() {
     // 打开已有会话时当前项目跟着它走：之后「新对话」自然落在同一个项目。
     if (status.workspaceId) setActiveWorkspace(status.workspaceId)
     runlogOffset = Math.max(0, status.runlogOffset - HISTORY_WINDOW)
-    for (;;) {
-      const resp = await getLog(sid, runlogOffset)
+    let resp = await getLog(sid, runlogOffset)
+    if (token !== pollToken) return false
+    // 窗口起点正切在一次调用与它的回执之间时，那张工具卡会缺参数：
+    // 先往更早再挪一页重拉，直到本批不再有找不到调用行的回执（0 是尽头）。
+    while (hasUnpairedToolResult(resp.rows) && runlogOffset > 0) {
+      runlogOffset = Math.max(0, runlogOffset - PAGE)
+      resp = await getLog(sid, runlogOffset)
       if (token !== pollToken) return false
+    }
+    for (;;) {
       if (resp.rows.length === 0) break
       appendRows(resp.rows)
       runlogOffset = resp.nextOffset
+      resp = await getLog(sid, runlogOffset)
+      if (token !== pollToken) return false
     }
     if (status.liveRunId) {
       const assistant = push({ key: `${status.liveRunId}:live`, runId: status.liveRunId, role: 'assistant', text: '', state: 'streaming' })
@@ -862,7 +903,7 @@ export function useChat() {
     }
   }
 
-  // attachToolRow 把一条技能工具账本行叠到它那场的 assistant 气泡上（按 runId 找）。
+  // attachToolRow 把一条工具账本行叠到它那场的 assistant 气泡上（按 runId 找）。
   // 气泡还没出现就排队（翻页/首次渲染的顺序里 tool 行在前）。
   function attachToolRow(r: Row) {
     const ev = toolRowEvent(r)
@@ -870,6 +911,10 @@ export function useChat() {
     for (let i = bubbles.value.length - 1; i >= 0; i--) {
       const b = bubbles.value[i]
       if (b.role === 'assistant' && b.runId === r.runId) {
+        // 翻页时气泡已经建好（行序被拆开处理），只能按 offset 判断先后：工具行更早 → 卡片在上。
+        if ((r.runlogOffset ?? 0) > 0 && b.logOffset !== undefined && (r.runlogOffset ?? 0) < b.logOffset) {
+          b.toolsFirst = true
+        }
         mergeTool(b, ev)
         return
       }
@@ -884,6 +929,8 @@ export function useChat() {
     const q = pendingTools.get(b.runId)
     if (!q) return
     pendingTools.delete(b.runId)
+    // 行到了、气泡还没建：这些工具行的 offset 全在这场的正文行之前 → 卡片画在正文上方。
+    b.toolsFirst = true
     for (const ev of q) mergeTool(b, ev)
   }
 
@@ -908,6 +955,7 @@ export function useChat() {
       media: media.length ? media : undefined,
       state: 'done',
       usage: r.usage,
+      logOffset: r.runlogOffset,
     }
     flushPendingTools(b)
     return b
@@ -964,7 +1012,7 @@ export function useChat() {
       let upper = oldestOffset
       let floor = Math.max(0, upper - 1 - PAGE)
       const collected: ChatRow[] = []
-      // 技能工具账本行也收：它们属于这一页里某场的 assistant 气泡（C5 的技能工具卡）。
+      // 工具账本行也收：它们属于这一页里某场的 assistant 气泡（doc/59 的工具卡）。
       // 它们不计入「这一页有没有对话行」的判断——账本行不能把翻页卡住。
       const collectedTools: Row[] = []
       for (;;) {
@@ -984,7 +1032,9 @@ export function useChat() {
         // 窗口是从新到旧依次处理的：更早的一窗要放在已收集的前面。
         collected.unshift(...windowRows)
         collectedTools.unshift(...windowTools)
-        if (collected.length || floor === 0) break
+        // 这一页有回执的调用行还在更早时，也再扩一页——理由同 reconcile。
+        if (collected.length && !hasUnpairedToolResult(collectedTools)) break
+        if (floor === 0) break
         upper = floor
         floor = Math.max(0, upper - 1 - PAGE)
       }
@@ -1000,6 +1050,7 @@ export function useChat() {
               media: media.length ? media : undefined,
               state: 'done' as const,
               usage: r.usage,
+              logOffset: r.runlogOffset,
             }
           }),
         )

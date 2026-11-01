@@ -15,7 +15,7 @@ export type Frame = {
   // 'task' = 看板结构帧（doc/41 §5.2）：text 是当前全量看板的紧凑视图，name 是触发它的工具名。
   // 'question' = 等帧（doc/47 §5.2）：run 挂起等人，messageId 是 run_questions 行 id。
   // 'tool_call' / 'tool_result' = 工具帧（19v6-01 §2）：name + args / output，配对键 toolCallId。
-  // 对话页只用它们画技能工具卡（doc/52 C5），别的工具帧不进气泡。
+  // 对话页把全部工具帧画成工具卡（doc/59），不按工具名筛。
   kind:
     | 'start'
     | 'delta'
@@ -52,10 +52,12 @@ export type Usage = { promptTokens: number; completionTokens: number; window: nu
 export type Row = {
   runlogOffset?: number
   runId: RunID
-  // 工具执行账本行（tool_call / tool_result）也在 runlog 里；对话界面只画 user/assistant，
-  // 例外是技能工具（doc/52 C5）——它们的 payload 被解析成工具卡。
+  // 工具执行账本行（tool_call / tool_result）也在 runlog 里；对话界面画 user/assistant，
+  // 工具行的 payload 解析成工具卡（doc/59：全部工具都进气泡）。
   role: 'user' | 'assistant' | 'tool_call' | 'tool_result'
   messageId?: string
+  // 产出该行的 agent：空 = 主代理，非空 = 子代理名字（工具卡据此加前缀）。
+  agent: string
   text: string
   // 工具行的结构化负载（tool_call: {name,args,toolCallId}；tool_result: {name,output,toolCallId}）。
   // assistant 行的 payload 被后端解成 usage 后清空，不会出现在这里。

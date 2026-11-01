@@ -43,6 +43,7 @@
 - 想知道「agent 怎么测、公开基准选哪个、哪些不该跑」：`doc/56`。
 - 改网络抓取（`web_fetch`）：`doc/57`。
 - 改读文件（`read_file` 怎么分页）或 bash 大输出（留尾／全文落盘）：`doc/58`。
+- 改对话页的工具卡（哪些工具进气泡、摘要／失败／截断口径）：`doc/59`。
 - 想知道某个设计当时为什么这么裁、代价是什么：`doc/problems/`（问题档案，按模块分组）。
 
 **不要先读：** `doc/01`–`15`、`doc/19-v3`／`v4`／`v5`、`docs/`。这些是历史材料，不是现行施工面。
@@ -102,6 +103,7 @@
 
 | 57 | [网络抓取（`web_fetch`）](57-网络抓取.md) | ✅（2026-11-01，A1–A3） | `internal/runengine/{webfetch.go,webfetch_test.go,worker.go,fileops.go,search.go}`、`agents/researcher.md` | 父池加 `web_fetch`：按调用方厂商选择器走 DeepSeek `/v1/tools/fetch`（只用 `deepseek` 一行，其他厂商直接报错）；整页 Markdown 落盘 `.tako/fetch/`，工具只回描述段；researcher 走继承自动拿到，coder 白名单不动 |
 | 58 | [读分页与输出留存](58-读分页与输出留存.md) | ✅（2026-11-01，A0–A8） | `internal/runengine/{readwindow.go,filetools.go,bash.go,bashspill.go,notes.go,product_api.go}`、`internal/runengine/{filetools_test.go,bashspill_test.go}` | 两处「拿不到就永远拿不到」的收口：`read_file` 改**分页读**（入参 `path`/`offset`/`limit`，`head`/`tail` 删掉；每页 2000 行 / 50KB / 单行 2000 字符；页脚恒带总行数与下一个 `offset`；「超 200KB 直接报错」撤掉，长文件读得到中间）；`bash` 改**留尾 + 全文落盘 + 回路径**（每流 64,000 字节尾窗；全文落 `.tako/bash/<runId>/<seq>.out`，64MB/流，**装不下全文就删文件、不报路径**；回执行给路径；30 天清扫，每次 bash 调用前触发）。四个 API 的请求／响应字节不动；`POST /api/dev/workspace/read`（A0）让 read 的模型侧字节可 curl 逐字断言 |
+| 59 | [工具调用可见性](59-工具调用可见性.md) | ✅（2026-11-01，A1–A2） | `web/src/{chat.ts,App.vue,api.ts}`（前端零后端改动） | 对话页把**每一次**工具调用画成工具卡（帧与 runlog 两条路径、按 `toolCallId` 配对）：删掉「只认技能三件」的白名单；摘要行 + 展开看参数／回执原文，失败按「错误：」前缀标「失败」，参数 2,000 / 回执 8,000 字符截断；初始窗口与翻页加了「回执找不到同批调用行就往前扩一页」的取数规则。翻掉 doc/52 C5 的窄口（卡片机制保留、筛选去掉），子代理行带 `agent` 前缀 |
 
 ## 2. 历史存档（`doc/`，不作施工面）
 

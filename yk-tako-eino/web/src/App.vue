@@ -242,30 +242,62 @@ function onAskTextKeydown(ev: KeyboardEvent) {
   void submitAsk()
 }
 
-// —— 技能工具卡（doc/52 C5）——
-// 卡片只认 read_skill / use_skill / read_skill_file（chat.ts 的 SKILL_TOOL_NAMES 已筛过）。
-// 措辞按工具名分（§2.3：读与用靠工具名区分，不靠返回内容），read_skill_file 单独一行。
-function toolArgsOf(t: ToolCard): { name?: string; path?: string } {
+// —— 工具卡（doc/59）——
+// 每次工具调用一张卡：默认一行摘要，展开看完整参数与回执原文。
+// 技能三件说中文标签（doc/52 C5 的措辞保留），其余显示工具名 + 关键参数。
+const SKILL_TOOL_NAMES = new Set(['read_skill', 'use_skill', 'read_skill_file'])
+const TOOL_ARGS_CLIP = 2000
+const TOOL_OUTPUT_CLIP = 8000
+
+function toolArgsOf(t: ToolCard): Record<string, unknown> {
   try {
-    const parsed = JSON.parse(t.args) as { name?: string; path?: string }
-    return parsed && typeof parsed === 'object' ? parsed : {}
+    const parsed = JSON.parse(t.args) as unknown
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {}
   } catch {
     return {}
   }
 }
 
-function toolCardLabel(t: ToolCard): string {
-  const a = toolArgsOf(t)
-  const name = a.name || '（未知技能）'
-  if (t.name === 'use_skill') return `使用技能：${name}`
-  if (t.name === 'read_skill_file') return `查看技能文件：${name}${a.path ? ` / ${a.path}` : ''}`
-  return `查看技能：${name}`
+function argText(a: Record<string, unknown>, key: string): string {
+  const v = a[key]
+  return typeof v === 'string' ? v : ''
 }
 
-// 失败回执是 JSON 信封（116001/116107/116114/116115/116116）；成功回执以 <skill 开头。
-// 卡片把 message 摆出来，code 不进正文——人只需要知道「为什么没读到」。
+function oneLine(s: string, n = 90): string {
+  const flat = s.replace(/\s+/g, ' ').trim()
+  return flat.length > n ? `${flat.slice(0, n)}…` : flat
+}
+
+function clipped(s: string, limit: number): string {
+  if (s.length <= limit) return s
+  return `${s.slice(0, limit)}\n…（后面还有 ${(s.length - limit).toLocaleString()} 字符，已截断）`
+}
+
+function toolCardLabel(t: ToolCard): string {
+  const a = toolArgsOf(t)
+  const skill = argText(a, 'name') || '（未知技能）'
+  if (t.name === 'use_skill') return `使用技能：${skill}`
+  if (t.name === 'read_skill_file') return `查看技能文件：${skill}${argText(a, 'path') ? ` / ${argText(a, 'path')}` : ''}`
+  if (t.name === 'read_skill') return `查看技能：${skill}`
+  if (t.name === 'web_search') return `搜索：${oneLine(argText(a, 'query'))}`
+  if (t.name === 'web_fetch') return `抓取：${oneLine(argText(a, 'url'))}`
+  if (t.name === 'read_file') {
+    const offset = a.offset
+    const from = typeof offset === 'number' && offset > 0 ? `（从第 ${offset} 行）` : ''
+    return `读取：${oneLine(argText(a, 'path'))}${from}`
+  }
+  if (t.name === 'bash') return `执行：${oneLine(argText(a, 'command'))}`
+  if (t.name === 'write_file' || t.name === 'edit_file') return `写文件：${oneLine(argText(a, 'path'))}`
+  const rest = oneLine(t.args || '')
+  return rest && rest !== '{}' ? `${t.name}：${rest}` : t.name
+}
+
+// 工具错误文本恒以「错误：」开头（tools.go 的 toolErrorText，doc/59）。
+// 技能三件的失败还是 JSON 信封（116001/116107/…）：成功回执以 <skill 开头。
 function toolCardFail(t: ToolCard): string {
-  if (!t.output || t.output.startsWith('<skill')) return ''
+  if (!t.output) return ''
+  if (t.output.startsWith('错误：')) return t.output
+  if (!SKILL_TOOL_NAMES.has(t.name) || t.output.startsWith('<skill')) return ''
   try {
     const parsed = JSON.parse(t.output) as { code?: unknown; message?: unknown }
     if (typeof parsed.code === 'number' && parsed.code !== 0) {
@@ -286,6 +318,17 @@ function toolCardState(t: ToolCard, bubbleState: string): 'running' | 'failed' |
     return bubbleState === 'streaming' || bubbleState === 'offline' ? 'running' : 'done'
   }
   return 'done'
+}
+
+// 气泡里两块内容（正文 / 工具卡）谁在上。历史上卡片一直挂在正文下方，但这个 run 的行序
+// 是 tool_call → tool_result → assistant：卡片才是先发生的那件事，画到下面就是在倒着讲。
+// chat.ts 的 toolsFirst 记下这个先后（历史面按 offset 判、实时面按第一帧判）。
+function bubbleBlocks(b: Bubble): Array<'text' | 'tools'> {
+  const hasText = !!b.text
+  const hasTools = b.role === 'assistant' && !!b.tools?.length
+  if (!hasTools) return hasText ? ['text'] : []
+  if (!hasText) return ['tools']
+  return b.toolsFirst ? ['tools', 'text'] : ['text', 'tools']
 }
 
 function askStatusLabel(q: AskQuestion): string {
@@ -1582,8 +1625,34 @@ async function onScroll() {
                        此前是纯文本插值——模型的标题、表格、代码块全变成字面符号。
                        用 div 不用 p：markdown 会产出块级元素，<p> 装块级元素会被 HTML 解析器拆开。
                        v-memo：正文没变就别重算——否则流式输出时每个 token 到达都要把
-                       **所有**气泡的 markdown 重新 parse + sanitize 一遍。 -->
-                  <div v-if="b.text" class="bubble-text" v-html="renderSafe(b.text)" v-memo="[b.text]" />
+                       **所有**气泡的 markdown 重新 parse + sanitize 一遍。
+                       正文与工具卡谁在上按 toolsFirst 排（doc/59 §6）：runlog 的行序是
+                       tool_call → tool_result → assistant，卡片先发生就先画。 -->
+                  <template v-for="blk in bubbleBlocks(b)" :key="`${b.key}:${blk}`">
+                    <div v-if="blk === 'text'" class="bubble-text" v-html="renderSafe(b.text)" v-memo="[b.text]" />
+                    <!-- 工具卡（doc/59）：每调一次工具一行，默认只露摘要；展开是参数与回执原文，
+                         与模型当时看到的是同一份（不重新读盘）。失败把「错误：…」直接摆出来。 -->
+                    <div v-else class="tool-cards">
+                      <details
+                        v-for="t in b.tools"
+                        :key="t.callId"
+                        class="tool-card"
+                        :data-tool="t.name"
+                        :data-state="toolCardState(t, b.state)"
+                      >
+                        <summary>
+                          <span v-if="t.agent" class="tool-agent" title="子代理">{{ t.agent }}</span>
+                          <span class="tool-name">{{ toolCardLabel(t) }}</span>
+                          <span v-if="toolCardState(t, b.state) === 'failed'" class="tool-chip fail">失败</span>
+                          <span v-else-if="toolCardState(t, b.state) === 'running'" class="tool-chip">执行中</span>
+                        </summary>
+                        <p v-if="toolCardFail(t)" class="tool-fail">{{ clipped(toolCardFail(t), TOOL_ARGS_CLIP) }}</p>
+                        <pre v-if="t.args && t.args !== '{}'" class="tool-args">{{ clipped(t.args, TOOL_ARGS_CLIP) }}</pre>
+                        <pre v-if="t.output !== undefined" class="tool-out">{{ clipped(t.output, TOOL_OUTPUT_CLIP) }}</pre>
+                        <p v-else class="tool-wait">还没有回执。</p>
+                      </details>
+                    </div>
+                  </template>
                   <span
                     v-if="(b.state === 'streaming' || b.state === 'offline') && !pendingAsks.length"
                     class="typing"
@@ -1604,27 +1673,6 @@ async function onScroll() {
                     @click="resumeRun(b)"
                   >继续这一轮</button>
                   <p v-if="b.state === 'error'" class="note">失败，没有写进历史</p>
-                  <!-- 技能工具卡（doc/52 C5）：模型读了什么，人看到同一份回执。
-                       展开出来的是当时进模型的原文（含 D33 的 <skill> 包裹标记），不重新读盘；
-                       失败把回执里的 message 直接摆出来，不用再展开找。 -->
-                  <div v-if="b.role === 'assistant' && b.tools?.length" class="tool-cards">
-                    <details
-                      v-for="t in b.tools"
-                      :key="t.callId"
-                      class="tool-card"
-                      :data-tool="t.name"
-                      :data-state="toolCardState(t, b.state)"
-                    >
-                      <summary>
-                        <span class="tool-name">{{ toolCardLabel(t) }}</span>
-                        <span v-if="toolCardState(t, b.state) === 'failed'" class="tool-chip fail">失败</span>
-                        <span v-else-if="toolCardState(t, b.state) === 'running'" class="tool-chip">执行中</span>
-                      </summary>
-                      <p v-if="toolCardFail(t)" class="tool-fail">{{ toolCardFail(t) }}</p>
-                      <pre v-if="t.output !== undefined" class="tool-out">{{ t.output }}</pre>
-                      <p v-else class="tool-wait">还没有回执。</p>
-                    </details>
-                  </div>
                 </div>
               </div>
               <!-- 用量与复制是这一轮的元信息，不是正文（doc/51 §6）：
@@ -3293,13 +3341,16 @@ async function onScroll() {
   .gate-card { padding: 0.9rem 0.85rem 1rem; }
 }
 
-/* 技能工具卡（doc/52 C5）：一行一句「读了什么」，展开看回执原文 */
+/* 工具卡（doc/59）：一行一句「调了什么」，展开看参数与回执原文 */
 .tool-cards {
   display: flex;
   flex-direction: column;
   gap: 0.35rem;
   margin-top: 0.55rem;
 }
+/* 卡片排在正文上方时（那次调用先发生），间距换到另一边 */
+.tool-cards:first-child { margin-top: 0; }
+.tool-cards + .bubble-text { margin-top: 0.55rem; }
 .tool-card {
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -3318,8 +3369,17 @@ async function onScroll() {
   color: var(--ink-soft);
 }
 .tool-card summary::-webkit-details-marker { display: none; }
-.tool-name { font-weight: 550; }
+.tool-name { font-weight: 550; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-agent {
+  flex: none;
+  border-radius: 999px;
+  padding: 0 0.4rem;
+  background: var(--hover);
+  color: var(--muted);
+  font-size: 0.66rem;
+}
 .tool-chip {
+  flex: none;
   margin-left: auto;
   border-radius: 999px;
   padding: 0 0.45rem;
@@ -3333,11 +3393,24 @@ async function onScroll() {
   color: var(--danger);
   font-size: 0.76rem;
   line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tool-args {
+  margin: 0 0 0.35rem;
+  padding: 0.4rem 0.55rem;
+  border-radius: 8px;
+  border: 1px dashed var(--line);
+  background: var(--bg-raised);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.7rem;
+  line-height: 1.5;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .tool-out {
   margin: 0 0 0.5rem;
-  max-height: 18rem;
-  overflow: auto;
   padding: 0.5rem 0.6rem;
   border-radius: 8px;
   background: var(--bg-raised);

@@ -8,7 +8,7 @@
 本步只要求语义、不要求实现：
 
 1. **查状态** `GET /api/sessions/{sessionId}` → `{liveRunId, runlogOffset=高水位}`；
-2. **补历史** `GET /api/sessions/{sessionId}/log?runlogOffset=本地值`（新 tab 本地值 = `max(0, 第 1 步的高水位 - 窗口)`，**不是 0**）→ 渲染这批定稿记录；本地 `runlogOffset` 推进到返回的 `nextOffset`；**若 `nextOffset` 仍小于第 1 步的高水位，说明本批被 W 截断，重复拉直到追平**；用户往上滚要更早的历史时，用更小的 offset **临时**拉一批（见下「两种游标」）；
+2. **补历史** `GET /api/sessions/{sessionId}/log?runlogOffset=本地值`（新 tab 本地值 = `max(0, 第 1 步的高水位 - 窗口)`，**不是 0**）→ 渲染这批定稿记录；本地 `runlogOffset` 推进到返回的 `nextOffset`；**若 `nextOffset` 仍小于第 1 步的高水位，说明本批被 W 截断，重复拉直到追平**；用户往上滚要更早的历史时，用更小的 offset **临时**拉一批（见下「两种游标」）；**窗口起点可能正好落在一次工具调用与它的回执之间**（游标排他）：取回的行里若有回执找不到同批的调用行，把起点再往前挪一页重拉，直到配对完整或到 0（卡片口径见 [doc/59](../59-工具调用可见性.md) §5.2）；
 3. **观测生成** 若 `liveRunId` 非空 → `GET /api/runs/{liveRunId}/frames?eventOffset=本地值`（新 tab = 0）→ 按 `eventOffset` 追加 delta 成「正在生成」气泡；按轮询间隔重复拉 `nextOffset` 之后；
 4. **收口** 见 frames `status:done`（terminal）或 `status:gone`，或状态查询发现 `liveRunId` 变 `""` / 变了 → 回第 2 步拉一次 log，把那条 `assistant` 全文按 `runId` **替换**半截气泡；停止轮询该 run 的 frames。
 
