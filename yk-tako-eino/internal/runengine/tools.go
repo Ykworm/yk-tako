@@ -67,6 +67,16 @@ func wrapToolErrors(t tool.BaseTool) tool.BaseTool {
 // 这段实现噪声明文进的是模型输入与 runlog 展示行（「tool_result 行 text 可直接展示」，F1 活体
 // curl 实测所见），在这里剥掉、只留原因句；剥不出来（eino 将来改格式）则原文照发，不误伤。
 func toolErrorText(_ context.Context, err error) string {
+	msg := stripToolShell(err)
+	if strings.HasPrefix(msg, "错误：") {
+		return msg
+	}
+	return "错误：" + msg
+}
+
+// stripToolShell 剥掉 eino 那层外壳，只留工具自己写的原因句。dev 诊断口（postDevRead）要的是
+// 这一层——模型侧那层「错误：」前缀是 toolErrorText 加的，诊断口回原文更好认。
+func stripToolShell(err error) string {
 	msg := err.Error()
 	for _, prefix := range []string{"[LocalFunc] ", "[EnhancedLocalFunc] "} {
 		if strings.HasPrefix(msg, prefix) {
@@ -76,8 +86,5 @@ func toolErrorText(_ context.Context, err error) string {
 			break
 		}
 	}
-	if strings.HasPrefix(msg, "错误：") {
-		return msg
-	}
-	return "错误：" + msg
+	return msg
 }

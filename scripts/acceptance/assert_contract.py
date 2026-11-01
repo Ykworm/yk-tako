@@ -92,6 +92,13 @@ def check_step(expect, http, body, vars, tally, label):
             items = data.get(spec["path"], []) if isinstance(data, dict) else []
             hit = any(isinstance(it, dict) and harness.match(spec["match"], it) for it in items)
             want(hit, f"数组 {spec['path']} 里没有满足 {spec['match']} 的项")
+        if "data_contains" in expect:
+            # 只断「含某几段」，不逐字比全文——给**逐请求变**的字节用
+            # （例：bash 落盘提示行里的 run id 每次都不同，全文比不了）。
+            spec = expect["data_contains"]
+            hay = data.get(spec["path"], "") if isinstance(data, dict) else ""
+            missing = [s for s in spec["contains"] if s not in hay]
+            want(not missing, f"data.{spec['path']} 里缺 {missing}（实有 {str(hay)[:160]}）")
 
     if bad:
         tally.no(label, "；".join(bad))
@@ -364,6 +371,9 @@ def main():
             continue
         if case.get("needs") == "pg" and not harness.PG_DSN:
             tally.skip(case["id"], "没给 TAKO_PG_DSN（这条要直连 PG 造「忙」闸）")
+            continue
+        if case.get("needs") == "sandbox" and not harness.sandbox_available():
+            tally.skip(case["id"], "这台机器没有可用的 sandbox-exec（bash 会 fail closed，doc/35）")
             continue
         # 每个用例自带上一个账号，别互相污染（用例 0 那条要「没配模型」的租户）
         run_case(case, key, tally, args.print, base_vars)

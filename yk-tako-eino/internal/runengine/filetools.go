@@ -180,31 +180,32 @@ func newWriteFileTool(root string) (tool.BaseTool, error) {
 		})
 }
 
-// readTextFileInput 是 read_text_file 的入参 schema：head/tail 用指针区分「没给」与「给了 0」，
-// 两者都非必填（omitempty）；同给 = 报错（19v6-08 §3「head/tail 同时给出 → 错误」）。
+// readTextFileInput 是 read_text_file 的入参 schema：path 必填，offset/limit 非必填
+// （omitempty）。offset 是 1-based 起始行、limit 是本次最多几行（doc/58 §3）。
 type readTextFileInput struct {
-	Path string `json:"path" jsonschema:"description=相对 workspace 根的路径（POSIX 风格，如 notes/todo.txt）"`
-	Head *int   `json:"head,omitempty" jsonschema:"description=只读前 N 行（与 tail 二选一，同给报错）"`
-	Tail *int   `json:"tail,omitempty" jsonschema:"description=只读后 N 行（与 head 二选一，同给报错）"`
+	Path   string `json:"path" jsonschema:"description=相对 workspace 根的路径（POSIX 风格，如 notes/todo.txt）"`
+	Offset *int   `json:"offset,omitempty" jsonschema:"description=从第几行开始读（1-based，默认 1）"`
+	Limit  *int   `json:"limit,omitempty" jsonschema:"description=本次最多读多少行（默认 2000、上限 2000）"`
 }
 
 // newReadTextFileTool / newReadFileTool（F4）是同一实现的两位出口：read_text_file 是 MCP
 // filesystem 标准名，read_file 是 OpenHands 系惯用名——别名按真名进声明面（模型喊谁就是谁，
 // 两把工具同时在池，同上）而不是给一把工具挂双名参数，声明面看到的始终是模型将调用的名字。
-// 实现：纯文本直出原文；>200KB 且无截读参数 = 错误提示（无界读 = 一次工具调用灌爆上下文；
-// 200KB 是减灾档不是安全边界，19v6-08 §3）。head/tail 按行截读；截读分支先剪掉文件尾的
-// 那一个换行再分行——文件以 \n 收尾是常态，照 Split 直切会把空串当最后一行，tail N 会少返回一行。
+// 实现：流式读，按行交付（每行最多 2000 字符）；一次调用最多给 2000 行 / 50KB，
+// 末尾附一行页脚（总行数 + 下一个 offset）——大文件靠 offset/limit 分页读（19v6-08 §3）。
 func newReadTextFileTool(root string) (tool.BaseTool, error) {
 	return buildReadTool("read_text_file",
-		"读取 workspace 内的文本文件，内容原样直出。path 是相对 workspace 根的路径（如 notes/todo.txt）。"+
-			"文件超过 200KB 时请改用 head（只读前 N 行）或 tail（只读后 N 行）截读——两者二选一，同给会报错。", root)
+		"读取 workspace 内的文本文件。path 是相对 workspace 根的路径（如 notes/todo.txt）。"+
+			"offset 从第几行开始读（1-based，默认 1）、limit 本次最多读多少行（默认 2000、上限 2000）——"+
+			"读到的内容后面附一行页脚，写明总行数与下一个 offset（读大文件靠它续读）。", root)
 }
 
 // newReadFileTool 造 read_file：惯用名别名，参数与行为等同 read_text_file（19v6-08 §3 名单第 11 名）。
 func newReadFileTool(root string) (tool.BaseTool, error) {
 	return buildReadTool("read_file",
 		"读取 workspace 内的文本文件（惯用名，等同 read_text_file：同参同行为）。path 是相对 workspace 根的路径。"+
-			"文件超过 200KB 时请改用 head（只读前 N 行）或 tail（只读后 N 行）截读——两者二选一，同给会报错。", root)
+			"offset 从第几行开始读（1-based，默认 1）、limit 本次最多读多少行（默认 2000、上限 2000）——"+
+			"读到的内容后面附一行页脚，写明总行数与下一个 offset（读大文件靠它续读）。", root)
 }
 
 // buildReadTool 是读工具的两个名字共用的装配体（名字/描述随调用方，行为一份）。
@@ -215,14 +216,8 @@ func buildReadTool(name, desc, root string) (tool.BaseTool, error) {
 			if err != nil {
 				return "", err
 			}
-			if in.Head != nil && in.Tail != nil {
-				return "", fmt.Errorf("head 与 tail 不能同时给（截读二选一）")
-			}
-			if in.Head != nil && *in.Head <= 0 {
-				return "", fmt.Errorf("head 须为正整数（给的是 %d）", *in.Head)
-			}
-			if in.Tail != nil && *in.Tail <= 0 {
-				return "", fmt.Errorf("tail 须为正整数（给的是 %d）", *in.Tail)
+			if err := checkReadArgs(in); err != nil {
+				return "", err
 			}
 			fi, err := os.Stat(full)
 			if err != nil {
@@ -234,34 +229,68 @@ func buildReadTool(name, desc, root string) (tool.BaseTool, error) {
 			if fi.IsDir() {
 				return "", fmt.Errorf("%s 是目录不是文件", in.Path)
 			}
-			const maxBytes = 200 * 1024
-			if in.Head == nil && in.Tail == nil && fi.Size() > maxBytes {
-				return "", fmt.Errorf("文件 %s 有 %d 字节、超过 200KB 上限，无界读会灌爆上下文——请用 head（前 N 行）或 tail（后 N 行）截读", in.Path, fi.Size())
+			// 流式读（doc/58 §3.3）：一趟扫过去同时算整文件 sha256、点总行数、只收要的那一页。
+			// 整份文件不进内存——大文件今天只能 head/tail，中间那段永远读不到。
+			offset, limit := 1, readWindowMaxLines
+			if in.Offset != nil {
+				offset = *in.Offset
 			}
-			raw, err := os.ReadFile(full)
+			if in.Limit != nil {
+				limit = *in.Limit
+			}
+			var (
+				page   []string
+				total  int
+				capped bool
+				used   int
+			)
+			fp, err := scanTextFile(full, func(no int, text string) {
+				total = no
+				if capped || no < offset || len(page) >= limit {
+					return
+				}
+				n := len(text)
+				if len(page) > 0 {
+					n++ // 行间的换行也占字节（dsh 的 lineByteSize）
+				}
+				if used+n > readWindowMaxBytes {
+					capped = true
+					return
+				}
+				used += n
+				page = append(page, text)
+			})
 			if err != nil {
 				return "", fmt.Errorf("读取失败：%v", err)
 			}
 			// 记基准：「我读到的是哪一版」——write_file 的写前判据靠它（filefp.go）。
-			// 记的是**整份文件**的指纹（raw 是全文，head/tail 只是截给人看的），因为
+			// 记的是**整份文件**的指纹（流式算的 sha256，读到的只是其中一页），因为
 			// write_file 是整份覆盖语义 → 尾部的改动同样会被它抹掉，同样算冲突。
 			// bash 读不记（它不走 read_file）→ bash 改过的文件，write_file 会拒并要求重读。
 			base := fileBaselineFrom(ctx)
-			base.set(agentNameOf(ctx), full, fingerprintOfBytes(fi, raw))
-			text := string(raw)
-			if in.Head == nil && in.Tail == nil {
-				return text, nil
+			base.set(agentNameOf(ctx), full, fp)
+			// 越界报错（空文件读第 1 行不算越界——dsh 的同款豁免）。
+			if offset > total && !(total == 0 && offset == 1) {
+				return "", fmt.Errorf("offset %d 超出文件末尾（共 %d 行）", offset, total)
 			}
-			lines := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
-			if in.Head != nil {
-				if n := *in.Head; n < len(lines) {
-					lines = lines[:n]
-				}
-			} else if n := *in.Tail; n < len(lines) {
-				lines = lines[len(lines)-n:]
-			}
-			return strings.Join(lines, "\n"), nil
+			return readBody(page, readFooter(offset, total, page, capped)), nil
 		})
+}
+
+// checkReadArgs 判读工具的入参：offset 与 limit 各有取值范围。报错文案是契约（doc/58 §3.1）。
+func checkReadArgs(in readTextFileInput) error {
+	if in.Offset != nil && *in.Offset < 1 {
+		return fmt.Errorf("offset 须为正整数（给的是 %d）", *in.Offset)
+	}
+	if in.Limit != nil {
+		if *in.Limit < 1 {
+			return fmt.Errorf("limit 须为正整数（给的是 %d）", *in.Limit)
+		}
+		if *in.Limit > readWindowMaxLines {
+			return fmt.Errorf("limit 不得大于 %d（给的是 %d）", readWindowMaxLines, *in.Limit)
+		}
+	}
+	return nil
 }
 
 // editFileInput 是 edit_file 的入参 schema：replace_all 默认 false（omitempty）——

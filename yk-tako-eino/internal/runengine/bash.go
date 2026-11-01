@@ -5,7 +5,6 @@
 package runengine
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -18,10 +17,6 @@ import (
 	"github.com/cloudwego/eino/components/tool/utils"
 )
 
-// bashOutputCap 是 stdout/stderr 各自的字节帽（doc/17 §3 推荐值 32 KB）：
-// 超出截断、结果文本写明——引导模型把大输出落文件再读，而不是灌进上下文。
-const bashOutputCap = 32 * 1024
-
 // bashEnvWhitelist 是子进程环境白名单：引擎进程里可能有厂商 API Key 等密钥，
 // tool_result 与 runlog 行是永久历史——env 全量透传 = 密钥进永久库。
 //
@@ -31,42 +26,14 @@ var bashEnvWhitelist = []string{"HOME", "TMPDIR", "LANG", "LC_ALL"}
 
 // bashIn 是 bash 的入参 schema：由 InferTool 按 struct tag 反射生成。
 type bashIn struct {
-	Command string `json:"command" jsonschema:"description=要执行的 bash 命令，在 workspace 根目录下运行；无单次时长限制，stdout/stderr 各 32 KB 截断"`
-}
-
-// capWriter 包住 buf：帽内照收、帽外丢弃并置 truncated——大输出不进内存也不逼死管道对端。
-type capWriter struct {
-	buf       bytes.Buffer
-	cap       int
-	truncated bool
-}
-
-func (w *capWriter) Write(p []byte) (int, error) {
-	if w.buf.Len() >= w.cap {
-		w.truncated = true
-		return len(p), nil
-	}
-	room := w.cap - w.buf.Len()
-	if len(p) > room {
-		w.buf.Write(p[:room])
-		w.truncated = true
-		return len(p), nil
-	}
-	return w.buf.Write(p)
-}
-
-func (w *capWriter) truncatedNote(name string) string {
-	if w.truncated {
-		return fmt.Sprintf("\n（%s 超 32 KB 已截断——把需要的内容写进文件再读，不要直接重跑打印）", name)
-	}
-	return ""
+	Command string `json:"command" jsonschema:"description=要执行的 bash 命令，在 workspace 根目录下运行；无单次时长限制，stdout/stderr 各保留尾部 64000 字节，完整输出落盘后给出路径"`
 }
 
 // outputSections 拼装 stdout/stderr 两段，成功结果与被终止错误共用同形。
-func outputSections(stdout, stderr *capWriter) string {
-	out := fmt.Sprintf("stdout:\n%s%s", stdout.buf.String(), stdout.truncatedNote("stdout"))
-	if stderr.buf.Len() > 0 {
-		out += fmt.Sprintf("\nstderr:\n%s%s", stderr.buf.String(), stderr.truncatedNote("stderr"))
+func outputSections(stdout, stderr *tailCollector) string {
+	out := fmt.Sprintf("stdout:\n%s%s", stdout.text(), stdout.note("stdout"))
+	if len(stderr.tail) > 0 {
+		out += fmt.Sprintf("\nstderr:\n%s%s", stderr.text(), stderr.note("stderr"))
 	}
 	return out
 }
@@ -79,7 +46,9 @@ func outputSections(stdout, stderr *capWriter) string {
 // 时长帽 30 秒，到点把已收到的输出交回工具结果，不把父 run 打成 error。
 // 工作目录来自 ctx 里的会话根；这只是默认目录，不是牢笼。有 sandbox-exec 时同一条命令再套一层配置。
 func newBashTool(workspace string) (tool.BaseTool, error) {
-	return utils.InferTool("bash", "在 workspace 根目录下执行一条 bash 命令并返回退出码与 stdout/stderr。输出超 32 KB 会被截断，单次最长 30 秒，大输出请先写进文件再读。",
+	return utils.InferTool("bash", "在 workspace 根目录下执行一条 bash 命令并返回退出码与 stdout/stderr。"+
+		"输出超过 64000 字节时只保留尾部，完整输出会落盘并给出路径（用 read_file 分页读它）。"+
+		"单次最长 30 秒，大输出请先写进文件再读。",
 		func(ctx context.Context, in bashIn) (string, error) {
 			// 没有 sandbox-exec 就拒绝。cwd 只是默认目录，不能当成隔离。
 			return runBash(ctx, activeRoot(ctx, workspace), in.Command, bashTimeout, true)
@@ -88,6 +57,8 @@ func newBashTool(workspace string) (tool.BaseTool, error) {
 
 // runBash 执行一条命令。cwd 不是安全边界：requireSandbox 为真时没有 sandbox-exec 就拒绝执行。
 func runBash(ctx context.Context, workspace, command string, timeout time.Duration, requireSandbox bool) (string, error) {
+	// 清扫过期落盘（doc/58 §4.4）：每次 bash 调用前扫一次 .tako/bash/。
+	sweepBashSpills(workspace, time.Now())
 	cmd, cleanup, _, runCtx, err := startBash(ctx, workspace, command, timeout, requireSandbox)
 	if err != nil {
 		return "", err
@@ -99,10 +70,14 @@ func runBash(ctx context.Context, workspace, command string, timeout time.Durati
 			cmd.Env = append(cmd.Env, k+"="+v)
 		}
 	}
-	stdout, stderr := &capWriter{cap: bashOutputCap}, &capWriter{cap: bashOutputCap}
+	spill := newBashSpill(ctx, workspace)
+	stdout := &tailCollector{cap: bashOutputCap, spill: spill, ext: "out"}
+	stderr := &tailCollector{cap: bashOutputCap, spill: spill, ext: "err"}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	cmd.WaitDelay = 3 * time.Second
 	err = cmd.Run()
+	stdout.closeSpill()
+	stderr.closeSpill()
 	// sandbox-exec 被时长帽杀掉时，Run 返回的是退出码 -1，不是 DeadlineExceeded。
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		return fmt.Sprintf("bash 超时，死前输出：\n%s", outputSections(stdout, stderr)), nil

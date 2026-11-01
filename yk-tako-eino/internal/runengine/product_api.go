@@ -1,6 +1,7 @@
 package runengine
 
 import (
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/cloudwego/eino/components/tool"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
@@ -880,7 +882,14 @@ func (s *Server) postDevBash(c *gin.Context) {
 	if !ok {
 		return
 	}
-	out, err := runBash(c.Request.Context(), dir, command, bashDevTimeout, true)
+	// dev 口不是一场 run，但它要落盘 bash 全文（doc/58 §4）——给它一个当场生成的
+	// run id，落在 .tako/bash/<runId>/ 下。逐请求一个新 id：同一个会话连调两次也不会撞名。
+	rid, err := newRunID()
+	if err != nil {
+		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
+		return
+	}
+	out, err := runBash(withNoteBox(c.Request.Context(), newNoteBox(sid, rid, 0)), dir, command, bashDevTimeout, true)
 	if err != nil {
 		writeEnvelope(c, http.StatusBadRequest, codeForbidden, err.Error(), nil)
 		return
@@ -890,6 +899,55 @@ func (s *Server) postDevBash(c *gin.Context) {
 		SessionID SessionID `json:"sessionId"`
 		Sandboxed bool      `json:"sandboxed"`
 	}{Output: out, SessionID: sid, Sandboxed: sandboxAvailable()})
+}
+
+// postDevRead 是读工具的诊断口：直接调 read_file 工具、回它的输出原文。
+//
+// 为什么要有它：read 的输出字节是**模型侧**字节（四个产品 API 打不到它）。没有这个口，
+// 「read 的字节对不对」只能靠「起 run + 盼模型照着调」来验——模型不听就假红。
+// 它让 read 的契约可 curl、可逐字节断言；只在 -dev 模式注册（与 workspace/file、workspace/bash 同族）。
+//
+//	POST /api/dev/workspace/read {"path":"a.md"}
+//	200 {"code":0,"message":"","data":{"output":"<工具输出原文>","sessionId":"s_…"}}
+func (s *Server) postDevRead(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	// 请求体就是读工具的入参（同一个 struct）——工具加了字段，这个口自动跟上，不会两处各写一份。
+	var req readTextFileInput
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Path) == "" {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	dir, sid, ok := s.devWorkspaceDir(c, p)
+	if !ok {
+		return
+	}
+	args, err := json.Marshal(req)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	tl, err := newReadTextFileTool(dir)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	it, ok := tl.(tool.InvokableTool)
+	if !ok {
+		internal(c, errors.New("读工具不可调用"))
+		return
+	}
+	out, err := it.InvokableRun(c.Request.Context(), string(args))
+	if err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, stripToolShell(err), nil)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", struct {
+		Output    string    `json:"output"`
+		SessionID SessionID `json:"sessionId"`
+	}{Output: out, SessionID: sid})
 }
 
 func (s *Server) memoryContext(c *gin.Context) (bool, bool) {

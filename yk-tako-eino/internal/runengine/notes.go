@@ -620,6 +620,7 @@ type noteBox struct {
 	snap    string // 渲染后的快照段：run 起手填一次，run 内冻结
 	fails   int    // 本 run 写入失败次数（只由 tickFailure 增；随 run 死）
 	spills  int    // 本 run 截断落盘计数器（只由 tickSpill 增；文件名顺编用，随 run 死）
+	bashes  int    // 本 run bash 落盘计数器（只由 tickBash 增；stdout/stderr 各占一个顺号，随 run 死）
 }
 
 func newNoteBox(session SessionID, run RunID, userSeq int64) *noteBox {
@@ -645,6 +646,15 @@ func (b *noteBox) tickSpill() int {
 	defer b.mu.Unlock()
 	b.spills++
 	return b.spills
+}
+
+// tickBash 记一次 bash 调用、返回本 run 内的顺编号（从 1 起）。一次 bash 调用占一个号：
+// stdout 与 stderr 各写一个文件（`.out` / `.err`），同号不同名，不会互相盖。
+func (b *noteBox) tickBash() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.bashes++
+	return b.bashes
 }
 
 func (b *noteBox) setSnapshot(s string) {

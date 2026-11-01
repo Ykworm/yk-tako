@@ -128,7 +128,11 @@ TAKO_ENGINE_RESTART='cd <仓库根>/yk-tako-eino && nohup go run ./cmd/yktako -e
         "data": null,                   // 子集比对：只断点名的键
         "data_keys": ["a", "b"],        // 键集与键序必须逐字相同（要精确就写这个）
         "frame_kinds_contains": ["start", "terminal"],
-        "rows_len_equals": "{rows_before}"
+        "rows_len_equals": "{rows_before}",
+        "data_contains": {                // 只断「含某几段」，不逐字比全文
+          "path": "output",               // 给**逐请求变**的字节用（例：bash 落盘提示行里的 run id）
+          "contains": ["（stdout 完整输出已存到 .tako/bash/", "共 100000 字节"]
+        }
       }
     }
   ]
@@ -140,6 +144,10 @@ TAKO_ENGINE_RESTART='cd <仓库根>/yk-tako-eino && nohup go run ./cmd/yktako -e
 `op=seed_ws`（往**项目目录**里造文件/目录/符号链接——产出文件在文件系统上，SQL 造不出来；
 目录布局 = `<workspace根>/tenants/<tid>/workspaces/<wid>/`，根由 `TAKO_WS_ROOT` 给）、
 带 `sql` 的步骤（请求前先跑一句 SQL）。
+
+用例级字段 `needs`：值 `pg` = 要直连 PG（造「忙」闸）、`sandbox` = 要 macOS 的 `sandbox-exec`
+（bash 的围栏；Linux 上引擎对 bash fail closed，见 doc/35）。条件不满足时这条**跳过并说明原因**，
+不假装跑过。
 
 ## 什么时候必须跑
 

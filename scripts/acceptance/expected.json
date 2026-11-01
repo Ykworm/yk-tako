@@ -1,12 +1,14 @@
 {
-  "version": "2026-10-28",
+  "version": "2026-11-01",
   "source": "doc/19-v6/19v6-04-验收-curl.md",
   "note": [
     "本文件是契约字节的**机器真源**；doc/19-v6/19v6-04-验收-curl.md 是同一份内容的人读版。",
     "两份**同批改**。check-expected.sh 守两边的用例号集合一致。",
     "tier=core 的用例不需要模型，必须全过；tier=model 需要真实跑一轮（要 API Key 与网络）。",
     "expect 字段：http / code / message / data（子集比对：只断点名的键，值写 \"$any\" 是通配）/ data_keys（data 对象的键集与键序必须逐字相同）/ frame_kinds_contains / rows_len_equals / data_items_some（数组里**至少有一项**满足条件，如 {\"path\":\"workspaces\",\"match\":{\"id\":\"{wid}\",\"isDefault\":false}}——expect 里也能写 {var}）。",
-    "step 字段：method / path / body / auth / sql（请求前先跑的 SQL）/ capture（把响应里的值存成变量）/ op=signup（建账号+租户+配模型）/ op=wait_terminal（等这一场跑完）。"
+    "expect 字段另加 data_contains（只断 data 里某个字符串**含**哪几段：{\"path\":\"output\",\"contains\":[\"…\",\"…\"]}）——给**逐请求变**的字节用（例：bash 落盘提示行里的 run id 每次都不同，全文比不了）。",
+    "step 字段：method / path / body / auth / sql（请求前先跑的 SQL）/ capture（把响应里的值存成变量）/ op=signup（建账号+租户+配模型）/ op=wait_terminal（等这一场跑完）。",
+    "用例级字段：needs（\"pg\"=要直连 PG、\"sandbox\"=要 macOS sandbox-exec；不满足就跳过并说明原因，不假装跑过）。"
   ],
   "cases": [
     {
@@ -1907,6 +1909,194 @@
             "code": 111102,
             "message": "请先登录",
             "data": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "32-read-pagination",
+      "case": "用例 32",
+      "tier": "core",
+      "desc": "读分页（doc/58 §3）：offset/limit 切片 + 三态页脚、offset 越界/非正/limit 超帽 400 111002、缺文件 400 111002（读工具的字节只有 dev 口打得到）",
+      "steps": [
+        {
+          "op": "signup",
+          "no_model": true
+        },
+        {
+          "method": "POST",
+          "path": "/api/dev/workspace/file",
+          "body": {
+            "path": "d58-page.txt",
+            "content": "line 1\nline 2\nline 3\n"
+          },
+          "expect": {
+            "http": 201,
+            "code": 0,
+            "message": "",
+            "data": {
+              "path": "d58-page.txt"
+            }
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/dev/workspace/read",
+          "body": {
+            "path": "d58-page.txt"
+          },
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data": {
+              "output": "line 1\nline 2\nline 3\n\n（已读到文件末尾，共 3 行）"
+            }
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/dev/workspace/read",
+          "body": {
+            "path": "d58-page.txt",
+            "offset": 2,
+            "limit": 1
+          },
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data": {
+              "output": "line 2\n\n（已显示第 2-2 行，共 3 行；继续读用 offset=3）"
+            }
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/dev/workspace/read",
+          "body": {
+            "path": "d58-page.txt",
+            "offset": 9
+          },
+          "expect": {
+            "http": 400,
+            "code": 111002,
+            "message": "offset 9 超出文件末尾（共 3 行）",
+            "data": null
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/dev/workspace/read",
+          "body": {
+            "path": "d58-page.txt",
+            "offset": 0
+          },
+          "expect": {
+            "http": 400,
+            "code": 111002,
+            "message": "offset 须为正整数（给的是 0）",
+            "data": null
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/dev/workspace/read",
+          "body": {
+            "path": "d58-page.txt",
+            "limit": 5000
+          },
+          "expect": {
+            "http": 400,
+            "code": 111002,
+            "message": "limit 不得大于 2000（给的是 5000）",
+            "data": null
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/dev/workspace/read",
+          "body": {
+            "path": "d58-nope.txt"
+          },
+          "expect": {
+            "http": 400,
+            "code": 111002,
+            "message": "文件不存在：d58-nope.txt",
+            "data": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "33-bash-output-retention",
+      "case": "用例 33",
+      "tier": "core",
+      "needs": "sandbox",
+      "desc": "bash 输出留存（doc/58 §4）：小输出形状不变（不建落盘目录）、大输出留尾 + 全文落盘并回路径、落盘文件真在盘上（读回 100000 字节）",
+      "steps": [
+        {
+          "op": "signup",
+          "no_model": true
+        },
+        {
+          "method": "POST",
+          "path": "/api/dev/workspace/bash",
+          "body": {
+            "cmd": "echo hi"
+          },
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data": {
+              "output": "退出码：0\nstdout:\nhi\n",
+              "sandboxed": true
+            }
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/dev/workspace/bash",
+          "body": {
+            "cmd": "printf 'x%.0s' {1..100000}"
+          },
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data_contains": {
+              "path": "output",
+              "contains": [
+                "stdout:\n",
+                "（stdout 完整输出已存到 .tako/bash/",
+                "1.out，共 100000 字节；用 read_file 分页读它）"
+              ]
+            }
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/dev/workspace/bash",
+          "body": {
+            "cmd": "for f in .tako/bash/*/1.out; do v=$(< \"$f\"); echo \"${#v}\"; done"
+          },
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data": {
+              "output": "退出码：0\nstdout:\n100000\n"
+            }
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/api/dev/workspace/bash",
+          "body": {
+            "cmd": "n=0; for d in .tako/bash/*/; do [ -d \"$d\" ] && n=$((n+1)); done; echo $n"
+          },
+          "expect": {
+            "http": 200,
+            "code": 0,
+            "data": {
+              "output": "退出码：0\nstdout:\n1\n"
+            }
           }
         }
       ]

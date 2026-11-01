@@ -14,6 +14,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -119,6 +120,26 @@ def psql(sql):
     if r.returncode != 0:
         return False, f"psql 失败：{(r.stderr or '').strip()[:200]}"
     return True, r.stdout.strip()
+
+
+def sandbox_available():
+    """这台机器能不能跑 bash（有能 apply 的 macOS sandbox-exec）。
+
+    bash 的围栏只有 macOS 的 sandbox-exec；Linux 上引擎对 bash fail closed
+    （doc/35 的 Linux 缺口）。要 bash 的用例在那种机器上**跳过并说明原因**，
+    不假装跑过——判据与引擎侧同款：找得到 sandbox-exec 且它能 apply 一条 allow default 的 profile。
+    """
+    if not sys.platform.startswith("darwin"):
+        return False
+    path = shutil.which("sandbox-exec")
+    if not path:
+        return False
+    try:
+        r = subprocess.run([path, "-p", "(version 1)(allow default)", "/bin/echo", "ok"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0 and "ok" in (r.stdout or "")
 
 
 def pick(obj, path):

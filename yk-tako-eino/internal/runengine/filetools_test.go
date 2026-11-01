@@ -166,8 +166,9 @@ func TestFirstPartyFileEffectsPassLint(t *testing.T) {
 	}
 }
 
-// read_text_file：全文直出 / head / tail（尾换行不折出空行）/ 同给报错 / 非正数报错 / 不存在 / 目录。
-func TestReadTextFileBasicHeadTail(t *testing.T) {
+// read_text_file：全文直出（带页脚）/ offset+limit 切片 / 参数校验 / 不存在 / 目录。
+// head/tail 在 A3 删掉了——截读方言只剩 offset/limit 一套（dsh 形态）。
+func TestReadTextFileBasic(t *testing.T) {
 	root := t.TempDir()
 	var sb strings.Builder
 	for i := 1; i <= 30; i++ {
@@ -183,29 +184,28 @@ func TestReadTextFileBasicHeadTail(t *testing.T) {
 	it := raw.(tool.InvokableTool)
 	ctx := context.Background()
 
+	// 全文直出带页脚（A1 起：末尾换行不再折出空行，尾部追加页脚行）。
 	out, err := it.InvokableRun(ctx, `{"path":"lines.txt"}`)
 	if err != nil {
 		t.Fatalf("全文读取报错: %v", err)
 	}
-	if out != sb.String() {
+	if out != "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12\nline 13\nline 14\nline 15\nline 16\nline 17\nline 18\nline 19\nline 20\nline 21\nline 22\nline 23\nline 24\nline 25\nline 26\nline 27\nline 28\nline 29\nline 30\n\n（已读到文件末尾，共 30 行）" {
 		t.Fatalf("全文直出漂移: got %q", out)
 	}
 
-	out, err = it.InvokableRun(ctx, `{"path":"lines.txt","head":3}`)
-	if err != nil || out != "line 1\nline 2\nline 3" {
-		t.Fatalf("head=3: out=%q err=%v", out, err)
+	out, err = it.InvokableRun(ctx, `{"path":"lines.txt","offset":2,"limit":2}`)
+	if err != nil || out != "line 2\nline 3\n\n（已显示第 2-3 行，共 30 行；继续读用 offset=4）" {
+		t.Fatalf("offset+limit 切片: out=%q err=%v", out, err)
 	}
 
-	out, err = it.InvokableRun(ctx, `{"path":"lines.txt","tail":2}`)
-	if err != nil || out != "line 29\nline 30" {
-		t.Fatalf("tail=2: out=%q err=%v", out, err)
+	if _, err = it.InvokableRun(ctx, `{"path":"lines.txt","offset":0}`); err == nil || !strings.Contains(err.Error(), "正整数") {
+		t.Fatalf("offset=0 应报非正数: %v", err)
 	}
-
-	if _, err = it.InvokableRun(ctx, `{"path":"lines.txt","head":1,"tail":1}`); err == nil || !strings.Contains(err.Error(), "不能同时") {
-		t.Fatalf("head+tail 同给应报错: %v", err)
+	if _, err = it.InvokableRun(ctx, `{"path":"lines.txt","limit":5000}`); err == nil || !strings.Contains(err.Error(), "2000") {
+		t.Fatalf("limit=5000 应报超帽: %v", err)
 	}
-	if _, err = it.InvokableRun(ctx, `{"path":"lines.txt","head":0}`); err == nil || !strings.Contains(err.Error(), "正整数") {
-		t.Fatalf("head=0 应报非正数: %v", err)
+	if _, err = it.InvokableRun(ctx, `{"path":"lines.txt","offset":31}`); err == nil || !strings.Contains(err.Error(), "超出文件末尾") {
+		t.Fatalf("offset 越界应报错: %v", err)
 	}
 	if _, err = it.InvokableRun(ctx, `{"path":"nope.txt"}`); err == nil || !strings.Contains(err.Error(), "不存在") {
 		t.Fatalf("缺失文件应报不存在: %v", err)
@@ -215,12 +215,12 @@ func TestReadTextFileBasicHeadTail(t *testing.T) {
 	}
 }
 
-// 200KB 减灾档：无截读参数被挡（错误带上限提示），head 放行、恰 5 行。
-func TestReadTextFileSizeGuard(t *testing.T) {
+// 大文件不再报错：>200KB 的文件照样流式分页读（doc/58 §3.3，200KB 那条错误已撤）。
+func TestReadTextFileLargeFilePaged(t *testing.T) {
 	root := t.TempDir()
 	var sb strings.Builder
-	for sb.Len() <= 200*1024 {
-		sb.WriteString("row 0123456789\n") // 15 字节/行
+	for i := 1; i <= 15000; i++ {
+		fmt.Fprintf(&sb, "row %05d\n", i)
 	}
 	if err := os.WriteFile(filepath.Join(root, "big.txt"), []byte(sb.String()), 0o644); err != nil {
 		t.Fatal(err)
@@ -232,13 +232,58 @@ func TestReadTextFileSizeGuard(t *testing.T) {
 	it := raw.(tool.InvokableTool)
 	ctx := context.Background()
 
-	if _, err = it.InvokableRun(ctx, `{"path":"big.txt"}`); err == nil || !strings.Contains(err.Error(), "200KB") {
-		t.Fatalf(">200KB 无截读应报上限提示: %v", err)
+	out, err := it.InvokableRun(ctx, `{"path":"big.txt"}`)
+	if err != nil {
+		t.Fatalf("大文件分页读不该报错: %v", err)
 	}
-	out, err := it.InvokableRun(ctx, `{"path":"big.txt","head":5}`)
-	want := strings.Repeat("row 0123456789\n", 4) + "row 0123456789"
-	if err != nil || out != want {
-		t.Fatalf("head=5: out=%q err=%v", out, err)
+	if !strings.HasPrefix(out, "row 00001\n") {
+		t.Fatalf("大文件首页应从第 1 行开始: %q", out[:min(40, len(out))])
+	}
+	if !strings.HasSuffix(out, "\n\n（已显示第 1-2000 行，共 15000 行；继续读用 offset=2001）") {
+		t.Fatalf("大文件首页页脚不对: %q", out[max(0, len(out)-80):])
+	}
+
+	out, err = it.InvokableRun(ctx, `{"path":"big.txt","offset":14001}`)
+	if err != nil {
+		t.Fatalf("大文件尾页不该报错: %v", err)
+	}
+	if !strings.HasPrefix(out, "row 14001\n") {
+		t.Fatalf("大文件尾页起点不对: %q", out[:min(40, len(out))])
+	}
+	if !strings.HasSuffix(out, "\n\n（已读到文件末尾，共 15000 行）") {
+		t.Fatalf("大文件尾页页脚不对: %q", out[max(0, len(out)-80):])
+	}
+}
+
+// 字节帽先到：单行超 2000 字符先截断（dsh 的 READ_MAX_LINE_LENGTH），
+// 整页超 50KB 时页脚换成「本次被 50KB 上限截断」——只能靠 offset 跳着读。
+func TestReadTextFileByteCapFooter(t *testing.T) {
+	root := t.TempDir()
+	var sb strings.Builder
+	for i := 0; i < 40; i++ {
+		sb.WriteString(strings.Repeat("x", 3000))
+		sb.WriteString("\n")
+	}
+	if err := os.WriteFile(filepath.Join(root, "cap.txt"), []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := newReadTextFileTool(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	it := raw.(tool.InvokableTool)
+	out, err := it.InvokableRun(context.Background(), `{"path":"cap.txt"}`)
+	if err != nil {
+		t.Fatalf("读不该报错: %v", err)
+	}
+	// 超长单行截到 2000 字符 + 行尾标注（实跑字节）。
+	if !strings.HasPrefix(out, strings.Repeat("x", readMaxLineChars)+"…（本行超长已截断）\n") {
+		t.Fatalf("超长单行截断形状不对: %q", out[:min(60, len(out))])
+	}
+	// 页脚：字节帽先到（实跑字节：40 行 × 3000 字符，每行截到 2000 字符 = 2001 字节 → 25 行越过 50KB）。
+	const wantFooter = "\n\n（已显示第 1-25 行，共 40 行；本次被 50KB 上限截断，继续读用 offset=26）"
+	if !strings.HasSuffix(out, wantFooter) {
+		t.Fatalf("字节帽页脚不对: %q", out[max(0, len(out)-90):])
 	}
 }
 
@@ -325,12 +370,12 @@ func TestReadFileAlias(t *testing.T) {
 
 	it := rawAlias.(tool.InvokableTool)
 	out, err := it.InvokableRun(ctx, `{"path":"hello.txt"}`)
-	if err != nil || out != "alias body\nsecond\n" {
+	if err != nil || out != "alias body\nsecond\n\n（已读到文件末尾，共 2 行）" {
 		t.Fatalf("别名全文读取: out=%q err=%v", out, err)
 	}
-	out, err = it.InvokableRun(ctx, `{"path":"hello.txt","head":1}`)
-	if err != nil || out != "alias body" {
-		t.Fatalf("别名 head=1: out=%q err=%v", out, err)
+	out, err = it.InvokableRun(ctx, `{"path":"hello.txt","offset":1,"limit":1}`)
+	if err != nil || out != "alias body\n\n（已显示第 1-1 行，共 2 行；继续读用 offset=2）" {
+		t.Fatalf("别名 offset+limit: out=%q err=%v", out, err)
 	}
 }
 
