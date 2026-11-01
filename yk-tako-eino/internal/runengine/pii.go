@@ -209,7 +209,7 @@ func hasSecretPII(hits []PIIHit) bool {
 // devPiiCheck 是 PII 打码探针（脚手架：长期保留，纯函数无状态——对齐 gate-check 先例）。
 //
 //	POST /api/dev/pii-check {"text":"key=sk-proj-AbCdEfGhIjKlMnOpQrSt"}
-//	200 {"code":0,"message":"","data":{"masked":"key=sk-p******************QrSt","hits":[{"kind":"api_key","start":4,"end":30}]}}
+//	200 {"code":0,"message":"","data":{"masked":"key=sk-p********************QrSt","hits":[{"kind":"api_key","start":4,"end":32}]}}
 func (s *Server) devPiiCheck(c *gin.Context) {
 	if _, ok := s.requirePrincipal(c); !ok {
 		return

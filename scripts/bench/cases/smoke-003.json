@@ -1,0 +1,7 @@
+{
+  "id": "smoke-003",
+  "question": "列出 1、2、3 三个数字，用逗号分隔。",
+  "answer": "1,2,3",
+  "type": "list",
+  "note": "守官方 scorer 的列表支：元素个数必须相等，个数不等直接判错（官方还会 warn）。防的是把 'basil, broccoli, celery, lettuce, sweet potatoes' 与 'broccoli, celery, fresh basil, lettuce, sweet potatoes' 这类逐位不同的列表当成同长就过。"
+}

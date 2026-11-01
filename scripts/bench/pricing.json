@@ -1,0 +1,17 @@
+{
+  "_comment": "价目真源。出处：DeepSeek 官方价目页 https://api-docs.deepseek.com/quick_start/pricing ，2026-11-01 抓取。单位：美元 / 100 万 token。",
+  "_source": "https://api-docs.deepseek.com/quick_start/pricing",
+  "_fetchedAt": "2026-11-01",
+  "model": "deepseek-flash",
+  "modelName": "DeepSeek Flash",
+  "currency": "USD",
+  "perMillionTokens": {
+    "inputCacheHit": { "offPeak": 0.003, "peak": 0.006 },
+    "inputCacheMiss": { "offPeak": 0.15, "peak": 0.3 },
+    "output": { "offPeak": 0.6, "peak": 1.2 }
+  },
+  "peakHoursUtc": [[1, 4], [6, 10]],
+  "peakDaysUtc": "Mon-Fri（不含中国法定节假日；周末与节假日全为 off-peak）",
+  "usageFrameCaveat": "引擎 usage 帧只给 promptTokens 总量，不分缓存命中/未命中；本表按【缓存未命中】价算，是偏贵的上界。真账单以厂商为准。",
+  "priceNote": "官方页脚注：off-peak 价是 peak 价的一半。"
+}

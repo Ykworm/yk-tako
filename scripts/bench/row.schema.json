@@ -1,0 +1,64 @@
+{
+  "schemaVersion": "1",
+  "desc": "一行 = 一臂跑一题的结果。键序固定，三臂（tako/pi/dsh）共用的机器真源；判定段由 judge.py 填，臂单独跑且找不到题面时写 null。",
+  "keys": [
+    "taskId",
+    "arm",
+    "runId",
+    "sessionId",
+    "workspaceId",
+    "status",
+    "answer",
+    "modelCalls",
+    "toolCalls",
+    "promptTokens",
+    "completionTokens",
+    "totalTokens",
+    "wallSec",
+    "tools",
+    "pass",
+    "reason"
+  ],
+  "groups": {
+    "execution": [
+      "taskId",
+      "arm",
+      "runId",
+      "sessionId",
+      "workspaceId",
+      "status",
+      "answer",
+      "modelCalls",
+      "toolCalls",
+      "promptTokens",
+      "completionTokens",
+      "totalTokens",
+      "wallSec",
+      "tools"
+    ],
+    "verdict": ["pass", "reason"]
+  },
+  "sources": {
+    "taskId": "题面文件里的题 id（GAIA task_id / 自造题 id）；arm 单跑找不到题面时为 null",
+    "arm": "跑出这一行的臂名（tako / pi / dsh）",
+    "runId": "POST /api/runs → data.runId",
+    "sessionId": "POST /api/runs → data.sessionId",
+    "workspaceId": "POST /api/workspaces → data.workspace.id",
+    "status": "GET /api/runs/:id → data.status（complete / error / stopped / failed）",
+    "answer": "GET /api/runs/:id/frames → frames[kind=delta].text 拼接 → 末个非空行 → 去答句前缀",
+    "modelCalls": "GET /api/runs/:id/frames → frames[kind=usage] 条数",
+    "toolCalls": "GET /api/runs/:id/frames → frames[kind=tool_call] 条数",
+    "promptTokens": "frames[kind=usage] 各条 promptTokens 求和（一枪一帧，累加才是整场账单）",
+    "completionTokens": "frames[kind=usage] 各条 completionTokens 求和",
+    "totalTokens": "frames[kind=usage] 各条 totalTokens 求和",
+    "wallSec": "runner 本地墙钟（发起 run 到终态）",
+    "tools": "frames[kind=tool_call].name 逐条，按帧序",
+    "pass": "judge.py 的 pass；run 没跑完时由 runner 写 false",
+    "reason": "judge.py 的 reason（number / string / list / mismatch）；run 没跑完时写 timeout / run error"
+  },
+  "notes": [
+    "traceId / spanId 不进这一行：三臂公约要求三臂都产得出，pi / dsh 没有 OTel；trace 归报告的口径字段。",
+    "答案在 delta 帧里，terminal 帧的 text 是空的——抽取只看 delta。",
+    "厂商不报 token 时该 usage 帧可能缺列；缺列按 0 计入累加，并在报告里记口径。"
+  ]
+}

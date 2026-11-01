@@ -1,0 +1,25 @@
+{
+  "slice_id": "gaia-l1-text-25",
+  "_comment": "GAIA 切片配方（机器真源）。题面、标准答案、task_id 一律不入库——GAIA 条款要求不外发数据集（dataset card: not reshare outside a gated or private repository；leaderboard content.py: do not repost the public dev set）。明文留本机 gitignore 目录，切片用 slice_hash 复现。",
+  "source_repo": "gaia-benchmark/GAIA",
+  "source_file": "2023/validation/metadata.level1.parquet",
+  "source_revision_main": "682dd723ee1e1697e00360edccf2366dc8418dd9",
+  "source_file_sha256": "5e574b0faeb4603b816e426cf7c7aefb1fe398d32f9c4861e1a4e3304f2b1281",
+  "source_file_bytes": 39524,
+  "mirror": "https://hf-mirror.com",
+  "filter": {
+    "level": "1",
+    "file_name_empty": true
+  },
+  "sort": "task_id asc",
+  "pool_level1_text_only": 42,
+  "slice_size": 25,
+  "slice_hash": "sha256:ee7e330594d0fc2aad40f00755f38b975caa80baffedfb288b9fc1106070e145",
+  "slice_hash_recipe": {
+    "algorithm": "sha256",
+    "payload": "json.dumps(cases, ensure_ascii=False, sort_keys=True).encode('utf-8')",
+    "cases_fields": ["task_id", "question", "answer"],
+    "question_column": "Question",
+    "answer_column": "Final answer"
+  }
+}

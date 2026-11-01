@@ -1,0 +1,7 @@
+{
+  "id": "smoke-002",
+  "question": "用大写英文字母写出「ping」这个词，只输出这个词。",
+  "answer": "PING",
+  "type": "string",
+  "note": "守官方 scorer 的字符串支：大小写与空格归一后应判过。防的是上一轮自制口径把 'THE SEA GULL GLIDED PEACEFULLY TO MY CHAIR' 对 'The seagull glided peacefully to my chair.' 判成错。"
+}
