@@ -5,10 +5,16 @@ package runengine
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"yk-tako-eino/internal/observability"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // 线一召回的帽（doc/29 §8，数值写死不是配置）。
@@ -32,15 +38,38 @@ type RecallResult struct {
 
 // Recall 是注入与预览的唯一实现（doc/29 §6）：线一按开关与词表查记忆，线二按开关用
 // 用户原文走 pg_search。两线都无命中时 Block 为空串——模型输入与没有记忆功能时逐字节相同。
-func (s *Store) Recall(ctx context.Context, query string) (RecallResult, error) {
+func (s *Store) Recall(ctx context.Context, query string) (res RecallResult, err error) {
+	ctx, span := startStep(ctx, "tako.step.recall")
+	defer func() {
+		span.SetAttributes(
+			attribute.Int("tako.recall.terms", res.Terms),
+			attribute.Int("memory_hits", res.MemoryHits),
+			attribute.Int("dialogue_hits", res.DialogueHits),
+			attribute.Int("injected_runes", res.InjectedRunes),
+		)
+		finishSpan(span, err)
+	}()
 	terms := recallTerms(query)
-	res := RecallResult{Terms: len(terms)}
+	res = RecallResult{Terms: len(terms)}
 	var blocks []string
 	if s.memoryCfg.Recall && len(terms) > 0 {
-		items, err := s.recallMemoryItems(ctx, terms)
-		if err != nil {
-			return res, err
+		lineCtx, lineSpan := observability.Tracer().Start(ctx, "search_memory", trace.WithSpanKind(trace.SpanKindInternal))
+		lineSpan.SetAttributes(
+			attribute.String(attrOperation, "search_memory"),
+			attribute.String("gen_ai.memory.store.id", "tako-memory"),
+			attribute.Int("gen_ai.memory.record.count", 0),
+		)
+		observability.SetTextJSON(lineSpan, "gen_ai.memory.query.text", query)
+		items, merr := s.recallMemoryItems(lineCtx, terms)
+		if merr != nil {
+			finishSpan(lineSpan, merr)
+			return res, merr
 		}
+		lineSpan.SetAttributes(attribute.Int("gen_ai.memory.record.count", len(items)))
+		if b, jerr := json.Marshal(items); jerr == nil {
+			observability.SetTextJSON(lineSpan, "gen_ai.memory.records", string(b))
+		}
+		finishSpan(lineSpan, nil)
 		block, hits := renderMemoryBlock(items)
 		if hits > 0 {
 			res.MemoryHits = hits
@@ -49,10 +78,22 @@ func (s *Store) Recall(ctx context.Context, query string) (RecallResult, error) 
 	}
 	// 线二用原文整句（分词由扩展按索引声明的 tokenizer 做，我们侧零切词）。
 	if s.memoryCfg.RAG && strings.TrimSpace(query) != "" {
-		chunks, err := s.recallDialogueItems(ctx, query)
-		if err != nil {
-			return res, err
+		lineCtx, lineSpan := observability.Tracer().Start(ctx, "retrieval", trace.WithSpanKind(trace.SpanKindInternal))
+		lineSpan.SetAttributes(
+			attribute.String(attrOperation, "retrieval"),
+			attribute.String("gen_ai.data_source.id", "pg_search"),
+			attribute.Int("gen_ai.retrieval.top_k", dialogueRecallItemsMax),
+		)
+		observability.SetTextJSON(lineSpan, "gen_ai.retrieval.query.text", query)
+		chunks, derr := s.recallDialogueItems(lineCtx, query)
+		if derr != nil {
+			finishSpan(lineSpan, derr)
+			return res, derr
 		}
+		if b, jerr := json.Marshal(chunks); jerr == nil {
+			observability.SetTextJSON(lineSpan, "gen_ai.retrieval.documents", string(b))
+		}
+		finishSpan(lineSpan, nil)
 		block, hits := renderDialogueBlock(chunks)
 		if hits > 0 {
 			res.DialogueHits = hits

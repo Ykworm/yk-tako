@@ -16,10 +16,15 @@ import (
 	"errors"
 	"fmt"
 
+	"yk-tako-eino/internal/observability"
+
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // errJournalGateLost = 账本写入时本执行者已不是当前令牌持有者（doc/30 §7 围栏）：
@@ -85,7 +90,7 @@ func (t *journalInvokableTool) Info(ctx context.Context) (*schema.ToolInfo, erro
 	return t.inner.Info(ctx)
 }
 
-func (t *journalInvokableTool) InvokableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (string, error) {
+func (t *journalInvokableTool) InvokableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (out string, err error) {
 	target, ok := journalTargetFrom(ctx)
 	if !ok {
 		return t.inner.InvokableRun(ctx, argumentsInJSON, opts...)
@@ -94,23 +99,50 @@ func (t *journalInvokableTool) InvokableRun(ctx context.Context, argumentsInJSON
 	if name, ok := callerNameFrom(ctx); ok && name != "" {
 		return t.inner.InvokableRun(ctx, argumentsInJSON, opts...)
 	}
+	// 两道直通闸之后才开 span：子代理内部工具调用不是本包装链的记账对象
+	// （doc/54 §6），给它半条无名 span 只会污染时间线。
+	ctx, span := observability.Tracer().Start(ctx, "execute_tool", trace.WithSpanKind(trace.SpanKindInternal))
+	span.SetAttributes(
+		attribute.String(attrOperation, "execute_tool"),
+		attribute.String("gen_ai.tool.type", "function"),
+	)
+	defer func() {
+		switch {
+		case err == nil:
+			span.SetStatus(codes.Ok, "")
+		case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+			span.SetStatus(codes.Unset, "")
+		default:
+			span.SetAttributes(attribute.String("error.type", "tool_error"))
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+	}()
 	info, err := t.inner.Info(ctx)
 	if err != nil {
 		return "", err
 	}
 	callID := compose.GetToolCallID(ctx)
+	span.SetName("execute_tool " + info.Name)
+	span.SetAttributes(attribute.String("gen_ai.tool.name", info.Name))
+	if callID != "" {
+		span.SetAttributes(attribute.String("gen_ai.tool.call.id", callID))
+	}
+	observability.SetTextJSON(span, "gen_ai.tool.call.arguments", argumentsInJSON)
 	if err := t.store.InsertJournal(ctx, RunJournal{
 		RunID: target.runID, Epoch: target.epoch, Role: "tool_call",
 		ToolCallID: callID, ToolName: info.Name, Args: argumentsInJSON,
 	}); err != nil {
 		return "", fmt.Errorf("账本 tool_call 写入失败，工具未执行: %w", err)
 	}
-	out, err := t.inner.InvokableRun(ctx, argumentsInJSON, opts...)
+	out, err = t.inner.InvokableRun(ctx, argumentsInJSON, opts...)
 	if err != nil {
 		// 工具错误已被内层 wrapToolErrors 转成结果，能走到这里的是取消/中断一类的真错误：
 		// 不写 result，run 照常走 error 出口；账本留下 intent = 「可能执行过、结果不可知」。
 		return "", err
 	}
+	observability.SetTextJSON(span, "gen_ai.tool.call.result", out)
 	if err := t.store.InsertJournal(ctx, RunJournal{
 		RunID: target.runID, Epoch: target.epoch, Role: "tool_result",
 		Text: out, ToolCallID: callID, ToolName: info.Name,

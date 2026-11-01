@@ -114,6 +114,9 @@ var firstPartyFileEffects = map[string]string{
 	// .tako/search/（程序命名新文件、一次一写不覆盖，沿 search_history 的 spill 机制）——
 	// 声明 write。提取程序只扫调用参数、参数里只有 query 没有 path，不会去猜 query 字符串。
 	"web_search": fileEffectWrite,
+	// web_fetch（doc/57 §2）：每次抓取把整页写进 workspace 的 .tako/fetch/（程序命名新文件、
+	// 一次一写不覆盖）——声明 write。参数里只有 url 没有 path，提取程序不会去猜 URL。
+	"web_fetch": fileEffectWrite,
 }
 
 // fileEffectToolNames 是启动 lint 的目录名单（v1 常量表，逐名带出处；精确命中用，不转小写）：

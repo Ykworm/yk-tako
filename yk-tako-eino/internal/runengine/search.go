@@ -189,7 +189,13 @@ func spillIfTruncated(inline, full string, truncated bool, workspace string, box
 // 路径闸复用 resolveInWorkspace，MkdirAll / 打开 / 写入任一步失败都返回 ok=false
 // （doc/21 §3.2：写失败不报错，退化为纯截断行为）。
 func spillSearchResult(workspace string, box *noteBox, full string) (string, bool) {
-	rel := fmt.Sprintf(".tako/search/%s_%d.md", box.run, box.tickSpill())
+	return spillNote(workspace, box, ".tako/search", full)
+}
+
+// spillNote 是两类落盘的共同实现（doc/21 的搜索截断、doc/57 的整页抓取）：subdir 下的
+// <runId>_<n>.md，其余语义与 spillSearchResult 一致。
+func spillNote(workspace string, box *noteBox, subdir, full string) (string, bool) {
+	rel := fmt.Sprintf("%s/%s_%d.md", subdir, box.run, box.tickSpill())
 	fullPath, err := resolveInWorkspace(workspace, rel)
 	if err != nil {
 		return "", false

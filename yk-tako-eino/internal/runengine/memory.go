@@ -18,6 +18,7 @@ import (
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
+	"go.opentelemetry.io/otel/attribute"
 	"gorm.io/gorm"
 )
 
@@ -304,7 +305,19 @@ func (s *Store) tenantChat(ctx context.Context, tenantID string) (model.BaseChat
 
 // processMemoryJob 处理一条已 claim 的任务：读本 run 轨迹 + 已有笔记 → 调抽取模型 →
 // 机械校验 → items + done 同一笔事务（doc/29 §4.2–§4.5）。
-func (s *Store) processMemoryJob(ctx context.Context, job *claimedMemoryJob, getModel MemoryModelFunc, counter TokenCounter) (extractStats, error) {
+func (s *Store) processMemoryJob(ctx context.Context, job *claimedMemoryJob, getModel MemoryModelFunc, counter TokenCounter) (stats extractStats, err error) {
+	// 抽取跑在 EndRun 之后，ctx 里没有 run span，所以这一步自成一条 trace 的根（doc/54 §2.6）。
+	ctx, span := startStep(ctx, "tako.step.memory_extract")
+	defer func() {
+		span.SetAttributes(
+			attribute.String("tako.memory.job_id", job.ID),
+			attribute.String("tako.run.id", string(job.RunID)),
+			attribute.String("gen_ai.conversation.id", string(job.SessionID)),
+			attribute.Int("tako.memory.attempt", job.Attempts),
+			attribute.Int("tako.memory.items", stats.Items),
+		)
+		finishSpan(span, err)
+	}()
 	// 重放闸（doc/29 §4.5）：items 与 job=done 同笔事务，本 run 已有记忆行 = 上次 attempt 已完整
 	// 提交，重放直接翻 done、不再调模型。生成模型即使 temperature=0 也会改写措辞，内容级去重
 	// 兜不住「同一事实换个说法」；验收里的「重放假 job 不翻倍」由这道闸保证。
@@ -347,7 +360,7 @@ func (s *Store) processMemoryJob(ctx context.Context, job *claimedMemoryJob, get
 	if err != nil {
 		return extractStats{}, fmt.Errorf("解析抽取输出: %w", err)
 	}
-	stats, err := s.writeMemoryJobResult(ctx, job, seq, episode, items)
+	stats, err = s.writeMemoryJobResult(ctx, job, seq, episode, items)
 	if err != nil {
 		return extractStats{}, err
 	}

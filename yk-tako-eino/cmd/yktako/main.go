@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"yk-tako-eino/internal/config"
+	"yk-tako-eino/internal/observability"
 	"yk-tako-eino/internal/runengine"
 
 	"github.com/cloudwego/eino/components/model"
@@ -100,6 +101,7 @@ func main() {
 	// 先读 .env 再注册旗标：-lease-ttl/-lease-renew 的默认值取自 TAKO_LEASE_TTL/TAKO_LEASE_RENEW。
 	// Open() 内那次调用照旧（godotenv 不覆盖已设变量、可重复调），这里只是把它提前一步。
 	config.LoadDotEnv()
+	observability.Setup(context.Background())
 
 	engine := flag.String("engine", "127.0.0.1:8090", "listen address")
 	batch := flag.Int("batch-window", 200, "per-batch limit for frames/log reads")
@@ -271,13 +273,13 @@ func main() {
 		memoryRef := strings.TrimSpace(os.Getenv("TAKO_MEMORY_MODEL"))
 		getModel := func(ctx context.Context) (model.BaseChatModel, error) {
 			if memoryRef == "" {
-				return opened.Chat, nil
+				return runengine.WrapChatModel(opened.Chat, opened.Ref), nil
 			}
 			m, err := modelRegistry.Get(ctx, memoryRef)
 			if err != nil {
 				return nil, err
 			}
-			return m.Chat, nil
+			return runengine.WrapChatModel(m.Chat, memoryRef), nil
 		}
 		go store.RunMemoryExtractor(ctx, getModel, counter)
 	}

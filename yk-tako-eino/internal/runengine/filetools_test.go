@@ -154,9 +154,10 @@ func TestFirstPartyFileEffectsPassLint(t *testing.T) {
 		"search_history":   fileEffectWrite,
 		"bash":             fileEffectWrite,
 		"web_search":       fileEffectWrite,
+		"web_fetch":        fileEffectWrite,
 	}
 	if len(firstPartyFileEffects) != len(want) {
-		t.Fatalf("注册表条目数 %d, want %d（文件工具 + memory + search_history + bash + web_search）", len(firstPartyFileEffects), len(want))
+		t.Fatalf("注册表条目数 %d, want %d（文件工具 + memory + search_history + bash + web_search + web_fetch）", len(firstPartyFileEffects), len(want))
 	}
 	for name, effect := range want {
 		if firstPartyFileEffects[name] != effect {

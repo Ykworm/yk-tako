@@ -264,7 +264,7 @@ func TestShippedAgentSpecToolGuards(t *testing.T) {
 		"get_time", "write_file", "read_text_file", "read_file", "edit_file", "move_file",
 		"create_directory", "list_directory", "directory_tree", "get_file_info", "search_files",
 		"read_media_file", "read_pdf_text", "bash", "memory", "search_history", "web_search",
-		"ask_user", "enter_plan_mode", "submit_plan",
+		"web_fetch", "ask_user", "enter_plan_mode", "submit_plan",
 	}
 	// 名字宇宙从注册表派生（不另抄一份名单，两份会各自腐化）：父池加一把登记过 file_effect 的
 	// 新工具 ⇒ 集合与写死的池序不等 ⇒ 红。get_time 按 fileops.go:86 的说明不进注册表，显式并进来。
@@ -298,7 +298,8 @@ func TestShippedAgentSpecToolGuards(t *testing.T) {
 	golden := map[string][]string{
 		"researcher": {"get_time", "write_file", "read_text_file", "read_file", "edit_file", "move_file",
 			"create_directory", "list_directory", "directory_tree", "get_file_info", "search_files",
-			"read_media_file", "read_pdf_text", "memory", "search_history", "web_search", "ask_user",
+			"read_media_file", "read_pdf_text", "memory", "search_history", "web_search", "web_fetch",
+			"ask_user",
 			"enter_plan_mode", "submit_plan"},
 		"coder": {"write_file", "read_text_file", "edit_file", "list_directory", "search_files", "memory", "bash"},
 	}

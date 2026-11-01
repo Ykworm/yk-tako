@@ -209,7 +209,7 @@ func TestContractToolTiering(t *testing.T) {
 	direct := []string{
 		"get_time", "bash",
 		"write_file", "read_text_file", "edit_file", "list_directory", "search_files",
-		"memory", "search_history", "web_search",
+		"memory", "search_history", "web_search", "web_fetch",
 	}
 	for _, n := range direct {
 		if isDeferredTool(n) {

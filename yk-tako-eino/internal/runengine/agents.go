@@ -659,7 +659,7 @@ func (h *agentSpecHandler) resolveSpecModel(ctx context.Context, spec AgentSpec)
 	if err != nil {
 		return nil, agentModelEntry{}, fmt.Errorf("model %q: %v", ref, err)
 	}
-	return inst.Chat, agentModelEntry{ref: inst.Ref, translate: TranslatorFor(inst.Protocol)}, nil
+	return wrapChatModel(inst.Chat, inst.Ref), agentModelEntry{ref: inst.Ref, translate: TranslatorFor(inst.Protocol)}, nil
 }
 
 // subagentHandlers 是一条规格的 middleware。wire 紧挨折叠之前：折叠会换短 state.Messages，

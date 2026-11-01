@@ -34,11 +34,15 @@ import (
 	"sync"
 	"time"
 
+	"yk-tako-eino/internal/observability"
+
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // agentMaxIterations 是单次 run 的模型调用上限（主代理与子代理共用；2026-10-16 用户裁定 50）。
@@ -244,6 +248,14 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		return nil, err
 	}
 	pool = append(pool, wrapToolErrors(ws))
+	// 网页抓取工具入池（doc/57）：web_search 之后 append——搜索找到链接、抓取读原文是同一件活的
+	// 两步。选择器与 web_search 同源（调用方标记 + 生效 ref 的厂商 id），本篇只有 deepseek 一行；
+	// 结果落盘根是 .tako/fetch/（与搜索文件分开）。
+	wf, err := newWebFetchTool(workspace, counter)
+	if err != nil {
+		return nil, err
+	}
+	pool = append(pool, wrapToolErrors(wf))
 	// 任务看板四把工具入池（C1，doc/41 §3.3）：静态注册——每个 run 都是干活 run，
 	// 没有「只在有看板语义下才有意义」的状态。正本是 PG 表 run_tasks（活得过崩溃）。
 	// 位置：web_search 之后、摘要器之前（不影响任何既有顺序约定）。
@@ -333,7 +345,7 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 	// 看板使用约定静态拼进系统提示（doc/41 §3.3）：约定写在提示词里，不写状态机——
 	// 「提示词和工具，一个都不能少」。子代理的规格文件（agents/*.md）自带各自的约定。
 	system = system + "\n\n" + taskBoardPrompt + "\n\n" + askUserPrompt + "\n\n" + planPrompt
-	w := &Worker{store: store, sum: sum, chat: chat, tools: pool, handlers: handlers, translate: translate, system: system,
+	w := &Worker{store: store, sum: sum, chat: wrapChatModel(chat, modelRef), tools: pool, handlers: handlers, translate: translate, system: system,
 		rootRef: modelRef, leaseRenew: leaseRenew, workspace: workspace, compactWindow: compactWindow, compactLimit: compactLimit, archiveTTL: archiveTTL, counter: counter}
 	// 启动时先建一次，配置坏了立刻退出。每场 run 再新建，避免多个租户共用一个 agent 实例时取消互相踩掉。
 	agent, err := w.newRunAgent(context.Background())
@@ -507,21 +519,80 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 	// 计划模式快照（doc/47 §3.2）：PG 是真源，resume 时从这里恢复——批准前崩溃再接管，
 	// 守卫仍然是「开」的；批准后崩溃则读到 false，放行。
 	ctx = withPlanGate(ctx, seedPlanGate(ctx, w.store, runID))
+	// 运行级记录（doc/54 A2）：一条根 span 记整场 run。放在 quota 之前——早退也要有记录；
+	// 收尾 defer 注册在 EndRun 之前，LIFO 让它在定稿之后结束（能读到终态与折后容器）。
+	var turn []TurnEntry
+	if resume != nil {
+		turn = resume.Turn
+	}
+	ctx, runSpan := observability.Tracer().Start(ctx, "invoke_agent yktako", trace.WithSpanKind(trace.SpanKindClient))
+	runSpan.SetAttributes(
+		attribute.String(attrOperation, "invoke_agent"),
+		attribute.String("gen_ai.agent.name", "yktako"),
+		attribute.String("gen_ai.conversation.id", string(sessionID)),
+		attribute.String("tako.run.id", string(runID)),
+		attribute.Int64("tako.run.epoch", epoch),
+		attribute.String("tako.usage.scope", "conversation"),
+		attribute.String("cozeloop.span_type", "agent"),
+	)
+	if ws, werr := w.store.SessionWorkspaceID(ctx, sessionID); werr == nil && ws != "" {
+		runSpan.SetAttributes(attribute.String("tako.workspace.id", ws))
+	}
+	if t0, ok := ingressStartFrom(ctx); ok && !t0.IsZero() {
+		runSpan.SetAttributes(attribute.Int64("tako.run.start_delay_ms", time.Since(t0).Milliseconds()))
+	}
+	if p, ok := principalFromCtx(ctx); ok {
+		if p.TenantID != "" {
+			runSpan.SetAttributes(attribute.String("tako.tenant.id", p.TenantID))
+		}
+		if p.UserID != "" {
+			runSpan.SetAttributes(attribute.String("tako.user.id", p.UserID))
+		}
+	}
+	if text, terr := w.store.runUserText(ctx, sessionID, runID); terr == nil && text != "" {
+		observability.SetMessages(runSpan, "gen_ai.input.messages", []*schema.Message{{Role: schema.User, Content: text}})
+	}
+	modelRef := ""
+	if prof := profileFrom(ctx); prof != nil {
+		modelRef = prof.ModelRef
+	}
+	log.Printf("trace %s/%s traceId=%s", sessionID, runID, runSpan.SpanContext().TraceID())
+	defer func() {
+		w.finishRunSpan(ctx, runSpan, sessionID, runID, status, turn, len(box.stagedList()), modelRef)
+	}()
 	if p, ok := principalFromCtx(ctx); ok {
 		ctx = withScope(ctx, dataScope{TenantID: p.TenantID, UserID: p.UserID, Scope: "user"})
 		if p.TenantID != "" {
-			_, _, daily, maxBytes, qerr := w.store.TenantQuota(ctx, p.TenantID)
+			quotaCtx, quotaSpan := startStep(ctx, "tako.step.quota")
+			_, _, daily, maxBytes, qerr := w.store.TenantQuota(quotaCtx, p.TenantID)
+			quotaSpan.SetAttributes(
+				attribute.Int64("tako.quota.daily", daily),
+				attribute.Int64("tako.quota.used", 0),
+				attribute.Bool("tako.quota.exceeded", false),
+			)
 			if qerr == nil && daily > 0 {
-				used, uerr := w.store.DailyTokenUsage(ctx, p.TenantID, time.Now())
+				used, uerr := w.store.DailyTokenUsage(quotaCtx, p.TenantID, time.Now())
+				quotaSpan.SetAttributes(attribute.Int64("tako.quota.used", used))
 				if uerr == nil && used >= daily {
+					quotaSpan.SetAttributes(attribute.Bool("tako.quota.exceeded", true))
+					finishSpan(quotaSpan, nil)
 					log.Printf("quota %s/%s: daily tokens %d/%d", sessionID, runID, used, daily)
 					status = "error"
 					return
 				}
 			}
-			if dir, err := runWorkspace(ctx, w, p.TenantID, sessionID); err != nil {
+			finishSpan(quotaSpan, qerr)
+			wsCtx, wsSpan := startStep(ctx, "tako.step.workspace")
+			if dir, err := runWorkspace(wsCtx, w, p.TenantID, sessionID); err != nil {
+				wsSpan.SetAttributes(attribute.String("error.type", "workspace_error"))
+				finishSpan(wsSpan, err)
 				log.Printf("workspace %s/%s: %v", sessionID, runID, err)
 			} else {
+				wsSpan.SetAttributes(
+					attribute.String("tako.workspace.id", dir),
+					attribute.Int64("tako.workspace.max_bytes", maxBytes),
+				)
+				finishSpan(wsSpan, nil)
 				ref := WorkspaceRef{TenantID: p.TenantID, SessionID: sessionID, Root: dir, TenantRoot: tenantStorageRoot(w.workspace, p.TenantID), MaxBytes: maxBytes}
 				if maxBytes > 0 {
 					tenantID := p.TenantID
@@ -540,10 +611,7 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 	// T3-2 起子代理条目也在列（带 Agent 归属）：分拣归 EndRun 的两个投影，worker 只负责记全。
 	// 续跑（doc/30 §9）：起手先把账本重放出的已发生轮次装进 turn——EndRun 定稿时它们与
 	// 本次新产出的条目同笔落 runlog/mh，不丢中断前的半场。
-	var turn []TurnEntry
-	if resume != nil {
-		turn = resume.Turn
-	}
+	// turn 已随根 span 起手提前声明（收尾闭包引用它）。
 	defer func() {
 		// mh 写入源 = 折后 state 派生（A4）：RunID==currentRun 且 Seq≥2 的行、按位置从 2 连续
 		// 重编（mid-fold 折走单位留下的 seq 空洞在此闭合）。final 为空 = 非成功终态
@@ -558,7 +626,14 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 		}
 		// WithoutCancel（doc/17 §4 D4）：stop 判死后本 ctx 已取消，但 stopped 收尾还要写
 		// 已配对工具行——收尾的 PG/Redis 调用不能吃取消；foldBox 等 ctx 值仍要带上。
-		_, _, ok, err := w.store.EndRun(context.WithoutCancel(ctx), sessionID, runID, epoch, status, box.stagedList(), mhRows, turn)
+		finCtx, finSpan := startStep(ctx, "tako.step.finalize")
+		_, _, ok, err := w.store.EndRun(context.WithoutCancel(finCtx), sessionID, runID, epoch, status, box.stagedList(), mhRows, turn)
+		finSpan.SetAttributes(
+			attribute.String("tako.finalize.status", status),
+			attribute.Int("tako.finalize.mh_rows", len(mhRows)),
+			attribute.Int("tako.finalize.staged", len(box.stagedList())),
+		)
+		finishSpan(finSpan, err)
 		switch {
 		case err != nil:
 			// 收尾失败仍留痕。D1 后有两个方向：DB 半败 = 闸没放（租约到点自蒸、会话自动解锁，不再永久锁死）；
@@ -631,6 +706,7 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 		}
 		ctx = withRunInstruction(ctx, instruction)
 	}
+	observability.SetSystemInstructions(runSpan, w.instruction(ctx))
 
 	// 续跑终稿态（doc/30 §9.1）：账本最后一条 assistant 无 tool_calls = 模型已说完、只差放闸。
 	// 不调模型、不组输入——turn 里已是完整半场，直接走 defer 的 EndRun 定稿。
@@ -642,7 +718,7 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 	if resume != nil {
 		// 续跑输入 = mh 全序 + 账本重放行（doc/30 §9.1）：中断前的轮次从未进 mh（EndRun 没跑），
 		// 只能由账本恢复；折叠自测仍走同一条 prepareInputFrom。
-		history, herr := w.store.ModelMessages(ctx, sessionID)
+		history, herr := w.loadModelMessages(withHistoryResume(ctx, true), sessionID)
 		if herr != nil {
 			log.Printf("prepareInput %s/%s: %v", sessionID, runID, herr)
 			status = "error"
@@ -874,7 +950,7 @@ func (w *Worker) runEndFold(ctx context.Context, box *foldBox, c int) error {
 	if err != nil {
 		return fmt.Errorf("重读 mh: %w", err)
 	}
-	folded, staged, err := foldInput(ctx, w.instruction(ctx), history, box.run, c*4/5, w.compactWindow, w.counter, w.sum.summarize, firstPartyFileEffects)
+	folded, staged, err := foldInput(withCompactTrigger(ctx, "rescue"), w.instruction(ctx), history, box.run, c*4/5, w.compactWindow, w.counter, w.sum.summarize, firstPartyFileEffects)
 	if err != nil {
 		return fmt.Errorf("强折: %w", err)
 	}
@@ -900,7 +976,7 @@ func (w *Worker) rescueOverflow(ctx context.Context, box *foldBox, cause error) 
 	}
 	window, hasWindow := extractWindow(cause)
 	limit := rescueLimit(box.countBase(), window, hasWindow)
-	folded, staged, err := foldInput(ctx, w.instruction(ctx), history, box.run, limit, window, w.counter, w.sum.summarize, firstPartyFileEffects)
+	folded, staged, err := foldInput(withCompactTrigger(ctx, "rescue"), w.instruction(ctx), history, box.run, limit, window, w.counter, w.sum.summarize, firstPartyFileEffects)
 	if err != nil {
 		return nil, fmt.Errorf("强折: %w", err)
 	}
@@ -1163,7 +1239,7 @@ func (w *Worker) recallBlock(ctx context.Context, sessionID SessionID, runID Run
 // 切分后本轮 user 行仍排在 base 末位（mh 全序按 run_id,seq 排，本轮 run 的 ULID 最大），
 // 坐标（seq=1）天然稳——不碰 convertState / nextRunSeq / foldInput 的钉死规则。
 func (w *Worker) prepareInput(ctx context.Context, sessionID SessionID, runID RunID) ([]*schema.Message, error) {
-	history, err := w.store.ModelMessages(ctx, sessionID)
+	history, err := w.loadModelMessages(ctx, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -1281,7 +1357,7 @@ func (w *Worker) prepareInputFrom(ctx context.Context, sessionID SessionID, runI
 		if total > limit {
 			log.Printf("compact %s/%s: 输入 %d tok > limit %d，进入折叠", sessionID, runID, total, limit)
 			var err error
-			history, staged, err = foldInput(ctx, sys, history, runID, limit, w.compactWindow, w.counter, w.sum.summarize, firstPartyFileEffects)
+			history, staged, err = foldInput(withCompactTrigger(ctx, "initial"), sys, history, runID, limit, w.compactWindow, w.counter, w.sum.summarize, firstPartyFileEffects)
 			if err != nil {
 				return nil, err
 			}

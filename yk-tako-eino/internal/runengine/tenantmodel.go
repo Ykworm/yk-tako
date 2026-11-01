@@ -55,6 +55,9 @@ func (m *TenantModels) Resolve(ctx context.Context, tenantID, ref, configRaw str
 		return TenantBuilt{}, "", err
 	}
 	sum := sha256.Sum256([]byte(cacheKey))
+	if built.Chat != nil {
+		built.Chat = wrapChatModel(built.Chat, built.Ref)
+	}
 	return built, hex.EncodeToString(sum[:]), nil
 }
 

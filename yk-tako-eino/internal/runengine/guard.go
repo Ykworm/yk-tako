@@ -135,7 +135,7 @@ func (m *guardModel) rescueFold(ctx context.Context, box *foldBox, input []*sche
 	annotateMediaTokens(ctx, history, box, box.mediaResolver())
 	cRej := countInput(m.counter, sys, history)
 	window, hasWindow := extractWindow(cause)
-	folded, staged, err := foldInput(ctx, sys, history, box.run, rescueLimit(cRej, window, hasWindow), window,
+	folded, staged, err := foldInput(withCompactTrigger(ctx, "rescue"), sys, history, box.run, rescueLimit(cRej, window, hasWindow), window,
 		m.counter, m.summarize, m.fileEffects)
 	if err != nil {
 		return nil, false

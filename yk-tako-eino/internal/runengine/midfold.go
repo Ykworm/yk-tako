@@ -589,7 +589,7 @@ func (h *midfoldHandler) BeforeModelRewriteState(ctx context.Context, state *adk
 		return ctx, state, nil
 	}
 	log.Printf("compact mid-run %s/%s: 输入 %d tok > limit %d，进入折叠", box.session, box.run, total, h.limit)
-	folded, staged, err := foldInput(ctx, sys, history, box.run, h.limit, h.window, h.counter, h.summarize, h.fileEffects)
+	folded, staged, err := foldInput(withCompactTrigger(ctx, "midfold"), sys, history, box.run, h.limit, h.window, h.counter, h.summarize, h.fileEffects)
 	if err != nil {
 		return ctx, state, err
 	}
@@ -711,7 +711,7 @@ func (h *agentFoldHandler) BeforeModelRewriteState(ctx context.Context, state *a
 		stripReasoning(state.Messages)
 		return ctx, state, nil
 	}
-	folded, _, err := foldInput(ctx, sys, history, box.run, h.limit, h.window, h.counter, h.summarize, h.fileEffects)
+	folded, _, err := foldInput(withCompactTrigger(ctx, "midfold"), sys, history, box.run, h.limit, h.window, h.counter, h.summarize, h.fileEffects)
 	if err != nil {
 		return ctx, state, fmt.Errorf("%s %w", foldChainErrorMark, err)
 	}

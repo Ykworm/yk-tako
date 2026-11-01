@@ -98,9 +98,9 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 	r.POST("/api/auth/switch-tenant", s.auth.RequireAuth(), s.auth.SwitchTenant)
 	authn := s.auth.RequireAuth()
 	sys := s.auth.RequireSystemAdmin()
-	r.POST("/api/runs", authn, s.postRuns)
+	r.POST("/api/runs", traceIngress(), authn, s.postRuns)
 	r.POST("/api/runs/:runId/stop", authn, s.stopRun)
-	r.POST("/api/runs/:runId/resume", authn, s.resumeRun)
+	r.POST("/api/runs/:runId/resume", traceIngress(), authn, s.resumeRun)
 	r.GET("/api/runs/:runId", authn, s.getRunStatus)
 	// 等人机器（doc/47）：挂起中的问题/方案行。列表按 run 可见性；答案端点按行找到 run 再判权。
 	r.GET("/api/runs/:runId/questions", authn, s.listQuestions)
@@ -209,6 +209,7 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 		r.POST("/api/dev/pii-check", authn, s.devPiiCheck)
 		r.POST("/api/dev/question-check", authn, s.devQuestionCheck)
 		r.POST("/api/dev/plan-gate-check", authn, s.devPlanGateCheck)
+		r.POST("/api/dev/trace-check", authn, s.devTraceCheck)
 		r.POST("/api/dev/clean-sweep", s.devCleanSweep)
 	}
 	return r
@@ -519,7 +520,7 @@ func (s *Server) postRuns(c *gin.Context) {
 	if req.AgentID != "" {
 		_ = s.store.db.WithContext(ctx).Exec(`UPDATE sessions SET agent_id = ? WHERE id = ?`, req.AgentID, sessionID).Error
 	}
-	go s.worker.Run(withRunProfile(withPrincipal(context.Background(), p), prof), sessionID, runID, 1)
+	go s.worker.Run(withRunProfile(withPrincipal(launchContext(c.Request.Context()), p), prof), sessionID, runID, 1)
 	handed = true
 	writeEnvelope(c, http.StatusAccepted, codeOK, "", postRunsResponse{SessionID: sessionID, RunID: runID, MessageID: req.MessageID})
 }
@@ -718,7 +719,7 @@ func (s *Server) resumeRun(c *gin.Context) {
 	}
 	// 与 POST 同一条纪律：run 的生命周期不属于这个请求。
 	// 续跑也要重新装配租户模型。装配失败就放弃这次认领，不拿进程里的平台密钥接着跑。
-	bg := context.Background()
+	bg := launchContext(c.Request.Context())
 	if p, ok := principalFrom(c); ok {
 		bg = withPrincipal(bg, p)
 		if s.worker != nil && s.worker.models != nil {

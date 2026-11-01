@@ -47,6 +47,7 @@ import (
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 	"github.com/pkoukk/tiktoken-go"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // compactKeepRuns 是循环起点 n（doc/12 §5「从 20 轮开始留」）。
@@ -395,7 +396,12 @@ func buildStaged(oldSummaryRuns []RunID, rawRuns, drop []runRows, currentRun Run
 // fileEffects = 第一方工具 file_effect 声明表（fileops.go），钉块提取的判定入口。
 func foldInput(ctx context.Context, system string, history []ModelMessage, currentRun RunID,
 	limit, window int, counter TokenCounter, summarize func(context.Context, string) (string, error),
-	fileEffects map[string]string) ([]ModelMessage, *StagedCompaction, error) {
+	fileEffects map[string]string) (out []ModelMessage, stagedOut *StagedCompaction, err error) {
+	ctx, span := startStep(ctx, "tako.step.compact")
+	defer func() {
+		span.SetAttributes(attribute.String("tako.compact.trigger", compactTriggerFrom(ctx)))
+		finishSpan(span, err)
+	}()
 
 	// ---- 分组：history 已按 (run_id, seq) 有序，run_id 是 ULID（字典序 = 时序）。----
 	// 旧不变量「seq=0 必是该 run 唯一可见行」在 mid-run（A4 起）已死：被折过的 run 可以同时有
