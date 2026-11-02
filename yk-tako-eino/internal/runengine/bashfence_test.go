@@ -23,7 +23,7 @@ import (
 
 func TestBashFenceConfinesToWorkspace(t *testing.T) {
 	if !sandboxAvailable() {
-		t.Skip("这台机器的 sandbox-exec 不能 apply，围栏用例无法证明沙箱路径")
+		t.Skip("这台机器没有可用的沙箱（seatbelt/bwrap 都探测失败），围栏用例无法证明沙箱路径")
 	}
 	ctx := context.Background()
 	root := t.TempDir() // macOS 上在 /var/folders 下（/var → /private/var 是 symlink）
@@ -40,26 +40,31 @@ func TestBashFenceConfinesToWorkspace(t *testing.T) {
 		t.Fatalf("项目内读写应成功，得到 %q", out)
 	}
 
-	// ② 越界写被拒
-	outside := filepath.Join(filepath.Dir(root), "tako-fence-outside.txt")
+	// ② 越界写被拒（写到宿主家目录；bwrap 的 /tmp 是沙箱内 tmpfs，不能拿它当「外面」）
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skipf("拿不到家目录：%v", err)
+	}
+	outside := filepath.Join(home, "tako-fence-outside.txt")
 	_ = os.Remove(outside)
 	out2, _ := runBash(ctx, root, "echo bad > "+outside, 10*time.Second, true)
-	if !strings.Contains(out2, "not permitted") {
+	if !sandboxDenied(out2) {
 		t.Fatalf("越界写应被沙箱拒绝，得到 %q", out2)
 	}
 	if _, err := os.Stat(outside); err == nil {
+		_ = os.Remove(outside)
 		t.Fatalf("越界写竟然成功了：%s", outside)
 	}
 
 	// ③ 越界读被拒（系统文件）
 	out3, _ := runBash(ctx, root, "cat /etc/hosts", 10*time.Second, true)
-	if !strings.Contains(out3, "not permitted") {
+	if !sandboxDenied(out3) {
 		t.Fatalf("越界读 /etc/hosts 应被沙箱拒绝，得到 %q", out3)
 	}
 
 	// ④ 读家目录被拒（agent 不该翻用户家目录）
-	out4, _ := runBash(ctx, root, "cat ~/.zshrc 2>/dev/null; echo done", 10*time.Second, true)
-	if strings.Contains(out4, "root:") || !strings.Contains(out4, "not permitted") && !strings.Contains(out4, "done") {
+	out4, _ := runBash(ctx, root, "cat ~/.zshrc; echo done", 10*time.Second, true)
+	if strings.Contains(out4, "root:") || !sandboxDenied(out4) {
 		t.Fatalf("读家目录应被沙箱拒绝，得到 %q", out4)
 	}
 }
@@ -73,7 +78,7 @@ func TestBashFenceConfinesToWorkspace(t *testing.T) {
 // 白名单顺带放行 → **这个 bug 会被偶然掩盖**，钉子就抓不住它了。
 func TestBashFenceSurvivesSymlinkedRoot(t *testing.T) {
 	if !sandboxAvailable() {
-		t.Skip("这台机器的 sandbox-exec 不能 apply")
+		t.Skip("这台机器没有可用的沙箱（seatbelt/bwrap 都探测失败）")
 	}
 	ctx := context.Background()
 	real, err := os.MkdirTemp("/tmp", "tako-fence-")

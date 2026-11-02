@@ -109,13 +109,14 @@ func connectMcpServer(ctx context.Context, name string, sc McpServerConfig, root
 		// （tenants/<别人的tid>/… 都在同一个 workspace 根下），而它的工具直接进模型工具池
 		// → 读到的别人的文件内容会进 tool_result → 进 mh / runlog / 记忆抽取。
 		// 没有沙箱 → **拒绝启动**（fail closed），不假装已经隔离（同 bash 的口径）。
-		if !sandboxAvailable() {
-			return nil, fmt.Errorf("这台机器没有可用的沙箱，租户 MCP server 不能启动（不能假装已隔离）")
-		}
 		if !commandInsideRoot(sc.Command, root) {
 			return nil, fmt.Errorf("租户 MCP server 的 command 必须在该租户的项目目录内（当前 %q）——围栏不允许在租户目录之外启动程序；依赖请预装到租户目录里再指向它", sc.Command)
 		}
-		cmd = sandboxWrap(cmd, root)
+		wrapped, err := sandboxWrap(cmd, root)
+		if err != nil {
+			return nil, err
+		}
+		cmd = wrapped
 	}
 	cmd.Env = append(os.Environ(), envPairs(sc.Env)...)
 	client := mcp.NewClient(&mcp.Implementation{Name: "yktako", Version: "v0"}, nil)

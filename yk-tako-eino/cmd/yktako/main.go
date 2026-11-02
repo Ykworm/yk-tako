@@ -195,6 +195,7 @@ func main() {
 		log.Fatalf("workspace %q 创建: %v", wsAbs, err)
 	}
 	log.Printf("workspace %s", wsAbs)
+	log.Printf("bash sandbox: %s", runengine.SandboxStatus())
 	// 系统技能根（doc/52 §4.2）：默认 <workspace>/system-skills。
 	// 旗标指到别处时用它（验收要给隔离实例指不同的根）。
 	//

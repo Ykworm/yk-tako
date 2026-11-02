@@ -9,7 +9,7 @@ import (
 
 func TestBashTimeoutMessage(t *testing.T) {
 	if !sandboxAvailable() {
-		t.Skip("这台机器的 sandbox-exec 不能 apply，超时用例无法证明沙箱路径")
+		t.Skip("这台机器没有可用的沙箱（seatbelt/bwrap 都探测失败），超时用例无法证明沙箱路径")
 	}
 	out, err := runBash(context.Background(), t.TempDir(), "sleep 30", time.Second, true)
 	if err != nil {

@@ -12,30 +12,112 @@ import (
 )
 
 // bash 的时长帽。工作目录只决定默认路径，拦不住 cat /etc/passwd。
-// 有 sandbox-exec 时用它把读写收进会话根；没有时不能假装已经隔离。
+// 围栏后端：macOS 用 sandbox-exec（seatbelt），Linux 用 bubblewrap（bwrap）；
+// 两者都探测不到时不能假装已经隔离。
 const (
 	bashTimeout    = 30 * time.Second
 	bashDevTimeout = 4 * time.Second
 )
 
-// sandboxAvailable 不只看 binary 在不在。LookPath 成功而 seatbelt 拒绝 apply 时，
-// 命令会以普通非零退出结束，调用方还会以为已经隔离。这里真正跑一次 apply。
-func sandboxAvailable() bool {
+// bashSandboxBackend 是这台机器上真正能 apply 的围栏后端。LookPath 成功不代表能用：
+// seatbelt 可能被策略拒，Linux 可能禁了非特权 user namespace，所以每个候选都要真跑一次。
+type bashSandboxBackend struct {
+	kind   string // "seatbelt" / "bwrap" / "none"
+	path   string
+	reason string // kind == "none" 时给人看的原因（启动日志与拒绝文案共用）
+}
+
+func (b bashSandboxBackend) usable() bool { return b.kind != "none" }
+
+func currentSandboxBackend() bashSandboxBackend {
 	sandboxProbe.once.Do(func() {
-		path, err := exec.LookPath("sandbox-exec")
-		if err != nil {
-			return
-		}
-		cmd := exec.Command(path, "-p", "(version 1)(allow default)", "/bin/echo", "ok")
-		out, err := cmd.CombinedOutput()
-		sandboxProbe.ok = err == nil && strings.Contains(string(out), "ok")
+		sandboxProbe.b = detectSandboxBackend()
 	})
-	return sandboxProbe.ok
+	return sandboxProbe.b
 }
 
 var sandboxProbe struct {
 	once sync.Once
-	ok   bool
+	b    bashSandboxBackend
+}
+
+// detectSandboxBackend 逐个候选真跑探针：macOS 的 seatbelt 在前，Linux 的 bwrap 在后。
+// 第一个能 apply 的后端胜出；全失败时把所有原因拼进 reason，启动日志一次看全。
+func detectSandboxBackend() bashSandboxBackend {
+	var reasons []string
+	if path, err := exec.LookPath("sandbox-exec"); err == nil {
+		if ok, reason := probeSeatbelt(path); ok {
+			return bashSandboxBackend{kind: "seatbelt", path: path}
+		} else {
+			reasons = append(reasons, "sandbox-exec："+reason)
+		}
+	}
+	if path, err := exec.LookPath("bwrap"); err == nil {
+		if ok, reason := probeBwrap(path); ok {
+			return bashSandboxBackend{kind: "bwrap", path: path}
+		} else {
+			reasons = append(reasons, "bwrap："+reason)
+		}
+	}
+	if len(reasons) == 0 {
+		reasons = append(reasons, "本机没有 sandbox-exec 或 bwrap")
+	}
+	return bashSandboxBackend{
+		kind:   "none",
+		reason: strings.Join(reasons, "；") + "（Debian/Ubuntu 请安装 bubblewrap 并确认非特权 user namespace 可用）",
+	}
+}
+
+// probeSeatbelt 是原来的探测：apply 一个全放行的最小 profile，看 echo 能不能跑出来。
+func probeSeatbelt(path string) (bool, string) {
+	cmd := exec.Command(path, "-p", "(version 1)(allow default)", "/bin/echo", "ok")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, strings.TrimSpace(err.Error() + " " + string(out))
+	}
+	if !strings.Contains(string(out), "ok") {
+		return false, "探针输出里没有 ok：" + strings.TrimSpace(string(out))
+	}
+	return true, ""
+}
+
+// probeBwrap 真跑一次最小挂载表。只看 LookPath 分不清三种失败：
+// binary 不在 / 非特权 userns 被禁 / seccomp 挡住 unshare——探针输出能区分。
+func probeBwrap(path string) (bool, string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	args := []string{
+		"--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup",
+		"--die-with-parent", "--new-session",
+		"--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+		"--ro-bind", "/usr", "/usr",
+		"--symlink", "usr/bin", "/bin",
+		"--symlink", "usr/sbin", "/sbin",
+		"--symlink", "usr/lib", "/lib",
+		"--symlink", "usr/lib64", "/lib64",
+		"--", "/bin/echo", "tako-bash-probe",
+	}
+	out, err := exec.CommandContext(ctx, path, args...).CombinedOutput()
+	if err != nil {
+		return false, strings.TrimSpace(err.Error() + " " + string(out))
+	}
+	if !strings.Contains(string(out), "tako-bash-probe") {
+		return false, "探针输出里没有 tako-bash-probe：" + strings.TrimSpace(string(out))
+	}
+	return true, ""
+}
+
+// sandboxAvailable 是产品路径的闸：任意一个后端能 apply 就算可用。
+func sandboxAvailable() bool { return currentSandboxBackend().usable() }
+
+// SandboxStatus 供启动日志与诊断：seatbelt / bwrap / none（原因）。
+// 配错在这行就暴露，不等客户第一次调工具。
+func SandboxStatus() string {
+	b := currentSandboxBackend()
+	if !b.usable() {
+		return "none（" + b.reason + "；bash 工具将拒绝执行）"
+	}
+	return b.kind
 }
 
 // sandboxProfile 是 bash 的围栏：**写只在工作区根（项目目录）内**，读是「工作区根 + 系统路径白名单
@@ -121,17 +203,95 @@ func sandboxRealPath(p string) string {
 	return p
 }
 
-// sandboxWrap 把一条命令包进 seatbelt 围栏（root = 围栏根；root 为空 = 不包）。
+// sandboxWrap 把一条命令包进当前后端（root = 围栏根；root 为空 = 不包）。
 //
 // 用途：MCP server 是宿主上的子进程（mcp.go 的 exec.Command），继承宿主权限 → 不围栏它，
 // 它能读所有租户的目录。租户自己配的 MCP 一律包围栏（根 = 该租户的存储根）。
 // 平台的系统 MCP（引擎自己的 mcp.json）不包——那是平台自己配的。
-func sandboxWrap(cmd *exec.Cmd, root string) *exec.Cmd {
+func sandboxWrap(cmd *exec.Cmd, root string) (*exec.Cmd, error) {
 	if root == "" {
-		return cmd
+		return cmd, nil
 	}
-	args := append([]string{"-p", sandboxProfile(root, nil)}, cmd.Args...)
-	return exec.Command("sandbox-exec", args...)
+	b := currentSandboxBackend()
+	switch b.kind {
+	case "bwrap":
+		return exec.Command(b.path, bwrapArgs(root, nil, cmd.Args, pathExists)...), nil
+	case "seatbelt":
+		args := append([]string{"-p", sandboxProfile(root, nil)}, cmd.Args...)
+		return exec.Command(b.path, args...), nil
+	default:
+		return nil, fmt.Errorf("这台机器没有可用的沙箱（%s），不能把租户 MCP server 当成已隔离", b.reason)
+	}
+}
+
+// bwrapEtcFiles 是沙箱里放行的 /etc 单文件白名单（只读）。
+// 纪律：只列工具真正要用的配置/证书，不 bind 整个 /etc——/etc/shadow 不在里面。
+// /etc/hosts 故意不放：macOS 的 profile 也拒绝它（越界读同一个口径），DNS 走 resolv.conf。
+var bwrapEtcFiles = []string{
+	"/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d",
+	"/etc/alternatives",
+	"/etc/nsswitch.conf", "/etc/localtime",
+	"/etc/resolv.conf", "/etc/gai.conf", "/etc/host.conf", "/etc/services",
+	"/etc/ssl/certs", "/etc/ssl/openssl.cnf", "/etc/ca-certificates.conf",
+}
+
+// bwrapArgs 生成一个 bwrap 命令：新根里只有系统目录（只读）、白名单 /etc（只读）、
+// 可写的工作区根，以及本场技能/工具根的只读挂载。
+//
+// 网络**不**卸 namespace：2026-10-28 D37 把 macOS 的 bash 出站网络打开了，Linux 必须对齐；
+// --unshare-all 会连 net 一起卸掉，技能脚本里的 curl/pip 会断。代价是沙箱进程能在宿主网卡上
+// bind 端口（macOS 侧是「出站开、入站禁」），这是与 seatbelt 的唯一已知差异，记在
+// doc/problems/没有沙箱的系统怎么办/问题与方案.md。
+//
+// exists 注入是为了单测金样；生产传 pathExists。
+func bwrapArgs(root string, extraReadRoots []string, command []string, exists func(string) bool) []string {
+	root = sandboxRealPath(root)
+	args := []string{
+		// 逐个卸命名空间（不用 --unshare-all：它含 net）
+		"--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup",
+		"--die-with-parent", // 引擎被 kill -9 时沙箱进程不孤儿化
+		"--new-session",     // 断开控制终端，防 TIOCSTI
+		"--proc", "/proc",   // 私有 /proc（ps 只看得到沙箱内进程）
+		"--dev", "/dev",
+		"--tmpfs", "/tmp",
+		"--ro-bind", "/usr", "/usr",
+		// Debian 12 是 merged-usr：/bin 等都是指向 /usr 的符号链接
+		"--symlink", "usr/bin", "/bin",
+		"--symlink", "usr/sbin", "/sbin",
+		"--symlink", "usr/lib", "/lib",
+		"--symlink", "usr/lib64", "/lib64",
+	}
+	for _, p := range bwrapEtcFiles {
+		if exists(p) {
+			args = append(args, "--ro-bind", p, p)
+		}
+	}
+	if exists("/opt") {
+		args = append(args, "--ro-bind", "/opt", "/opt")
+	}
+	seen := map[string]bool{}
+	for _, p := range extraReadRoots {
+		if p == "" {
+			continue
+		}
+		p = sandboxRealPath(p)
+		// 已经在可写根里的目录不再 ro-bind：macOS 的 profile 只加读权限、不撤写权限，
+		// 这里挂 ro 会让同一个目录在两套后端下语义不同。
+		if seen[p] || pathWithin(root, p) || !exists(p) {
+			continue
+		}
+		seen[p] = true
+		args = append(args, "--ro-bind", p, p)
+	}
+	args = append(args, "--bind", root, root, "--chdir", root, "--")
+	return append(args, command...)
+}
+
+// pathExists 是 bwrapArgs 的生产版存在性判断。挂载表只列确实存在的路径：
+// bwrap 对不存在的 bind 源是硬失败（不是跳过），一个缺失的可选文件会让整条 bash 起不来。
+func pathExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 // commandInsideRoot 判定一条待执行的命令是否落在围栏根内（绝对路径判定）。
@@ -168,7 +328,7 @@ func commandInsideRoot(command, root string) bool {
 	return rel == "." || !strings.HasPrefix(rel, "..")
 }
 
-// startBash 准备一条命令。requireSandbox 为真且本机没有能 apply 的 sandbox-exec 时直接失败，不退回裸 bash。
+// startBash 准备一条命令。requireSandbox 为真且本机没有能 apply 的围栏后端时直接失败，不退回裸 bash。
 // 返回的 runCtx 是套了时长帽的那个 context。沙箱里的进程被杀掉时，cmd.Run 往往给出退出码 -1，
 // 不再带 DeadlineExceeded；调用方要看 runCtx 才知道是超时。
 func startBash(ctx context.Context, workspace, command string, timeout time.Duration, requireSandbox bool) (*exec.Cmd, func(), bool, context.Context, error) {
@@ -179,22 +339,28 @@ func startBash(ctx context.Context, workspace, command string, timeout time.Dura
 		runCtx, c = context.WithTimeout(ctx, timeout)
 		cancel = c
 	}
-	path, lookErr := exec.LookPath("sandbox-exec")
-	if lookErr != nil || !sandboxAvailable() {
+	backend := currentSandboxBackend()
+	if !backend.usable() {
 		if requireSandbox {
 			cancel()
-			return nil, func() {}, false, nil, fmt.Errorf("这台机器的 sandbox-exec 不能 apply，不能把工作目录当成隔离")
+			return nil, func() {}, false, nil, fmt.Errorf("bash 沙箱不可用（%s），不能把工作目录当成隔离", backend.reason)
 		}
 		cmd := exec.CommandContext(runCtx, "bash", "-c", command)
 		cmd.Dir = workspace
 		return cmd, cancel, false, runCtx, nil
+	}
+	extraReadRoots := append(skillReadRoots(ctx), toolsRootFor(ctx, workspace))
+	if backend.kind == "bwrap" {
+		cmd := exec.CommandContext(runCtx, backend.path, bwrapArgs(workspace, extraReadRoots, []string{"/bin/bash", "-c", command}, pathExists)...)
+		cmd.Dir = workspace
+		return cmd, cancel, true, runCtx, nil
 	}
 	f, err := os.CreateTemp("", "tako-sb-*.sb")
 	if err != nil {
 		cancel()
 		return nil, func() {}, false, nil, err
 	}
-	if _, err := f.WriteString(sandboxProfile(workspace, append(skillReadRoots(ctx), toolsRootFor(ctx, workspace)))); err != nil {
+	if _, err := f.WriteString(sandboxProfile(workspace, extraReadRoots)); err != nil {
 		f.Close()
 		os.Remove(f.Name())
 		cancel()
@@ -202,7 +368,7 @@ func startBash(ctx context.Context, workspace, command string, timeout time.Dura
 	}
 	f.Close()
 	name := f.Name()
-	cmd := exec.CommandContext(runCtx, path, "-f", name, "/bin/bash", "-c", command)
+	cmd := exec.CommandContext(runCtx, backend.path, "-f", name, "/bin/bash", "-c", command)
 	cmd.Dir = workspace
 	return cmd, func() {
 		cancel()

@@ -4,7 +4,7 @@
 // 继承宿主权限 → 不围栏它，它能读所有租户的目录（tenants/<别人的tid>/… 都在同一个
 // workspace 根下），而它的工具直接进模型工具池 → 跨租户泄漏面。
 //
-// 处置（用户拍板「选 b」）：**租户自己配的 MCP 进 seatbelt 围栏，围栏根 = 该租户的存储根**；
+// 处置（用户拍板「选 b」）：**租户自己配的 MCP 进围栏（macOS seatbelt / Linux bwrap），围栏根 = 该租户的存储根**；
 // 平台的系统 MCP（引擎自己的 mcp.json）不围栏；没有沙箱 → fail closed（不假装已隔离）。
 package runengine
 
@@ -64,7 +64,7 @@ func TestMcpFenceRootByCustom(t *testing.T) {
 }
 
 // TestMcpConnCacheKeyIncludesFenceRoot：同一份配置在两个租户下 → **不能复用同一个连接**
-//（复用 = 围栏串了：租户 B 会拿到租户 A 的那个无边界进程）。
+// （复用 = 围栏串了：租户 B 会拿到租户 A 的那个无边界进程）。
 func TestMcpConnCacheKeyIncludesFenceRoot(t *testing.T) {
 	s := &Server{mcpConfPath: filepath.Join(t.TempDir(), "none.json")}
 	calls := 0
@@ -94,7 +94,7 @@ func TestMcpConnCacheKeyIncludesFenceRoot(t *testing.T) {
 // 并说清「依赖要预装到租户目录里」（围栏不允许在租户目录之外启动程序）。
 func TestTenantMcpCommandOutsideRootRejected(t *testing.T) {
 	if !sandboxAvailable() {
-		t.Skip("这台机器的 sandbox-exec 不能 apply")
+		t.Skip("这台机器没有可用的沙箱（seatbelt/bwrap 都探测失败）")
 	}
 	root := t.TempDir()
 	_, err := connectMcpServer(context.Background(), "x", McpServerConfig{Command: "/bin/echo", Args: []string{"hi"}}, root)

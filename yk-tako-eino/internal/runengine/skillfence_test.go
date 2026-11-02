@@ -17,7 +17,7 @@ import (
 
 func TestBashFenceSkillRoots(t *testing.T) {
 	if !sandboxAvailable() {
-		t.Skip("这台机器的 sandbox-exec 不能 apply，围栏用例无法证明沙箱路径")
+		t.Skip("这台机器没有可用的沙箱（seatbelt/bwrap 都探测失败），围栏用例无法证明沙箱路径")
 	}
 	root := t.TempDir()
 	skillDir, err := os.MkdirTemp("/tmp", "tako-skill-")
@@ -32,7 +32,7 @@ func TestBashFenceSkillRoots(t *testing.T) {
 
 	// ① 没登记：读被拒（新 run 没调 use_skill 的现场）
 	out, _ := runBash(context.Background(), root, "cat "+main, 10*time.Second, true)
-	if !strings.Contains(out, "not permitted") {
+	if !sandboxDenied(out) {
 		t.Fatalf("没登记的技能根应读不到，得到 %q", out)
 	}
 
@@ -46,7 +46,7 @@ func TestBashFenceSkillRoots(t *testing.T) {
 
 	// ③ 只读：写被拒，盘上内容不变
 	out3, _ := runBash(ctx, root, "echo x > "+main, 10*time.Second, true)
-	if !strings.Contains(out3, "not permitted") {
+	if !sandboxDenied(out3) {
 		t.Fatalf("技能根写应被拒绝，得到 %q", out3)
 	}
 	if raw, _ := os.ReadFile(main); string(raw) != "DEMO-BODY-MARKER-42" {
@@ -64,7 +64,7 @@ func TestBashFenceSkillRoots(t *testing.T) {
 		t.Fatal(err)
 	}
 	out4, _ := runBash(ctx, root, "cat "+other, 10*time.Second, true)
-	if !strings.Contains(out4, "not permitted") {
+	if !sandboxDenied(out4) {
 		t.Fatalf("隔壁技能应读不到，得到 %q", out4)
 	}
 }

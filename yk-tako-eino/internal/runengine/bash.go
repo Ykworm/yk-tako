@@ -44,18 +44,18 @@ func outputSections(stdout, stderr *tailCollector) string {
 // 变「错误：…」结果文本——记录制（命令+最终输出落 runlog）在非正常死亡时不缺角，
 // 卡死的命令事后可查「死前做到哪」（Qoder 记录形态同款）。
 // 时长帽 30 秒，到点把已收到的输出交回工具结果，不把父 run 打成 error。
-// 工作目录来自 ctx 里的会话根；这只是默认目录，不是牢笼。有 sandbox-exec 时同一条命令再套一层配置。
+// 工作目录来自 ctx 里的会话根；这只是默认目录，不是牢笼。有围栏后端时同一条命令再套一层配置。
 func newBashTool(workspace string) (tool.BaseTool, error) {
 	return utils.InferTool("bash", "在 workspace 根目录下执行一条 bash 命令并返回退出码与 stdout/stderr。"+
 		"输出超过 64000 字节时只保留尾部，完整输出会落盘并给出路径（用 read_file 分页读它）。"+
 		"单次最长 30 秒，大输出请先写进文件再读。",
 		func(ctx context.Context, in bashIn) (string, error) {
-			// 没有 sandbox-exec 就拒绝。cwd 只是默认目录，不能当成隔离。
+			// 没有可用的围栏后端就拒绝。cwd 只是默认目录，不能当成隔离。
 			return runBash(ctx, activeRoot(ctx, workspace), in.Command, bashTimeout, true)
 		})
 }
 
-// runBash 执行一条命令。cwd 不是安全边界：requireSandbox 为真时没有 sandbox-exec 就拒绝执行。
+// runBash 执行一条命令。cwd 不是安全边界：requireSandbox 为真时没有可用的围栏后端就拒绝执行。
 func runBash(ctx context.Context, workspace, command string, timeout time.Duration, requireSandbox bool) (string, error) {
 	// 清扫过期落盘（doc/58 §4.4）：每次 bash 调用前扫一次 .tako/bash/。
 	sweepBashSpills(workspace, time.Now())
@@ -78,7 +78,7 @@ func runBash(ctx context.Context, workspace, command string, timeout time.Durati
 	err = cmd.Run()
 	stdout.closeSpill()
 	stderr.closeSpill()
-	// sandbox-exec 被时长帽杀掉时，Run 返回的是退出码 -1，不是 DeadlineExceeded。
+	// 围栏（sandbox-exec / bwrap）被时长帽杀掉时，Run 返回的是退出码 -1，不是 DeadlineExceeded。
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		return fmt.Sprintf("bash 超时，死前输出：\n%s", outputSections(stdout, stderr)), nil
 	}
