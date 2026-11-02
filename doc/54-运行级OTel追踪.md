@@ -1,7 +1,7 @@
 # 54 · 运行级追踪：OTel GenAI 语义 + CozeLoop 上报
 
 > 性质：**方案（已落地，2026-10-31）**。
-> 状态：✅ A1–A9 全部施工并验收（2026-10-31）：`POST /api/dev/trace-check` 回 `exported:true`；真 run 产出根 `invoke_agent yktako` + `chat` / `execute_tool` / `tako.step.*` 子 span，引擎日志带 `traceId=`；`go test ./internal/runengine ./internal/observability` 全绿。台账在 `tmp/cozeloop/`（不入库）。
+> 状态：✅ A1–A9 全部施工并验收（2026-10-31）：`POST /api/dev/trace-check` 回 `exported:true`；真 run 产出根 `invoke_agent yktako` + `chat` / `execute_tool` / `tako.step.*` 子 span，引擎日志带 `traceId=`；`go test ./internal/runengine ./internal/observability` 全绿。台账在 `tmp/cozeloop/`（不入库）。**2026-11-01 增补**：第二个出口 Langfuse（`LANGFUSE_*`，与 CozeLoop 可双发、可单发），并实测确认 `gen_ai.*` 到 Langfuse 原生模型的映射与 v2 读回路径（§3.1）。
 > 日期：2026-10-31。
 > 代码落点：`yk-tako-eino/internal/observability/`（装配、内容序列化、开关）、`internal/runengine/{trace.go,trace_run.go}`（run 根 span / chat / 入口 / 探针 / 求和）、`worker.go`、`journal.go`、`recall.go`、`compact.go`、`memory.go`、`server.go`、`cmd/yktako/main.go`、`yk-tako-eino/.env`（内容开关，不入库）。
 > 参照：OpenTelemetry GenAI 语义（`gen_ai.*`，semantic-conventions-genai）；CozeLoop 的 OTLP 接入点（`https://api.coze.cn/v1/loop/opentelemetry/v1/traces`，http/protobuf）。
@@ -335,6 +335,48 @@ run 根 span 只回答「整场多久」，A4/A5 只回答「模型/工具各自
 - 入口 span 与 run span 同一条 trace；A6 之前没有入口 span，run span 自己就是根（§2.4）。
 - 内容属性受 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT` 控制（`.env` 默认 `SPAN_ONLY`）：根 span 写本轮业务输入/输出/系统提示词，`chat`/`execute_tool`/召回 span 写各自的内容（§2.2）。
 - 日志里打一行 `trace <sessionId>/<runId> traceId=<32 hex>`，客服/排查从 runId 能跳到 Loop。
+
+### 3.1 第二个出口：Langfuse（2026-11-01 起可双发）
+
+**为什么加**：CozeLoop 的 trace 查询只开在网页面（查询接口要浏览器 `session_key` cookie，PAT 能调的 `/v1/loop` 路由只有 files/prompts/ingest）。所以「把跑过的 trace 拉回来做归因」在 Loop 上做不到——只能人眼看。Langfuse 的 public API 能用 `Basic(pk:sk)` 直接读回 span 与 metrics，bench 的归因（doc/56 §D1）需要这条路。
+
+**怎么接**：同一份 OTLP span，再来一个 exporter，互不影响：
+
+| 变量 | 用途 |
+|---|---|
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | Basic 认证的用户名与密码 |
+| `LANGFUSE_BASE_URL` | 例 `https://us.cloud.langfuse.com`；实际打到 `<base>/api/public/otel/v1/traces`，额外带 `x-langfuse-ingestion-version: 4` |
+
+- 两套凭据都配 → 双发；只配一套 → 只发那一套；都不配 → noop（与原行为一致）。启动日志打 `trace: enabled (cozeloop=on langfuse=on)`。
+- 失败仍按 §4 第 1 条隔离：某个 exporter 建不起来只记日志，另一个照发；导出失败只进全局 error handler。
+
+**映射（2026-11-01 真 run 实测，非文档推断）**：Langfuse 直接认 `gen_ai.*`，不需要另写 adapter：
+
+| tako 发的 | Langfuse 落成 |
+|---|---|
+| span 名 `invoke_agent yktako` + `gen_ai.operation.name=invoke_agent` | `AGENT`（根） |
+| `gen_ai.conversation.id` | 观测上的 `sessionId`（按会话归组） |
+| span 名 `chat <model>` | `GENERATION`，带 model、usage（input/output/total）、`input`/`output` 消息数组 |
+| span 名 `execute_tool <name>` | `TOOL`，名字裁成 `<name>`，带参数与回执、latency |
+| `tako.*`、`cozeloop.span_type` | 落 `metadata.attributes.*`（Loop 私有标签不干扰 Langfuse 分类） |
+
+实测一场 2 次模型调用 + 1 次 `bash` 的 run：树是 `POST /api/runs` → `invoke_agent yktako` → {`tako.step.*`, 两个 `GENERATION`, 一个 `TOOL`}；两枪 usage 求和 6496+73+6596+7 = **13172**，与 usage 帧求和逐值一致。
+
+**怎么读回来**（这两条是现行通道、没有下线日期，脚本照这两条写；旧 v1 资源 `/api/public/traces`、`/api/public/observations/{id}`、`/api/public/sessions`、`/api/public/metrics` 在 Cloud 上 2026-11-16 下线，不要用）：
+
+```
+GET <base>/api/public/v2/observations?filter=<JSON>[&limit=<n>][&fields=core,basic,usage,io,metadata,model]
+GET <base>/api/public/v2/metrics
+```
+`filter` 是 JSON 数组，按单条 trace 取数的写法（`scripts/bench/traces.py` 就是这么调的，实测返回 12 条 span）：
+
+```json
+[{"type":"string","column":"traceId","operator":"=","value":"<32 hex>"}]
+```
+
+`fromStartTime`/`toStartTime` 是 UTC，只在按时间窗扫的时候用。`/api/public/observations/{id}` 另有 5 次/分钟限流，不要逐条拉详情——按 traceId 一次拉整棵树（`limit=200`）就够。
+
+**列表接口本身也有限流：30 次/分钟**（2026-11-02 实测，`429 {"limit":30,"retryAfterSeconds":19}`）。逐 trace 拉一批（比如 bench 的 125 场）会撞上，必须读 `retryAfterSeconds` 退避重试；`traces.py` 已内建，勿用裸 for 循环拉。
 
 ---
 

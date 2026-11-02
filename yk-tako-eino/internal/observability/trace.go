@@ -4,8 +4,10 @@ package observability
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -22,6 +24,7 @@ import (
 const (
 	cozeLoopEndpoint = "api.coze.cn"
 	cozeLoopPath     = "/v1/loop/opentelemetry/v1/traces"
+	langfusePath     = "/api/public/otel/v1/traces"
 	captureEnv       = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT"
 	serviceName      = "yktako"
 )
@@ -38,29 +41,49 @@ var (
 func Setup(ctx context.Context) {
 	token := strings.TrimSpace(os.Getenv("COZELOOP_API_TOKEN"))
 	workspace := strings.TrimSpace(os.Getenv("COZELOOP_WORKSPACE_ID"))
+	lfPublic := strings.TrimSpace(os.Getenv("LANGFUSE_PUBLIC_KEY"))
+	lfSecret := strings.TrimSpace(os.Getenv("LANGFUSE_SECRET_KEY"))
+	lfBase := strings.TrimSpace(os.Getenv("LANGFUSE_BASE_URL"))
 	capture = parseCapture(os.Getenv(captureEnv))
 
 	mu.Lock()
 	defer mu.Unlock()
-	if token == "" || workspace == "" {
+
+	// 后端可并存：两套凭据都配了就双发，只配一套就发那一套。
+	var opts []sdktrace.TracerProviderOption
+	cozeOn := false
+	if token != "" && workspace != "" {
+		exp, err := otlptracehttp.New(ctx,
+			otlptracehttp.WithEndpoint(cozeLoopEndpoint),
+			otlptracehttp.WithURLPath(cozeLoopPath),
+			otlptracehttp.WithHeaders(map[string]string{
+				"authorization":         "Bearer " + token,
+				"cozeloop-workspace-id": workspace,
+			}),
+			otlptracehttp.WithTimeout(5*time.Second),
+		)
+		if err != nil {
+			log.Printf("trace: cozeloop exporter disabled: %v", err)
+		} else {
+			opts = append(opts, sdktrace.WithBatcher(exp))
+			cozeOn = true
+		}
+	}
+	langfuseOn := false
+	if lfPublic != "" && lfSecret != "" && lfBase != "" {
+		exp, err := newLangfuseExporter(ctx, lfBase, lfPublic, lfSecret)
+		if err != nil {
+			log.Printf("trace: langfuse exporter disabled: %v", err)
+		} else {
+			opts = append(opts, sdktrace.WithBatcher(exp))
+			langfuseOn = true
+		}
+	}
+	if len(opts) == 0 {
 		enabled = false
 		provider = nil
-		log.Printf("trace: disabled (COZELOOP_* 未配置)")
+		log.Printf("trace: disabled (COZELOOP_* / LANGFUSE_* 均未配置)")
 		log.Printf("trace content: %s", onOff(capture))
-		return
-	}
-	exp, err := otlptracehttp.New(ctx,
-		otlptracehttp.WithEndpoint(cozeLoopEndpoint),
-		otlptracehttp.WithURLPath(cozeLoopPath),
-		otlptracehttp.WithHeaders(map[string]string{
-			"authorization":         "Bearer " + token,
-			"cozeloop-workspace-id": workspace,
-		}),
-		otlptracehttp.WithTimeout(5*time.Second),
-	)
-	if err != nil {
-		enabled = false
-		log.Printf("trace: disabled (exporter: %v)", err)
 		return
 	}
 	host, _ := os.Hostname()
@@ -71,17 +94,36 @@ func Setup(ctx context.Context) {
 	if err != nil {
 		res = resource.Default()
 	}
-	provider = sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exp),
-		sdktrace.WithResource(res),
-	)
+	opts = append(opts, sdktrace.WithResource(res))
+	provider = sdktrace.NewTracerProvider(opts...)
 	otel.SetTracerProvider(provider)
 	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
 		log.Printf("trace export: %v", err)
 	}))
 	enabled = true
-	log.Printf("trace: enabled (workspace=%s)", workspace)
+	log.Printf("trace: enabled (cozeloop=%s langfuse=%s)", onOff(cozeOn), onOff(langfuseOn))
 	log.Printf("trace content: %s", onOff(capture))
+}
+
+// newLangfuseExporter 指向 <base>/api/public/otel/v1/traces：Basic(pk:sk) + ingestion 版本头。
+func newLangfuseExporter(ctx context.Context, base, publicKey, secretKey string) (sdktrace.SpanExporter, error) {
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" {
+		return nil, fmt.Errorf("LANGFUSE_BASE_URL 不是合法地址")
+	}
+	opts := []otlptracehttp.Option{
+		otlptracehttp.WithEndpoint(u.Host),
+		otlptracehttp.WithURLPath(strings.TrimRight(u.Path, "/") + langfusePath),
+		otlptracehttp.WithHeaders(map[string]string{
+			"authorization":                "Basic " + base64.StdEncoding.EncodeToString([]byte(publicKey+":"+secretKey)),
+			"x-langfuse-ingestion-version": "4",
+		}),
+		otlptracehttp.WithTimeout(5 * time.Second),
+	}
+	if u.Scheme == "http" {
+		opts = append(opts, otlptracehttp.WithInsecure())
+	}
+	return otlptracehttp.New(ctx, opts...)
 }
 
 // Ready reports whether an exporter is configured.

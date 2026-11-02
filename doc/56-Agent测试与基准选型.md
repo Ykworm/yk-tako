@@ -1,8 +1,8 @@
 # 56 · Agent 测试与基准选型
 
 > 性质：**方案（部分落地，2026-10-31 立项）**。回答「拿什么测现在的 tako」——哪些公开基准值得跑、谁来跑、多久跑一次、哪些只该借方法不该搬环境。
-> 状态：🔶 部分落地。**已施工（2026-11-01）**：`scripts/bench/`——行 schema（`row.schema.json`）、**两臂（tako / dsh）**、判定器（`judge.py`，内置官方 scorer 三支 + `--selftest`）、切片配方与派生核对（`cases/gaia_l1_25.json` + `slice.py`）、批量 runner（`run_bench.py`，支持多臂配对）、价目表（`pricing.json`）、键集守门（`check-schema.sh`）；**§4.7 可比性协议**已落纸。**G1 已跑完**（2026-11-01）：GAIA 25 题两轮单臂实测——题面本身 2/25，题面 + 尾句 21/25，口径钉死见 §4.8；**两臂配对也已跑完**——tako 22/25 vs dsh 20/25，见 §4.9。**未施工**：pi 臂（未装）、pass^k 与基线归因（下一轮）、SWE-bench（gated）。
-> 日期：2026-10-31 立项；2026-11-01 第一批落地（口径见 §4.7），同日第二批落地并实跑出数（§4.8），同日第三批：装 dsh 臂并跑两臂配对（§4.9）。
+> 状态：🔶 部分落地。**已施工（2026-11-01）**：`scripts/bench/`——行 schema（`row.schema.json`）、**两臂（tako / dsh）**、判定器（`judge.py`，内置官方 scorer 三支 + `--selftest`）、切片配方与派生核对（`cases/gaia_l1_25.json` + `slice.py`）、批量 runner（`run_bench.py`，支持多臂配对）、价目表（`pricing.json`）、键集守门（`check-schema.sh`）；**§4.7 可比性协议**已落纸。**G1 已跑完**（2026-11-01）：GAIA 25 题两轮单臂实测——题面本身 2/25，题面 + 尾句 21/25，口径钉死见 §4.8；**两臂配对也已跑完**——tako 22/25 vs dsh 20/25，见 §4.9。**pass^k 与基线归因已施工（2026-11-01 夜）**：`--repeat` / `--baseline` / `--write-baseline` + 归因五态（§6.1），trace 取证走 Langfuse v2（`scripts/bench/traces.py`）。**D1 首轮 k=5 基线已跑完（2026-11-02 凌晨）**：tako Pass@5 24/25 · pass^5 20/25，dsh 23/25 · 14/25，基线落 `scripts/bench/baselines/gaia.json`（§4.10）。**未施工**：pi 臂（未装）、SWE-bench（gated）。
+> 日期：2026-10-31 立项；2026-11-01 第一批落地（口径见 §4.7），同日第二批落地并实跑出数（§4.8），同日第三批：装 dsh 臂并跑两臂配对（§4.9）；11-02 凌晨第四批：k=5 基线与 pass^k 归因（§4.10）。
 > 代码落点：`scripts/bench/`（公开题标定）、`scripts/eval/`（doc/45 内部回归，本方案只回填指标，不另起 runner）；**不改 `internal/runengine/` 的生产代码**（本轮实测确认：跑评测不需要改引擎一行）。
 > 参照：doc/45（内部场景回归，本方案的下层）、doc/16 §2b 第 6 项、用户 2026-10-31 给的候选清单（SWE-bench / HumanEval / MBPP / LiveCodeBench / GAIA / τ-bench / AgentBench / Claw-Eval）。
 > 与 doc/45 的关系：doc/45 测「tako 的机制有没有把活干完」；本篇测「模型+tako 在标准任务上有多强」。两层不合并，也不互相替代。
@@ -322,7 +322,7 @@ tako 补浏览器最省的一条是**挂 MCP**（doc/33）：Playwright MCP 是 
 
 #### 4.7.8 本轮必须登记的事实
 
-- **GAIA 题面会发到 CozeLoop**：trace 的内容开关开着（dev 排障要看输入输出），题面与答案会随 span 落到 CozeLoop 私有 workspace（api.coze.cn）。这是登记在案的代价，不是漏洞。
+- **GAIA 题面会发到 CozeLoop 与 Langfuse**：trace 的内容开关开着（dev 排障要看输入输出），题面与答案会随 span 落到 CozeLoop 私有 workspace（api.coze.cn）与 Langfuse Cloud（us.cloud.langfuse.com，2026-11-01 起双发，见 doc/54 §3.1）。这是登记在案的代价，不是漏洞。
 - **切片明文不入库**：GAIA 条款（dataset card「not reshare … outside of a gated or private repository」；leaderboard `content.py`「Please do not repost the public dev set」）要求不外发数据集。仓库只入**配方 + `slice_hash`**，明文留本机 gitignore 目录；hash 是**复现装置**不是保密装置——本地照常可读、可调优。
 - **公开网上查得到标注答案（2026-11-01 实跑撞到）**：GAIA 的 dev set 被大量转载，模型一次 `web_search`（把题面关键词拼上 "GAIA"）就命中了别人整理的答案集——本轮实测第 1 题就是这样答的。后果有两层：**分数不能当「模型能力上限」读**（这一轮量的是 runtime 的产出形态）；**三臂同条件才可比**（谁都能查答案，所以查不查是各臂自己的行为差异，也算差异本身）。禁语再加一条：**不许把 GAIA dev set 的分说成模型水平**。
 - **tako 默认 system prompt 是中文向，官方 scorer 不翻译**：默认提示词是「你是 yk-tako……回答简洁、说中文」（`internal/config/model.go`），官方 scorer 的字符串支只做「去所有空白 + 删 ASCII 标点 + 小写」，**不翻译**。中文长句对英文 gold **必挂**。所以本轮的主要失配是**格式**不是内容——这类失配要单独归因，别混进「模型答错」。
@@ -510,6 +510,39 @@ tako 补浏览器最省的一条是**挂 MCP**（doc/33）：Playwright MCP 是 
 7. **下一轮 B3 的价值在重复，不在换臂**：pi 臂装上后是三臂并排，但**先做 D1（`--repeat 5`）**——没有重复次数，单次配对数连噪声都分不出来（§4.9.1）；
 8. **超时、语言失配、读题风格要分开记账，别混进「不会」**：本轮 7 道翻转里，1 道是撞 300s 上限（timeout）、2 道是答案语言/单位与 gold 不匹配、1 道（Guava 题）是**读题风格与出题人不一致**——那题没有任何知识可不会，两种读法都自洽，只是 gold 取了其中一种。真正「答出不同事实」的只有 2 道。归因三态（`model_baseline` / `harness_format` / `flaky_runtime`）要把这几类分开，其中「读题风格」这一类还得单独立项：GAIA 里有一批**条件句陷阱题**（条件句 + 禁令 + 一个输出词），gold 是出题人的判断而非客观事实，人来判也可能给出另一个答案。
 
+### 4.10 D1：k=5 首轮基线——「能做对一次」与「次次做对」差在哪
+
+2026-11-01 23:37 – 11-02 04:08，同一批 25 题、同一模型、同一隔离引擎（`yktako-d1`，8953）、同一 B 口径（题面 + 尾句「最后一行只输出答案，不要解释。」，§4.8），**每题每臂跑 5 次、串行不并发**（并发会破坏「同一时刻只有一场 run 在同一台引擎上」这个可比性前提）：
+
+```bash
+python3 scripts/bench/run_bench.py --cases gaia --arms tako,dsh --repeat 5 \
+  --tail "最后一行只输出答案，不要解释。" --write-baseline --engine-log tmp/d1-engine.log
+```
+
+报告在 `tmp/bench-reports/20261101-233715/gaia-25-20261101-233715-x5.{md,json}`；125 个 tako run 的根 span traceId 125/125 从引擎日志对上，归因取证经 `traces.py --all` 拉回 125 份事实后 `--rebuild --traces` 回填。
+
+| 臂 | Pass@5 | pass^5 | 未完成轮次 | 模型调用 | 工具调用 | token | 墙钟合计 | $（本臂口径） | $（同口径上界） |
+|---|---|---|---|---|---|---|---|---|---|
+| tako | **24 / 25** | **20 / 25** | 1 | 605 | 668 | 10,796,281 | 3124.2s | 1.6954 | 1.6954 |
+| dsh | **23 / 25** | **14 / 25** | 22 | 1472 | 1570 | 34,480,868 | 13170.6s | 0.5511 | 5.3433 |
+
+配对：**Pass@5 都过 23、只有 tako 过 1、只有 dsh 过 0、都没过 1；pass^5 都过 13、只有 tako 过 7、只有 dsh 过 1、都没过 4。**
+
+**两臂的步数预算（核过代码，不是口径推断）**：tako 有步数闸——`adk.NewChatModelAgent` 的 `MaxIterations=50`（`internal/runengine/worker.go`；本轮单轮最多 27 次模型调用，未触顶）；dsh 没找到步数闸；**真正截断两臂的是每题 300s 墙钟**——dsh 的 22 个未完成轮次都是撞它，不是模型主动停。
+
+**这一轮量到的三件事**：
+
+1. **Pass@5 与 pass^5 的差就是「不稳」的价钱**。tako 24 → 20：4 题 5 次里错 1 次（`3cef3a44` 11110、`42576abe` 11100、`4b6bb5f7` 10011、`5188369a` T0111 其中一次超时）；dsh 23 → 14：9 题不稳，**其中 22 个未完成轮次落在 8 道题上**——dsh 的缺口主要是 300s 内跑不完，不是答错。
+2. **同臂重跑的噪声结论没被推翻，只是被量化了**（§4.9.1 的单轮分歧率 28%）：k=5 下 tako 有 4 题、dsh 有 9 题在「过/不过」之间摆动。**所以仍然不给两臂排名**：pass^5 的 13/7/1/4 里，dsh 那 4 道「都没过」有 2 道是 5 轮全超时——那是步数预算与 harness 的差，不是知识差。
+3. **归因**：tako `incomplete` 1 / `model_baseline` 4 / `ok` 20；dsh `incomplete` 8 / `model_baseline` 3 / `ok` 14。基线是**本轮自身**（首次真值，§6.1 的「抄真值」），所以没有 `engine_regression` / `model_below_baseline`，退出码 0；以后每轮拿 `scripts/bench/baselines/gaia.json` 对照，红了才拦门禁。
+
+**基线文件**：`scripts/bench/baselines/gaia.json`——只存 `sha256(task_id)[:12]`、`passAtN`、`passK`、逐次判决，**不含题面/答案/题号明文**；键为 `{caseSet, repeat: 5, modelRef, engineCommit, sliceHash, arms}`，模型或口径一变就要重建。
+
+**两个施工期实撞（以后跑之前先看这两条）**：
+
+- **k=5 必须带钉死的尾句**。第一版忘了 `--tail`，跑的是 §4.8 已判死的 A 口径（题面本身）：39 次里只过 5 次、答案全是散文，与 A 轮 2/25 同档；跑到 39/250 时停掉作废。**同一个脚本，少一个参数就是另一个协议的数。**
+- **Langfuse 读接口限流 30 次/分钟**（`429 {"limit":30,"retryAfterSeconds":19}`）。125 场全量拉一次就会撞上；`traces.py` 已按 `retryAfterSeconds` 退避重试，勿再用 for 循环裸拉。
+
 ---
 
 ## 5. C2：SWE-bench 25 题模型基线（不经过 tako）
@@ -601,6 +634,18 @@ repeat: 5          # 跑 M=5 次
 报告同时给 **Pass@N**（N 次里至少 1 次过，能力天花板）与 **pass^k**（k 次全过，可靠性地板）。两个数差得越大，说明模型越「靠运气」——但**只有 pass^k 参与判红**，Pass@N 只是信息。
 
 B 组还有一层：**模型水平低本身不算回归**。`baseline`（首次实测抄真值）用来把「红」分成两种——`model_baseline`（红但等于基线 = 已知的模型水平，**不拦门禁**）与 `model_below_baseline`（红且低于基线 = 要查，**拦门禁**）。基线只影响归因，不改变判定。C 组也照此输出，但不判红。
+
+**已落地（2026-11-01 夜）**：`run_bench.py --repeat N` 出 Pass@N / pass^N 两列与逐次明细；基线用 `--write-baseline` 落 `scripts/bench/baselines/<题集>.json`，键是 `sha256(task_id)[:12]`——**题面、gold、task_id 明文都不入库**。归因按「判定 + 基线 + trace 取证」三份证据推：
+
+| 归因 | 判据 |
+|---|---|
+| `incomplete` | 任一轮没跑完（超时 / error） |
+| `model_baseline` | 基线该题本就没全过 |
+| `engine_regression` | 基线过、本轮挂，且 trace 里工具有「错误：」回执或 span 上的 runId 与本轮对不上（串号） |
+| `model_below_baseline` | 基线过、本轮挂，trace 正常（工具回执无错、runId 一致） |
+| `unasserted` | 没基线或缺 trace：证据不齐，不下结论 |
+
+取证走 Langfuse（`traces.py`，doc/54 §3.1）；trace 是异步上报的，所以流程是「跑 → 贴 traceId → 拉事实 → `--rebuild` 回填归因」，`--rebuild` 也执行红码规则。**只有 `engine_regression` / `model_below_baseline` 让退出码非零**。
 
 ### 6.2 终态断言：读世界，不读模型自述
 

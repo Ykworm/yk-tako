@@ -1,0 +1,565 @@
+{
+  "arms": {
+    "dsh": {
+      "0011b22d84d1": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "07219a10542b": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "0dbc46381744": {
+        "passAtN": false,
+        "passK": false,
+        "verdicts": [
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "11c528db7a3e": {
+        "passAtN": true,
+        "passK": false,
+        "verdicts": [
+          false,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "1209a07b75f0": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "19a91d036cf4": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "1e45184ca472": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "276c2128be4f": {
+        "passAtN": true,
+        "passK": false,
+        "verdicts": [
+          true,
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "3248dafebe93": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "3708984f0824": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "3b34793bc1a6": {
+        "passAtN": true,
+        "passK": false,
+        "verdicts": [
+          false,
+          false,
+          false,
+          true,
+          true
+        ]
+      },
+      "5623fa6a4953": {
+        "passAtN": true,
+        "passK": false,
+        "verdicts": [
+          false,
+          true,
+          false,
+          true,
+          true
+        ]
+      },
+      "657c0b7a2439": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "68d8c180b7c0": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "711be2880d02": {
+        "passAtN": true,
+        "passK": false,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          false
+        ]
+      },
+      "81a0445fd7e2": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "82744e88bd6c": {
+        "passAtN": true,
+        "passK": false,
+        "verdicts": [
+          true,
+          true,
+          false,
+          true,
+          true
+        ]
+      },
+      "9a9939e37e35": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "a211ca9123e6": {
+        "passAtN": true,
+        "passK": false,
+        "verdicts": [
+          true,
+          false,
+          false,
+          true,
+          true
+        ]
+      },
+      "a6e94a2087c1": {
+        "passAtN": true,
+        "passK": false,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          false
+        ]
+      },
+      "a86a4b258302": {
+        "passAtN": false,
+        "passK": false,
+        "verdicts": [
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "aea19e124058": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "b814760a42f3": {
+        "passAtN": true,
+        "passK": false,
+        "verdicts": [
+          true,
+          true,
+          true,
+          false,
+          false
+        ]
+      },
+      "c7901b3faa92": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "f84b22deee71": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      }
+    },
+    "tako": {
+      "0011b22d84d1": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "07219a10542b": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "0dbc46381744": {
+        "passAtN": false,
+        "passK": false,
+        "verdicts": [
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      },
+      "11c528db7a3e": {
+        "passAtN": true,
+        "passK": false,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          false
+        ]
+      },
+      "1209a07b75f0": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "19a91d036cf4": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "1e45184ca472": {
+        "passAtN": true,
+        "passK": false,
+        "verdicts": [
+          true,
+          true,
+          true,
+          false,
+          false
+        ]
+      },
+      "276c2128be4f": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "3248dafebe93": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "3708984f0824": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "3b34793bc1a6": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "5623fa6a4953": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "657c0b7a2439": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "68d8c180b7c0": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "711be2880d02": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "81a0445fd7e2": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "82744e88bd6c": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "9a9939e37e35": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "a211ca9123e6": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "a6e94a2087c1": {
+        "passAtN": true,
+        "passK": false,
+        "verdicts": [
+          false,
+          false,
+          true,
+          true,
+          true
+        ]
+      },
+      "a86a4b258302": {
+        "passAtN": true,
+        "passK": false,
+        "verdicts": [
+          true,
+          false,
+          false,
+          true,
+          true
+        ]
+      },
+      "aea19e124058": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "b814760a42f3": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "c7901b3faa92": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      },
+      "f84b22deee71": {
+        "passAtN": true,
+        "passK": true,
+        "verdicts": [
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      }
+    }
+  },
+  "caseSet": "gaia",
+  "createdAt": "2026-11-02T10:17:36+08:00",
+  "engineCommit": "c1807b19442e6a8ed32b42f9a04040200935c0b5",
+  "modelRef": "deepseek/deepseek-flash",
+  "repeat": 5,
+  "sliceHash": "sha256:ee7e330594d0fc2aad40f00755f38b975caa80baffedfb288b9fc1106070e145",
+  "taskKey": "sha256(task_id)[:12]"
+}
