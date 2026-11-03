@@ -18,6 +18,12 @@ yk-tako-eino/yktako
 # 执行台账（planning.md / todos.md），用户验收完即清理，不进版本库
 tmp/
 
+# 本地证书与私钥（部署用，不入库）
+/certs/
+
+# 面试/个人准备材料，只留本地，不进版本库
+doc/interview/
+
 # 运行时数据（-workspace 根：hist / notes / .tako / .media 落盘，进程写、可重建）
 yk-tako-eino/workspace/
 
