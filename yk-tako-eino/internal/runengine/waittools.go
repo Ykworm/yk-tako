@@ -120,6 +120,14 @@ func questionToolName(kind string) string {
 	return "ask_user"
 }
 
+// waitToolNames 是「等人」工具名集合：runlog 写口据此在 assistant 正文行上记分段切点
+// （planning §3.1）。与 questionToolName 的 kind→name 映射同词表（1:1）。
+var waitToolNames = map[string]bool{
+	"ask_user":      true,
+	"submit_plan":   true,
+	"skill_install": true,
+}
+
 type submitPlanInput struct {
 	Plan string `json:"plan" jsonschema:"description=完整方案：目标、步骤、要改哪些文件/执行什么命令；用户会原样看到并可直接编辑"`
 }

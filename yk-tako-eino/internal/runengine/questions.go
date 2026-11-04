@@ -164,12 +164,13 @@ func (s *Store) RunWorkspace(ctx context.Context, runID RunID) (string, error) {
 
 // questionView 是 list 端点的响应行（doc/47 §5.3）。args 一并给出：刷新后前端靠
 // questions?status=pending 重建问题卡，options 只能从 args 解析（帧可能已过 TTL）。
-// answer 只给安装行（doc/52 C5）：它的结论是程序写的那句话（「已安装技能：x。」或失败原因），
-// 刷新后卡片要能复述，不能只剩一个「已处理」。其他 kind 的 answer 是人提交的原文，
-// 前端在帧里已经拿过，不回放。
+// toolCallId 让前端把行挂回发起它的那个工具调用（runlog 分段按它对齐）。
+// answer 对所有 kind 都回放：install 行是程序写的结论（「已安装技能：x。」或失败原因）；
+// question 行是人提交的原文（历史里渲染成答案气泡）；plan 行是编辑后的方案或驳回意见。
 type questionView struct {
 	QuestionID string    `json:"questionId"`
 	RunID      RunID     `json:"runId"`
+	ToolCallID string    `json:"toolCallId,omitempty"`
 	Kind       string    `json:"kind"`
 	Question   string    `json:"question"`
 	Args       string    `json:"args,omitempty"`
@@ -201,11 +202,8 @@ func (s *Server) listQuestions(c *gin.Context) {
 	views := make([]questionView, 0, len(rows))
 	for _, r := range rows {
 		v := questionView{
-			QuestionID: r.ID, RunID: r.RunID, Kind: r.Kind, Question: r.Question,
-			Args: r.Args, Status: r.Status, Decision: r.Decision, CreatedAt: r.CreatedAt,
-		}
-		if r.Kind == questionKindInstall {
-			v.Answer = r.Answer
+			QuestionID: r.ID, RunID: r.RunID, ToolCallID: r.ToolCallID, Kind: r.Kind, Question: r.Question,
+			Args: r.Args, Status: r.Status, Decision: r.Decision, Answer: r.Answer, CreatedAt: r.CreatedAt,
 		}
 		views = append(views, v)
 	}

@@ -1150,8 +1150,109 @@ func TestEndRunLandsUsagePayload(t *testing.T) {
 	}
 }
 
-// ---- C 系列（compact）存储面回归网（C3 第 1/2/4/5 条；渲染/验货/重试/stall 边界在 compact_test.go）----
+// 20. 提问分段（planning §3.1）：含 ask_user 的 run 仍只写一条 root assistant 行，正文是 Σ，
+// payload 追加 segments（提问前正文的 rune 偏移 + 该次调用 id）；账单与分段共存时同一 JSON；
+// 无账单只有分段时 usage 缺席、segments 照出；无提问 run 的 payload 形状不变（上条已覆盖）。
+func TestEndRunLandsQuestionSegments(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid, rid, rid2 := SessionID("s_1"), RunID("r_1"), RunID("r_2")
+	s.mustAcquire(t, sid, rid, "m_1", "帮我选一个")
+	s.mustDelta(t, ctx, rid, "我先问一下。")
 
+	const mainRef = "deepseek/deepseek-flash"
+	ask1 := schema.ToolCall{ID: "call_ask_1", Type: "function",
+		Function: schema.FunctionCall{Name: "ask_user", Arguments: `{"question":"选 A 还是 B？"}`}}
+	ask2 := schema.ToolCall{ID: "call_ask_2", Type: "function",
+		Function: schema.FunctionCall{Name: "ask_user", Arguments: `{"question":"确定吗？"}`}}
+	turn := []TurnEntry{
+		{Role: "assistant", Agent: "", Text: "我先问一下。", ToolCalls: []schema.ToolCall{ask1}, Model: mainRef,
+			Usage: &UsageBill{PromptTokens: 100, CompletionTokens: 10, TotalTokens: 110}},
+		{Role: "tool", Agent: "", Text: "A", ToolCallID: "call_ask_1", ToolName: "ask_user", Model: mainRef},
+		{Role: "assistant", Agent: "", Text: "那再确认：", ToolCalls: []schema.ToolCall{ask2}, Model: mainRef},
+		{Role: "tool", Agent: "", Text: "确定", ToolCallID: "call_ask_2", ToolName: "ask_user", Model: mainRef},
+		{Role: "assistant", Agent: "", Text: "好的。", Model: mainRef,
+			Usage: &UsageBill{PromptTokens: 300, CompletionTokens: 30, TotalTokens: 330}},
+	}
+	if _, _, ok, err := s.EndRun(ctx, sid, rid, 1, "complete", nil, mhRowsFromTurn(rid, turn), turn); err != nil || !ok {
+		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
+	}
+
+	// 六个 runlog 行：user + 两次（tool_call / tool_result）+ 唯一一条 root assistant。
+	rows, _, exists, err := s.ReadLog(ctx, sid, 0, 200)
+	if err != nil || !exists {
+		t.Fatalf("ReadLog: exists=%v err=%v", exists, err)
+	}
+	if len(rows) != 6 {
+		t.Fatalf("runlog 行数 = %d, want 6（Σ 行不拆行）", len(rows))
+	}
+	root := rows[5]
+	if root.Role != "assistant" || root.Text != "我先问一下。那再确认：好的。" {
+		t.Fatalf("root 行 = %+v, want assistant + Σ 正文", root)
+	}
+	// 偏移按 rune 算：第一段「我先问一下。」= 6，第二段再加「那再确认：」= 11。
+	wantSegs := []RunlogSegment{
+		{End: 6, ToolCallID: "call_ask_1"},
+		{End: 11, ToolCallID: "call_ask_2"},
+	}
+	if len(root.Segments) != len(wantSegs) {
+		t.Fatalf("segments = %+v, want %+v", root.Segments, wantSegs)
+	}
+	for i, w := range wantSegs {
+		if root.Segments[i] != w {
+			t.Errorf("segments[%d] = %+v, want %+v", i, root.Segments[i], w)
+		}
+	}
+	if root.Usage == nil || root.Usage.PromptTokens != 300 {
+		t.Errorf("root usage = %+v, want 最后一枪账单与分段共存于同一 payload", root.Usage)
+	}
+	if root.Payload != "" {
+		t.Errorf("assistant 行 payload 原文不该透出: %q", root.Payload)
+	}
+	var payload string
+	if err := s.db.Raw(`SELECT payload FROM runlog_entries WHERE run_id = ? AND role = 'assistant'`, rid).Scan(&payload).Error; err != nil {
+		t.Fatal(err)
+	}
+	wantPayload := `{"promptTokens":300,"completionTokens":30,"totalTokens":330,` +
+		`"segments":[{"end":6,"toolCallId":"call_ask_1"},{"end":11,"toolCallId":"call_ask_2"}]}`
+	if payload != wantPayload {
+		t.Errorf("assistant payload = %s, want %s", payload, wantPayload)
+	}
+
+	// 只有分段、没有账单：payload 只含 segments，读侧 usage 缺席、segments 照出。
+	s.mustAcquire(t, sid, rid2, "m_2", "再问一次")
+	s.mustDelta(t, ctx, rid2, "好的。")
+	ask3 := schema.ToolCall{ID: "call_ask_3", Type: "function",
+		Function: schema.FunctionCall{Name: "ask_user", Arguments: `{"question":"先问再答"}`}}
+	turn2 := []TurnEntry{
+		{Role: "assistant", Agent: "", Text: "", ToolCalls: []schema.ToolCall{ask3}, Model: mainRef},
+		{Role: "tool", Agent: "", Text: "答", ToolCallID: "call_ask_3", ToolName: "ask_user", Model: mainRef},
+		{Role: "assistant", Agent: "", Text: "好的。", Model: mainRef},
+	}
+	if _, _, ok, err := s.EndRun(ctx, sid, rid2, 1, "complete", nil, mhRowsFromTurn(rid2, turn2), turn2); err != nil || !ok {
+		t.Fatalf("EndRun(r2): ok=%v err=%v", ok, err)
+	}
+	rows2, _, exists, err := s.ReadLog(ctx, sid, 6, 200)
+	if err != nil || !exists {
+		t.Fatalf("ReadLog(r2): exists=%v err=%v", exists, err)
+	}
+	if len(rows2) != 4 {
+		t.Fatalf("r2 行数 = %d, want 4", len(rows2))
+	}
+	root2 := rows2[3]
+	if root2.Usage != nil {
+		t.Errorf("无账单 assistant 行不该有 usage: %+v", root2.Usage)
+	}
+	// 提问前没有正文 → 首个切点 end=0（前端据此得到空首段，只画问题卡）。
+	if len(root2.Segments) != 1 || root2.Segments[0].End != 0 || root2.Segments[0].ToolCallID != "call_ask_3" {
+		t.Errorf("r2 segments = %+v, want [{0 call_ask_3}]", root2.Segments)
+	}
+	if !s.sqlBool(t, `SELECT payload = '{"segments":[{"end":0,"toolCallId":"call_ask_3"}]}' FROM runlog_entries WHERE run_id = ? AND role = 'assistant'`, rid2) {
+		t.Error("无账单 run 的 assistant payload 应只含 segments")
+	}
+}
+
+// ---- C 系列（compact）存储面回归网（C3 第 1/2/4/5 条；渲染/验货/重试/stall 边界在 compact_test.go）----
 // C3-1+2+5：EndRun(complete, staged) 同笔事务——被压行 compacted=true（原文保留）+ 新 seq=0 摘要行
 // （role=user / compacted=false / 三字段形状）一起成；读侧 ModelMessages 只见非 compacted 行。
 func TestEndRunCompleteWithStagedCompaction(t *testing.T) {

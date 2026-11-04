@@ -491,6 +491,7 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, ep
 		// payload 列随行落账单）——失败终态复用同一套写口，不另开形状。
 		writeTurnRows := func(rootAlways bool) error {
 			pending := map[string]string{} // agent 名 → 该 agent 已出的 assistant 文本累计（root 键 = ""）
+			var segments []RunlogSegment   // root 行内的提问分段切点（planning §3.1）
 			for _, e := range turn {
 				if e.Role == "tool" {
 					if err := insertToolResult(e); err != nil {
@@ -499,6 +500,15 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, ep
 					continue
 				}
 				pending[e.Agent] += e.Text
+				// 人等的工具调用在 root 正文里留一个切点：End = 此刻 root 已累积正文的
+				// rune 长度（前端按 code point 切），ToolCallID 供问题行挂回该段。
+				if e.Agent == "" {
+					for _, tc := range e.ToolCalls {
+						if waitToolNames[tc.Function.Name] {
+							segments = append(segments, RunlogSegment{End: len([]rune(pending[""])), ToolCallID: tc.ID})
+						}
+					}
+				}
 				if e.Agent != "" && len(e.ToolCalls) == 0 {
 					logID, err := newRowID("rl_")
 					if err != nil {
@@ -553,11 +563,12 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, ep
 			}
 			// assistant 文本行（text=pending[""]）：与旧形状逐字节一致（agent NULL + model=主 ref），
 			// 「Σ root turn 正文 == 定稿全文」的收口锚。payload 列随行落 root 最后一枪账单
-			// （doc/27 A3；账单缺失 = 厂商没报，不写列）。
+			// （doc/27 A3；账单缺失 = 厂商没报，不写列）；含等人工具时同列追加分段清单
+			// （planning §3.1；无提问的 run 字节不变）。
 			// RETURNING 拿回本行 seq 即 runlogOffset（旧 Lua 的 LLEN 语义）。
 			var usageSQL any
-			if rootUsage != nil {
-				b, err := json.Marshal(rootUsage)
+			if rootUsage != nil || len(segments) > 0 {
+				b, err := json.Marshal(assistantLogPayload{UsageBill: rootUsage, Segments: segments})
 				if err != nil {
 					return err
 				}

@@ -23,19 +23,38 @@ type UsageBill struct {
 	Window           int `json:"window,omitempty"`
 }
 
+// RunlogSegment 是含「等人」工具（ask_user / submit_plan / skill_install）的 run 在一条
+// assistant 正文行里留下的分段切点。End = 切点前正文的 rune 长度（前端按 code point 切，
+// 不能按 UTF-16 下标切）；ToolCallID = 触发这次切分的那个工具调用 id，前端据此把
+// question 行挂回该段。最后一段没有切点，直到正文末尾。
+type RunlogSegment struct {
+	End        int    `json:"end"`
+	ToolCallID string `json:"toolCallId"`
+}
+
+// assistantLogPayload 是 assistant 行 payload 列的两种内容合一：provider 账单（doc/27 §4b）
+// 与提问分段清单。账单缺失且无分段时不写 payload 列；无分段的 run 编出来的字节与旧
+// json.Marshal(UsageBill) 完全一致。
+type assistantLogPayload struct {
+	*UsageBill
+	Segments []RunlogSegment `json:"segments,omitempty"`
+}
+
 // Row 是 runlog 里的一条定稿记录（19v6-01 §3）。RunlogOffset 读时注入（seq 列形态）。
 // Usage 是 assistant 行的账单（读侧从 payload 解出注入；user/tool 行不写该字段）；
 // assistant 行的 payload 原文不再透出，tool 扩展行 payload 照旧原样。
+// Segments 是含等人工具 run 的分段切点（读侧从 payload 解出注入），无提问的 run 不写该字段。
 type Row struct {
-	RunlogOffset int        `json:"runlogOffset,omitempty"`
-	RunID        RunID      `json:"runId"`
-	Role         string     `json:"role"`
-	Agent        string     `json:"agent"`
-	Model        string     `json:"model"`
-	MessageID    string     `json:"messageId,omitempty"`
-	Text         string     `json:"text"`
-	Payload      string     `json:"payload,omitempty"`
-	Usage        *UsageBill `json:"usage,omitempty"`
+	RunlogOffset int             `json:"runlogOffset,omitempty"`
+	RunID        RunID           `json:"runId"`
+	Role         string          `json:"role"`
+	Agent        string          `json:"agent"`
+	Model        string          `json:"model"`
+	MessageID    string          `json:"messageId,omitempty"`
+	Text         string          `json:"text"`
+	Payload      string          `json:"payload,omitempty"`
+	Usage        *UsageBill      `json:"usage,omitempty"`
+	Segments     []RunlogSegment `json:"segments,omitempty"`
 }
 
 // Frame 是 runlive 里的一帧（19v6-01 §2）。EventOffset 同理，读时注入。

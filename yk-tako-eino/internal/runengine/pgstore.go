@@ -832,12 +832,14 @@ func (s *Store) ReadLog(ctx context.Context, sessionID SessionID, from, w int) (
 			Text:         e.Text,
 			Payload:      e.Payload,
 		}
-		// assistant 行 payload = usage JSON（doc/27 §4b）：解出注入 usage 字段、原文不透出；
-		// 无 payload（user 行 / 账单缺失）不写该字段。tool 扩展行 payload 照旧原样透出。
+		// assistant 行 payload = usage JSON（doc/27 §4b）＋可选分段清单（planning §3.1）：
+		// 解出注入 usage/segments 字段、原文不透出；无 payload（user 行 / 账单与分段都缺）
+		// 不写这些字段。tool 扩展行 payload 照旧原样透出。
 		if e.Role == "assistant" && e.Payload != "" {
-			var bill UsageBill
-			if err := json.Unmarshal([]byte(e.Payload), &bill); err == nil {
-				row.Usage = &bill
+			var p assistantLogPayload
+			if err := json.Unmarshal([]byte(e.Payload), &p); err == nil {
+				row.Usage = p.UsageBill
+				row.Segments = p.Segments
 				row.Payload = ""
 			}
 		}

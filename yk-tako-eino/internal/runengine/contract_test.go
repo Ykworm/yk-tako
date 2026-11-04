@@ -114,6 +114,38 @@ func TestContractLogResponseBytes(t *testing.T) {
 	}
 }
 
+// TestContractLogQuestionSegmentsBytes 钉住含提问 run 的 assistant 行分段形状（planning §3.1）：
+// segments 紧跟账单字段；无分段的行字节见上一条（不写该键）。
+func TestContractLogQuestionSegmentsBytes(t *testing.T) {
+	got := mustJSON(t, Row{
+		RunlogOffset: 3, RunID: "r_1", Role: "assistant", Model: "deepseek/deepseek-flash",
+		Text:     "先问一下。好的。",
+		Usage:    &UsageBill{PromptTokens: 1, CompletionTokens: 2, TotalTokens: 3},
+		Segments: []RunlogSegment{{End: 5, ToolCallID: "call_ask_1"}},
+	})
+	const want = `{"runlogOffset":3,"runId":"r_1","role":"assistant","agent":"","model":"deepseek/deepseek-flash",` +
+		`"text":"先问一下。好的。","usage":{"promptTokens":1,"completionTokens":2,"totalTokens":3},` +
+		`"segments":[{"end":5,"toolCallId":"call_ask_1"}]}`
+	if got != want {
+		t.Fatalf("分段行字节 = %s\nwant %s", got, want)
+	}
+}
+
+// TestContractQuestionViewBytes 钉住 questions 响应行的字段序与新增字段（planning §3.3）：
+// toolCallId 在 runId 之后；answer 对所有 kind 回放。
+func TestContractQuestionViewBytes(t *testing.T) {
+	got := mustJSON(t, questionView{
+		QuestionID: "qs_1", RunID: "r_1", ToolCallID: "call_ask_1", Kind: "question",
+		Question: "选 A 还是 B？", Status: "answered", Answer: "A",
+		CreatedAt: time.Unix(0, 0).UTC(),
+	})
+	const want = `{"questionId":"qs_1","runId":"r_1","toolCallId":"call_ask_1","kind":"question",` +
+		`"question":"选 A 还是 B？","status":"answered","answer":"A","createdAt":"1970-01-01T00:00:00Z"}`
+	if got != want {
+		t.Fatalf("question 行字节 = %s\nwant %s", got, want)
+	}
+}
+
 // TestContractBusinessCodes 钉住 doc/40 §4 业务码表里的关键码值。
 //
 // 码值是**契约**：前端按 code 分支（登录过期 111104、会话忙 112101、找不到会话 112001……）。
@@ -221,7 +253,7 @@ func TestContractToolTiering(t *testing.T) {
 // TestContractStreamEventBytes 钉住 SSE 事件帧的 data 字节（doc/46 §3.3 用例 9）。
 //
 // 键序 seq → type → id → at 是契约的一部分：前端 EventSource 收到后按 type 分派失效
-//（web/src/mutation.ts 的 dispatch）。下面的字节不是手写的，是 2026-10-23 从活引擎实跑抄的：
+// （web/src/mutation.ts 的 dispatch）。下面的字节不是手写的，是 2026-10-23 从活引擎实跑抄的：
 //
 //	GET /api/events（curl -N 挂读）后 DELETE /api/sessions/{sid}，收到的帧：
 //	id: 1792737898948-0
@@ -242,7 +274,7 @@ func TestContractStreamEventBytes(t *testing.T) {
 }
 
 // TestContractWorkspaceFilesBytes 钉住 GET /api/workspaces/{id}/files 的 data 字段序
-//（doc/48 B1）：path → entries；entry = name → kind →（**只有文件**才有）size → modifiedAt。
+// （doc/48 B1）：path → entries；entry = name → kind →（**只有文件**才有）size → modifiedAt。
 //
 // 目录**不出现** size / modifiedAt 这两个键（不是 0）——加字段忘了同步、或把目录写成 0，
 // 这里就红。下面的字节不是手写的，是 2026-10-23 从活引擎实跑抄下来的。
