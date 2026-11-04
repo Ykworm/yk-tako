@@ -10,10 +10,23 @@
 // **分层是为了能单测**：renderMarkdown 是纯函数、不碰 DOM → Node 内置 test runner 直接测；
 // sanitizeHtml 要 DOM → 只能在浏览器里验（playwright），所以两半的断言分开放。
 
-import { marked } from 'marked'
+import { marked, Renderer } from 'marked'
 import DOMPurify from 'dompurify'
 
 marked.setOptions({ gfm: true, breaks: true })
+
+// 宽表在窄屏会顶出气泡：表格自己不能横向滚，右侧列就永远看不到。
+// 给每张表套一层滚动壳，宽度仍由表格内容决定（滚动壳在 CSS 里限宽）。
+// 注意不能自己 new Renderer 再调用——那份实例没有 parser，单元格会炸；
+// 这里借用 marked 正在用的渲染器（this），它已经绑好 parser。
+const baseTable = Renderer.prototype.table
+marked.use({
+  renderer: {
+    table(this: Renderer, token) {
+      return `<div class="table-scroll">${baseTable.call(this, token)}</div>`
+    },
+  },
+})
 
 // —— 裸链接的边界（doc/49 A10）——
 // marked 的自动链接不认全角标点：模型写「见 https://example.com/a，后面」时，逗号和后面的中文会被

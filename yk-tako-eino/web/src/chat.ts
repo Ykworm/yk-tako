@@ -47,6 +47,9 @@ export type Bubble = {
   usageUnknown?: boolean
   // interrupted 态专用：还能不能续（续跑次数没耗尽）。false = 次数用尽，只能重发。
   resumable?: boolean
+  // 这一拍开始流式的时刻（epoch ms）：页面上的「正在思考 · Ns」从它起算。
+  // 进入 streaming 时打点（排队不算——排队有自己那行注释），续跑/接管的段重新打。
+  startedAt?: number
   // board 是任务看板的结构态（doc/41 §5.2 的 kind=task 帧）：紧凑视图文本。
   // 它是**结构**（前端按行解析渲染状态色），不是让前端去猜自然语言回执。
   board?: string
@@ -63,14 +66,23 @@ export type Bubble = {
   toolsFirst?: boolean
   // 历史气泡的行号（= key 里的 offset）。翻页时用来判定工具行是否早于它所属的气泡。
   logOffset?: number
+  // segmentCallId 是这一段的结束时点（doc/47 §5.5）：一条含提问的 assistant 行按 segments 切成
+  // 多段，第 i 段的 segmentCallId = segments[i].toolCallId；最后一段没有。问题行按它挂回本段。
+  segmentCallId?: string
+  // empty = 切出来的空段（提问前一个字都没说 / 结尾空段）：页面上不画空气泡框，
+  // 只保留它挂的问题卡或工具卡。
+  empty?: boolean
 }
 
 // 一张工具卡。callId 是配对键（帧与 runlog 行同一个 toolCallId）；
 // output 是工具回执原文——模型看到的就是它（D33 之后技能正文是 marker，不是重新读盘）。
-export type ToolCard = { callId: string; name: string; args: string; output?: string; agent?: string }
+// startedAt 是调用帧到的时刻：回执还没来、卡片显示「执行中 · Ns」时按它计秒。
+export type ToolCard = { callId: string; name: string; args: string; output?: string; agent?: string; startedAt?: number }
 
 export type AskQuestion = {
   id: string
+  // 发起这次等待的工具调用 id（doc/47 §5.5）：历史重建按它把问题卡挂回 runlog 分段的切点。
+  toolCallId?: string
   kind: 'question' | 'plan' | 'install'
   text: string
   options: string[]
@@ -167,11 +179,15 @@ function writeStoredWorkspace(id: string | null, tenantId: string) {
   else localStorage.removeItem(key)
 }
 const POLL_MS = 400
-// 冗余信号核对节奏：每 STATUS_EVERY 拍 frames 顺带查一次 session（≈2s 一次 GET）。
+// 流式期间的第一拍节奏（A2）：上一拉有帧说明模型正在出字，150ms 再拉一次——
+// 400ms 一拍会把几十个 1–3 字的 delta 攒成一大段一次刷出来。空拍（等首字/等工具）仍用 POLL_MS。
+const POLL_LIVE_MS = 150
+// 冗余信号核对节奏：每 STATUS_EVERY_MS 查一次 session（≈2s 一次 GET），与拉帧拍数无关
+// （A2 起有帧的拍更密，按拍数算会让核对变成 0.75s 一次）。
 // 放闸与定稿是同一笔 PG 事务（19v6-03 D1：UPDATE runs 落终态 + assistant 行入 runlog），
 // 所以「闸已空」必然意味着「runlog 已定稿」；terminal 帧是 commit 后的 Redis 半、可能比闸晚到，
 // 收口本就以 log 为准，这一拍只会让收口提前，不会误收。
-const STATUS_EVERY = 5
+const STATUS_EVERY_MS = 2000
 // 窗口化初始游标 = max(0, 高水位 - HISTORY_WINDOW)（19v6-01 §3：初始值不是 0；窗口大小客户端定）。
 // 10 = 刷新后先见最近五轮，更早的上滚翻页拿（U5）。
 const HISTORY_WINDOW = 10
@@ -194,6 +210,7 @@ function questionFromFrame(f: Frame): AskQuestion {
   const install = f.name === 'skill_install' ? installProposal(f.args) : undefined
   return {
     id: f.messageId ?? '',
+    toolCallId: f.toolCallId,
     kind: f.name === 'submit_plan' ? 'plan' : f.name === 'skill_install' ? 'install' : 'question',
     text: f.text ?? '',
     options: frameOptions(f.args),
@@ -206,6 +223,7 @@ function questionFromRow(row: QuestionRow): AskQuestion {
   const install = row.kind === 'install' ? installProposal(row.args) : undefined
   return {
     id: row.questionId,
+    toolCallId: row.toolCallId,
     kind: row.kind,
     text: row.question,
     options: frameOptions(row.args),
@@ -279,6 +297,14 @@ function toolRowEvent(r: Row): ToolEvent | null {
   }
 }
 
+// WAIT_TOOL_NAMES 与后端 waitToolNames 同词表（doc/47 §5.5）：这些调用会在正文里留下切点。
+const WAIT_TOOL_NAMES = new Set(['ask_user', 'submit_plan', 'skill_install'])
+
+function isWaitToolRow(r: Row): boolean {
+  const ev = toolRowEvent(r)
+  return !!ev && WAIT_TOOL_NAMES.has(ev.name)
+}
+
 // 一批行里只要有回执找不到同批的调用行，那张工具卡就只有输出、拿不到参数
 // （调用先于回执落账，它一定在更早一页）：调用方据此把窗口再往更早扩一页。
 function hasUnpairedToolResult(rows: Row[]): boolean {
@@ -308,6 +334,7 @@ function mergeTool(b: Bubble, ev: ToolEvent) {
       callId: ev.callId,
       name: ev.name,
       args: ev.args ?? '',
+      startedAt: Date.now(),
       ...(ev.output !== undefined ? { output: ev.output } : {}),
       ...(ev.agent ? { agent: ev.agent } : {}),
     })
@@ -324,10 +351,15 @@ export function useChat() {
   const draft = ref('')
   const attachments = ref<Attachment[]>([])
   const busy = ref(false)
+  // 这场会话当前有活 run（以服务端状态为准）。它跟 busy 分开：run 可能是别的 tab / 别的端
+  // 发起的，本实例没有轮询者，但页面上照样得给出停止入口。
+  const liveRunId = ref<RunID | null>(null)
   const pending = ref<Pending[]>([])
   // 工具行可能先于气泡到达（翻页时 tool_call 行排在它那场的 assistant 行之前）：
   // 按 runId 排队的卡片事件，等那场的气泡出现再合并。
   const pendingTools = new Map<RunID, ToolEvent[]>()
+  // 历史窗口里已经拉过问答档案的 run：一个窗口最多 PAGE 个 run，按 run 拉一次即可（doc/47 §5.5）。
+  const questionsLoaded = new Set<RunID>()
   const loadingOlder = ref(false)
   const atStart = ref(true)
   // 新对话落点（doc/44 §2.2）：null = 让服务端挂默认项目。
@@ -347,6 +379,27 @@ export function useChat() {
   let oldestOffset = 0
   let pollToken = 0
   let pumping = false
+  // 本实例正在轮的 run：同一场 run 只许一个轮询者，接管（reconcile / 空转探测）时靠它去重。
+  const pollingRuns = new Set<RunID>()
+  // 正在投递（POST 在飞、runId 还没回来）的条数。会话状态核对时要认出「这一轮是我自己的」，
+  // 否则会把同一轮按历史再重放一遍（登录观察者与首条消息赛跑时真实发生过）。
+  let delivering = 0
+  // busy 是「本实例正拿着这一轮」的计数，不是布尔开关：投递与多个轮询者并存时，
+  // 先结束的那个不能把页面上的停止入口一起关掉。
+  let busyHolds = 0
+  function holdBusy() {
+    busyHolds++
+    busy.value = true
+  }
+  function releaseBusy() {
+    if (busyHolds > 0) busyHolds--
+    if (busyHolds === 0) busy.value = false
+  }
+  // 换会话/换租户时，旧投递与旧轮询者都已作废（token 变了）：计数从零重来。
+  function resetBusy() {
+    busyHolds = 0
+    busy.value = false
+  }
   // 本 tab 投递时乐观渲染过的 user 行（气泡当场就有）的 messageId 集合。收口补渲染（drainLog）
   // 拉到的 log 行里，靠它认出自己的 user 行跳过，免得画两遍；messageId 是投递前就定好、
   // 服务端原样回写的那个（19v6-01 §1）。
@@ -400,9 +453,12 @@ export function useChat() {
     bubbles.value = []
     draft.value = ''
     attachments.value = []
-    busy.value = false
+    resetBusy()
+    liveRunId.value = null
     loadingOlder.value = false
     renderedMessageIds.clear()
+    pendingTools.clear()
+    questionsLoaded.clear()
     runlogOffset = 0
     oldestOffset = 0
     atStart.value = true
@@ -456,25 +512,58 @@ export function useChat() {
     bubbles.value = []
     draft.value = ''
     attachments.value = []
-    busy.value = false
+    resetBusy()
+    liveRunId.value = null
     renderedMessageIds.clear()
     sessionGone.value = '这场会话已在其它窗口删除。'
   }
 
   // gateIdle：闸空 = 会话没有活 run（19v6-01 §4）。404 = 本地 sid 已被 reset 清成僵尸，
   // 它必然不占闸——丢掉本地值连同游标，这一条改走懒建；其余查不到一律算「不空」，宁可下一拍再试。
+  // 顺带把「这场会话有活 run」记到 liveRunId：闸是别的 tab/端占着时，当前页面也得能叫停。
   async function gateIdle(): Promise<boolean> {
     const sid = sessionId.value
     if (!sid) return true
     try {
-      return !(await getSession(sid)).liveRunId
+      const status = await getSession(sid)
+      liveRunId.value = status.liveRunId ?? null
+      return !status.liveRunId
     } catch (e) {
       if (isNotFound(e)) {
         dropSession()
+        liveRunId.value = null
         return true
       }
       return false
     }
+  }
+
+  // probeLive：空转时低频率核对这场会话有没有活 run。
+  // 为什么要主动问：run 可能是另一个 tab / 另一台设备发起的，本实例没有任何本地信号；
+  // 不查的话「当前会话正在跑」这件事在这一页上根本不存在——没有停止入口，也看不到输出。
+  // 发现了就接管帧面（起点 0，与 reconcile 同一套），收口仍以 runlog 为准。
+  async function probeLive() {
+    const sid = sessionId.value
+    if (!sid || busy.value || pending.value.length) return
+    const token = pollToken
+    let status
+    try {
+      status = await getSession(sid)
+    } catch {
+      return // 这一拍没结论，下一拍再来
+    }
+    if (token !== pollToken) return
+    liveRunId.value = status.liveRunId ?? null
+    if (!status.liveRunId || pollingRuns.has(status.liveRunId)) return
+    const assistant = push({
+      key: `${status.liveRunId}:live`,
+      runId: status.liveRunId,
+      role: 'assistant',
+      text: '',
+      state: 'streaming',
+      startedAt: Date.now(),
+    })
+    void pollFrames(status.liveRunId, assistant, 0, token)
   }
 
   async function deliver(p: Pending) {
@@ -482,14 +571,17 @@ export function useChat() {
     const token = pollToken
     const tenantAtSend = readTenant().id
     assistant.state = 'streaming'
+    assistant.startedAt = Date.now()
     assistant.text = ''
-    busy.value = true
+    delivering++
+    holdBusy()
     try {
       const resp = await postWithFreshSession(p)
       if (active.value) writeStoredSession(resp.sessionId, tenantAtSend)
       if (token !== pollToken) return
       sessionId.value = resp.sessionId
       assistant.runId = resp.runId
+      liveRunId.value = resp.runId
       flushPendingTools(assistant)
       await pollFrames(resp.runId, assistant, 0, token)
     } catch (e) {
@@ -505,7 +597,8 @@ export function useChat() {
         assistant.text = e instanceof ApiError ? `投递失败：${e.message}` : '投递失败'
       }
     } finally {
-      if (token === pollToken) busy.value = false
+      delivering--
+      if (token === pollToken) releaseBusy()
     }
   }
 
@@ -535,9 +628,24 @@ export function useChat() {
     }
   }
 
+  // run 的轮询入口：同一场 run 只许一个轮询者（收口/接管/空转探测都可能碰到同一场），
+  // 忙态按持有者计数——先退出的一方不能把别人的停止入口一起关掉。
+  async function pollFrames(runId: RunID, assistant: Bubble, eventOffset: number, token: number) {
+    if (pollingRuns.has(runId) || token !== pollToken) return
+    pollingRuns.add(runId)
+    holdBusy()
+    try {
+      await pollFramesOnce(runId, assistant, eventOffset, token)
+    } finally {
+      pollingRuns.delete(runId)
+      if (liveRunId.value === runId) liveRunId.value = null
+      if (token === pollToken) releaseBusy()
+    }
+  }
+
   // 19v6-01 §2：delta 按 eventOffset 顺序追加，本地游标 = nextOffset。
   // terminal 帧 / status:gone / liveRunId 易主，三者任一即停轮询并收口（19v6-02 第 4 步），不押注单一信号。
-  async function pollFrames(runId: RunID, assistant: Bubble, eventOffset: number, token: number) {
+  async function pollFramesOnce(runId: RunID, assistant: Bubble, eventOffset: number, token: number) {
     // 等人行的 PG 真源先拉一次：刷新后帧面里可能带着已答过的旧 question 帧，
     // 行状态才说明它是不是还在等；帧丢了（runlive 重建）也能把 pending 行补成卡。
     const questionRows = new Map<string, QuestionRow>()
@@ -557,7 +665,25 @@ export function useChat() {
     } catch {
       // 列表拉不到不挡帧面：question 帧自己带全文与 args。
     }
-    let ticks = 0
+    let statusCheckedAt = Date.now()
+    // 实时分段（doc/47 §5.5）：question 帧到达即封口当前段；封口后第一条正文/工具帧先
+    // 新起一段再落内容。答案气泡由 qa 块按 answered 自动渲染，不用额外 push。
+    let current = assistant
+    let sealed = false
+    let segIndex = 0
+    const nextSegment = () => {
+      if (!sealed) return
+      current.state = 'done'
+      current = push({
+        key: `${runId}:live:${++segIndex}`,
+        runId,
+        role: 'assistant',
+        text: '',
+        state: 'streaming',
+        startedAt: Date.now(),
+      })
+      sealed = false
+    }
     for (;;) {
       if (token !== pollToken) return
       let resp
@@ -576,12 +702,18 @@ export function useChat() {
         if (f.kind === 'resume') {
           // resume 帧（doc/30 §8.3）的 text 是**账本里已产出的整段正文**，不是增量片段——
           // 语义跟 delta 正好相反：这里是**替换**，用 += 会把崩溃前的正文重复拼一遍。
+          // 续跑先收敛成单段（doc/47 §5.5），收口再由 runlog 重建。
+          current = assistant
+          sealed = false
           assistant.text = f.text ?? ''
-        } else if (f.kind === 'delta' && f.text) assistant.text += f.text
+        } else if (f.kind === 'delta' && f.text) {
+          nextSegment()
+          current.text += f.text
+        }
         // usage 帧（doc/27 §4a）：每枪一帧，多枪取最后一帧（= 下一枪的基线）；
         // 子代理帧（agent 非空）第一版不渲染，跳过。
         if (f.kind === 'usage' && !f.agent) {
-          assistant.usage = {
+          current.usage = {
             promptTokens: f.promptTokens ?? 0,
             completionTokens: f.completionTokens ?? 0,
             window: f.window ?? 0,
@@ -589,17 +721,23 @@ export function useChat() {
         }
         if (f.kind === 'task' && !f.agent) {
           // 看板帧：text = 当前全量看板的紧凑视图（模型的眼睛同一份文本，前端按行渲染）。
-          assistant.board = f.text ?? ''
+          current.board = f.text ?? ''
         }
         if (f.kind === 'question' && !f.agent) {
           // 行已 answered 的旧帧不再立卡（刷新场景）；pending / 无行（列表没拉到）才立。
           const row = f.messageId ? questionRows.get(f.messageId) : undefined
-          if (!row || row.status === 'pending') upsertQuestion(assistant, questionFromFrame(f))
+          if (!row || row.status === 'pending') {
+            upsertQuestion(current, questionFromFrame(f))
+            sealed = true
+          }
         }
         // 工具帧（doc/59）：call 与 result 按 toolCallId 配成一张卡；子代理的也收，
-        // 卡片上用 agent 字段标出是谁调的。
+        // 卡片上用 agent 字段标出是谁调的。封口后的工具帧属于下一段。
         const tev = toolFrameEvent(f)
-        if (tev) mergeTool(assistant, tev)
+        if (tev) {
+          nextSegment()
+          mergeTool(current, tev)
+        }
         if (f.kind === 'terminal') terminalStatus = f.status ?? 'complete'
       }
       eventOffset = resp.nextOffset
@@ -607,10 +745,13 @@ export function useChat() {
         await closeOut(runId, assistant, terminalStatus)
         return
       }
-      await sleep(POLL_MS)
-      if (++ticks % STATUS_EVERY === 0 && (await runSettled(runId, token))) {
-        if (token === pollToken) await closeOut(runId, assistant, null)
-        return
+      await sleep(resp.frames.length ? POLL_LIVE_MS : POLL_MS)
+      if (Date.now() - statusCheckedAt >= STATUS_EVERY_MS) {
+        statusCheckedAt = Date.now()
+        if (await runSettled(runId, token)) {
+          if (token === pollToken) await closeOut(runId, assistant, null)
+          return
+        }
       }
     }
   }
@@ -630,9 +771,17 @@ export function useChat() {
     if (!runId) return
     const token = pollToken
     b.state = 'streaming'
+    b.startedAt = Date.now()
     b.text = ''
-    // 续跑期间会话闸被占着：置 busy 让队列里的新消息等它收口再投（POST 会撞 409）。
-    busy.value = true
+    // resume 帧的 text 是整段正文：续跑把这场收敛成单段（doc/47 §5.5），
+    // 旧的实时段由收口时的 runlog 重建，避免「resume 正文 + 旧段」并存。
+    for (let i = bubbles.value.length - 1; i >= 0; i--) {
+      const x = bubbles.value[i]
+      if (x !== b && x.role === 'assistant' && x.runId === runId) bubbles.value.splice(i, 1)
+    }
+    // 续跑期间会话闸被占着：置忙让队列里的新消息等它收口再投（POST 会撞 409）。
+    holdBusy()
+    liveRunId.value = runId
     try {
       try {
         await postResume(runId)
@@ -646,14 +795,17 @@ export function useChat() {
           return
         }
         if (code === CODE_NOT_RESUMABLE) {
+          liveRunId.value = null
           await closeOut(runId, b, null)
           return
         }
         if (code === CODE_RESUME_EXHAUSTED) {
+          liveRunId.value = null
           b.state = 'interrupted'
           b.resumable = false
           return
         }
+        liveRunId.value = null
         b.state = 'error'
         b.text = e instanceof ApiError ? `续跑失败：${e.message}` : '续跑失败'
         return
@@ -661,7 +813,7 @@ export function useChat() {
       if (token !== pollToken) return
       await pollFrames(runId, b, 0, token)
     } finally {
-      if (token === pollToken) busy.value = false
+      if (token === pollToken) releaseBusy()
     }
   }
 
@@ -725,22 +877,20 @@ export function useChat() {
   // 所以看到终态帧时 log 里的行已经在库里。
   async function closeOut(runId: RunID, assistant: Bubble, terminalStatus: string | null) {
     if (terminalStatus === 'error' || terminalStatus === 'stopped') {
-      const row = await drainLog(runId, assistant)
-      if (row && !assistant.text) assistant.text = row.text
-      assistant.state = terminalStatus === 'stopped' ? 'stopped' : 'error'
+      const rows = await drainLog(runId, assistant)
+      const hit = lastRootAssistant(rows)
+      if (hit && !assistant.text) assistant.text = hit.text
+      const last = lastRunAssistant(runId) ?? assistant
+      last.state = terminalStatus === 'stopped' ? 'stopped' : 'error'
       return
     }
     // 本 tab 亲历的收尾：全程没见过 usage 帧 = 厂商没报账单，标出来（error 态不标——失败气泡本就有说明行）。
-    if (!assistant.usage) assistant.usageUnknown = true
-    const row = await drainLog(runId, assistant)
-    if (row) {
-      assistant.text = row.text
-      // 历史真源里也带账单（doc/27 §4b）：有就覆盖场内最后一帧，没有则维持 usageUnknown 判定。
-      if (row.usage) {
-        assistant.usage = row.usage
-        assistant.usageUnknown = false
-      }
-      assistant.state = 'done'
+    const usageUnknown = !assistant.usage
+    const rows = await drainLog(runId, assistant)
+    const hit = lastRootAssistant(rows)
+    if (hit) {
+      // 历史真源里也带账单（doc/27 §4b）与分段（doc/47 §5.5）：整场按行重放，实时段全部作废。
+      await rebuildRunBubbles(runId, rows, assistant, usageUnknown)
       return
     }
     // 没有定稿行。三种收尾在 log 里长得一样（都没有 assistant 行），靠 run 的状态分辨：
@@ -749,10 +899,11 @@ export function useChat() {
     //   别的        = 真失败。
     // 先问单场 run：它给的是派生状态（running + 租约过期 → interrupted），比
     // getSession 的 lastRunStatus 更准（后者说的是「最新一场」，未必是本场）。
+    const last = lastRunAssistant(runId) ?? assistant
     const st = await getRun(runId).catch(() => null)
     if (st && st.status === 'interrupted') {
-      assistant.state = 'interrupted'
-      assistant.resumable = st.resumable
+      last.state = 'interrupted'
+      last.resumable = st.resumable
       return
     }
     // error 收尾与 stopped 收尾在 log 里长得一样（都没有 assistant 行）——
@@ -761,35 +912,114 @@ export function useChat() {
     if (sid) {
       try {
         if ((await getSession(sid)).lastRunStatus === 'stopped') {
-          assistant.state = 'stopped'
+          last.state = 'stopped'
           return
         }
       } catch {
         // 引擎不可达：按失败收口（原语义），不为此加重试
       }
     }
-    assistant.state = 'error'
+    last.state = 'error'
+  }
+
+  // lastRunAssistant 取这场 run 屏上的最后一条 assistant 气泡（分段后一个 run 可能有多条）。
+  function lastRunAssistant(runId: RunID): Bubble | undefined {
+    for (let i = bubbles.value.length - 1; i >= 0; i--) {
+      const b = bubbles.value[i]
+      if (b.role === 'assistant' && b.runId === runId) return b
+    }
+    return undefined
+  }
+
+  // lastRootAssistant 取本 run 的 root 定稿行（子代理终稿行 agent 非空，不算）。
+  function lastRootAssistant(rows: Row[]): Row | null {
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const r = rows[i]
+      if (r.role === 'assistant' && !r.agent) return r
+    }
+    return null
+  }
+
+  // rebuildRunBubbles 把一场 run 的 runlog 行重放成气泡，替换屏上的实时段（doc/47 §5.5）。
+  // 历史路径与收口共用同一套规则，保证「跑完的样子 = 刷新后的样子」。
+  async function rebuildRunBubbles(
+    runId: RunID,
+    rows: Row[],
+    assistant: Bubble,
+    usageUnknown: boolean,
+  ) {
+    const token = pollToken
+    // 问题真源：pending / answered 都画（answered 才有答案气泡）；stale 不画。
+    const liveQuestions = bubbles.value
+      .filter((b) => b.runId === runId && b.role === 'assistant')
+      .flatMap((b) => b.questions ?? [])
+    let questions: AskQuestion[] | null = null
+    try {
+      questions = (await getQuestions(runId))
+        .filter((r) => r.status !== 'stale')
+        .map(questionFromRow)
+    } catch {
+      // 拉不到就沿用屏上已有的（本 tab 亲历的问题卡不能因一次抖动消失）。
+    }
+    if (token !== pollToken) return
+
+    const built: Bubble[] = []
+    for (const r of rows) {
+      if (!isChatRow(r)) continue
+      // 自己乐观渲染过的 user 气泡已经在了，不再重复建。
+      if (r.role === 'user' && r.messageId && renderedMessageIds.has(r.messageId)) continue
+      built.push(...rowBubbles(r))
+    }
+    if (usageUnknown) {
+      const last = [...built].reverse().find((b) => b.role === 'assistant')
+      if (last && !last.usage) last.usageUnknown = true
+    }
+    for (const q of questions ?? liveQuestions) {
+      const target = pickQuestionTarget(built, runId, q.toolCallId)
+      if (target) upsertQuestion(target, q)
+    }
+
+    const idx = bubbles.value.indexOf(assistant)
+    const insertAt = idx >= 0 ? idx : bubbles.value.length
+    const removedBefore = bubbles.value
+      .slice(0, insertAt)
+      .filter((b) => b.role === 'assistant' && b.runId === runId).length
+    const remaining = bubbles.value.filter((b) => !(b.role === 'assistant' && b.runId === runId))
+    remaining.splice(Math.max(0, insertAt - removedBefore), 0, ...built)
+    bubbles.value = remaining
+    // 工具行重挂到重建后的第一段（数组已换，attachToolRow 读到的是新的响应式元素）。
+    for (const r of rows) {
+      if (!isChatRow(r)) attachToolRow(r)
+    }
   }
 
   // 从对齐游标续拉 log 直到追平（空批 = 追平），这正是 19v6-02 第 4 步的「回第 2 步拉一次 log」：
   // 游标经过的**别人的**定稿行不能白过——不是本 tab 的就当场补渲染（多 tab/他端投递的整轮
-  // 借此进列表）；本 tab 乐观渲染过的 user 行按 messageId 认出跳过（气泡早就在）；本次要替换的
-  // 那条 assistant 行只记下、不渲染，交给 closeOut 整条替换半截气泡。
-  async function drainLog(runId: RunID, assistant: Bubble): Promise<Row | null> {
+  // 借此进列表）；本 tab 乐观渲染过的 user 行按 messageId 认出跳过（气泡早就在）；本场 run
+  // 的全部行原样返回，交给 closeOut 重放成段（doc/47 §5.5）。
+  async function drainLog(runId: RunID, assistant: Bubble): Promise<Row[]> {
     const token = pollToken
     const sid = sessionId.value
-    if (!sid) return null
-    let hit: Row | null = null
+    if (!sid) return []
+    const runRows: Row[] = []
     let ownUserOffset = 0
     const foreign: Row[] = []
     for (;;) {
-      if (token !== pollToken) return null
+      if (token !== pollToken) return []
       const resp = await getLog(sid, runlogOffset)
-      if (token !== pollToken) return null
+      if (token !== pollToken) return []
       for (const r of resp.rows) {
-        if (r.role === 'assistant' && r.runId === runId) {
-          hit = r
-        } else if (r.role === 'user' && r.messageId && renderedMessageIds.has(r.messageId)) {
+        if (r.runId === runId) {
+          // 本场 run 的行（user / assistant / 工具账本）：全部交给收口重放，不在 drain 里画。
+          runRows.push(r)
+          if (r.role === 'user' && r.messageId && renderedMessageIds.has(r.messageId)) {
+            ownUserOffset = r.runlogOffset ?? 0
+            noteRendered(r)
+            backfillOwnUserMedia(r)
+          }
+          continue
+        }
+        if (r.role === 'user' && r.messageId && renderedMessageIds.has(r.messageId)) {
           // 自己的 user 行：气泡早渲染过，但「最老已渲染」的记账仍要含它——否则 atStart 撒谎，
           // 翻页会把这两行当没渲染过的再拉一遍、画成两份。带图投递在这里按服务端真源
           // 回填媒体（乐观气泡当时只有文字，path/sha 由服务端铸出）。
@@ -804,9 +1034,9 @@ export function useChat() {
       runlogOffset = resp.nextOffset
       if (!advanced) break
     }
-    if (token !== pollToken) return null
+    if (token !== pollToken) return []
     renderForeign(foreign, assistant, ownUserOffset)
-    return hit
+    return runRows
   }
 
   // 切换工作区后调用：清掉屏幕上的气泡，再按新工作区自己的会话键重拉。不删其他工作区记下的会话。
@@ -817,10 +1047,12 @@ export function useChat() {
     bubbles.value = []
     draft.value = ''
     attachments.value = []
-    busy.value = false
+    resetBusy()
+    liveRunId.value = null
     loadingOlder.value = false
     renderedMessageIds.clear()
     pendingTools.clear()
+    questionsLoaded.clear()
     runlogOffset = 0
     oldestOffset = 0
     atStart.value = true
@@ -868,13 +1100,15 @@ export function useChat() {
       resp = await getLog(sid, runlogOffset)
       if (token !== pollToken) return false
     }
+    liveRunId.value = status.liveRunId ?? null
     if (status.liveRunId) {
-      const assistant = push({ key: `${status.liveRunId}:live`, runId: status.liveRunId, role: 'assistant', text: '', state: 'streaming' })
-      busy.value = true
-      const token = pollToken
-      pollFrames(status.liveRunId, assistant, 0, token).finally(() => {
-        if (token === pollToken) busy.value = false
-      })
+      // 本实例已经有一个轮询者在跟这场 run（登录后立刻发消息时，authState 观察者还会再 reconcile
+      // 一次），或者正有一条投递在飞（runId 还没回来）——这一轮已经在自己的轨道上。
+      // 再起一个轮询者会把同一轮画两份（用户会看到同一场对话出现两条、提问翻页器数出 2/2）。
+      if (!pollingRuns.has(status.liveRunId) && delivering === 0) {
+        const assistant = push({ key: `${status.liveRunId}:live`, runId: status.liveRunId, role: 'assistant', text: '', state: 'streaming', startedAt: Date.now() })
+        void pollFrames(status.liveRunId, assistant, 0, token)
+      }
     } else if (status.lastRunStatus === 'interrupted' && status.lastRunId) {
       // 崩了、但账本还在：这场 run 可以被接管（doc/30 §8）。气泡正文先空着——
       // 崩溃前已产出的正文在账本里，点「继续」后随 resume 帧一起回来（doc/30 §8.3）。
@@ -916,13 +1150,13 @@ export function useChat() {
     }
   }
 
-  // attachToolRow 把一条工具账本行叠到它那场的 assistant 气泡上（按 runId 找）。
-  // 气泡还没出现就排队（翻页/首次渲染的顺序里 tool 行在前）。
+  // attachToolRow 把一条工具账本行叠到它那场的第一条 assistant 气泡上（按 runId 找）。
+  // 气泡还没出现就排队（翻页/首次渲染的顺序里 tool 行在前）。多段 run 里工具卡统一挂第一段
+  // （doc/47 §5.5）：工具行的位置不随提问分段漂移。
   function attachToolRow(r: Row) {
     const ev = toolRowEvent(r)
     if (!ev) return
-    for (let i = bubbles.value.length - 1; i >= 0; i--) {
-      const b = bubbles.value[i]
+    for (const b of bubbles.value) {
       if (b.role === 'assistant' && b.runId === r.runId) {
         // 翻页时气泡已经建好（行序被拆开处理），只能按 offset 判断先后：工具行更早 → 卡片在上。
         if ((r.runlogOffset ?? 0) > 0 && b.logOffset !== undefined && (r.runlogOffset ?? 0) < b.logOffset) {
@@ -947,8 +1181,6 @@ export function useChat() {
     for (const ev of q) mergeTool(b, ev)
   }
 
-  // 一条 log 行 → 气泡，并记账「最老已渲染 offset」（loadOlder 的翻页基准）。
-  // 占位行在这里解析成媒体引用、从正文剥掉（doc/32 A5）。
   // runlog 同时是工具执行账本（tool_call / tool_result），气泡只收对话两角色——
   // 账本行留在库里和模型输入里，不上对话页面。
   type ChatRow = Row & { role: 'user' | 'assistant' }
@@ -957,21 +1189,89 @@ export function useChat() {
     return r.role === 'user' || r.role === 'assistant'
   }
 
-  function rowBubble(r: ChatRow): Bubble {
-    noteRendered(r)
-    const { media, display } = parseMedia(r.text)
-    const b: Bubble = {
-      key: `log:${r.runlogOffset}`,
-      runId: r.runId,
-      role: r.role,
-      text: display,
-      media: media.length ? media : undefined,
-      state: 'done',
-      usage: r.usage,
-      logOffset: r.runlogOffset,
+  // splitRowText 按 segments 的 rune 偏移把一行正文切成多段（doc/47 §5.5）。
+  // 用 Array.from 按 code point 切：后端 offset 是 Go rune 数，中文/emoji 不会切坏；
+  // 没有 segments 的行原样一段。
+  function splitRowText(text: string, segments?: Row['segments']): string[] {
+    if (!segments?.length) return [text]
+    const chars = Array.from(text)
+    const parts: string[] = []
+    let prev = 0
+    for (const seg of segments) {
+      const end = Math.max(prev, Math.min(chars.length, seg.end))
+      parts.push(chars.slice(prev, end).join(''))
+      prev = end
     }
-    flushPendingTools(b)
-    return b
+    parts.push(chars.slice(prev).join(''))
+    return parts
+  }
+
+  // 历史里的问答档案：问题/答案的真源是 run_questions（doc/47 §5.5），runlog 只给切点。
+  // 按 run 拉一次、按 toolCallId 挂回分段气泡；拉不到就不画空壳（与 install 行同原则）。
+  async function loadRunQuestions(runIDs: Iterable<RunID>) {
+    const token = pollToken
+    for (const runId of runIDs) {
+      if (questionsLoaded.has(runId)) continue
+      questionsLoaded.add(runId)
+      try {
+        const rows = await getQuestions(runId)
+        if (token !== pollToken) return
+        for (const row of rows) {
+          if (row.status === 'stale') continue
+          attachQuestionRow(row)
+        }
+      } catch {
+        // 网络/引擎抖动：允许下次窗口重试。
+        questionsLoaded.delete(runId)
+      }
+    }
+  }
+
+  // pickQuestionTarget 找问题卡该挂的气泡：优先按 segments 的 toolCallId 精确配对，
+  // 老数据（没有 segments）退回这场的第一条 assistant 气泡。
+  function pickQuestionTarget(list: Bubble[], runId: RunID, toolCallId?: string): Bubble | undefined {
+    if (toolCallId) {
+      const exact = list.find(
+        (b) => b.role === 'assistant' && b.runId === runId && b.segmentCallId === toolCallId,
+      )
+      if (exact) return exact
+    }
+    return list.find((b) => b.role === 'assistant' && b.runId === runId)
+  }
+
+  // attachQuestionRow 把问题行挂回它的段（历史路径）。
+  function attachQuestionRow(row: QuestionRow) {
+    const target = pickQuestionTarget(bubbles.value, row.runId, row.toolCallId)
+    if (target) upsertQuestion(target, questionFromRow(row))
+  }
+
+  // 一条 log 行 → 气泡（含提问时可能多段），并记账「最老已渲染 offset」（loadOlder 的翻页基准）。
+  function rowBubbles(r: ChatRow): Bubble[] {
+    noteRendered(r)
+    // 先按原始正文切段、再逐段解析媒体占位行——否则剥掉占位行后偏移就对不上了。
+    const parts = r.role === 'assistant' ? splitRowText(r.text, r.segments) : [r.text]
+    const out: Bubble[] = []
+    for (let i = 0; i < parts.length; i++) {
+      const { media, display } = parseMedia(parts[i])
+      const last = i === parts.length - 1
+      out.push({
+        key: i === 0 ? `log:${r.runlogOffset}` : `log:${r.runlogOffset}:${i}`,
+        runId: r.runId,
+        role: r.role,
+        text: display,
+        media: media.length ? media : undefined,
+        state: 'done',
+        // 账单是整场 run 的：挂在最后一段（页面底部），不在中段重复。
+        usage: last ? r.usage : undefined,
+        logOffset: r.runlogOffset,
+        segmentCallId: r.segments?.[i]?.toolCallId,
+        // 空段只在真被切开时存在（无提问的行不会因空正文被当成空段）。
+        empty: parts.length > 1 && display === '' && media.length === 0 ? true : undefined,
+      })
+    }
+    // 工具行先于正文行落库：挂到这场的第一段（doc/47 §5.5，工具卡位置不因分段改变）。
+    flushPendingTools(out[0])
+    return out
   }
 
   // 收口时认出自己的 user 行，按服务端真源回填乐观气泡的媒体与正文。
@@ -1002,15 +1302,29 @@ export function useChat() {
       const idx = bubbles.value.indexOf(assistant)
       if (idx < 0) return // 列表已被 newSession 清空，整批作废
       const before = ownUserOffset > 0 && (r.runlogOffset ?? 0) < ownUserOffset
-      bubbles.value.splice(Math.max(0, before ? idx - 1 : idx + 1), 0, rowBubble(r))
+      const built = rowBubbles(r)
+      bubbles.value.splice(Math.max(0, before ? idx - built.length : idx + 1), 0, ...built)
     }
   }
 
   function appendRows(rows: Row[]) {
+    const runsWithQuestions = new Set<RunID>()
     for (const r of rows) {
-      if (isChatRow(r)) push(rowBubble(r))
-      else attachToolRow(r)
+      if (isChatRow(r)) {
+        // 自己乐观渲染过的 user 行已经画在屏上了：中途 reconcile（登录观察者与首条消息赛跑）
+        // 重放历史时不能再画一遍，否则同一句话出现两条。记账（最老已渲染 offset）仍要含它。
+        if (r.role === 'user' && r.messageId && renderedMessageIds.has(r.messageId)) {
+          noteRendered(r)
+        } else {
+          for (const b of rowBubbles(r)) push(b)
+        }
+      } else {
+        attachToolRow(r)
+      }
+      if (r.segments?.length || (r.role === 'tool_call' && isWaitToolRow(r))) runsWithQuestions.add(r.runId)
     }
+    // 历史里的问答档案：问题/答案的真源是 run_questions（doc/47 §5.5），runlog 只给切点。
+    void loadRunQuestions(runsWithQuestions)
   }
 
   // 翻页：临时游标只用于这一次请求，拉完 prepend，**不回退对齐游标**（19v6-02「两种游标别混」）。
@@ -1052,22 +1366,18 @@ export function useChat() {
         floor = Math.max(0, upper - 1 - PAGE)
       }
       if (collected.length) {
-        bubbles.value.unshift(
-          ...collected.map((r) => {
-            const { media, display } = parseMedia(r.text)
-            return {
-              key: `log:${r.runlogOffset}`,
-              runId: r.runId,
-              role: r.role,
-              text: display,
-              media: media.length ? media : undefined,
-              state: 'done' as const,
-              usage: r.usage,
-              logOffset: r.runlogOffset,
-            }
-          }),
-        )
-        for (const r of collectedTools) attachToolRow(r)
+        const built: Bubble[] = []
+        const runsWithQuestions = new Set<RunID>()
+        for (const r of collected) {
+          built.push(...rowBubbles(r))
+          if (r.segments?.length) runsWithQuestions.add(r.runId)
+        }
+        bubbles.value.unshift(...built)
+        for (const r of collectedTools) {
+          attachToolRow(r)
+          if (isWaitToolRow(r)) runsWithQuestions.add(r.runId)
+        }
+        void loadRunQuestions(runsWithQuestions)
         oldestOffset = collected[0].runlogOffset ?? oldestOffset
       }
       atStart.value = oldestOffset <= 1
@@ -1081,7 +1391,9 @@ export function useChat() {
     pollToken++
     pending.value = []
     pendingTools.clear()
-    busy.value = false
+    questionsLoaded.clear()
+    resetBusy()
+    liveRunId.value = null
     loadingOlder.value = false
   }
 
@@ -1092,16 +1404,18 @@ export function useChat() {
     bubbles.value = []
     draft.value = ''
     attachments.value = []
-    busy.value = false
+    resetBusy()
+    liveRunId.value = null
     renderedMessageIds.clear()
     pendingTools.clear()
+    questionsLoaded.clear()
     sessionGone.value = ''
   }
 
   return {
-    sessionId, bubbles, draft, attachments, busy, pending, loadingOlder, atStart,
+    sessionId, bubbles, draft, attachments, busy, liveRunId, pending, loadingOlder, atStart,
     activeWorkspaceId, sessionGone, active,
-    send, reconcile, loadOlder, newSession, showTenantSession, resumeRun,
+    send, reconcile, loadOlder, newSession, showTenantSession, resumeRun, probeLive,
     setActiveWorkspace, openSession, closeOnDeleted, answerQuestion,
     setActive, dispose,
   }

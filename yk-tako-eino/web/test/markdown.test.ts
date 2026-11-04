@@ -31,6 +31,13 @@ test('GFM 表格渲染成 table/th/td', () => {
   assert.match(html, /<td>1<\/td>/)
 })
 
+// 窄屏宽表要能横向滚：表格外面必须有滚动壳，不能靠气泡自己撑宽。
+test('表格套滚动壳', () => {
+  const html = renderMarkdown('| a | b |\n| --- | --- |\n| 1 | 2 |')
+  assert.match(html, /<div class="table-scroll"><table>/)
+  assert.match(html, /<\/table>\s*<\/div>/)
+})
+
 test('围栏代码块带 language 类', () => {
   const html = renderMarkdown('```text\nx\n```')
   assert.match(html, /<pre><code class="language-text">/)

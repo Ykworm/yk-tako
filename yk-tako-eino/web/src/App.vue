@@ -76,6 +76,33 @@ const pending = computed(() => activeChat.value.pending.value)
 const loadingOlder = computed(() => activeChat.value.loadingOlder.value)
 const atStart = computed(() => activeChat.value.atStart.value)
 const busy = computed(() => activeChat.value.busy.value)
+// 这一页能不能叫停：本实例在跑（busy），或者服务端说这场会话有活 run（可能是别的 tab/端发起的）。
+// 只看 busy 会漏掉后一种——用户看到的正是「当前会话在跑，却找不到停止按钮」。
+const canStop = computed(
+  () =>
+    !!activeChat.value.liveRunId.value ||
+    bubbles.value.some((b) => (b.state === 'streaming' || b.state === 'offline') && !!b.runId),
+)
+// 流式反馈（A1）：只在有活气泡时跑 1s 时钟，给「正在思考 · Ns」「执行中 · Ns」计秒。
+// 没有活气泡（翻历史、收口后）立刻停表——否则整页每秒白重渲染一次。
+const statusNow = ref(Date.now())
+let statusClock: number | undefined
+const hasLiveBubble = computed(() => bubbles.value.some((b) => b.state === 'streaming' || b.state === 'offline'))
+watch(
+  hasLiveBubble,
+  (live) => {
+    if (live && statusClock === undefined) {
+      statusNow.value = Date.now()
+      statusClock = window.setInterval(() => {
+        statusNow.value = Date.now()
+      }, 1000)
+    } else if (!live && statusClock !== undefined) {
+      window.clearInterval(statusClock)
+      statusClock = undefined
+    }
+  },
+  { immediate: true },
+)
 const activeWorkspaceId = computed(() => activeChat.value.activeWorkspaceId.value)
 const sessionGone = computed(() => activeChat.value.sessionGone.value)
 const draft = computed({
@@ -422,6 +449,33 @@ function toolCardState(t: ToolCard, bubbleState: string): 'running' | 'failed' |
   return 'done'
 }
 
+// 秒数文案（A1）：状态行与工具 chip 同一套计法。不足 1 分钟只报秒，免得「0m03s」这种。
+function fmtElapsed(startedAt: number | undefined): string {
+  if (!startedAt) return ''
+  const total = Math.max(0, Math.floor((statusNow.value - startedAt) / 1000))
+  return total < 60 ? `${total}s` : `${Math.floor(total / 60)}m${String(total % 60).padStart(2, '0')}s`
+}
+
+// 气泡级状态行（A1）：正文还没出、也没有在跑的工具时，说明这一拍在等什么。
+// 有工具在跑就不在这里重复——秒数挂在那一行 chip 上，一眼看清慢在哪一步；
+// 正文开始出了就靠光标，不再占一行字。
+function bubbleStatus(b: Bubble): string {
+  if (b.state !== 'streaming' || b.text) return ''
+  if (b.tools?.some((t) => toolCardState(t, b.state) === 'running')) return ''
+  const elapsed = fmtElapsed(b.startedAt)
+  const suffix = elapsed ? ` · ${elapsed}` : ''
+  return b.tools?.length ? `正在继续${suffix}` : `正在思考${suffix}`
+}
+
+// 工具 chip 文案：执行中带秒数（A1）——工具是长停顿最常见的那一段。
+function toolChip(t: ToolCard, bubbleState: string): string {
+  const state = toolCardState(t, bubbleState)
+  if (state === 'failed') return '失败'
+  if (state !== 'running') return ''
+  const elapsed = fmtElapsed(t.startedAt)
+  return elapsed ? `执行中 · ${elapsed}` : '执行中'
+}
+
 // 气泡里两块内容（正文 / 工具卡）谁在上。历史上卡片一直挂在正文下方，但这个 run 的行序
 // 是 tool_call → tool_result → assistant：卡片才是先发生的那件事，画到下面就是在倒着讲。
 // chat.ts 的 toolsFirst 记下这个先后（历史面按 offset 判、实时面按第一帧判）。
@@ -562,6 +616,7 @@ const drawerOpen = ref(false)
 const drawerEl = ref<HTMLElement | null>(null)
 const menuBtnEl = ref<HTMLButtonElement | null>(null)
 let mobileMq: MediaQueryList | null = null
+let liveProbe: number | undefined
 const tenants = ref<TenantItem[]>([])
 const switching = ref(false)
 const switchError = ref('')
@@ -961,17 +1016,27 @@ const stopping = ref(false)
 const stopError = ref('')
 
 // target 给等人面板用：面板顶掉输入框时气泡可能是 offline（拉不到帧），按 streaming 找会找不到。
+// 没有气泡可点（run 是别的 tab/端发起的）时退回实例记下的 liveRunId——停止是会话级能力，
+// 不是「只有发起这一轮的那个 tab 才能停」。
 async function stopCurrent(target?: Bubble) {
   if (stopping.value) return
-  const b = target ?? bubbles.value.find((x) => x.state === 'streaming' && x.runId)
-  if (!b || !b.runId) return
+  const runId =
+    target?.runId ??
+    bubbles.value.find((x) => x.state === 'streaming' && x.runId)?.runId ??
+    activeChat.value.liveRunId.value
+  if (!runId) return
   stopping.value = true
   stopError.value = ''
   try {
-    await stopRun(b.runId as RunID)
+    await stopRun(runId as RunID)
     // 服务端幂等（停了再调仍回 stopped）。这里先本地落定，界面立刻有反应；
     // 轮询随后收到 terminal 帧会再收口一次（两边一致，不会打架）。
-    b.state = 'stopped'
+    if (activeChat.value.liveRunId.value === runId) activeChat.value.liveRunId.value = null
+    if (target) target.state = 'stopped'
+    else {
+      const own = bubbles.value.find((x) => x.runId === runId && (x.state === 'streaming' || x.state === 'offline'))
+      if (own) own.state = 'stopped'
+    }
   } catch (e) {
     stopError.value = e instanceof ApiError ? e.message : '叫停失败'
   } finally {
@@ -990,7 +1055,49 @@ function fitComposer() {
   const el = composerEl.value
   if (!el) return
   el.style.height = 'auto'
-  el.style.height = `${Math.min(el.scrollHeight, 168)}px`
+  // 用户拖过高度（composerMin > 0）就让自动增高长到用户定的那档，没拖过仍是原来的 168px。
+  const cap = Math.max(168, composerMin.value)
+  el.style.height = `${Math.min(el.scrollHeight, cap)}px`
+}
+
+// 输入框高度拖动（composer-resize）：用户拖出来的最小高度，本机偏好，0 = 跟随内容自动增高。
+// 存 localStorage 不入库：它只影响这台设备的排版，不改变任何会话/帧数据。
+const COMPOSER_MIN_KEY = 'tako.composer.minHeight'
+const composerMaxHeight = () => Math.min(480, Math.round(window.innerHeight * 0.55))
+const composerMin = ref(Math.min(Number(localStorage.getItem(COMPOSER_MIN_KEY)) || 0, composerMaxHeight()))
+let gripDrag: { y: number; start: number } | null = null
+
+function onGripDown(ev: PointerEvent) {
+  ev.preventDefault()
+  const el = ev.currentTarget as HTMLElement
+  el.setPointerCapture(ev.pointerId)
+  // 起点取当前实际高度而不是 composerMin：自动高度时后者是 0，拖 120px 只会长到 120（少了基线那截）。
+  const h = composerEl.value?.getBoundingClientRect().height
+  gripDrag = { y: ev.clientY, start: h ? Math.round(h) : composerMin.value }
+}
+
+function onGripMove(ev: PointerEvent) {
+  if (!gripDrag) return
+  const next = Math.min(composerMaxHeight(), Math.max(0, gripDrag.start + (gripDrag.y - ev.clientY)))
+  // 低于 48px 没有意义（比默认行高还矮），直接归 0 = 自动高度。
+  composerMin.value = next < 48 ? 0 : next
+  fitComposer()
+}
+
+function onGripUp(ev: PointerEvent) {
+  if (!gripDrag) return
+  gripDrag = null
+  const el = ev.currentTarget as HTMLElement
+  if (el.hasPointerCapture(ev.pointerId)) el.releasePointerCapture(ev.pointerId)
+  if (composerMin.value) localStorage.setItem(COMPOSER_MIN_KEY, String(composerMin.value))
+  else localStorage.removeItem(COMPOSER_MIN_KEY)
+  composerEl.value?.focus()
+}
+
+function resetComposerHeight() {
+  composerMin.value = 0
+  localStorage.removeItem(COMPOSER_MIN_KEY)
+  void nextTick(fitComposer)
 }
 
 watch(draft, () => {
@@ -1400,6 +1507,11 @@ onMounted(async () => {
   mobileMq.addEventListener('change', syncMobile)
   window.addEventListener('keydown', onWindowKey)
   window.addEventListener('pointerdown', onDocPointer)
+  // 「当前会话」可能跑着别的 tab/端发起的 run：空转时低频核对，发现就接管帧面并给出停止入口。
+  // 只在页面可见时问；后台 tab 不烧请求。
+  liveProbe = window.setInterval(() => {
+    if (document.visibilityState === 'visible' && loggedIn.value) void activeChat.value.probeLive()
+  }, 5000)
   if (!loggedIn.value) return
   await loadTenants()
   await reconcile()
@@ -1412,6 +1524,8 @@ onBeforeUnmount(() => {
   mobileMq?.removeEventListener('change', syncMobile)
   window.removeEventListener('keydown', onWindowKey)
   window.removeEventListener('pointerdown', onDocPointer)
+  if (liveProbe !== undefined) window.clearInterval(liveProbe)
+  if (statusClock !== undefined) window.clearInterval(statusClock)
   for (const url of Object.values(mediaSrc.value)) URL.revokeObjectURL(url)
 })
 
@@ -1740,7 +1854,9 @@ async function onScroll() {
             <div v-else-if="bubbles.length && !atStart" class="older muted">上滚查看更早的记录</div>
 
             <article v-for="b in bubbles" :key="b.key" class="turn" :class="b.role">
-              <div :class="['bubble', b.role, b.state]">
+              <!-- empty = 提问切出来的空段（doc/47 §5.5）：不画空气泡框，只留它挂的问题卡。
+                   带工具卡的空段仍画框（卡必须有地方放）。 -->
+              <div v-if="!b.empty || b.tools?.length" :class="['bubble', b.role, b.state]">
                 <div class="bubble-main">
                   <template v-if="b.media?.length">
                     <template v-for="(m, i) in b.media" :key="`${b.key}:m${i}`">
@@ -1782,8 +1898,7 @@ async function onScroll() {
                         <summary>
                           <span v-if="t.agent" class="tool-agent" title="子代理">{{ t.agent }}</span>
                           <span class="tool-name">{{ toolCardLabel(t) }}</span>
-                          <span v-if="toolCardState(t, b.state) === 'failed'" class="tool-chip fail">失败</span>
-                          <span v-else-if="toolCardState(t, b.state) === 'running'" class="tool-chip">执行中</span>
+                          <span v-if="toolChip(t, b.state)" class="tool-chip" :class="{ fail: toolCardState(t, b.state) === 'failed' }">{{ toolChip(t, b.state) }}</span>
                         </summary>
                         <p v-if="toolCardFail(t)" class="tool-fail">{{ clipped(toolCardFail(t), TOOL_ARGS_CLIP) }}</p>
                         <pre v-if="t.args && t.args !== '{}'" class="tool-args">{{ clipped(t.args, TOOL_ARGS_CLIP) }}</pre>
@@ -1792,13 +1907,16 @@ async function onScroll() {
                       </details>
                     </div>
                   </template>
+                  <!-- 等待指示（A1）：正文一个字符都还没出时才画点——出了正文有光标，
+                       再挂三个点在正文下面会让人以为下一段马上到。旁边那行字说明在等什么、等了多久。 -->
                   <span
-                    v-if="(b.state === 'streaming' || b.state === 'offline') && !pendingAsks.length"
+                    v-if="(b.state === 'streaming' || b.state === 'offline') && !b.text && !pendingAsks.length"
                     class="typing"
                     aria-label="正在生成"
                   >
                     <i></i><i></i><i></i>
                   </span>
+                  <span v-if="!pendingAsks.length && bubbleStatus(b)" class="run-status">{{ bubbleStatus(b) }}</span>
                   <p v-if="b.state === 'offline'" class="note">拉不到帧，改看会话状态</p>
                   <p v-if="b.state === 'queued'" class="note">会话忙，这条还在排队</p>
                   <p v-if="b.state === 'stopped'" class="note">已停止，没有写进历史</p>
@@ -1834,48 +1952,52 @@ async function onScroll() {
               <!-- 问答记录（doc/47 §5.2）：互动本身在底部 dock，这里留的是可回看的档案。
                    方案按文档渲染（标题/列表/代码），问题连同选项与答案一起留档。 -->
               <div v-if="b.questions?.length" class="qa-stack">
-                <div
-                  v-for="q in b.questions"
-                  :key="q.id"
-                  :class="['qa-card', q.kind, q.status]"
-                >
-                  <header class="qa-head">
-                    <span class="qa-kind">{{ q.kind === 'plan' ? 'Plan' : q.kind === 'install' ? '安装' : '问题' }}</span>
-                    <span :class="['qa-chip', q.status, q.decision]">{{ askStatusLabel(q) }}</span>
-                  </header>
-                  <template v-if="q.kind === 'plan'">
-                    <PlanDoc v-if="q.text" :text="q.text" />
-                  </template>
-                  <template v-else-if="q.kind === 'install'">
-                    <!-- 安装卡只从行 args 重建（D24）：刷新后仍能看清装的是什么、结果是什么。 -->
-                    <SkillInstallCard
-                      :q="q"
-                      :can-approve="canApproveSkills"
-                      :seen="sourceSeenInSession(q.install?.source)"
-                      :live="b.state === 'streaming' || b.state === 'offline'"
-                    />
-                  </template>
-                  <template v-else>
-                    <p class="qa-question">{{ q.text }}</p>
-                    <ul v-if="q.options.length" class="qa-opts">
-                      <li
-                        v-for="(opt, i) in q.options"
-                        :key="`${q.id}:o${i}`"
-                        :class="{ picked: q.status === 'answered' && q.submitted === opt }"
-                      >
-                        <span class="qa-num">{{ i + 1 }}</span>
-                        <span>{{ opt }}</span>
-                      </li>
-                    </ul>
-                  </template>
-                  <p v-if="q.status === 'answered' && q.kind !== 'install'" class="qa-answer">
-                    <template v-if="q.kind === 'plan' && q.decision === 'revise'">已退回修改{{ q.submitted ? `：${q.submitted}` : '' }}</template>
-                    <template v-else-if="q.kind === 'plan'">已批准执行{{ q.submitted ? '（按你改写后的方案）' : '' }}</template>
-                    <template v-else>你的回答：{{ q.submitted || '（空）' }}</template>
-                  </p>
-                  <p v-else-if="q.status === 'stale' && q.kind !== 'install'" class="qa-note">这条已经失效，引擎重启后没有恢复等待。</p>
-                  <p v-if="q.error" class="qa-note error">{{ q.error }}</p>
-                </div>
+                <template v-for="q in b.questions" :key="q.id">
+                  <div :class="['qa-card', q.kind, q.status]">
+                    <header class="qa-head">
+                      <span class="qa-kind">{{ q.kind === 'plan' ? 'Plan' : q.kind === 'install' ? '安装' : '问题' }}</span>
+                      <span :class="['qa-chip', q.status, q.decision]">{{ askStatusLabel(q) }}</span>
+                    </header>
+                    <template v-if="q.kind === 'plan'">
+                      <PlanDoc v-if="q.text" :text="q.text" />
+                    </template>
+                    <template v-else-if="q.kind === 'install'">
+                      <!-- 安装卡只从行 args 重建（D24）：刷新后仍能看清装的是什么、结果是什么。 -->
+                      <SkillInstallCard
+                        :q="q"
+                        :can-approve="canApproveSkills"
+                        :seen="sourceSeenInSession(q.install?.source)"
+                        :live="b.state === 'streaming' || b.state === 'offline'"
+                      />
+                    </template>
+                    <template v-else>
+                      <p class="qa-question">{{ q.text }}</p>
+                      <ul v-if="q.options.length" class="qa-opts">
+                        <li
+                          v-for="(opt, i) in q.options"
+                          :key="`${q.id}:o${i}`"
+                          :class="{ picked: q.status === 'answered' && q.submitted === opt }"
+                        >
+                          <span class="qa-num">{{ i + 1 }}</span>
+                          <span>{{ opt }}</span>
+                        </li>
+                      </ul>
+                    </template>
+                    <!-- 方案审批的结论留在卡里（它不是自由文本）；问题的答案画成右侧用户气泡（doc/47 §5.5）。 -->
+                    <p v-if="q.status === 'answered' && q.kind === 'plan'" class="qa-answer">
+                      <template v-if="q.decision === 'revise'">已退回修改{{ q.submitted ? `：${q.submitted}` : '' }}</template>
+                      <template v-else>已批准执行{{ q.submitted ? '（按你改写后的方案）' : '' }}</template>
+                    </p>
+                    <p v-else-if="q.status === 'stale' && q.kind !== 'install'" class="qa-note">这条已经失效，引擎重启后没有恢复等待。</p>
+                    <p v-if="q.error" class="qa-note error">{{ q.error }}</p>
+                  </div>
+                  <!-- 人对提问的回答独立成一个用户气泡：问答的痕迹不再混在 agent 正文里。 -->
+                  <div v-if="q.kind === 'question' && q.status === 'answered'" class="qa-answer-bubble">
+                    <div class="bubble user done">
+                      <div class="bubble-main"><p>{{ q.submitted || '（空）' }}</p></div>
+                    </div>
+                  </div>
+                </template>
               </div>
             </article>
           </section>
@@ -1923,11 +2045,12 @@ async function onScroll() {
                 <button type="button" :disabled="askIndex >= pendingAsks.length - 1" aria-label="下一条" @click="moveAsk(1)">›</button>
               </div>
               <!-- 等待期间 composer 被这个面板顶掉，没有出口就只剩等。 -->
+              <span v-if="stopError" class="hint stop-fail ask-stop-fail" role="alert">{{ stopError }}</span>
               <button
-                v-if="ask.bubble.runId"
+                v-if="ask.bubble.runId || canStop"
                 type="button"
                 class="stop-btn ask-stop"
-                :disabled="stopping"
+                :disabled="stopping || !canStop"
                 @click="stopCurrent(ask.bubble)"
               >{{ stopping ? '正在停止…' : '停止' }}</button>
             </header>
@@ -2038,6 +2161,20 @@ async function onScroll() {
           </aside>
 
           <form v-else class="composer" @submit.prevent="onSend">
+            <!-- 高度拖动条（composer-resize）：参照形态是卡片上沿正中一条白色短条。
+                 往上拖长高、往下拖变矮，双击回到自动高度。 -->
+            <div
+              class="composer-grip"
+              role="separator"
+              aria-orientation="horizontal"
+              aria-label="拖动调整输入框高度，双击恢复"
+              title="向上拖放大输入框，双击恢复自动高度"
+              @pointerdown="onGripDown"
+              @pointermove="onGripMove"
+              @pointerup="onGripUp"
+              @pointercancel="onGripUp"
+              @dblclick="resetComposerHeight"
+            />
             <input
               ref="fileEl"
               type="file"
@@ -2058,6 +2195,7 @@ async function onScroll() {
               v-model="draft"
               rows="1"
               enterkeyhint="send"
+              :style="composerMin ? { minHeight: `${composerMin}px` } : undefined"
               :placeholder="pending.length ? `还有 ${pending.length} 条在排队，这轮结束后自动发出` : '写一条消息'"
               aria-label="消息"
               @keydown="onDraftKeydown"
@@ -2093,14 +2231,17 @@ async function onScroll() {
               <span v-if="pending.length" class="hint queue">排队 {{ pending.length }}</span>
               <span v-else-if="busy" class="hint live">正在回复</span>
               <span v-else class="hint">Enter 发送 · Shift+Enter 换行 · 可粘贴图片</span>
-              <!-- 叫停这一轮（doc/48 A3）：引擎端点早就有，前端一直没接。 -->
+              <span v-if="stopError" class="hint stop-fail" role="alert">{{ stopError }}</span>
+              <!-- 叫停这一轮（doc/48 A3）：引擎端点早就有，前端一直没接。
+                   runId 还没回来（投递在飞）时按钮先占位、标明「正在启动…」——点了没反应
+                   比没有按钮更让人糊涂。 -->
               <button
-                v-if="busy"
+                v-if="busy || canStop"
                 type="button"
                 class="stop-btn"
-                :disabled="stopping"
+                :disabled="stopping || !canStop"
                 @click="stopCurrent()"
-              >{{ stopping ? '正在停止…' : '停止' }}</button>
+              >{{ stopping ? '正在停止…' : canStop ? '停止' : '正在启动…' }}</button>
               <button type="submit" class="send" :disabled="!draft.trim() && !attachments.length" aria-label="发送">
                 <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
                   <path d="M10 16.2V4.4M5.2 8.8 10 4l4.8 4.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none" />
@@ -2566,6 +2707,9 @@ async function onScroll() {
 .stop-btn:disabled {
   opacity: 0.55;
 }
+/* 叫停失败要看得见：此前 stopError 只写不读，点完没反应等于「没有停止能力」。 */
+.hint.stop-fail { color: var(--danger); }
+.ask-stop-fail { margin-left: auto; }
 .logout {
   height: 28px;
   padding: 0 0.55rem;
@@ -2783,8 +2927,11 @@ async function onScroll() {
 }
 
 .thread {
-  width: min(45rem, calc(100% - 2rem));
+  /* 铺满对话区（doc/47 §5.5）：宽屏不再留 45rem 白边，左右各留 1.5rem 呼吸位。 */
+  width: 100%;
   margin: 0 auto;
+  padding-left: 1.5rem;
+  padding-right: 1.5rem;
   flex: 1;
   min-height: 0;
   display: flex;
@@ -3014,6 +3161,9 @@ async function onScroll() {
   gap: 0.35rem;
   animation: rise 0.18s ease-out;
 }
+/* 铺宽后 assistant 正文用满列宽；用户消息保持窄气泡（右对齐的短句不该拉满）。 */
+.bubble.assistant { max-width: 100%; }
+.bubble.user { max-width: 78%; }
 @keyframes rise {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: none; }
@@ -3025,6 +3175,9 @@ async function onScroll() {
   line-height: 1.65;
   white-space: pre-wrap;
   word-break: break-word;
+  /* flex 子项的自动最小宽度是内容宽度：长工具卡 / 宽表会把气泡顶出屏幕。
+     允许收缩，溢出交给各自的滚动壳处理。 */
+  min-width: 0;
 }
 .bubble p { margin: 0; }
 .bubble.user .bubble-main {
@@ -3057,6 +3210,10 @@ async function onScroll() {
    否则一条都不生效（写普通后代选择器是最容易踩的坑）。 */
 .bubble-text {
   margin: 0;
+  min-width: 0;
+  /* markdown 自带块结构；继承 .bubble-main 的 pre-wrap 会把 </p> 后面的换行
+     也画成一行——每个气泡底部都多出一条空白。 */
+  white-space: normal;
 }
 .bubble-text :deep(h1),
 .bubble-text :deep(h2),
@@ -3133,11 +3290,22 @@ async function onScroll() {
   border-left: 3px solid var(--line-strong);
   color: var(--ink-soft);
 }
+/* 表格滚动壳（markdown.ts 里生成）：窄屏列多时只滚表格，不把整条正文变成滚动区。 */
+.bubble-text :deep(.table-scroll) {
+  overflow-x: auto;
+  max-width: 100%;
+  -webkit-overflow-scrolling: touch;
+}
 .bubble-text :deep(table) {
   width: 100%;
   border-collapse: collapse;
   margin: 0.45rem 0;
   font-size: 0.86rem;
+}
+.bubble-text :deep(.table-scroll) table {
+  width: max-content;
+  min-width: 100%;
+  margin: 0.15rem 0;
 }
 .bubble-text :deep(th),
 .bubble-text :deep(td) {
@@ -3234,6 +3402,16 @@ async function onScroll() {
   0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
   30% { opacity: 1; transform: translateY(-2px); }
 }
+/* 状态行（A1）：跟在三个点后面，说明这一拍在等什么、等了多久。
+   tabular-nums 让秒数变化时后面的字不跟着左右抖。 */
+.run-status {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 0.4rem;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
 .note {
   gap: 0.3rem;
   margin-top: 0.4rem !important;
@@ -3299,12 +3477,38 @@ async function onScroll() {
   display: flex;
   flex-direction: column;
   gap: 0.35rem;
+  position: relative;
   background: var(--bg-raised);
   border: 1px solid var(--line);
   border-radius: var(--radius-panel);
   padding: var(--space-3);
   box-shadow: var(--shadow);
 }
+/* 高度拖动条（composer-resize）：20px 透明热区包着 5px 的白色短条——
+   6px 的线鼠标按不住。短条悬停变深，提示这里可以拖。 */
+.composer-grip {
+  position: absolute;
+  top: -10px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 88px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: ns-resize;
+  touch-action: none;
+  z-index: 2;
+}
+.composer-grip::before {
+  content: '';
+  width: 56px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+}
+.composer-grip:hover::before { background: var(--hover); border-color: var(--muted); }
 .composer:focus-within {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow);
@@ -3317,7 +3521,6 @@ async function onScroll() {
   background: transparent;
   padding: 0.15rem var(--space-1) 0;
   line-height: 1.55;
-  max-height: 10.5rem;
 }
 .composer textarea::placeholder { color: var(--muted); }
 .chips {
@@ -3525,10 +3728,39 @@ async function onScroll() {
   }
   .gate-copy h1 { font-size: 1.8rem; }
   .thread {
-    width: min(100% - 1.2rem, 46rem);
+    width: 100%;
+    padding-left: 0.6rem;
+    padding-right: 0.6rem;
     padding-bottom: calc(0.75rem + env(safe-area-inset-bottom));
   }
-  .hint:not(.live):not(.queue) { display: none; }
+  /* 只藏键盘操作提示；停止失败是 alert，不能跟着藏（否则手机上点了停止没反应也没字）。 */
+  .hint:not(.live):not(.queue):not(.stop-fail) { display: none; }
+
+  /* 触屏尺寸（doc/51 §5 续）：鼠标 32px 够用，手指不够——输入框 16px 以下
+     iOS 还会在聚焦时自动放大整页。这里只放大控件，不改排版。 */
+  .composer textarea,
+  .ask-other textarea,
+  .gate-card input {
+    font-size: 16px;
+  }
+  .icon-btn,
+  .send {
+    width: 36px;
+    height: 36px;
+  }
+  .new-chat { height: 36px; }
+  .menu-btn {
+    width: 36px;
+    height: 36px;
+  }
+  .recent-item { height: 40px; }
+  .stop-btn {
+    padding: 0.32rem 0.7rem;
+    font-size: 0.78rem;
+  }
+  .ask-option { min-height: 44px; }
+  /* 列表滚到头不要触发浏览器的下拉刷新 / 回弹链。 */
+  .list { overscroll-behavior: contain; }
 }
 
 /* 窄屏（手机，doc/48 D4）：全站原来只有 860px 一个断点，375px 上侧边栏挤成一团。
@@ -3543,6 +3775,11 @@ async function onScroll() {
   .recent-time { display: none; }
   .composer { padding: var(--space-2) var(--space-3); }
   .gate-card { padding: 0.9rem 0.85rem 1rem; }
+  /* 手机没有硬件键盘，`Enter 提交 · Shift+Enter 换行` 只会把 footer 挤成两行；
+     留按钮、把提示藏掉，按钮靠右。 */
+  .ask-hint { display: none; }
+  .ask-foot { justify-content: flex-end; }
+  .ask-dock { padding: 0.7rem 0.75rem 0.65rem; }
 }
 
 /* 工具卡（doc/59）：一行一句「调了什么」，展开看参数与回执原文 */
@@ -3551,6 +3788,7 @@ async function onScroll() {
   flex-direction: column;
   gap: 0.35rem;
   margin-top: 0.55rem;
+  min-width: 0;
 }
 /* 卡片排在正文上方时（那次调用先发生），间距换到另一边 */
 .tool-cards:first-child { margin-top: 0; }
@@ -3573,7 +3811,7 @@ async function onScroll() {
   color: var(--ink-soft);
 }
 .tool-card summary::-webkit-details-marker { display: none; }
-.tool-name { font-weight: 550; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-name { flex: 1 1 0; font-weight: 550; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tool-agent {
   flex: none;
   border-radius: 999px;
@@ -3728,6 +3966,14 @@ async function onScroll() {
   color: var(--ink-soft);
   white-space: pre-wrap;
 }
+/* 提问的答案独立成用户气泡（doc/47 §5.5）：右对齐、宽度与普通用户消息一致。 */
+.qa-answer-bubble {
+  align-self: flex-end;
+  max-width: 78%;
+  display: flex;
+}
+.qa-answer-bubble .bubble { max-width: 100%; }
+.qa-answer-bubble .bubble-main { white-space: pre-wrap; word-break: break-word; }
 .qa-note {
   margin: 0.4rem 0 0;
   font-size: 0.78rem;

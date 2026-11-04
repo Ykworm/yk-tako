@@ -60,10 +60,14 @@ export type Row = {
   agent: string
   text: string
   // 工具行的结构化负载（tool_call: {name,args,toolCallId}；tool_result: {name,output,toolCallId}）。
-  // assistant 行的 payload 被后端解成 usage 后清空，不会出现在这里。
+  // assistant 行的 payload 被后端解成 usage/segments 后清空，不会出现在这里。
   payload?: string
   // assistant 行的 provider 账单（后端从 payload 列解出注入；user/tool 行不写该字段）。
   usage?: Usage
+  // 含「等人」工具（ask_user / submit_plan / skill_install）的 run 在一行正文里留下的切点
+  // （doc/47 §5.5）：end = 切点前正文的 rune 长度（按 code point 切），toolCallId = 该次调用。
+  // 无提问的 run 不写该字段；最后一段没有切点。
+  segments?: { end: number; toolCallId: string }[]
 }
 
 export type PostRunsResponse = {
@@ -159,6 +163,8 @@ export type LogResponse = {
 export type QuestionRow = {
   questionId: string
   runId: RunID
+  // 发起这次等待的工具调用 id（doc/47 §5.5）：前端据此把问题行挂回 runlog 分段上的切点。
+  toolCallId?: string
   // kind=install 是对话内安装的确认行（doc/52 C3）：args 存程序解析出的候选全表与选中集。
   kind: 'question' | 'plan' | 'install'
   question: string
@@ -167,8 +173,8 @@ export type QuestionRow = {
   // 方案行的审批结论（doc/47 §5.3）：approve / revise；问题行与 pending 行不写。
   // 安装行同用这两值：approve=装、cancel 由答案端点直接写成文字（这里不出现）。
   decision?: 'approve' | 'revise' | 'cancel'
-  // 只给安装行（doc/52 C5）：程序在批准后写回的结果文本（「已安装技能：x。」或失败原因）。
-  // 刷新后卡片靠它复述结果；其他 kind 不返回。
+  // 已答行的人提交内容：question 行=用户原文（历史里画成答案气泡）；plan 行=编辑后的方案
+  // 或驳回意见；install 行=程序写回的结论（「已安装技能：x。」或失败原因，doc/52 C5）。
   answer?: string
   createdAt: string
 }
