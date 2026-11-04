@@ -366,7 +366,7 @@ researcher 走排除路，排除清单仍只有 bash，所以它的有效名单�
 
 ## 6. doc/18 的教训，哪些还有效
 
-- 旧线 bug「同一轮 `read_file` 重读后随即又被换占位」（docs/2026-09-30 handoff 问题①）：
+- 旧线 bug「同一轮 `read_file` 重读后随即又被换占位」（`doc/log/2026-09-30-uncommitted-review-handoff.md` 问题①）：
   根因是旧线靠「user 消息条数」启发式判「本轮」，条数一变 seen 就乱。v6 的判定坐标是
   结构化的：最后一条 user 之后才是当前 run 的 tool 回执，工具图按 ToolCallID 记账；
   这一类 bug **没有存在的土壤**。

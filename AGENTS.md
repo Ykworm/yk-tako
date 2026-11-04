@@ -16,7 +16,8 @@ yk-tako/
     mcp.example.json       MCP 配置样例（本机真配置 mcp.json 不入库）
   doc/                     当前方案与实现真源（入口 doc/README.md）
     19-v6/                 第六代运行引擎架构文档集（代际编号，不是服务版本）
-  docs/                    历史交接与文章，不作施工真源
+    log/                   按日期的记录：交接、变更执行台账、文章（不作真源）
+    archive/               旧线与旧代归档（不作施工面）
   scripts/dev.sh           一键开发环境（Redis / Postgres / 引擎 / Vite）
   scripts/check-master-plan.sh  检查 doc/16 总纲有没有漏掉 doc/README.md 的现行真源
   scripts/acceptance/      可机器重跑的验收：机器真源 expected.json + 断言器 + 活体抽验
@@ -27,7 +28,7 @@ yk-tako/
 
 - 所有 Go 代码在 `yk-tako-eino/` 下，Go 命令都以它为 cwd（`go run ./cmd/yktako`、`go test ./internal/runengine`）。
 - 运行时产物不入库：`yk-tako-eino/workspace/`、`yk-tako-eino/tmp/`、`tmp/`、`yk-tako-eino/mcp.json`、`.env`。
-- 方案与实现记录放 `doc/`；执行台账放 `tmp/<方案名>/`，验收完清理，不当作文档真源。
+- 方案与实现记录放 `doc/`；执行期台账放 `tmp/<方案名>/`（不入库），验收后按下面「台账产物」留档到 `doc/log/`。
 
 ## 文档状态与真源
 
@@ -35,9 +36,10 @@ yk-tako/
 - `doc/README.md`：文档索引——现行真源 / 历史存档 / 非方案内容三张表、阅读顺序、新增文档规则。读任何一篇文档前先查这里。
 - `doc/16-能力复刻总规划.md`：**总纲（结论页）**——「tako 做什么、做到哪了、下一步做什么」的答案在它的 §0.1 现状快照与 §2 能力表。它与 `doc/README.md`（目录页）必须同批更新，只更其中一边就会让总纲的现状变成假的。
 - `doc/19-v6/`：第六代运行引擎架构文档集，v6 契约与机制的真源（v6 是代际编号，不是服务版本）。
-- `docs/`：历史交接与文章（早期 handoff、superpowers 记录等），**不作施工真源**；引用前先确认结论是否已被 `doc/` 取代。
-- `tmp/`：本地执行台账（planning.md / todos.md），验收后清理，不进版本库。
-- **归档区**：本轮不搬家，历史文档仍按原编号留在 `doc/`；将来迁入 `doc/archive/` 后只作历史诊断。归档文档不能作为「所以方案该怎么做」的论据。
+- `doc/log/`：**记录**——按日期的交接、变更执行台账与文章，**不作施工真源**；引用前先确认结论是否已被 `doc/` 取代。索引在 `doc/log/README.md`。
+- `doc/archive/`：**归档**——被整代取代的旧线与旧引擎代际（v3／v4／v5），只作历史诊断。归档文档不能作为「所以方案该怎么做」的论据。
+- `tmp/`：执行期台账（planning.md / todos.md），不进版本库；验收后按「台账产物」留档。
+- **四类归属**：现行真源（`doc/`）、决策档案（`doc/problems/`）、记录（`doc/log/`）、归档（`doc/archive/`）。**时效变化不搬家，只改状态**——只有被整代取代才进 `doc/archive/`。
 
 新增或修改文档时：
 
@@ -49,6 +51,7 @@ yk-tako/
    只更目录会怎样：下一场会话按 README 的「第一次进仓库」顺序读，读完总纲以为新落地的几篇现行真源不存在，得再翻索引才看到结论——总纲最值钱的那一格（现状）废了，而且废在最能省事的地方。
    收尾跑 `scripts/check-master-plan.sh`：它比对 `doc/README.md` §1 的现行真源编号与 `doc/16` 的引用，漏引即失败。
 5. 被取代的文档在头注标「已取代」并指向新真源，不删原文。
+6. 文件名带日期的一律进 `doc/log/`（`YYYY-MM-DD-短标题.md` 或 `YYYY-MM-DD-方案名/`）；被整代取代的旧文档进 `doc/archive/`。收尾跑 `scripts/check-doc-layout.sh`。
 
 ## 协作模式：用例驱动 loop
 
@@ -137,7 +140,13 @@ loop 内的顺序固定为 **契约 → 数据需求 → 存储 → 实现**：
 
 ## 台账产物
 
-`tmp/<方案名>/planning.md` + `todos.md`，用户验收完就清理。
+工作期用 `tmp/<方案名>/planning.md` + `todos.md`，不入库。用户验收后：
+
+1. `todos.md` **原样**搬进 `doc/log/<YYYY-MM-DD>-<方案名>/tasks.md`，顶部加状态头（性质：执行记录，状态以 README 与代码为准；结果；未做项）。此后冻结，不再更新。
+2. `planning.md` 的结论提炼进同目录 `README.md`（病灶／拍的轴／动了什么／验收／关联真源），不原样留。
+3. 删 `tmp/<方案名>/`。
+
+`tasks.md` 只回答「当时怎么走的」，不回答「现在该怎么做」；与 `doc/NN` 冲突以 `doc/NN` 为准，也不进任何机器检查。
 
 - `planning.md`：阶段划分、用例 → API/帧 → 存储 → loop 的对照表、loop 顺序、
   **脚手架与转正计划**（哪些是临时实现、由哪个 action 负责转正）、演进记录。

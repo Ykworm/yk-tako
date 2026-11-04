@@ -55,7 +55,7 @@
 
 ### 1.4 与 v6 的关系（gap handoff 口径）
 
-- `docs/2026-10-07-v6-gap-handoff.md` §2.1：子代理在 **B 桶（从未做过）**，T1 三项之一。
+- `doc/log/2026-10-07-v6-gap-handoff.md` §2.1：子代理在 **B 桶（从未做过）**，T1 三项之一。
 - §3 候选 1：**工具循环 + 基础工具集是 T1 三项（子代理 / 记忆 / context_usage）共同的前置**；
   第一个要拍的问题 = 循环走 Eino ADK / 手写 ReAct / 在 v6 worker 上扩展——它决定 tool 消息与 runlog 扩展行形态。
 - 即：**子代理立项前必须先有「v6 的工具循环」**，这是本文与 gap handoff 的交叉点。
@@ -227,7 +227,7 @@ tako 若要抄，这两层可以合并为一层（tako 没有 dashboard 浏览�
 | 素材 | 位置 |
 |---|---|
 | tako 设计原点 | `doc/16-能力复刻总规划.md` §3（+ §5 排序）；doc/08 §4；doc/03 §5；doc/05 §2.2 |
-| v6 现状与差距口径 | `docs/2026-10-07-v6-gap-handoff.md` §2.1（B 桶）/ §3（前置=工具循环） |
+| v6 现状与差距口径 | `doc/log/2026-10-07-v6-gap-handoff.md` §2.1（B 桶）/ §3（前置=工具循环） |
 | 旧线子代理痕迹 | `doc/09-设计了解.md` §5（root 过滤/前缀）；`doc/10` §4.2；`doc/11` §4.2 |
 | Octop 壳（库+API） | `ref-agent/Octop/src/octop/infra/agents/subagents/`（catalog.py + library/ 490 md）；`ref-agent/Octop/src/octop/api/routers/subagents.py` |
 | harness 运行时 | `harness-pkg/harness-agent/harness_agent/subagents/loader.py`；`.../agent.py` `_resolve_subagents`(~L1596)；`.../middleware/tool_order.py`；`.../builtin/agents/README.md`（权威字段表）+ `en/general-purpose.md`（默认种子） |
@@ -240,4 +240,4 @@ tako 若要抄，这两层可以合并为一层（tako 没有 dashboard 浏览�
 - **承重论断先验前提**：引用本文时，机制级事实（§2/§3）都有源码坐标，可直接复查；
   标「推断」的两处（§2.3 尾、§4 尾）不可当裁定用。
 - **doc/16 §3 的三问里，第 1 问已被本轮调研回答**（Eino 两层都现成，§3.1/§3.2）；第 2、3 问与 §5 清单一起留给 planning。
-- 端口/环境/命令纪律见 `docs/2026-10-07-v6-gap-handoff.md` §4。
+- 端口/环境/命令纪律见 `doc/log/2026-10-07-v6-gap-handoff.md` §4。

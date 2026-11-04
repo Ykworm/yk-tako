@@ -196,7 +196,7 @@
 | doc/24 新接缝 | `midfold.go:262` stripReasoning、:283 usageBasedInput、:343-397 先估→再折→后滤（B3 实读钉 a 的原文） |
 | B1 话本与证据 | `tmp/19-v6/evidence-overflow/b1/`（报文逐字节、psql、帧序）；拒收行 `requested 1057854 > 1048576` |
 | 新证据落点 | `tmp/19-v6/evidence-overflow/b2/`、`b3/`（本 loop 新建） |
-| 环境 | `scripts/dev.sh`；`yk-tako-eino/.env`；PG 5433 / Redis 6390；同判例 handoff = `docs/2026-10-12-overflow-handoff.md`（A1–A4 已完工，仅供查环境纪律） |
+| 环境 | `scripts/dev.sh`；`yk-tako-eino/.env`；PG 5433 / Redis 6390；同判例 handoff = `doc/log/2026-10-12-overflow-handoff.md`（A1–A4 已完工，仅供查环境纪律） |
 
 ## 6. 纪律提醒（给接手会话）
 

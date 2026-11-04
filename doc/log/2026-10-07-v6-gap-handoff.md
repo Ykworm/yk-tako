@@ -84,7 +84,7 @@
 | 工具安全三件套 + 审批（放行/硬拒/暂停问人） | doc/06 | 「暂停问人」吃 `hitl_prompt`/`hitl_reply` 行；payload 列形状待立项时定（planning §8.6 ⑤） |
 | 任务看板（Plan/Tasks/Actions） | doc/01、02、07 | 扩展行进 runlog 的裁定已覆盖；**重建时用已裁名 `tasktracker`**（见 `doc/XX-taskboard-重命名-handoff.md`，改名当时未执行） |
 | 上下文压缩 | doc/12、13 | 落点已裁：`run_model_messages` 打 `compacted` 标记（原文保留）+ 每被压 run 一行 seq=0 摘要；触发者/摘要 role 未定 |
-| media_offload（图片落盘换占位符） | doc/18 | —（旧线末期遗留五问记录在 `docs/2026-09-30-uncommitted-review-handoff.md`） |
+| media_offload（图片落盘换占位符） | doc/18 | —（旧线末期遗留五问记录在 `doc/log/2026-09-30-uncommitted-review-handoff.md`） |
 | Web 端旧能力（审批 / 停止 / 事件回放等） | doc/10、11、15 | 现 web 只有聊天 + 连接自愈（reconcile / 双游标 / 409 排队 / 僵尸 sid 自愈） |
 
 **B. 从未做过**（doc/16 的 ⬜）：
@@ -173,6 +173,6 @@ PATH="$HOME/sdk/go1.27.0/bin:$PATH" go test ./internal/runengine/ -count=1   # 1
 | `tmp/19-v6/planning.md` + `todos.md` | 执行台账（planning §8 = 落库施工规格；D1 实测记录在 todos 节末）；不进版本库 |
 | `doc/16-能力复刻总规划.md` | 能力总规划与梯队（状态列待按 v6 重标） |
 | `doc/01–18` | 旧线设计文档——重建时的设计来源；注意端点/协议措辞多为旧线口径，与 v6 冲突时以 v6 为准 |
-| `docs/2026-09-30-uncommitted-review-handoff.md` | 旧线末期未清问题（mediaoffload 五问等） |
+| `doc/log/2026-09-30-uncommitted-review-handoff.md` | 旧线末期未清问题（mediaoffload 五问等） |
 | `doc/XX-taskboard-重命名-handoff.md` | taskboard→tasktracker 改名决策与影响面（改名未执行） |
 | 本文件 | 现状快照 + 差距分析 + 下一步候选 |
