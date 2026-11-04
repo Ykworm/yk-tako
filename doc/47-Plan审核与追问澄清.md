@@ -1,6 +1,6 @@
 # 47 · Plan 审核与追问澄清
 
-> 性质：**已落地（2026-10-23）**。两条 loop：**Q（ask_user，doc/41 Loop A 换名复活）+ P（plan gate，kimi 式运行时守卫，模型自主触发）**，按 §6 顺序 Q1→Q2（∥P1）→P2→Q3（∥P3）→Q4→Q5 全部收口；同日按用户「交互要像 kimi」的要求重做前端交互层（§5.2/§5.4，decision=approve/revise 语义入列）。
+> 性质：**已落地（2026-10-23）**。两条 loop：**Q（ask_user，doc/41 Loop A 换名复活）+ P（plan gate，kimi 式运行时守卫，模型自主触发）**，按 §6 顺序 Q1→Q2（∥P1）→P2→Q3（∥P3）→Q4→Q5 全部收口；同日按用户「交互要像 kimi」的要求重做前端交互层（§5.2/§5.4，decision=approve/revise 语义入列）。**2026-11-03 补记（§5.5）**：一场 run 的正文按等人工具分段（runlog assistant 行 payload `segments`），历史与实时同套渲染，问/答不再挤在一个气泡里。
 > 状态：✅（Q1–Q5、P1–P3 已落地；`go test`/`go vet`/快闸 `assert_contract.py`/`check-expected.sh` 全绿；活体：问题卡瀑布、方案卡编辑后执行、`question_crash.sh` 16 条断言全过；交互重做后重跑活体：提问→选项→看板→方案→驳回→重提→编辑后批准→执行，看板 5/5）。
 > 开放问题：**1–5 全部已拍**（2026-10-23，见 §8）——1 拍为 **A 纯模型自主**；6（驳回语义）当日补拍，见 §8。
 > 日期：2026-10-23（方案与落地同日；P 线因开放问题 1 翻案重写为 A 形态；交互层当日按 kimi 参照重做）。
@@ -196,13 +196,13 @@ P 和 Q 共用同一套「等人」机器，Q 先施工成底座：
 |---|---|---|---|---|---|
 | `question` | 发起工具名（`ask_user` / `submit_plan`） | 原始参数 JSON（含可选 `options`） | 等人内容全文（问题 / 方案） | 行 id | run 在等这行的答案/批准 |
 
-SSE 与轮询同真源透传（server.go:978 原样透传，零改动）；前端 `chat.ts` 分派加一个分支、按 `name` 渲染问题卡或方案卡。交互层对齐 kimi（2026-10-23 重做）：**对话流里留档案**（问题记录 = 编号选项 + 你的回答；方案记录 = `PlanDoc` 按标题/列表/表格/代码块渲染的文档，带状态 chip），**待答现场挂在输入区上方**（问题面板编号选项 `→ [n]` + 自由文本；方案面板 = 批准 / 编辑后批准 / 退回修改；多条待答可翻页）。刷新后靠 `questions?status=pending` 从 PG 重建面板与档案，不依赖帧的 TTL。
+SSE 与轮询同真源透传（server.go:978 原样透传，零改动）；前端 `chat.ts` 分派加一个分支、按 `name` 渲染问题卡或方案卡。交互层对齐 kimi（2026-10-23 重做）：**对话流里留档案**（问题记录 = 编号选项 + 答案用户气泡；方案记录 = `PlanDoc` 按标题/列表/表格/代码块渲染的文档，带状态 chip），**待答现场挂在输入区上方**（问题面板编号选项 `→ [n]` + 自由文本；方案面板 = 批准 / 编辑后批准 / 退回修改；多条待答可翻页）。刷新后靠 `questions?status=pending` 从 PG 重建面板与档案，不依赖帧的 TTL。
 
 ### 5.3 端点（信封走 doc/40；全部新增，既有端点字节零变更）
 
 | 端点 | 契约（成功体在 `data`） | 失败码（新增 **`15` 人审与问答段**，doc/40 §4.2 补行） |
 |---|---|---|
-| `GET /api/runs/:id/questions?status=pending` | `[{questionId,runId,kind,question,args?,status,decision?,createdAt}]`（plan 行的 `question` 字段存方案全文；`args` 是工具原始参数 JSON，前端刷新后靠它重建 options；`decision` 给已答方案行标明批准/驳回；前端据 `kind` 渲染） | 400 `111002`（status 不在 pending/answered/stale）；404 `112002`（run 不在） |
+| `GET /api/runs/:id/questions?status=pending` | `[{questionId,runId,toolCallId,kind,question,args?,status,answer?,decision?,createdAt}]`（plan 行的 `question` 字段存方案全文；`toolCallId` 让历史按 runlog 的人等工具行把卡挂回正确段；`args` 是工具原始参数 JSON，前端刷新后靠它重建 options；`answer` 对 question/plan/install 三类都返回——question 行是用户原文，plan 行是编辑后的方案/驳回意见；`decision` 给已答方案行标明批准/驳回；前端据 `kind` 渲染） | 400 `111002`（status 不在 pending/answered/stale）；404 `112002`（run 不在） |
 | `POST /api/questions/:id/answer` body `{answer,decision?}` | `{questionId,status}`（plan 行：approve 时 answer=编辑后方案全文、未编辑空串；revise 时 answer=修改意见、可空。question 行不接受 decision；plan 行 decision 缺省=approve） | 400 `111002`（decision 不在 approve/revise，或 question 行带了 decision）；404 `115002`（行不存在）；409 `115101`（已答过/失效——CAS 影响 0 行） |
 | `POST /api/dev/question-check`（仅 -dev）body `{runId,status?}` | 只读诊断：`{runId,total,rows:[{questionId,kind,status,toolCallId}]}` | — |
 | `POST /api/dev/plan-gate-check`（仅 -dev）body `{tool,planMode?}` | `{planMode,deny}`——走真 `isMutatingTool` 与真守卫判定路径（不依赖模型）。`write_file` → `{planMode:true,deny:true}`；`read_file` → `{planMode:true,deny:false}`；显式 `planMode:false` → `{planMode:false,deny:false}` | — |
@@ -220,6 +220,34 @@ SSE 与轮询同真源透传（server.go:978 原样透传，零改动）；前�
 | 退回修改 | `{answer:"<意见，可空>",decision:"revise"}` | answered / revise | 「方案被驳回，尚未执行；计划模式仍然开启。请根据用户意见修改方案，再调用 submit_plan 重新提交…」+ 意见 |
 
 驳回后模型重新 submit_plan 会落**新行、新帧、新卡**；旧卡显示「已驳回」和当时的意见，档案不丢。resume 对账读同一 `decision` 列：approve 补退出 plan mode，revise 只把驳回文本换回 tool_result（plan mode 保持）。
+
+### 5.5 2026-11-03 补记：一场 run 的正文按等人工具分段
+
+**病灶。** 一次 run 问三次，页面上仍只有一个 assistant 气泡：提问前的说明、三次问答、回答后的继续全叠在同一框里；刷新后问题卡直接消失（`getQuestions` 只在 run 活着时调用），只剩三段混在一起的正文和一张参数 JSON 工具卡。用户要回看「我当时为什么选了 B」得在同一框里翻，分不清哪句是提问、哪句是答完后的继续。
+
+**存储：只加偏移，不加行。** 「一场 run 一条 Σ root assistant 行」的不变量保留（`getLog` 行数、`runlogOffset`、窗口分页、`closeOut` 的定位都不变）。`writeTurnRows` 遍历 turn 时，遇到 `ask_user` / `submit_plan` / `skill_install` 调用，把此刻 root 累积正文的 **rune 长度**与该工具调用 id 记进 `segments`，轮末仍只写一条 assistant 行：
+
+```json
+{"promptTokens":123,"completionTokens":45,"totalTokens":168,
+ "segments":[{"end":18,"toolCallId":"call_ask_1"},{"end":42,"toolCallId":"call_ask_2"}]}
+```
+
+- `end` 是前一段正文的结束位置（rune 偏移），最后一段 = 最后一个 `end` 到正文末尾；前端用 `Array.from` 按 code point 切，中文/emoji 不会切坏。
+- 没有等人工具的 run 不写 `segments`，payload 形状与今天逐字节一致；提问发生在任何正文之前时 `end` 为 0（首段为空，只画它带的问题卡）。
+- 不按每个工具调用分段：要分开的是「人介入」这条线；按全部工具切会把所有含工具的 run 都牵进契约与分页验收，收益不是本篇要解决的问题。
+
+**读口增量。** `questionView` 补 `toolCallId`（`run_questions` 早有该列，只是没透出）；`answer` 从只给 install 行改为三类都返回。问题/答案的真源仍是 `run_questions`，**不把答案写成 runlog 的 user 行**——那是「用户真的投递了一条消息」的语义，工具结果混进去会让历史搜索与归档把答案当成用户发言。
+
+**前端：历史与实时同一套渲染。**
+
+- runlog 的一条 assistant 行按 `segments` 切成多段，每段一个气泡；非等人工具行仍按 run 排队，挂到**第一段**（沿用 `toolsFirst`）。
+- `segments[].toolCallId` 与 question 行配对，问题卡挂在「该切点前的那一段」气泡后面；`kind=question` 且已答时，紧跟卡片渲染一个右对齐用户气泡（内容 `answer`），方案/安装卡不生成答案气泡（它们不是自由文本）。
+- 实时路径：`question` 帧挂到当前段并封口；封口后的第一条非 question 帧（delta/tool/usage）先 push 新段再落内容；答题成功由同一张卡自动带出答案气泡，不额外 push。
+- `closeOut` 不再只替换一条正文，而是把本 run 的 runlog 行按同一规则重放成气泡（含问题卡与答案气泡），替换屏上的实时段——跑完的样子与刷新后的样子由同一套渲染产生。
+
+**代价（已知）。** 收口重放把工具卡统一挂到第一段，原本在回答后出现的工具可能上移到第一段；问题卡的跨 tab 状态同步仍未做（别的 tab 答题，本 tab 分段正文正确，卡状态可能滞后）。
+
+**验收。** 隔离引擎真跑一轮：`GET /api/sessions/:sid/log?runlogOffset=0` 仍是一条 assistant 行，`segments:[{"end":7,"toolCallId":"call_…"}]`（正文「我先确认一下。ok」，切出 `我先确认一下。` / `ok`）；`GET /api/runs/:rid/questions?status=answered` 同时有 `toolCallId` 与 `answer:"A"`；没有提问的 run `segments` 不出现。浏览器：实时答题得到「段 1 → 问题卡 → 答案气泡 → 段 2」，刷新后 DOM 顺序与内容一致（实测 6 个节点逐项对齐）。
 
 ## 6. Loop 拆分（已按此顺序收口；每拍先交 todos.md，粒度 ≤80 行 diff）
 
