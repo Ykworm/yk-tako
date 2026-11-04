@@ -21,6 +21,9 @@ tmp/
 # 本地证书与私钥（部署用，不入库）
 /certs/
 
+# 部署凭据（服务器地址 / 管理面板账号 / 数据库口令，不入库）
+/secrets/
+
 # 面试/个人准备材料，只留本地，不进版本库
 doc/interview/
 
@@ -32,3 +35,6 @@ yk-tako-eino/mcp.json
 
 # Python 字节码（scripts/acceptance 的工具跑起来会生成）
 __pycache__/
+
+# README 的人工润色版草稿，仅本地参考，不进版本库
+/README-human.md
