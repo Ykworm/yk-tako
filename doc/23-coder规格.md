@@ -14,6 +14,8 @@
 >
 > `doc/17` 第 3.1 节把 `agents/coder.md` 写成 bash 之后的新文件，并给过一份名单。本篇取代那份。施工仍排在 bash 已经进父池之后。
 >
+> **再修订（2026-11-05，终稿要求）**：§2 的 `description` 与「终稿只写路径和结论」那一条已被改写。原句把终稿压成「路径 + 一句结论」，父代理收不到「改了什么、怎么验的、还剩什么」。今天的正文（`yk-tako-eino/agents/coder.md`）要求终稿自足四项：改了什么与为什么、动过每个文件的路径、怎么验证的（跑了哪条命令、结果是什么）、还剩什么或值得跟进；`description` 同步写明父代理只收这份交接，让主代理在派活前就知道能拿回什么。这是提示词层的改动，无程序侧抽取、无信封，§2 代码块保留 2026-10-15 原文备查。零 Go 改动。
+>
 > **施工状态（2026-10-15）：已落地**。§2 全文逐字落盘（`yk-tako-eino/agents/coder.md`，tools 照 §3）+ §6 剧本一、剧本二活体全过（台账 `tmp/23-coder规格/`）：frames 出 `agent=coder` 的 write_file/bash、终稿只交路径与结论、无 search_history/web_search；笔记面——`agent system coder:` 行含 `output/agg.txt`、write_file 参数即该路径、无第二条结果文件。零 Go 改动（仅 filetools_test 的注册表断言随 bash 进池增补一行）。
 
 ## 1. 要解决的那一次委派
