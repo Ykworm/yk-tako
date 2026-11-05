@@ -57,7 +57,7 @@ type WorkspaceRef struct {
 	TenantID   string
 	SessionID  SessionID
 	Root       string
-	TenantRoot string // <workspace>/tenants/<tenant>，存储帽数整棵租户目录
+	TenantRoot string // <workspace>/tenants/<tenant>，存储上限管整棵租户目录
 	MaxBytes   int64
 	// Reserve 在落盘前占住字节。没设时 write_file 仍用目录大小做一次检查。
 	Reserve func(adding int) (func(), error)
@@ -79,7 +79,7 @@ func activeRoot(ctx context.Context, fallback string) string {
 	return fallback
 }
 
-// tenantStorageRoot 是一个租户在 workspace 下的目录。存储帽数这整棵树，不单数一场会话。
+// tenantStorageRoot 是一个租户在 workspace 下的目录。存储上限数这整棵树，不单数一场会话。
 func tenantStorageRoot(root, tenantID string) string {
 	return filepath.Join(root, "tenants", tenantID)
 }

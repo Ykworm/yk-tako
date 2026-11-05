@@ -128,7 +128,7 @@ func TestRecallTopFiveAndRuneCap(t *testing.T) {
 	ctx := context.Background()
 	s := newMemoryStore(t)
 	now := time.Now()
-	// 7 条不同 topic 都命中同一个词，注入只取前 5；内容 200 rune 时 600 帽只放得下两条。
+	// 7 条不同 topic 都命中同一个词，注入只取前 5；内容 200 rune 时 600 上限只放得下两条。
 	for i := 0; i < 7; i++ {
 		head := "zeta" + string(rune('0'+i))
 		s.addMemory(t, "fact", "topic.hit"+string(rune('0'+i)),
@@ -147,7 +147,7 @@ func TestRecallTopFiveAndRuneCap(t *testing.T) {
 		t.Fatalf("render hits = %d", hits)
 	}
 	if n := utf8.RuneCountInString(block); n > memoryRecallRuneCap {
-		t.Fatalf("memory 块 %d rune > 帽 %d", n, memoryRecallRuneCap)
+		t.Fatalf("memory 块 %d rune > 上限 %d", n, memoryRecallRuneCap)
 	}
 	if strings.Count(block, "\n- [") != hits {
 		t.Fatalf("块内条数 != hits（hits=%d）:\n%s", hits, block)

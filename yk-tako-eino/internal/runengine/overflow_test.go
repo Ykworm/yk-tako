@@ -159,7 +159,7 @@ func TestRescueLimit(t *testing.T) {
 }
 
 // TestDetectTruncation：检出②两子检 (a)/(b) 的边界与负路径（A3 四要素第 4 条；doc §5/§12②）——
-// 默认输出帽的 length（completion 贴默认上限、P 远小于窗）必须不命中：(c) 缺席期间它是主要误报面。
+// 默认输出上限的 length（completion 贴默认上限、P 远小于窗）必须不命中：(c) 缺席期间它是主要误报面。
 func TestDetectTruncation(t *testing.T) {
 	usage := func(p, c int) *schema.TokenUsage { return &schema.TokenUsage{PromptTokens: p, CompletionTokens: c} }
 	cases := []struct {
@@ -181,7 +181,7 @@ func TestDetectTruncation(t *testing.T) {
 		{"b-boundary-off-by-one", &schema.ResponseMeta{FinishReason: "length", Usage: usage(3959, 0)}, 4000, false, false, 0},
 		// (b) 要求 completion==0：贴窗但产出了字 = (c) 的面（缺席），不命中
 		{"b-needs-zero-completion", &schema.ResponseMeta{FinishReason: "length", Usage: usage(3980, 5)}, 4000, false, false, 0},
-		// 负路径①（doc §12②）：provider 默认输出帽的 length——completion 贴默认上限（DeepSeek 4096）、
+		// 负路径①（doc §12②）：provider 默认输出上限的 length——completion 贴默认上限（DeepSeek 4096）、
 		// P 远小于窗，不命中（(c) 若在场这条会被误折，正是它缺席的代价上界）
 		{"default-output-cap", &schema.ResponseMeta{FinishReason: "length", Usage: usage(1000, 4096)}, 1048576, false, false, 0},
 		// 负路径②：length + completion==0 但 P 不够贴窗（模型自己空输出）——不命中

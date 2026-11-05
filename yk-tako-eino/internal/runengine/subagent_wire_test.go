@@ -175,7 +175,7 @@ func TestDelegationToolWritesWireUnderSessionDir(t *testing.T) {
 		t.Fatalf("回传应带实例 id: %q", out)
 	}
 	if !strings.Contains(out, "omitted") {
-		t.Fatalf("超帽截断应仍在，id 接在后面: %q", out)
+		t.Fatalf("超上限截断应仍在，id 接在后面: %q", out)
 	}
 
 	matches, err := filepath.Glob(filepath.Join(root, "tenants", tenant, "sessions", "s_wire", ".tako", "subagents", "sa_*.jsonl"))

@@ -5,12 +5,12 @@
 // 若没有这句，子代理同样当没有。笔记让这句话跨会话、跨代理活下来。
 //
 // 端到端链路（每环可点名）：用户说规矩 → 模型调 memory(action=add, quote=用户原句) → writeNote
-// 在同一个 PG 事务里取 workspace 级锁、算帽、插入 notes 表 → 下一场 run 的 BeforeAgent 读未替代行、
+// 在同一个 PG 事务里取 workspace 级锁、算上限、插入 notes 表 → 下一场 run 的 BeforeAgent 读未替代行、
 // 渲染快照段冻进 noteBox → BeforeModelRewriteState 把 state.Messages[0] 重写为 Instruction + 快照段
 // → 模型在系统提示里读到上次写下的原话和路径（新会话、子代理同一份——子代理侧缝在 agents.go）。
 //
-// 写入只有一个函数（writeNote）：字数帽（agent 2200 / user 1375 字）、非空原话（≤200 字）全在
-// 函数里面；本版唯一调用方 = memory 工具。帽检查与插入同一 PG 事务 + workspace 级 advisory xact
+// 写入只有一个函数（writeNote）：字数上限（agent 2200 / user 1375 字）、非空原话（≤200 字）全在
+// 函数里面；本版唯一调用方 = memory 工具。上限检查与插入同一 PG 事务 + workspace 级 advisory xact
 // 锁（doc/17 §7 四件之 4）：笔记按 workspace 分、跨会话可并发写——「一会话同时只有一场 run」管不到
 // 跨会话，闸必须在库里不在进程里（AGENTS.md 多副本纪律）。
 //
@@ -35,7 +35,7 @@ import (
 	"gorm.io/gorm"
 )
 
-// 容量帽（doc/17 §8，借 Hermes 内置笔记默认；字数 = rune 数，中文按字）。
+// 容量上限（doc/17 §8，借 Hermes 内置笔记默认；字数 = rune 数，中文按字）。
 // quote 超出拒绝、不截断（planning §1-5）。
 const (
 	noteCapAgent = 2200
@@ -44,7 +44,7 @@ const (
 )
 
 // noteFailAdviseAfter 是劝停句的触发线（doc/17 §7 四件之 2）：同一场 run 里写入失败记到 3 次，
-// 第 4 次的结果写明「停止再调、先回复用户」——否则帽满/定位失败时模型一直重试，用户等不到回复。
+// 第 4 次的结果写明「停止再调、先回复用户」——否则上限满/定位失败时模型一直重试，用户等不到回复。
 const noteFailAdviseAfter = 3
 
 // 两类 kind 的取值（DDL 注释同词）。
@@ -54,7 +54,7 @@ const (
 )
 
 // 写入失败分类（noteWriteResult.fail）：拒写路径的结果文本按它选原因句；
-// M3 的三次记次也按它归类（超帽 / 定位失败（M2）/ 原话为空）。
+// M3 的三次记次也按它归类（超上限 / 定位失败（M2）/ 原话为空）。
 const (
 	noteFailAction     = "action"
 	noteFailKind       = "kind"
@@ -127,7 +127,7 @@ type noteEntry struct {
 	Quote   string
 }
 
-// noteSums 是两类未替代 content 的 rune 合计（帽检查与「已用」行的数字，planning §3-C）。
+// noteSums 是两类未替代 content 的 rune 合计（上限检查与「已用」行的数字，planning §3-C）。
 type noteSums struct{ Agent, User int }
 
 func (s noteSums) of(kind string) int {
@@ -147,7 +147,7 @@ func (s noteSums) plus(kind string, delta int) noteSums {
 	return s
 }
 
-// noteCap 按 kind 取帽。
+// noteCap 按 kind 取上限。
 func noteCap(kind string) int {
 	if kind == noteKindUser {
 		return noteCapUser
@@ -170,14 +170,14 @@ type noteWrite struct {
 type noteWriteResult struct {
 	fail           string
 	op             string // add / replace / remove
-	kind           string // 目标 kind（超帽原因句取它）
+	kind           string // 目标 kind（超上限原因句取它）
 	entries        []noteEntry
 	sums           noteSums
 	itemRunes      int    // 本条 content 的 rune 数
 	quoteRunes     int    // 本条 quote 的 rune 数
 	locateHits     int    // 定位结果：-1 未带 old_content；0 无命中；>1 多行命中；1 唯一命中
-	oldRunes       int    // replace 中被替代行的 rune 数（超帽原因句带数字）
-	projRunes      int    // replace 超帽时的替换后合计（同上）
+	oldRunes       int    // replace 中被替代行的 rune 数（超上限原因句带数字）
+	projRunes      int    // replace 超上限时的替换后合计（同上）
 	invisibleField string // 不可见字符拒写时：content / quote
 	invisibleID    string // 不可见字符拒写时：命中的码点（invisible_unicode_U+XXXX）
 }
@@ -188,10 +188,10 @@ type noteWriteResult struct {
 // 三种动作的写入语义（doc/17 §7）：
 //   - add：插一行；
 //   - replace：old_content 全文定位唯一一条未替代行 → 插新行 + 旧行 superseded_by 指新行
-//     （旧行 content/quote 一字不改——对质证据链）；超帽检查按「旧行退出后的合计」算；
+//     （旧行 content/quote 一字不改——对质证据链）；超上限检查按「旧行退出后的合计」算；
 //   - remove：old_content 定位唯一一条未替代行 → 物理删除（用户明说删掉，不留指针）。
 //
-// 业务拒写（超帽/缺原话/定位不到/字段非法）不是 Go error——以 fail 分类回到调用方格式化成结果文本；
+// 业务拒写（超上限/缺原话/定位不到/字段非法）不是 Go error——以 fail 分类回到调用方格式化成结果文本；
 // 返回的 error 只承载底座故障（DB 断）。
 func (s *Store) writeNote(ctx context.Context, workspace string, sourceRunID RunID, sourceSeq int64, in noteWrite) (noteWriteResult, error) {
 	action := strings.TrimSpace(in.Action)
@@ -210,7 +210,7 @@ func (s *Store) writeNote(ctx context.Context, workspace string, sourceRunID Run
 		if err := tx.Exec(`SELECT pg_advisory_xact_lock(hashtext(?))`, lockKey).Error; err != nil {
 			return err
 		}
-		// 当前有效集先读出：字段/超帽/定位拒绝时结果文本也要带清单与「已用」行（planning §3-C）。
+		// 当前有效集先读出：字段/超上限/定位拒绝时结果文本也要带清单与「已用」行（planning §3-C）。
 		entries, sums, err := liveNotesFrom(tx, workspace, sc)
 		if err != nil {
 			return err
@@ -307,7 +307,7 @@ func (s *Store) writeNote(ctx context.Context, workspace string, sourceRunID Run
 }
 
 // validateNoteWrite 跑字段级检查（不碰库的部分），命中即返回分类；通过返回 ""。
-// itemRunes/quoteRunes 供原因句与超帽检查带数字。missing old_content 也归 noteFailLocate
+// itemRunes/quoteRunes 供原因句与超上限检查带数字。missing old_content 也归 noteFailLocate
 // （调用方据此把 locateHits 置 -1，与「找不到 / 多行命中」的消息区分开）。
 func validateNoteWrite(in noteWrite) (fail string, itemRunes, quoteRunes int) {
 	switch in.Action {
@@ -510,7 +510,7 @@ type memoryInput struct {
 }
 
 // newMemoryTool 造 memory 工具：笔记的唯一工具入口（写入逻辑全在 writeNote）。
-// 业务拒写（超帽/缺原话/定位失败/字段非法）格式化成结果文本回注模型（planning §1-7）——不经 Go error 通道；
+// 业务拒写（超上限/缺原话/定位失败/字段非法）格式化成结果文本回注模型（planning §1-7）——不经 Go error 通道；
 // 底座故障（DB 断）上抛给 wrapToolErrors 兜底（装配点在 NewWorker，同其余第一方工具）。
 // 写入失败 tick noteBox 的每 run 计数器（M3）：只失败调用 tick，成功既不加也不清——第 4 次起结果里
 // 追加劝停句（memoryStopAdvice），计数随 run 死（noteBox 每 run 新建）。
@@ -584,7 +584,7 @@ func noteFailText(res noteWriteResult) string {
 	case noteFailQuoteEmpty:
 		return "错误：add / replace 必须带 quote（用户原句）——没有原话就不记。"
 	case noteFailQuoteLong:
-		return fmt.Sprintf("错误：quote %d 字超帽（上限 %d 字）——只贴用户说的那句，不要转述。", res.quoteRunes, noteQuoteCap)
+		return fmt.Sprintf("错误：quote %d 字超过 %d 字上限——只贴用户说的那句，不要转述。", res.quoteRunes, noteQuoteCap)
 	case noteFailLocate:
 		switch {
 		case res.locateHits < 0:

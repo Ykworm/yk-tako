@@ -65,8 +65,8 @@ const maxUnitFoldAttempts = 20
 // 骨架三重动机：卡死教训（体积失控要有槽级配给）、散文漂移（无骨架跨合并栏目互吞）、
 // 机械锚点无家（fileOps 挂靠 ## 重要事实）。存量散文摘要的迁移语义 = 首事件整体进
 // ## 其他上下文（prompt 第 3 条与 renderFold 的「此前摘要，请合并进新的摘要」对应，改一处要同步）。
-// 规则 ② 的总预算为 %d 占位符——attempt() 按硬帽（maxTokens×4/5 字/tok，dev 校准）每次调用渲染：
-// 软目标必须与硬帽同源，静态值在硬帽落地后会诱导超帽截断（A3 实测教训）。
+// 规则 ② 的总预算为 %d 占位符——attempt() 按硬上限（maxTokens×4/5 字/tok，dev 校准）每次调用渲染：
+// 软目标必须与硬上限同源，静态值在硬上限落地后会诱导超上限截断（A3 实测教训）。
 const compactPrompt = `你在为一段较早的对话维护一份长期摘要，供后续轮次继续使用。` +
 	`按这段内容实际在谈的事做摘要，只保留对后续仍然有用的信息。` +
 	"摘要必须用下面六个栏目的 markdown 骨架，栏目标题一字不差、顺序不变：\n" +
@@ -105,8 +105,8 @@ const (
 	summarizeMaxAttempts = 3
 )
 
-// 摘要预算帽分档的档常量（C5-A7；19v6-07 §5 分档表 = 2026-10-11 用户表落码）。
-// maxTokens（= 分档 ceiling）是两层身份：硬预算帽 + 三层验货算术主检的比对基线
+// 摘要预算上限分档的档常量（C5-A7；19v6-07 §5 分档表 = 2026-10-11 用户表落码）。
+// maxTokens（= 分档 ceiling）是两层身份：硬预算上限 + 三层验货算术主检的比对基线
 // （completion ≥ 它 ⇒ 按截断拒收，误杀代价仅多一次重试）。
 const (
 	summarizeCeilingSmallCap   = 1024    // 小窗式 min(limit/2, ·) 的反向校准封顶（防 verbose 超产，dev 位）
@@ -125,7 +125,7 @@ const compactAdmissionDivisor = 3
 
 // summarizeBudgetDivisor 是小窗式 min(limit/2, 1024) 的除数（C5-A3 校准值；A7 起由
 // summarizeCeiling 的小窗分支使用）：除数 2 的守恒 S + tail_max = limit/2 + limit/3 = 5/6·limit < limit
-// （n=0 恒有解，余 limit/6 给 keep 与估算误差）；除数 3 在 window 4000 下帽 = 1066，低于
+// （n=0 恒有解，余 limit/6 给 keep 与估算误差）；除数 3 在 window 4000 下上限 = 1066，低于
 // A2 实录 S = 1221（模型自然产出），已弃。
 const summarizeBudgetDivisor = 2
 
@@ -143,9 +143,9 @@ func CompactLimitFor(window int) int {
 	return window - min(window/5, 16384)
 }
 
-// summarizeCeiling 按窗口分档算摘要预算帽（C5-A7；19v6-07 §5 分档表，纯函数，装配期一次）。
+// summarizeCeiling 按窗口分档算摘要预算上限（C5-A7；19v6-07 §5 分档表，纯函数，装配期一次）。
 //
-//	window ≤ 0（compact 关）        → 4096（A3 前常量语义；小窗式禁算——min(0,1024)=0 会把帽掐死）
+//	window ≤ 0（compact 关）        → 4096（A3 前常量语义；小窗式禁算——min(0,1024)=0 会把上限掐死）
 //	window ≤ 32768（小窗/dev）      → min(limit/2, 1024)——恒有解守恒体（limit/2）＋反向校准封顶；
 //	                                  limit 经 compactLimitFor（三期起；32768 ≤ 81920 恒走 ×4/5 支，逐值不变）
 //	32768 < window < 1048576（中窗）→ 4096；window ≥ 1048576（大窗）→ 8192（均区间下限，不插值）
@@ -380,8 +380,8 @@ func buildStaged(oldSummaryRuns []RunID, rawRuns, drop []runRows, currentRun Run
 //
 // C5-A5 钉块：定案处把 file-ops 块（旧块继承 ∪ 本次 drop 提取）钉进摘要末尾——
 // assembled[0] 与 staged.Summary 同源（本轮模型也看得到路径）。三档检查 = **重跑本循环自己的
-// 收口**（含块全量 < limit；2026-10-11 用户拍死口径，弃静态「S+块+tail ≤ 帽」算式：它不含 keep、
-// 且帽与摘要自身预算同值使块无预算、二档无成立空间）：全量钉 → 超则两表各砍 50 重渲染再验 →
+// 收口**（含块全量 < limit；2026-10-11 用户拍死口径，弃静态「S+块+tail ≤ 上限」算式：它不含 keep、
+// 且上限与摘要自身预算同值使块无预算、二档无成立空间）：全量钉 → 超则两表各砍 50 重渲染再验 →
 // 仍超 = 折叠失败（errStillOver，C2 已有链）。无操作 = 无块 = 检查不发生（无 file 工具会话零行为变化）。
 //
 // B4 trim 兜底（19v6-09 §8「压后仍超的最后手段」）：定案循环折尽仍超（n=0 / 单位折尽或封顶）
@@ -897,7 +897,7 @@ func dropMessages(drop []runRows) []ModelMessage {
 type summarizer struct {
 	chat            ChatStream
 	temp            float32       // 低温档（0.3，借 WeKnora 经验值）
-	maxTokens       int           // = summarizeCeiling(window, ref, maxOutput)（A7 分档）——算术主检基线 + 硬预算帽
+	maxTokens       int           // = summarizeCeiling(window, ref, maxOutput)（A7 分档）——算术主检基线 + 硬预算上限
 	stallFirstToken time.Duration // 首 token 限时（初值 30s 待校准）
 	stallChunkGap   time.Duration // chunk 间隔限时（初值 30s 待校准）
 	stallTotal      time.Duration // 宽松总上限：本质仍是墙钟，仅防无限拖长
@@ -956,8 +956,8 @@ func (s *summarizer) summarize(ctx context.Context, input string) (string, error
 func (s *summarizer) attempt(ctx context.Context, input string, attempt int) (string, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.stallTotal)
 	defer cancel()
-	// 字预算随硬帽动态渲染（A3）：静态值（A2 的 1200 字）在硬帽落地后会诱导超帽截断 →
-	// 验货拒收 → 重试耗尽 → 每次折叠都走 A——prompt 软目标必须与硬帽同源。
+	// 字预算随硬上限动态渲染（A3）：静态值（A2 的 1200 字）在硬上限落地后会诱导超上限截断 →
+	// 验货拒收 → 重试耗尽 → 每次折叠都走 A——prompt 软目标必须与硬上限同源。
 	// 换算系数 4/5 字/tok：来源 C2 实测中文摘要 ≈1.18 tok/字，保守取 0.8（dev 校准）。
 	budgetRunes := s.maxTokens * 4 / 5
 	stream, err := chatFrom(ctx, s.chat).Stream(ctx, []*schema.Message{

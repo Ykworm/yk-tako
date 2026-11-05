@@ -59,7 +59,7 @@ func neverStream() (*schema.StreamReader[*schema.Message], *schema.StreamWriter[
 }
 
 // testSummarizer 小旋钮的 summarizer（stall 计时缩到毫秒级，不然单测要等 30s）。
-// 帽取中窗常量 4096：验货断言（completion ≥ 帽）在各测试自带的 completion 量级下行为同 A3。
+// 上限取中窗常量 4096：验货断言（completion ≥ 上限）在各测试自带的 completion 量级下行为同 A3。
 func testSummarizer(chat ChatStream) *summarizer {
 	s := newSummarizer(chat, summarizeCeilingMid)
 	s.stallFirstToken = 80 * time.Millisecond
@@ -1221,7 +1221,7 @@ func TestCompactPromptSixSlotsInOrder(t *testing.T) {
 	}
 	for _, rule := range []string{
 		"直接省略整个标题",       // 规则①空槽省略不编造
-		"%d 字以内",         // 规则②总量预算为占位符——渲染值随硬帽（A3 动态化）
+		"%d 字以内",         // 规则②总量预算为占位符——渲染值随硬上限（A3 动态化）
 		"整体并进「## 其他上下文」", // 规则③散文迁移语义
 		"不允许输出没有槽标题的正文",  // 规则④：迁移/echo 时骨架仍必须存在（A2 e2e 防回归）
 		"不要开场白、不要代码块围栏",  // 规则⑤输出纯净
@@ -1253,7 +1253,7 @@ func TestSummarizeSendsStructuredPrompt(t *testing.T) {
 	}
 }
 
-// ---- C5-A7：summarizer 预算帽分档（小窗式 / 中窗 / 大窗 + 档界 + 两个 override）----
+// ---- C5-A7：summarizer 预算上限分档（小窗式 / 中窗 / 大窗 + 档界 + 两个 override）----
 
 // 三期重裁（19v6-09 §9）逐锚：limit = window − min(window/5, 16384)。
 // 81920 交点两侧都钉：交点处两式同值（65536）、交点之上 reserve 恒 16384（吃回窗口）、
@@ -1331,12 +1331,12 @@ func TestSummarizeCeilingMaxOutput(t *testing.T) {
 		maxOutput int
 		want      int
 	}{
-		{4000, "", 500, 500},                              // 小于帽 → 顶到 500
-		{4000, "", 2048, 1024},                            // 大于帽 → 帽不变
-		{4000, "", 1024, 1024},                            // 等于帽
+		{4000, "", 500, 500},                              // 小于上限 → 顶到 500
+		{4000, "", 2048, 1024},                            // 大于上限 → 上限不变
+		{4000, "", 1024, 1024},                            // 等于上限
 		{256000, "", 0, 4096},                             // 0 = 不顶
 		{256000, "anthropic/claude-sonnet-4", 5000, 5000}, // 乘后 5324 → 顶到 5000（硬顶最后生效）
-		{256000, "anthropic/claude-sonnet-4", 5324, 5324}, // 等于乘后帽
+		{256000, "anthropic/claude-sonnet-4", 5324, 5324}, // 等于乘后上限
 	} {
 		if got := summarizeCeiling(tc.window, tc.ref, tc.maxOutput); got != tc.want {
 			t.Fatalf("window=%d ref=%q maxOutput=%d: ceiling=%d, want %d",
@@ -1350,7 +1350,7 @@ func TestAttemptRendersBudgetIntoPrompt(t *testing.T) {
 	chat := &fakeChatStream{handler: func(call int) (*schema.StreamReader[*schema.Message], error) {
 		return streamOf([]string{"## 会话意图\n验证"}, 10, "stop"), nil
 	}}
-	s := newSummarizer(chat, summarizeCeiling(600, "", 0)) // 帽 = 240 tok → 字预算 = 192
+	s := newSummarizer(chat, summarizeCeiling(600, "", 0)) // 上限 = 240 tok → 字预算 = 192
 	if _, _, err := s.attempt(context.Background(), "任意输入", 1); err != nil {
 		t.Fatalf("attempt: %v", err)
 	}

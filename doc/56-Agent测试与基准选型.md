@@ -241,10 +241,10 @@ tako 补浏览器最省的一条是**挂 MCP**（doc/33）：Playwright MCP 是 
 
 所以「下载仓库 → 装依赖 → 跑测试」在环境配合下部分可行；「装浏览器」「起本地服务」当前不可行。要补，先改 bash 单命令预算与缓存重定向（引擎能力，另开一拍），不要评测脚本里替模型做。
 
-**三个上限要分开看**（「输出帽太小」这个直觉的准确边界）：
+**三个上限要分开看**（「输出上限太小」这个直觉的准确边界）：
 
-- **下载体积**：落盘，不进 stdout。300MB 的仓库或依赖写进项目根即可，输出帽不参与；挡住它的是 30 秒墙钟。
-- **回给模型的输出**：`bashOutputCap` 是 **64,000 字节/流**，且**留尾**（报错与最终结果都在尾部），**全文落盘并回路径**（`.tako/bash/<runId>/<seq>.out`，64MB/流，装不下全文就删文件不报路径）——2026-11-01 doc/58 落地。改前是 32KB/流、**留头丢尾、不留全文**：装依赖、跑测试的错误通常在尾部，模型会看到开头、看不到报错，这比「帽小」更糟。pi 的形状是留尾 50KB / 2000 行，并把全文写进临时文件、回路径（`packages/coding-agent/src/core/tools/truncate.ts`、`packages/coding-agent/src/core/bash-executor.ts`）——tako 现在与它同形。
+- **下载体积**：落盘，不进 stdout。300MB 的仓库或依赖写进项目根即可，输出上限不参与；挡住它的是 30 秒墙钟。
+- **回给模型的输出**：`bashOutputCap` 是 **64,000 字节/流**，且**留尾**（报错与最终结果都在尾部），**全文落盘并回路径**（`.tako/bash/<runId>/<seq>.out`，64MB/流，装不下全文就删文件不报路径）——2026-11-01 doc/58 落地。改前是 32KB/流、**留头丢尾、不留全文**：装依赖、跑测试的错误通常在尾部，模型会看到开头、看不到报错，这比「上限小」更糟。pi 的形状是留尾 50KB / 2000 行，并把全文写进临时文件、回路径（`packages/coding-agent/src/core/tools/truncate.ts`、`packages/coding-agent/src/core/bash-executor.ts`）——tako 现在与它同形。
 - **阅读上限**：`read_file` **分页读**（`offset` 1-based + `limit` 行），每页 2000 行 / 50KB，页脚恒带总行数与下一个 `offset`，**没有 200KB 硬拒绝**——2026-11-01 doc/58 落地。改前是无界读超过 200KB 直接拒绝，且只有 head/tail、没有 offset 分页（[filetools.go](file:///Users/yuweikang/dev/ykcode/learn/yk-tako/yk-tako-eino/internal/runengine/filetools.go)）。pi 的 `read` 同样是 `offset`（1-based）+ `limit`（行）分页、2000 行 / 50KB 一页、页尾给下一个 `offset`（`packages/coding-agent/src/core/tools/read.ts`）——与 bash 那条一样是**另一处独立参照**（两家参考实现各自收敛到同一形状，不是某一个人的口味）。
 
 所以 coding agent 该补的是「留尾 + 全文落盘 + 回路径」与「分页读」，不是单纯把 32KB 调大；另外单命令超时要可配置（pi 是每次调用可选 `timeout`，默认不限）。**这两条已落地**：[doc/58](58-读分页与输出留存.md)（read 加 `offset`/`limit` 分页 + bash 留尾落盘，2026-11-01 A1–A8 收口）——剩下的缺口是「单命令超时不可配」，仍挂着。

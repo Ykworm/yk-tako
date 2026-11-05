@@ -86,7 +86,7 @@ func TestReserveStorageOneWinner(t *testing.T) {
 	close(start)
 	wg.Wait()
 	if okN.Load() != 1 {
-		t.Fatalf("100 字节帽、目录已有 10、两笔各占 80，只应有一笔成功，得到 %d", okN.Load())
+		t.Fatalf("100 字节上限、目录已有 10、两笔各占 80，只应有一笔成功，得到 %d", okN.Load())
 	}
 	for _, rel := range rels {
 		rel()

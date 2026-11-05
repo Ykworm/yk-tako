@@ -8,7 +8,7 @@ import (
 )
 
 // B2：passage 组装（doc/29 §5.1）——只收 user / root 终稿 / 子代理终稿，工具行不进；
-// 子代理单条截 1000，总帽 4000 从尾部截并记 truncated。
+// 子代理单条截 1000，总上限 4000 从尾部截并记 truncated。
 func TestBuildDialoguePassage(t *testing.T) {
 	sub := strings.Repeat("研", dialogueSubFinalCap+200)
 	entries := []RunlogEntry{
@@ -39,7 +39,7 @@ func TestBuildDialoguePassage(t *testing.T) {
 	long := append(entries, RunlogEntry{Role: "assistant", Text: strings.Repeat("尾", dialogueChunkCap)})
 	cut, truncated := buildDialoguePassage("s_1", "r_2", long)
 	if !truncated || utf8.RuneCountInString(cut) != dialogueChunkCap {
-		t.Fatalf("超帽 passage: truncated=%v runes=%d, want true/%d",
+		t.Fatalf("超上限 passage: truncated=%v runes=%d, want true/%d",
 			truncated, utf8.RuneCountInString(cut), dialogueChunkCap)
 	}
 	if !strings.HasPrefix(cut, "[会话 s_1 · 场 r_2]") {
@@ -116,7 +116,7 @@ func TestResetDialogueChunks(t *testing.T) {
 	}
 }
 
-// B2：每轮批量帽 20——反查把历史一次全判待索引，必须分批发酵。
+// B2：每轮批量上限 20——反查把历史一次全判待索引，必须分批发酵。
 func TestDialogueIndexerBatchCap(t *testing.T) {
 	ctx := context.Background()
 	s := newMemoryStore(t)

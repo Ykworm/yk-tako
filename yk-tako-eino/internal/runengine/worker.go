@@ -125,7 +125,7 @@ type Worker struct {
 	// 与「第一枪还原」记账（A3/translator 后）也要它——存一份给 Workspace() 取用。
 	workspace     string
 	compactWindow int
-	compactLimit  int // = compactLimitFor(window)（window=0 时 0）：触发线 / 准入线两处共用，不各自重算；摘要预算帽自 A7 起归 summarizeCeiling 分档
+	compactLimit  int // = compactLimitFor(window)（window=0 时 0）：触发线 / 准入线两处共用，不各自重算；摘要预算上限自 A7 起归 summarizeCeiling 分档
 	// archiveTTL 是 -archive-ttl。清扫器和 resume 过期判断读同一个值。
 	archiveTTL time.Duration
 	counter    TokenCounter
@@ -169,7 +169,7 @@ type runCancel struct {
 // （tools.go 的机制说明）。
 //
 // C5-A7：modelRef 是主模型生效 ref（config.ChatModel.Ref，Claude override 判定用）、
-// maxOutput 是 TAKO_MODEL_MAX_OUTPUT（正整数 tok，0 = 不顶）——摘要预算帽 =
+// maxOutput 是 TAKO_MODEL_MAX_OUTPUT（正整数 tok，0 = 不顶）——摘要预算上限 =
 // summarizeCeiling(compactWindow, modelRef, maxOutput)，装配期一次算好注给 summarizer。
 //
 // T3-1b：resolver 是子代理 `model:` 写值档的解析口（进程内 ModelRegistry，main 侧适配）——
@@ -177,7 +177,7 @@ type runCancel struct {
 //
 // T3-3：subagentConcurrency 是委派并发闸容量（-subagent-concurrency，main 已保证 >= 1）——
 // 池级信号量、全部规格共享；subagentReturnCap 是子代理回传上限字节数（-subagent-return-cap，
-// <=0 = 不裁剪）——超帽截断的语义在 delegationTool（agents.go）。
+// <=0 = 不裁剪）——超上限截断的语义在 delegationTool（agents.go）。
 //
 // mediaSend 是 TAKO_MEDIA_SEND（默认开，字面 off 才关）。关时不挂媒体包壳，模型输入与占位逐字节相同。
 func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, system, workspace, agentsDir string, leaseRenew time.Duration,
@@ -217,7 +217,7 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 	}
 	pool = append(pool, wrapToolErrors(readPDF))
 	// bash 执行工具入池（doc/17 第 3 节）：文件工具之后、memory 前——批量活先写脚本再跑；
-	// 作业根 workspace（相对路径在 workspace 内解析），32 KB 帽 / 环境白名单在 bash.go（无自动超时，2026-10-15 用户裁）。
+	// 作业根 workspace（相对路径在 workspace 内解析），32 KB 上限 / 环境白名单在 bash.go（无自动超时，2026-10-15 用户裁）。
 	bash, err := newBashTool(workspace)
 	if err != nil {
 		return nil, err
@@ -298,7 +298,7 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		pool = append(pool, wrapToolErrors(t))
 	}
 	// 摘要器在 agent 装配前构造（A4，planning 裁定 9）：midfoldHandler 要拿它的 summarize 方法值——
-	// mid-run 折叠与 prepareInput 的 Run fold 共用同一个摘要器、同一顶帽（C5-A7 分档）。
+	// mid-run 折叠与 prepareInput 的 Run fold 共用同一个摘要器、同一道上限（C5-A7 分档）。
 	compactLimit := CompactLimitFor(compactWindow)
 	ceiling := summarizeCeiling(compactWindow, modelRef, maxOutput)
 	sum := newSummarizer(chat, ceiling)
@@ -1176,7 +1176,7 @@ func (w *Worker) watchdog(ctx context.Context, sessionID SessionID, runID RunID,
 // 开启时单条 user 消息计数 > limit/compactAdmissionDivisor ⇒ 不放行，由调用方回 413。
 // 媒体不在预算里（doc/32 A2 翻案 2026-10-18）：文本管道下请求里只有占位行，base64 字节
 // 根本不进模型窗口——对它跑 cl100k 既拒错人（3MB 图实际只发一行占位）又跑不动
-// （regexp2 对 MB 级 base64 分钟级）；图的门槛是 ingestImages 的硬帽（≤5MB/张、≤4 张）。
+// （regexp2 对 MB 级 base64 分钟级）；图的门槛是 ingestImages 的硬上限（≤5MB/张、≤4 张）。
 // 半边二（字节真进请求）动工时窗口计数按 provider 口径（deepseek 实测按张平价 ~384 token）
 // 另拍，不回这套字节折算。
 // 返回 (limit, tokens, ok)：limit = compactLimitFor(window)（与触发折叠同一 limit，不发明第二个数）；

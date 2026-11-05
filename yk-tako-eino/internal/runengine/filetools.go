@@ -753,7 +753,7 @@ var mediaMimeByExt = map[string]string{
 // runlog/model_history/帧三处落库面（doc/32 §1 病灶），而文本管道下模型本来就看不见图。
 // 句尾措辞是「请勿重复调用」——回执的读者就是刚调完的模型，指回自己 = 死循环（与入口占位
 // mediaPlaceholder 的措辞分工见 media.go）。多模态消费随 translator 升级（19v6-08 §3 挂账）。
-// >5MB 拒读：读进来就是往上下文灌大字节（减灾档），帽与入口图同值（mediaMaxBytes）。
+// >5MB 拒读：读进来就是往上下文灌大字节（减灾档），上限与入口图同值（mediaMaxBytes）。
 func newReadMediaFileTool(store *Store, root string) (tool.BaseTool, error) {
 	return utils.InferTool("read_media_file",
 		"读取媒体文件的元信息（path/mime/size/sha 占位行；媒体字节不会写入对话记录）。"+

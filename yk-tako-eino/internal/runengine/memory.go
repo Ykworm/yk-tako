@@ -252,15 +252,15 @@ UPDATE memory_jobs j
 	return &job, nil
 }
 
-// 线一抽取的帽与词表（doc/29 §4.2–§4.4、§8；数值写死不是配置）。
+// 线一抽取的上限与词表（doc/29 §4.2–§4.4、§8；数值写死不是配置）。
 const (
-	memoryExtractInputCap = 8000 // 一场 run 轨迹拼进抽取调用的总帽（rune）
+	memoryExtractInputCap = 8000 // 一场 run 轨迹拼进抽取调用的总上限（rune）
 	memoryExtractItemsMax = 5    // 每场最多抽 5 条（episode 另算）
 	memoryContentCap      = 200  // 单条 content 上限（rune）
 	memoryTopicCap        = 40   // topic 上限（含首字符）
-	memorySubFinalCap     = 1000 // 子代理终稿进抽取输入的单条帽
-	memoryToolArgsCap     = 200  // tool_call args 单条帽
-	memoryToolResultCap   = 500  // tool_result 输出单条帽
+	memorySubFinalCap     = 1000 // 子代理终稿进抽取输入的单条上限
+	memoryToolArgsCap     = 200  // tool_call args 单条上限
+	memoryToolResultCap   = 500  // tool_result 输出单条上限
 	memoryExtractTimeout  = 90 * time.Second
 )
 
@@ -389,7 +389,7 @@ const memoryExtractPrompt = `你是 tako 的记忆抽取器。输入是一场已
 
 // buildExtractInput 把本 run 的 runlog 拼成有界文本（doc/29 §4.2）：
 // user 与 root 终稿全留；子代理终稿每条 1000 rune；tool_call args 200、tool_result 500。
-// 总帽 8000：先整行丢最旧的工具行，仍超再整行丢最旧的子代理终稿；极端情况下从头截断
+// 总上限 8000：先整行丢最旧的工具行，仍超再整行丢最旧的子代理终稿；极端情况下从头截断
 // （user 在最前优先保，root 终稿可能被截尾——只在单场本身超过 8000 rune 时发生）。
 func (s *Store) buildExtractInput(ctx context.Context, job *claimedMemoryJob) (string, error) {
 	var entries []RunlogEntry
@@ -426,7 +426,7 @@ func (s *Store) buildExtractInput(ctx context.Context, job *claimedMemoryJob) (s
 			}
 		}
 	}
-	// 超帽的丢弃顺序（doc/29 §4.2）：最旧工具行 → 最旧子代理终稿 → 从头截断。
+	// 超上限的丢弃顺序（doc/29 §4.2）：最旧工具行 → 最旧子代理终稿 → 从头截断。
 	total := 0
 	for _, l := range lines {
 		total += utf8.RuneCountInString(l.text) + 1

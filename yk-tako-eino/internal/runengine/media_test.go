@@ -112,7 +112,7 @@ func TestIngestImagesRejects(t *testing.T) {
 		{"白名单外", []postImage{{MIME: "image/heic", DataBase64: pngB64(t, 3)}}, "不在白名单"},
 		{"base64 坏", []postImage{{MIME: "image/png", DataBase64: "!!!"}}, "base64 解不开"},
 		{"空内容", []postImage{{MIME: "image/png", DataBase64: ""}}, "内容为空"},
-		{"超单文件帽", []postImage{{MIME: "image/png", DataBase64: base64.StdEncoding.EncodeToString(make([]byte, mediaMaxBytes+1))}}, "上限"},
+		{"超单文件上限", []postImage{{MIME: "image/png", DataBase64: base64.StdEncoding.EncodeToString(make([]byte, mediaMaxBytes+1))}}, "上限"},
 	}
 	for _, tc := range cases {
 		_, err := ingestImages(root, tc.imgs, 1)
@@ -180,7 +180,7 @@ func TestMediaDisplayName(t *testing.T) {
 	}
 }
 
-// A2 翻案后图与 token 准入线彻底解耦：本组硬帽（白名单/张数/单文件字节）就是图唯一的门。
+// A2 翻案后图与 token 准入线彻底解耦：本组硬上限（白名单/张数/单文件字节）就是图唯一的门。
 // 旧 TestAdmitTextFoldsImages（base64 折进 cl100k 预算）随翻案删除——「不折算」由
 // AdmitText 签名去 blobs 在编译层钉死。窗口关闭放行、边界两侧的文本行为归 compact_test.go
 // 的 TestAdmitTextBoundary。

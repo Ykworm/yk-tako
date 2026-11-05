@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-// bash 的两档帽（doc/58 §7 拍板 3，照 dsh bash-local 的默认值）：
+// bash 的两档上限（doc/58 §7 拍板 3，照 dsh bash-local 的默认值）：
 // 内存尾窗 64,000 字节/流（dsh 的 maxOutputBytes），落盘全文 64MB/流（dsh 的 maxSpillBytes）。
 const (
 	bashOutputCap = 64_000
@@ -91,10 +91,10 @@ func sanitizePathSegment(s string) string {
 // tailCollector 收一个流的字节：内存留尾部 ≤cap，全文落盘（≤bashSpillCap）。
 type tailCollector struct {
 	cap      int
-	spillCap int   // 落盘帽（0 = 用默认 bashSpillCap）
+	spillCap int   // 落盘上限（0 = 用默认 bashSpillCap）
 	tail     []byte
 	total    int64
-	dropped  bool // 丢过字节（= 超过内存帽）
+	dropped  bool // 丢过字节（= 超过内存上限）
 
 	spill    *bashSpill
 	ext      string // 文件扩展名：out / err

@@ -237,7 +237,7 @@ func TestRestoreToolMediaSkips(t *testing.T) {
 		reason  string
 	}{
 		{"缺文件", line, resolverTo(filepath.Join(t.TempDir(), "nope.png")), "file_missing"},
-		{"超帽", bigLine, resolverTo(bigFull), "too_large"},
+		{"超上限", bigLine, resolverTo(bigFull), "too_large"},
 		{"白名单外", mediaReceiptPlaceholder("workspaces/w1/.media/a.svg", "image/svg+xml", 10, sha), resolverTo(full), "mime_not_restorable"},
 		{"resolver 拒绝", line, func(context.Context, string) (string, error) { return "", os.ErrPermission }, "path_unreadable"},
 	}
@@ -787,7 +787,7 @@ func TestMediaSendBoundaries(t *testing.T) {
 		assertMediaSkipped(t, "看\n"+line, "file_missing", resolve)
 	})
 
-	t.Run("超帽", func(t *testing.T) {
+	t.Run("超上限", func(t *testing.T) {
 		big := append(append([]byte(nil), raw...), make([]byte, mediaMaxBytes)...)
 		write("big.png", big)
 		line := mediaPlaceholder("big.png", 1, "big.png", "image/png", len(big), shaOf(big))

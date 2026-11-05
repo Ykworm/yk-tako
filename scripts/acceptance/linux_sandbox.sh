@@ -9,7 +9,7 @@
 #   2. 越界读被挡（../.env、/etc/shadow、~/.ssh）
 #   3. 越界写被挡（宿主 HOME 下留不下文件）
 #   4. 出站网络通（D37 与 macOS 对齐；--unshare-all 会误卸 net）
-#   5. 超时帽生效且不留孤儿进程
+#   5. 超时上限生效且不留孤儿进程
 #
 # 参数（环境变量，不写死本机端口与路径）：
 #   TAKO_BASE         引擎地址，默认 http://127.0.0.1:8943
@@ -89,9 +89,9 @@ if [ -e "$OUTSIDE" ]; then no "宿主 HOME 下被写出了文件：$OUTSIDE"; rm
 OUT=$(post_bash "curl -sS -m 8 -o /dev/null -w 'NET-HTTP=%{http_code}' https://example.com; echo")
 has "$OUT" "NET-HTTP=200" "沙箱内出站网络通（与 macOS D37 同语义）"
 
-# ── 5. 超时帽 + 孤儿进程 ──────────────────────────────────────────────────
+# ── 5. 超时上限 + 孤儿进程 ──────────────────────────────────────────────────
 OUT=$(post_bash 'sleep 10; echo NEVER')
-has "$OUT" "bash 超时" "超时帽生效"
+has "$OUT" "bash 超时" "超时上限生效"
 hasnt "$OUT" "NEVER" "超时后没有继续跑完"
 sleep 1
 if pgrep -af 'sleep 10' >/dev/null 2>&1; then no "超时后还有孤儿进程：$(pgrep -af 'sleep 10')"; else ok "超时后没有孤儿进程"; fi

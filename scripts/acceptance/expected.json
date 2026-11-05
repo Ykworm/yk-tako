@@ -1917,7 +1917,7 @@
       "id": "32-read-pagination",
       "case": "用例 32",
       "tier": "core",
-      "desc": "读分页（doc/58 §3）：offset/limit 切片 + 三态页脚、offset 越界/非正/limit 超帽 400 111002、缺文件 400 111002（读工具的字节只有 dev 口打得到）",
+      "desc": "读分页（doc/58 §3）：offset/limit 切片 + 三态页脚、offset 越界/非正/limit 超上限 400 111002、缺文件 400 111002（读工具的字节只有 dev 口打得到）",
       "steps": [
         {
           "op": "signup",

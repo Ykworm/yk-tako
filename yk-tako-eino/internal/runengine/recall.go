@@ -17,7 +17,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// 线一召回的帽（doc/29 §8，数值写死不是配置）。
+// 线一召回的上限（doc/29 §8，数值写死不是配置）。
 const (
 	memoryRecallTermsMax   = 12 // 检索词上限（按原文出现先后截断）
 	memoryRecallCandidates = 20 // SQL 候选上限

@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// bash 的时长帽。工作目录只决定默认路径，拦不住 cat /etc/passwd。
+// bash 的时长上限。工作目录只决定默认路径，拦不住 cat /etc/passwd。
 // 围栏后端：macOS 用 sandbox-exec（seatbelt），Linux 用 bubblewrap（bwrap）；
 // 两者都探测不到时不能假装已经隔离。
 const (
@@ -329,7 +329,7 @@ func commandInsideRoot(command, root string) bool {
 }
 
 // startBash 准备一条命令。requireSandbox 为真且本机没有能 apply 的围栏后端时直接失败，不退回裸 bash。
-// 返回的 runCtx 是套了时长帽的那个 context。沙箱里的进程被杀掉时，cmd.Run 往往给出退出码 -1，
+// 返回的 runCtx 是套了时长上限的那个 context。沙箱里的进程被杀掉时，cmd.Run 往往给出退出码 -1，
 // 不再带 DeadlineExceeded；调用方要看 runCtx 才知道是超时。
 func startBash(ctx context.Context, workspace, command string, timeout time.Duration, requireSandbox bool) (*exec.Cmd, func(), bool, context.Context, error) {
 	runCtx := ctx

@@ -28,7 +28,7 @@ type webFetchInput struct {
 	URL string `json:"url" jsonschema:"description=一个 http(s) 链接"`
 }
 
-// webFetchURLMax 是 url 的字数帽：DeepSeek Fetch 收 ≤8192 字符，超了整次 400。
+// webFetchURLMax 是 url 的字数上限：DeepSeek Fetch 收 ≤8192 字符，超了整次 400。
 const webFetchURLMax = 8192
 
 func newWebFetchTool(workspace string, counter TokenCounter) (tool.BaseTool, error) {
@@ -101,7 +101,7 @@ func webFetchFn(ctx context.Context, in webFetchInput, workspace string, counter
 }
 
 // deepseekFetch 是选择器的 deepseek 行（doc/57 §3）：POST /v1/tools/fetch，响应 {title, content}。
-// 正文不设字节帽（2026-11-01 拍），所以不走 postJSON 的 1 MiB 读法，直接解响应流。
+// 正文不设字节上限（2026-11-01 拍），所以不走 postJSON 的 1 MiB 读法，直接解响应流。
 func deepseekFetch(ctx context.Context, target string) (fetchedPage, error) {
 	base := strings.TrimRight(envOrDefault("DEEPSEEK_FETCH_BASE_URL",
 		envOrDefault("DEEPSEEK_SEARCH_BASE_URL", "https://api.deepseek.com")), "/")
@@ -120,7 +120,7 @@ func deepseekFetch(ctx context.Context, target string) (fetchedPage, error) {
 	return fetchedPage{URL: target, Title: strings.TrimSpace(resp.Title), Content: resp.Content}, nil
 }
 
-// postJSONDecode 发 POST JSON 并把响应流直接解进 out：抓取正文不设字节帽（doc/57 §4），
+// postJSONDecode 发 POST JSON 并把响应流直接解进 out：抓取正文不设字节上限（doc/57 §4），
 // 不能复用 postJSON 的 1 MiB 信封读法。错误口径与 postJSON 一致：≥400 只报状态码，不贴正文。
 func postJSONDecode(ctx context.Context, endpoint string, headers map[string]string, body any, timeout time.Duration, out any) error {
 	payload, err := json.Marshal(body)

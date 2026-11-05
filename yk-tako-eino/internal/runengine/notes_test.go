@@ -143,7 +143,7 @@ func TestRenderNotesSnapshotTwoForms(t *testing.T) {
 
 // ── M7：写入函数四道检查（真实例 PG，newTestStore 隔离库）──────────────────────
 //
-// 四条检查的测试锚：帽（含 replace 投影合计）、原话（非空/≤200）、不可见字符（content/quote
+// 四条检查的测试锚：上限（含 replace 投影合计）、原话（非空/≤200）、不可见字符（content/quote
 // 两字段、remove 不被毒行挡）、同事务锁（另连接持锁时 writeNote 阻塞）+ 替代语义（旧行逐字不动、
 // superseded_by 指新行、remove 物理删、多命中拒写）。
 
@@ -176,7 +176,7 @@ func mustWriteNoteOK(t *testing.T, s *Store, ws string, in noteWrite) noteWriteR
 	return res
 }
 
-// ① 帽（add 两 kind 恰满不拒、超 1 字拒；replace 按「旧行退出后的投影合计」算——
+// ① 上限（add 两 kind 恰满不拒、超 1 字拒；replace 按「旧行退出后的投影合计」算——
 // 同一占用下整句换新不该被拒，若按未减旧的合计算必拒）。
 func TestWriteNoteCaps(t *testing.T) {
 	s := newTestStore(t, testLease, testTTL)
@@ -196,7 +196,7 @@ func TestWriteNoteCaps(t *testing.T) {
 		t.Fatalf("超 1 字未拒: fail=%q", res.fail)
 	}
 	if got := len(allNoteRows(t, s, ws)); got != 1 {
-		t.Fatalf("超帽后行数 = %d, want 1（拒写不落库）", got)
+		t.Fatalf("超上限后行数 = %d, want 1（拒写不落库）", got)
 	}
 
 	// replace 投影：受控造 2200 满 → 整句换成另一个 2200 字句，旧行退出后仍恰满 → 该过。
@@ -215,10 +215,10 @@ func TestWriteNoteCaps(t *testing.T) {
 		OldContent: strings.Repeat("新", noteCapAgent),
 	})
 	if res.fail != noteFailOverCap || res.projRunes != noteCapAgent+1 {
-		t.Fatalf("投影超帽: fail=%q projRunes=%d, want %s/%d", res.fail, res.projRunes, noteFailOverCap, noteCapAgent+1)
+		t.Fatalf("投影超上限: fail=%q projRunes=%d, want %s/%d", res.fail, res.projRunes, noteFailOverCap, noteCapAgent+1)
 	}
 
-	// user 帽 1375 同理（恰满过、+1 拒）。
+	// user 上限 1375 同理（恰满过、+1 拒）。
 	mustWriteNoteOK(t, s, ws, noteWrite{
 		Action: "add", Kind: noteKindUser,
 		Content: strings.Repeat("好", noteCapUser), Quote: "原话",

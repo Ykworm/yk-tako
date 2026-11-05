@@ -289,7 +289,7 @@ type logResponse struct {
 //	              （同 messageId 同 text）；服务端**不按 messageId 去重**，幂等只在「闸」层面。
 //	text       —— 消息正文。
 //	images     —— 可省（doc/32 A1）。每项 {mime, dataBase64, name?}：name = 用户上传文件名
-//	              （可省，A6 通信字段）；白名单与单文件 5MB / 单消息 4 张帽见 media.go。
+//	              （可省，A6 通信字段）；白名单与单文件 5MB / 单消息 4 张上限见 media.go。
 //	              合法图落工作区目录 .media/（内容寻址，占位 path 带 workspaces/<wid>/），user 行 text = 正文 + 每图一行
 //	              [media …] 占位（含 seq 全会话序号与 name）——对话里只有 path，没有字节。
 //
@@ -467,7 +467,7 @@ func (s *Server) postRuns(c *gin.Context) {
 	}
 	// 准入（C5-A1，tail 支）：单条消息超 limit/3 → 抢闸前拒收——不烧闸、不落 mh 行、零痕迹，
 	// 客户端可裁剪重发（messageId 复用无妨：幂等只在闸层面，这里根本没到闸）。
-	// 只数正文（doc/32 A2 翻案 2026-10-18）：图的门槛是 ingestImages 的硬帽（上面已过），
+	// 只数正文（doc/32 A2 翻案 2026-10-18）：图的门槛是 ingestImages 的硬上限（上面已过），
 	// base64 不进 cl100k——文本管道下模型窗口里只有占位行，数字节既拒错人又跑不动。
 	if limit, tokens, ok := s.worker.AdmitText(req.Text); !ok {
 		// limit 与 tokens 进 data（客户端据此裁剪重发），message 只放人话（doc/40 §3 规则 3）。
@@ -1302,7 +1302,7 @@ func (s *Server) getMemoryJobs(c *gin.Context) {
 }
 
 // getMemoryDialogue（doc/29 §7.2③）＝ 索引状态（线二观测口）；runId 空 = 最近 20 条。
-// passage 随行返回：B 组要验块内容，dev 观测口，块帽 4000 rune 可接受。
+// passage 随行返回：B 组要验块内容，dev 观测口，块上限 4000 rune 可接受。
 // 信封（doc/40 A7-5）：200 {"code":0,"message":"","data":{"chunks":[…]}}。
 type dialogueChunkResponse struct {
 	RunID     RunID     `json:"runId"`

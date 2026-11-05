@@ -202,7 +202,7 @@ func TestReadTextFileBasic(t *testing.T) {
 		t.Fatalf("offset=0 应报非正数: %v", err)
 	}
 	if _, err = it.InvokableRun(ctx, `{"path":"lines.txt","limit":5000}`); err == nil || !strings.Contains(err.Error(), "2000") {
-		t.Fatalf("limit=5000 应报超帽: %v", err)
+		t.Fatalf("limit=5000 应报超上限: %v", err)
 	}
 	if _, err = it.InvokableRun(ctx, `{"path":"lines.txt","offset":31}`); err == nil || !strings.Contains(err.Error(), "超出文件末尾") {
 		t.Fatalf("offset 越界应报错: %v", err)
@@ -255,7 +255,7 @@ func TestReadTextFileLargeFilePaged(t *testing.T) {
 	}
 }
 
-// 字节帽先到：单行超 2000 字符先截断（dsh 的 READ_MAX_LINE_LENGTH），
+// 字节上限先到：单行超 2000 字符先截断（dsh 的 READ_MAX_LINE_LENGTH），
 // 整页超 50KB 时页脚换成「本次被 50KB 上限截断」——只能靠 offset 跳着读。
 func TestReadTextFileByteCapFooter(t *testing.T) {
 	root := t.TempDir()
@@ -280,10 +280,10 @@ func TestReadTextFileByteCapFooter(t *testing.T) {
 	if !strings.HasPrefix(out, strings.Repeat("x", readMaxLineChars)+"…（本行超长已截断）\n") {
 		t.Fatalf("超长单行截断形状不对: %q", out[:min(60, len(out))])
 	}
-	// 页脚：字节帽先到（实跑字节：40 行 × 3000 字符，每行截到 2000 字符 = 2001 字节 → 25 行越过 50KB）。
+	// 页脚：字节上限先到（实跑字节：40 行 × 3000 字符，每行截到 2000 字符 = 2001 字节 → 25 行越过 50KB）。
 	const wantFooter = "\n\n（已显示第 1-25 行，共 40 行；本次被 50KB 上限截断，继续读用 offset=26）"
 	if !strings.HasSuffix(out, wantFooter) {
-		t.Fatalf("字节帽页脚不对: %q", out[max(0, len(out)-90):])
+		t.Fatalf("字节上限页脚不对: %q", out[max(0, len(out)-90):])
 	}
 }
 

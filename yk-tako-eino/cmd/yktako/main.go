@@ -258,7 +258,7 @@ func main() {
 	}
 	log.Printf("memory: extract=%v recall=%v rag=%v", memCfg.Extract, memCfg.Recall, memCfg.RAG)
 
-	// C5-A7：摘要预算帽的硬顶（正整数 tok；缺省/0 = 不顶；解析失败/负由 intEnv fail fast）。
+	// C5-A7：摘要预算上限的硬顶（正整数 tok；缺省/0 = 不顶；解析失败/负由 intEnv fail fast）。
 	maxOutput := intEnv("TAKO_MODEL_MAX_OUTPUT", 0)
 
 	// T3-1b：子代理 `model:` 写值档的模型客户端缓存（进程内懒加载，19v6-05 §4）——启动时为空，

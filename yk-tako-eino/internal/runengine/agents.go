@@ -409,7 +409,7 @@ func (d *delegationTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
 	return d.inner.Info(ctx)
 }
 
-// InvokableRun：取闸（满则等，ctx 取消可中断——不无限吊住父循环）→ 内层照跑 → 回传超帽截断。
+// InvokableRun：取闸（满则等，ctx 取消可中断——不无限吊住父循环）→ 内层照跑 → 回传超上限截断。
 // 内层错误分流（A2，doc/17 §6 + planning D2）：折叠链错误（handler 的 foldChainErrorMark 前缀，
 // graph 层的 [NodeRunError] 壳不影响文本匹配）与厂商溢出拒收（IsOverflowError，待拍①已裁转）
 // 同属「终稿出不来」一类——转成错误文本当这次委派的工具结果，父 run 保持 complete；
@@ -472,13 +472,13 @@ func runSubagentGuarded(ctx context.Context, store *Store, sem chan struct{}, ca
 		// ctx 取消、panic 转成的事件错误、其余上抛：不写 terminal，文件留成半成品。
 		return "", err
 	}
-	// 先按帽截断正文，再把实例 id 接在末尾，帽不会把 id 切掉。
+	// 先按上限截断正文，再把实例 id 接在末尾，上限不会把 id 切掉。
 	text := withSubagentInstance(truncateDelegationReturn(out, capBytes), subagentWireID(wire))
 	wire.finish("complete", text)
 	return text, nil
 }
 
-// delegationTruncationNotice 是超帽回传的尾缀模板（照 pi：50 KB 上限、UTF-8 安全 + omitted 提示；
+// delegationTruncationNotice 是超上限回传的尾缀模板（照 pi：50 KB 上限、UTF-8 安全 + omitted 提示；
 // 全量在子代理 runlog，19v6-05 §4）。%d = 被省略的字节数。
 const delegationTruncationNotice = "[Output truncated: %d bytes omitted. Full output preserved in subagent runlog.]"
 

@@ -35,7 +35,7 @@ func (s *Store) addChunk(t *testing.T, rid RunID, sid SessionID, workspace, pass
 	}
 }
 
-// B3：@@@ 召回的排序、scope 过滤、条数帽与特殊字符安全（doc/29 §6.2）。
+// B3：@@@ 召回的排序、scope 过滤、条数上限与特殊字符安全（doc/29 §6.2）。
 func TestRecallDialogueItems(t *testing.T) {
 	ctx := context.Background()
 	s := newRagStore(t)
@@ -67,12 +67,12 @@ func TestRecallDialogueItems(t *testing.T) {
 		t.Fatalf("特殊字符查询: %v", err)
 	}
 
-	// 条数帽：4 条命中最多回 3 条。
+	// 条数上限：4 条命中最多回 3 条。
 	s.addChunk(t, "r_e", "s_5", "/tmp/ws-test", "5433 5433 又一次")
 	s.addChunk(t, "r_f", "s_6", "/tmp/ws-test", "5433 再来一条")
 	items, err = s.recallDialogueItems(ctx, "5433")
 	if err != nil || len(items) != dialogueRecallItemsMax {
-		t.Fatalf("条数帽 = %d err=%v, want %d", len(items), err, dialogueRecallItemsMax)
+		t.Fatalf("条数上限 = %d err=%v, want %d", len(items), err, dialogueRecallItemsMax)
 	}
 }
 
@@ -99,7 +99,7 @@ func TestRecallLexicalGap(t *testing.T) {
 	}
 }
 
-// B3：两线合并块（顺序 memory → dialogue）、每条 300 帽、HTML 转义、开关联动。
+// B3：两线合并块（顺序 memory → dialogue）、每条 300 上限、HTML 转义、开关联动。
 func TestRecallMergedBlock(t *testing.T) {
 	ctx := context.Background()
 	s := newRagStore(t)
@@ -128,7 +128,7 @@ func TestRecallMergedBlock(t *testing.T) {
 	if strings.Contains(line, "<b>") || !strings.Contains(line, "&lt;b&gt;") {
 		t.Fatalf("dialogue 转义缺失:\n%s", line)
 	}
-	// 300 帽：行内「汉」的数量 ≤300。
+	// 300 上限：行内「汉」的数量 ≤300。
 	if got := strings.Count(line, "汉"); got > dialogueRecallRuneCap {
 		t.Fatalf("dialogue 行未截断：%d 个汉字", got)
 	}

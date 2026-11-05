@@ -4,7 +4,7 @@
 // 否则打 searchfree 兜底；都失败交「错误：」回注，调用方照实写未能查证（run 仍 complete）。
 // 装配形状（2026-10-18 二稿）：结果全文写 <workspace>/.tako/search/<runId>_<n>.md，
 // 工具返回只有一段描述——来源、条数、文件占多少 token（与折叠链同一份 TokenCounter）、
-// 文件路径；要看内容调用方自己 read_file。没有内联条目，8192/800 帽对 web_search 不适用。
+// 文件路径；要看内容调用方自己 read_file。没有内联条目，8192/800 上限对 web_search 不适用。
 package runengine
 
 import (
@@ -57,7 +57,7 @@ type webSearchInput struct {
 	Query string `json:"query" jsonschema:"description=一句检索词"`
 }
 
-// webSearchQueryMaxRunes 是 query 的字数帽：新 /v1/tools/search 端点收 1–128 Unicode 字符，
+// webSearchQueryMaxRunes 是 query 的字数上限：新 /v1/tools/search 端点收 1–128 Unicode 字符，
 // 超了整次 400。截断不报错——检索词截断无信息损失争议，报错只会白烧一次 searchfree 兜底。
 const webSearchQueryMaxRunes = 128
 
@@ -136,7 +136,7 @@ func webSearchFn(ctx context.Context, in webSearchInput, workspace string, count
 }
 
 // searchHit 是一行搜索结果的中间形状（文件装配的输入）：title 截 200；snippet 在 deepseek
-// 行 = summary 全文（文件面无帽，原文抄录 65–2492 字极差大也不截）、searchfree 行截 500。
+// 行 = summary 全文（文件面无上限，原文抄录 65–2492 字极差大也不截）、searchfree 行截 500。
 type searchHit struct {
 	title   string
 	url     string
@@ -147,7 +147,7 @@ type searchHit struct {
 // /v1/tools/search（按次计费 $0.75/千次、5 QPS、与 Fetch 独立限流）。不经过模型：请求就是
 // 查询词，响应 results 每条自带 title/url/summary（summary 是页面原文抽取，不是模型转述）。
 // need_content 显式给 false（snippet/summary 不依赖它）；count 不传 = 端点默认 10；
-// 60 秒帽只兜「ctx 没被取消但厂商不回」（ctx 取消经手动停止拍自动生效）。
+// 60 秒上限只兜「ctx 没被取消但厂商不回」（ctx 取消经手动停止拍自动生效）。
 func deepseekSearch(ctx context.Context, query string) ([]searchHit, error) {
 	base := strings.TrimRight(envOrDefault("DEEPSEEK_SEARCH_BASE_URL", "https://api.deepseek.com"), "/")
 	headers := map[string]string{"Authorization": "Bearer " + os.Getenv("DEEPSEEK_API_KEY")}
@@ -229,7 +229,7 @@ func searchfreeSearch(ctx context.Context, query string) ([]searchHit, error) {
 	return hits, nil
 }
 
-// postJSON 是两行共用的发请求出口：POST JSON、头可加、超时帽取先到（工具 ctx 之外的兜底）；
+// postJSON 是两行共用的发请求出口：POST JSON、头可加、超时上限取先到（工具 ctx 之外的兜底）；
 // 状态 ≥ 400 只报状态码不贴正文（doc/22 §5：原因里只有 HTTP 状态，不贴密钥）。
 func postJSON(ctx context.Context, url string, headers map[string]string, body any, timeout time.Duration) ([]byte, error) {
 	payload, err := json.Marshal(body)
@@ -260,7 +260,7 @@ func postJSON(ctx context.Context, url string, headers map[string]string, body a
 }
 
 // renderSearchFile 渲染落盘文件全文（doc/22 §3）：首行来源 + 查询 + 编号条目
-// （标题 200 字、摘要全文——文件不受 8192/800 任何帽管，超帽内容住文件不吃上下文）。
+// （标题 200 字、摘要全文——文件不受 8192/800 任何上限管，超上限内容住文件不吃上下文）。
 func renderSearchFile(source, query string, hits []searchHit) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "来源：%s\n查询：%s\n", source, query)

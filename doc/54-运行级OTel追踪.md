@@ -95,7 +95,7 @@ Loop 原生 adapter 能自动产出「每次模型调用、每次工具执行」
 | `gen_ai.input.messages` | JSON 字符串（semconv 消息数组） | 本轮用户原文（召回注入前，业务输入）；开关关时不写 | run 级 trace 容器里的本轮 user 行 | 内容开关开时，召回前 |
 | `gen_ai.output.messages` | JSON 字符串（semconv 消息数组） | 本轮 root agent 的 assistant 产出（含 tool_call parts）；子代理条目不进根输出 | `turn` 里 `Agent==""` 的 assistant 条目 | 内容开关开时，收尾 |
 | `gen_ai.system_instructions` | JSON 字符串（`[{"type":"text",...}]`） | 本轮系统提示词；开关关时不写 | `w.instruction(ctx)` | 内容开关开时，解析后 |
-| `tako.content.truncated` | `true` | 内容属性被体积帽截断过；接收端据此知道内容不完整 | 内容序列化 helper | 写内容时 |
+| `tako.content.truncated` | `true` | 内容属性被体积上限截断过；接收端据此知道内容不完整 | 内容序列化 helper | 写内容时 |
 | `gen_ai.conversation.compacted` | `true` | 本 run 是否折过历史；语义约定要求只在确定折过时写 `true`，**不写 `false`** | 本 run 产生过折叠产物（`foldBox.stagedList()` 非空） | 收尾 |
 | `error.type` | `run_error` | 失败分类，接收端按它做错误分组；本篇只有这一个粗分类，拿得到更细的错误码再细分 | `status=error` 时写 | 收尾 |
 | `tako.run.status` | `complete` / `error` / `stopped` | 最终态；用户停止由停止端点翻库，所以要从库里回读，不能只信本地变量 | 收尾时读 `runs.status` | 收尾 |
@@ -138,7 +138,7 @@ Loop 原生 adapter 能自动产出「每次模型调用、每次工具执行」
 
 **格式**：按 semconv 的 JSON schema 序列化成 **JSON 字符串**（Go 的 OTel span 还不支持结构化属性；规范允许在 span 上退化为字符串）。消息对象是 `{"role":"user","parts":[...]}`；文本 part `{"type":"text","content":"..."}`；工具调用 `{"type":"tool_call","id":...,"name":...,"arguments":...}`；工具结果 `{"type":"tool_call_response","id":...,"response":...}`；思考内容 `{"type":"reasoning","content":...}`。图片不内联 base64，用 `{"type":"uri","uri":"tako://media/<id>","modality":"image"}` 引用，字节仍走 tako 的 media 出口。
 
-**体积帽**（常量，不做配置）：每个文本 part 最多 8 KiB；每个属性序列化后最多 64 KiB，超了保留最近的 part/message 并写 `tako.content.truncated=true`。不设帽会撞上传体上限，也会把 trace 存储成本放大。
+**体积上限**（常量，不做配置）：每个文本 part 最多 8 KiB；每个属性序列化后最多 64 KiB，超了保留最近的 part/message 并写 `tako.content.truncated=true`。不设上限会撞上传体上限，也会把 trace 存储成本放大。
 
 **PII 说明**：默认开意味着用户原文、工具结果、系统提示词会随 span 发到 Loop。这是本仓库 `.env` 的选择——排障需要内容。关掉只需把值改成 `NO_CONTENT`；本篇不做掩码、不做租户级开关、不做外部存储引用（§6 登记）。将来给多租户用，先补掩码再谈默认值。
 
@@ -156,9 +156,9 @@ Loop 原生 adapter 能自动产出「每次模型调用、每次工具执行」
 
 1. **默认值行业里没有统一答案。** OTel 规范与 Azure 是「默认不采」，LangSmith 与 OpenAI Agents SDK 是「默认采、给关掉的开关」。默认值取决于产品把 trace 当调试工具（需要内容）还是当运营台账（只需要元数据）。
 2. **只有「全采/全不采」不够，真正要的是出口前的掩码。** Langfuse 的做法值得抄：内容不是不能记，而是必须在离开应用之前把手机号、身份证、token 这类字段替换掉。这件事必须在进程内做（SDK hook 或 OTel processor），不能指望后端。本篇先不做，登记在 §6。
-3. **内容体积是独立于 PII 的问题。** 几 MB 的 messages 会撞上传体上限、拖慢导出、把 trace 存储成本放大几十倍；所以即使开关打开，也要有体积帽（上文 8 KiB / 64 KiB）。
+3. **内容体积是独立于 PII 的问题。** 几 MB 的 messages 会撞上传体上限、拖慢导出、把 trace 存储成本放大几十倍；所以即使开关打开，也要有体积上限（上文 8 KiB / 64 KiB）。
 
-**tako 选规范里的第 2 种用法**：内容记录在 span 属性上，加标准开关。第 1 种是 OTel 默认（不采），第 3 种是生产态（外部存储 + 引用）。现在处于开发/自用阶段，内容直接放 span 最省事；开关和体积帽先立好，将来切第 3 种时只换出口，不换调用点。
+**tako 选规范里的第 2 种用法**：内容记录在 span 属性上，加标准开关。第 1 种是 OTel 默认（不采），第 3 种是生产态（外部存储 + 引用）。现在处于开发/自用阶段，内容直接放 span 最省事；开关和体积上限先立好，将来切第 3 种时只换出口，不换调用点。
 
 出处（官方文档，2026-10-31 核对）：[OTel GenAI spans 语义约定](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/)、[LangSmith 文档](https://docs.smith.langchain.com/)、[Langfuse 文档](https://langfuse.com/docs)、[OpenAI Agents SDK tracing](https://openai.github.io/openai-agents-python/tracing/)、[Azure AI Foundry 文档](https://learn.microsoft.com/en-us/azure/ai-foundry/)。
 
@@ -393,7 +393,7 @@ GET <base>/api/public/v2/metrics
 
 | 步 | 做什么 | 解决了什么 | 验收（第一行是打一个跑着的东西） |
 |---|---|---|---|
-| A1 | `internal/observability` 装配（env → OTLP exporter → TracerProvider，缺配置即 noop；解析 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT` 并提供内容序列化 helper）+ `POST /api/dev/trace-check` 发一条样例根 span（开关开时带样例 input/output/system，验证 JSON 与体积帽）并 ForceFlush | 先证明「令牌 + 空间 ID + 端点 + 属性名 + 内容开关」这条管道通；不通时能隔离在观测层 | `curl -X POST /api/dev/trace-check` → `{"code":0,...,"data":{"traceId":"<32 hex>","exported":true}}`；Loop 按 traceId 搜到 `invoke_agent yktako`，内容开关开时能看到 `gen_ai.input.messages`/`output.messages`；把 env 改成 `NO_CONTENT` 重起 → 同一条探针没有内容属性；清空 COZELOOP env → `exported:false` |
+| A1 | `internal/observability` 装配（env → OTLP exporter → TracerProvider，缺配置即 noop；解析 `OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT` 并提供内容序列化 helper）+ `POST /api/dev/trace-check` 发一条样例根 span（开关开时带样例 input/output/system，验证 JSON 与体积上限）并 ForceFlush | 先证明「令牌 + 空间 ID + 端点 + 属性名 + 内容开关」这条管道通；不通时能隔离在观测层 | `curl -X POST /api/dev/trace-check` → `{"code":0,...,"data":{"traceId":"<32 hex>","exported":true}}`；Loop 按 traceId 搜到 `invoke_agent yktako`，内容开关开时能看到 `gen_ai.input.messages`/`output.messages`；把 env 改成 `NO_CONTENT` 重起 → 同一条探针没有内容属性；清空 COZELOOP env → `exported:false` |
 | A2 | `worker.run` 起手开 span、收尾写属性；`runs.status` 回读；`tako.workspace.id` 回读；根 span 内容属性（本轮用户原文 / root assistant 输出 / 系统提示词）；日志打 traceId | 把真 run 的会话/租户/项目/用量/状态/业务输入输出装进记录 | curl 起一场真 run → 完成后 Loop 搜 `conversation.id=<sessionId>`；`gen_ai.usage.*` 与 `/api/runs/{id}/frames` 的 usage 帧求和逐值相等；`tako.workspace.id` 与 `sessions.workspace_id` 一致；内容开时三个内容属性可 JSON 解析，`NO_CONTENT` 时一个都没有 |
 | A3 | doc/54 收口、doc/README 索引、doc/16 基线、`.env` 注释与启动日志说明（含内容开关与 A7–A9 已登记） | 状态与真源一致，下一场会话知道第一段已落地、后续拍已登记 | `bash scripts/check-master-plan.sh` 通过；A1/A2 两条 curl 复打仍绿 |
 | A4（第二段，A3 绿后接） | 模型调用子 span：包装 `model.BaseChatModel`，每次调用一条 `chat {model}` CLIENT span，写 `gen_ai.response.time_to_first_chunk`、usage、`gen_ai.response.finish_reasons`；内容开关开时写 `gen_ai.system_instructions` / `input.messages` / `output.messages`；TTFT/TPOT 从这里出 | run 级只有总时长，TTFT/TPOT 是推理调用层的度量；内容属性落到每次真实调用上 | curl 起一场流式 run → Loop 里 run span 下出现 `chat <model>` 子 span；`time_to_first_chunk` 非空且 < 总时长；`(总时长 − TTFT) / (output_tokens − 1)` 与手算值一致；内容开时 input/output 可解析，output 含 tool_call parts |

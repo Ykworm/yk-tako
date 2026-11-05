@@ -125,7 +125,7 @@ POST /api/runs 请求体加图：`images` 数组（每项 `{mime, dataBase64, na
   折进 `AdmitText` 预算，两个后来的事实把它打翻：① tiktoken-go 对 MB 级 base64 是分钟级
   （300KB 实测 39s，3MB 截图≈分钟，而用户随手截图就 3MB）；② deepseek-flash 实测按张
   平价 ~384 token，cl100k 数字节差三个数量级——就算跑得动也是拒错人（文本管道下 3MB 图
-  实际只发一行占位进模型窗口）。图的门槛退回硬帽（≤5MB/张、≤4 张、白名单，字节比较瞬时，
+  实际只发一行占位进模型窗口）。图的门槛退回硬上限（≤5MB/张、≤4 张、白名单，字节比较瞬时，
   在 `ingestImages` 里、token 准入之前）；`AdmitText` 签名去 blobs（「不折算」编译层钉死）。
   图片进窗口的 token 按 DeepSeek v41 另计，只加实际会发送的图（A3-5 已落地）。`AdmitText` 仍只数正文。usage 仍是已经发出去的请求的锚点，估算只补锚点之后新增的图。不回这套字节折算。翻案活体：3MB 图 POST 43ms 落占位行（翻案前 300KB 就要 39s）。
 - 验收（curl 手打）：POST 带 1×1 PNG 的 base64 → 202 → `GET /api/sessions/{id}/log`
@@ -264,7 +264,7 @@ A3 的五拍：
   `countInput` 不计工具声明，折叠触发线看的是估算。
 - 单测覆盖解析、最后一条 user 与其后 tool 才还原、历史边界、读盘失败、召回标签边界、
   工具图 commit 后不重复、user 图只在成功回复后算已发、guard 重试共用同一条 pending、回执金样、
-  SVG/BMP/PDF 不还原、缺文件、超帽、sha 不符、`../` 与 symlink 越界、非普通文件、
+  SVG/BMP/PDF 不还原、缺文件、超上限、sha 不符、`../` 与 symlink 越界、非普通文件、
   `Vision=false` 原样返回并打一行 `model_no_vision`、`TAKO_MEDIA_SEND=off` 不挂包壳、
   目录 `deepseek/deepseek-flash` 的 `vision` 为 true 而 `deepseek-v4-pro` 为 false，
   以及 A3-5 的 v41 向量、四格式读头、`countInput` 加 `MediaTokens`、只给未发送的图标价、

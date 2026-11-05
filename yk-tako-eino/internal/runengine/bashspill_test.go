@@ -63,7 +63,7 @@ func TestBashKeepsTailAndSpillsWhole(t *testing.T) {
 	}
 }
 
-// 装不下全文：把落盘帽调到很小，超了就**删文件、不报路径**（dsh 的 discardSpill 纪律）。
+// 装不下全文：把落盘上限调到很小，超了就**删文件、不报路径**（dsh 的 discardSpill 纪律）。
 func TestBashSpillDiscardedWhenWholeDoesNotFit(t *testing.T) {
 	root := t.TempDir()
 	c := &tailCollector{

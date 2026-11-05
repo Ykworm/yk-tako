@@ -1,7 +1,7 @@
 // 本文件是 read 工具的分页窗口（doc/58 §3）：一次调用最多给模型 2000 行 / 50KB，
 // 末尾附一行页脚（总行数 + 下一个 offset）。形态照 dsh 的 tool-fs read
 // （packages/fs/tool-fs/src/read-render.ts）：offset 1-based、limit 行数、
-// 页脚三态、被字节帽挡下的那一行丢弃且后续行不再收。
+// 页脚三态、被字节上限挡下的那一行丢弃且后续行不再收。
 //
 // 读法是**流式**的（dsh 的 buildWindow 同款）：一趟扫过去同时干三件事——
 // 算整文件 sha256（写前判据要整份口径）、点总行数（页脚要给）、只收请求的那一页。
@@ -20,7 +20,7 @@ import (
 	"unicode/utf8"
 )
 
-// read 的三个帽（dsh 的 READ_LIMIT / READ_MAX_BYTES / READ_MAX_LINE_LENGTH）：
+// read 的三个上限（dsh 的 READ_LIMIT / READ_MAX_BYTES / READ_MAX_LINE_LENGTH）：
 // 一次调用最多返回 2000 行、最多 50KB；单行超过 2000 字符的部分截掉并标注。
 const (
 	readWindowMaxLines = 2000
@@ -156,7 +156,7 @@ func trimToRuneBoundary(b []byte) []byte {
 }
 
 // readFooter 派生页脚三态（字节定死，doc/58 §3.2）：
-// 字节帽先到 → 说明只能靠 offset 跳着读；否则还有更多 → 给下一个 offset；
+// 字节上限先到 → 说明只能靠 offset 跳着读；否则还有更多 → 给下一个 offset；
 // 读到末尾 → 只报总行数（head/tail 删掉后，总行数是模型唯一的定位坐标）。
 func readFooter(offset, total int, page []string, capped bool) string {
 	last := offset + len(page) - 1

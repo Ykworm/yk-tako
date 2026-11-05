@@ -51,7 +51,7 @@ import (
 // overflowGuard 是挂在中介链尾的救援中间件（D13）：只覆写 WrapModel，把内层模型包成
 // guardModel。windowOn 取自操作者窗标（compactWindow > 0；窗未声明 = 本层关）。
 // 救援依赖（B2）随构造注入：counter 计数、summarize 摘要、fileEffects 钉块判定表——
-// 与 midfoldHandler 同一组装配件（同一顶帽、同一张表）。
+// 与 midfoldHandler 同一组装配件（同一道上限、同一张表）。
 type overflowGuard struct {
 	*adk.BaseChatModelAgentMiddleware
 	windowOn    bool

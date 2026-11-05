@@ -265,7 +265,7 @@ index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型�
   - **回传给父 run 的文本** = AgentTool 的返回值 = 子代理**末轮消息正文**（多轮时为其末段：不含工具轮前导语）；**先裁后落**——mh tool 行 / runlog 委派 `tool_result` 行 / 帧侧 `tool_result.output` 三处是同一份**已裁剪文本**（逐字节相等）；全量只在子代理终稿行。
   - **截断尾缀原文**（delegationTool，代码 `agents.go`；照 pi）：
     `[Output truncated: %d bytes omitted. Full output preserved in subagent runlog.]`，N = 总字节 − 保留字节；
-    截点回退到 UTF-8 rune 边界（绝不劈开多字节字符，保留段最多比帽少 3 字节）；`cap ≤ 0` = 不裁剪。
+    截点回退到 UTF-8 rune 边界（绝不劈开多字节字符，保留段最多比上限少 3 字节）；`cap ≤ 0` = 不裁剪。
     尾缀里的「subagent runlog」= 同一 log 端点上该 agent 的行（无新端点；客户端按行内 `agent` 字段跳转）。
   - **两个旋钮（main 旗标；选择归 human 写配置）**：`-subagent-concurrency`（默认 8；进程级信号量、全部规格共享；<1 = 启动即拒——0 = 所有委派永久等闸）+ `-subagent-return-cap`（默认 51200 B）；启动日志 `subagents: concurrency N, return cap M B`。
   - **随仓 seed 规格** `yk-tako-eino/agents/researcher.md`（开箱可跑 + 格式参照）：不写 `model` = 继承主实例那一档的活样例。`tools` 那一档自 2026-10-16 起改写成 `exclude_tools` 排除名单（`doc/26`：排除 `bash` 与写类四把，有效名单 11 项），不再是「什么都不写」的样例——**「两行都不写 = 整份继承父池」这一档今天没有出厂规格在用**，它仍是合法写法（`resolveToolPool` 第一态），但 `agents_test.go` 的 `TestShippedAgentSpecToolGuards` 要求出厂规格写 `tools:` / `exclude_tools:` 之一，有意继承要在测试的 `inheritOK` 里显式表态。

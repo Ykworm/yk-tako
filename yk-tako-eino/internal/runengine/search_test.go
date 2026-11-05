@@ -1,5 +1,5 @@
 // 本文件：21-历史查找 H5 回归网（search_history 面）。目标是钉住后续改动最容易悄悄变形的
-// 五个地方：词校验句与顺序（L8）、ILIKE 模式串的转义、片段/窗口行的有界渲染、4000 帽的
+// 五个地方：词校验句与顺序（L8）、ILIKE 模式串的转义、片段/窗口行的有界渲染、4000 上限的
 // 丢块规则（词模式末位丢起 / 窗口模式最远丢起 L5）与截断计数口径（H5 裁定：内联首行也写
 // 全量命中数）、截断落盘面（内容 = 未截断渲染、路径行逐字、run 内顺编、写失败降级）。
 // DB 路径的活体面已被 H1/H2/H4 验收覆盖，这里补两条 store 级小网（范围过滤与窗口负路径）。
@@ -219,7 +219,7 @@ func TestRenderSearchHits(t *testing.T) {
 		}
 		inline, full, truncated := renderSearchHits(hits, "E_DECK_17")
 		if !truncated {
-			t.Fatalf("10 块应超帽触发截断")
+			t.Fatalf("10 块应超上限触发截断")
 		}
 		if !strings.HasPrefix(inline, "命中 10 条。范围：本会话里本场 run 之前已提交的行。") {
 			t.Fatalf("截断后内联首行应写全量数「命中 10 条」（H5 裁定）\n实得首行: %q", strings.SplitN(inline, "\n", 2)[0])
@@ -245,7 +245,7 @@ func TestRenderSearchHits(t *testing.T) {
 	})
 }
 
-// TestRenderSearchWindow 钉窗口模式渲染：空兜底、升序、每行 800 字帽、截断从离 around_seq
+// TestRenderSearchWindow 钉窗口模式渲染：空兜底、升序、每行 800 字上限、截断从离 around_seq
 // 最远的行丢起（L5：距离相同先丢 seq 较大者）、截断句与全文。
 func TestRenderSearchWindow(t *testing.T) {
 	t.Run("空兜底", func(t *testing.T) {
@@ -271,7 +271,7 @@ func TestRenderSearchWindow(t *testing.T) {
 		}
 	})
 
-	t.Run("行帽800", func(t *testing.T) {
+	t.Run("行上限800", func(t *testing.T) {
 		rows := []RunlogEntry{{Seq: 5, Role: "user", Text: strings.Repeat("字", 900)}}
 		inline, _, _ := renderSearchWindow(rows, 5, 1)
 		want := "seq=5 的窗口，前后各 1 行。\n---\nseq=5 role=user agent=\n" + strings.Repeat("字", 800) + "\n……（后略）"
@@ -289,7 +289,7 @@ func TestRenderSearchWindow(t *testing.T) {
 		}
 		inline, full, truncated := renderSearchWindow(rows, 10, 5)
 		if !truncated {
-			t.Fatalf("10 行 × 700 字应超帽触发截断")
+			t.Fatalf("10 行 × 700 字应超上限触发截断")
 		}
 		if !strings.HasPrefix(inline, "seq=10 的窗口，前后各 5 行。") {
 			t.Fatalf("窗口首行不对，实得: %q", strings.SplitN(inline, "\n", 2)[0])

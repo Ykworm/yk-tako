@@ -88,12 +88,12 @@ func (s *Store) ResetDialogueChunks(ctx context.Context) (int64, error) {
 	return res.RowsAffected, res.Error
 }
 
-// 线二索引循环的节奏与帽（doc/29 §5.1/§5.2/§8，写死不是配置）。
+// 线二索引循环的节奏与上限（doc/29 §5.1/§5.2/§8，写死不是配置）。
 const (
 	dialogueIndexScanInterval = 2 * time.Second // 空扫间隔
 	dialogueIndexBatch        = 20              // 每轮最多索引的 run 数（反查会把历史一次全判待索引）
-	dialogueChunkCap          = 4000            // passage 总帽（rune）
-	dialogueSubFinalCap       = 1000            // 子代理终稿单条帽（rune）
+	dialogueChunkCap          = 4000            // passage 总上限（rune）
+	dialogueSubFinalCap       = 1000            // 子代理终稿单条上限（rune）
 )
 
 // RunDialogueIndexer 是线二的后台常驻循环（doc/29 §5.2）：每 2s 反查「complete 且不在
@@ -169,10 +169,10 @@ ON CONFLICT (run_id) DO UPDATE SET
 		passage, utf8.RuneCountInString(passage), truncated).Error
 }
 
-// 线二召回的帽（doc/29 §6.2/§8）。
+// 线二召回的上限（doc/29 §6.2/§8）。
 const (
 	dialogueRecallItemsMax = 3   // 注入的历史对话块上限
-	dialogueRecallRuneCap  = 300 // 每条 passage 的注入帽
+	dialogueRecallRuneCap  = 300 // 每条 passage 的注入上限
 )
 
 // dialogueCandidate 是一条召回的原文块（finished_at 取 run 的定稿时间，用于渲染日期）。
@@ -207,7 +207,7 @@ SELECT c.run_id, c.session_id, c.passage, paradedb.score(c.run_id) AS score,
 }
 
 // buildDialoguePassage 把 runlog 机械拼成一块（doc/29 §5.1）：user 全留、root 终稿全留、
-// 子代理终稿每条截 1000；总帽 4000，超出从尾部截并记 truncated。
+// 子代理终稿每条截 1000；总上限 4000，超出从尾部截并记 truncated。
 func buildDialoguePassage(sessionID SessionID, runID RunID, entries []RunlogEntry) (string, bool) {
 	lines := make([]string, 0, len(entries)+1)
 	lines = append(lines, "[会话 "+string(sessionID)+" · 场 "+string(runID)+"]")

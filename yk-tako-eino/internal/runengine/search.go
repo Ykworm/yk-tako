@@ -13,10 +13,10 @@
 // 为中心切前后各 200 字的片段 → 拼成「命中 N 条。…」文本进当轮 tool_result → 模型读出错误码、
 // 答用户。片段只进当轮工具结果，下一场的系统提示不因此变长。
 //
-// 有界性（doc/21 §3.2）：片段化 + 4000 字总帽不是锦上添花——没有它们，一次查询把刚折掉的
+// 有界性（doc/21 §3.2）：片段化 + 4000 字总上限不是锦上添花——没有它们，一次查询把刚折掉的
 // 正文原样灌回窗口，下一轮又触发折叠，这把工具就变成折叠的抽水机。截断落盘（H3，同节）：
-// 真丢行时把摘帽全文写进 <workspace>/.tako/search/<runId>_<n>.md、内联只加一行路径——
-// 帽保体积、文件保信息；写失败静默退化为纯截断，不炸 run。
+// 真丢行时把不设上限的全文写进 <workspace>/.tako/search/<runId>_<n>.md、内联只加一行路径——
+// 上限保体积、文件保信息；写失败静默退化为纯截断，不炸 run。
 //
 // 数据边界（doc/21 §3）：历史唯一真源 = runlog_entries，工具只读它（不写、也不读
 // run_model_messages）。它解决的是「下一场来问」：本场中途刚被折掉、还没提交的那段拿不到。
@@ -48,7 +48,7 @@ const (
 	searchLimitDefault    = 5    // limit 不传 = 5
 	searchLimitMax        = 10   // limit 上限（钳）
 	searchSnippetHalf     = 200  // 词模式片段：命中点向前、向后各取 200 字
-	searchResultCap       = 4000 // 命中块 / 窗口块拼接串的 rune 帽（L4：首行总结与截断行不计）
+	searchResultCap       = 4000 // 命中块 / 窗口块拼接串的 rune 上限（L4：首行总结与截断行不计）
 	searchWindowDefault   = 2    // window 不传 = 2
 	searchWindowMax       = 5    // window 上限（钳）
 	searchWindowLineRunes = 800  // 窗口模式每行从行首起最多取的字数
@@ -170,7 +170,7 @@ func newSearchHistoryTool(store *Store, workspace string) (tool.BaseTool, error)
 	})
 }
 
-// spillIfTruncated 是截断落盘出口（H3，doc/21 §3.2）：真丢行时把摘帽全文写进
+// spillIfTruncated 是截断落盘出口（H3，doc/21 §3.2）：真丢行时把不设上限的全文写进
 // <workspace>/.tako/search/<runId>_<n>.md，内联结果在「其余命中已截断。」之后加一行路径；
 // 写失败静默退化（不加路径行，其余字节与落盘机制存在前相同）。无截断 = 原样返回，不碰文件系统。
 func spillIfTruncated(inline, full string, truncated bool, workspace string, box *noteBox) string {
@@ -303,7 +303,7 @@ func runeIndexFold(hay []rune, needle string) int {
 // 全部命中块拼接串超 searchResultCap（L4：只计块拼接串，首行总结与截断行不计）→ 从末位
 // （最旧）整块丢起，末尾加「其余命中已截断。」——一次工具结果不能把刚折掉的正文原样灌回窗口。
 // 0 条 = 整段结果就是「没有命中。」。
-// H3（doc/21 §3.2「截断落盘」）：真丢行时另出一份 full = 摘帽全文（同一份渲染含全部块、
+// H3（doc/21 §3.2「截断落盘」）：真丢行时另出一份 full = 不设上限的全文（同一份渲染含全部块、
 // 不含截断标记行），交调用方落盘；无截断时 full 为空串、inline 与落盘机制存在前逐字节相同。
 func renderSearchHits(hits []RunlogEntry, firstWord string) (inline, full string, truncated bool) {
 	if len(hits) == 0 {
@@ -313,7 +313,7 @@ func renderSearchHits(hits []RunlogEntry, firstWord string) (inline, full string
 	for i, h := range hits {
 		blocks[i] = fmt.Sprintf("seq=%d role=%s agent=%s\n%s", h.Seq, h.Role, h.Agent, searchSnippet(h.Text, firstWord))
 	}
-	// 单块永不超过帽（片段有界在上游保证），len>1 的守卫防病态输入产出空结果。
+	// 单块永不超过上限（片段有界在上游保证），len>1 的守卫防病态输入产出空结果。
 	kept := len(blocks)
 	for kept > 1 && utf8.RuneCountInString(strings.Join(blocks[:kept], "\n---\n")) > searchResultCap {
 		kept--
@@ -351,7 +351,7 @@ func windowLine(text string) string {
 
 // renderSearchWindow 渲染窗口模式结果（doc/21 §3.3 样本）：首行「seq=N 的窗口，前后各 W 行。」+
 // `---` 分隔的窗口块（seq 升序；头行与词模式同形）。
-// 总帽 searchResultCap（L4 同口径：只计块拼接串）→ 从离 around_seq 最远的行丢起（L5：
+// 总上限 searchResultCap（L4 同口径：只计块拼接串）→ 从离 around_seq 最远的行丢起（L5：
 // 距离相同先丢 seq 较大者，确定性序），末尾加「其余命中已截断。」。
 // rows 为空是理论不可达（存在性前置已保证 seq=N 自己落在窗口里）——按负路径兜底。
 // H3 同 renderSearchHits：真丢行时另出 full = 完整窗口（含被丢行、不含截断标记行）供落盘。
@@ -406,7 +406,7 @@ func renderSearchWindow(rows []RunlogEntry, aroundSeq int64, window int) (inline
 }
 
 // renderWindowBlocks 拼窗口模式「首行 + 块体」——inline 与落盘全文共用同一份渲染，
-// 差别只是 kept 过滤（摘帽全文 = 全量行）。
+// 差别只是 kept 过滤（不设上限的全文 = 全量行）。
 func renderWindowBlocks(blocks []string, kept []bool, aroundSeq int64, window int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "seq=%d 的窗口，前后各 %d 行。", aroundSeq, window)

@@ -15,7 +15,7 @@ type TenantStorage struct {
 
 func (TenantStorage) TableName() string { return "tenant_storage" }
 
-// ReserveStorage 在持有租户行锁时数目录，再加上在途预留。超帽返回 errStorageQuota，不改预留。
+// ReserveStorage 在持有租户行锁时数目录，再加上在途预留。超上限返回 errStorageQuota，不改预留。
 // release 在写入成功或失败后都要调：成功后字节已经在目录里，预留必须放开。
 func (s *Store) ReserveStorage(ctx context.Context, tenantID string, adding, maxBytes int64, used func() int64) (func(), error) {
 	noop := func() {}

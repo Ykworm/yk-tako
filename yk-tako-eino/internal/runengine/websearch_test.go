@@ -145,11 +145,11 @@ func TestWebSearchStrictLookup(t *testing.T) {
 }
 
 // searchfree 行（非 deepseek 厂商）：始终落盘 + 描述段形状。文件里标题截 200、url 去重、
-// 无 url 项丢掉、摘要空写无摘要、searchfree 的 500 字帽生效；描述段 token 数 = 文件字数
+// 无 url 项丢掉、摘要空写无摘要、searchfree 的 500 字上限生效；描述段 token 数 = 文件字数
 // （runeCounter 口径自洽）。
 func TestWebSearchSearchfreeSpillsFile(t *testing.T) {
 	long := strings.Repeat("标", 250) // 250 字，超 200 截
-	huge := strings.Repeat("摘", 500) // 500 字 = searchfree parse 帽，文件里应全文在场
+	huge := strings.Repeat("摘", 500) // 500 字 = searchfree parse 上限，文件里应全文在场
 	results := map[string]any{"results": []map[string]any{
 		{"title": long, "url": "https://a.example/1", "snippet": "s1"},
 		{"title": "无 url 项", "snippet": "该丢"},
@@ -187,7 +187,7 @@ func TestWebSearchSearchfreeSpillsFile(t *testing.T) {
 	if lines[2] != wantSearch {
 		t.Fatalf("搜索行 = %q, want %q", lines[2], wantSearch)
 	}
-	// 文件面：标题截 200、去重、无 url 项丢、巨摘要全文（不吃任何帽）、摘要空写无摘要。
+	// 文件面：标题截 200、去重、无 url 项丢、巨摘要全文（不吃任何上限）、摘要空写无摘要。
 	if !strings.Contains(file, "1. "+strings.Repeat("标", 200)+"…") {
 		t.Fatal("标题没按 200 字截断")
 	}

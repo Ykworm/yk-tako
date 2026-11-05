@@ -18,16 +18,16 @@ import (
 	"strings"
 )
 
-// errStorageQuota 是租户存储帽用完。postRuns 把它收成 429，不建 run。
+// errStorageQuota 是租户存储上限用完。postRuns 把它收成 429，不建 run。
 var errStorageQuota = errors.New("storage quota")
 
 const (
 	// mediaDirName 是 workspace 根下的媒体目录；占位行里的 path 相对 workspace 根，
 	// read_media_file 与 GET /api/media 共用同一把牢笼（resolveInWorkspace）。
 	mediaDirName = ".media"
-	// mediaMaxBytes 是单文件帽：入口图（A1）与 read_media_file（filetools.go）同值引用。
+	// mediaMaxBytes 是单文件上限：入口图（A1）与 read_media_file（filetools.go）同值引用。
 	mediaMaxBytes = 5 << 20
-	// mediaMaxPerMsg 是单条消息的图数帽（planning 设计决定 2）。
+	// mediaMaxPerMsg 是单条消息的图数上限（planning 设计决定 2）。
 	mediaMaxPerMsg = 4
 	// mediaNameMaxRunes 是 name 字段的截断长度（doc/32 §3 sanitize）：用户文件名超长
 	// 只削显示面，不影响落盘。

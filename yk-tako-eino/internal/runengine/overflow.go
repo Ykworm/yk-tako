@@ -188,7 +188,7 @@ type truncationHit struct {
 //	    一个字没生成（MiMo 形态）。
 //
 // (c)（0 < completion < 自请预算）缺席（doc §5 登记）：主循环不发 max_tokens、没有「自请预算」
-// 可比对——不配预算时 provider 默认输出帽也报 length（DeepSeek 默认 4096），无预算判定会把
+// 可比对——不配预算时 provider 默认输出上限也报 length（DeepSeek 默认 4096），无预算判定会把
 // 每次正常长回答误判成溢出（fixtures 钉死这条负路径）。
 // usage 缺失（meta / Usage 为 nil）= 无从检起：沉默盲区、不误报（doc §5 诚实登记）。
 func detectTruncation(meta *schema.ResponseMeta, window int) *truncationHit {

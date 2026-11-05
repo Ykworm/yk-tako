@@ -528,14 +528,14 @@ func TestAgentSpecModelBranches(t *testing.T) {
 	}
 }
 
-// TestTruncateDelegationReturn 钉回传裁剪（T3-3）：未过帽原样、过帽 = UTF-8 完整前缀 + 提示尾缀
+// TestTruncateDelegationReturn 钉回传裁剪（T3-3）：未过上限原样、过上限 = UTF-8 完整前缀 + 提示尾缀
 // （N = 总字节 − 保留字节）、截点回退到 rune 边界、cap<=0 = 不裁剪。
 func TestTruncateDelegationReturn(t *testing.T) {
 	notice := func(n int) string { return fmt.Sprintf(delegationTruncationNotice, n) }
 
 	short := "短"
 	if got := truncateDelegationReturn(short, 100); got != short {
-		t.Fatalf("未过帽应原样: %q", got)
+		t.Fatalf("未过上限应原样: %q", got)
 	}
 	if got := truncateDelegationReturn(strings.Repeat("结", 20), 0); got != strings.Repeat("结", 20) {
 		t.Fatalf("cap 0 应为不裁剪: %q", got)

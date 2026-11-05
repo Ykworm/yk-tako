@@ -410,7 +410,7 @@ func mediaMessageWithParts(msg *schema.Message, text string, images []schema.Mes
 	return &clone
 }
 
-// loadMediaBytes 走与 read_media_file 相同的路径闸，并校验普通文件、5MB 帽、大小与 sha 前缀。
+// loadMediaBytes 走与 read_media_file 相同的路径闸，并校验普通文件、5MB 上限、大小与 sha 前缀。
 // 返回的 reason 只用于日志；空串 = 可以还原。
 func loadMediaBytes(
 	ctx context.Context,

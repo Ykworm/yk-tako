@@ -152,7 +152,7 @@ tako 今天有两层机器能自动判红的东西，**都是"接口有没有按
 | 原样 | 为什么不进 | 登记到哪 |
 |---|---|---|
 | bash 大输出留尾 + 全文落盘 | acceptance 33 已完整覆盖（大输出留尾 + 全文落盘回路径 + 落盘文件真在盘上读回） | acceptance（已有） |
-| read 单页切片形状 | acceptance 32 已覆盖（offset/limit 切片 + 三态页脚 + 越界/非正/超帽/缺文件四类 400） | 只留 `k-file-roundtrip` 的「读到中间」那条链 |
+| read 单页切片形状 | acceptance 32 已覆盖（offset/limit 切片 + 三态页脚 + 越界/非正/超上限/缺文件四类 400） | 只留 `k-file-roundtrip` 的「读到中间」那条链 |
 | 写前指纹比对的**拒绝** | 拒绝逻辑只在 `write_file` 工具层（`filetools.go:139-160`，要 run 里的 file baseline；dev 写口是裸 `os.WriteFile`，打不到那条路）→ 要模型先 read 再 write → 模型依赖、必 flaky | 判据层留在 `k-file-fingerprint`；拒绝那半登记为未覆盖 |
 
 **与 `scripts/acceptance/` 的分工**：acceptance 断**单次调用**的契约字节（信封 / 字段序 / 业务码 / 单页切片 / 小输出形状）；本篇断**任务链**（多步、并发、崩溃、模型涌现）。**acceptance 已经钉住的字节不再写进语料**——重复的断言只是多一处要维护的地方。
