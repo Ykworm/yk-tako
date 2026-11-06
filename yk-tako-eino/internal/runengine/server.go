@@ -210,6 +210,7 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 		r.POST("/api/dev/pii-check", authn, s.devPiiCheck)
 		r.POST("/api/dev/question-check", authn, s.devQuestionCheck)
 		r.POST("/api/dev/plan-gate-check", authn, s.devPlanGateCheck)
+		r.POST("/api/dev/task-check", authn, s.devTaskCheck)
 		r.POST("/api/dev/trace-check", authn, s.devTraceCheck)
 		r.POST("/api/dev/clean-sweep", s.devCleanSweep)
 	}

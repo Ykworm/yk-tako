@@ -2,6 +2,7 @@ package runengine
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -22,7 +23,7 @@ func TestTaskBoardSurvivesProcessRestart(t *testing.T) {
 	if _, err := s.CreateTask(ctx, "ten_1", rid, "s_1", "创建 hello.txt", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpdateTask(ctx, "ten_1", rid, 2, taskStatusCompleted, "", "", ""); err != nil {
+	if err := s.UpdateTask(ctx, "ten_1", rid, 2, taskStatusCompleted, "已输出页脚", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -74,7 +75,7 @@ func TestPreviousBoardRunAndSkillNames(t *testing.T) {
 	if _, err := s.CreateTask(ctx, tenant, older, session, "更早的一场", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpdateTask(ctx, tenant, older, 1, taskStatusCompleted, "", "", ""); err != nil {
+	if err := s.UpdateTask(ctx, tenant, older, 1, taskStatusCompleted, "更早一场的产出", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(2 * time.Millisecond)
@@ -87,10 +88,10 @@ func TestPreviousBoardRunAndSkillNames(t *testing.T) {
 	if _, err := s.CreateTask(ctx, tenant, prev, session, "普通任务", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpdateTask(ctx, tenant, prev, 1, taskStatusCompleted, "", "", ""); err != nil {
+	if err := s.UpdateTask(ctx, tenant, prev, 1, taskStatusCompleted, "第一批用例已过", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.UpdateTask(ctx, tenant, prev, 3, taskStatusInProgress, "", "", ""); err != nil {
+	if err := s.UpdateTask(ctx, tenant, prev, 3, taskStatusInProgress, "", "", "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -122,14 +123,22 @@ func TestPreviousBoardRunAndSkillNames(t *testing.T) {
 	if open, err := s.ListOpenTasks(ctx, older); err != nil || len(open) != 0 {
 		t.Fatalf("older 未完成行 = %+v, %v", open, err)
 	}
+	// doc/64：上一场「已完成的结果」只取 completed 且 result 非空的行。
+	done, err := s.ListCompletedResults(ctx, prev)
+	if err != nil || len(done) != 1 || done[0].TaskNo != 1 || done[0].Result != "第一批用例已过" {
+		t.Fatalf("prev 已完成结果 = %+v, %v", done, err)
+	}
+	if done, err := s.ListCompletedResults(ctx, older); err != nil || len(done) != 1 || done[0].Result != "更早一场的产出" {
+		t.Fatalf("older 已完成结果 = %+v, %v", done, err)
+	}
 }
 
-// 「上一场」段的两种形态：列未完成行（带说明）；全完成只给一行。
+// 「上一场」段的形态：列未完成行（带说明）；全完成只给一行；doc/64 起再带已完成的结果。
 func TestPreviousBoardView(t *testing.T) {
-	if got := previousBoardView("", nil); got != "" {
+	if got := previousBoardView("", nil, nil); got != "" {
 		t.Fatalf("没有上一场却渲染了 %q", got)
 	}
-	all := previousBoardView("r_1", nil)
+	all := previousBoardView("r_1", nil, nil)
 	if all != "上一场（r_1）已全部完成" {
 		t.Fatalf("全完成 = %q", all)
 	}
@@ -137,9 +146,127 @@ func TestPreviousBoardView(t *testing.T) {
 		{TaskNo: 2, Status: taskStatusPending, Subject: "写测试", Description: "给 store 层补两条用例"},
 		{TaskNo: 3, Status: taskStatusInProgress, Subject: "收口"},
 	}
-	got := previousBoardView("r_1", rows)
+	got := previousBoardView("r_1", rows, nil)
 	want := "上一场（r_1）还有 2 项没完成：\n#2 [pending] 写测试\n说明：给 store 层补两条用例\n#3 [in_progress] 收口"
 	if got != want {
 		t.Fatalf("上一场段 =\n%q\nwant\n%q", got, want)
+	}
+	done := []RunTask{{TaskNo: 1, Status: taskStatusCompleted, Subject: "跑基线", Result: "p95=1.8s"}}
+	got = previousBoardView("r_1", nil, done)
+	want = "上一场（r_1）已全部完成\n已完成的结果：\n#1 跑基线——结果：p95=1.8s"
+	if got != want {
+		t.Fatalf("全完成 + 结果段 =\n%q\nwant\n%q", got, want)
+	}
+}
+
+// —— 标完成必须带结果（doc/64 A1）：闸只认「有字」，并给出模型能照做的拒写文本 ——
+func TestTaskResultGate(t *testing.T) {
+	allowed, text := taskResultGate(taskStatusCompleted, "")
+	if allowed || text != taskResultRequiredText {
+		t.Fatalf("completed + 空结果 = (%v, %q)，两项都该拒", allowed, text)
+	}
+	if allowed, _ := taskResultGate(taskStatusCompleted, " \n\t "); allowed {
+		t.Fatal("只有空白的 result 也算没写")
+	}
+	if allowed, text := taskResultGate(taskStatusCompleted, "p95=1.8s，脚本 scripts/bench.py"); !allowed || text != "" {
+		t.Fatalf("completed + 有结果 = (%v, %q)，该放行且不带文本", allowed, text)
+	}
+	// 其它状态与结果无关：pending / in_progress / deleted 空着也放行。
+	for _, st := range []string{taskStatusPending, taskStatusInProgress, taskStatusDeleted} {
+		if allowed, text := taskResultGate(st, ""); !allowed || text != "" {
+			t.Fatalf("%s + 空结果 = (%v, %q)，该放行", st, allowed, text)
+		}
+	}
+	// 拒写文本必须是「错误：」开头：toolErrorText 不重复加前缀，模型看到的就是这一句。
+	if !strings.HasPrefix(taskResultRequiredText, "错误：") {
+		t.Fatalf("拒写文本没以「错误：」开头: %q", taskResultRequiredText)
+	}
+}
+
+// —— A2：闸在真写入路径上（拒绝不留半截；通过后两列一起写；超长截断）——
+func TestUpdateTaskRequiresResultOnComplete(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTestStoreWithDSN(t, testLease, testTTL)
+	rid := RunID("r_gate")
+	no, err := s.CreateTask(ctx, "ten_gate", rid, "s_gate", "跑基线", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateTask(ctx, "ten_gate", rid, no, taskStatusInProgress, "", "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// 拒绝：状态与 result 都不写（整笔回滚）。
+	err = s.UpdateTask(ctx, "ten_gate", rid, no, taskStatusCompleted, "", "", "", "")
+	if !errors.Is(err, ErrTaskResultRequired) {
+		t.Fatalf("标完成不带结果 = %v, want ErrTaskResultRequired", err)
+	}
+	row, err := s.GetTask(ctx, rid, no)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != taskStatusInProgress || row.Result != "" {
+		t.Fatalf("拒绝后行 = %+v，状态与结果都该没动", row)
+	}
+
+	// 通过：status 与 result 一起落。
+	if err := s.UpdateTask(ctx, "ten_gate", rid, no, taskStatusCompleted, "p95=1.8s", "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	row, _ = s.GetTask(ctx, rid, no)
+	if row.Status != taskStatusCompleted || row.Result != "p95=1.8s" {
+		t.Fatalf("通过后行 = %+v", row)
+	}
+
+	// 已有结果的行再改别的字段（status 仍传 completed）→ 不会被二次拦。
+	if err := s.UpdateTask(ctx, "ten_gate", rid, no, taskStatusCompleted, "", "跑基线（改）", "", ""); err != nil {
+		t.Fatalf("已完成行改主题被拦了: %v", err)
+	}
+	row, _ = s.GetTask(ctx, rid, no)
+	if row.Subject != "跑基线（改）" || row.Result != "p95=1.8s" {
+		t.Fatalf("改主题后行 = %+v", row)
+	}
+
+	// 超长：截到 300 字并标原长，不拒写。
+	long := strings.Repeat("字", 350)
+	no2, err := s.CreateTask(ctx, "ten_gate", rid, "s_gate", "长结果", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateTask(ctx, "ten_gate", rid, no2, taskStatusCompleted, long, "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	row, _ = s.GetTask(ctx, rid, no2)
+	want := strings.Repeat("字", 300) + "…〔截断：原 350 字符〕"
+	if row.Result != want {
+		t.Fatalf("超长结果长度 = %d，want 截断标记 %q", len([]rune(row.Result)), want[len(want)-12:])
+	}
+}
+
+// —— A3：TaskList 视图带结果预览；写回执与 task 帧不带（D34 取舍）——
+func TestTaskListView(t *testing.T) {
+	rows := []RunTask{
+		{TaskNo: 1, Status: taskStatusCompleted, Subject: "跑基线", Result: "p95=1.8s，脚本 scripts/bench.py"},
+		{TaskNo: 2, Status: taskStatusCompleted, Subject: "旧行没结果"},
+		{TaskNo: 3, Status: taskStatusInProgress, Subject: "收口"},
+	}
+	got := taskListView(rows)
+	want := "看板：\n" +
+		"#1 [completed] 跑基线\n  结果：p95=1.8s，脚本 scripts/bench.py\n" +
+		"#2 [completed] 旧行没结果\n" +
+		"#3 [in_progress] 收口\n" +
+		"（还有 1 项没完成：动手前把它标 in_progress，做完立刻标 completed；卡住就建一条 blocker 记录）"
+	if got != want {
+		t.Fatalf("TaskList 视图 =\n%q\nwant\n%q", got, want)
+	}
+	// 写回执 / kind=task 帧的视图不带结果（不让每张回执重付历史结果）。
+	if receipt := taskBoardView(rows); strings.Contains(receipt, "结果：") {
+		t.Fatalf("taskBoardView 不该带结果: %q", receipt)
+	}
+	// 预览上限 100 字：超了带截断标记。
+	long := strings.Repeat("字", 150)
+	view := taskListView([]RunTask{{TaskNo: 1, Status: taskStatusCompleted, Subject: "长", Result: long}})
+	if !strings.Contains(view, strings.Repeat("字", 100)+"…〔截断：原 150 字符〕") {
+		t.Fatalf("长结果预览没按 100 字截断: %q", view)
 	}
 }
