@@ -96,6 +96,11 @@ loop 内的顺序固定为 **契约 → 数据需求 → 存储 → 实现**：
   例：「块是程序的保管」不合格；要说就说操作——程序每次从工具调用记录里把路径重抄出来、
   贴摘要末尾、下一代读回合并，**不靠任何模型的记性**；
 - 跳步概括：可以省略形容词，不能省略因果链。
+- **用 LLM 时代自造词当术语**：先核社区出处，无 pre-LLM 业界出处的词不进文档与对话。
+  首个禁词是「闸」（真闸／软闸／词闸／重放闸／过闸……）——人类工程文献不用这个字，
+  读者只能靠猜。按它实际在干什么换成有出处的惯用词：数据库唯一索引（防重）、
+  准入（写前校验）、互斥 / advisory lock（并发）、租约（worker 领活）、上限（预算）、
+  拒绝（校验不过）。2026-11-07 用户定。
 
 **自检清单（2026-10-11 补；解释类输出落地前逐条跑一遍）**：
 
@@ -272,17 +277,17 @@ npm run build                     # vue-tsc -b && vite build
 
 ## 双远端同步
 
-同一份历史推到两个私有仓：**AtomGit 是主仓**（华为云部署从它拉最新代码），GitHub 是镜像。
+同一份历史推到两个私有仓：**GitHub 是主仓**，AtomGit 是备份镜像。
 
-- `origin` = AtomGit `git@atomgit.com:webcan/yk-tako.git`（主仓）
-- `github` = GitHub `https://github.com/Ykworm/yk-tako.git`（镜像）
+- `origin` = GitHub `https://github.com/Ykworm/yk-tako.git`（主仓）
+- `atomgit` = AtomGit `git@atomgit.com:webcan/yk-tako.git`（镜像）
 
-**铁律：先推 AtomGit，成功后再推 GitHub。** GitHub 可以落后，不能领先——领先就意味着华为云上的代码是旧的。
+**铁律：先推 GitHub，成功后再推 AtomGit。** AtomGit 可以落后，不能领先——领先就意味着主仓不是最新。
 
-- 日常同步：`./scripts/sync-remotes.sh [branch]`（默认 `main`）。脚本先推 `origin`，成功后才推 `github`。
-- 每个 clone 执行一次 `git config core.hooksPath .githooks`。`.githooks/pre-push` 会比对两边同分支的 SHA，任何让 GitHub 领先的推送直接拒绝。
+- 日常同步：`./scripts/sync-remotes.sh [branch]`（默认 `main`）。脚本先推 `origin`（GitHub 主仓），成功后才推 `atomgit`。
+- 每个 clone 执行一次 `git config core.hooksPath .githooks`。`.githooks/pre-push` 会比对两边同分支的 SHA，任何让 AtomGit 领先的推送直接拒绝。
 - 禁止 `git push --mirror`：本地还有远端不需要的引用，`--mirror` 会把它们一起推上去。
-- 远端 URL 不写访问令牌或密码；AtomGit 用 SSH key，GitHub 用凭据助手。
+- 远端 URL 不写访问令牌或密码；GitHub 用凭据助手，AtomGit 用 SSH key。
 
 ## 参考实现
 

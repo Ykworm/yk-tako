@@ -25,7 +25,7 @@
 | 设计裁定 | `doc/problems/` |
 | 带日期的记录（交接、跑分、台账、文章） | `doc/log/` |
 | 被整代取代的材料 | `doc/archive/` |
-| 非方案（故事、求职材料） | `doc/blog/`、`doc/interview/` |
+| 非方案（故事、求职材料） | `doc/blog/` |
 
 **时效变化不搬家，只改状态**；只有被整代取代才进 `doc/archive/`。
 

@@ -1,6 +1,6 @@
 > **性质**：执行记录（冻结）。状态以 `doc/README.md`、`doc/53` 与代码为准，本文件不再更新。
 > **结果**：A1–A4 全部执行完成（2026-11-04 收口）；`docs/` 已删除，记录进 `doc/log/`，旧线/旧代进 `doc/archive/`，规则文本与 `scripts/check-doc-layout.sh` 同批落地。
-> **未做**：`doc/17` 归属、`doc/interview/`、`doc/blog/` 去留、状态词表统一、大文档拆分（见 planning 待拍项）。
+> **未做**：`doc/17` 归属、`doc/blog/` 去留、状态词表统一、大文档拆分（见 planning 待拍项）。
 
 # 文档归属重构 · todos
 
@@ -60,7 +60,7 @@ python3 tmp/doc-refactor/check_links.py                          # 期望 broken
 4. 搬 10 篇旧线计划与设计：`docs/superpowers/{plans,specs}/` → `doc/archive/old-line/{plans,specs}/`（用户判定 `superpowers` 名字碍眼，不保留该分组）。
 5. 新建 `doc/archive/README.md`：按 `old-line/`（含 plans/specs）、`engine/` 两组列文件名与一句话说明。
 6. 改 `doc/README.md` §2（两组指针表）、§4（从 `docs/` 表删掉 10 行旧线计划）、`doc/53` §7、`doc/16` 头注、`doc/41` 两处引用。
-7. **偏差**：归档正文里的旧路径（`docs/superpowers/...`、`doc/07...`）不批量改写，只在 `doc/archive/README.md` 头注声明「当时的位置」；只修真正断掉的 markdown 链接（`02` 的 `AGENTS.md`、`doc/interview` 一处文件名笔误）。
+7. **偏差**：归档正文里的旧路径（`docs/superpowers/...`、`doc/07...`）不批量改写，只在 `doc/archive/README.md` 头注声明「当时的位置」；只修真正断掉的 markdown 链接（`02` 的 `AGENTS.md`、一处非方案目录的文件名笔误）。
 
 **验收实录**
 

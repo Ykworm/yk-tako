@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# 拦住直接推 GitHub：GitHub 只能收到 AtomGit 已经有的同一个 SHA。
+# 拦住直接推 AtomGit（镜像）：AtomGit 只能收到主仓 GitHub 已经有的同一个 SHA。
 # 安装：每个 clone 执行一次 git config core.hooksPath .githooks
 set -euo pipefail
 
 remote="${1:-}"
-[ "$remote" = "github" ] || exit 0
+[ "$remote" = "atomgit" ] || exit 0
 
 while read -r local_ref local_sha remote_ref remote_sha; do
   case "$local_ref" in
@@ -12,7 +12,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     *) continue ;;
   esac
 
-  # 删除分支不会让 GitHub 领先。
+  # 删除分支不会让 AtomGit 领先。
   if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
     continue
   fi
@@ -20,13 +20,13 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   branch="${local_ref#refs/heads/}"
   upstream="$(git ls-remote origin "refs/heads/$branch" | cut -f1)"
   if [ -z "$upstream" ]; then
-    echo "pre-push: AtomGit（origin）没有分支 $branch；先推 AtomGit，再推 GitHub。" >&2
+    echo "pre-push: 主仓 GitHub（origin）没有分支 $branch；先推 GitHub，再推 AtomGit。" >&2
     exit 1
   fi
   if [ "$upstream" != "$local_sha" ]; then
-    echo "pre-push: GitHub 不能领先 AtomGit（$branch）。" >&2
-    echo "  AtomGit: $upstream" >&2
-    echo "  本地:    $local_sha" >&2
+    echo "pre-push: AtomGit 不能领先主仓 GitHub（$branch）。" >&2
+    echo "  主仓 GitHub: $upstream" >&2
+    echo "  本地:        $local_sha" >&2
     echo "先执行 ./scripts/sync-remotes.sh，或 git push origin $branch。" >&2
     exit 1
   fi

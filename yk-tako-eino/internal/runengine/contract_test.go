@@ -223,11 +223,11 @@ func TestContractFrameKindVocabulary(t *testing.T) {
 // TestContractToolTiering 钉住工具分档的**现状**：deferred 档只收 mcp__ 前缀，一手工具每轮全量声明。
 //
 // 这不是「已完成」的断言，是「现状如此」的断言——它防的是
-// 「进度误会.md」第 1 条记的那个误会：以为工具说明已经隔着 tool_search 检索，
+// 那条「进度误会」记录第 1 条记的误会：以为工具说明已经隔着 tool_search 检索，
 // 其实只有 MCP 档隔着，一手工具（get_time、文件工具族、bash、memory、search_history、web_search…）
-// 仍是 direct 档，每轮全量声明（19v6-06 §3、进度误会.md 第 1 条）。
+// 仍是 direct 档，每轮全量声明（19v6-06 §3）。
 //
-// 要改成「一手工具也进 deferred 档」时，先改 19v6-06 与进度误会.md，再改这里。
+// 要改成「一手工具也进 deferred 档」时，先改 19v6-06 与那份「进度误会」记录，再改这里。
 func TestContractToolTiering(t *testing.T) {
 	if deferredToolPrefix != "mcp__" {
 		t.Fatalf("deferred 前缀 = %q, want \"mcp__\"", deferredToolPrefix)
