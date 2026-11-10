@@ -126,7 +126,9 @@ func newWriteFileTool(root string) (tool.BaseTool, error) {
 			}
 			// 取写锁（粒度=文件）。**比对必须在锁内做**——否则「检查—写」之间有缝，
 			// 另一个写者能在缝里落盘，锁就白加了（filefp.go 的三层分工）。
-			unlock, err := lockPaths(lockDirFor(ctx, root), []string{full})
+			// ctx 上有写锁提供者时走它（生产：PG advisory lock 跨副本 + 本机 flock）；
+			// 没有就退化成现有的本机 flock（单测与旧调用方）。
+			unlock, err := lockFilePaths(ctx, root, []string{full})
 			if err != nil {
 				if errors.Is(err, errLockTimeout) {
 					return "", fmt.Errorf("这个文件正被另一个 agent 写，稍后重试")
@@ -166,7 +168,10 @@ func newWriteFileTool(root string) (tool.BaseTool, error) {
 			if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 				return "", fmt.Errorf("创建父目录失败：%v", err)
 			}
-			if err := os.WriteFile(full, []byte(in.Content), 0o644); err != nil {
+			// 原子替换：同目录唯一临时文件写完整内容 → rename 覆盖目标（atomicfile.go）。
+			// 不再用 os.WriteFile 直写目标——那会让不参加锁的读者读到空文件或半截。
+			// 原子替换**不防最后写者覆盖**：防那个的是上面的基准校验（写前比对指纹）。
+			if err := atomicWriteFile(full, []byte(in.Content), 0o644); err != nil {
 				return "", fmt.Errorf("写入失败：%v", err)
 			}
 			// 写后刷新基准：同一 run 内连续改同一个文件不误报。
@@ -323,7 +328,8 @@ func newEditFileTool(root string) (tool.BaseTool, error) {
 			// 取写锁（粒度=文件）。edit_file 不查基准表做拒绝判断——OldText 锚点本身就是
 			// 「我读到的那一段」，它是 edit 的基准；但锁仍然要取：它保证下面的「现读」读到的是
 			// 完整的一版（不会读到别人写了一半的文件），并让「读—改—写」成为原子的一段。
-			unlock, err := lockPaths(lockDirFor(ctx, root), []string{full})
+			// ctx 上有写锁提供者时走它（生产：PG advisory lock 跨副本 + 本机 flock）。
+			unlock, err := lockFilePaths(ctx, root, []string{full})
 			if err != nil {
 				if errors.Is(err, errLockTimeout) {
 					return "", fmt.Errorf("这个文件正被另一个 agent 写，稍后重试")
@@ -354,7 +360,9 @@ func newEditFileTool(root string) (tool.BaseTool, error) {
 				return "", fmt.Errorf("old_text 在 %s 中出现 %d 次、不唯一——补足前后文让它恰好一处，或显式 replace_all:true 全部替换", in.Path, count)
 			}
 			out := strings.ReplaceAll(text, in.OldText, in.NewText)
-			if err := os.WriteFile(full, []byte(out), fi.Mode().Perm()); err != nil {
+			// 原子替换（同 atomicfile.go）：结果基于**最新内容**算出来，写回时不截断目标
+			// → 不参加锁的读者只会看到完整旧版或完整新版。
+			if err := atomicWriteFile(full, []byte(out), fi.Mode().Perm()); err != nil {
 				return "", fmt.Errorf("写入失败：%v", err)
 			}
 			// 写后刷新基准（若有这一行）：让表跟磁盘保持一致，否则下一次 write_file 会因为
@@ -389,9 +397,10 @@ func newMoveFileTool(root string) (tool.BaseTool, error) {
 			if err != nil {
 				return "", err
 			}
-			// 取写锁：move 动的是两个路径（源与目标）→ 两把锁。lockPaths 内部去重 + 按字典序取
+			// 取写锁：move 动的是两个路径（源与目标）→ 两把锁。锁层内部去重 + 按字典序取
 			// （防 AB-BA 死锁）；源与目标同路径时只取一把（取两次同一把锁 = 自己等自己）。
-			unlock, err := lockPaths(lockDirFor(ctx, root), []string{src, dst})
+			// 两把锁都要进多副本锁：漏掉目标 = 另一个写者在目标路径上写时我们照样 rename 过去。
+			unlock, err := lockFilePaths(ctx, root, []string{src, dst})
 			if err != nil {
 				if errors.Is(err, errLockTimeout) {
 					return "", fmt.Errorf("这个文件正被另一个 agent 写，稍后重试")

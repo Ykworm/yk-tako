@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 // 这个文件是**契约字节的快闸**：钉住信封、session/frames/log 三个响应体、帧 kind 词表、
@@ -157,6 +159,8 @@ func TestContractBusinessCodes(t *testing.T) {
 		want int
 	}{
 		{"成功", codeOK, 0},
+		{"请求格式不对", codeBadJSON, 111001},
+		{"请求参数不对", codeBadInput, 111002},
 		{"缺 token", codeMissingToken, 111102},
 		{"token 过期", codeTokenExpired, 111104},
 		{"模型不可用", codeModelUnavailable, 111408},
@@ -172,6 +176,7 @@ func TestContractBusinessCodes(t *testing.T) {
 		// 同项目并发不再被拒，改由文件级防护兜（flock + 写前指纹比对）。
 		{"默认项目不能删", codeWorkspaceDefault, 114005},
 		{"活 run 不能删", codeSessionBusy, 114007},
+		{"记忆模式不提供观测口", codeMemoryMode, 118001},
 		{"内部错误", codeInternal, 111901},
 	}
 	for _, c := range cases {
@@ -308,5 +313,47 @@ func TestContractWorkspaceBodyBytes(t *testing.T) {
 	const want = `{"id":"ws_01M5J00E5X3AH3DVKX5QA0647Q","name":"验收项目","createdAt":"2026-10-22T14:24:00Z","visibility":"private","owner":true,"isDefault":false}`
 	if got != want {
 		t.Fatalf("项目对象字节序漂移：\n得到 %s\n期望 %s", got, want)
+	}
+}
+
+// TestContractMemoryObserveBytes 钉住记忆观测口（doc/65 §6.5）的契约字节。
+//
+// 下面的字节不是手写的，是 2026-11-10 从活引擎实跑抄下来的（两个模式各起一台）：
+//
+//	markdown 引擎：GET /api/memory/items、/jobs、/recall?q=x 三连 409，同一份守卫体；
+//	pipeline 引擎空库：items/jobs 的 data 是空数组（不是 null，页面 .map 才不炸）；
+//	recall 无命中回四键全零。
+//
+// recall 的 data 是 gin.H（map）——字节序由 encoding/json 按键名字典序定，服务端写键的
+// 顺序不作数，所以这里用同一个 gin.H 复现：block → dialogueHits → injectedRunes → memoryHits。
+// 模式门控的活体断言在 expected.json 用例 35–38（needs=markdown-mode / pipeline-mode）。
+func TestContractMemoryObserveBytes(t *testing.T) {
+	got := mustJSON(t, envelope{Code: codeMemoryMode, Message: ErrMemoryModeUnsupported.Error(), Data: nil})
+	const wantGuard = `{"code":118001,"message":"当前记忆模式不提供这个观测口","data":null}`
+	if got != wantGuard {
+		t.Fatalf("记忆模式守卫字节 = %s\nwant %s", got, wantGuard)
+	}
+	got = mustJSON(t, gin.H{"items": []memoryItemResponse{}})
+	if got != `{"items":[]}` {
+		t.Fatalf("items 空库字节 = %s, want {\"items\":[]}", got)
+	}
+	got = mustJSON(t, gin.H{"jobs": []memoryJobResponse{}})
+	if got != `{"jobs":[]}` {
+		t.Fatalf("jobs 空库字节 = %s, want {\"jobs\":[]}", got)
+	}
+	got = mustJSON(t, gin.H{"block": "", "memoryHits": 0, "dialogueHits": 0, "injectedRunes": 0})
+	const wantRecall = `{"block":"","dialogueHits":0,"injectedRunes":0,"memoryHits":0}`
+	if got != wantRecall {
+		t.Fatalf("recall 空命中字节 = %s\nwant %s", got, wantRecall)
+	}
+	got = mustJSON(t, envelope{Code: codeBadInput, Message: "state 只能是 active、superseded、removed 或 archived", Data: nil})
+	const wantState = `{"code":111002,"message":"state 只能是 active、superseded、removed 或 archived","data":null}`
+	if got != wantState {
+		t.Fatalf("state 校验字节 = %s\nwant %s", got, wantState)
+	}
+	got = mustJSON(t, envelope{Code: codeBadJSON, Message: "请求格式不对", Data: nil})
+	const wantEmptyQ = `{"code":111001,"message":"请求格式不对","data":null}`
+	if got != wantEmptyQ {
+		t.Fatalf("recall 空 q 字节 = %s\nwant %s", got, wantEmptyQ)
 	}
 }

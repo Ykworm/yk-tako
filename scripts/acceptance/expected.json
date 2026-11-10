@@ -1,2123 +1,2269 @@
 {
-  "version": "2026-11-01",
-  "source": "doc/19-v6/19v6-04-验收-curl.md",
-  "note": [
-    "本文件是契约字节的**机器真源**；doc/19-v6/19v6-04-验收-curl.md 是同一份内容的人读版。",
-    "两份**同批改**。check-expected.sh 守两边的用例号集合一致。",
-    "tier=core 的用例不需要模型，必须全过；tier=model 需要真实跑一轮（要 API Key 与网络）。",
-    "expect 字段：http / code / message / data（子集比对：只断点名的键，值写 \"$any\" 是通配）/ data_keys（data 对象的键集与键序必须逐字相同）/ frame_kinds_contains / rows_len_equals / data_items_some（数组里**至少有一项**满足条件，如 {\"path\":\"workspaces\",\"match\":{\"id\":\"{wid}\",\"isDefault\":false}}——expect 里也能写 {var}）。",
-    "expect 字段另加 data_contains（只断 data 里某个字符串**含**哪几段：{\"path\":\"output\",\"contains\":[\"…\",\"…\"]}）——给**逐请求变**的字节用（例：bash 落盘提示行里的 run id 每次都不同，全文比不了）。",
-    "step 字段：method / path / body / auth / sql（请求前先跑的 SQL）/ capture（把响应里的值存成变量）/ op=signup（建账号+租户+配模型）/ op=wait_terminal（等这一场跑完）。",
-    "用例级字段：needs（\"pg\"=要直连 PG、\"sandbox\"=要 macOS sandbox-exec；不满足就跳过并说明原因，不假装跑过）。"
-  ],
-  "cases": [
+ "version": "2026-11-01",
+ "source": "doc/19-v6/19v6-04-验收-curl.md",
+ "note": [
+  "本文件是契约字节的**机器真源**；doc/19-v6/19v6-04-验收-curl.md 是同一份内容的人读版。",
+  "两份**同批改**。check-expected.sh 守两边的用例号集合一致。",
+  "tier=core 的用例不需要模型，必须全过；tier=model 需要真实跑一轮（要 API Key 与网络）。",
+  "expect 字段：http / code / message / data（子集比对：只断点名的键，值写 \"$any\" 是通配）/ data_keys（data 对象的键集与键序必须逐字相同）/ frame_kinds_contains / rows_len_equals / data_items_some（数组里**至少有一项**满足条件，如 {\"path\":\"workspaces\",\"match\":{\"id\":\"{wid}\",\"isDefault\":false}}——expect 里也能写 {var}）。",
+  "expect 字段另加 data_contains（只断 data 里某个字符串**含**哪几段：{\"path\":\"output\",\"contains\":[\"…\",\"…\"]}）——给**逐请求变**的字节用（例：bash 落盘提示行里的 run id 每次都不同，全文比不了）。",
+  "step 字段：method / path / body / auth / sql（请求前先跑的 SQL）/ capture（把响应里的值存成变量）/ op=signup（建账号+租户+配模型）/ op=wait_terminal（等这一场跑完）。",
+  "用例级字段：needs（\"pg\"=要直连 PG、\"sandbox\"=要 macOS sandbox-exec；不满足就跳过并说明原因，不假装跑过）。"
+ ],
+ "cases": [
+  {
+   "id": "0-signup",
+   "case": "用例 0",
+   "tier": "core",
+   "desc": "注册 → 账号/租户/成员/accessToken 一并回来",
+   "steps": [
     {
-      "id": "0-signup",
-      "case": "用例 0",
-      "tier": "core",
-      "desc": "注册 → 账号/租户/成员/accessToken 一并回来",
-      "steps": [
-        {
-          "op": "signup",
-          "expect": {
-            "http": 201,
-            "code": 0,
-            "message": "",
-            "data_keys": [
-              "user",
-              "tenant",
-              "membership",
-              "accessToken",
-              "tokenType",
-              "expiresIn",
-              "refreshToken"
-            ]
-          }
-        }
+     "op": "signup",
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "user",
+       "tenant",
+       "membership",
+       "accessToken",
+       "tokenType",
+       "expiresIn",
+       "refreshToken"
       ]
-    },
-    {
-      "id": "0-runtime-config",
-      "case": "用例 0",
-      "tier": "core",
-      "desc": "租户配模型密钥 → 密钥回显成掩码",
-      "steps": [
-        {
-          "op": "signup",
-          "expect": {
-            "http": 201,
-            "code": 0,
-            "message": ""
-          }
-        },
-        {
-          "method": "PUT",
-          "path": "/api/tenants/{ten}/runtime-config",
-          "body": {
-            "modelRef": "deepseek/deepseek-flash",
-            "mcpServers": {},
-            "secrets": {
-              "DEEPSEEK_API_KEY": "{key}"
-            },
-            "sandbox": {
-              "network": false
-            }
-          },
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": ""
-          }
-        }
-      ]
-    },
-    {
-      "id": "0-auth-required-runs",
-      "case": "用例 0",
-      "tier": "core",
-      "desc": "业务四端点不带 Authorization 一律 401 信封",
-      "steps": [
-        {
-          "method": "POST",
-          "path": "/api/runs",
-          "body": {
-            "messageId": "m_x",
-            "text": "hi"
-          },
-          "auth": false,
-          "expect": {
-            "http": 401,
-            "code": 111102,
-            "message": "请先登录",
-            "data": null
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/sessions/s_nope",
-          "auth": false,
-          "expect": {
-            "http": 401,
-            "code": 111102,
-            "message": "请先登录",
-            "data": null
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/runs/r_nope/frames",
-          "auth": false,
-          "expect": {
-            "http": 401,
-            "code": 111102,
-            "message": "请先登录",
-            "data": null
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/sessions/s_nope/log",
-          "auth": false,
-          "expect": {
-            "http": 401,
-            "code": 111102,
-            "message": "请先登录",
-            "data": null
-          }
-        }
-      ]
-    },
-    {
-      "id": "0-model-not-configured",
-      "case": "用例 0",
-      "tier": "core",
-      "desc": "租户没配模型密钥 → POST /api/runs 回 409 111408，run 起不来",
-      "steps": [
-        {
-          "op": "signup",
-          "no_model": true,
-          "expect": {
-            "http": 201,
-            "code": 0,
-            "message": ""
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/runs",
-          "body": {
-            "messageId": "m_1",
-            "text": "hi"
-          },
-          "expect": {
-            "http": 409,
-            "code": 111408,
-            "message": "这个工作区的模型还不可用",
-            "data": null
-          }
-        }
-      ]
-    },
-    {
-      "id": "1-post-runs",
-      "case": "用例 1",
-      "tier": "model",
-      "desc": "投递 → 202 + sessionId/runId/messageId",
-      "steps": [
-        {
-          "method": "POST",
-          "path": "/api/runs",
-          "body": {
-            "messageId": "m_v6",
-            "text": "只回复 ok"
-          },
-          "capture": {
-            "sid": "data.sessionId",
-            "rid": "data.runId"
-          },
-          "expect": {
-            "http": 202,
-            "code": 0,
-            "message": "",
-            "data_keys": [
-              "sessionId",
-              "runId",
-              "messageId"
-            ]
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/runs/{rid}/skills",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data": {
-              "runId": "{rid}",
-              "loads": []
-            },
-            "data_keys": [
-              "runId",
-              "loads"
-            ]
-          }
-        }
-      ]
-    },
-    {
-      "id": "1-session-while-running",
-      "case": "用例 1",
-      "tier": "model",
-      "desc": "跑中 GET /api/sessions/{sid} → 五个字段，顺序固定",
-      "steps": [
-        {
-          "method": "POST",
-          "path": "/api/runs",
-          "body": {
-            "messageId": "m_v6",
-            "text": "只回复 ok"
-          },
-          "capture": {
-            "sid": "data.sessionId",
-            "rid": "data.runId"
-          },
-          "expect": {
-            "http": 202,
-            "code": 0,
-            "message": "",
-            "data_keys": [
-              "sessionId",
-              "runId",
-              "messageId"
-            ]
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/sessions/{sid}",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data_keys": [
-              "liveRunId",
-              "runlogOffset",
-              "lastRunStatus",
-              "lastRunId",
-              "workspaceId"
-            ]
-          }
-        }
-      ]
-    },
-    {
-      "id": "1-frames-and-log",
-      "case": "用例 1",
-      "tier": "model",
-      "desc": "定稿后：frames 有 start/terminal，log 有 user+assistant 两行，session 变 complete",
-      "steps": [
-        {
-          "method": "POST",
-          "path": "/api/runs",
-          "body": {
-            "messageId": "m_v6",
-            "text": "只回复 ok"
-          },
-          "capture": {
-            "sid": "data.sessionId",
-            "rid": "data.runId"
-          },
-          "expect": {
-            "http": 202,
-            "code": 0,
-            "message": "",
-            "data_keys": [
-              "sessionId",
-              "runId",
-              "messageId"
-            ]
-          }
-        },
-        {
-          "op": "wait_terminal",
-          "run": "{rid}",
-          "timeout": 90
-        },
-        {
-          "op": "wait_settled",
-          "session": "{sid}",
-          "timeout": 30
-        },
-        {
-          "method": "GET",
-          "path": "/api/runs/{rid}/frames?eventOffset=0",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data_keys": [
-              "frames",
-              "nextOffset",
-              "status"
-            ],
-            "frame_kinds_contains": [
-              "start",
-              "terminal"
-            ]
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/sessions/{sid}",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data_keys": [
-              "liveRunId",
-              "runlogOffset",
-              "lastRunStatus",
-              "lastRunId",
-              "workspaceId"
-            ],
-            "data": {
-              "liveRunId": "",
-              "lastRunStatus": "complete"
-            }
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/sessions/{sid}/log?runlogOffset=0",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data_keys": [
-              "rows",
-              "nextOffset"
-            ]
-          }
-        }
-      ]
-    },
-    {
-      "id": "2-log-offset-out-of-range",
-      "case": "用例 2",
-      "tier": "model",
-      "desc": "runlog 游标越界 → 空 rows，nextOffset 原样回",
-      "steps": [
-        {
-          "method": "POST",
-          "path": "/api/runs",
-          "body": {
-            "messageId": "m_v6",
-            "text": "只回复 ok"
-          },
-          "capture": {
-            "sid": "data.sessionId",
-            "rid": "data.runId"
-          },
-          "expect": {
-            "http": 202,
-            "code": 0,
-            "message": ""
-          }
-        },
-        {
-          "op": "wait_terminal",
-          "run": "{rid}",
-          "timeout": 90
-        },
-        {
-          "op": "wait_settled",
-          "session": "{sid}",
-          "timeout": 30
-        },
-        {
-          "method": "GET",
-          "path": "/api/sessions/{sid}/log?runlogOffset=999",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data": {
-              "rows": [],
-              "nextOffset": 999
-            }
-          }
-        }
-      ]
-    },
-    {
-      "id": "2-frames-offset-out-of-range",
-      "case": "用例 2",
-      "tier": "model",
-      "desc": "frames 游标越界 → 空 frames，nextOffset 原样回（status 随 runlive TTL 变，不钉）",
-      "steps": [
-        {
-          "method": "POST",
-          "path": "/api/runs",
-          "body": {
-            "messageId": "m_v6",
-            "text": "只回复 ok"
-          },
-          "capture": {
-            "sid": "data.sessionId",
-            "rid": "data.runId"
-          },
-          "expect": {
-            "http": 202,
-            "code": 0,
-            "message": ""
-          }
-        },
-        {
-          "op": "wait_terminal",
-          "run": "{rid}",
-          "timeout": 90
-        },
-        {
-          "op": "wait_settled",
-          "session": "{sid}",
-          "timeout": 30
-        },
-        {
-          "method": "GET",
-          "path": "/api/runs/{rid}/frames?eventOffset=999",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data": {
-              "frames": [],
-              "nextOffset": 999
-            }
-          }
-        }
-      ]
-    },
-    {
-      "id": "3-unknown-session",
-      "case": "用例 3",
-      "tier": "core",
-      "desc": "未知 sessionId：三个端点一律 404 112001",
-      "steps": [
-        {
-          "method": "POST",
-          "path": "/api/runs",
-          "body": {
-            "sessionId": "s_nope",
-            "messageId": "m_9",
-            "text": "hi"
-          },
-          "expect": {
-            "http": 404,
-            "code": 112001,
-            "message": "找不到这场会话",
-            "data": null
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/sessions/s_nope",
-          "expect": {
-            "http": 404,
-            "code": 112001,
-            "message": "找不到这场会话",
-            "data": null
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/sessions/s_nope/log",
-          "expect": {
-            "http": 404,
-            "code": 112001,
-            "message": "找不到这场会话",
-            "data": null
-          }
-        }
-      ]
-    },
-    {
-      "id": "3-unknown-run-frames",
-      "case": "用例 3",
-      "tier": "core",
-      "desc": "未知 run 在 frames 上仍不是 404——200 + 空 frames + gone",
-      "steps": [
-        {
-          "method": "GET",
-          "path": "/api/runs/r_nope/frames",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data": {
-              "frames": [],
-              "nextOffset": 0,
-              "status": "gone"
-            },
-            "data_keys": [
-              "frames",
-              "nextOffset",
-              "status"
-            ]
-          }
-        }
-      ]
-    },
-    {
-      "id": "4-busy-rejected",
-      "case": "用例 4",
-      "tier": "model",
-      "needs": "pg",
-      "desc": "忙时诚实拒绝：409 112101，且忙拒在 runlog 里零痕迹",
-      "steps": [
-        {
-          "method": "POST",
-          "path": "/api/runs",
-          "body": {
-            "messageId": "m_v6",
-            "text": "只回复 ok"
-          },
-          "capture": {
-            "sid": "data.sessionId",
-            "rid": "data.runId"
-          },
-          "expect": {
-            "http": 202,
-            "code": 0,
-            "message": ""
-          }
-        },
-        {
-          "op": "wait_terminal",
-          "run": "{rid}",
-          "timeout": 90
-        },
-        {
-          "op": "wait_settled",
-          "session": "{sid}",
-          "timeout": 30
-        },
-        {
-          "method": "GET",
-          "path": "/api/sessions/{sid}/log?runlogOffset=0",
-          "capture": {
-            "rows_before": "data.rows"
-          },
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": ""
-          }
-        },
-        {
-          "sql": "UPDATE runs SET status='running', lease_until=now()+interval '5 minutes', finished_at=NULL WHERE id='{rid}'"
-        },
-        {
-          "method": "POST",
-          "path": "/api/runs",
-          "body": {
-            "sessionId": "{sid}",
-            "messageId": "m_busy",
-            "text": "急"
-          },
-          "expect": {
-            "http": 409,
-            "code": 112101,
-            "message": "这场会话正在跑，等它跑完再发",
-            "data": null
-          }
-        },
-        {
-          "sql": "UPDATE runs SET status='complete', lease_until=NULL, finished_at=now() WHERE id='{rid}'"
-        },
-        {
-          "method": "GET",
-          "path": "/api/sessions/{sid}/log?runlogOffset=0",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "rows_len_equals": "{rows_before}"
-          }
-        }
-      ]
-    },
-    {
-      "id": "10-question-codes",
-      "case": "用例 10",
-      "tier": "core",
-      "desc": "人审与问答码段：未知 run 的列表 404 112002；未知行答题 404 115002；无鉴权 401 111102",
-      "steps": [
-        {
-          "method": "GET",
-          "path": "/api/runs/r_nope/questions?status=pending",
-          "expect": {
-            "http": 404,
-            "code": 112002,
-            "message": "找不到这次运行",
-            "data": null
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/questions/qs_nope/answer",
-          "body": {
-            "answer": "x"
-          },
-          "expect": {
-            "http": 404,
-            "code": 115002,
-            "message": "找不到这个提问",
-            "data": null
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/questions/qs_nope/answer",
-          "body": {
-            "answer": "x"
-          },
-          "auth": false,
-          "expect": {
-            "http": 401,
-            "code": 111102,
-            "message": "请先登录",
-            "data": null
-          }
-        }
-      ]
-    },
-    {
-      "id": "12-workspace-files",
-      "case": "用例 12",
-      "tier": "core",
-      "desc": "项目文件清单：目录在前、内部目录与符号链接不列、越界与绝对路径 400 111002、看不见的项目 404 114001",
-      "steps": [
-        {
-          "method": "POST",
-          "path": "/api/workspaces",
-          "body": {
-            "name": "acc-files"
-          },
-          "capture": {
-            "wid": "data.workspace.id"
-          },
-          "expect": {
-            "http": 201,
-            "code": 0,
-            "message": ""
-          }
-        },
-        {
-          "op": "seed_ws",
-          "workspace": "{wid}",
-          "files": {
-            "hello.txt": "Hello, world!\n",
-            ".media/pic.png": "x",
-            ".tako/search/r1_1.md": "x"
-          },
-          "dirs": [
-            "sub"
-          ],
-          "symlinks": [
-            "link-out"
-          ]
-        },
-        {
-          "method": "GET",
-          "path": "/api/workspaces/{wid}/files?path=.",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data": {
-              "path": ".",
-              "entries": [
-                {
-                  "name": "sub",
-                  "kind": "dir"
-                },
-                {
-                  "name": "hello.txt",
-                  "kind": "file",
-                  "size": 14
-                }
-              ]
-            }
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/workspaces/{wid}/files?path=sub",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data": {
-              "path": "sub",
-              "entries": []
-            }
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/workspaces/{wid}/files?path=../../etc",
-          "expect": {
-            "http": 400,
-            "code": 111002,
-            "message": "路径不对",
-            "data": null
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/workspaces/{wid}/files?path=/etc/passwd",
-          "expect": {
-            "http": 400,
-            "code": 111002,
-            "message": "路径不对",
-            "data": null
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/workspaces/ws_nope/files",
-          "expect": {
-            "http": 404,
-            "code": 114001,
-            "message": "找不到这个项目",
-            "data": null
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/workspaces/{wid}/files?path=nope",
-          "expect": {
-            "http": 404,
-            "code": 114101,
-            "message": "找不到这个文件",
-            "data": null
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/workspaces/{wid}/files",
-          "auth": false,
-          "expect": {
-            "http": 401,
-            "code": 111102,
-            "message": "请先登录",
-            "data": null
-          }
-        }
-      ]
-    },
-    {
-      "id": "13-workspace-isdefault",
-      "case": "用例 13",
-      "tier": "core",
-      "desc": "项目列表带 isDefault：新建的项目是 false（默认项目不能删，服务端 114005）",
-      "steps": [
-        {
-          "method": "POST",
-          "path": "/api/workspaces",
-          "body": {
-            "name": "acc-isdefault"
-          },
-          "capture": {
-            "wid": "data.workspace.id"
-          },
-          "expect": {
-            "http": 201,
-            "code": 0,
-            "message": ""
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/workspaces",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data_items_some": {
-              "path": "workspaces",
-              "match": {
-                "id": "{wid}",
-                "isDefault": false
-              }
-            }
-          }
-        }
-      ]
-    },
-    {
-      "id": "14-skills-empty",
-      "case": "用例 14",
-      "tier": "core",
-      "desc": "技能列表：data 有 skills[] 与 invalid[] 两个键，元素字段序固定（name→description→source→path→enabled→bytes→requires→missing→updatedAt→valid）",
-      "steps": [
-        {
-          "op": "signup",
-          "expect": {
-            "http": 201,
-            "code": 0,
-            "message": ""
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/skills",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data_keys": [
-              "skills",
-              "invalid"
-            ]
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/skills",
-          "auth": false,
-          "expect": {
-            "http": 401,
-            "code": 111102,
-            "message": "请先登录",
-            "data": null
-          }
-        }
-      ]
-    },
-    {
-      "id": "15-skills-rescan",
-      "case": "用例 15",
-      "tier": "core",
-      "desc": "技能重扫：盘上的技能目录进表（added）→ 列表看得见 → 重扫幂等；不带 token → 401",
-      "steps": [
-        {
-          "op": "signup",
-          "expect": {
-            "http": 201,
-            "code": 0,
-            "message": ""
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/skills/rescan",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data_keys": [
-              "added",
-              "updated",
-              "removed",
-              "invalid",
-              "roots"
-            ]
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/skills",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data_keys": [
-              "skills",
-              "invalid"
-            ]
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/skills/rescan",
-          "auth": false,
-          "expect": {
-            "http": 401,
-            "code": 111102,
-            "message": "请先登录",
-            "data": null
-          }
-        }
-      ]
-    },
-    {
-      "id": "16-skills-rescan-tenant",
-      "case": "用例 16",
-      "tier": "core",
-      "desc": "技能重扫（租户视角）：roots[] 只含本租户根；不带 token → 401",
-      "steps": [
-        {
-          "op": "signup",
-          "expect": {
-            "http": 201,
-            "code": 0,
-            "message": ""
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/skills/rescan",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data_keys": [
-              "added",
-              "updated",
-              "removed",
-              "invalid",
-              "roots"
-            ]
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/skills/rescan",
-          "auth": false,
-          "expect": {
-            "http": 401,
-            "code": 111102,
-            "message": "请先登录",
-            "data": null
-          }
-        }
-      ]
-    },
-    {
-      "id": "17-skills-detail",
-      "case": "用例 17",
-      "tier": "core",
-      "desc": "技能详情：名字按租户视界解析，data 键序 skill→body；未知名字与无 token 的拒绝路径",
-      "steps": [
-        {
-          "op": "signup",
-          "expect": {
-            "http": 201,
-            "code": 0,
-            "message": ""
-          }
-        },
-        {
-          "op": "seed_skill",
-          "name": "demo",
-          "skill_md": "---\nname: demo\ndescription: 演示技能\n---\n\n# 演示\n\n正文。\n"
-        },
-        {
-          "method": "POST",
-          "path": "/api/skills/rescan",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data_keys": [
-              "added",
-              "updated",
-              "removed",
-              "invalid",
-              "roots"
-            ]
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/skills/demo",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data_keys": [
-              "skill",
-              "body"
-            ]
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/skills/nope",
-          "expect": {
-            "http": 404,
-            "code": 116001,
-            "message": "找不到这个技能",
-            "data": null
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/skills/demo",
-          "auth": false,
-          "expect": {
-            "http": 401,
-            "code": 111102,
-            "message": "请先登录",
-            "data": null
-          }
-        }
-      ]
-    },
-    {
-      "id": "18-run-skills-empty",
-      "case": "用例 18",
-      "tier": "core",
-      "desc": "本场技能动作清单（doc/52 B1；B4 起从 runlog 真派生）：未知 run 404 112002、未登录 401 111102；没调过技能工具的 run 仍是 loads:[]（用例 1 的末步与本拍实跑字节），非空形态见用例 21",
-      "steps": [
-        {
-          "method": "GET",
-          "path": "/api/runs/r_nope/skills",
-          "expect": {
-            "http": 404,
-            "code": 112002,
-            "message": "找不到这次运行",
-            "data": null
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/runs/r_nope/skills",
-          "auth": false,
-          "expect": {
-            "http": 401,
-            "code": 111102,
-            "message": "请先登录",
-            "data": null
-          }
-        }
-      ]
-    },
-    {
-      "id": "25-skills-install",
-      "case": "用例 25",
-      "tier": "core",
-      "desc": "技能安装/更新/删除（doc/52 C1）：multipart 装上 → 列表出现 → 坏包三连（zip 穿越 116105、缺 description 116102、正文超限 116116）→ 同名再装 116106 → DELETE 回 deleted → 删不存在的 116001 → 删后重装 201",
-      "steps": [
-        {
-          "op": "signup",
-          "no_model": true
-        },
-        {
-          "op": "upload",
-          "path": "/api/skills/install",
-          "files": {
-            "demo/SKILL.md": "---\nname: demo\ndescription: 演示技能：安装验收用\nrequires: [python3]\n---\n正文\n",
-            "demo/notes.md": "resource\n"
-          },
-          "expect": {
-            "http": 201,
-            "code": 0,
-            "message": "",
-            "data": {
-              "installed": [
-                {
-                  "name": "demo",
-                  "dependencies": [
-                    {
-                      "name": "python3"
-                    }
-                  ],
-                  "warnings": []
-                }
-              ],
-              "warnings": []
-            }
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/skills",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data_items_some": {
-              "path": "skills",
-              "match": {
-                "name": "demo",
-                "source": "tenant",
-                "valid": true,
-                "requires": [
-                  "python3"
-                ],
-                "missing": []
-              }
-            }
-          }
-        },
-        {
-          "op": "upload",
-          "path": "/api/skills/install",
-          "files": {
-            "demo/SKILL.md": "---\nname: demo\ndescription: 穿越用例\n---\nx\n",
-            "../evil.md": "pwned\n"
-          },
-          "expect": {
-            "http": 400,
-            "code": 116105
-          }
-        },
-        {
-          "op": "upload",
-          "path": "/api/skills/install",
-          "files": {
-            "nodesc/SKILL.md": "---\nname: nodesc\n---\n正文\n"
-          },
-          "expect": {
-            "http": 400,
-            "code": 116102
-          }
-        },
-        {
-          "op": "upload",
-          "path": "/api/skills/install",
-          "files": {
-            "toobig/SKILL.md": "---\nname: toobig\ndescription: 正文超限\n---\n"
-          },
-          "fill_bytes": 140000,
-          "expect": {
-            "http": 413,
-            "code": 116116
-          }
-        },
-        {
-          "op": "upload",
-          "path": "/api/skills/install",
-          "files": {
-            "demo/SKILL.md": "---\nname: demo\ndescription: 演示技能：安装验收用\n---\n正文\n"
-          },
-          "expect": {
-            "http": 409,
-            "code": 116106
-          }
-        },
-        {
-          "method": "DELETE",
-          "path": "/api/skills/demo",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data": {
-              "status": "deleted"
-            }
-          }
-        },
-        {
-          "method": "DELETE",
-          "path": "/api/skills/demo",
-          "expect": {
-            "http": 404,
-            "code": 116001,
-            "message": "找不到这个技能",
-            "data": null
-          }
-        },
-        {
-          "op": "upload",
-          "path": "/api/skills/install",
-          "files": {
-            "demo/SKILL.md": "---\nname: demo\ndescription: 演示技能：删后重装\n---\n正文\n"
-          },
-          "expect": {
-            "http": 201,
-            "code": 0
-          }
-        }
-      ]
-    },
-    {
-      "id": "26-skills-preview",
-      "case": "用例 26",
-      "tier": "core",
-      "desc": "技能来源预览（doc/52 C2）：命令串只认 add（remove → 116109）；SSH、服务端本地路径、shell 元字符、私网/回环直链一律 116109；install 的 JSON 分支与 preview 同一套拒绝；无 token 401。成功抓取要公网（GitHub codeload / GitLab），由活体抽验与 19v6-04 用例 26 记录。",
-      "steps": [
-        {
-          "op": "signup",
-          "no_model": true
-        },
-        {
-          "method": "POST",
-          "path": "/api/skills/preview",
-          "body": {
-            "command": "npx skills remove x"
-          },
-          "expect": {
-            "http": 400,
-            "code": 116109,
-            "message": "只支持 add，不支持 \"remove\"（list/find/remove/update/check/init/use 都不认）",
-            "data": null
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/skills/preview",
-          "body": {
-            "source": "http://127.0.0.1/x.zip"
-          },
-          "expect": {
-            "http": 400,
-            "code": 116109,
-            "message": "来源地址不是公网地址（拒绝内网/回环/元数据地址）",
-            "data": null
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/skills/preview",
-          "body": {
-            "source": "git@github.com:o/r.git"
-          },
-          "expect": {
-            "http": 400,
-            "code": 116109
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/skills/preview",
-          "body": {
-            "source": "/tmp/x.zip"
-          },
-          "expect": {
-            "http": 400,
-            "code": 116109
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/skills/preview",
-          "body": {
-            "command": "npx skills add o/r; rm -rf /"
-          },
-          "expect": {
-            "http": 400,
-            "code": 116109
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/skills/install",
-          "body": {
-            "command": "npx skills remove x"
-          },
-          "expect": {
-            "http": 400,
-            "code": 116109
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/skills/preview",
-          "body": {
-            "source": "o/r",
-            "command": "npx skills add o/r"
-          },
-          "expect": {
-            "http": 400,
-            "code": 116109
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/skills/preview",
-          "body": {
-            "command": "npx skills add o/r"
-          },
-          "auth": false,
-          "expect": {
-            "http": 401,
-            "code": 111102,
-            "message": "请先登录",
-            "data": null
-          }
-        }
-      ]
-    },
-    {
-      "id": "28-skills-check",
-      "case": "用例 28",
-      "tier": "core",
-      "desc": "依赖检查（doc/52 D1）：requires 现算 found/path、缺的不拦；名字按租户视界解析，无 token 401",
-      "steps": [
-        {
-          "op": "signup",
-          "no_model": true
-        },
-        {
-          "op": "seed_skill",
-          "name": "dep-check",
-          "skill_md": "---\nname: dep-check\ndescription: D1 契约用例\nrequires: [sh, no-such-tool-d1]\n---\n正文\n"
-        },
-        {
-          "method": "POST",
-          "path": "/api/skills/rescan",
-          "expect": {
-            "http": 200,
-            "code": 0
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/skills/dep-check/check",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data": {
-              "dependencies": [
-                {
-                  "name": "sh",
-                  "found": true
-                },
-                {
-                  "name": "no-such-tool-d1",
-                  "found": false
-                }
-              ],
-              "checkedOn": "host"
-            }
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/skills/dep-check",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data": {
-              "skill": {
-                "name": "dep-check",
-                "requires": [
-                  "sh",
-                  "no-such-tool-d1"
-                ],
-                "missing": [
-                  "no-such-tool-d1"
-                ]
-              }
-            }
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/skills/nope/check",
-          "expect": {
-            "http": 404,
-            "code": 116001,
-            "message": "找不到这个技能",
-            "data": null
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/skills/dep-check/check",
-          "auth": false,
-          "expect": {
-            "http": 401,
-            "code": 111102,
-            "message": "请先登录",
-            "data": null
-          }
-        }
-      ]
-    },
-    {
-      "id": "29-agent-skill-scope",
-      "case": "用例 29",
-      "tier": "core",
-      "desc": "技能作用域（doc/52 E1）：manager 规格可收窄 skills:／exclude_skills:（JSON 面 skillPolicy），空名单=一个都不要；普通子代理写这两个字段一律 400（md 导入与 JSON 新建同判）；不写=inherit",
-      "steps": [
-        {
-          "op": "signup",
-          "no_model": true
-        },
-        {
-          "method": "POST",
-          "path": "/api/tenants/{ten}/agents",
-          "body": {
-            "name": "scope-mgr",
-            "kind": "root",
-            "spec": "你是主助手。",
-            "skillPolicy": {
-              "mode": "allow",
-              "names": [
-                "demo"
-              ]
-            }
-          },
-          "expect": {
-            "http": 201,
-            "code": 0,
-            "message": "",
-            "data": {
-              "agent": {
-                "name": "scope-mgr",
-                "skillPolicy": {
-                  "mode": "allow",
-                  "names": [
-                    "demo"
-                  ]
-                }
-              }
-            }
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/tenants/{ten}/agents?kind=root",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data_items_some": {
-              "path": "agents",
-              "match": {
-                "name": "scope-mgr",
-                "skillPolicy": {
-                  "mode": "allow",
-                  "names": [
-                    "demo"
-                  ]
-                }
-              }
-            }
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/tenants/{ten}/agents",
-          "body": {
-            "name": "scope-sub",
-            "kind": "subagent",
-            "spec": "你是子代理。",
-            "skillPolicy": {
-              "mode": "inherit",
-              "names": []
-            }
-          },
-          "expect": {
-            "http": 201,
-            "code": 0,
-            "data": {
-              "agent": {
-                "name": "scope-sub",
-                "skillPolicy": {
-                  "mode": "inherit",
-                  "names": []
-                }
-              }
-            }
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/tenants/{ten}/agents",
-          "body": {
-            "name": "scope-sub2",
-            "kind": "subagent",
-            "spec": "你是子代理。",
-            "skillPolicy": {
-              "mode": "allow",
-              "names": [
-                "demo"
-              ]
-            }
-          },
-          "expect": {
-            "http": 400,
-            "code": 111002,
-            "message": "skills:／exclude_skills: 只对主助手有效（普通子代理没有技能目录）",
-            "data": null
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/tenants/{ten}/agents/import",
-          "body": {
-            "files": [
-              {
-                "name": "sub-skills.md",
-                "content": "---\nname: sub-skills\ndescription: 子代理写作用域\nskills:\n  - demo\n---\n正文\n"
-              }
-            ]
-          },
-          "expect": {
-            "http": 400,
-            "code": 111002,
-            "message": "skills:／exclude_skills: 只对主助手有效（普通子代理没有技能目录）",
-            "data": null
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/tenants/{ten}/agents/import",
-          "body": {
-            "files": [
-              {
-                "name": "coder.md",
-                "content": "---\nname: coder\ndescription: 带作用域的主助手规格\nexclude_skills:\n  - demo\n---\n正文\n"
-              }
-            ]
-          },
-          "expect": {
-            "http": 201,
-            "code": 0,
-            "data": {
-              "agents": [
-                {
-                  "name": "coder",
-                  "skillPolicy": {
-                    "mode": "exclude",
-                    "names": [
-                      "demo"
-                    ]
-                  }
-                }
-              ]
-            }
-          }
-        }
-      ]
-    },
-    {
-      "id": "30-skill-disable",
-      "case": "用例 30",
-      "tier": "core",
-      "desc": "技能禁用（doc/52 E2）：PATCH enabled=false 写 skill_disables、列表/详情回 enabled:false；enable 撤销；viewer 403 111203；DELETE 同事务清禁用行（重装后回 enabled:true 为证）",
-      "steps": [
-        {
-          "op": "signup",
-          "no_model": true
-        },
-        {
-          "op": "seed_skill",
-          "name": "demo-off",
-          "skill_md": "---\nname: demo-off\ndescription: 禁用验收用例\n---\n正文：一条测试技能。\n"
-        },
-        {
-          "method": "POST",
-          "path": "/api/skills/rescan",
-          "body": {},
-          "expect": {
-            "http": 200,
-            "code": 0
-          }
-        },
-        {
-          "method": "PATCH",
-          "path": "/api/skills/demo-off",
-          "body": {
-            "enabled": false
-          },
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data": {
-              "skill": {
-                "name": "demo-off",
-                "enabled": false
-              }
-            }
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/skills",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data_items_some": {
-              "path": "skills",
-              "match": {
-                "name": "demo-off",
-                "enabled": false
-              }
-            }
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/skills/demo-off",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data": {
-              "skill": {
-                "name": "demo-off",
-                "enabled": false
-              }
-            }
-          }
-        },
-        {
-          "method": "PATCH",
-          "path": "/api/skills/demo-off",
-          "body": {
-            "enabled": true
-          },
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data": {
-              "skill": {
-                "name": "demo-off",
-                "enabled": true
-              }
-            }
-          }
-        },
-        {
-          "op": "invite_viewer"
-        },
-        {
-          "method": "PATCH",
-          "path": "/api/skills/demo-off",
-          "tokenVar": "viewerTok",
-          "body": {
-            "enabled": false
-          },
-          "expect": {
-            "http": 403,
-            "code": 111203,
-            "message": "没有权限做这件事",
-            "data": null
-          }
-        },
-        {
-          "method": "PATCH",
-          "path": "/api/skills/demo-off",
-          "auth": false,
-          "body": {
-            "enabled": false
-          },
-          "expect": {
-            "http": 401,
-            "code": 111102,
-            "message": "请先登录",
-            "data": null
-          }
-        },
-        {
-          "method": "PATCH",
-          "path": "/api/skills/demo-off",
-          "body": {
-            "enabled": false
-          },
-          "expect": {
-            "http": 200,
-            "code": 0
-          }
-        },
-        {
-          "method": "DELETE",
-          "path": "/api/skills/demo-off",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data": {
-              "status": "deleted"
-            }
-          }
-        },
-        {
-          "op": "seed_skill",
-          "name": "demo-off",
-          "skill_md": "---\nname: demo-off\ndescription: 禁用验收用例\n---\n正文：一条测试技能。\n"
-        },
-        {
-          "method": "POST",
-          "path": "/api/skills/rescan",
-          "body": {},
-          "expect": {
-            "http": 200,
-            "code": 0
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/skills",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data_items_some": {
-              "path": "skills",
-              "match": {
-                "name": "demo-off",
-                "enabled": true
-              }
-            }
-          }
-        }
-      ]
-    },
-    {
-      "id": "31-tools-write",
-      "case": "用例 31",
-      "tier": "core",
-      "desc": "工具上传写面（doc/52 D36 F1）：上传单文件到租户工具根（staging→.trash→rename）、同名覆盖、坏名/预留名/空文件 116117、额度不足 429 113001、viewer 只读 403、删除回 deleted 且列表消失；工具根不进表，列表就是扫盘",
-      "steps": [
-        {
-          "op": "signup",
-          "no_model": true
-        },
-        {
-          "op": "upload_tool",
-          "path": "/api/tools",
-          "name": "hello",
-          "content": "#!/bin/sh\necho hi\n",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "message": "",
-            "data": {
-              "tool": {
-                "name": "hello",
-                "exe": true,
-                "bytes": 18
-              }
-            }
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/tools",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data_items_some": {
-              "path": "tools",
-              "match": {
-                "name": "hello",
-                "exe": true,
-                "bytes": 18
-              }
-            }
-          }
-        },
-        {
-          "op": "upload_tool",
-          "path": "/api/tools",
-          "name": "hello",
-          "content": "#!/bin/sh\necho version-two\n",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data": {
-              "tool": {
-                "name": "hello",
-                "bytes": 27
-              }
-            }
-          }
-        },
-        {
-          "op": "upload_tool",
-          "path": "/api/tools",
-          "name": "../evil",
-          "content": "x\n",
-          "expect": {
-            "http": 400,
-            "code": 116117,
-            "message": "工具名只能是小写字母、数字和连字符（64 字符以内）",
-            "data": null
-          }
-        },
-        {
-          "op": "upload_tool",
-          "path": "/api/tools",
-          "name": "bash",
-          "content": "x\n",
-          "expect": {
-            "http": 400,
-            "code": 116117,
-            "message": "\"bash\" 是保留名，不能用作工具名",
-            "data": null
-          }
-        },
-        {
-          "op": "upload_tool",
-          "path": "/api/tools",
-          "name": "Bash",
-          "content": "x\n",
-          "expect": {
-            "http": 400,
-            "code": 116117
-          }
-        },
-        {
-          "op": "upload_tool",
-          "path": "/api/tools",
-          "name": "empty",
-          "content": "",
-          "expect": {
-            "http": 400,
-            "code": 116117,
-            "message": "上传的文件是空的",
-            "data": null
-          }
-        },
-        {
-          "sql": "UPDATE tenants SET max_storage_bytes = 1 WHERE id = '{ten}'"
-        },
-        {
-          "op": "upload_tool",
-          "path": "/api/tools",
-          "name": "quota",
-          "content": "x\n",
-          "expect": {
-            "http": 429,
-            "code": 113001,
-            "message": "这个工作区的额度用完了",
-            "data": null
-          }
-        },
-        {
-          "sql": "UPDATE tenants SET max_storage_bytes = 0 WHERE id = '{ten}'"
-        },
-        {
-          "method": "GET",
-          "path": "/api/tools",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data_items_some": {
-              "path": "tools",
-              "match": {
-                "name": "hello",
-                "bytes": 27
-              }
-            }
-          }
-        },
-        {
-          "op": "invite_viewer"
-        },
-        {
-          "op": "upload_tool",
-          "path": "/api/tools",
-          "name": "hello",
-          "tokenVar": "viewerTok",
-          "content": "x\n",
-          "expect": {
-            "http": 403,
-            "code": 111203,
-            "message": "没有权限做这件事",
-            "data": null
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/tools",
-          "tokenVar": "viewerTok",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data_items_some": {
-              "path": "tools",
-              "match": {
-                "name": "hello"
-              }
-            }
-          }
-        },
-        {
-          "method": "DELETE",
-          "path": "/api/tools/nope",
-          "expect": {
-            "http": 404,
-            "code": 116119,
-            "message": "找不到这个工具",
-            "data": null
-          }
-        },
-        {
-          "method": "DELETE",
-          "path": "/api/tools/hello",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data": {
-              "status": "deleted"
-            }
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/tools",
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data": {
-              "tools": []
-            }
-          }
-        },
-        {
-          "method": "GET",
-          "path": "/api/tools",
-          "auth": false,
-          "expect": {
-            "http": 401,
-            "code": 111102,
-            "message": "请先登录",
-            "data": null
-          }
-        }
-      ]
-    },
-    {
-      "id": "32-read-pagination",
-      "case": "用例 32",
-      "tier": "core",
-      "desc": "读分页（doc/58 §3）：offset/limit 切片 + 三态页脚、offset 越界/非正/limit 超上限 400 111002、缺文件 400 111002（读工具的字节只有 dev 口打得到）",
-      "steps": [
-        {
-          "op": "signup",
-          "no_model": true
-        },
-        {
-          "method": "POST",
-          "path": "/api/dev/workspace/file",
-          "body": {
-            "path": "d58-page.txt",
-            "content": "line 1\nline 2\nline 3\n"
-          },
-          "expect": {
-            "http": 201,
-            "code": 0,
-            "message": "",
-            "data": {
-              "path": "d58-page.txt"
-            }
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/dev/workspace/read",
-          "body": {
-            "path": "d58-page.txt"
-          },
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data": {
-              "output": "line 1\nline 2\nline 3\n\n（已读到文件末尾，共 3 行）"
-            }
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/dev/workspace/read",
-          "body": {
-            "path": "d58-page.txt",
-            "offset": 2,
-            "limit": 1
-          },
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data": {
-              "output": "line 2\n\n（已显示第 2-2 行，共 3 行；继续读用 offset=3）"
-            }
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/dev/workspace/read",
-          "body": {
-            "path": "d58-page.txt",
-            "offset": 9
-          },
-          "expect": {
-            "http": 400,
-            "code": 111002,
-            "message": "offset 9 超出文件末尾（共 3 行）",
-            "data": null
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/dev/workspace/read",
-          "body": {
-            "path": "d58-page.txt",
-            "offset": 0
-          },
-          "expect": {
-            "http": 400,
-            "code": 111002,
-            "message": "offset 须为正整数（给的是 0）",
-            "data": null
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/dev/workspace/read",
-          "body": {
-            "path": "d58-page.txt",
-            "limit": 5000
-          },
-          "expect": {
-            "http": 400,
-            "code": 111002,
-            "message": "limit 不得大于 2000（给的是 5000）",
-            "data": null
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/dev/workspace/read",
-          "body": {
-            "path": "d58-nope.txt"
-          },
-          "expect": {
-            "http": 400,
-            "code": 111002,
-            "message": "文件不存在：d58-nope.txt",
-            "data": null
-          }
-        }
-      ]
-    },
-    {
-      "id": "33-bash-output-retention",
-      "case": "用例 33",
-      "tier": "core",
-      "needs": "sandbox",
-      "desc": "bash 输出留存（doc/58 §4）：小输出形状不变（不建落盘目录）、大输出留尾 + 全文落盘并回路径、落盘文件真在盘上（读回 100000 字节）",
-      "steps": [
-        {
-          "op": "signup",
-          "no_model": true
-        },
-        {
-          "method": "POST",
-          "path": "/api/dev/workspace/bash",
-          "body": {
-            "cmd": "echo hi"
-          },
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data": {
-              "output": "退出码：0\nstdout:\nhi\n",
-              "sandboxed": true
-            }
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/dev/workspace/bash",
-          "body": {
-            "cmd": "printf 'x%.0s' {1..100000}"
-          },
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data_contains": {
-              "path": "output",
-              "contains": [
-                "stdout:\n",
-                "（stdout 完整输出已存到 .tako/bash/",
-                "1.out，共 100000 字节；用 read_file 分页读它）"
-              ]
-            }
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/dev/workspace/bash",
-          "body": {
-            "cmd": "for f in .tako/bash/*/1.out; do v=$(< \"$f\"); echo \"${#v}\"; done"
-          },
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data": {
-              "output": "退出码：0\nstdout:\n100000\n"
-            }
-          }
-        },
-        {
-          "method": "POST",
-          "path": "/api/dev/workspace/bash",
-          "body": {
-            "cmd": "n=0; for d in .tako/bash/*/; do [ -d \"$d\" ] && n=$((n+1)); done; echo $n"
-          },
-          "expect": {
-            "http": 200,
-            "code": 0,
-            "data": {
-              "output": "退出码：0\nstdout:\n1\n"
-            }
-          }
-        }
-      ]
+     }
     }
-  ],
-  "declared_not_asserted": {
-    "用例 30": "禁用对 run 的生效面（doc/52 E2）——目录里消失、use_skill/read_skill 回 116107、正在跑的 run 盒子不回缩，都只在真跑模型时出现，core tier 没有 HTTP 入口；纯函数与存储侧由 go test 的 skills_test.go（SetSkillDisabled 幂等、ListSkillDisables）与 skilltools_test.go（116107 信封逐字）钉住，活体字节见 19v6-04 用例 30",
-    "用例 5": "单批上限 W —— 要用 -batch-window 3 特殊起引擎才造得出截断，默认 W=200 下这条断言没有意义；改引擎起法后手工重放",
-    "用例 6": "工具循环（get_time）—— 断模型会不会真的去调工具，换个模型就飘；帧 kind 全集由 go test 的契约测试钉住",
-    "用例 7": "委派子代理 —— 同上，模型是否委派不稳定；回传裁剪的机制断言在 doc/39 的活体抽验里",
-    "用例 8": "任务看板的 task 帧 —— 要模型真的去调 TaskCreate/TaskUpdate 才造得出这条帧，模型行为不稳（换个模型就飘）；帧 kind 词表由 go test 的契约测试钉住，看板的持久化由 TestTaskBoardSurvivesProcessRestart 钉住（另一个 Store 实例读回同一批行）",
-    "用例 9": "变更事件流（doc/46）—— SSE 长连接读取进不了短连接断言器：挂读/续传/双副本的活体断言由 scripts/acceptance/events_live.sh 判红；帧 data 字节由 go test 的 TestContractStreamEventBytes 钉住；游标语义（Last-Event-ID 续传、不带则从 $ 起不回放历史）见 doc/46 §3.3",
-    "用例 11": "question 帧与同轮注回（ask_user / submit_plan）—— 要模型真的调 ask_user 才造得出 question 帧与待答行，模型行为不稳（换个模型就飘）；帧 kind 词表由 go test 的契约测试钉住，挂起→答题→同轮继续与一答终答（409 115101）、崩溃续跑第三分支由 scripts/acceptance/question_crash.sh 判红",
-    "用例 19": "read_skill 的工具结果形态（doc/52 B2）—— 成功走 `<skill …>正文</skill>` XML、失败走 JSON 信封（116001／116107／116116），这些字节只在「模型真的调了 read_skill」的 run 里出现，core tier 没有对应的 HTTP 路径，换个模型就飘；纯函数侧（frontmatter 切分、转义往返、16,384/16,385 token 与 64KB/64KB+1 两条边界、三个信封逐字）由 go test 的 skilltools_test.go 钉住，活体字节见 19v6-04 用例 19",
-    "用例 20": "技能围栏（doc/52 B3）—— use_skill 打开本场技能根的只读读权、bash 写拒／脚本可跑、新 run 与隔壁技能不可见、子代理空盒、出站开入站关、租户 MCP 同一条 profile：这些都在真跑一轮的 bash/use_skill/MCP 工具结果里，core tier 没有对应 HTTP 路径；profile 字节与只读/可见性由 go test 的 skillfence_test.go、skillbox_test.go、mcpfence_test.go 钉住，活体字节见 19v6-04 用例 20",
-    "用例 21": "技能资源与加载清单（doc/52 B4）—— read_skill_file 的文件/目录成功体、116115（超限不带部分内容）、116114（越界/入口文件/平铺同文案）与 GET /api/runs/:id/skills 的非空 rows 都只在「模型真的调了这些工具」的 run 里出现，core tier 没有对应 HTTP 路径；纯函数侧（cleanSkillRel、文件/目录形态、软链越界、64KB/16,384 token 边界、loadsFromEntries 的配对与键序）由 go test 的 skillresource_test.go 钉住，活体字节见 19v6-04 用例 21",
-    "用例 22": "任务看板的技能归属（doc/52 B5）—— task 帧带 skillName、看板行带「（技能：名字）」要模型真的先 use_skill 再 TaskCreate 才造得出；run_tasks 没有读端点，core tier 无法断言。纯函数与存储侧由 go test 钉住（skill_name 落库、视图行形态、touchedSkill、skill box 的挪尾与 usedSkillName），活体字节见 19v6-04 用例 22",
-    "用例 23": "看板跨 run 续做与执行权恢复（doc/52 B6/D34/D35）——「上一场」段要模型真去调 TaskList、执行权恢复要真跑 bash、崩溃段要 kill -9 与租约过期，模型行为与进程时序都不稳；纯函数与存储侧由 go test 钉住（TestPreviousBoardRunAndSkillNames / TestPreviousBoardView / TestRestoreSkillRoots / TestSkillBoxLastUsedOrder），活体字节见 19v6-04 用例 23",
-    "用例 24": "技能正文折叠标记与技能记录块（doc/52 B7/B8，D33/D31/D30）—— marker 要模型先 use_skill 再 TaskCreate、记录块要真折一次才进摘要，「下一枪正文是 marker」「摘要里有 <!-- tako:skill-ops v1 -->」「trim 是整块替换」都只在真跑 + 真压的 run 里出现，core tier 没有 HTTP 路径；纯函数侧（marker 重写、slimSkillBlocks 的只读不换、extract/inherit/merge/render 逐字、与 D33 marker 共存、三档块收口）由 go test 的 skillslim_test.go / skillops_test.go / compact_test.go 钉住，活体清单元件见 19v6-04 用例 24",
-    "用例 27": "对话内安装（doc/52 C3，D20/D24）—— skill_install 全程只提议：pending 行要模型真的调这个工具才造得出（换模型就飘），approve/cancel 的落盘要看 pending 行 id，core tier 没有「造一条 kind=install 行」的 HTTP 入口；纯函数与存储侧由 go test 的 skillask_test.go 钉住（staging 路径包含/EvalSymlinks、按提案选择、过期、discard），活体字节（viewer 403 111203、owner 200、重复 approve 409 115101、三种文本、use_skill 的 <skill …>、SSE 的 skills_changed）见 19v6-04 用例 27",
-    "用例 31": "工具上传的超限分支（doc/52 D36 F1）——>128MB 要在 core tier 里现造 129MB 请求体（机器真源里每条用例都会重跑，代价不成比例），只做活体验证：413 116118，盘上无新增；max_storage_bytes 限额走 SQL 步真断言（429 113001）。staging 清理与 .trash 旧目录靠行为证明（覆盖后 bytes 变、.trash 多一个目录），活体字节见 19v6-04 用例 31",
-    "用例 34": "提问分段与问答读口（doc/47 §5.5）——要模型真的调 ask_user 才造得出带 `segments` 的 assistant 行与带 `toolCallId`/`answer` 的问答行，模型行为不稳（同用例 11 先例）；core tier 没有「造一条带 segments 的 runlog 行」的 HTTP 入口。响应形状由 go test 快闸逐字钉住：TestContractLogQuestionSegmentsBytes（segments 键序、无 segments 时省略）与 TestContractQuestionViewBytes（toolCallId/answer 键序），存储侧由 TestEndRunLandsQuestionSegments 钉住（含提问仍一条 assistant 行、end 是 rune 偏移、无提问 run payload 不变），活体字节见 19v6-04 用例 34"
+   ]
+  },
+  {
+   "id": "0-runtime-config",
+   "case": "用例 0",
+   "tier": "core",
+   "desc": "租户配模型密钥 → 密钥回显成掩码",
+   "steps": [
+    {
+     "op": "signup",
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "PUT",
+     "path": "/api/tenants/{ten}/runtime-config",
+     "body": {
+      "modelRef": "deepseek/deepseek-flash",
+      "mcpServers": {},
+      "secrets": {
+       "DEEPSEEK_API_KEY": "{key}"
+      },
+      "sandbox": {
+       "network": false
+      }
+     },
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": ""
+     }
+    }
+   ]
+  },
+  {
+   "id": "0-auth-required-runs",
+   "case": "用例 0",
+   "tier": "core",
+   "desc": "业务四端点不带 Authorization 一律 401 信封",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/runs",
+     "body": {
+      "messageId": "m_x",
+      "text": "hi"
+     },
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/sessions/s_nope",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/runs/r_nope/frames",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/sessions/s_nope/log",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "0-model-not-configured",
+   "case": "用例 0",
+   "tier": "core",
+   "desc": "租户没配模型密钥 → POST /api/runs 回 409 111408，run 起不来",
+   "steps": [
+    {
+     "op": "signup",
+     "no_model": true,
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/runs",
+     "body": {
+      "messageId": "m_1",
+      "text": "hi"
+     },
+     "expect": {
+      "http": 409,
+      "code": 111408,
+      "message": "这个工作区的模型还不可用",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "1-post-runs",
+   "case": "用例 1",
+   "tier": "model",
+   "desc": "投递 → 202 + sessionId/runId/messageId",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/runs",
+     "body": {
+      "messageId": "m_v6",
+      "text": "只回复 ok"
+     },
+     "capture": {
+      "sid": "data.sessionId",
+      "rid": "data.runId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "sessionId",
+       "runId",
+       "messageId"
+      ]
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/runs/{rid}/skills",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "runId": "{rid}",
+       "loads": []
+      },
+      "data_keys": [
+       "runId",
+       "loads"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "1-session-while-running",
+   "case": "用例 1",
+   "tier": "model",
+   "desc": "跑中 GET /api/sessions/{sid} → 五个字段，顺序固定",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/runs",
+     "body": {
+      "messageId": "m_v6",
+      "text": "只回复 ok"
+     },
+     "capture": {
+      "sid": "data.sessionId",
+      "rid": "data.runId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "sessionId",
+       "runId",
+       "messageId"
+      ]
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/sessions/{sid}",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "liveRunId",
+       "runlogOffset",
+       "lastRunStatus",
+       "lastRunId",
+       "workspaceId"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "1-frames-and-log",
+   "case": "用例 1",
+   "tier": "model",
+   "desc": "定稿后：frames 有 start/terminal，log 有 user+assistant 两行，session 变 complete",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/runs",
+     "body": {
+      "messageId": "m_v6",
+      "text": "只回复 ok"
+     },
+     "capture": {
+      "sid": "data.sessionId",
+      "rid": "data.runId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "sessionId",
+       "runId",
+       "messageId"
+      ]
+     }
+    },
+    {
+     "op": "wait_terminal",
+     "run": "{rid}",
+     "timeout": 90
+    },
+    {
+     "op": "wait_settled",
+     "session": "{sid}",
+     "timeout": 30
+    },
+    {
+     "method": "GET",
+     "path": "/api/runs/{rid}/frames?eventOffset=0",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "frames",
+       "nextOffset",
+       "status"
+      ],
+      "frame_kinds_contains": [
+       "start",
+       "terminal"
+      ]
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/sessions/{sid}",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "liveRunId",
+       "runlogOffset",
+       "lastRunStatus",
+       "lastRunId",
+       "workspaceId"
+      ],
+      "data": {
+       "liveRunId": "",
+       "lastRunStatus": "complete"
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/sessions/{sid}/log?runlogOffset=0",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "rows",
+       "nextOffset"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "2-log-offset-out-of-range",
+   "case": "用例 2",
+   "tier": "model",
+   "desc": "runlog 游标越界 → 空 rows，nextOffset 原样回",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/runs",
+     "body": {
+      "messageId": "m_v6",
+      "text": "只回复 ok"
+     },
+     "capture": {
+      "sid": "data.sessionId",
+      "rid": "data.runId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "op": "wait_terminal",
+     "run": "{rid}",
+     "timeout": 90
+    },
+    {
+     "op": "wait_settled",
+     "session": "{sid}",
+     "timeout": 30
+    },
+    {
+     "method": "GET",
+     "path": "/api/sessions/{sid}/log?runlogOffset=999",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "rows": [],
+       "nextOffset": 999
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "2-frames-offset-out-of-range",
+   "case": "用例 2",
+   "tier": "model",
+   "desc": "frames 游标越界 → 空 frames，nextOffset 原样回（status 随 runlive TTL 变，不钉）",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/runs",
+     "body": {
+      "messageId": "m_v6",
+      "text": "只回复 ok"
+     },
+     "capture": {
+      "sid": "data.sessionId",
+      "rid": "data.runId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "op": "wait_terminal",
+     "run": "{rid}",
+     "timeout": 90
+    },
+    {
+     "op": "wait_settled",
+     "session": "{sid}",
+     "timeout": 30
+    },
+    {
+     "method": "GET",
+     "path": "/api/runs/{rid}/frames?eventOffset=999",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "frames": [],
+       "nextOffset": 999
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "3-unknown-session",
+   "case": "用例 3",
+   "tier": "core",
+   "desc": "未知 sessionId：三个端点一律 404 112001",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/runs",
+     "body": {
+      "sessionId": "s_nope",
+      "messageId": "m_9",
+      "text": "hi"
+     },
+     "expect": {
+      "http": 404,
+      "code": 112001,
+      "message": "找不到这场会话",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/sessions/s_nope",
+     "expect": {
+      "http": 404,
+      "code": 112001,
+      "message": "找不到这场会话",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/sessions/s_nope/log",
+     "expect": {
+      "http": 404,
+      "code": 112001,
+      "message": "找不到这场会话",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "3-unknown-run-frames",
+   "case": "用例 3",
+   "tier": "core",
+   "desc": "未知 run 在 frames 上仍不是 404——200 + 空 frames + gone",
+   "steps": [
+    {
+     "method": "GET",
+     "path": "/api/runs/r_nope/frames",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "frames": [],
+       "nextOffset": 0,
+       "status": "gone"
+      },
+      "data_keys": [
+       "frames",
+       "nextOffset",
+       "status"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "4-busy-rejected",
+   "case": "用例 4",
+   "tier": "model",
+   "needs": "pg",
+   "desc": "忙时诚实拒绝：409 112101，且忙拒在 runlog 里零痕迹",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/runs",
+     "body": {
+      "messageId": "m_v6",
+      "text": "只回复 ok"
+     },
+     "capture": {
+      "sid": "data.sessionId",
+      "rid": "data.runId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "op": "wait_terminal",
+     "run": "{rid}",
+     "timeout": 90
+    },
+    {
+     "op": "wait_settled",
+     "session": "{sid}",
+     "timeout": 30
+    },
+    {
+     "method": "GET",
+     "path": "/api/sessions/{sid}/log?runlogOffset=0",
+     "capture": {
+      "rows_before": "data.rows"
+     },
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "UPDATE runs SET status='running', lease_until=now()+interval '5 minutes', finished_at=NULL WHERE id='{rid}'"
+    },
+    {
+     "method": "POST",
+     "path": "/api/runs",
+     "body": {
+      "sessionId": "{sid}",
+      "messageId": "m_busy",
+      "text": "急"
+     },
+     "expect": {
+      "http": 409,
+      "code": 112101,
+      "message": "这场会话正在跑，等它跑完再发",
+      "data": null
+     }
+    },
+    {
+     "sql": "UPDATE runs SET status='complete', lease_until=NULL, finished_at=now() WHERE id='{rid}'"
+    },
+    {
+     "method": "GET",
+     "path": "/api/sessions/{sid}/log?runlogOffset=0",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "rows_len_equals": "{rows_before}"
+     }
+    }
+   ]
+  },
+  {
+   "id": "10-question-codes",
+   "case": "用例 10",
+   "tier": "core",
+   "desc": "人审与问答码段：未知 run 的列表 404 112002；未知行答题 404 115002；无鉴权 401 111102",
+   "steps": [
+    {
+     "method": "GET",
+     "path": "/api/runs/r_nope/questions?status=pending",
+     "expect": {
+      "http": 404,
+      "code": 112002,
+      "message": "找不到这次运行",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/questions/qs_nope/answer",
+     "body": {
+      "answer": "x"
+     },
+     "expect": {
+      "http": 404,
+      "code": 115002,
+      "message": "找不到这个提问",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/questions/qs_nope/answer",
+     "body": {
+      "answer": "x"
+     },
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "12-workspace-files",
+   "case": "用例 12",
+   "tier": "core",
+   "desc": "项目文件清单：目录在前、内部目录与符号链接不列、越界与绝对路径 400 111002、看不见的项目 404 114001",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-files"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "op": "seed_ws",
+     "workspace": "{wid}",
+     "files": {
+      "hello.txt": "Hello, world!\n",
+      ".media/pic.png": "x",
+      ".tako/search/r1_1.md": "x"
+     },
+     "dirs": [
+      "sub"
+     ],
+     "symlinks": [
+      "link-out"
+     ]
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/files?path=.",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "path": ".",
+       "entries": [
+        {
+         "name": "sub",
+         "kind": "dir"
+        },
+        {
+         "name": "hello.txt",
+         "kind": "file",
+         "size": 14
+        }
+       ]
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/files?path=sub",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "path": "sub",
+       "entries": []
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/files?path=../../etc",
+     "expect": {
+      "http": 400,
+      "code": 111002,
+      "message": "路径不对",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/files?path=/etc/passwd",
+     "expect": {
+      "http": 400,
+      "code": 111002,
+      "message": "路径不对",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/ws_nope/files",
+     "expect": {
+      "http": 404,
+      "code": 114001,
+      "message": "找不到这个项目",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/files?path=nope",
+     "expect": {
+      "http": 404,
+      "code": 114101,
+      "message": "找不到这个文件",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/files",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "13-workspace-isdefault",
+   "case": "用例 13",
+   "tier": "core",
+   "desc": "项目列表带 isDefault：新建的项目是 false（默认项目不能删，服务端 114005）",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-isdefault"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_items_some": {
+       "path": "workspaces",
+       "match": {
+        "id": "{wid}",
+        "isDefault": false
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "14-skills-empty",
+   "case": "用例 14",
+   "tier": "core",
+   "desc": "技能列表：data 有 skills[] 与 invalid[] 两个键，元素字段序固定（name→description→source→path→enabled→bytes→requires→missing→updatedAt→valid）",
+   "steps": [
+    {
+     "op": "signup",
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/skills",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "skills",
+       "invalid"
+      ]
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/skills",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "15-skills-rescan",
+   "case": "用例 15",
+   "tier": "core",
+   "desc": "技能重扫：盘上的技能目录进表（added）→ 列表看得见 → 重扫幂等；不带 token → 401",
+   "steps": [
+    {
+     "op": "signup",
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/skills/rescan",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "added",
+       "updated",
+       "removed",
+       "invalid",
+       "roots"
+      ]
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/skills",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "skills",
+       "invalid"
+      ]
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/skills/rescan",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "16-skills-rescan-tenant",
+   "case": "用例 16",
+   "tier": "core",
+   "desc": "技能重扫（租户视角）：roots[] 只含本租户根；不带 token → 401",
+   "steps": [
+    {
+     "op": "signup",
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/skills/rescan",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "added",
+       "updated",
+       "removed",
+       "invalid",
+       "roots"
+      ]
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/skills/rescan",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "17-skills-detail",
+   "case": "用例 17",
+   "tier": "core",
+   "desc": "技能详情：名字按租户视界解析，data 键序 skill→body；未知名字与无 token 的拒绝路径",
+   "steps": [
+    {
+     "op": "signup",
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "op": "seed_skill",
+     "name": "demo",
+     "skill_md": "---\nname: demo\ndescription: 演示技能\n---\n\n# 演示\n\n正文。\n"
+    },
+    {
+     "method": "POST",
+     "path": "/api/skills/rescan",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "added",
+       "updated",
+       "removed",
+       "invalid",
+       "roots"
+      ]
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/skills/demo",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "skill",
+       "body"
+      ]
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/skills/nope",
+     "expect": {
+      "http": 404,
+      "code": 116001,
+      "message": "找不到这个技能",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/skills/demo",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "18-run-skills-empty",
+   "case": "用例 18",
+   "tier": "core",
+   "desc": "本场技能动作清单（doc/52 B1；B4 起从 runlog 真派生）：未知 run 404 112002、未登录 401 111102；没调过技能工具的 run 仍是 loads:[]（用例 1 的末步与本拍实跑字节），非空形态见用例 21",
+   "steps": [
+    {
+     "method": "GET",
+     "path": "/api/runs/r_nope/skills",
+     "expect": {
+      "http": 404,
+      "code": 112002,
+      "message": "找不到这次运行",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/runs/r_nope/skills",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "25-skills-install",
+   "case": "用例 25",
+   "tier": "core",
+   "desc": "技能安装/更新/删除（doc/52 C1）：multipart 装上 → 列表出现 → 坏包三连（zip 穿越 116105、缺 description 116102、正文超限 116116）→ 同名再装 116106 → DELETE 回 deleted → 删不存在的 116001 → 删后重装 201",
+   "steps": [
+    {
+     "op": "signup",
+     "no_model": true
+    },
+    {
+     "op": "upload",
+     "path": "/api/skills/install",
+     "files": {
+      "demo/SKILL.md": "---\nname: demo\ndescription: 演示技能：安装验收用\nrequires: [python3]\n---\n正文\n",
+      "demo/notes.md": "resource\n"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": "",
+      "data": {
+       "installed": [
+        {
+         "name": "demo",
+         "dependencies": [
+          {
+           "name": "python3"
+          }
+         ],
+         "warnings": []
+        }
+       ],
+       "warnings": []
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/skills",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data_items_some": {
+       "path": "skills",
+       "match": {
+        "name": "demo",
+        "source": "tenant",
+        "valid": true,
+        "requires": [
+         "python3"
+        ],
+        "missing": []
+       }
+      }
+     }
+    },
+    {
+     "op": "upload",
+     "path": "/api/skills/install",
+     "files": {
+      "demo/SKILL.md": "---\nname: demo\ndescription: 穿越用例\n---\nx\n",
+      "../evil.md": "pwned\n"
+     },
+     "expect": {
+      "http": 400,
+      "code": 116105
+     }
+    },
+    {
+     "op": "upload",
+     "path": "/api/skills/install",
+     "files": {
+      "nodesc/SKILL.md": "---\nname: nodesc\n---\n正文\n"
+     },
+     "expect": {
+      "http": 400,
+      "code": 116102
+     }
+    },
+    {
+     "op": "upload",
+     "path": "/api/skills/install",
+     "files": {
+      "toobig/SKILL.md": "---\nname: toobig\ndescription: 正文超限\n---\n"
+     },
+     "fill_bytes": 140000,
+     "expect": {
+      "http": 413,
+      "code": 116116
+     }
+    },
+    {
+     "op": "upload",
+     "path": "/api/skills/install",
+     "files": {
+      "demo/SKILL.md": "---\nname: demo\ndescription: 演示技能：安装验收用\n---\n正文\n"
+     },
+     "expect": {
+      "http": 409,
+      "code": 116106
+     }
+    },
+    {
+     "method": "DELETE",
+     "path": "/api/skills/demo",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "status": "deleted"
+      }
+     }
+    },
+    {
+     "method": "DELETE",
+     "path": "/api/skills/demo",
+     "expect": {
+      "http": 404,
+      "code": 116001,
+      "message": "找不到这个技能",
+      "data": null
+     }
+    },
+    {
+     "op": "upload",
+     "path": "/api/skills/install",
+     "files": {
+      "demo/SKILL.md": "---\nname: demo\ndescription: 演示技能：删后重装\n---\n正文\n"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0
+     }
+    }
+   ]
+  },
+  {
+   "id": "26-skills-preview",
+   "case": "用例 26",
+   "tier": "core",
+   "desc": "技能来源预览（doc/52 C2）：命令串只认 add（remove → 116109）；SSH、服务端本地路径、shell 元字符、私网/回环直链一律 116109；install 的 JSON 分支与 preview 同一套拒绝；无 token 401。成功抓取要公网（GitHub codeload / GitLab），由活体抽验与 19v6-04 用例 26 记录。",
+   "steps": [
+    {
+     "op": "signup",
+     "no_model": true
+    },
+    {
+     "method": "POST",
+     "path": "/api/skills/preview",
+     "body": {
+      "command": "npx skills remove x"
+     },
+     "expect": {
+      "http": 400,
+      "code": 116109,
+      "message": "只支持 add，不支持 \"remove\"（list/find/remove/update/check/init/use 都不认）",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/skills/preview",
+     "body": {
+      "source": "http://127.0.0.1/x.zip"
+     },
+     "expect": {
+      "http": 400,
+      "code": 116109,
+      "message": "来源地址不是公网地址（拒绝内网/回环/元数据地址）",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/skills/preview",
+     "body": {
+      "source": "git@github.com:o/r.git"
+     },
+     "expect": {
+      "http": 400,
+      "code": 116109
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/skills/preview",
+     "body": {
+      "source": "/tmp/x.zip"
+     },
+     "expect": {
+      "http": 400,
+      "code": 116109
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/skills/preview",
+     "body": {
+      "command": "npx skills add o/r; rm -rf /"
+     },
+     "expect": {
+      "http": 400,
+      "code": 116109
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/skills/install",
+     "body": {
+      "command": "npx skills remove x"
+     },
+     "expect": {
+      "http": 400,
+      "code": 116109
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/skills/preview",
+     "body": {
+      "source": "o/r",
+      "command": "npx skills add o/r"
+     },
+     "expect": {
+      "http": 400,
+      "code": 116109
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/skills/preview",
+     "body": {
+      "command": "npx skills add o/r"
+     },
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "28-skills-check",
+   "case": "用例 28",
+   "tier": "core",
+   "desc": "依赖检查（doc/52 D1）：requires 现算 found/path、缺的不拦；名字按租户视界解析，无 token 401",
+   "steps": [
+    {
+     "op": "signup",
+     "no_model": true
+    },
+    {
+     "op": "seed_skill",
+     "name": "dep-check",
+     "skill_md": "---\nname: dep-check\ndescription: D1 契约用例\nrequires: [sh, no-such-tool-d1]\n---\n正文\n"
+    },
+    {
+     "method": "POST",
+     "path": "/api/skills/rescan",
+     "expect": {
+      "http": 200,
+      "code": 0
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/skills/dep-check/check",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "dependencies": [
+        {
+         "name": "sh",
+         "found": true
+        },
+        {
+         "name": "no-such-tool-d1",
+         "found": false
+        }
+       ],
+       "checkedOn": "host"
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/skills/dep-check",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data": {
+       "skill": {
+        "name": "dep-check",
+        "requires": [
+         "sh",
+         "no-such-tool-d1"
+        ],
+        "missing": [
+         "no-such-tool-d1"
+        ]
+       }
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/skills/nope/check",
+     "expect": {
+      "http": 404,
+      "code": 116001,
+      "message": "找不到这个技能",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/skills/dep-check/check",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "29-agent-skill-scope",
+   "case": "用例 29",
+   "tier": "core",
+   "desc": "技能作用域（doc/52 E1）：manager 规格可收窄 skills:／exclude_skills:（JSON 面 skillPolicy），空名单=一个都不要；普通子代理写这两个字段一律 400（md 导入与 JSON 新建同判）；不写=inherit",
+   "steps": [
+    {
+     "op": "signup",
+     "no_model": true
+    },
+    {
+     "method": "POST",
+     "path": "/api/tenants/{ten}/agents",
+     "body": {
+      "name": "scope-mgr",
+      "kind": "root",
+      "spec": "你是主助手。",
+      "skillPolicy": {
+       "mode": "allow",
+       "names": [
+        "demo"
+       ]
+      }
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": "",
+      "data": {
+       "agent": {
+        "name": "scope-mgr",
+        "skillPolicy": {
+         "mode": "allow",
+         "names": [
+          "demo"
+         ]
+        }
+       }
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tenants/{ten}/agents?kind=root",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data_items_some": {
+       "path": "agents",
+       "match": {
+        "name": "scope-mgr",
+        "skillPolicy": {
+         "mode": "allow",
+         "names": [
+          "demo"
+         ]
+        }
+       }
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tenants/{ten}/agents",
+     "body": {
+      "name": "scope-sub",
+      "kind": "subagent",
+      "spec": "你是子代理。",
+      "skillPolicy": {
+       "mode": "inherit",
+       "names": []
+      }
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "data": {
+       "agent": {
+        "name": "scope-sub",
+        "skillPolicy": {
+         "mode": "inherit",
+         "names": []
+        }
+       }
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tenants/{ten}/agents",
+     "body": {
+      "name": "scope-sub2",
+      "kind": "subagent",
+      "spec": "你是子代理。",
+      "skillPolicy": {
+       "mode": "allow",
+       "names": [
+        "demo"
+       ]
+      }
+     },
+     "expect": {
+      "http": 400,
+      "code": 111002,
+      "message": "skills:／exclude_skills: 只对主助手有效（普通子代理没有技能目录）",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tenants/{ten}/agents/import",
+     "body": {
+      "files": [
+       {
+        "name": "sub-skills.md",
+        "content": "---\nname: sub-skills\ndescription: 子代理写作用域\nskills:\n  - demo\n---\n正文\n"
+       }
+      ]
+     },
+     "expect": {
+      "http": 400,
+      "code": 111002,
+      "message": "skills:／exclude_skills: 只对主助手有效（普通子代理没有技能目录）",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tenants/{ten}/agents/import",
+     "body": {
+      "files": [
+       {
+        "name": "coder.md",
+        "content": "---\nname: coder\ndescription: 带作用域的主助手规格\nexclude_skills:\n  - demo\n---\n正文\n"
+       }
+      ]
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "data": {
+       "agents": [
+        {
+         "name": "coder",
+         "skillPolicy": {
+          "mode": "exclude",
+          "names": [
+           "demo"
+          ]
+         }
+        }
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "30-skill-disable",
+   "case": "用例 30",
+   "tier": "core",
+   "desc": "技能禁用（doc/52 E2）：PATCH enabled=false 写 skill_disables、列表/详情回 enabled:false；enable 撤销；viewer 403 111203；DELETE 同事务清禁用行（重装后回 enabled:true 为证）",
+   "steps": [
+    {
+     "op": "signup",
+     "no_model": true
+    },
+    {
+     "op": "seed_skill",
+     "name": "demo-off",
+     "skill_md": "---\nname: demo-off\ndescription: 禁用验收用例\n---\n正文：一条测试技能。\n"
+    },
+    {
+     "method": "POST",
+     "path": "/api/skills/rescan",
+     "body": {},
+     "expect": {
+      "http": 200,
+      "code": 0
+     }
+    },
+    {
+     "method": "PATCH",
+     "path": "/api/skills/demo-off",
+     "body": {
+      "enabled": false
+     },
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "skill": {
+        "name": "demo-off",
+        "enabled": false
+       }
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/skills",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data_items_some": {
+       "path": "skills",
+       "match": {
+        "name": "demo-off",
+        "enabled": false
+       }
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/skills/demo-off",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data": {
+       "skill": {
+        "name": "demo-off",
+        "enabled": false
+       }
+      }
+     }
+    },
+    {
+     "method": "PATCH",
+     "path": "/api/skills/demo-off",
+     "body": {
+      "enabled": true
+     },
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data": {
+       "skill": {
+        "name": "demo-off",
+        "enabled": true
+       }
+      }
+     }
+    },
+    {
+     "op": "invite_viewer"
+    },
+    {
+     "method": "PATCH",
+     "path": "/api/skills/demo-off",
+     "tokenVar": "viewerTok",
+     "body": {
+      "enabled": false
+     },
+     "expect": {
+      "http": 403,
+      "code": 111203,
+      "message": "没有权限做这件事",
+      "data": null
+     }
+    },
+    {
+     "method": "PATCH",
+     "path": "/api/skills/demo-off",
+     "auth": false,
+     "body": {
+      "enabled": false
+     },
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    },
+    {
+     "method": "PATCH",
+     "path": "/api/skills/demo-off",
+     "body": {
+      "enabled": false
+     },
+     "expect": {
+      "http": 200,
+      "code": 0
+     }
+    },
+    {
+     "method": "DELETE",
+     "path": "/api/skills/demo-off",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data": {
+       "status": "deleted"
+      }
+     }
+    },
+    {
+     "op": "seed_skill",
+     "name": "demo-off",
+     "skill_md": "---\nname: demo-off\ndescription: 禁用验收用例\n---\n正文：一条测试技能。\n"
+    },
+    {
+     "method": "POST",
+     "path": "/api/skills/rescan",
+     "body": {},
+     "expect": {
+      "http": 200,
+      "code": 0
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/skills",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data_items_some": {
+       "path": "skills",
+       "match": {
+        "name": "demo-off",
+        "enabled": true
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "31-tools-write",
+   "case": "用例 31",
+   "tier": "core",
+   "desc": "工具上传写面（doc/52 D36 F1）：上传单文件到租户工具根（staging→.trash→rename）、同名覆盖、坏名/预留名/空文件 116117、额度不足 429 113001、viewer 只读 403、删除回 deleted 且列表消失；工具根不进表，列表就是扫盘",
+   "steps": [
+    {
+     "op": "signup",
+     "no_model": true
+    },
+    {
+     "op": "upload_tool",
+     "path": "/api/tools",
+     "name": "hello",
+     "content": "#!/bin/sh\necho hi\n",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "tool": {
+        "name": "hello",
+        "exe": true,
+        "bytes": 18
+       }
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tools",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data_items_some": {
+       "path": "tools",
+       "match": {
+        "name": "hello",
+        "exe": true,
+        "bytes": 18
+       }
+      }
+     }
+    },
+    {
+     "op": "upload_tool",
+     "path": "/api/tools",
+     "name": "hello",
+     "content": "#!/bin/sh\necho version-two\n",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data": {
+       "tool": {
+        "name": "hello",
+        "bytes": 27
+       }
+      }
+     }
+    },
+    {
+     "op": "upload_tool",
+     "path": "/api/tools",
+     "name": "../evil",
+     "content": "x\n",
+     "expect": {
+      "http": 400,
+      "code": 116117,
+      "message": "工具名只能是小写字母、数字和连字符（64 字符以内）",
+      "data": null
+     }
+    },
+    {
+     "op": "upload_tool",
+     "path": "/api/tools",
+     "name": "bash",
+     "content": "x\n",
+     "expect": {
+      "http": 400,
+      "code": 116117,
+      "message": "\"bash\" 是保留名，不能用作工具名",
+      "data": null
+     }
+    },
+    {
+     "op": "upload_tool",
+     "path": "/api/tools",
+     "name": "Bash",
+     "content": "x\n",
+     "expect": {
+      "http": 400,
+      "code": 116117
+     }
+    },
+    {
+     "op": "upload_tool",
+     "path": "/api/tools",
+     "name": "empty",
+     "content": "",
+     "expect": {
+      "http": 400,
+      "code": 116117,
+      "message": "上传的文件是空的",
+      "data": null
+     }
+    },
+    {
+     "sql": "UPDATE tenants SET max_storage_bytes = 1 WHERE id = '{ten}'"
+    },
+    {
+     "op": "upload_tool",
+     "path": "/api/tools",
+     "name": "quota",
+     "content": "x\n",
+     "expect": {
+      "http": 429,
+      "code": 113001,
+      "message": "这个工作区的额度用完了",
+      "data": null
+     }
+    },
+    {
+     "sql": "UPDATE tenants SET max_storage_bytes = 0 WHERE id = '{ten}'"
+    },
+    {
+     "method": "GET",
+     "path": "/api/tools",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data_items_some": {
+       "path": "tools",
+       "match": {
+        "name": "hello",
+        "bytes": 27
+       }
+      }
+     }
+    },
+    {
+     "op": "invite_viewer"
+    },
+    {
+     "op": "upload_tool",
+     "path": "/api/tools",
+     "name": "hello",
+     "tokenVar": "viewerTok",
+     "content": "x\n",
+     "expect": {
+      "http": 403,
+      "code": 111203,
+      "message": "没有权限做这件事",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tools",
+     "tokenVar": "viewerTok",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data_items_some": {
+       "path": "tools",
+       "match": {
+        "name": "hello"
+       }
+      }
+     }
+    },
+    {
+     "method": "DELETE",
+     "path": "/api/tools/nope",
+     "expect": {
+      "http": 404,
+      "code": 116119,
+      "message": "找不到这个工具",
+      "data": null
+     }
+    },
+    {
+     "method": "DELETE",
+     "path": "/api/tools/hello",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data": {
+       "status": "deleted"
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tools",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data": {
+       "tools": []
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tools",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "32-read-pagination",
+   "case": "用例 32",
+   "tier": "core",
+   "desc": "读分页（doc/58 §3）：offset/limit 切片 + 三态页脚、offset 越界/非正/limit 超上限 400 111002、缺文件 400 111002（读工具的字节只有 dev 口打得到）",
+   "steps": [
+    {
+     "op": "signup",
+     "no_model": true
+    },
+    {
+     "method": "POST",
+     "path": "/api/dev/workspace/file",
+     "body": {
+      "path": "d58-page.txt",
+      "content": "line 1\nline 2\nline 3\n"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": "",
+      "data": {
+       "path": "d58-page.txt"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/dev/workspace/read",
+     "body": {
+      "path": "d58-page.txt"
+     },
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data": {
+       "output": "line 1\nline 2\nline 3\n\n（已读到文件末尾，共 3 行）"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/dev/workspace/read",
+     "body": {
+      "path": "d58-page.txt",
+      "offset": 2,
+      "limit": 1
+     },
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data": {
+       "output": "line 2\n\n（已显示第 2-2 行，共 3 行；继续读用 offset=3）"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/dev/workspace/read",
+     "body": {
+      "path": "d58-page.txt",
+      "offset": 9
+     },
+     "expect": {
+      "http": 400,
+      "code": 111002,
+      "message": "offset 9 超出文件末尾（共 3 行）",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/dev/workspace/read",
+     "body": {
+      "path": "d58-page.txt",
+      "offset": 0
+     },
+     "expect": {
+      "http": 400,
+      "code": 111002,
+      "message": "offset 须为正整数（给的是 0）",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/dev/workspace/read",
+     "body": {
+      "path": "d58-page.txt",
+      "limit": 5000
+     },
+     "expect": {
+      "http": 400,
+      "code": 111002,
+      "message": "limit 不得大于 2000（给的是 5000）",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/dev/workspace/read",
+     "body": {
+      "path": "d58-nope.txt"
+     },
+     "expect": {
+      "http": 400,
+      "code": 111002,
+      "message": "文件不存在：d58-nope.txt",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "33-bash-output-retention",
+   "case": "用例 33",
+   "tier": "core",
+   "needs": "sandbox",
+   "desc": "bash 输出留存（doc/58 §4）：小输出形状不变（不建落盘目录）、大输出留尾 + 全文落盘并回路径、落盘文件真在盘上（读回 100000 字节）",
+   "steps": [
+    {
+     "op": "signup",
+     "no_model": true
+    },
+    {
+     "method": "POST",
+     "path": "/api/dev/workspace/bash",
+     "body": {
+      "cmd": "echo hi"
+     },
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data": {
+       "output": "退出码：0\nstdout:\nhi\n",
+       "sandboxed": true
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/dev/workspace/bash",
+     "body": {
+      "cmd": "printf 'x%.0s' {1..100000}"
+     },
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data_contains": {
+       "path": "output",
+       "contains": [
+        "stdout:\n",
+        "（stdout 完整输出已存到 .tako/bash/",
+        "1.out，共 100000 字节；用 read_file 分页读它）"
+       ]
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/dev/workspace/bash",
+     "body": {
+      "cmd": "for f in .tako/bash/*/1.out; do v=$(< \"$f\"); echo \"${#v}\"; done"
+     },
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data": {
+       "output": "退出码：0\nstdout:\n100000\n"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/dev/workspace/bash",
+     "body": {
+      "cmd": "n=0; for d in .tako/bash/*/; do [ -d \"$d\" ] && n=$((n+1)); done; echo $n"
+     },
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "data": {
+       "output": "退出码：0\nstdout:\n1\n"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "35-memory-mode-guard",
+   "case": "用例 35",
+   "tier": "core",
+   "needs": "markdown-mode",
+   "desc": "markdown 模式观测口守卫（doc/65 §6.5）：items/jobs/recall 三口统一 409 118001「当前记忆模式不提供这个观测口」、data=null——不返回空数组假装文件里没有记忆。要 markdown 模式引擎（TAKO_MEMORY_MODE=markdown）",
+   "steps": [
+    {
+     "op": "signup",
+     "no_model": true
+    },
+    {
+     "method": "GET",
+     "path": "/api/memory/items?limit=1",
+     "expect": {
+      "http": 409,
+      "code": 118001,
+      "message": "当前记忆模式不提供这个观测口",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/memory/jobs",
+     "expect": {
+      "http": 409,
+      "code": 118001,
+      "message": "当前记忆模式不提供这个观测口",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/memory/recall?q=test",
+     "expect": {
+      "http": 409,
+      "code": 118001,
+      "message": "当前记忆模式不提供这个观测口",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "36-memory-items-observe",
+   "case": "用例 36",
+   "tier": "core",
+   "needs": "pipeline-mode",
+   "desc": "pipeline 观测口 items（doc/65 §6.5）：空租户回 {\"items\":[]}（空数组也带键）；state 非法 400 111002 枚举文案。要 pipeline 引擎（默认模式）",
+   "steps": [
+    {
+     "op": "signup",
+     "no_model": true
+    },
+    {
+     "method": "GET",
+     "path": "/api/memory/items?limit=1",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "items": []
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/memory/items?state=bogus",
+     "expect": {
+      "http": 400,
+      "code": 111002,
+      "message": "state 只能是 active、superseded、removed 或 archived",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "37-memory-jobs-observe",
+   "case": "用例 37",
+   "tier": "core",
+   "needs": "pipeline-mode",
+   "desc": "pipeline 观测口 jobs（doc/65 §4.5 新字段集 kind/targetLayer/leaseUntil/claimEpoch/nextAttemptAt）：空租户回 {\"jobs\":[]}。要 pipeline 引擎",
+   "steps": [
+    {
+     "op": "signup",
+     "no_model": true
+    },
+    {
+     "method": "GET",
+     "path": "/api/memory/jobs",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "jobs": []
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "38-memory-recall-shape",
+   "case": "用例 38",
+   "tier": "core",
+   "needs": "pipeline-mode",
+   "desc": "pipeline 召回口（doc/40 A7-5 信封）：data 键序 block→dialogueHits→injectedRunes→memoryHits（gin.H 字母序）；无命中全零空 block；缺 q 400 111001。要 pipeline 引擎",
+   "steps": [
+    {
+     "op": "signup",
+     "no_model": true
+    },
+    {
+     "method": "GET",
+     "path": "/api/memory/recall?q=%E7%BB%9D%E5%AF%B9%E6%B2%A1%E6%9C%89%E7%9A%84%E8%AF%8DXYZQ",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "block": "",
+       "dialogueHits": 0,
+       "injectedRunes": 0,
+       "memoryHits": 0
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/memory/recall?q=",
+     "expect": {
+      "http": 400,
+      "code": 111001,
+      "message": "请求格式不对",
+      "data": null
+     }
+    }
+   ]
   }
+ ],
+ "declared_not_asserted": {
+  "用例 30": "禁用对 run 的生效面（doc/52 E2）——目录里消失、use_skill/read_skill 回 116107、正在跑的 run 盒子不回缩，都只在真跑模型时出现，core tier 没有 HTTP 入口；纯函数与存储侧由 go test 的 skills_test.go（SetSkillDisabled 幂等、ListSkillDisables）与 skilltools_test.go（116107 信封逐字）钉住，活体字节见 19v6-04 用例 30",
+  "用例 5": "单批上限 W —— 要用 -batch-window 3 特殊起引擎才造得出截断，默认 W=200 下这条断言没有意义；改引擎起法后手工重放",
+  "用例 6": "工具循环（get_time）—— 断模型会不会真的去调工具，换个模型就飘；帧 kind 全集由 go test 的契约测试钉住",
+  "用例 7": "委派子代理 —— 同上，模型是否委派不稳定；回传裁剪的机制断言在 doc/39 的活体抽验里",
+  "用例 8": "任务看板的 task 帧 —— 要模型真的去调 TaskCreate/TaskUpdate 才造得出这条帧，模型行为不稳（换个模型就飘）；帧 kind 词表由 go test 的契约测试钉住，看板的持久化由 TestTaskBoardSurvivesProcessRestart 钉住（另一个 Store 实例读回同一批行）",
+  "用例 9": "变更事件流（doc/46）—— SSE 长连接读取进不了短连接断言器：挂读/续传/双副本的活体断言由 scripts/acceptance/events_live.sh 判红；帧 data 字节由 go test 的 TestContractStreamEventBytes 钉住；游标语义（Last-Event-ID 续传、不带则从 $ 起不回放历史）见 doc/46 §3.3",
+  "用例 11": "question 帧与同轮注回（ask_user / submit_plan）—— 要模型真的调 ask_user 才造得出 question 帧与待答行，模型行为不稳（换个模型就飘）；帧 kind 词表由 go test 的契约测试钉住，挂起→答题→同轮继续与一答终答（409 115101）、崩溃续跑第三分支由 scripts/acceptance/question_crash.sh 判红",
+  "用例 19": "read_skill 的工具结果形态（doc/52 B2）—— 成功走 `<skill …>正文</skill>` XML、失败走 JSON 信封（116001／116107／116116），这些字节只在「模型真的调了 read_skill」的 run 里出现，core tier 没有对应的 HTTP 路径，换个模型就飘；纯函数侧（frontmatter 切分、转义往返、16,384/16,385 token 与 64KB/64KB+1 两条边界、三个信封逐字）由 go test 的 skilltools_test.go 钉住，活体字节见 19v6-04 用例 19",
+  "用例 20": "技能围栏（doc/52 B3）—— use_skill 打开本场技能根的只读读权、bash 写拒／脚本可跑、新 run 与隔壁技能不可见、子代理空盒、出站开入站关、租户 MCP 同一条 profile：这些都在真跑一轮的 bash/use_skill/MCP 工具结果里，core tier 没有对应 HTTP 路径；profile 字节与只读/可见性由 go test 的 skillfence_test.go、skillbox_test.go、mcpfence_test.go 钉住，活体字节见 19v6-04 用例 20",
+  "用例 21": "技能资源与加载清单（doc/52 B4）—— read_skill_file 的文件/目录成功体、116115（超限不带部分内容）、116114（越界/入口文件/平铺同文案）与 GET /api/runs/:id/skills 的非空 rows 都只在「模型真的调了这些工具」的 run 里出现，core tier 没有对应 HTTP 路径；纯函数侧（cleanSkillRel、文件/目录形态、软链越界、64KB/16,384 token 边界、loadsFromEntries 的配对与键序）由 go test 的 skillresource_test.go 钉住，活体字节见 19v6-04 用例 21",
+  "用例 22": "任务看板的技能归属（doc/52 B5）—— task 帧带 skillName、看板行带「（技能：名字）」要模型真的先 use_skill 再 TaskCreate 才造得出；run_tasks 没有读端点，core tier 无法断言。纯函数与存储侧由 go test 钉住（skill_name 落库、视图行形态、touchedSkill、skill box 的挪尾与 usedSkillName），活体字节见 19v6-04 用例 22",
+  "用例 23": "看板跨 run 续做与执行权恢复（doc/52 B6/D34/D35）——「上一场」段要模型真去调 TaskList、执行权恢复要真跑 bash、崩溃段要 kill -9 与租约过期，模型行为与进程时序都不稳；纯函数与存储侧由 go test 钉住（TestPreviousBoardRunAndSkillNames / TestPreviousBoardView / TestRestoreSkillRoots / TestSkillBoxLastUsedOrder），活体字节见 19v6-04 用例 23",
+  "用例 24": "技能正文折叠标记与技能记录块（doc/52 B7/B8，D33/D31/D30）—— marker 要模型先 use_skill 再 TaskCreate、记录块要真折一次才进摘要，「下一枪正文是 marker」「摘要里有 <!-- tako:skill-ops v1 -->」「trim 是整块替换」都只在真跑 + 真压的 run 里出现，core tier 没有 HTTP 路径；纯函数侧（marker 重写、slimSkillBlocks 的只读不换、extract/inherit/merge/render 逐字、与 D33 marker 共存、三档块收口）由 go test 的 skillslim_test.go / skillops_test.go / compact_test.go 钉住，活体清单元件见 19v6-04 用例 24",
+  "用例 27": "对话内安装（doc/52 C3，D20/D24）—— skill_install 全程只提议：pending 行要模型真的调这个工具才造得出（换模型就飘），approve/cancel 的落盘要看 pending 行 id，core tier 没有「造一条 kind=install 行」的 HTTP 入口；纯函数与存储侧由 go test 的 skillask_test.go 钉住（staging 路径包含/EvalSymlinks、按提案选择、过期、discard），活体字节（viewer 403 111203、owner 200、重复 approve 409 115101、三种文本、use_skill 的 <skill …>、SSE 的 skills_changed）见 19v6-04 用例 27",
+  "用例 31": "工具上传的超限分支（doc/52 D36 F1）——>128MB 要在 core tier 里现造 129MB 请求体（机器真源里每条用例都会重跑，代价不成比例），只做活体验证：413 116118，盘上无新增；max_storage_bytes 限额走 SQL 步真断言（429 113001）。staging 清理与 .trash 旧目录靠行为证明（覆盖后 bytes 变、.trash 多一个目录），活体字节见 19v6-04 用例 31",
+  "用例 34": "提问分段与问答读口（doc/47 §5.5）——要模型真的调 ask_user 才造得出带 `segments` 的 assistant 行与带 `toolCallId`/`answer` 的问答行，模型行为不稳（同用例 11 先例）；core tier 没有「造一条带 segments 的 runlog 行」的 HTTP 入口。响应形状由 go test 快闸逐字钉住：TestContractLogQuestionSegmentsBytes（segments 键序、无 segments 时省略）与 TestContractQuestionViewBytes（toolCallId/answer 键序），存储侧由 TestEndRunLandsQuestionSegments 钉住（含提问仍一条 assistant 行、end 是 rune 偏移、无提问 run payload 不变），活体字节见 19v6-04 用例 34",
+  "用例 39": "记忆工具回执与抽取落行的端到端（doc/65 §13.3-1）——「模型会不会真调 memory 工具、targetLayer 给什么」随模型飘，快闸没有 HTTP 入口能造；工具回执字节、inrun 受理、postrun 收拢、supersede/remove 指针与 BM25 召回由 scripts/acceptance/memory_pipeline_live.sh 判红（真 broker + 真模型），markdown 侧由 memory_markdown_live.sh 判红",
+  "用例 40": "消费者崩溃补投恰好一次（doc/65 §13.3-2）——要 kill -9 正在处理任务的引擎 + 真 broker 重投，快闸造不出；kill -9、租约过期补投、A→B→A 不被去重吞由 scripts/acceptance/memory_redpanda_crash.sh 判红",
+  "用例 41": "文件锁竞争与原子替换（doc/65 §13.3-4）——要两个隔离引擎共连同一 PG/共享 workspace 才造得出跨进程竞争；flock 串行、写前版本拒绝、kill -9 释放由 scripts/acceptance/memory_file_race.sh 判红，存储侧不变量由 go test 的 memory_filelock_test.go 钉住",
+  "用例 42": "旧 notes/memory_items 升级迁移与模式互切（doc/65 §13.3-5）——要预置旧形态数据的库 + 双向互切命令；由 scripts/acceptance/memory_migrate_live.sh 判红（42 断言），幂等重放与失败预检在其中逐条断",
+  "用例 43": "项目删除的连带清理（doc/65 §13.3-6）——workspace 两类行都清、user 行跨项目仍可见、USER.md 不变、runs/runlog 不变：要真删一个挂了记忆的项目；由 scripts/acceptance/memory_project_delete_live.sh 判红，删除级联的存储侧由 go test 的 delete_cascade_test.go 钉住"
+ }
 }

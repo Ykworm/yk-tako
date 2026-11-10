@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+
 	"flag"
+	"fmt"
+	"github.com/cloudwego/eino/components/model"
 	"log"
 	"os"
 	"path/filepath"
@@ -13,8 +16,6 @@ import (
 	"yk-tako-eino/internal/config"
 	"yk-tako-eino/internal/observability"
 	"yk-tako-eino/internal/runengine"
-
-	"github.com/cloudwego/eino/components/model"
 )
 
 // runliveTTL 是 run **正常结束**后 runlive 键的回收期限（19v6-03「生命周期」只写「设 TTL」未给数值；dev 取 300s）。
@@ -120,7 +121,26 @@ func main() {
 	subagentConcurrency := flag.Int("subagent-concurrency", 8, "max concurrent subagent delegations (process-wide semaphore; must be >= 1)")
 	subagentReturnCap := flag.Int("subagent-return-cap", 51200, "max bytes of a subagent's return text handed back to the parent; excess is truncated with a notice (<=0 disables)")
 	rebuildDialogue := flag.Bool("rebuild-dialogue", false, "clear dialogue_chunks at startup and let the indexer rebuild them from complete runs (requires TAKO_RAG=on)")
+	migrateTo := flag.String("memory-migrate-to", "", "offline memory mode migration: markdown|pipeline; stop all engine replicas first; does not start HTTP/worker/consumer (doc/65 §6.2)")
 	flag.Parse()
+
+	// 离线互切形态（doc/65 §6.2）：不起 HTTP / Worker / 消费者 / 定时器，只连 PG 与工作区。
+	// 放在所有引擎校验之前：lease/subagent/resume 这些参数与迁移无关，不该挡住迁移。
+	if *migrateTo != "" {
+		if *migrateTo != runengine.MemoryMigrateToMarkdown && *migrateTo != runengine.MemoryMigrateToPipeline {
+			fmt.Fprintf(os.Stderr, "memory-migrate-to=%q 不是合法值（markdown|pipeline）\n", *migrateTo)
+			flag.Usage()
+			os.Exit(2)
+		}
+		wsAbs, err := filepath.Abs(*workspace)
+		if err != nil {
+			log.Fatalf("workspace %q 绝对化: %v", *workspace, err)
+		}
+		if err := runengine.RunMemoryModeMigration(context.Background(), *migrateTo, *pgDSN, wsAbs); err != nil {
+			log.Fatalf("memory mode migration: %v", err)
+		}
+		return
+	}
 
 	// 必须 leaseRenew 严格小于 leaseTTL：
 	//   ① renew >= ttl → 第一次 watchdog 触发前租约已过期 = 进程稳定地自己放闸，
@@ -231,12 +251,26 @@ func main() {
 
 	// 长期记忆配置（doc/29 §8）：三个开关默认 on，值 "off" 才关；tenant 一期恒 default。
 	// 配置写入 Store 后，EndRun（登记 job）、Worker（注入）、Server（预览）读同一份。
+	//
+	// 记忆**模式**（doc/65 §0 / §5）：实例级开关，pipeline（默认）或 markdown。
+	// 非法值启动即退——「以为切了模式、其实没切」这种半状态不能活到线上。
+	memMode, err := runengine.ParseMemoryMode(os.Getenv("TAKO_MEMORY_MODE"))
+	if err != nil {
+		log.Fatalf("TAKO_MEMORY_MODE: %v", err)
+	}
 	memCfg := runengine.MemoryConfig{
 		TenantID:  "default",
 		Workspace: wsAbs,
 		Extract:   envOn("TAKO_MEMORY_EXTRACT"),
 		Recall:    envOn("TAKO_MEMORY_RECALL"),
 		RAG:       envOn("TAKO_RAG"),
+		Mode:      memMode,
+	}
+	// markdown 模式：只装配文件工具——抽取消费者、memory_jobs、postrun、每回合 BM25 召回
+	// 全不启动。环境变量即使还写着 on 也不生效（下面那行日志会显示 extract=false recall=false）。
+	if memCfg.Mode == runengine.MemoryModeMarkdown {
+		memCfg.Extract = false
+		memCfg.Recall = false
 	}
 	store.ConfigureMemory(memCfg)
 	// 线二的 pg_search 索引（doc/29 §5.4）：RAG 开且 preload/扩展缺失 = 启动即退；
@@ -256,7 +290,7 @@ func main() {
 		}
 		log.Printf("rebuild-dialogue: 清空 dialogue_chunks %d 行，等待索引循环重建", n)
 	}
-	log.Printf("memory: extract=%v recall=%v rag=%v", memCfg.Extract, memCfg.Recall, memCfg.RAG)
+	log.Printf("memory: mode=%s extract=%v recall=%v rag=%v", memCfg.Mode, memCfg.Extract, memCfg.Recall, memCfg.RAG)
 
 	// C5-A7：摘要预算上限的硬顶（正整数 tok；缺省/0 = 不顶；解析失败/负由 intEnv fail fast）。
 	maxOutput := intEnv("TAKO_MODEL_MAX_OUTPUT", 0)
@@ -268,21 +302,46 @@ func main() {
 	tenantModels := runengine.NewTenantModels(modelRegistryResolver{modelRegistry}, os.Environ(), opened.Ref)
 	store.SetTenantModels(tenantModels)
 
-	// 线一抽取循环（doc/29 §4.5）：TAKO_MEMORY_MODEL 为空复用主模型；非空走 ModelRegistry
-	// 懒解析（坏 ref 只让 job 失败重试，不影响启动与 run）。循环与 server 同生命周期。
-	if memCfg.Extract {
-		memoryRef := strings.TrimSpace(os.Getenv("TAKO_MEMORY_MODEL"))
+	// 记忆层的存量迁移（doc/65 §6.1）：notes 表的数据搬进 memory_items 的 resident 层、
+	// 旧 memory_items 行迁成 recall/workspace、旧列与旧表清掉。**可重入**——第二次启动
+	// 整步跳过（每一步都以「输入还在不在」为闸），不会重复搬、不会把 teamInstructions 追加两遍。
+	// 迁移失败 = 启动失败：带着半迁移的库继续跑，两种模式的记忆语义就是错的。
+	if err := store.MigrateMemorySchema(ctx); err != nil {
+		log.Fatalf("memory migrate: %v", err)
+	}
+
+	// 记忆的视图与 BM25 索引（doc/65 §4.1/§4.4）：pipeline 且 Extract/Recall 任一开才需要；
+	// pg_search 缺失启动即退。**与 dialogue 的索引检查分开执行**——记忆检查的错误文案
+	// 不建议「设 TAKO_RAG=off」（TAKO_RAG 从此只控制 dialogue_chunks，施工包 §5.1）。
+	if memCfg.Mode == runengine.MemoryModePipeline && (memCfg.Extract || memCfg.Recall) {
+		if err := store.EnsureMemoryIndexes(ctx); err != nil {
+			log.Fatalf("memory index: %v", err)
+		}
+	}
+
+	// 记忆抽取的消费者与对账器（doc/65 §4.6）：pipeline 且 Extract=on 才起；
+	// broker 不可达 / 认证失败 / topic 不存在 = 启动即退（fail fast）。
+	// Extract=off 不要求 broker（没有登记方，任务侧本来就没有流量）。
+	// markdown 模式两者都不碰（上面 ConfigureMemory 已把开关按关处理）。
+	var memoryWake runengine.MemoryWakeFunc
+	if memCfg.Mode == runengine.MemoryModePipeline && memCfg.Extract {
+		memoryModelRef := strings.TrimSpace(os.Getenv("TAKO_MEMORY_MODEL"))
 		getModel := func(ctx context.Context) (model.BaseChatModel, error) {
-			if memoryRef == "" {
-				return runengine.WrapChatModel(opened.Chat, opened.Ref), nil
+			if memoryModelRef == "" {
+				return opened.Chat, nil
 			}
-			m, err := modelRegistry.Get(ctx, memoryRef)
+			inst, err := modelRegistryResolver{modelRegistry}.Get(ctx, memoryModelRef)
 			if err != nil {
 				return nil, err
 			}
-			return runengine.WrapChatModel(m.Chat, memoryRef), nil
+			return inst.Chat, nil
 		}
-		go store.RunMemoryExtractor(ctx, getModel, counter)
+		stop, wake, err := runengine.StartMemoryConsumer(ctx, store, getModel, counter)
+		if err != nil {
+			log.Fatalf("memory consumer: %v", err)
+		}
+		memoryWake = wake
+		_ = stop // 进程生命周期与 main 一致（log.Fatal 退出）；显式停服路径归 API 层
 	}
 
 	// 线二索引循环（doc/29 §5.2）：RAG 关时不启动；反查「complete 且未入 dialogue_chunks」，
@@ -295,7 +354,7 @@ func main() {
 	// T3：agentsDir 只是规格目录位置（装载是 run 起手扫盘、失败降级为 log）——目录不存在不算启动错误。
 	mediaSend := envOn("TAKO_MEDIA_SEND")
 	log.Printf("media: send=%v", mediaSend)
-	worker, err := runengine.NewWorker(store, opened.Chat, runengine.TranslatorFor(string(opened.Protocol)), config.SystemPrompt(), wsAbs, *agentsDir, *leaseRenew, *compactWindow, opened.Ref, maxOutput, *subagentConcurrency, *subagentReturnCap, modelRegistryResolver{modelRegistry}, counter, mediaSend, *archiveTTL)
+	worker, err := runengine.NewWorker(store, opened.Chat, runengine.TranslatorFor(string(opened.Protocol)), config.SystemPrompt(), wsAbs, *agentsDir, *leaseRenew, *compactWindow, opened.Ref, maxOutput, *subagentConcurrency, *subagentReturnCap, modelRegistryResolver{modelRegistry}, counter, mediaSend, *archiveTTL, memoryWake)
 	if err != nil {
 		log.Fatalf("agent 装配: %v", err)
 	}

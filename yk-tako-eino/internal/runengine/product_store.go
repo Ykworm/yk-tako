@@ -6,10 +6,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -523,7 +525,7 @@ func (s *Store) UpdateAgent(ctx context.Context, row TenantAgent) error {
 			"name": row.Name, "kind": row.Kind, "description": row.Description, "spec": row.Spec,
 			"model_ref": row.ModelRef, "tools": row.Tools, "tool_policy": row.ToolPolicy,
 			"skill_policy": row.SkillPolicy,
-			"visibility": row.Visibility, "source": row.Source, "default_id": row.DefaultID,
+			"visibility":   row.Visibility, "source": row.Source, "default_id": row.DefaultID,
 		})
 	if isUniqueViolation(res.Error) {
 		return ErrAgentExists
@@ -551,37 +553,93 @@ func (s *Store) DeleteAgent(ctx context.Context, tenantID, id string) error {
 	return s.db.WithContext(ctx).Delete(&TenantAgent{}, "id = ?", id).Error
 }
 
-func (s *Store) ListScopedNotes(ctx context.Context, workspace string) ([]Note, error) {
-	q := applyNoteScope(s.db.WithContext(ctx), scopeFrom(ctx)).Where("superseded_by IS NULL").Order("created_at, id")
-	if workspace != "" {
-		q = q.Where("workspace = ?", workspace)
+// TenantTeamInstructions 读该租户的团队规范（租户系统提示材料，不是记忆）。
+//
+// 读失败**不阻断 run**：团队规范是配置面的一部分，读不到就不带它（系统提示照常拼），
+// 但要记日志——静默丢掉一段团队规矩会让模型以为没有这条规矩。
+func (s *Store) TenantTeamInstructions(ctx context.Context, tenantID string) (string, error) {
+	if tenantID == "" {
+		return "", nil
 	}
-	var rows []Note
-	err := q.Find(&rows).Error
-	if rows == nil {
-		rows = []Note{}
+	cfg, err := s.GetRuntimeConfig(ctx, tenantID)
+	if err != nil {
+		return "", err
 	}
-	return rows, err
+	return cfg.TeamInstructions, nil
 }
 
-func (s *Store) SeedMemoryFact(ctx context.Context, kind, topic, content string) (string, error) {
+// teamInstructionsFor 取当前上下文的租户团队规范（拼进系统提示用）。
+//
+// 空串 = 这段上下文没有租户身份（旁路调用）或该租户没配团队规范。
+func (s *Store) teamInstructionsFor(ctx context.Context) string {
+	tenantID := ""
+	if ref, ok := workspaceFrom(ctx); ok && ref.TenantID != "" {
+		tenantID = ref.TenantID
+	} else if p, ok := principalFromCtx(ctx); ok && p.TenantID != "" {
+		tenantID = p.TenantID
+	}
+	if tenantID == "" {
+		return ""
+	}
+	text, err := s.TenantTeamInstructions(ctx, tenantID)
+	if err != nil {
+		log.Printf("team instructions: 读租户 %s 的团队规范失败：%v", tenantID, err)
+		return ""
+	}
+	return strings.TrimSpace(text)
+}
+
+// teamInstructionsSection 把团队规范渲染成系统提示里的一段。
+//
+// 形态：标题 + 正文 + 空行。**明确标成「租户规范」而不是「记忆」**——它是管理员配的
+// 租户系统提示材料，与 user/workspace 两值记忆轴无关（doc/65 §6.1）。
+func teamInstructionsSection(text string) string {
+	if text == "" {
+		return ""
+	}
+	return "租户规范（本租户统一的规矩，优先于一般偏好）：\n" + text
+}
+
+// DevMemorySeed 是 dev 数据准备口（POST /api/dev/memory）的输入：新行结构的五个字段
+// 加 scope=workspace 时的项目 id。词表校验在 handler 做，这里只落库。
+type DevMemorySeed struct {
+	Layer       string
+	Scope       string
+	State       string
+	Content     string
+	Quote       string
+	WorkspaceID string
+}
+
+// SeedMemoryFact 插一条手动种下的记忆（dev 工具用）。
+//
+// 新结构（doc/65 §4.2）没有 kind/topic 两列：分类改成 layer（读在哪一层）+ scope（谁能看），
+// 来源用 source='model'（doc/65 §4.2：直接工具写入的行）。
+// 种历史行（state 非 active）时补 left_active_at/removed_at，让时间审计列与状态一致。
+func (s *Store) SeedMemoryFact(ctx context.Context, seed DevMemorySeed) (string, error) {
 	sc := scopeFrom(ctx)
 	id, err := newRowID("mem_")
 	if err != nil {
 		return "", err
 	}
-	if kind == "" {
-		kind = "fact"
+	userID := sc.UserID
+	if seed.Scope == MemoryScopeWorkspace {
+		userID = ""
 	}
-	ws := s.memoryCfg.Workspace
-	if ws == "" {
-		ws = "default"
+	var leftActive, removedAt *time.Time
+	now := time.Now()
+	if seed.State != MemoryStateActive {
+		leftActive = &now
+	}
+	if seed.State == MemoryStateRemoved {
+		removedAt = &now
 	}
 	err = s.db.WithContext(ctx).Exec(`
-INSERT INTO memory_items (id, tenant_id, user_id, workspace, kind, content, topic,
-        source_session_id, source_run_id, source_seq, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, '', '', 0, now())`,
-		id, sc.TenantID, sc.UserID, ws, kind, content, topic).Error
+INSERT INTO memory_items (id, tenant_id, user_id, workspace, layer, scope, content, quote,
+        source, source_session_id, source_run_id, source_seq, state, left_active_at, removed_at, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'model', '', '', 0, ?, ?, ?, now(), now())`,
+		id, sc.TenantID, userID, seed.WorkspaceID, seed.Layer, seed.Scope, seed.Content, seed.Quote,
+		seed.State, leftActive, removedAt).Error
 	return id, err
 }
 
@@ -832,12 +890,36 @@ type runtimeConfig struct {
 	McpServers map[string]McpServerConfig `json:"mcpServers"`
 	Secrets    map[string]string          `json:"secrets,omitempty"`
 	Sandbox    runtimeSandbox             `json:"sandbox"`
+	// TeamInstructions 是租户级团队规范：进系统提示的**租户系统提示材料**，不是记忆。
+	//
+	// 它为什么在这而不是在记忆里（doc/65 §6.1）：记忆只有 user / workspace 两个可见域，
+	// 「团队规范」不属于任何一个——它是租户配置的产物（管理员写、迁移时从旧 notes 的
+	// scope='tenant' 行搬过来），不从对话自动提取，也**不提供记忆管理面**。
+	// 它不进 user/workspace 两值词表、不进常驻快照的容量口径、也不出现在 GET /api/memory/* 的行里。
+	TeamInstructions string `json:"teamInstructions,omitempty"`
+	// Memory 是记忆相关的租户配置（doc/65 §5.1 的 memory.residentRunes）。
+	Memory memoryRuntimeConfig `json:"memory,omitempty"`
 }
+
+// memoryRuntimeConfig 是租户的记忆相关配置。
+//
+// ResidentRunes 是常驻记忆的 rune 预算：缺省 2200，可配 500–10000。
+// 0 = 用缺省（不写这个字段就是缺省）。
+type memoryRuntimeConfig struct {
+	ResidentRunes int `json:"residentRunes,omitempty"`
+}
+
+// teamInstructionsCap 是团队规范的长度上限（rune）。超了拒绝保存（不静默截断——
+// 截断会把管理员写的半句话当成完整规范发给模型）。
+const teamInstructionsCap = 4000
 
 func normalizeRuntime(cfg runtimeConfig) runtimeConfig {
 	if cfg.McpServers == nil {
 		cfg.McpServers = map[string]McpServerConfig{}
 	}
+	// TeamInstructions 只做无害归一：去首尾空白。**不截断**——超长是校验的事（拒绝），
+	// 截断会把管理员写的半句话当成完整规范。
+	cfg.TeamInstructions = strings.TrimSpace(cfg.TeamInstructions)
 	for name, sc := range cfg.McpServers {
 		if sc.Args == nil {
 			sc.Args = []string{}
@@ -851,6 +933,14 @@ func normalizeRuntime(cfg runtimeConfig) runtimeConfig {
 }
 
 func validateRuntime(cfg runtimeConfig) error {
+	// 常驻预算：0 = 缺省；范围外**拒绝**（不静默夹取——夹取会让管理员以为自己设成了 10000，
+	// 实际生效的是别的数）。
+	if r := cfg.Memory.ResidentRunes; r != 0 && (r < 500 || r > 10000) {
+		return fmt.Errorf("常驻记忆预算 %d 不在允许范围（500–10000，或留空用缺省 2200）", r)
+	}
+	if n := utf8.RuneCountInString(cfg.TeamInstructions); n > teamInstructionsCap {
+		return fmt.Errorf("团队规范太长了（%d 字，上限 %d 字）——删掉一些再保存", n, teamInstructionsCap)
+	}
 	for name, sc := range cfg.McpServers {
 		if !mcpServerNameRe.MatchString(name) || strings.TrimSpace(sc.Command) == "" {
 			return errors.New("mcp config")

@@ -20,8 +20,8 @@
 | **子代理** | 委派 + 上下文隔离 + 折叠回传 | ✅ |
 | | 持久档案与 resume（跑完还能接着问） | ✅ |
 | | 工具权限分档（白名单 / 排除清单；普通子代理拿不到技能工具，也读不到技能目录） | ✅ |
-| **记忆** | 长期记忆抽取与自动召回 | ✅ |
-| | 跨会话对话召回 | ✅ |
+| **记忆** | 长期记忆抽取与自动召回（`pipeline` / `markdown` 双模式，`TAKO_MEMORY_MODE` 切换） | ✅ |
+| | 跨会话对话召回 + 主动历史查询（`search_memory`：时点回放 / 改口链） | ✅ |
 | **安全** | bash 沙箱（macOS seatbelt / Linux bwrap） | ✅ |
 | | 文件围栏 + 同文件并发写防护 | ✅ |
 | | PII 脱敏（工具出口 / 模型输入 / 记忆入库） | ✅ |
@@ -127,7 +127,9 @@ flowchart LR
 
 两层不并表：常驻层的读者是系统提示，召回层的读者是按需检索，读取契约不同。目前 `memory` 工具不写 `memory_items`，抽取器也不写 `notes`，同一件事可能两边各存一份——这一档由「写侧不重复、读侧笔记优先、删除留痕」处理。两层各自怎么补删改、定位、去重与过期，见 [doc/65](doc/65-记忆两层方案.md)。
 
-记忆检索的时点回放与历史链——方案（待点头）里的 `search_memory` 工具：`as_of` 按「事实现实中何时为真」回放、`include_history` 沿改口链双向展开——参考了 [Zep](https://www.getzep.com/) 的 memory 产品 [Graphiti](https://github.com/getzep/graphiti)（时序知识图谱：双时间轴 + as-of 查询）。tako 借它的查询语义，没有照抄图谱存储。故事版演示（一场搬家 + 六个问题）见 [doc/68](doc/68-记忆检索的故事演示.md)。
+上面描述的是 `pipeline` 模式（默认）。运行时由 `TAKO_MEMORY_MODE` 选模式，实例级、重启切换：`pipeline` = PG 两层 + 后台抽取，抽取任务经 Redpanda（Kafka 协议）按会话分区派工，凭据走 `TAKO_REDPANDA_BROKERS / USER / PASSWORD / MECH`（只从环境变量读）；不配 broker 时消费者不起，抽取任务留在队列里等。`markdown` = 不要 PG 记忆表、不要 MQ：master 用同步 `memory` 工具直接写 `USER.md`（全项目通用）与项目 `MEMORY.md`，跨进程文件锁 + 原子替换保证多副本不写坏文件。
+
+记忆检索的时点回放与历史链——`pipeline` 模式的 `search_memory` 工具：`as_of` 按「事实现实中何时为真」回放、`include_history` 沿改口链双向展开——参考了 [Zep](https://www.getzep.com/) 的 memory 产品 [Graphiti](https://github.com/getzep/graphiti)（时序知识图谱：双时间轴 + as-of 查询）。tako 借它的查询语义，没有照抄图谱存储。故事版演示（一场搬家 + 六个问题）见 [doc/68](doc/68-记忆检索的故事演示.md)。
 
 ## 基准测试
 
@@ -193,6 +195,7 @@ kimi 指参照实现 kimi-code，DSH 指 deepseek-harness，两者都是 tako �
 - Node.js >= 20.19（Vite 7 要求）
 - Redis 与 Postgres：端口上已有实例就复用；空闲时脚本用本机 `redis-server` 和 `initdb/pg_ctl` 起本地实例（数据在 `tmp/pg-5433/`）
 - `yk-tako-eino/.env` 里配好模型密钥（如 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`、`TAKO_MODEL`）
+- 可选：`pipeline` 模式的后台抽取要一个 Redpanda（Kafka 协议）broker 与四个 `TAKO_REDPANDA_*` 变量；不配也能起引擎，只是抽取任务不消费。`markdown` 模式零额外依赖
 
 默认前端 <http://127.0.0.1:5173>、引擎 `127.0.0.1:8901`、Redis `127.0.0.1:6390`、Postgres `127.0.0.1:5433/tako`。
 

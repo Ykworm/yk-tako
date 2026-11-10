@@ -24,7 +24,7 @@ func TestExtractSkillOps(t *testing.T) {
 			skillCallFor("c2", "use_skill", `{"name": " demo "}`), // 同名字去重
 			skillCallFor("c3", "read_skill", `{"name":"other"}`),
 			skillCallFor("c4", "read_skill_file", `{"name":"demo","path":"a.md"}`), // 资源不算
-			skillCallFor("c5", "read_skill", `not-json`),                          // 坏 JSON 跳过
+			skillCallFor("c5", "read_skill", `not-json`),                           // 坏 JSON 跳过
 		}},
 		{RunID: "r2", Seq: 1, Role: "user", Text: "问"},
 	}

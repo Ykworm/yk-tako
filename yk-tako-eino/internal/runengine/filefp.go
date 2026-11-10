@@ -1,20 +1,23 @@
 package runengine
 
-// 本文件是「同文件并发写」的底座（方案真源 = tmp/文件写入并发/planning.md；产品侧口径见 doc/42 §2.4）。
+// 本文件是「同文件并发写」的底座（方案真源 = doc/71 §4/§5；产品侧口径见 doc/42 §2.4）。
 //
 // 三样东西各管一段，谁也替代不了谁：
 //
 //	① 指纹 Fingerprint    —— 一个文件此刻的样子（mtime + size + sha256）。
 //	② 基准表 fileBaseline —— 「某个 agent 读到的是哪一版」——run 级内存，不落库、不跨 run 共享。
-//	③ 写锁 lockPaths      —— flock 排它锁，粒度=文件；同机跨进程跨副本都串。
+//	③ 写锁                —— 此刻有没有另一个**合作写者**正在写。
+//	   跨副本靠 filelock.go 的 PG advisory lock（所有副本共享）；本机的 flock 在这里，
+//	   只管同机进程之间（flock 挂在本机 inode 上，别的机器看不见它 → 不能当跨副本互斥）。
 //
 // 为什么三者都要：
 //   - 只有锁：B 的内容在拿锁之前就基于旧版算好了 → 照样用旧版覆盖新版（两边都报成功）。
 //   - 只有基准表：检查与写不是原子的 → 两者之间有缝。
 //   - 锁 + 基准表，且**比对在锁内**：B 取到锁之后才去比 → 必然看到 A 写进去的东西 → 拒。
+//   - 再加原子替换（atomicfile.go）：不参加锁的读者不会读到写了一半的文件。
 //
 // 基准表回答「我读到的是哪一版」，锁回答「此刻有没有别人在写」——前者不互斥任何东西。
-// flock 是 advisory 的：bash（rm / sed -i / > 重定向）完全绕过 → 不守规矩的写者由 doc/41 的人审兜。
+// 锁是 advisory 的：bash（rm / sed -i / > 重定向）完全绕过 → 不守规矩的写者由 doc/41 的人审兜。
 
 import (
 	"context"
@@ -210,15 +213,25 @@ func lockPathFor(lockDir, absPath string) string {
 
 // lockPaths 取这些路径的排它写锁（粒度=文件），返回释放函数。
 //
+// 这是 lockPathsCtx 的无 ctx 包装：给不需要取消的调用方用（既有单测、dev 端点）。
+// 需要在等待期间听取消的走 lockPathsCtx。
+func lockPaths(lockDir string, paths []string) (func(), error) {
+	return lockPathsCtx(context.Background(), lockDir, paths)
+}
+
+// lockPathsCtx 同 lockPaths，但等待期间听 ctx 的取消（run 被停 → 立刻放掉排队）。
+//
 // 规则（三条，缺一就死锁）：
 //  1. 路径**去重**（同一把锁不取两次）——flock 挂在 open file description 上，同一进程两次 open
 //     同一文件是两个不同的 open file description → 第二次会阻塞在**自己**的第一次上。
 //  2. 路径**按字典序**取（防 AB-BA 死锁）：A 拿 L1 再 L2、B 拿 L2 再 L1 → 互等。
 //  3. 逐把取，任一把失败就把已拿到的**全部**释放再返回错误。
 //
-// 拿不到锁的两种结局：超时（30s）→ errLockTimeout；其余错误 → 原样返回。
+// 拿不到锁的两种结局：超时（30s）→ errLockTimeout（可重试）；其余错误 → 原样返回。
 // flock 是 advisory 的：bash 不受这把锁约束（它不调 flock）→ bash 那层由 doc/41 的人审兜。
-func lockPaths(lockDir string, paths []string) (func(), error) {
+// 跨副本互斥不靠它（靠 filelock.go 的 PG advisory lock）——flock 挂在本机 inode 上，
+// 别的机器看不见。
+func lockPathsCtx(ctx context.Context, lockDir string, paths []string) (func(), error) {
 	uniq := make([]string, 0, len(paths))
 	seen := map[string]bool{}
 	for _, p := range paths {
@@ -272,7 +285,13 @@ func lockPaths(lockDir string, paths []string) (func(), error) {
 				release()
 				return nil, errLockTimeout
 			}
-			time.Sleep(lockWaitInterval)
+			select {
+			case <-ctx.Done():
+				_ = fd.Close()
+				release()
+				return nil, ctx.Err()
+			case <-time.After(lockWaitInterval):
+			}
 		}
 		locks = append(locks, held{fd: fd, pth: p})
 	}

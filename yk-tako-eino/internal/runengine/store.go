@@ -1,5 +1,5 @@
 // 本文件是存储层的装配与跨存储方法：Store 握住两半——PG（sessions / runs / run_model_messages /
-// runlog_entries / notes，见 pgstore.go 与 notes.go）与 Redis（tk:runlive / tk:runepoch，见 redisstore.go）。
+// runlog_entries / memory_items / memory_jobs，见 pgstore.go 与 memory_store.go）与 Redis（tk:runlive / tk:runepoch，见 redisstore.go）。
 // 只有四个方法要同时动两半：AcquireRun / EndRun / RenewLease / Reset（planning §8.4 事务映射）。
 //
 // 跨存储排序的两条已裁边界（§8.4，2026-10-07）：
@@ -725,32 +725,37 @@ ON CONFLICT (tenant_id, day) DO UPDATE SET tokens = tenant_usage_daily.tokens + 
 			if err := writeTurnRows(true); err != nil {
 				return err
 			}
-			// 线一 outbox（doc/29 §4.1）：**与 run 定稿同一笔事务**登记抽取任务——run 定稿 ⇒
-			// 待抽任务一定存在；进程在 COMMIT 后崩溃也有补偿线索。只登记 complete（error/stopped
-			// 没有可信结果，EndRun 本就不写完整轨迹）。登记失败 = 整笔回滚——与「同事务」同义，
-			// 不是新增的异步失败面。
+			// 记忆兜底抽取任务（doc/65 §4.5）：**与 run 定稿同一笔事务**登记——
+			// run 定稿 ⇒ 待抽任务一定存在；进程在 COMMIT 后崩溃也有补偿线索。
+			// 只登记 complete（error/stopped 没有可信结果，EndRun 本就不写完整轨迹）。
+			// 登记失败 = 整笔回滚——与「同事务」同义，不是新增的异步失败面。
+			//
+			// 幂等靠 dedup_key（postrun:<run_id>）：重复定稿（续跑再定稿）复用同一行，
+			// 不产生第二条任务。run_id 因此**不再全局唯一**（一个 run 可有 inrun/postrun/tidy 多条）。
 			if s.memoryCfg.Extract && s.memoryCfg.Workspace != "" {
 				var owner struct {
-					TenantID string
-					UserID   string
+					TenantID    string
+					UserID      string
+					WorkspaceID string
 				}
-				if err := tx.Raw(`SELECT tenant_id, user_id FROM sessions WHERE id = ?`, sessionID).Scan(&owner).Error; err != nil {
+				if err := tx.Raw(`SELECT tenant_id, user_id, workspace_id FROM sessions WHERE id = ?`, sessionID).Scan(&owner).Error; err != nil {
 					return err
 				}
 				tid := owner.TenantID
 				if tid == "" {
 					tid = s.memoryCfg.TenantID
 				}
-				jobID, err := newRowID("mj_")
-				if err != nil {
-					return err
-				}
-				if err := tx.Exec(
-					`INSERT INTO memory_jobs (id, run_id, session_id, tenant_id, user_id, workspace, status, attempts,
-					         next_attempt_at, last_error, created_at, updated_at)
-					 VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, now(), '', now(), now())
-					 ON CONFLICT (run_id) DO NOTHING`,
-					jobID, runID, sessionID, tid, owner.UserID, s.memoryCfg.Workspace).Error; err != nil {
+				dedup := "postrun:" + string(runID)
+				if _, err := s.registerMemoryJob(ctx, tx, MemoryJobSpec{
+					RunID:       runID,
+					SessionID:   sessionID,
+					TenantID:    tid,
+					UserID:      owner.UserID,
+					Workspace:   owner.WorkspaceID,
+					Kind:        MemoryJobKindPostrun,
+					TargetLayer: MemoryLayerRecall,
+					DedupKey:    &dedup,
+				}); err != nil {
 					return err
 				}
 			}
@@ -943,10 +948,12 @@ func (s *Store) AbandonClaim(ctx context.Context, runID RunID, epoch int64) erro
 // 返回 Redis 删除**键数**（响应字节与旧形态一致）。
 // 五表同清：`runs` 必须清——它是闸的落点，漏清则幽灵 running 行永久残留
 // （清扫只在新 POST 时按 session_id 触发，旧 session 已 404，再没人替它扫）；
-// `notes` 是笔记层（M1）的库内状态，同属「引擎自己的东西」，全局归零一并清。
+// 记忆层（memory_items / memory_jobs）是引擎自己的状态，同属「引擎自己的东西」，全局归零一并清。
+// 旧的 `notes` 表已随存量迁移退役（doc/65 §6.1），不再出现在 TRUNCATE 列表里——
+// 表都不在了，还 TRUNCATE 它会直接报错。
 func (s *Store) Reset(ctx context.Context) (deleted int, err error) {
 	if err := s.db.WithContext(ctx).Exec(
-		`TRUNCATE TABLE tenant_invitations, tenant_agents, tenant_settings, tenant_usage_daily, audit_log, refresh_tokens, tenant_members, tenants, users, sessions, runs, run_model_messages, runlog_entries, notes, run_journal`).Error; err != nil {
+		`TRUNCATE TABLE tenant_invitations, tenant_agents, tenant_settings, tenant_usage_daily, audit_log, refresh_tokens, tenant_members, tenants, users, sessions, runs, run_model_messages, runlog_entries, memory_items, memory_jobs, run_journal`).Error; err != nil {
 		return 0, err
 	}
 	var cursor uint64

@@ -58,7 +58,10 @@ type WorkspaceRef struct {
 	SessionID  SessionID
 	Root       string
 	TenantRoot string // <workspace>/tenants/<tenant>，存储上限管整棵租户目录
-	MaxBytes   int64
+	// WorkspaceID 是这场会话挂着的项目 id。没挂项目 = 空串。
+	// markdown 记忆的项目文件（MEMORY.md）按它定位——作业根目录本身不告诉你是哪个项目。
+	WorkspaceID string
+	MaxBytes    int64
 	// Reserve 在落盘前占住字节。没设时 write_file 仍用目录大小做一次检查。
 	Reserve func(adding int) (func(), error)
 }
@@ -108,15 +111,30 @@ func workspaceRoot(root, tenantID, workspaceID string) (string, error) {
 }
 
 // runWorkspace 按会话行选作业根。挂了项目就用项目目录，否则仍是这场会话自己的目录。
-func runWorkspace(ctx context.Context, w *Worker, tenantID string, sessionID SessionID) (string, error) {
+// 第二个返回值是项目 id（没挂项目 = 空串）：markdown 记忆的项目文件要按它定位。
+func runWorkspace(ctx context.Context, w *Worker, tenantID string, sessionID SessionID) (string, string, error) {
 	wid, err := w.store.SessionWorkspaceID(ctx, sessionID)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if wid != "" {
-		return workspaceRoot(w.workspace, tenantID, wid)
+		dir, err := workspaceRoot(w.workspace, tenantID, wid)
+		return dir, wid, err
 	}
-	return sessionWorkspace(w.workspace, tenantID, sessionID)
+	dir, err := sessionWorkspace(w.workspace, tenantID, sessionID)
+	return dir, "", err
+}
+
+// userDir 算出用户目录，不创建它。id 只允许单段路径，避免从库里的值走出去。
+//
+// 这是**新建的目录段**（users/<user>/）：markdown 记忆模式的用户文件 USER.md 落在这里，
+// 跨项目可见（doc/65 §5.1）。它落在租户根下 → 计入租户目录存储上限。
+func userDir(root, tenantID, userID string) (string, error) {
+	if root == "" || tenantID == "" || userID == "" || userID == "." || userID == ".." ||
+		strings.ContainsRune(userID, os.PathSeparator) || strings.ContainsRune(userID, '/') {
+		return "", os.ErrInvalid
+	}
+	return filepath.Join(root, "tenants", tenantID, "users", userID), nil
 }
 
 // sessionDir 算出会话目录，不创建它。id 只允许单段路径。删除用它做 RemoveAll。

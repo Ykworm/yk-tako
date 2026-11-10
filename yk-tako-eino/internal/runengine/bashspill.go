@@ -91,7 +91,7 @@ func sanitizePathSegment(s string) string {
 // tailCollector 收一个流的字节：内存留尾部 ≤cap，全文落盘（≤bashSpillCap）。
 type tailCollector struct {
 	cap      int
-	spillCap int   // 落盘上限（0 = 用默认 bashSpillCap）
+	spillCap int // 落盘上限（0 = 用默认 bashSpillCap）
 	tail     []byte
 	total    int64
 	dropped  bool // 丢过字节（= 超过内存上限）

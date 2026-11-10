@@ -21,6 +21,10 @@ func newRagStore(t *testing.T) *Store {
 	if err := s.EnsureDialogueIndex(context.Background()); err != nil {
 		t.Fatalf("EnsureDialogueIndex: %v", err)
 	}
+	// C3 起线一召回走 BM25：合并块用例（TestRecallMergedBlock）要记忆索引也在。
+	if err := s.EnsureMemoryIndexes(context.Background()); err != nil {
+		t.Fatalf("EnsureMemoryIndexes: %v", err)
+	}
 	return s
 }
 
@@ -103,7 +107,7 @@ func TestRecallLexicalGap(t *testing.T) {
 func TestRecallMergedBlock(t *testing.T) {
 	ctx := context.Background()
 	s := newRagStore(t)
-	s.addMemory(t, "fact", "project.dev-pg-port", "dev 库是 PostgreSQL 5433 端口", time.Now())
+	s.addMemory(t, "dev 库是 PostgreSQL 5433 端口", time.Now())
 	long := "5433 <b>" + strings.Repeat("汉", dialogueRecallRuneCap+50)
 	s.addChunk(t, "r_long", "s_9", "/tmp/ws-test", long)
 

@@ -362,6 +362,19 @@ func (s *Store) DeleteWorkspaceCascade(ctx context.Context, tenantID, userID, id
 		if n > 0 {
 			return ErrWorkspaceBusy
 		}
+		// 记忆按 **scope** 清（doc/65 §3.3）：删这个项目的 scope='workspace' 的记忆，
+		// **两层都删**（resident 与 recall 不分）；scope='user' 的记忆**保留**
+		//（它跟人走，即使产生于这个被删的项目）。
+		// runs / runlog_entries / usage 不动（运行档案留着）；单场会话删除不动记忆。
+		if err := tx.Exec(
+			`DELETE FROM memory_items WHERE scope = 'workspace' AND workspace = ?`, id).Error; err != nil {
+			return err
+		}
+		// 这个项目的记忆任务也清掉（否则旧 MQ 消息会指向已删项目的 job）。
+		if err := tx.Exec(
+			`DELETE FROM memory_jobs WHERE workspace = ?`, id).Error; err != nil {
+			return err
+		}
 		res := tx.Exec(`DELETE FROM workspaces WHERE id = ?`, id)
 		if res.Error != nil {
 			return res.Error
@@ -496,17 +509,110 @@ func findDefaultWorkspace(tx *gorm.DB, tenantID, userID string) (Workspace, erro
 	return rows[0], nil
 }
 
+// expandLegacyMemorySchema 是记忆表的**升级预置**（expand 步）。
+//
+// 为什么要它：GORM 的 AutoMigrate 加 NOT NULL 新列时，老行没有值 → PG 拒
+// （"column \"updated_at\" of relation \"memory_items\" contains null values"）。
+// 所以先把新列按**可空**铺上去并回填默认值，再让 AutoMigrate 去收紧成 NOT NULL。
+//
+// 这一步**只铺结构、不动语义**：回填的默认值是「旧行在新结构里的保守起点」——
+// 旧 memory_items 行是租户内按 user 过滤的召回事实，所以 layer='recall'、scope='user'
+// 是保守值（迁移步骤随后把它们改成 recall/workspace 并补项目 id）。
+//
+// 幂等：全部 IF NOT EXISTS + WHERE ... IS NULL，第二次跑是空操作。
+func expandLegacyMemorySchema(db *gorm.DB) error {
+	// 全新库上这两张表还不存在（AutoMigrate 还没跑）→ 没什么可预置的，直接跳过。
+	// **不能**在这里无条件 ALTER：表不存在会报 relation does not exist。
+	for _, tbl := range []string{"memory_items", "memory_jobs"} {
+		var reg string
+		if err := db.Raw(`SELECT COALESCE(to_regclass($1)::text, '')`, tbl).Scan(&reg).Error; err != nil {
+			return err
+		}
+		if reg == "" {
+			return nil
+		}
+	}
+	// memory_items 与 memory_jobs 的新列（可空铺开）。
+	for _, ddl := range []string{
+		`ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS layer text`,
+		`ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS scope text`,
+		`ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS state text`,
+		`ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS source text`,
+		`ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS quote text`,
+		`ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS superseded_by text`,
+		`ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS conflict_with text`,
+		`ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS left_active_at timestamptz`,
+		`ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS removed_at timestamptz`,
+		`ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS valid_from timestamptz`,
+		`ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS expires_at timestamptz`,
+		`ALTER TABLE memory_items ADD COLUMN IF NOT EXISTS updated_at timestamptz`,
+		`ALTER TABLE memory_jobs ADD COLUMN IF NOT EXISTS kind text`,
+		`ALTER TABLE memory_jobs ADD COLUMN IF NOT EXISTS target_layer text`,
+		`ALTER TABLE memory_jobs ADD COLUMN IF NOT EXISTS quote text`,
+		`ALTER TABLE memory_jobs ADD COLUMN IF NOT EXISTS source_seq bigint`,
+		`ALTER TABLE memory_jobs ADD COLUMN IF NOT EXISTS trace_parent text`,
+		`ALTER TABLE memory_jobs ADD COLUMN IF NOT EXISTS claim_epoch bigint`,
+		`ALTER TABLE memory_jobs ADD COLUMN IF NOT EXISTS batch_id text`,
+		`ALTER TABLE memory_jobs ADD COLUMN IF NOT EXISTS batch_payload text`,
+		`ALTER TABLE memory_jobs ADD COLUMN IF NOT EXISTS batch_committed_at timestamptz`,
+		`ALTER TABLE memory_jobs ADD COLUMN IF NOT EXISTS dedup_key text`,
+	} {
+		if err := db.Exec(ddl).Error; err != nil {
+			return fmt.Errorf("升级预置 %s: %w", ddl, err)
+		}
+	}
+	// 回填：让 NOT NULL 收紧时老行有值。
+	for _, ddl := range []string{
+		`UPDATE memory_items SET layer = 'recall' WHERE layer IS NULL`,
+		`UPDATE memory_items SET scope = 'user' WHERE scope IS NULL`,
+		`UPDATE memory_items SET state = 'active' WHERE state IS NULL`,
+		`UPDATE memory_items SET source = 'extracted' WHERE source IS NULL`,
+		`UPDATE memory_items SET quote = '' WHERE quote IS NULL`,
+		`UPDATE memory_items SET updated_at = created_at WHERE updated_at IS NULL`,
+		`UPDATE memory_jobs SET kind = 'postrun' WHERE kind IS NULL`,
+		`UPDATE memory_jobs SET quote = '' WHERE quote IS NULL`,
+		`UPDATE memory_jobs SET source_seq = 0 WHERE source_seq IS NULL`,
+		`UPDATE memory_jobs SET trace_parent = '' WHERE trace_parent IS NULL`,
+		`UPDATE memory_jobs SET claim_epoch = 0 WHERE claim_epoch IS NULL`,
+		`UPDATE memory_jobs SET batch_id = '' WHERE batch_id IS NULL`,
+		`UPDATE memory_jobs SET batch_payload = '' WHERE batch_payload IS NULL`,
+	} {
+		if err := db.Exec(ddl).Error; err != nil {
+			return fmt.Errorf("升级回填 %s: %w", ddl, err)
+		}
+	}
+	return nil
+}
+
 // autoMigrate 从九个 struct 建表（dev 迁移方式，待定项①已裁：AutoMigrate 够用，无迁移文件；
 // 上生产换不换显式迁移归部署面）。部分索引（WHERE 条件）优先走 GORM index tag；
 // 若某版 GORM 表达不全，在这里补 CREATE ... IF NOT EXISTS 兜底——仍是代码内，不引迁移文件。
-// 后三张是 doc/29 长期记忆：memory_items / memory_jobs（线一）与 dialogue_chunks（线二，
+// 后三张是长期记忆：memory_items / memory_jobs（pipeline，doc/65 §4）与 dialogue_chunks（线二，
 // pg_search 索引另由 ensureDialogueIndex 手写；建表本身不需要扩展）。
+//
+// **memory_items / memory_jobs 的结构已换成 doc/65 §4.2 的新形态**：
+// 旧结构靠 kind/topic 分类 + 正文去重唯一索引，新结构改成 layer/scope/state + 无去重。
+// GORM 的 AutoMigrate **只加列不删列**：旧列（kind/topic）与旧唯一索引必须显式 DROP，
+// 否则它们会继续挡着「A→B→A 改口产生新历史行」这条正确性要求。
 func autoMigrate(db *gorm.DB) error {
-	// 旧库上的 memory_items_dedup 不含 user_id。先丢掉，AutoMigrate 按新列重建，
-	// 再建一次显式部分索引，保证 ON CONFLICT 的列和 WHERE 与代码一致。
+	// 旧结构的两个唯一索引先丢掉（正文去重 + episode 唯一）——新结构不再有这两条语义。
+	// 这两条索引不依赖「行内容」，只依赖列，删掉不影响存量行的可读性：
+	// 迁移要读的 kind/topic **列本身**留到迁移步骤再删（见下面）。
 	_ = db.Exec(`DROP INDEX IF EXISTS memory_items_dedup`).Error
 	_ = db.Exec(`DROP INDEX IF EXISTS idx_memory_items_memory_items_dedup`).Error
-	if err := db.AutoMigrate(&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}, &Note{}, &RunJournal{},
+	_ = db.Exec(`DROP INDEX IF EXISTS memory_items_episode_once`).Error
+	_ = db.Exec(`DROP INDEX IF EXISTS idx_memory_items_memory_items_episode_once`).Error
+	// 注意：**没有 &Note{}**——旧的 notes 表随存量迁移退役（memory_migrate.go 会搬它的数据
+	// 再删表）。全新库不再建这张表；升级库上它还留着，等迁移步骤来搬。
+	//
+	// 升级预置（expand）：GORM 的 AutoMigrate 加 NOT NULL 新列时，老行没有值 → PG 直接拒
+	// （column contains null values）。所以**先**用可空列把新结构铺开并回填，
+	// **再**让 AutoMigrate 去收紧成 NOT NULL。这是 expand/contract 的第一步——
+	// 收紧与删列都在迁移步骤（memory_migrate.go）里做，那时数据已经搬完了。
+	if err := expandLegacyMemorySchema(db); err != nil {
+		return err
+	}
+	if err := db.AutoMigrate(&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}, &RunJournal{},
 		&MemoryItem{}, &MemoryJob{}, &DialogueChunk{},
 		&User{}, &Tenant{}, &TenantMember{}, &RefreshToken{}, &AuditLog{}, &TenantUsageDaily{},
 		&TenantInvitation{}, &TenantAgent{}, &AgentDefault{}, &TenantSetting{}, &TenantStorage{},
@@ -514,12 +620,20 @@ func autoMigrate(db *gorm.DB) error {
 		&SkillRow{}, &SkillDisable{}); err != nil {
 		return err
 	}
-	_ = db.Exec(`DROP INDEX IF EXISTS memory_items_dedup`).Error
-	if err := db.Exec(`CREATE UNIQUE INDEX memory_items_dedup
-ON memory_items (tenant_id, user_id, workspace, kind, content)
-WHERE kind <> 'episode'`).Error; err != nil {
+	// 旧列 kind/topic **不在这里删**——它们是存量迁移的**输入**：
+	// 迁移要靠 kind 认出 episode 行（置 archived）、靠 topic 保留旧分组语义，
+	// 复制完成后才删（施工包 §7.3「先加新列不先删旧列」）。
+	// 删列由 memory_migrate.go 的迁移步骤在复制之后执行（那里会连依赖这两个列的
+	// 非唯一索引一起删——PG 虽然会自动删掉依赖索引，但索引名要留在迁移里才说得清）。
+	// 读视图：普通应用读取只打视图（doc/65 §4.1）。视图与 BM25 索引由
+	// EnsureMemoryIndexes 在启动装配期建（main.go 调）；这里先把视图建出来，
+	// 让迁移期间的读口与测试有视图可用（幂等，EnsureMemoryIndexes 会重建）。
+	if err := ensureMemoryViews(db); err != nil {
 		return err
 	}
+	// memory_jobs 的 run_id **不再全局唯一**（doc/65 §4.5：一个 run 可有 inrun/postrun/tidy
+	// 多条任务，幂等由 dedup_key 保证，EndRun 已走 dedup_key 登记）。
+	// 旧库升级时残留的 run_id 唯一索引由 dropLegacyMemorySchema 负责摘掉（memory_migrate.go）。
 	// 技能目录的部分唯一索引（doc/52 §4.7、D7）：(tenant_id, name) WHERE valid。
 	// 同一个桶内生效名字唯一——数据库层就是闸，插入失败本身就是拒装。
 	// 同名的 invalid 行可以并存（盘上有几份同名东西就记几条），所以必须是部分索引。

@@ -4,7 +4,7 @@
 //
 //	① 工具统一出口（wrapToolErrors）——自家工具、media/pdf、tool_search、**MCP 工具**都走它。
 //	② 模型输入的唯一转换口（toSchemaMessages）——首轮装配、mid-run fold、救援采用、guard 重试都走它。
-//	③ 记忆抽取入库前（memory.go 的 writeMemoryJobResult）——密钥类整条拒收，证件类打码后入库。
+//	③ 记忆写入前（memory_store.go 的 WriteMemoryItems）——密钥类整条拒收，证件类打码后入库。
 package runengine
 
 import (
@@ -86,21 +86,22 @@ func TestPIIMountFoldPathSurvives(t *testing.T) {
 func TestPIIMemoryRejectsSecret(t *testing.T) {
 	ctx := context.Background()
 	s := newMemoryStore(t)
-	job := &claimedMemoryJob{ID: "mj_1", RunID: "r_1", SessionID: "s_1",
-		TenantID: testOwner.TenantID, UserID: testOwner.UserID, Workspace: "/tmp/ws-test", Attempts: 1}
-
-	stats, err := s.writeMemoryJobResult(ctx, job, 1, "这一场聊到了配置", []extractedItem{
-		{Kind: "fact", Topic: "api.key", Content: "我的密钥是 sk-proj-AbCdEfGhIjKlMnOpQrSt"},
-		{Kind: "fact", Topic: "user.idcard", Content: "我的身份证是 110101199003077777"},
+	res, err := s.WriteMemoryItems(ctx, []MemoryItem{
+		{TenantID: testOwner.TenantID, UserID: testOwner.UserID, Workspace: "p1",
+			Layer: MemoryLayerRecall, Scope: MemoryScopeUser, Source: MemorySourceExtracted,
+			Content: "我的密钥是 sk-proj-AbCdEfGhIjKlMnOpQrSt"},
+		{TenantID: testOwner.TenantID, UserID: testOwner.UserID, Workspace: "p1",
+			Layer: MemoryLayerRecall, Scope: MemoryScopeUser, Source: MemorySourceExtracted,
+			Content: "我的身份证是 110101199003077777"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.Rejected != 1 {
-		t.Errorf("Rejected = %d, want 1（密钥类整条拒收）", stats.Rejected)
+	if res.Rejected != 1 {
+		t.Errorf("Rejected = %d, want 1（密钥类整条拒收）", res.Rejected)
 	}
-	if stats.Items != 1 {
-		t.Errorf("Items = %d, want 1（证件类打码后入库）", stats.Items)
+	if res.Written != 1 {
+		t.Errorf("Written = %d, want 1（证件类打码后入库）", res.Written)
 	}
 	// 库里不能有密钥
 	if got := s.count(t, &MemoryItem{}, "content LIKE ?", "%EfGhIjKlMnOpQrSt%"); got != 0 {
@@ -108,7 +109,7 @@ func TestPIIMemoryRejectsSecret(t *testing.T) {
 	}
 	// 证件类要已打码
 	var content string
-	if err := s.db.Raw(`SELECT content FROM memory_items WHERE topic = ?`, "user.idcard").Row().Scan(&content); err != nil {
+	if err := s.db.Raw(`SELECT content FROM memory_items WHERE content LIKE ?`, "%110101%").Row().Scan(&content); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(content, "110101199003077777") {

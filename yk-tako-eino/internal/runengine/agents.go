@@ -566,6 +566,11 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 	// 技能四工具在这里剔掉（doc/52 §2.8）：子代理结构性看不见它们——继承档拿不到，
 	// 白名单档写了名字按「未知名」拒载（错误信息会列出可选名单，不含它们）。
 	base := dropSkillTools(ctx, append([]tool.BaseTool(nil), runCtx.Tools...))
+	// 记忆工具只给 master（doc/65 §4.4/§4.5/§5.2「普通 subagent 不得继承」）：
+	// memory（派工/条目两种形状）与 search_memory（主动查询）都不给子代理。
+	// 子代理只读当场冻结的快照，不改记忆、不主动检索。
+	// 剔在 base = 三档（继承 / exclude / 白名单）共用一份过滤。
+	base = dropMemoryAndSearchTools(ctx, base)
 	ctx = withSubagentAssembly(ctx, &subagentAssembly{base: base, snap: snap, specs: specs})
 	var loaded []string
 	for _, spec := range specs {
@@ -587,7 +592,13 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 			log.Printf("agents: %s: 拒载: %v", spec.Name, err)
 			continue
 		}
-		instruction := spec.Prompt + "\n\n" + snap
+		// 子代理的 Instruction = 规格正文 + 租户规范 + 快照段（与主代理同一份拼装口径）。
+		// 租户规范是租户系统提示材料（teamInstructions），跟记忆轴无关，但它对子代理同样成立。
+		instruction := spec.Prompt
+		if team := teamInstructionsSection(h.store.teamInstructionsFor(ctx)); team != "" {
+			instruction = instruction + "\n\n" + team
+		}
+		instruction = instruction + "\n\n" + snap
 		// 子代理的目录分级（T4/T5 A2）：只有显式写进 tools: 才挂自己的 toolSearchHandler——
 		// 每条规格一份完整目录/激活集，tool_search 只搜自己的池。继承档与 exclude_tools 档
 		// 不自动加（2026-10-20 已拍），其 MCP 工具照旧全部 direct 声明。

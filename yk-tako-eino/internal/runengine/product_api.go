@@ -536,144 +536,63 @@ func (s *Server) deleteTenant(c *gin.Context) {
 	}{Status: "archived"})
 }
 
-type noteBody struct {
-	ID        string `json:"id"`
-	Scope     string `json:"scope"`
-	Workspace string `json:"workspace"`
-	Kind      string `json:"kind"`
-	Content   string `json:"content"`
-	Quote     string `json:"quote"`
-}
-
-func notesData(rows []Note) any {
-	out := make([]noteBody, 0, len(rows))
-	for _, row := range rows {
-		out = append(out, noteBody{ID: row.ID, Scope: row.Scope, Workspace: row.Workspace, Kind: row.Kind, Content: row.Content, Quote: row.Quote})
-	}
-	return struct {
-		Notes []noteBody `json:"notes"`
-	}{Notes: out}
-}
-
-func (s *Server) listDevNotes(c *gin.Context) {
-	p, ok := s.requirePrincipal(c)
-	if !ok {
-		return
-	}
-	ctx := withScope(c.Request.Context(), dataScope{TenantID: p.TenantID, UserID: p.UserID, Scope: "user"})
-	rows, err := s.store.ListScopedNotes(ctx, c.Query("workspace"))
-	if err != nil {
-		internal(c, err)
-		return
-	}
-	writeEnvelope(c, http.StatusOK, codeOK, "", notesData(rows))
-}
-
-func (s *Server) postDevNote(c *gin.Context) {
-	p, ok := s.requirePrincipal(c)
-	if !ok {
-		return
-	}
-	var req struct {
-		Workspace string `json:"workspace"`
-		Kind      string `json:"kind"`
-		Content   string `json:"content"`
-		Quote     string `json:"quote"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
-		return
-	}
-	if req.Kind == "" {
-		req.Kind = noteKindAgent
-	}
-	ctx := withScope(c.Request.Context(), dataScope{TenantID: p.TenantID, UserID: p.UserID, Scope: "user"})
-	res, err := s.store.writeNote(ctx, req.Workspace, "", 0, noteWrite{Action: "add", Kind: req.Kind, Content: req.Content, Quote: req.Quote})
-	if err != nil {
-		internal(c, err)
-		return
-	}
-	if res.fail != "" {
-		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "笔记内容不符合要求", nil)
-		return
-	}
-	rows, err := s.store.ListScopedNotes(ctx, req.Workspace)
-	if err != nil {
-		internal(c, err)
-		return
-	}
-	writeEnvelope(c, http.StatusCreated, codeOK, "", notesData(rows))
-}
-
-func (s *Server) listTenantNotes(c *gin.Context) {
-	p, ok := s.requirePrincipal(c)
-	if !ok {
-		return
-	}
-	ctx := withScope(c.Request.Context(), dataScope{TenantID: p.TenantID, Scope: "tenant"})
-	rows, err := s.store.ListScopedNotes(ctx, c.Query("workspace"))
-	if err != nil {
-		internal(c, err)
-		return
-	}
-	writeEnvelope(c, http.StatusOK, codeOK, "", notesData(rows))
-}
-
-func (s *Server) postTenantNote(c *gin.Context) {
-	p, ok := s.requirePrincipal(c)
-	if !ok {
-		return
-	}
-	var req struct {
-		Workspace string `json:"workspace"`
-		Kind      string `json:"kind"`
-		Content   string `json:"content"`
-		Quote     string `json:"quote"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
-		return
-	}
-	if req.Workspace == "" {
-		req.Workspace = "team"
-	}
-	if req.Kind == "" {
-		req.Kind = noteKindAgent
-	}
-	ctx := withScope(c.Request.Context(), dataScope{TenantID: p.TenantID, UserID: p.UserID, Scope: "tenant"})
-	res, err := s.store.writeNote(ctx, req.Workspace, "", 0, noteWrite{Action: "add", Kind: req.Kind, Content: req.Content, Quote: req.Quote})
-	if err != nil {
-		internal(c, err)
-		return
-	}
-	if res.fail != "" {
-		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "笔记内容不符合要求", nil)
-		return
-	}
-	rows, err := s.store.ListScopedNotes(ctx, req.Workspace)
-	if err != nil {
-		internal(c, err)
-		return
-	}
-	writeEnvelope(c, http.StatusCreated, codeOK, "", notesData(rows))
-}
-
+// postDevMemory 是 dev 数据准备口（doc/65 §6.5），不是产品管理 API：非 dev 模式不注册。
+// 新行结构字段：layer/scope/state/content/quote；scope=workspace 必须带 workspaceId。
 func (s *Server) postDevMemory(c *gin.Context) {
 	p, ok := s.requirePrincipal(c)
 	if !ok {
 		return
 	}
 	var req struct {
-		Kind    string `json:"kind"`
-		Content string `json:"content"`
-		Topic   string `json:"topic"`
+		Layer       string `json:"layer"`
+		Scope       string `json:"scope"`
+		State       string `json:"state"`
+		Content     string `json:"content"`
+		Quote       string `json:"quote"`
+		WorkspaceID string `json:"workspaceId"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Content) == "" {
-		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "邮箱或密码不符合要求", nil)
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "content 不能为空", nil)
+		return
+	}
+	if req.Layer == "" {
+		req.Layer = MemoryLayerRecall
+	}
+	if req.Scope == "" {
+		req.Scope = MemoryScopeUser
+	}
+	if req.State == "" {
+		req.State = MemoryStateActive
+	}
+	switch req.Layer {
+	case MemoryLayerResident, MemoryLayerRecall:
+	default:
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "layer 只能是 resident 或 recall", nil)
+		return
+	}
+	switch req.Scope {
+	case MemoryScopeUser:
+		req.WorkspaceID = ""
+	case MemoryScopeWorkspace:
+		if strings.TrimSpace(req.WorkspaceID) == "" {
+			writeEnvelope(c, http.StatusBadRequest, codeBadInput, "scope=workspace 必须带 workspaceId", nil)
+			return
+		}
+	default:
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "scope 只能是 user 或 workspace", nil)
+		return
+	}
+	switch req.State {
+	case MemoryStateActive, MemoryStateSuperseded, MemoryStateRemoved, MemoryStateArchived:
+	default:
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "state 只能是 active、superseded、removed 或 archived", nil)
 		return
 	}
 	ctx := withScope(c.Request.Context(), dataScope{TenantID: p.TenantID, UserID: p.UserID, Scope: "user"})
-	id, err := s.store.SeedMemoryFact(ctx, req.Kind, req.Topic, req.Content)
+	id, err := s.store.SeedMemoryFact(ctx, DevMemorySeed{
+		Layer: req.Layer, Scope: req.Scope, State: req.State,
+		Content: req.Content, Quote: req.Quote, WorkspaceID: req.WorkspaceID,
+	})
 	if err != nil {
 		internal(c, err)
 		return
@@ -681,6 +600,78 @@ func (s *Server) postDevMemory(c *gin.Context) {
 	writeEnvelope(c, http.StatusCreated, codeOK, "", struct {
 		ID string `json:"id"`
 	}{ID: id})
+}
+
+// devMemoryFileData 是 GET /api/dev/memory-file 的响应体。
+// 格式读不懂时 usageKnown=false：usedRunes/entryCount 不报 0 冒充「文件是空的」。
+type devMemoryFileData struct {
+	Target     string `json:"target"`
+	FileName   string `json:"fileName"`
+	Content    string `json:"content"`
+	UsedRunes  int    `json:"usedRunes"`
+	Cap        int    `json:"cap"`
+	EntryCount int    `json:"entryCount"`
+	UsageKnown bool   `json:"usageKnown"`
+	ParseError string `json:"parseError"`
+}
+
+// getDevMemoryFile 是 markdown 模式的只读验收口（doc/65 §6.5）：回当前文件原文与使用量。
+// 只读，不写文件；文件不存在 = 空记忆（正常起点）。非 dev 模式不注册。
+func (s *Server) getDevMemoryFile(c *gin.Context) {
+	p, ok := s.requirePrincipal(c)
+	if !ok {
+		return
+	}
+	target := strings.TrimSpace(c.Query("target"))
+	var dir, fileName string
+	var capacity int
+	var err error
+	switch target {
+	case memoryTargetUser:
+		dir, err = userDir(s.mediaRoot, p.TenantID, p.UserID)
+		fileName, capacity = memoryUserFileName, memoryUserCap
+	case memoryTargetWorkspace:
+		wid := strings.TrimSpace(c.Query("workspaceId"))
+		if wid == "" {
+			writeEnvelope(c, http.StatusBadRequest, codeBadInput, "target=workspace 必须带 workspaceId", nil)
+			return
+		}
+		if _, verr := s.store.VisibleWorkspace(c.Request.Context(), wid, p.TenantID, p.UserID); verr != nil {
+			if errors.Is(verr, ErrWorkspaceNotFound) {
+				writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
+				return
+			}
+			internal(c, verr)
+			return
+		}
+		dir, err = workspaceDir(s.mediaRoot, p.TenantID, wid)
+		fileName, capacity = memoryWorkspaceFileName, memoryWorkspaceCap
+	default:
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "target 只能是 user 或 workspace", nil)
+		return
+	}
+	if err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "id 不合法，定位不到记忆文件", nil)
+		return
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, fileName))
+	if err != nil && !os.IsNotExist(err) {
+		internal(c, err)
+		return
+	}
+	data := devMemoryFileData{
+		Target: target, FileName: fileName, Content: string(raw),
+		Cap: capacity, UsageKnown: true,
+	}
+	entries, perr := parseMemoryEntries(raw)
+	if perr != nil {
+		data.UsageKnown = false
+		data.ParseError = perr.Error()
+	} else {
+		data.UsedRunes = memoryEntriesRunes(entries)
+		data.EntryCount = len(entries)
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", data)
 }
 
 func (s *Server) devWorkspaceDir(c *gin.Context, p principal) (string, SessionID, bool) {

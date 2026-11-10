@@ -202,6 +202,18 @@ func (s *Store) mustAcquire(t *testing.T, sid SessionID, rid RunID, msgID, text 
 	}
 }
 
+// mustAcquireWithWorkspace 造一场挂在指定项目上的 run（会话的 workspace_id = 项目 id）。
+func (s *Store) mustAcquireWithWorkspace(t *testing.T, sid SessionID, rid RunID, msgID, text, workspaceID string) {
+	t.Helper()
+	ok, err := s.AcquireRun(context.Background(), sid, rid, Row{RunID: rid, Role: "user", MessageID: msgID, Text: text}, testOwner, workspaceID)
+	if err != nil {
+		t.Fatalf("AcquireRun(%s, %s): %v", sid, rid, err)
+	}
+	if !ok {
+		t.Fatalf("AcquireRun(%s, %s) = false, want true", sid, rid)
+	}
+}
+
 func (s *Store) mustDelta(t *testing.T, ctx context.Context, rid RunID, text string) {
 	t.Helper()
 	// model 传空串：多数用例验的是生命周期语义、不关心 model 值（帧上恒在字段，无 omitempty）。
@@ -541,8 +553,10 @@ func TestEndRunAfterGateLostIsNoop(t *testing.T) {
 	}
 }
 
-// 9. Reset 两半都清、且只删自己的东西：PG 五表空（含 M1 的 notes）、db1 的 tk:* 键清空，
-// 而邻居键（非 tk: 前缀）完好——本机 6390 上真跑着别的键空间，这条不是假想需求。
+// 9. Reset 两半都清、且只删自己的东西：PG 侧的记忆表空（memory_items / memory_jobs）、
+// db1 的 tk:* 键清空，而邻居键（非 tk: 前缀）完好——本机 6390 上真跑着别的键空间，这条不是假想需求。
+//
+// （旧的 notes 表随存量迁移退役，见 doc/65 §6.1 —— 这里改查新结构的两张记忆表。）
 func TestResetClearsBothHalvesOnlyOwnPrefix(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t, testLease, testTTL)
@@ -550,8 +564,16 @@ func TestResetClearsBothHalvesOnlyOwnPrefix(t *testing.T) {
 	s.mustAcquire(t, sid, rid, "m_1", "hi")
 	s.mustDelta(t, ctx, rid, "world")
 	if err := s.db.Exec(
-		`INSERT INTO notes (id, workspace, kind, content, quote, source_run_id, source_seq, created_at)
-		 VALUES ('n_1', '/ws', 'agent', 'deck 在 output/deck.html', '原话', 'r_1', 1, now())`).Error; err != nil {
+		`INSERT INTO memory_items (id, tenant_id, user_id, workspace, layer, scope, content, quote,
+		        state, source, source_session_id, source_run_id, source_seq, created_at, updated_at)
+		 VALUES ('mem_reset_1', 't1', 'u1', 'ws1', 'recall', 'workspace', 'deck 在 output/deck.html', '原话',
+		        'active', 'extracted', '', 'r_1', 1, now(), now())`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Exec(
+		`INSERT INTO memory_jobs (id, run_id, session_id, tenant_id, user_id, workspace, kind, status,
+		        attempts, next_attempt_at, created_at, updated_at)
+		 VALUES ('mj_reset_1', 'r_1', 's_1', 't1', 'u1', 'ws1', 'postrun', 'pending', 0, now(), now(), now())`).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := s.rdb.Set(ctx, "other:x", "not mine", 0).Err(); err != nil {
@@ -565,7 +587,7 @@ func TestResetClearsBothHalvesOnlyOwnPrefix(t *testing.T) {
 	if deleted != 2 {
 		t.Errorf("Reset deleted = %d, want 2（runlive + runepoch 两键）", deleted)
 	}
-	for _, m := range []any{&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}, &Note{}, &RunJournal{}} {
+	for _, m := range []any{&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}, &RunJournal{}, &MemoryItem{}, &MemoryJob{}} {
 		if got := s.count(t, m, ""); got != 0 {
 			t.Errorf("reset 后 %T 行数 = %d, want 0", m, got)
 		}

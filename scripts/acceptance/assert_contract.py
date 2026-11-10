@@ -375,6 +375,15 @@ def main():
         if case.get("needs") == "sandbox" and not harness.sandbox_available():
             tally.skip(case["id"], "这台机器没有可用的 sandbox-exec（bash 会 fail closed，doc/35）")
             continue
+        # 记忆模式门（doc/65）：观测口字节随 TAKO_MEMORY_MODE 分叉。引擎的模式由操作员起引擎时
+        # 定；跑套件时把同一个值给到运行器（TAKO_MEMORY_MODE），两边对不上就跳过并明说，不硬跑假红。
+        mode = os.environ.get("TAKO_MEMORY_MODE", "").strip().lower()
+        if case.get("needs") == "markdown-mode" and mode != "markdown":
+            tally.skip(case["id"], "要 markdown 模式引擎：起引擎与跑本套件都带 TAKO_MEMORY_MODE=markdown")
+            continue
+        if case.get("needs") == "pipeline-mode" and mode == "markdown":
+            tally.skip(case["id"], "markdown 模式引擎跑不了这条（要 pipeline 观测口）")
+            continue
         # 每个用例自带上一个账号，别互相污染（用例 0 那条要「没配模型」的租户）
         run_case(case, key, tally, args.print, base_vars)
 

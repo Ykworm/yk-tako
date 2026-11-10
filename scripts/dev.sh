@@ -8,6 +8,8 @@
 #   ENGINE_PORT=8905 WEB_PORT=5180 ./scripts/dev.sh
 #   REDIS_PORT=6392 REDIS_SERVER_BIN=/path/to/redis-server ./scripts/dev.sh
 #   PG_PORT=5434 PG_BIN_DIR=/path/to/pg/bin ./scripts/dev.sh
+#   REDPANDA_PORT=9093 REDPANDA_IMAGE=redpandadata/redpanda:vX.Y.Z ./scripts/dev.sh
+#   TAKO_MEMORY_MODE=markdown ./scripts/dev.sh   # 不起 Redpanda
 #
 # 没有 start：后台化会把「前台混排日志」和「Ctrl-C 一起停」这两条脚本的价值都赔掉。
 # restart 不是后台化——它就是 stop 之后在当前终端接着前台跑一次，两条都留着。
@@ -20,6 +22,10 @@
 # 引擎的存储层是 Redis（tk:runlive/tk:runepoch 两键）+ Postgres，任一不可达就 fail fast 不起进程，
 # 所以这里先把两半都备好：端口上已有监听者就复用（可能是你自己留着的那份数据，脚本不碰），
 # 空闲才自己起——Redis 一个内存态实例，Postgres 一个 initdb 在 tmp/pg-<端口>/data 的本地实例。
+#
+# pipeline 记忆模式的抽取队列是 Redpanda（doc/65 §5.2）：默认 127.0.0.1:9092，同一条复用纪律；
+# 空闲才用固定版本容器起一份（禁止 latest），topic tako.memory.extract 显式建成 8 分区。
+# TAKO_MEMORY_MODE=markdown 整段跳过；调用方显式给了 TAKO_REDPANDA_BROKERS 就以它为准，不起本地容器。
 #
 # 登录和租户密钥封存也在这一条链上：没设 TAKO_JWT_SECRET（至少 32 字节）时引擎在 auth 处退出。
 # 脚本只在调用方没给够长的值时填开发用默认值，不写进 .env。TAKO_DATA_KEY 同理，新的租户密钥写成 seal2。
@@ -42,6 +48,12 @@ pg_data_dir="$pg_base/data"
 pg_log="$pg_base/postgres.log"
 pg_bin_dir=""   # 空闲时按需解析（PG_BIN_DIR → PATH → 本机已知路径）
 pg_started=""   # 只对「本脚本起的」实例置位：收尾 pg_ctl stop 只认它
+memory_mode="${TAKO_MEMORY_MODE:-pipeline}"
+redpanda_port="${REDPANDA_PORT:-9092}"
+redpanda_image="${REDPANDA_IMAGE:-redpandadata/redpanda:v25.3.18}"
+container_bin=""       # docker 或 podman，按需解析
+redpanda_container=""  # 本脚本起的容器的唯一名称
+redpanda_started=""    # 只对「本脚本起的」容器置位：收尾 stop/rm 只认它
 
 # 前台跑着的这个脚本把自己登记成 pidfile，另一个终端里的 stop/status 才找得到它。
 # 按引擎端口命名，同机多实例（8901 / 8914 …）互不覆盖。
@@ -185,6 +197,7 @@ run() { # run <标签> <颜色> <目录> <命令...>
 # Redis 端口不进这个循环：复用的可能是别人留着的数据，只能靠 pkill -P 收走自己那份子进程。
 # Postgres 同理不进循环：pg_ctl 起的 postmaster 不在本脚本进程树上（pkill -P 收不到），
 # 只对自己置位过 pg_started 的那份显式 `pg_ctl stop`；复用的实例绝不碰。
+# Redpanda 容器同理：只 stop/rm 置位过 redpanda_started 的那个唯一名称；复用的监听者绝不碰。
 shutdown() {
   trap - INT TERM EXIT
   rm -f "$pid_file"
@@ -196,6 +209,10 @@ shutdown() {
   done
   if [ -n "$pg_started" ]; then
     "$pg_bin_dir/pg_ctl" -D "$pg_data_dir" -m fast stop >/dev/null 2>&1 || true
+  fi
+  if [ -n "$redpanda_started" ]; then
+    "$container_bin" stop "$redpanda_container" >/dev/null 2>&1 || true
+    "$container_bin" rm "$redpanda_container" >/dev/null 2>&1 || true
   fi
 }
 trap shutdown INT TERM EXIT
@@ -271,6 +288,64 @@ else
   fi
 fi
 
+# Redpanda 是 pipeline 记忆模式的抽取队列（doc/65 §5.2）。markdown 模式整段跳过——
+# 引擎在这个模式下不装配消费者，broker 环境变量留着也不生效。
+# 与 Redis/PG 同一条纪律：端口上已有监听者只复用（可能是你自己留着的 broker 和数据，脚本不碰）；
+# 空闲才自己起一个固定版本容器，唯一名称，收尾只 stop/rm 自己起的那份。
+if [ "$memory_mode" != "markdown" ]; then
+  if [ -n "${TAKO_REDPANDA_BROKERS:-}" ]; then
+    # 调用方显式指向了某个 broker（比如远程真集群），以它为准，不起本地容器。
+    echo "Redpanda 用调用方给的 TAKO_REDPANDA_BROKERS，不起本地容器。"
+  else
+    redpanda_listener="$(lsof -tiTCP:"$redpanda_port" -sTCP:LISTEN 2>/dev/null | head -1 || true)"
+    if [ -n "$redpanda_listener" ]; then
+      echo "Redpanda 127.0.0.1:${redpanda_port} 已有监听者（PID ${redpanda_listener}），直接复用。"
+      echo "复用实例的 topic tako.memory.extract 需自行确认为 8 分区；引擎启动时还会探 topic 存在性（不存在即退出）。"
+    else
+      container_bin="$(command -v docker 2>/dev/null || command -v podman 2>/dev/null || true)"
+      if [ -z "$container_bin" ]; then
+        echo "端口 $redpanda_port 空闲，但找不到 docker/podman：装一个容器运行时，或用 REDPANDA_PORT 指向已有 broker，或 export TAKO_REDPANDA_BROKERS 指向远程集群，或 TAKO_MEMORY_MODE=markdown 跳过。" >&2
+        exit 1
+      fi
+      redpanda_container="tako-dev-redpanda-${redpanda_port}-$$"
+      redpanda_started=1
+      "$container_bin" run -d --name "$redpanda_container" \
+        -p "127.0.0.1:${redpanda_port}:9092" \
+        "$redpanda_image" \
+        redpanda start --mode dev-container --smp 1 --memory 1G \
+        --kafka-addr PLAINTEXT://0.0.0.0:9092 \
+        --advertise-kafka-addr "PLAINTEXT://127.0.0.1:${redpanda_port}" >/dev/null
+      # 等 Kafka API 真正可用（容器起跑 ≠ broker 就绪），最多 60s。
+      redpanda_ready=""
+      for _ in $(seq 120); do
+        if "$container_bin" exec "$redpanda_container" rpk cluster info >/dev/null 2>&1; then
+          redpanda_ready=1
+          break
+        fi
+        if [ "$("$container_bin" inspect -f '{{.State.Running}}' "$redpanda_container" 2>/dev/null || true)" != "true" ]; then
+          echo "Redpanda 容器退出了，看日志：$container_bin logs $redpanda_container" >&2
+          exit 1
+        fi
+        sleep 0.5
+      done
+      if [ -z "$redpanda_ready" ]; then
+        echo "Redpanda 60s 内没就绪，看日志：$container_bin logs $redpanda_container" >&2
+        exit 1
+      fi
+      # 显式建 8 分区，不依赖自动创建（自动创建的分区数随 broker 配置走，可能不是 8）。
+      # 已存在时 create 报错可忽略，下面的 describe 会把关分区数。
+      "$container_bin" exec "$redpanda_container" rpk topic create tako.memory.extract --partitions 8 >/dev/null 2>&1 || true
+      redpanda_parts="$("$container_bin" exec "$redpanda_container" rpk topic describe tako.memory.extract 2>/dev/null | awk '/^PARTITIONS/ {print $2}')"
+      if [ "$redpanda_parts" != "8" ]; then
+        echo "topic tako.memory.extract 分区数不是 8（读到：${redpanda_parts:-空}）；请自行处理后重跑。" >&2
+        exit 1
+      fi
+      echo "Redpanda 127.0.0.1:${redpanda_port} 就绪（容器 ${redpanda_container}，topic tako.memory.extract 8 分区）。"
+    fi
+    export TAKO_REDPANDA_BROKERS="127.0.0.1:${redpanda_port}"
+  fi
+fi
+
 # 调用方已经 export 的值优先。这里的两把只给本机开发，不打印内容。
 jwt_secret="${TAKO_JWT_SECRET-}"
 if [ "${#jwt_secret}" -lt 32 ]; then
@@ -290,6 +365,6 @@ run 引擎 '\033[36m' "$repo_root/yk-tako-eino" \
 run 前端 '\033[35m' "$repo_root/yk-tako-eino/web" \
   npm run dev -- --host 127.0.0.1 --port "$web_port" --strictPort
 
-echo "前端 http://127.0.0.1:$web_port  →  引擎 http://127.0.0.1:$engine_port  (redis $redis_addr, pg $pg_addr/tako)"
+echo "前端 http://127.0.0.1:$web_port  →  引擎 http://127.0.0.1:$engine_port  (redis $redis_addr, pg $pg_addr/tako, memory=$memory_mode)"
 
 wait

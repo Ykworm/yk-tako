@@ -15,6 +15,13 @@
 | `tenant_gate.sh` | doc/43 租户并发闸的**活体验收**：上限 2 的租户并发打 4 次 `POST /api/runs` → 恰好 2 个 `202` + 2 个 `429`（响应体逐字 `{"code":113001,…}`），库里 run 行数与会话行数都 = 上限 | 要 |
 | `question_crash.sh` | doc/47 问/方案**挂起中活得过崩溃**的活体验收：`ask_user` 挂起 → `kill -9` → 重启 → `resume` → 帧重发（指回同一行）→ `answer` → run complete、runlog 里答案逐字注回；另钉一答终答 409 `115101` | 要 |
 | `sse_reconnect.sh` | **SSE 重连自愈**的活体验收（doc/46 §7.5）：对着一个 access token 只有 20 秒的隔离引擎，让页面静静不动直到 token 过期，再重启引擎制造断线 → 断线后 401 次数有界、事件流恢复。**自带引擎与 vite，不用手工准备**；未修复时判红退出 | — |
+| `memory_pipeline_live.sh` | doc/65 `pipeline` 模式活体：真 Redpanda + 真模型，记住 → 改口 → 删除 → 每回合召回，inrun 受理（工具回执「已受理」）与 postrun 收拢（EndRun 登记） | 要 |
+| `memory_redpanda_crash.sh` | doc/65 消费者崩溃活体：`kill -9` 正在抽取的引擎 → 重启补投——恰好一次（不重复写）、epoch/attempts 留痕、A→B→A 不被去重吞掉、召回命中 | 要 |
+| `memory_markdown_live.sh` | doc/65 `markdown` 模式活体：**无 broker**，真实写 `USER.md` / 项目 `MEMORY.md`，改口删除下一场读到新快照，`memory_jobs` 全程为零 | 要 |
+| `memory_migrate_live.sh` | doc/65 迁移与双向互切活体：旧结构升级、pipeline↔markdown、失败预检（活 run / pending / failed）、重放幂等。**自己起停引擎**，不打模型、不连 broker | 不要 |
+| `memory_file_race.sh` | doc/65 + doc/71 多副本文件写入竞争：跨进程锁串行、写前版本拒绝、原子替换可见性、崩溃释放锁。**自己起停两台隔离引擎**共库共 workspace | 不要 |
+| `memory_project_delete_live.sh` | doc/65 §3.3 项目删除级联：scope=workspace 的记忆两层都清、该项目 jobs 清掉；scope=user 的行、`USER.md`、运行档案不动 | 要 |
+| `memory_live_lib.sh` | 六个 memory 脚本共用的底座（注册 / 拉帧 / SQL 断言），**source 用，不直接执行** | — |
 | `check-expected.sh` | 守「19v6-04 散文」与「`expected.json`」的用例号集合一致 | — |
 | `harness.py` | 三个脚本共用的底座：HTTP 调用、.env 取密钥、psql 补丁、断言计数 | — |
 | `mcp_fetch_server.py` | doc/52 B3 的活体验收夹具：最小的 stdio MCP server（JSON-RPC 2.0，工具 `fetch_probe(url)`），在租户 MCP 的围栏里 `curl` 一个 URL 并回报 HTTP 码——用来打「租户 MCP 与 bash 同一条 profile、出站开、入站关」。配进租户 `mcp.json` 后由模型经 `tool_search` 激活再调用 | 要 |
@@ -89,6 +96,53 @@ bash scripts/acceptance/check-expected.sh
 | `TAKO_ENGINE_RESTART` | 重启引擎的命令（一行 shell 片段，后台起） |
 | `TAKO_LEASE_WAIT` | 等租约过期的秒数，默认 35（引擎 lease TTL 30s） |
 
+`memory_redpanda_crash.sh` 用同一对 `TAKO_ENGINE_PIDS` / `TAKO_ENGINE_RESTART`（契约相同：RESTART 必须带与被杀实例相同的 `-pg` / `-redis` / `-workspace` / `TAKO_JWT_SECRET` / broker 环境）。
+
+## 记忆活体（doc/65）怎么跑
+
+六个脚本两类起法。公共纪律：注册密码随机生成（脚本里不出现密码字面量）；模型密钥与 broker 凭据只从环境变量读；kill 只打 `TAKO_ENGINE_PIDS` 指定的隔离 PID 或脚本自己起的进程；不调 `/api/dev/reset`。
+
+**自起停类**（脚本自己起停引擎，不用预起；靶子库给空的隔离 PG 库）：
+
+```bash
+# 迁移与双向互切（不打模型、不连 broker；Redis db、引擎端口可在脚本头注给的变量里换）
+TAKO_PG_DSN="host=127.0.0.1 port=5433 dbname=tako_mig sslmode=disable" \
+TAKO_PSQL="$PGBIN/psql" \
+  bash scripts/acceptance/memory_migrate_live.sh
+
+# 多副本文件竞争（两台引擎共库共 workspace）
+TAKO_PG_DSN="host=127.0.0.1 port=5433 dbname=tako_race sslmode=disable" \
+TAKO_PSQL="$PGBIN/psql" \
+  bash scripts/acceptance/memory_file_race.sh
+```
+
+**预起引擎类**（pipeline / markdown / crash / project_delete）：先按「怎么起一个隔离引擎」起一台，加模式与 broker。夹具目录脚本自己 `mkdir -p`（含 tenant/project 路径链），不用手建：
+
+```bash
+cd yk-tako-eino
+set -a; source .env; set +a   # broker 凭据也放 .env——只进环境，不进任何文件
+TAKO_MEMORY_MODE=pipeline \
+TAKO_REDPANDA_BROKERS=<broker地址> TAKO_REDPANDA_USER=<用户> \
+TAKO_REDPANDA_PASSWORD=<密码> TAKO_REDPANDA_MECH=SCRAM-SHA-256 \
+TAKO_JWT_SECRET='dev-only-jwt-secret-change-me-32bytes' \
+  go run ./cmd/yktako -engine 127.0.0.1:8943 \
+    -pg "host=127.0.0.1 port=5433 dbname=tako_mem sslmode=disable" \
+    -redis "redis://127.0.0.1:6390/10" -workspace ../tmp/workspace-mem
+```
+
+```bash
+# pipeline 活体——broker 不可达时明确报「缺 broker，未跑」并退出非零，不静默当通过
+TAKO_BASE=http://127.0.0.1:8943 TAKO_ENV=yk-tako-eino/.env \
+TAKO_PG_DSN="host=127.0.0.1 port=5433 dbname=tako_mem sslmode=disable" \
+TAKO_PSQL="$PGBIN/psql" \
+  bash scripts/acceptance/memory_pipeline_live.sh
+
+# crash 活体——另给 TAKO_ENGINE_PIDS / TAKO_ENGINE_RESTART（见上表）
+
+# markdown 活体——TAKO_MEMORY_MODE=markdown、不带 broker 变量，另必给 TAKO_WS_ROOT（= 引擎 -workspace）
+# project_delete 活体——同 markdown 起法即可（级联在存储层，与模式无关）
+```
+
 ```bash
 TAKO_BASE=http://127.0.0.1:8943 TAKO_ENV=yk-tako-eino/.env \
 TAKO_PG_DSN="host=127.0.0.1 port=5433 dbname=tako_acc sslmode=disable" \
@@ -154,4 +208,5 @@ TAKO_ENGINE_RESTART='cd <仓库根>/yk-tako-eino && nohup go run ./cmd/yktako -e
 - 改了契约字节（端点的请求/响应/帧格式/业务码）→ 跑 `assert_contract.py`，
   并同步 `doc/19-v6/19v6-04-验收-curl.md` 与 `expected.json`。
 - 改了存储形态、游标语义、多租户可见性 → 跑 `spotcheck.sh`。
+- 改了记忆两层（doc/65）的存储、抽取、召回、迁移或模式行为 → 跑对应的 `memory_*.sh`（改契约字节另走第一条）。
 - 只改了模型侧的散文期望 → 也要跑 `check-expected.sh`，确认清单与散文没脱节。

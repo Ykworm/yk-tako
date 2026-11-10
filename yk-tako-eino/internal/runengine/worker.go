@@ -181,7 +181,7 @@ type runCancel struct {
 //
 // mediaSend 是 TAKO_MEDIA_SEND（默认开，字面 off 才关）。关时不挂媒体包壳，模型输入与占位逐字节相同。
 func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, system, workspace, agentsDir string, leaseRenew time.Duration,
-	compactWindow int, modelRef string, maxOutput int, subagentConcurrency, subagentReturnCap int, resolver ModelResolver, counter TokenCounter, mediaSend bool, archiveTTL time.Duration) (*Worker, error) {
+	compactWindow int, modelRef string, maxOutput int, subagentConcurrency, subagentReturnCap int, resolver ModelResolver, counter TokenCounter, mediaSend bool, archiveTTL time.Duration, wake ...MemoryWakeFunc) (*Worker, error) {
 	// file_effect 启动 lint（C5-A4，fileops.go）：F1 起注册表非空（write_file 首条），
 	// lint 从空转变成真检查——此后任何文件工具漏声明 = 启动失败。
 	if err := lintFileEffects(firstPartyFileEffects); err != nil {
@@ -223,14 +223,40 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		return nil, err
 	}
 	pool = append(pool, wrapToolErrors(bash))
-	// 笔记工具入池（M1，notes.go）：文件工具族之后 append——继承整池的子代理天然拿到它；
-	// researcher 走的是 exclude_tools 排除路（doc/26），memory 不在排除项里，仍在它的有效名单。
-	// 写入逻辑全在 writeNote。
-	mem, err := newMemoryTool(store, workspace)
-	if err != nil {
-		return nil, err
+	// 记忆工具入池（memory_dispatch.go / memory_markdown.go / memory_search.go）：
+	// **形状由模式与开关决定**（doc/65 §5.1/§6.2/§6.4）——
+	//   - markdown：同步条目工具（当场改 USER.md / MEMORY.md）；
+	//   - pipeline + Extract=on：**派工**工具（只登记 inrun 任务，后台抽取器与当前已有记忆
+	//     比对后才写）；wake 是登记提交后的叫醒（没起消费者就不传——对账器兜底）；
+	//   - pipeline + Extract=off：**不挂** memory（没有消费者，登记的任务只会永远 pending）。
+	// 都只给 master：普通 subagent 不得继承（agents.go 的 dropMemoryAndSearchTools 剔掉）。
+	if store != nil {
+		if store.markdownMode() {
+			mem, err := newMemoryMarkdownTool(store)
+			if err != nil {
+				return nil, err
+			}
+			pool = append(pool, wrapToolErrors(mem))
+		} else {
+			cfg := store.MemoryConfig()
+			if cfg.Extract {
+				mem, err := newMemoryDispatchTool(store, wake...)
+				if err != nil {
+					return nil, err
+				}
+				pool = append(pool, wrapToolErrors(mem))
+			}
+			// search_memory（doc/65 §4.4）：只在 pipeline+Recall=on 的 master 池出现——
+			// master 主动查历史记忆；每回合的被动召回走 recallIntoCurrentInput（下面）。
+			if cfg.Recall {
+				sm, err := newSearchMemoryTool(store)
+				if err != nil {
+					return nil, err
+				}
+				pool = append(pool, wrapToolErrors(sm))
+			}
+		}
 	}
-	pool = append(pool, wrapToolErrors(mem))
 	// 历史查找工具入池（H1，doc/21）：memory 之后 append——身份从 ctx 的 noteBox 取
 	// （session/run），只读 runlog_entries（工具参数里没有会话号）；H3 起吃 workspace 根
 	// （截断落盘写 <workspace>/.tako/search/）。
@@ -583,7 +609,8 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 			}
 			finishSpan(quotaSpan, qerr)
 			wsCtx, wsSpan := startStep(ctx, "tako.step.workspace")
-			if dir, err := runWorkspace(wsCtx, w, p.TenantID, sessionID); err != nil {
+			// 第二个返回值是项目 id（没挂项目 = 空串）：markdown 记忆的项目文件按它定位。
+			if dir, wid, err := runWorkspace(wsCtx, w, p.TenantID, sessionID); err != nil {
 				wsSpan.SetAttributes(attribute.String("error.type", "workspace_error"))
 				finishSpan(wsSpan, err)
 				log.Printf("workspace %s/%s: %v", sessionID, runID, err)
@@ -593,7 +620,7 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 					attribute.Int64("tako.workspace.max_bytes", maxBytes),
 				)
 				finishSpan(wsSpan, nil)
-				ref := WorkspaceRef{TenantID: p.TenantID, SessionID: sessionID, Root: dir, TenantRoot: tenantStorageRoot(w.workspace, p.TenantID), MaxBytes: maxBytes}
+				ref := WorkspaceRef{TenantID: p.TenantID, SessionID: sessionID, Root: dir, TenantRoot: tenantStorageRoot(w.workspace, p.TenantID), WorkspaceID: wid, MaxBytes: maxBytes}
 				if maxBytes > 0 {
 					tenantID := p.TenantID
 					ref.Reserve = func(adding int) (func(), error) {
@@ -677,6 +704,17 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 	// 写后刷新。write_file 的写前判据靠它（整份覆盖语义 → 必须整体是最新版）。
 	// 键带 agent 名：子代理不借用主代理的「读过」。
 	ctx = withFileBaseline(ctx, newFileBaseline())
+	// 同文件并发写的**写锁提供者**（filelock.go）：生产路径接多副本锁——
+	// PG advisory lock（所有副本共享的一台库 → 跨机器互斥）+ 本机 flock（本机附加保护）。
+	// 取锁顺序固定 PG → flock（反序会成环）。
+	// 挂在 ctx 而不是改工具工厂签名：工具工厂拿不到数据库，走 ctx 与基准表同一套路。
+	// 没有数据库时退化成只有本机 flock（单测与旧调用方）——那就没有跨副本互斥，诚实兜底。
+	if w.store != nil {
+		ctx = WithFileLocker(ctx, newChainFileLocker(
+			newPGFileLocker(w.store.db, 0),
+			newFlockFileLocker(w.workspace),
+		))
+	}
 	// 看板的 run 身份（C1）：一场 run 一块看板，四把工具从 ctx 取 run/session。
 	ctx = withTaskBox(ctx, newTaskBox(sessionID, runID))
 	// 本场用过的技能根（B3，D25）：use_skill 写、bash 的围栏读。子代理拿空盒（agents.go）。
@@ -1222,8 +1260,8 @@ func (w *Worker) recallBlock(ctx context.Context, sessionID SessionID, runID Run
 		log.Printf("memory recall %s/%s: 无命中", sessionID, runID)
 		return ""
 	}
-	log.Printf("memory recall %s/%s: terms=%d memoryHits=%d dialogueHits=%d injected=%d runes",
-		sessionID, runID, res.Terms, res.MemoryHits, res.DialogueHits, res.InjectedRunes)
+	log.Printf("memory recall %s/%s: memoryHits=%d dialogueHits=%d injected=%d runes",
+		sessionID, runID, res.MemoryHits, res.DialogueHits, res.InjectedRunes)
 	return res.Block
 }
 

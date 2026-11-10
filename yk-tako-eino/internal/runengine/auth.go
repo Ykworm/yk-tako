@@ -111,7 +111,7 @@ type devTenantData struct {
 const (
 	codeOK = 0
 	// 码段口径（doc/40 §4）：前两位是模块——11 身份与参数，12 会话与运行，13 配额，
-	// 14 项目与工作区，15 人审与问答。1110xx 参数，1111xx 登录与 token，1112xx 权限，1114xx 冲突，
+	// 14 项目与工作区，15 人审与问答，16 技能与工具，18 记忆模式。1110xx 参数，1111xx 登录与 token，1112xx 权限，1114xx 冲突，
 	// 1119xx 这一模块的内部失败；1120xx 资源缺失，1121xx 会话与运行的冲突；
 	// 1130xx 配额与准入；1140xx 项目，1141xx 项目里的文件；1150xx 人审与问答。
 	codeBadJSON      = 111001
@@ -215,7 +215,9 @@ const (
 	codeToolTooLarge = 116118
 	// 116119：找不到这个工具。
 	codeToolMissing = 116119
-	codeInternal    = 111901
+	// 118001：当前记忆模式不提供这个观测口（doc/65 §6.5：markdown 模式调 items/jobs/recall）。
+	codeMemoryMode = 118001
+	codeInternal   = 111901
 )
 
 var emailPattern = regexp.MustCompile(`^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$`)

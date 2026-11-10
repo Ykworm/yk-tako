@@ -32,7 +32,7 @@
 - 改视觉（配色／字阶／间距／圆角／侧栏三段／手机抽屉／气泡）：`doc/51`。
 - 加技能、改技能目录／加载／依赖／管理面：`doc/52`。
 - 改删除与档案清理（连带删会话、单场删除、保留窗口）：`doc/37`。
-- 改记忆、召回：现行实现 `doc/29`；两层读契约（常驻必见、召回到才见）并表为一张 `memory_items`（`layer` 列分流）的**方案（待点头）**：`doc/65`；想借鉴别家记忆设计（nanoMuse：防重／整理／变更账）：`doc/62`。
+- 改记忆、召回：现行实现 `doc/29`；两种独立模式（`pipeline` = PG 两层 + 抽取代理 + Redpanda；`markdown` = `USER.md` / `MEMORY.md` 同步直写）的**方案（待点头）**：`doc/65`；想借鉴别家记忆设计（nanoMuse：防重／整理／变更账）：`doc/62`。
 - 改崩溃续跑：`doc/30`。
 - 改 Redis 临时键（移除 draft）：`doc/38`。
 - 改流式端点：`doc/31`。
@@ -139,8 +139,8 @@
   - 落点：`auth.go`、`identity_store.go`、`members_store.go`、`tenant_api.go`、`scope.go`、`pgstore.go`
   - 2026-10-21 收口。A0–A6 共 30 拍已落地并 curl 验收，随 `9c21b66` 入库。团队前端不在本篇（doc/36 已落地）；A7 那一档里「旧成功体换信封」已由 [doc/40](40-响应信封统一.md) 于 2026-10-22 落地，**计费、API key、SSO、组织共享、审计导出整批已拍不做**（2026-10-22 用户裁，与运行时关系不大的商业化、合规项，§15；2026-10-23 复核维持）
 
-- **29** [长期记忆与对话召回](29-长期记忆.md) ✅
-  - 落点：`memory.go`、`recall.go`、`dialogue.go`、`worker.go`
+- **29** [长期记忆与对话召回](29-长期记忆.md) ✅（**线一 2026-11-10 起被 [doc/65](65-记忆两层方案.md) 取代；线二 dialogue_chunks 仍现行**）
+  - 落点：线二现行 = `dialogue.go`、`worker.go`；线一旧实现（`recall.go` 的 Go 侧词法召回、PG 轮询抽取循环）已退役
   - A1–B4 全落地；两条加工线共用 runlog。**2026-10-22**：召回块改进「本轮输入」并写回 mh 的 seq=1（runlog 仍纯原话）→ mid-run 折叠不再抹掉它；块带 created time；计入折叠预算。折叠链本身未改
 
 - **30** [崩溃续跑](30-崩溃续跑.md) 🔶
@@ -174,7 +174,7 @@
 - **37** [删除与档案清理](37-删除与档案清理.md) ✅
   - 落点：`pgstore.go`、`product_api.go`、`session_access.go`、`store.go`、`server.go`、`worker.go`、`archive_sweep.go`、`auth.go`、`cmd/yktako/main.go`
   - 2026-10-21 已落地。D1、D2 随 0fd15c5 入库；D3、D4 在 8905 curl 验收后入库。改写 doc/35「删除只删空项目」；单场删除仅属主；清扫器持 `cleaner_state` 租约，`-archive-ttl` 默认 168h，探针 `POST /api/dev/clean-sweep`。`114002` 退役
-  - 2026-11-07 补拍 **D-l**（记忆线随项目连带删清）：删项目时一并清 `notes`（只清 `scope='user'`）/`memory_items`/`dialogue_chunks`/`memory_jobs`。**D-l 尚未施工**，随 [doc/65](65-记忆两层方案.md) 的两层改造一起做；租户归档不动记忆行
+  - **D-l 已落地（2026-11-10 随 [doc/65](65-记忆两层方案.md)）**：按 scope 删除——`pipeline` 清该项目两层 `scope='workspace'` 的 `memory_items` 与相关 `memory_jobs`，保留跨项目 `user` 行；`markdown` 的项目 `MEMORY.md` 随目录删除、用户 `USER.md` 不动；两种模式都清 `dialogue_chunks`，租户归档不动记忆行。代码在 `pgstore.go` 删除事务与 `memory_migrate.go`；活体 `scripts/acceptance/memory_project_delete_live.sh`（9/9）
 
 - **38** [删除 tk:draft 键](38-删除draft键.md) ✅
   - 落点：`redisstore.go`、`store.go`、`server.go`、`worker.go`、`store_test.go`
@@ -287,13 +287,25 @@
 
 - **61** [并发控制设计](61-并发控制设计.md) ✅（2026-11-03，设计说明，无新增代码）
   - 落点：`internal/runengine/{pgstore.go,store.go,redisstore.go,filefp.go,filetools.go}`
-  - 解释「为什么不需要分布式锁」：互斥下沉到存储层原语（唯一索引 + 租约 + 行锁 + flock），核心路径无共享可变状态；含与应用层分布式锁的对比及适用边界
+  - 解释「为什么不需要分布式锁」：互斥下沉到存储层原语（唯一索引 + 租约 + 行锁 + flock），核心路径无共享可变状态；含与应用层分布式锁的对比及适用边界。文件写入的读者完整性、多副本与长任务隔离后续方案见 `doc/71`，不把待点头方案当现状
 
-- **65** [记忆两层方案（一张 `memory_items`，`layer` 列分流两种读契约：常驻必见、召回用到才见；`search_memory` 工具支持 as_of 时点回放与历史链）](65-记忆两层方案.md) ⬜（方案待点头）
-  - 落点：—（未施工）；现行实现见 `internal/runengine/{memory.go,recall.go,notes.go,store.go,pgstore.go}`
-  - 2026-11-07 立项（同日三稿：初稿并表被用户裁定为错；二稿只动召回层，用户追问「你确定」后回填常驻层四处缺口）。两层不并表：常驻层 `notes` 补 id 定位、删除留痕、人的 PATCH/DELETE 入口、`expires_at`；召回层 `memory_items` 加 `quote` / `state` / `superseded_by` / `removed_at` / `conflict_with` / `expires_at` / `pinned` / `source`，补 `PATCH` / `DELETE` 管理面，检索换 pg_search BM25（不引 ES），去重=相似度召回+模型判决+程序裁决；跨层以笔记为准（写侧跳过、读侧过滤、删除留痕抑制旧条目）；失败面按「坏在哪一步」分。待拍 11 项见该篇 §12
-  - 2026-11-07 四稿（用户指示后回填）：① 记忆线删除归属定了——随项目连带删清，[doc/37](37-删除与档案清理.md) 补 D-l（**未施工**）；② 相似度判定整体搬到 PG 的 BM25，`notes` 也建 `paradedb` 索引，Go 侧不再切中文词；③ 证据时间不新增列，由 `source_run_id → runs.finished_at` 推导。22 条重复的计数口径、RAG 关掉时的召回行为、schema 迁移路径三处本轮不写
-  - 2026-11-08 增补（八～十稿，用户拍）：**八稿并表**——`notes` 并入 `memory_items`，`layer` 列（resident|recall）分流、两个视图承载查询、`kind` 全撤、scope 统一三值、写入线判定标准单源（统一条目形状）、管理面一个端点两 tab；**九稿 `search_memory` 工具**——`as_of` 时点回放（借 Zep Graphiti 双时间轴的查询语义：认知期 `created_at`+翻转时刻、现实期 `valid_from` 新增+`expires_at`∪supersede 链）、`include_history` 历史链遍历、纯 SQL 无额外 LLM 调用；**十稿召回时机改每用户回合一次**（含首句，注入块按回合追加）。故事版演示见 [doc/68](68-记忆检索的故事演示.md)（非方案）
+- **65** [记忆双模式（`pipeline` = PG 两层 + 统一抽取代理 + Redpanda；`markdown` = `USER.md` / `MEMORY.md` 同步直写）](65-记忆两层方案.md) ✅（**2026-11-10 落地**）
+  - 落点：`internal/runengine/{memory.go,memory_pipeline.go,memory_queue.go,memory_search.go,memory_store.go,memory_types.go,memory_mode.go,memory_dispatch.go,memory_markdown.go,memory_migrate.go,memory_write.go,memory_text_guard.go,atomicfile.go,notes.go}`、`cmd/yktako/main.go`（`TAKO_MEMORY_MODE`）；`scripts/acceptance/memory_*.sh` 六件活体；演进记录见 `doc/log/2026-11-09-记忆两层方案演进.md`（非方案）
+  - 两种模式是独立运行形态，不是同一管线的两个存储后端。`pipeline`：`memory_items` 两层（resident/recall）+ Redpanda 按会话分区派工 + 消费者三段流抽取（抽条目 → 全量筛候选 → 终局动作）+ 每回合 BM25 召回 + `search_memory` 现实时点回放与历史链；`markdown`：master 用 add/replace/remove/batch 同步维护两份文件，不启动抽取/MQ/BM25
+  - 同批统一：取消记忆管理面与管理 API；inrun 由 master 登记 `targetLayer`，postrun 永不写常驻；证据时间取 `source_run_id + source_seq → runlog_entries.created_at`；项目删除按 `scope='workspace'` 清记忆、保留 `user` 行（[doc/37](37-删除与档案清理.md) D-l 同批落地）
+  - 可靠性与并发：Redpanda 按 session 分区 + consumer group，PG `memory_jobs` 仍是状态真源，DB 前置条件保证 postrun 不越过未完成 inrun，对账器兜住漏投与崩溃；写事务用 workspace advisory lock；候选全量扫描但按 token 分批，不设 150 行上限；写幂等用持久化 job/批次身份，不用正文去重
+  - Markdown 写入只给 master，锁内重读 + 操作式修改 + 同目录临时文件原子 rename（`atomicfile.go`）；多副本用 PG advisory lock 协调。Rakazo 的真实内置存储已核为 PG document + revision，Hermes 才是纯文件参照
+  - 验收：观测口与守卫字节在 `expected.json` 用例 35–38 + 快闸 `TestContractMemoryObserveBytes`；活体六件——pipeline_live 20/20、markdown_live 26/26、migrate_live 42/42、file_race 11/11、project_delete 9/9、redpanda_crash（真 broker kill -9 补投与 A→B→A 不被吞）；[doc/29](29-长期记忆.md) 线一被本篇取代、线二仍现行
+
+- **70** [多 Agent 编排与持久 Task：第一版方案](70-多Agent编排与Task/03-第一版方案.md) ⬜（方案待点头）
+  - 落点：—（未施工）；预计涉及 `internal/runengine/`、`cmd/yktako/`、`web/`、`scripts/acceptance/`；方案集与调研入口见 [doc/70 README](70-多Agent编排与Task/README.md)
+  - 2026-11-09 立项并收束 V1：先落地一件可持久、执行、通知、停止与显式恢复的 Task，再完成「初始 DAG 整组原子创建 → A/B 并行 → 依赖满足后 C 汇总 → 失败阻断与最终单次交付」。V1 固定节点内容、执行者与依赖边；Goal 驱动的动态计划修订留作下一版，不做 Agent 自由群聊或无限共享历史。两篇方案初稿已由 V1 取代，调研继续以 Comma 作持久 Task／幂等／通知参照、Hermes 作依赖／调度参照、Octop 作同伴互调参照。未点头、未施工，不翻 doc/16 #9 的 🔶 状态
+
+- **71** [文件写入竞争：短写入互斥、版本校验、原子替换与长任务隔离](71-文件写入竞争.md) 🔶（**短写入三件套 2026-11-10 落地；长任务 worktree 归 doc/70 未开工**）
+  - 落点：`internal/runengine/{filefp.go,filelock.go,atomicfile.go,filetools.go}`；长任务编排便签归 `doc/70`
+  - 2026-11-09 立项。把锁、版本校验与原子 rename 分到三类故障：写者同时写、依据旧版覆盖、读者看到半截；整文件 `write_file` 保留 run/agent 级读取基准，局部 `edit_file` 与条目 Memory 在锁内按内容操作，不额外背整文件 map
+  - **已落地（2026-11-10）**：目标短写入链 = 锁内校验/操作（PG advisory lock，`filelock.go`）→ 同目录临时文件 → 原子 rename（`atomicfile.go`）→ 刷新基准；读者不排队，写者仍排队。`write_file`／`edit_file` 与 Markdown 记忆文件共用一条写盘路。活体 `memory_file_race.sh`（两台隔离引擎：串行、版本拒绝、原子读、kill -9 释放，11/11）
+  - 参考核查：Kimi 的 ToolAccesses 调度器只覆盖当前工具批次，Tower 用 worktree；Hermes 普通文件确有跨 subagent 的读取版本与同路径锁，但主要是进程内；Rakazo 的 expectedRevision + Serializable 只直接适用于 PG 文档。doc/61 仍是当前机制说明，doc/65 链接本篇消费文件写入原则
 
 ## 2. 历史存档（`doc/archive/`，不作施工面）
 
@@ -316,7 +328,8 @@
 | `doc/` | [62-nanoMuse 记忆设计调研](62-nanoMuse记忆设计调研.md) | 非方案，调研记录 | 2026-11-04 读浙大开源个人 agent nanoMuse（Meta Muse 的开源平替，本地 clone 于 `ref-agent/nanoMuse/`）的记忆模块源码：写时防重／读时检索／闲时整理／全程留账四条机制与对 tako 记忆（doc/29）的借鉴清单；借鉴条目落地须另立方案篇；不作施工面 |
 | `doc/` | [63-参照实现对照：子代理与折叠回查](63-参照实现对照-子代理与折叠回查.md) | 非方案，对照记录 | 2026-11-05 把根 README 里的对照表搬来正文：子代理（规格／回传／续跑／工具权限／嵌套／模型／运行形态）与折叠回查两张表，kimi 侧带代码指针、tako 侧带落点；只作对照阅读，不作施工真源 |
 | `doc/` | [66-诉求对照：场景应用与生产就绪](66-诉求对照-场景应用与生产就绪.md) | 非方案，对照记录 | 2026-11-07 把两组外部诉求（应用侧：Trace／Replay／灰度／成本、高敏决策与人工审核、证据链、任务编排；平台侧：Compose／模型网关／基础设施／Metrics／版本管理／Feature Flag／灰度回滚／成本／Runbook）合到一篇逐条对现状：有 3、半有 3、无 4，并给依赖顺序；原 doc/66 与 doc/67 同日合并于此，不作施工真源 |
-| `doc/` | [68-记忆检索的故事演示](68-记忆检索的故事演示.md) | 非方案，演示读物 | 2026-11-08：doc/65 §7.4 `search_memory` 语义的故事版演示——一场搬家 + 六个问题，覆盖 as_of 现实回放/认知回放、include_history 改口链、removed 删除边界、过期退场；参考脉络 Zep/Graphiti（借查询语义、不抄图谱存储）；不作施工真源 |
+| `doc/` | [68-记忆检索的故事演示](68-记忆检索的故事演示.md) | 非方案，演示读物 | 2026-11-08：doc/65 §4.4 `search_memory` 语义的故事版演示——一场搬家 + 六个问题，覆盖 as_of 现实回放、include_history 改口链、removed 删除边界、过期退场；认知回放只作对比说明，现行工具不开放；参考脉络 Zep/Graphiti（借查询语义、不抄图谱存储）；不作施工真源 |
+| `doc/` | [69-参照实现对照：rakazo 与 octop](69-参照实现对照-rakazo与octop.md) | 非方案，对照记录 | 2026-11-08：读 rakazo（`ref-agent/rakazo/`）与 Octop（`ref-agent/Octop/`）源码的对照——agent 管理（rakazo 的 Bot+Subagent 双形态、octop 的 Expert→Agent→Team 三层）、plugin（rakazo「静态声明不执行代码」vs octop「plugin.yaml+main.py 可执行包」）、skill（三家同构的 SKILL.md）；结论：rakazo 无 expert、octop 有、tako 无 plugin/expert/协作；只作对照阅读，不作施工真源 |
 | `doc/problems/` | [问题与方案库](problems/README.md)（43 条） | 非方案 | 决策档案：每条一个设计选择题——当时遇到什么、桌上有哪些候选、为什么这么裁、代价是什么、今天还成不成立；按模块分组，并在 `doc/53` 各小模块后反链 |
 
 ## 4. `doc/log/` 记录
@@ -335,6 +348,7 @@
 | 2026-10-19 | [多租户运行时现状交接](log/2026-10-19-多租户-handoff.md) | 现状交接 | 多租户全改后代码停在哪 |
 | 2026-11-02 | [GAIA k=5：一个模型，两个 harness](log/2026-11-02-gaia-k5-两臂可靠性对照.md) | 文章 | tako／dsh 两臂 k=5 可靠性对照 |
 | 2026-11-03 | [文档归属重构](log/2026-11-03-文档归属重构/README.md) | 变更记录 | `docs/` 并入 `doc/`、旧线归档、机器闸落地；执行流水见同目录 `tasks.md` |
+| 2026-11-09 | [记忆两层方案演进](log/2026-11-09-记忆两层方案演进.md) | 演进记录 | 2026-11-07～08 的改稿过程；现行双模式方案以 doc/65 为准，本文不作施工真源 |
 
 ## 5. 新增／修改文档的规则
 
@@ -351,4 +365,4 @@
    **动了产品能力的增减或状态翻转，同批还要更新 [doc/16](16-能力复刻总规划.md)**（§2 能力表 + §2c 横切契约 + 头注基线日期）——本索引是目录页，doc/16 是结论页，两个都得更，只更一边总纲的「现状」就是假的。收尾跑 `scripts/check-master-plan.sh`（比对本表 §1 的现行真源编号与 doc/16 的引用，漏引即失败）。
 7. **四类归属**：现行真源（`doc/` 顶层编号文档）、决策档案（`doc/problems/`）、记录（`doc/log/`）、归档（`doc/archive/`）。四者不互相冒充。
    **时效变化不搬家，只改状态**：一篇方案过时了就在头注改状态或标「已取代」；只有被整代取代（旧线、旧引擎代际）才进 `doc/archive/`。
-8. **变更执行台账**：`tmp/<方案名>/todos.md` 验收后**原样**搬进 `doc/log/<YYYY-MM-DD>-<方案名>/tasks.md` 并加状态头，此后冻结；`planning.md` 的结论提炼进同目录 `README.md`；随后删 `tmp/<方案名>/`。`tasks.md` 只记「当时怎么走的」，与 `doc/NN` 冲突时以 `doc/NN` 为准。
+8. **施工包留档**：开工前由主 Agent 写 `tmp/<方案名>/施工包.md` 并交用户确认；开发模型随后一次完成大任务，机器验收后由主 Agent 终审。用户验收后，施工包**原样**搬进 `doc/log/<YYYY-MM-DD>-<方案名>/build.md` 并加状态头，此后冻结；结论提炼进同目录 `README.md`，随后删 `tmp/<方案名>/`。`build.md` 只记「当时怎么施工的」，与 `doc/NN` 冲突时以 `doc/NN` 为准。

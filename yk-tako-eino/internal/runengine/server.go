@@ -173,8 +173,6 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 	r.GET("/api/tenants/:id", authn, s.auth.PathTenantMatch(), s.auth.RequireTenantRole("viewer"), s.getTenant)
 	r.PUT("/api/tenants/:id", authn, s.auth.PathTenantMatch(), s.auth.RequireTenantRole("owner"), s.putTenant)
 	r.DELETE("/api/tenants/:id", authn, s.auth.PathTenantMatch(), s.auth.RequireTenantRole("owner"), s.deleteTenant)
-	ten.GET("/notes", s.auth.RequireTenantRole("viewer"), s.listTenantNotes)
-	ten.POST("/notes", s.auth.RequireTenantRole("admin"), s.postTenantNote)
 	ten.GET("/agents", s.auth.RequireTenantRole("viewer"), s.listAgents)
 	ten.POST("/agents", s.auth.RequireTenantRole("member"), s.createAgent)
 	ten.POST("/agents/import", s.auth.RequireTenantRole("member"), s.importAgents)
@@ -198,9 +196,8 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 	if dev {
 		r.DELETE("/api/dev/reset", s.devReset)
 		r.GET("/api/dev/runs/:runId/journal", s.devJournal)
-		r.GET("/api/dev/notes", authn, s.listDevNotes)
-		r.POST("/api/dev/notes", authn, s.postDevNote)
 		r.POST("/api/dev/memory", authn, s.postDevMemory)
+		r.GET("/api/dev/memory-file", authn, s.getDevMemoryFile)
 		r.POST("/api/dev/workspace/file", authn, s.postDevFile)
 		r.GET("/api/dev/workspace/file", authn, s.getDevFile)
 		r.POST("/api/dev/workspace/bash", authn, s.postDevBash)
@@ -1235,11 +1232,18 @@ func (s *Server) getSessionLog(c *gin.Context) {
 }
 
 // 字段序 = doc/29 §7.2 契约字节序（items 按 created_at DESC, id DESC）。
+//
+// **doc/65 §4.2 的新行结构**：kind/topic 两列已取消，观测口按新字段给。
+// 字段集变了（旧 kind/topic 去掉，新增 layer/scope/state/quote/source）——
+// doc/29 的端点节已标被取代；doc/40 的端点响应表已按新字段集更新。
 type memoryItemResponse struct {
 	ID              string    `json:"id"`
-	Kind            string    `json:"kind"`
-	Topic           string    `json:"topic"`
+	Layer           string    `json:"layer"`
+	Scope           string    `json:"scope"`
+	State           string    `json:"state"`
 	Content         string    `json:"content"`
+	Quote           string    `json:"quote"`
+	Source          string    `json:"source"`
 	SourceSessionID SessionID `json:"sourceSessionId"`
 	SourceRunID     RunID     `json:"sourceRunId"`
 	SourceSeq       int64     `json:"sourceSeq"`
@@ -1247,14 +1251,28 @@ type memoryItemResponse struct {
 }
 
 // getMemoryItems（doc/29 §7.2①）= 记忆列表（管理面 + 抽取验收口）。
-// kind 空 = 全部（含 episode）；limit 默认 50、上限 200（钳制在 ListMemoryItems）。
-// 信封（doc/40 A7-5）：200 {"code":0,"message":"","data":{"items":[…]}}；内层字段序仍按 doc/29 §7.2。
+// layer 空 = 两层都要；state 空 = 只回 active 且未过期，历史必须显式传 state；
+// limit 默认 50、上限 200（钳制在 ListMemoryItems）。
+// 信封（doc/40 A7-5）：200 {"code":0,"message":"","data":{"items":[…]}}。
+//
+// **响应字段集变了**（doc/65 §4.2）：旧 kind/topic 去掉，新增 layer/scope/state/quote/source。
+// doc/29 的端点节已标被取代；doc/40 的端点响应表已按新字段集更新。
 func (s *Server) getMemoryItems(c *gin.Context) {
 	if ok, _ := s.memoryContext(c); !ok {
 		return
 	}
+	if !s.memoryPipelineOnly(c) {
+		return
+	}
+	state := c.Query("state")
+	switch state {
+	case "", MemoryStateActive, MemoryStateSuperseded, MemoryStateRemoved, MemoryStateArchived:
+	default:
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "state 只能是 active、superseded、removed 或 archived", nil)
+		return
+	}
 	limit, _ := strconv.Atoi(c.Query("limit"))
-	items, err := s.store.ListMemoryItems(c.Request.Context(), c.Query("kind"), limit)
+	items, err := s.store.ListMemoryItems(c.Request.Context(), c.Query("layer"), state, limit)
 	if err != nil {
 		internal(c, err)
 		return
@@ -1262,7 +1280,8 @@ func (s *Server) getMemoryItems(c *gin.Context) {
 	out := make([]memoryItemResponse, 0, len(items))
 	for _, it := range items {
 		out = append(out, memoryItemResponse{
-			ID: it.ID, Kind: it.Kind, Topic: it.Topic, Content: it.Content,
+			ID: it.ID, Layer: it.Layer, Scope: it.Scope, State: it.State,
+			Content: it.Content, Quote: it.Quote, Source: it.Source,
 			SourceSessionID: it.SourceSessionID, SourceRunID: it.SourceRunID,
 			SourceSeq: it.SourceSeq, CreatedAt: it.CreatedAt,
 		})
@@ -1270,21 +1289,44 @@ func (s *Server) getMemoryItems(c *gin.Context) {
 	writeEnvelope(c, http.StatusOK, codeOK, "", gin.H{"items": out})
 }
 
+// memoryPipelineOnly 是 items/jobs/recall 三个 pipeline 观测口的模式守卫（doc/65 §6.5）：
+// markdown 模式统一回 409/118001，不返回空数组假装文件里没有记忆。
+// dialogue 观测口两种模式都保留，不过这道守卫。
+func (s *Server) memoryPipelineOnly(c *gin.Context) bool {
+	if s.store.markdownMode() {
+		writeEnvelope(c, http.StatusConflict, codeMemoryMode, ErrMemoryModeUnsupported.Error(), nil)
+		return false
+	}
+	return true
+}
+
 // 字段序 = doc/29 §7.2② 契约字节序。
+//
+// **响应字段集变了**（doc/65 §4.5 的新 memory_jobs）：新增 kind/targetLayer/leaseUntil/
+// claimEpoch/nextAttemptAt。字段序由 TestContractMemoryObserveBytes 与
+// expected.json 用例 37 钉住。
 type memoryJobResponse struct {
-	ID        string    `json:"id"`
-	RunID     RunID     `json:"runId"`
-	Status    string    `json:"status"`
-	Attempts  int       `json:"attempts"`
-	LastError string    `json:"lastError"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	ID            string     `json:"id"`
+	RunID         RunID      `json:"runId"`
+	Kind          string     `json:"kind"`
+	TargetLayer   string     `json:"targetLayer"`
+	Status        string     `json:"status"`
+	Attempts      int        `json:"attempts"`
+	ClaimEpoch    int64      `json:"claimEpoch"`
+	LeaseUntil    *time.Time `json:"leaseUntil"`
+	NextAttemptAt time.Time  `json:"nextAttemptAt"`
+	LastError     string     `json:"lastError"`
+	CreatedAt     time.Time  `json:"createdAt"`
+	UpdatedAt     time.Time  `json:"updatedAt"`
 }
 
 // getMemoryJobs（doc/29 §7.2②）= 抽取任务状态（线一观测口）；runId 空 = 最近 20 条。
 // 信封（doc/40 A7-5）：200 {"code":0,"message":"","data":{"jobs":[…]}}。
 func (s *Server) getMemoryJobs(c *gin.Context) {
 	if ok, _ := s.memoryContext(c); !ok {
+		return
+	}
+	if !s.memoryPipelineOnly(c) {
 		return
 	}
 	jobs, err := s.store.ListMemoryJobs(c.Request.Context(), RunID(c.Query("runId")))
@@ -1294,8 +1336,14 @@ func (s *Server) getMemoryJobs(c *gin.Context) {
 	}
 	out := make([]memoryJobResponse, 0, len(jobs))
 	for _, j := range jobs {
+		targetLayer := ""
+		if j.TargetLayer != nil {
+			targetLayer = *j.TargetLayer
+		}
 		out = append(out, memoryJobResponse{
-			ID: j.ID, RunID: j.RunID, Status: j.Status, Attempts: j.Attempts,
+			ID: j.ID, RunID: j.RunID, Kind: j.Kind, TargetLayer: targetLayer,
+			Status: j.Status, Attempts: j.Attempts, ClaimEpoch: j.ClaimEpoch,
+			LeaseUntil: j.LeaseUntil, NextAttemptAt: j.NextAttemptAt,
 			LastError: j.LastError, CreatedAt: j.CreatedAt, UpdatedAt: j.UpdatedAt,
 		})
 	}
@@ -1339,6 +1387,9 @@ func (s *Server) getMemoryDialogue(c *gin.Context) {
 // q 空是 400 {"code":111001,"message":"请求格式不对","data":null}。
 func (s *Server) getMemoryRecall(c *gin.Context) {
 	if ok, _ := s.memoryContext(c); !ok {
+		return
+	}
+	if !s.memoryPipelineOnly(c) {
 		return
 	}
 	q := strings.TrimSpace(c.Query("q"))

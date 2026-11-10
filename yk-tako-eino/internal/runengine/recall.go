@@ -1,6 +1,10 @@
-// 本文件是两线共用的召回出口（doc/29 §6）：词法切词、线一候选查询、块渲染。
+// 本文件是两线共用的召回出口（doc/29 §6 / doc/65 §4.4）：线一候选查询、块渲染。
 // 注入（Worker.run）与预览端点（GET /api/memory/recall）调同一个 Store.Recall——
 // 预览显示的就是模型实际会看到的东西（开关也同一份）。
+//
+// 线一在 C3 起走 **BM25**（memory_search.go 的 bm25MemoryRows）：query 整句交给
+// pg_search（chinese_lindera 分词在扩展内做），Go 侧零切词；排序 = score、证据时间、id。
+// 旧实现（Go 切词 + ILIKE + 命中词数排序）已退役。
 package runengine
 
 import (
@@ -8,7 +12,6 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"yk-tako-eino/internal/observability"
@@ -17,9 +20,8 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// 线一召回的上限（doc/29 §8，数值写死不是配置）。
+// 线一召回的上限（doc/65 §4.4，数值写死不是配置）。
 const (
-	memoryRecallTermsMax   = 12 // 检索词上限（按原文出现先后截断）
 	memoryRecallCandidates = 20 // SQL 候选上限
 	memoryRecallItemsMax   = 5  // 注入条目上限
 	memoryRecallRuneCap    = 600
@@ -27,32 +29,27 @@ const (
 )
 
 // RecallResult 是两线召回的合并产物：Block 就是追加到本轮 user 消息末尾的原文。
-// Terms 只给日志用（预览端点不输出）。
 type RecallResult struct {
 	Block         string
 	MemoryHits    int
 	DialogueHits  int
 	InjectedRunes int
-	Terms         int
 }
 
-// Recall 是注入与预览的唯一实现（doc/29 §6）：线一按开关与词表查记忆，线二按开关用
+// Recall 是注入与预览的唯一实现（doc/29 §6）：线一按开关与 BM25 查记忆，线二按开关用
 // 用户原文走 pg_search。两线都无命中时 Block 为空串——模型输入与没有记忆功能时逐字节相同。
 func (s *Store) Recall(ctx context.Context, query string) (res RecallResult, err error) {
 	ctx, span := startStep(ctx, "tako.step.recall")
 	defer func() {
 		span.SetAttributes(
-			attribute.Int("tako.recall.terms", res.Terms),
 			attribute.Int("memory_hits", res.MemoryHits),
 			attribute.Int("dialogue_hits", res.DialogueHits),
 			attribute.Int("injected_runes", res.InjectedRunes),
 		)
 		finishSpan(span, err)
 	}()
-	terms := recallTerms(query)
-	res = RecallResult{Terms: len(terms)}
 	var blocks []string
-	if s.memoryCfg.Recall && len(terms) > 0 {
+	if s.memoryCfg.Recall && strings.TrimSpace(query) != "" {
 		lineCtx, lineSpan := observability.Tracer().Start(ctx, "search_memory", trace.WithSpanKind(trace.SpanKindInternal))
 		lineSpan.SetAttributes(
 			attribute.String(attrOperation, "search_memory"),
@@ -60,7 +57,7 @@ func (s *Store) Recall(ctx context.Context, query string) (res RecallResult, err
 			attribute.Int("gen_ai.memory.record.count", 0),
 		)
 		observability.SetTextJSON(lineSpan, "gen_ai.memory.query.text", query)
-		items, merr := s.recallMemoryItems(lineCtx, terms)
+		items, merr := s.recallMemoryItems(lineCtx, query)
 		if merr != nil {
 			finishSpan(lineSpan, merr)
 			return res, merr
@@ -105,123 +102,23 @@ func (s *Store) Recall(ctx context.Context, query string) (res RecallResult, err
 	return res, nil
 }
 
-// recallTerms 是机械的两段切词（doc/29 §6.1）：英文/数字连续串（长度 ≥2，转小写）+ 中文
-// 连续汉字串切 2-gram（单字串保留单字）。不引分词库；去重后按出现先后取前 12 个。
-func recallTerms(q string) []string {
-	terms := make([]string, 0, memoryRecallTermsMax)
-	seen := map[string]bool{}
-	add := func(t string) bool {
-		t = strings.ToLower(t)
-		if t == "" || seen[t] {
-			return false
-		}
-		seen[t] = true
-		terms = append(terms, t)
-		return true
-	}
-	isWord := func(r rune) bool {
-		return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' ||
-			r >= '0' && r <= '9' || r == '_' || r == '.' || r == '-'
-	}
-	runes := []rune(q)
-	for i := 0; i < len(runes) && len(terms) < memoryRecallTermsMax; {
-		r := runes[i]
-		switch {
-		case isWord(r):
-			j := i
-			for j < len(runes) && isWord(runes[j]) {
-				j++
-			}
-			if j-i >= 2 {
-				add(string(runes[i:j]))
-			}
-			i = j
-		case unicode.Is(unicode.Han, r):
-			j := i
-			for j < len(runes) && unicode.Is(unicode.Han, runes[j]) {
-				j++
-			}
-			if j-i == 1 {
-				add(string(runes[i:j]))
-			} else {
-				for k := i; k < j-1 && len(terms) < memoryRecallTermsMax; k++ {
-					add(string(runes[k : k+2]))
-				}
-			}
-			i = j
-		default:
-			i++
-		}
-	}
-	return terms
-}
-
-// memoryCandidate 是候选行（hits = 命中词数，只用于排序，不透出）。
+// memoryCandidate 是注入候选行（BM25 查询的产物，hits 语义已退役——排序在 SQL 里按 score）。
 type memoryCandidate struct {
 	ID        string
-	Kind      string
-	Topic     string
 	Content   string
 	CreatedAt time.Time
-	Hits      int
 }
 
-// recallMemoryItems 走 doc/29 §6.1 的 OR 宽召回：命中词数降序 → kind 优先级（preference
-// 0 / fact 1 / decision 2）→ created_at 降序，取 20 条；再在 Go 侧同 topic 留最新、取前 5。
-func (s *Store) recallMemoryItems(ctx context.Context, terms []string) ([]memoryCandidate, error) {
-	patterns := make([]string, len(terms))
-	for i, t := range terms {
-		patterns[i] = "%" + escapeLike(t) + "%"
-	}
-	var hits strings.Builder
-	hits.WriteString("(")
-	or := make([]string, len(terms))
-	for i := range terms {
-		if i > 0 {
-			hits.WriteString(" + ")
-		}
-		hits.WriteString(`CASE WHEN content ILIKE ? ESCAPE '\' THEN 1 ELSE 0 END`)
-		or[i] = `content ILIKE ? ESCAPE '\'`
-	}
-	hits.WriteString(")")
-	tenantID, workspace, userSQL, userArg := memoryRecallFilter(ctx, s.memoryCfg)
-	query := `SELECT id, kind, topic, content, created_at, ` + hits.String() + ` AS hits
-  FROM memory_items
- WHERE tenant_id = ? AND workspace = ?` + userSQL + `
-   AND kind IN ('fact', 'preference', 'decision')
-   AND (` + strings.Join(or, " OR ") + `)
- ORDER BY hits DESC,
-          CASE kind WHEN 'preference' THEN 0 WHEN 'fact' THEN 1 ELSE 2 END,
-          created_at DESC, id DESC
- LIMIT ?`
-	args := make([]any, 0, len(terms)*2+4)
-	for _, p := range patterns {
-		args = append(args, p)
-	}
-	args = append(args, tenantID, workspace)
-	args = append(args, userArg...)
-	for _, p := range patterns {
-		args = append(args, p)
-	}
-	args = append(args, memoryRecallCandidates)
-	var rows []memoryCandidate
-	if err := s.db.WithContext(ctx).Raw(query, args...).Scan(&rows).Error; err != nil {
+// recallMemoryItems 走 BM25 召回（doc/65 §4.4；查询本体在 memory_search.go）：
+// query 整句交给 paradedb.match，取 20 条候选，再取前 5。
+func (s *Store) recallMemoryItems(ctx context.Context, query string) ([]memoryCandidate, error) {
+	rows, err := s.bm25MemoryRows(ctx, query, memoryRecallCandidates, memoryBM25Active, time.Time{})
+	if err != nil {
 		return nil, err
-	}
-	// 同 topic 只留最新一条（created_at 最大），再保持 SQL 的候选顺序取前 5。
-	latest := map[string]memoryCandidate{}
-	for _, r := range rows {
-		if cur, ok := latest[r.Topic]; !ok || r.CreatedAt.After(cur.CreatedAt) ||
-			(r.CreatedAt.Equal(cur.CreatedAt) && r.ID > cur.ID) {
-			latest[r.Topic] = r
-		}
 	}
 	out := make([]memoryCandidate, 0, memoryRecallItemsMax)
 	for _, r := range rows {
-		if latest[r.Topic].ID != r.ID {
-			continue
-		}
-		out = append(out, r)
+		out = append(out, memoryCandidate{ID: r.ID, Content: r.Content, CreatedAt: r.CreatedAt})
 		if len(out) >= memoryRecallItemsMax {
 			break
 		}
@@ -229,8 +126,10 @@ func (s *Store) recallMemoryItems(ctx context.Context, terms []string) ([]memory
 	return out, nil
 }
 
-// memoryRecallFilter 决定召回的租户和人。没有身份时沿用启动配置（单测的 default 分区）。
-// 有身份时按这个人过滤；管理员 scope=tenant 只按租户，能看到本工作区全员。
+// memoryRecallFilter 决定线二召回（dialogue_chunks）的租户和人。没有身份时沿用启动配置
+// （单测的 default 分区）。有身份时按这个人过滤；管理员 scope=tenant 只按租户，
+// 能看到本工作区全员。线一（memory_items）的可见性在 memory_search.go，两线口径本就不同：
+// 对话原文块跟着工作区走，记忆行跟着人与项目走。
 func memoryRecallFilter(ctx context.Context, cfg MemoryConfig) (tenantID, workspace, userSQL string, userArg []any) {
 	tenantID, workspace = cfg.TenantID, cfg.Workspace
 	sc := scopeFrom(ctx)
@@ -242,11 +141,6 @@ func memoryRecallFilter(ctx context.Context, cfg MemoryConfig) (tenantID, worksp
 		return tenantID, workspace, "", nil
 	}
 	return tenantID, workspace, " AND user_id = ?", []any{sc.UserID}
-}
-
-// escapeLike 转义 ILIKE 的通配符：词表允许 `_`（read_media_file），不转义会变成单字符通配。
-func escapeLike(s string) string {
-	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
 }
 
 // escapeRecallHTML 是两线共用的注入防线（doc/29 §6.4）：内容里的 & < > 一律转义，
@@ -271,7 +165,7 @@ func renderMemoryBlock(items []memoryCandidate) (string, int) {
 	b.WriteString(header)
 	n := 0
 	for _, it := range items {
-		line := "- [" + it.Kind + "] " + memoryItemDate(it.CreatedAt) + " " + escapeRecallHTML(it.Content) + "\n"
+		line := "- " + memoryItemDate(it.CreatedAt) + " " + escapeRecallHTML(it.Content) + "\n"
 		lineRunes := utf8.RuneCountInString(line)
 		if total+lineRunes > memoryRecallRuneCap {
 			break
