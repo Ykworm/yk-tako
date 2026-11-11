@@ -30,6 +30,7 @@ import {
 } from './api'
 import { authFetch } from './auth'
 import ConfirmDialog from './ConfirmDialog.vue'
+import NotificationRecovery from './NotificationRecovery.vue'
 import { onMutation } from './mutation'
 
 const props = defineProps<{
@@ -39,8 +40,12 @@ const props = defineProps<{
   focusTaskId?: string
   focusOrchestrationId?: string
   focusQuestionId?: string
+  // doc/73 §7.2：交付失败处理项带着通知 id，打开恢复面板（重试、结果定位、attempt 历史）。
+  focusNotificationId?: string
   focusNonce?: number
 }>()
+
+const emit = defineEmits<{ openSession: [sessionId: string] }>()
 
 const phase = ref<'loading' | 'ready' | 'error'>('loading')
 const banner = ref('')
@@ -60,6 +65,8 @@ const orch = ref<OrchestrationView | null>(null)
 const revisions = ref<PlanRevisionRow[]>([])
 const revisionsLoading = ref(false)
 const planBusy = ref(false)
+// 恢复面板内联在列表上方（doc/73 §7.2）：不把完整问题或 DAG 塞进左侧处理项。
+const activeNotificationId = ref('')
 
 // Task 问题区（doc/72 §5）：pending 按 createdAt,id 的 FIFO 排，第一张可答；
 // answered／stale 只读展示。问题正文行是 Task 当前 run 的 run_questions 行。
@@ -429,6 +436,12 @@ const DELIVERY_LABEL: Record<string, string> = {
   delivered: '已交付',
   failed: '交付失败',
 }
+// 交付失败的机器原因（doc/73 §4.5）：展示给人读句子，原码不进主文案。
+const DELIVERY_ERR_LABEL: Record<string, string> = {
+  delivery_run_error: '交付执行出错',
+  delivery_stopped: '交付被停止',
+  artifact_invalid: '结果产物已不可读取',
+}
 
 function fmtWhen(iso: string | null): string {
   if (!iso) return '—'
@@ -457,6 +470,9 @@ async function applyFocus() {
   if (wid && wid !== workspaceId.value && workspaces.value.some((w) => w.id === wid)) {
     workspaceId.value = wid
   }
+  // 通知恢复面板与自动打开的组详情可以同时存在：失败通知既要在组里看交付状态，
+  // 也要在面板里看结果定位与重试。新的定位没有通知 id 时顺手关掉旧面板。
+  activeNotificationId.value = props.focusNotificationId ?? ''
   if (props.focusOrchestrationId) {
     await openOrch(props.focusOrchestrationId)
     return
@@ -472,6 +488,12 @@ async function applyFocus() {
     }
   }
   await openDetail(row, props.focusQuestionId ?? '')
+}
+
+// 重试成功／状态被别的入口推进：列表与组详情都从服务端重拉，不在本地改状态。
+async function onNotificationChanged() {
+  await loadTasks()
+  if (orch.value) await reloadOrch(orch.value.orchestration.orchestrationId)
 }
 
 watch(
@@ -523,6 +545,14 @@ onBeforeUnmount(() => {
     <p v-if="banner" class="banner error" role="alert">{{ banner }}</p>
     <p v-if="notice" class="banner ok" role="status">{{ notice }}</p>
 
+    <NotificationRecovery
+      v-if="activeNotificationId"
+      :notification-id="activeNotificationId"
+      @close="activeNotificationId = ''"
+      @open-session="emit('openSession', $event)"
+      @changed="onNotificationChanged"
+    />
+
     <section class="card">
       <div class="list-head">
         <h3>任务 <span class="count">{{ tasks.length }}</span></h3>
@@ -568,6 +598,11 @@ onBeforeUnmount(() => {
                   <span class="tag" :class="orch.orchestration.status">{{ ORCH_STATUS_LABEL[orch.orchestration.status] ?? orch.orchestration.status }}</span>
                   <template v-if="orch.orchestration.deliveryStatus">
                     · 交付：<span class="tag" :class="`d-${orch.orchestration.deliveryStatus}`">{{ DELIVERY_LABEL[orch.orchestration.deliveryStatus] }}</span>
+                    <template v-if="orch.orchestration.deliveryErrorCode">
+                      <span class="delivery-err" data-testid="orch-delivery-error">
+                        （{{ DELIVERY_ERR_LABEL[orch.orchestration.deliveryErrorCode] ?? orch.orchestration.deliveryErrorCode }}）
+                      </span>
+                    </template>
                   </template>
                   <span class="orch-rev"> · 计划 v{{ orch.orchestration.planRevision }}</span>
                   <span v-if="orch.orchestration.planHold" class="tag hold" data-testid="orch-plan-hold">计划待决策</span>
@@ -908,6 +943,7 @@ h4 { margin: 0 0 0.35rem; font-size: var(--text-sm); font-weight: 600; }
 }
 .task-key { font-weight: 600; }
 .task-agent { color: var(--muted); font-size: var(--text-xs); }
+.delivery-err { color: #b91c1c; font-size: var(--text-xs); }
 .task-desc {
   display: block;
   margin-top: 0.25rem;

@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
@@ -801,6 +802,69 @@ func TestAgentTaskNotificationBusyReceiver(t *testing.T) {
 	_ = launch.RunID
 }
 
+// TestAgentTaskNotificationExpiredReceiverRunReclaimed 钉住 2026-11-11 活体抓到的永久重试：
+// 来源会话上挂着一场 kill -9 留下的活行（status='running'、租约已过）时，忙检查按租约放行，
+// 但 one_live_run_per_session 只认 status——认领的 INSERT 撞唯一索引，每轮对账都失败、永不收敛。
+// 认领前必须像 AcquireRun 一样先把过期行翻 error 并删账本，然后才能铸协调 run。
+func TestAgentTaskNotificationExpiredReceiverRunReclaimed(t *testing.T) {
+	s := newTestStore(t, testLease, testTTL)
+	wsID, sessID := seedTaskEnv(t, s, "researcher")
+	ctx := context.Background()
+	resp, err := s.CreateAgentTask(ctx, testOwner, CreateTaskCommand{
+		IdempotencyKey: "k1", WorkspaceID: wsID, SourceSessionID: sessID, Content: "交付一件", Agent: "researcher",
+	}, planEnv{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := claimOne(t, s, resp.OrchestrationID)
+	submitOK(t, s, c.TaskID, c.RunID, c.Epoch)
+	setRunStatus(t, s, c.RunID, "complete")
+	if err := s.ReconcileRun(ctx, c.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AdvanceOrchestrations(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var notif AgentNotification
+	if err := s.db.Where("orchestration_id = ? AND kind = ?", resp.OrchestrationID, notifKindOrchFinished).
+		Take(&notif).Error; err != nil {
+		t.Fatalf("整组完成通知缺失: %v", err)
+	}
+
+	// 崩溃残留：租约已过的活行 + 它的在途账本。
+	deadRun := "r_dead_" + notif.ID[:8]
+	if err := s.db.Exec(`INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at)
+		VALUES (?, ?, 'running', 1, now() - make_interval(secs => 120), now())`, deadRun, sessID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Exec(`INSERT INTO run_journal (run_id, epoch, role, text, created_at)
+		VALUES (?, 1, 'user', '半截', now())`, deadRun).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	ts := &TaskScheduler{store: s}
+	launch := ts.claimNotification(ctx, notif.ID)
+	if launch == nil {
+		t.Fatalf("过期活行没有挡住认领")
+	}
+	if st, _ := notifStatus(t, s, notif.ID); st != notifStatusClaimed {
+		t.Fatalf("认领后通知状态 = %s, want claimed", st)
+	}
+	var deadStatus string
+	if err := s.db.Raw(`SELECT status FROM runs WHERE id = ?`, deadRun).Scan(&deadStatus).Error; err != nil {
+		t.Fatal(err)
+	}
+	if deadStatus != "error" {
+		t.Fatalf("过期活行状态 = %s, want error", deadStatus)
+	}
+	if got := s.count(t, &RunJournal{}, "run_id = ?", deadRun); got != 0 {
+		t.Fatalf("过期活行的账本没删，剩 %d 行", got)
+	}
+	if got := s.count(t, &Run{}, "session_id = ? AND status = 'running'", sessID); got != 1 {
+		t.Fatalf("来源会话上的活 run = %d, want 1（协调 run）", got)
+	}
+}
+
 // TestAgentTaskNotificationBusyNoStarvation 钉住消费候选的选择：来源会话忙的通知留在 pending，
 // 但不占本轮名额——否则积压的忙通知恒占前 8 条，别的会话的交付永远排不到（2026-11-11 活体抓过：
 // 一个挂起会话的两条旧通知把 DAG 交付饿死在 pending）。
@@ -1302,26 +1366,42 @@ func TestAgentTaskResumeNotifiesInterrupted(t *testing.T) {
 	}
 }
 
-// TestDropDeliveryNoTools 钉住协调 run 的工具面（doc/70 §6.3 用到交付角色）：
-// 2026-11-10 崩溃活体抓过——task_interrupted 交付里模型顺手 ask_user「你希望我怎么处理？」，
-// run 挂起等人、来源会话一直忙，orchestration_finished 永远认领不了。交付必须确定性终结：
-// 等人与再编排五件不进交付池，普通工具原样保留。
-func TestDropDeliveryNoTools(t *testing.T) {
+// TestKeepDeliveryReadOnlyTools 钉住协调 run 的工具面（doc/73 §10）：交付与说明只读。
+// 白名单而不是黑名单：bash／写盘／等人／再编排都默认不可用；未来新工具也默认不可用。
+func TestKeepDeliveryReadOnlyTools(t *testing.T) {
 	in := []tool.BaseTool{
 		&fakeInvokableTool{info: &schema.ToolInfo{Name: "ask_user"}},
+		&fakeInvokableTool{info: &schema.ToolInfo{Name: "bash"}},
+		&fakeInvokableTool{info: &schema.ToolInfo{Name: "write_file"}},
 		&fakeInvokableTool{info: &schema.ToolInfo{Name: "enter_plan_mode"}},
 		&fakeInvokableTool{info: &schema.ToolInfo{Name: "submit_plan"}},
 		&fakeInvokableTool{info: &schema.ToolInfo{Name: "delegate_task"}},
 		&fakeInvokableTool{info: &schema.ToolInfo{Name: "create_orchestration"}},
 		&fakeInvokableTool{info: &schema.ToolInfo{Name: "read_file"}},
+		&fakeInvokableTool{info: &schema.ToolInfo{Name: "read_text_file"}},
+		&fakeInvokableTool{info: &schema.ToolInfo{Name: "list_directory"}},
 	}
-	out := dropDeliveryNoTools(context.Background(), in)
-	if len(out) != 1 {
-		t.Fatalf("交付池剩 %d 件, want 1（只留 read_file）", len(out))
+	out := keepDeliveryReadOnlyTools(context.Background(), in)
+	if len(out) != 3 {
+		t.Fatalf("交付池剩 %d 件, want 3（三把只读工具）", len(out))
 	}
-	info, err := out[0].Info(context.Background())
-	if err != nil || info.Name != "read_file" {
-		t.Fatalf("留下的工具 = %v/%v, want read_file", info, err)
+	kept := map[string]bool{}
+	for _, x := range out {
+		info, err := x.Info(context.Background())
+		if err != nil {
+			t.Fatalf("Info: %v", err)
+		}
+		kept[info.Name] = true
+	}
+	for _, want := range []string{"read_file", "read_text_file", "list_directory"} {
+		if !kept[want] {
+			t.Fatalf("交付池漏了 %q：%v", want, kept)
+		}
+	}
+	for _, denied := range []string{"ask_user", "bash", "write_file", "delegate_task"} {
+		if kept[denied] {
+			t.Fatalf("交付池留下了 %q：%v", denied, kept)
+		}
 	}
 }
 
@@ -1378,7 +1458,8 @@ func TestAgentTaskInterruptedDeliveryConsumed(t *testing.T) {
 		t.Fatalf("重复对账多出了行 = %d, want 1", got)
 	}
 
-	// error 的交付 run：通知留 claimed（run 显式恢复后收口），组交付状态不动。
+	// error 的交付 run：通知 claimed→failed（机器原因 delivery_run_error），只等用户显式
+	// 重新处理；非整组通知不碰组交付状态，所以组没有 delivery_run_id 可写。
 	n2 := mkNotif("e1")
 	l2 := ts.claimNotification(ctx, n2)
 	if l2 == nil {
@@ -1388,7 +1469,65 @@ func TestAgentTaskInterruptedDeliveryConsumed(t *testing.T) {
 	if err := s.ReconcileDeliveryRun(ctx, l2.RunID); err != nil {
 		t.Fatal(err)
 	}
-	if st, _ := notifStatus(t, s, n2); st != notifStatusClaimed {
-		t.Fatalf("error 后通知 = %s, want claimed（留给显式恢复）", st)
+	if st, _ := notifStatus(t, s, n2); st != notifStatusFailed {
+		t.Fatalf("error 后通知 = %s, want failed（留给用户显式重试）", st)
 	}
+	if code := notifConsumeCode(t, s, n2); code != deliveryErrRunError {
+		t.Fatalf("error 后 consume_error_code = %q, want %q", code, deliveryErrRunError)
+	}
+	var g AgentOrchestration
+	if err := s.db.Where("id = ?", resp.OrchestrationID).Take(&g).Error; err != nil {
+		t.Fatal(err)
+	}
+	if g.DeliveryStatus != "" || g.DeliveryRunID != "" {
+		t.Fatalf("非整组通知改了组交付：%s/%s", g.DeliveryStatus, g.DeliveryRunID)
+	}
+	// 重复对账幂等：仍是一行 failed，不重复写 failed_at。
+	firstFailed := notifFailedAt(t, s, n2)
+	if err := s.ReconcileDeliveryRun(ctx, l2.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := notifStatus(t, s, n2); st != notifStatusFailed {
+		t.Fatalf("重复对账后通知 = %s, want failed", st)
+	}
+	if again := notifFailedAt(t, s, n2); !again.Equal(firstFailed) {
+		t.Fatalf("重复对账改写了 failed_at：%v → %v", firstFailed, again)
+	}
+
+	// stopped 的交付 run：同样是 failed + delivery_stopped。
+	n3 := mkNotif("s1")
+	l3 := ts.claimNotification(ctx, n3)
+	if l3 == nil {
+		t.Fatalf("第三条认领失败")
+	}
+	setRunStatus(t, s, l3.RunID, "stopped")
+	if err := s.ReconcileDeliveryRun(ctx, l3.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := notifStatus(t, s, n3); st != notifStatusFailed {
+		t.Fatalf("stopped 后通知 = %s, want failed", st)
+	}
+	if code := notifConsumeCode(t, s, n3); code != deliveryErrStopped {
+		t.Fatalf("stopped 后 consume_error_code = %q, want %q", code, deliveryErrStopped)
+	}
+}
+
+func notifConsumeCode(t *testing.T, s *Store, id string) string {
+	t.Helper()
+	var code string
+	if err := s.db.Raw(`SELECT consume_error_code FROM agent_notifications WHERE id = ?`, id).
+		Scan(&code).Error; err != nil {
+		t.Fatalf("read consume_error_code: %v", err)
+	}
+	return code
+}
+
+func notifFailedAt(t *testing.T, s *Store, id string) time.Time {
+	t.Helper()
+	var at time.Time
+	if err := s.db.Raw(`SELECT failed_at FROM agent_notifications WHERE id = ?`, id).
+		Scan(&at).Error; err != nil {
+		t.Fatalf("read failed_at: %v", err)
+	}
+	return at
 }

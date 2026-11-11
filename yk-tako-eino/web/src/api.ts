@@ -657,6 +657,9 @@ export type OrchestrationBody = {
   planHold: boolean
   deliveryStatus: string
   deliveryRunId: string
+  // doc/73 §4.4：交付失败的机器原因（delivery_run_error / delivery_stopped /
+  // artifact_invalid）；无失败时为空串。
+  deliveryErrorCode: string
   createdAt: string
   finishedAt: string | null
   deliveredAt: string | null
@@ -767,6 +770,8 @@ export type AttentionItem = {
   count: number
   questionId: string
   runId: string
+  // doc/73 §4.4：这一行对应的协调通知；没有对应通知时为空串。前端据此调用 retry。
+  notificationId: string
   status: string
   updatedAt: string
 }
@@ -811,6 +816,69 @@ export function listTaskQuestions(taskId: string, status?: string): Promise<Task
 export function getTaskAttention(workspaceId: string): Promise<{ items: AttentionItem[] }> {
   return request<{ items: AttentionItem[] }>(
     `/api/workspaces/${encodeURIComponent(workspaceId)}/task-attention`,
+  )
+}
+
+// —— 协调通知的恢复面（doc/73）——
+export const CODE_NOTIFICATION_MISSING = 117003 // 找不到这条通知（不存在／不可见／跨租户／来源会话已删除）
+export const CODE_NOTIFICATION_NOT_RETRYABLE = 117109 // 这条通知现在不能重新处理
+export const CODE_ARTIFACT_INVALID = 117110 // 结果产物已不可读取
+
+// 一次处理尝试：同一通知先后由哪些 run 处理。status 现读自 runs，与 resume 无关；
+// 同 run 的崩溃续跑只增 epoch，不增 attempt。
+export type NotificationAttempt = {
+  runId: RunID
+  attempt: number
+  status: string
+  createdAt: string
+}
+
+// 结果定位（doc/73 §9）：finalTaskId + resultRevision 永远指向当前持久结果；
+// 摘要与产物现读自该 Task，不用过期通知快照。非整组完成通知的 result 是 null。
+export type NotificationResult = {
+  finalTaskId: string
+  resultRevision: number
+  summary: string
+  artifacts: TaskArtifact[]
+}
+
+// GET /api/notifications/:id 的完整视图（字段序是契约字节序）。
+export type NotificationDetail = {
+  notificationId: string
+  orchestrationId: string
+  taskId: string
+  kind: string
+  status: string
+  runId: RunID
+  attempt: number
+  errorCode: string
+  result: NotificationResult | null
+  createdAt: string
+  claimedAt: string | null
+  failedAt: string | null
+  consumedAt: string | null
+  updatedAt: string
+  attempts: NotificationAttempt[]
+}
+
+// POST retry 的 data（202 新尝试 / 200 已有在处理的 run 或计划决策已接受）。
+export type NotificationRetryResult = {
+  notificationId: string
+  runId: RunID
+  status: string
+  attempt: number
+}
+
+export function getNotification(notificationId: string): Promise<NotificationDetail> {
+  return request<NotificationDetail>(`/api/notifications/${encodeURIComponent(notificationId)}`)
+}
+
+// 人工重新处理：只从 failed 出发；服务端在同一事务建新 run／attempt。
+// 202 新尝试；200 已有一场在处理的 run（双击／多副本）或计划决策已接受。
+export function retryNotification(notificationId: string): Promise<NotificationRetryResult> {
+  return request<NotificationRetryResult>(
+    `/api/notifications/${encodeURIComponent(notificationId)}/retry`,
+    { method: 'POST' },
   )
 }
 

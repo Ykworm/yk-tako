@@ -202,17 +202,7 @@ func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID
 			}
 		}
 		// 清扫死行（§8.3）：上一任进程死掉的活行按 lease 判死翻 error，唯一索引随之放行本 run。
-		// error 形状 = mh 只留 user 半、runlog 无 assistant 行（与 run 内出错的形状同一）。
-		// 账本同一条 CTE 里删（doc/30 §6.3）：只删**被本次翻 error 的** run——先 UPDATE 再按
-		// RETURNING 的 id 删，两步分开会误删「UPDATE 之后又续约成功」的 run 的账本。
-		if err := tx.Exec(
-			`WITH dead AS (
-			   UPDATE runs SET status = 'error', finished_at = now(), lease_until = NULL
-			    WHERE session_id = ? AND status = 'running' AND lease_until < now()
-			    RETURNING id
-			 )
-			 DELETE FROM run_journal WHERE run_id IN (SELECT id FROM dead)`,
-			sessionID).Error; err != nil {
+		if err := expireDeadSessionRunsTx(tx, sessionID); err != nil {
 			return err
 		}
 		// 别的会话上租约已过的活行也占着项目闸。沿用同一条「lease 到了就翻 error」的清扫，
@@ -295,6 +285,23 @@ func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID
 		return false, err
 	}
 	return true, nil
+}
+
+// expireDeadSessionRunsTx 把该会话上租约已过的活行按 error 收尾（唯一索引随之放行新 run）。
+// error 形状 = mh 只留 user 半、runlog 无 assistant 行（与 run 内出错的形状同一）。
+// 账本同一条 CTE 里删（doc/30 §6.3）：只删**被本次翻 error 的** run——先 UPDATE 再按
+// RETURNING 的 id 删，两步分开会误删「UPDATE 之后又续约成功」的 run 的账本。
+// AcquireRun 插新 run 前调用；协调交付的认领/重试也走同一扫尾——忙检查按「租约仍有效」
+// 判，而 one_live_run_per_session 只认 status='running'，不清就会撞索引永久重试。
+func expireDeadSessionRunsTx(tx *gorm.DB, sessionID SessionID) error {
+	return tx.Exec(
+		`WITH dead AS (
+		   UPDATE runs SET status = 'error', finished_at = now(), lease_until = NULL
+		    WHERE session_id = ? AND status = 'running' AND lease_until < now()
+		    RETURNING id
+		 )
+		 DELETE FROM run_journal WHERE run_id IN (SELECT id FROM dead)`,
+		sessionID).Error
 }
 
 // lockTenantGate 是**租户并发闸**（doc/43）：同一个租户内同时最多跑几场 run
@@ -972,12 +979,13 @@ func (s *Store) AbandonClaim(ctx context.Context, runID RunID, epoch int64) erro
 // `runs` 必须清——它是准入的落点，漏清则幽灵 running 行永久残留
 // （清扫只在新 POST 时按 session_id 触发，旧 session 已 404，再没人替它扫）；
 // 记忆层（memory_items / memory_jobs）是引擎自己的状态，同属「引擎自己的东西」，全局归零一并清；
-// 持久 Task 四表（agent_orchestrations / agent_tasks / agent_task_links / agent_notifications）同批。
+// 持久 Task 五表（agent_orchestrations / agent_tasks / agent_task_links / agent_notifications /
+// agent_notification_attempts）同批。
 // 旧的 `notes` 表已随存量迁移退役（doc/65 §6.1），不再出现在 TRUNCATE 列表里——
 // 表都不在了，还 TRUNCATE 它会直接报错。
 func (s *Store) Reset(ctx context.Context) (deleted int, err error) {
 	if err := s.db.WithContext(ctx).Exec(
-		`TRUNCATE TABLE tenant_invitations, tenant_agents, tenant_settings, tenant_usage_daily, audit_log, refresh_tokens, tenant_members, tenants, users, sessions, runs, run_model_messages, runlog_entries, memory_items, memory_jobs, run_journal, agent_orchestrations, agent_tasks, agent_task_links, agent_notifications`).Error; err != nil {
+		`TRUNCATE TABLE tenant_invitations, tenant_agents, tenant_settings, tenant_usage_daily, audit_log, refresh_tokens, tenant_members, tenants, users, sessions, runs, run_model_messages, runlog_entries, memory_items, memory_jobs, run_journal, agent_orchestrations, agent_tasks, agent_task_links, agent_notifications, agent_notification_attempts`).Error; err != nil {
 		return 0, err
 	}
 	var cursor uint64

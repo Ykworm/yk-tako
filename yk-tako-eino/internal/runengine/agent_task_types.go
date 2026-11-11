@@ -58,11 +58,22 @@ const (
 	notifKindPlanReviewRequired = "plan_review_required"
 )
 
-// 通知状态：pending（待消费）→ claimed（已认领、协调 run 在跑）→ consumed（已消费完）。
+// 通知状态（doc/73 §5.1）：pending（待消费）→ claimed（已认领、协调 run 在跑）→
+// consumed（已消费完）；claimed 的 run 明确 error／stopped 后进 failed，只能由用户显式
+// 重新处理（新 attempt）再回 claimed。failed 永不被普通 pending 消费查询捞起。
 const (
 	notifStatusPending  = "pending"
 	notifStatusClaimed  = "claimed"
 	notifStatusConsumed = "consumed"
+	notifStatusFailed   = "failed"
+)
+
+// 通知消费失败与整组交付失败的机器原因（doc/73 §4.5）。Task 自身 error_code 只表示被通知的
+// Task 为什么失败，不能拿来保存「交付没完成」。
+const (
+	deliveryErrRunError = "delivery_run_error" // 当前协调 run 以 error 结束
+	deliveryErrStopped  = "delivery_stopped"   // 用户停止当前协调 run
+	deliveryErrArtifact = "artifact_invalid"   // 当前结果产物已不可读取
 )
 
 // sessions.kind 词表：chat 是既有默认（所有普通会话）；agent_task 是 Task 执行会话——
@@ -82,15 +93,15 @@ const orchestrationConcurrency = 2
 
 // 机器错误码（error_code 列 / API error.code）。展示文案与机器原因分开（doc/70 §4.3）。
 const (
-	taskErrDependencyFailed  = "dependency_failed"
-	taskErrResultNotSubmit   = "result_not_submitted"
-	taskErrRunError          = "run_error"
-	taskErrAssemblyFailed    = "assembly_failed"
-	taskErrSubmitStaleEpoch  = "stale_execution"
-	taskErrSubmitNotRunning  = "not_running"
-	taskErrArtifactBad       = "artifact_invalid"
-	taskErrSubmitBad         = "result_invalid"
-	taskErrInputTimeout      = "input_timeout"
+	taskErrDependencyFailed = "dependency_failed"
+	taskErrResultNotSubmit  = "result_not_submitted"
+	taskErrRunError         = "run_error"
+	taskErrAssemblyFailed   = "assembly_failed"
+	taskErrSubmitStaleEpoch = "stale_execution"
+	taskErrSubmitNotRunning = "not_running"
+	taskErrArtifactBad      = "artifact_invalid"
+	taskErrSubmitBad        = "result_invalid"
+	taskErrInputTimeout     = "input_timeout"
 )
 
 // AgentOrchestration = `agent_orchestrations` 表。
@@ -116,14 +127,17 @@ type AgentOrchestration struct {
 	// DeliveryStatus：空 = 无可交付结果；pending → delivering → delivered（或 failed）。
 	DeliveryStatus string `gorm:"not null;default:''"`
 	DeliveryRunID  string `gorm:"not null;default:''"`
+	// DeliveryErrorCode 只在 delivery_status=failed 时有值（doc/73 §4.5 词表）：
+	// 它回答「交付为什么没完成」，与被通知 Task 的 error_code 不是一回事。
+	DeliveryErrorCode string `gorm:"not null;default:''"`
 	// PlanRevision 是图的接受版本（初始 0；每接受一次修订 +1）。它是修订 CAS 的版本号。
 	PlanRevision int `gorm:"not null;default:0"`
 	// PlanHold=true 表示检查点已触发：停止新领取与组收口，等一次 continue／revision。
-	PlanHold  bool `gorm:"not null;default:false"`
-	CreatedAt time.Time
-	FinishedAt     *time.Time
-	DeliveredAt    *time.Time
-	UpdatedAt      time.Time
+	PlanHold    bool `gorm:"not null;default:false"`
+	CreatedAt   time.Time
+	FinishedAt  *time.Time
+	DeliveredAt *time.Time
+	UpdatedAt   time.Time
 }
 
 func (AgentOrchestration) TableName() string { return "agent_orchestrations" }
@@ -165,11 +179,11 @@ func (AgentTask) TableName() string { return "agent_tasks" }
 
 // AgentTaskLink = `agent_task_links` 表。复合主键 (parent, child) 同时就是唯一约束。
 type AgentTaskLink struct {
-	ParentTaskID   string `gorm:"primaryKey"`
-	ChildTaskID    string `gorm:"primaryKey"`
-	TenantID       string `gorm:"not null;index"`
+	ParentTaskID    string `gorm:"primaryKey"`
+	ChildTaskID     string `gorm:"primaryKey"`
+	TenantID        string `gorm:"not null;index"`
 	OrchestrationID string `gorm:"not null;index"`
-	CreatedAt      time.Time
+	CreatedAt       time.Time
 }
 
 func (AgentTaskLink) TableName() string { return "agent_task_links" }
@@ -185,28 +199,47 @@ type AgentNotification struct {
 	Kind              string    `gorm:"not null"`
 	DedupKey          string    `gorm:"not null;uniqueIndex"`
 	Status            string    `gorm:"not null;default:pending"`
-	ClaimRunID        string    `gorm:"not null;default:''"`
+	ClaimRunID        string    `gorm:"not null;default:'';index"`
 	ErrorCode         string    `gorm:"not null;default:''"`
-	CreatedAt         time.Time
-	ClaimedAt         *time.Time
-	ConsumedAt        *time.Time
+	// ConsumeErrorCode 是最近一次协调 run 没完成消费的机器原因（doc/73 §4.5），
+	// 只在 status=failed 时有值；它与被通知 Task 的 ErrorCode 分开。
+	ConsumeErrorCode string `gorm:"not null;default:''"`
+	CreatedAt        time.Time
+	ClaimedAt        *time.Time
+	FailedAt         *time.Time
+	ConsumedAt       *time.Time
+	UpdatedAt        time.Time `gorm:"not null;default:now()"`
 }
 
 func (AgentNotification) TableName() string { return "agent_notifications" }
 
+// AgentNotificationAttempt = `agent_notification_attempts` 表（doc/73 §5.2）：同一通知先后由
+// 哪些 run 处理。首次认领写 attempt=1；同 run 的崩溃 resume 只增 epoch，不增 attempt；
+// 只有用户显式「重新处理」才 attempt+1。run 的执行状态与正文仍现读 runs／runlog，本表不复制。
+type AgentNotificationAttempt struct {
+	ID             string    `gorm:"primaryKey"` // ana_<ULID>
+	TenantID       string    `gorm:"not null;index:agent_notification_attempts_tenant_notif,priority:1"`
+	NotificationID string    `gorm:"not null;uniqueIndex:agent_notification_attempts_notif_attempt,priority:1;index:agent_notification_attempts_tenant_notif,priority:2"`
+	Attempt        int       `gorm:"not null;uniqueIndex:agent_notification_attempts_notif_attempt,priority:2"`
+	RunID          string    `gorm:"not null;uniqueIndex"`
+	CreatedAt      time.Time `gorm:"not null"`
+}
+
+func (AgentNotificationAttempt) TableName() string { return "agent_notification_attempts" }
+
 // AgentPlanRevision = `agent_plan_revisions` 表（doc/72 §5.2）：每一次被接受的计划修订一行。
 // command_json 是规范化命令（数组已排序），command_hash 是它的 SHA-256——同键不同命令靠它区分。
 type AgentPlanRevision struct {
-	ID              string `gorm:"primaryKey"` // pr_<ULID>
-	TenantID        string `gorm:"not null;uniqueIndex:agent_plan_revisions_idem,priority:1"`
-	OrchestrationID string `gorm:"not null;uniqueIndex:agent_plan_revisions_idem,priority:2;uniqueIndex:agent_plan_revisions_rev,priority:1;index:agent_plan_revisions_orch_rev,priority:1"`
-	Revision        int    `gorm:"not null;uniqueIndex:agent_plan_revisions_rev,priority:2;index:agent_plan_revisions_orch_rev,priority:2"`
-	BaseRevision    int    `gorm:"not null"`
-	SourceRunID     string `gorm:"not null;default:''"`
-	IdempotencyKey  string `gorm:"not null;uniqueIndex:agent_plan_revisions_idem,priority:3;size:128"`
-	CommandHash     string `gorm:"not null"`
-	CommandJSON     string `gorm:"not null;type:text"`
-	Reason          string `gorm:"not null;type:text"`
+	ID              string    `gorm:"primaryKey"` // pr_<ULID>
+	TenantID        string    `gorm:"not null;uniqueIndex:agent_plan_revisions_idem,priority:1"`
+	OrchestrationID string    `gorm:"not null;uniqueIndex:agent_plan_revisions_idem,priority:2;uniqueIndex:agent_plan_revisions_rev,priority:1;index:agent_plan_revisions_orch_rev,priority:1"`
+	Revision        int       `gorm:"not null;uniqueIndex:agent_plan_revisions_rev,priority:2;index:agent_plan_revisions_orch_rev,priority:2"`
+	BaseRevision    int       `gorm:"not null"`
+	SourceRunID     string    `gorm:"not null;default:''"`
+	IdempotencyKey  string    `gorm:"not null;uniqueIndex:agent_plan_revisions_idem,priority:3;size:128"`
+	CommandHash     string    `gorm:"not null"`
+	CommandJSON     string    `gorm:"not null;type:text"`
+	Reason          string    `gorm:"not null;type:text"`
 	CreatedAt       time.Time `gorm:"not null"`
 }
 
@@ -237,12 +270,12 @@ type taskError struct {
 // → currentRunId → result → error → resultRevision → createdAt → startedAt → finishedAt → updatedAt。
 // Status 带 interrupted 派生：running + 当前 run 租约过期 → interrupted（存储仍是 running）。
 type agentTaskView struct {
-	TaskID          string      `json:"taskId"`
-	OrchestrationID string      `json:"orchestrationId"`
-	Key             string      `json:"key"`
-	Content         string      `json:"content"`
-	Agent           string      `json:"agent"`
-	ModelRef        string      `json:"modelRef"`
+	TaskID          string `json:"taskId"`
+	OrchestrationID string `json:"orchestrationId"`
+	Key             string `json:"key"`
+	Content         string `json:"content"`
+	Agent           string `json:"agent"`
+	ModelRef        string `json:"modelRef"`
 	// 修订相关两列插在 modelRef 后（doc/72 §4.7）：旧字段相对顺序不变。
 	PlanCheckpoint  bool        `json:"planCheckpoint"`
 	CreatedRevision int         `json:"createdRevision"`
@@ -260,21 +293,24 @@ type agentTaskView struct {
 
 // orchestrationBody 是编排组视图的组半。
 type orchestrationBody struct {
-	OrchestrationID string     `json:"orchestrationId"`
-	Goal            string     `json:"goal"`
-	WorkspaceID     string     `json:"workspaceId"`
-	SourceSessionID string     `json:"sourceSessionId"`
-	Status          string     `json:"status"`
-	FinalTaskID     string     `json:"finalTaskId"`
+	OrchestrationID string `json:"orchestrationId"`
+	Goal            string `json:"goal"`
+	WorkspaceID     string `json:"workspaceId"`
+	SourceSessionID string `json:"sourceSessionId"`
+	Status          string `json:"status"`
+	FinalTaskID     string `json:"finalTaskId"`
 	// 修订相关两列插在 finalTaskId 后（doc/72 §4.7）：旧字段相对顺序不变。
-	PlanRevision    int        `json:"planRevision"`
-	PlanHold        bool       `json:"planHold"`
-	DeliveryStatus  string     `json:"deliveryStatus"`
-	DeliveryRunID   string     `json:"deliveryRunId"`
-	CreatedAt       time.Time  `json:"createdAt"`
-	FinishedAt      *time.Time `json:"finishedAt"`
-	DeliveredAt     *time.Time `json:"deliveredAt"`
-	UpdatedAt       time.Time  `json:"updatedAt"`
+	PlanRevision   int    `json:"planRevision"`
+	PlanHold       bool   `json:"planHold"`
+	DeliveryStatus string `json:"deliveryStatus"`
+	DeliveryRunID  string `json:"deliveryRunId"`
+	// DeliveryErrorCode 是交付失败的机器原因（doc/73 §4.4/§4.5）：插在 deliveryRunId 后，
+	// 既有字段顺序不变；无失败时为空串。
+	DeliveryErrorCode string     `json:"deliveryErrorCode"`
+	CreatedAt         time.Time  `json:"createdAt"`
+	FinishedAt        *time.Time `json:"finishedAt"`
+	DeliveredAt       *time.Time `json:"deliveredAt"`
+	UpdatedAt         time.Time  `json:"updatedAt"`
 }
 
 // taskLinkView 是依赖边视图：parent → child。

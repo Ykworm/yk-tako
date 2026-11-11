@@ -422,16 +422,17 @@ func TestContractAgentTaskViewBytes(t *testing.T) {
 	}
 }
 
-// TestContractOrchestrationViewBytes 钉住编排组视图的字段序（doc/70 §4.3）：
+// TestContractOrchestrationViewBytes 钉住编排组视图的字段序（doc/70 §4.3；doc/73 §4.4）：
 // 组体 orchestrationId → goal → workspaceId → sourceSessionId → status → finalTaskId
-// → deliveryStatus → deliveryRunId → createdAt → finishedAt → deliveredAt → updatedAt；
+// → planRevision → planHold → deliveryStatus → deliveryRunId → deliveryErrorCode
+// → createdAt → finishedAt → deliveredAt → updatedAt；
 // 外层 orchestration → tasks → links；边 = parentTaskId → childTaskId。
 func TestContractOrchestrationViewBytes(t *testing.T) {
 	got := mustJSON(t, orchestrationView{
 		Orchestration: orchestrationBody{
 			OrchestrationID: "or_1", Goal: "调研 A、B 后汇总", WorkspaceID: "ws_1",
 			SourceSessionID: "s_1", Status: "active", FinalTaskID: "at_1",
-			DeliveryStatus: "", DeliveryRunID: "",
+			DeliveryStatus: "", DeliveryRunID: "", DeliveryErrorCode: "",
 			CreatedAt: time.Unix(0, 0).UTC(), UpdatedAt: time.Unix(0, 0).UTC(),
 		},
 		Tasks: []agentTaskView{{
@@ -441,7 +442,7 @@ func TestContractOrchestrationViewBytes(t *testing.T) {
 		}},
 		Links: []taskLinkView{{ParentTaskID: "at_2", ChildTaskID: "at_1"}},
 	})
-	const want = `{"orchestration":{"orchestrationId":"or_1","goal":"调研 A、B 后汇总","workspaceId":"ws_1","sourceSessionId":"s_1","status":"active","finalTaskId":"at_1","planRevision":0,"planHold":false,"deliveryStatus":"","deliveryRunId":"",` +
+	const want = `{"orchestration":{"orchestrationId":"or_1","goal":"调研 A、B 后汇总","workspaceId":"ws_1","sourceSessionId":"s_1","status":"active","finalTaskId":"at_1","planRevision":0,"planHold":false,"deliveryStatus":"","deliveryRunId":"","deliveryErrorCode":"",` +
 		`"createdAt":"1970-01-01T00:00:00Z","finishedAt":null,"deliveredAt":null,"updatedAt":"1970-01-01T00:00:00Z"},` +
 		`"tasks":[{"taskId":"at_1","orchestrationId":"or_1","key":"C","content":"汇总成报告","agent":"coder","modelRef":"","planCheckpoint":false,"createdRevision":0,"workspaceId":"ws_1","status":"ready","currentRunId":"",` +
 		`"result":null,"error":null,"resultRevision":0,"createdAt":"1970-01-01T00:00:00Z","startedAt":null,"finishedAt":null,"updatedAt":"1970-01-01T00:00:00Z"}],` +
@@ -529,8 +530,8 @@ func TestContractPlanRevisionBytes(t *testing.T) {
 	}
 }
 
-// TestContractAttentionItemBytes 钉住「需要我处理」每行的字段序（doc/72 §4.6）：
-// 九个字段恒出现；不适用处是 "" / 0，前端不按缺字段分支。
+// TestContractAttentionItemBytes 钉住「需要我处理」每行的字段序（doc/72 §4.6；doc/73 §4.4）：
+// 十个字段恒出现（runId 后是 notificationId）；不适用处是 "" / 0，前端不按缺字段分支。
 func TestContractAttentionItemBytes(t *testing.T) {
 	got := mustJSON(t, attentionItem{
 		Kind: "question", TaskID: "at_1", OrchestrationID: "or_1", Title: "A",
@@ -538,17 +539,94 @@ func TestContractAttentionItemBytes(t *testing.T) {
 		UpdatedAt: time.Unix(0, 0).UTC(),
 	})
 	const want = `{"kind":"question","taskId":"at_1","orchestrationId":"or_1","title":"A","count":3,` +
-		`"questionId":"qs_1","runId":"r_1","status":"running","updatedAt":"1970-01-01T00:00:00Z"}`
+		`"questionId":"qs_1","runId":"r_1","notificationId":"","status":"running","updatedAt":"1970-01-01T00:00:00Z"}`
 	if got != want {
 		t.Fatalf("处理项字节 = %s\nwant %s", got, want)
 	}
 	got = mustJSON(t, attentionItem{
-		Kind: "plan_review", OrchestrationID: "or_1", Title: "调研",
-		Count: 1, Status: "active", UpdatedAt: time.Unix(0, 0).UTC(),
+		Kind: "delivery_failed", OrchestrationID: "or_1", Title: "调研",
+		Count: 1, RunID: "r_2", NotificationID: "an_1", Status: "failed",
+		UpdatedAt: time.Unix(0, 0).UTC(),
 	})
-	const wantEmpty = `{"kind":"plan_review","taskId":"","orchestrationId":"or_1","title":"调研","count":1,` +
-		`"questionId":"","runId":"","status":"active","updatedAt":"1970-01-01T00:00:00Z"}`
-	if got != wantEmpty {
-		t.Fatalf("无 Task 处理项字节 = %s\nwant %s", got, wantEmpty)
+	const wantNotif = `{"kind":"delivery_failed","taskId":"","orchestrationId":"or_1","title":"调研","count":1,` +
+		`"questionId":"","runId":"r_2","notificationId":"an_1","status":"failed","updatedAt":"1970-01-01T00:00:00Z"}`
+	if got != wantNotif {
+		t.Fatalf("交付失败处理项字节 = %s\nwant %s", got, wantNotif)
+	}
+}
+
+// TestContractNotificationDetailBytes 钉住通知详情的字段序（doc/73 §4.1；施工包 §4.1）。
+// 真实字节来自隔离引擎 curl（2026-11-11，-task-interval=-1s 起法）：
+// notificationId → orchestrationId → taskId → kind → status → runId → attempt → errorCode
+// → result → createdAt → claimedAt → failedAt → consumedAt → updatedAt → attempts；
+// 无认领时 runId=""、attempt=0、attempts=[]、三个时间 null；非整组交付通知的 result 为 null。
+func TestContractNotificationDetailBytes(t *testing.T) {
+	first := time.Unix(9, 0).UTC()
+	got := mustJSON(t, agentNotificationView{
+		NotificationID: "an_1", OrchestrationID: "or_1", TaskID: "at_1",
+		Kind: notifKindOrchFinished, Status: notifStatusFailed, RunID: "r_1", Attempt: 1,
+		ErrorCode: deliveryErrRunError,
+		Result: &notificationResultView{
+			FinalTaskID: "at_1", ResultRevision: 1, Summary: "交付摘要正文", Artifacts: []TaskArtifact{},
+		},
+		CreatedAt: time.Unix(0, 0).UTC(), ClaimedAt: ptrTime(time.Unix(1, 0).UTC()),
+		FailedAt: ptrTime(time.Unix(2, 0).UTC()), UpdatedAt: time.Unix(2, 0).UTC(),
+		Attempts: []notificationAttemptView{{RunID: "r_1", Attempt: 1, Status: "error", CreatedAt: first}},
+	})
+	const want = `{"notificationId":"an_1","orchestrationId":"or_1","taskId":"at_1","kind":"orchestration_finished","status":"failed","runId":"r_1","attempt":1,"errorCode":"delivery_run_error",` +
+		`"result":{"finalTaskId":"at_1","resultRevision":1,"summary":"交付摘要正文","artifacts":[]},` +
+		`"createdAt":"1970-01-01T00:00:00Z","claimedAt":"1970-01-01T00:00:01Z","failedAt":"1970-01-01T00:00:02Z","consumedAt":null,"updatedAt":"1970-01-01T00:00:02Z",` +
+		`"attempts":[{"runId":"r_1","attempt":1,"status":"error","createdAt":"1970-01-01T00:00:09Z"}]}`
+	if got != want {
+		t.Fatalf("通知详情字节 = %s\nwant %s", got, want)
+	}
+	got = mustJSON(t, agentNotificationView{
+		NotificationID: "an_2", OrchestrationID: "or_1", TaskID: "at_1",
+		Kind: "task_failed", Status: notifStatusPending,
+		CreatedAt: time.Unix(0, 0).UTC(), UpdatedAt: time.Unix(0, 0).UTC(),
+		Attempts: []notificationAttemptView{},
+	})
+	const wantPending = `{"notificationId":"an_2","orchestrationId":"or_1","taskId":"at_1","kind":"task_failed","status":"pending","runId":"","attempt":0,"errorCode":"",` +
+		`"result":null,"createdAt":"1970-01-01T00:00:00Z","claimedAt":null,"failedAt":null,"consumedAt":null,"updatedAt":"1970-01-01T00:00:00Z","attempts":[]}`
+	if got != wantPending {
+		t.Fatalf("无认领通知详情字节 = %s\nwant %s", got, wantPending)
+	}
+}
+
+// TestContractNotificationRetryBytes 钉住人工重试的 data 与失败信封（doc/73 §4.2；施工包 §4.2）。
+// 202 新尝试 / 200 已有处理中的 run：notificationId → runId → status → attempt；
+// 404 117003、409 117109／117110／112101、403 111203 的文案逐字。
+func TestContractNotificationRetryBytes(t *testing.T) {
+	got := mustJSON(t, notificationRetryView{
+		NotificationID: "an_1", RunID: "r_2", Status: notifStatusClaimed, Attempt: 2,
+	})
+	const wantNew = `{"notificationId":"an_1","runId":"r_2","status":"claimed","attempt":2}`
+	if got != wantNew {
+		t.Fatalf("重试新尝试字节 = %s\nwant %s", got, wantNew)
+	}
+	got = mustJSON(t, notificationRetryView{
+		NotificationID: "an_1", RunID: "r_1", Status: notifStatusClaimed, Attempt: 1,
+	})
+	const wantExisting = `{"notificationId":"an_1","runId":"r_1","status":"claimed","attempt":1}`
+	if got != wantExisting {
+		t.Fatalf("重试已有尝试字节 = %s\nwant %s", got, wantExisting)
+	}
+
+	cases := []struct {
+		code    int
+		message string
+		want    string
+	}{
+		{codeNotifMissing, "找不到这条通知", `{"code":117003,"message":"找不到这条通知","data":null}`},
+		{codeNotifNotRetryable, "这条通知现在不能重新处理", `{"code":117109,"message":"这条通知现在不能重新处理","data":null}`},
+		{codeArtifactInvalid, "结果产物已不可读取", `{"code":117110,"message":"结果产物已不可读取","data":null}`},
+		{codeSessionRunning, "这场会话正在生成，请稍后再试", `{"code":112101,"message":"这场会话正在生成，请稍后再试","data":null}`},
+		{codeForbidden, "没有权限做这件事", `{"code":111203,"message":"没有权限做这件事","data":null}`},
+	}
+	for _, c := range cases {
+		got = mustJSON(t, envelope{Code: c.code, Message: c.message, Data: nil})
+		if got != c.want {
+			t.Fatalf("重试失败信封字节 = %s\nwant %s", got, c.want)
+		}
 	}
 }

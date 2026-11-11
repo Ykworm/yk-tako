@@ -220,17 +220,20 @@ const (
 	// 118001：当前记忆模式不提供这个观测口（doc/65 §6.5：markdown 模式调 items/jobs/recall）。
 	codeMemoryMode = 118001
 	// 17 = 持久 Task 与编排（doc/40 §4.2c）。1170xx 资源缺失，1171xx 计划与状态冲突。
-	codeTaskMissing      = 117001 // 404 找不到这件任务（不存在或不可见）
-	codeOrchMissing      = 117002 // 404 找不到这个编排组
-	codePlanInvalid      = 117101 // 400 任务计划不合法（具体原因进 data.reason）
-	codePlanConflict     = 117102 // 409 创建键已经用于另一份计划（同键不同 plan_hash）
-	codeTaskNotResumable = 117103 // 409 这件任务现在不能恢复（非 interrupted／有活执行者／次数耗尽）
-	codeTaskFinished     = 117104 // 409 这件任务已结束，不能停止
-	codeOrchFinished     = 117105 // 409 这个编排组已结束，不能停止
-	codeRevisionStale    = 117106 // 409 计划已有新修订，请重新读取后再试（修订与继续共用）
-	codeNotRevisable     = 117107 // 409 这个编排组现在不能修订
-	codeRevisionConflict = 117108 // 409 这个修订键已经用于另一次修订
-	codeInternal         = 111901
+	codeTaskMissing       = 117001 // 404 找不到这件任务（不存在或不可见）
+	codeOrchMissing       = 117002 // 404 找不到这个编排组
+	codeNotifMissing      = 117003 // 404 找不到这条通知（不存在、不可见、跨租户或来源会话已删除）
+	codePlanInvalid       = 117101 // 400 任务计划不合法（具体原因进 data.reason）
+	codePlanConflict      = 117102 // 409 创建键已经用于另一份计划（同键不同 plan_hash）
+	codeTaskNotResumable  = 117103 // 409 这件任务现在不能恢复（非 interrupted／有活执行者／次数耗尽）
+	codeTaskFinished      = 117104 // 409 这件任务已结束，不能停止
+	codeOrchFinished      = 117105 // 409 这个编排组已结束，不能停止
+	codeRevisionStale     = 117106 // 409 计划已有新修订，请重新读取后再试（修订与继续共用）
+	codeNotRevisable      = 117107 // 409 这个编排组现在不能修订
+	codeRevisionConflict  = 117108 // 409 这个修订键已经用于另一次修订
+	codeNotifNotRetryable = 117109 // 409 这条通知现在不能重新处理（非 failed、状态矛盾、旧 attempt 或已消费）
+	codeArtifactInvalid   = 117110 // 409 结果产物已不可读取（恢复前发现路径失效、越界或文件不存在）
+	codeInternal          = 111901
 )
 
 var emailPattern = regexp.MustCompile(`^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$`)

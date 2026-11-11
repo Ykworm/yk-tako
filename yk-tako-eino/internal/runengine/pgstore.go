@@ -658,7 +658,8 @@ func autoMigrate(db *gorm.DB) error {
 		&TenantInvitation{}, &TenantAgent{}, &AgentDefault{}, &TenantSetting{}, &TenantStorage{},
 		&Workspace{}, &CleanerState{}, &RunTask{}, &RunQuestion{},
 		&SkillRow{}, &SkillDisable{},
-		&AgentOrchestration{}, &AgentTask{}, &AgentTaskLink{}, &AgentNotification{}, &AgentPlanRevision{}); err != nil {
+		&AgentOrchestration{}, &AgentTask{}, &AgentTaskLink{}, &AgentNotification{}, &AgentPlanRevision{},
+		&AgentNotificationAttempt{}); err != nil {
 		return err
 	}
 	// 旧列 kind/topic **不在这里删**——它们是存量迁移的**输入**：
@@ -722,6 +723,38 @@ WHERE execution_session_id IS NOT NULL`).Error; err != nil {
 	if err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS agent_tasks_current_run_once
 ON agent_tasks (current_run_id)
 WHERE current_run_id IS NOT NULL`).Error; err != nil {
+		return err
+	}
+	// 协调通知的生命周期索引（doc/73 §5.1）：调度轮按 status 找 claimed 且 run 已终态的行；
+	// 通知详情按 claim_run_id 反查；交付对账按 (delivery_status, delivery_run_id) 扫。
+	if err := db.Exec(`CREATE INDEX IF NOT EXISTS agent_notifications_status_created
+ON agent_notifications (status, created_at)`).Error; err != nil {
+		return err
+	}
+	if err := db.Exec(`CREATE INDEX IF NOT EXISTS agent_notifications_claim_run
+ON agent_notifications (claim_run_id)
+WHERE claim_run_id <> ''`).Error; err != nil {
+		return err
+	}
+	if err := db.Exec(`CREATE INDEX IF NOT EXISTS agent_orchestrations_delivery_run
+ON agent_orchestrations (delivery_status, delivery_run_id)`).Error; err != nil {
+		return err
+	}
+	// 回填（doc/73 §5：升级库上的存量行必须能被新读面与状态机解释，重复启动安全）：
+	// ① 已 failed 但没有机器原因的组，补 delivery_run_error——旧代码只翻状态不写原因，
+	//    读面会把空串当成「不知道」，回填后与当时唯一可能的失败路径一致；
+	// ② 已经认领过的通知补一行 attempt=1，让「这次通知被处理过几次」从第一天起就是真值。
+	//    id 用 gen_random_uuid（PG13+ 内建），attempt 表只需行存在，主键格式不对外。
+	if err := db.Exec(`UPDATE agent_orchestrations SET delivery_error_code = 'delivery_run_error'
+WHERE delivery_status = 'failed' AND delivery_error_code = ''`).Error; err != nil {
+		return err
+	}
+	if err := db.Exec(`INSERT INTO agent_notification_attempts (id, tenant_id, notification_id, attempt, run_id, created_at)
+SELECT 'ana_' || replace(gen_random_uuid()::text, '-', ''), tenant_id, id, 1, claim_run_id,
+       COALESCE(claimed_at, created_at)
+  FROM agent_notifications
+ WHERE claim_run_id <> ''
+ON CONFLICT DO NOTHING`).Error; err != nil {
 		return err
 	}
 	return db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS one_default_workspace_per_user

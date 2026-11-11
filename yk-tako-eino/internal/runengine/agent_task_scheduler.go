@@ -603,6 +603,7 @@ func (s *Server) AttachTaskScheduler(ts *TaskScheduler) {
 	ts.assemble = s.assembleRun
 	ts.assembleTask = s.assembleAgentTaskRun
 	ts.inputTimeout = s.taskInputTimeout
+	s.tasks = ts
 }
 
 // Start 显式启动调度循环（§8.1：不藏在路由注册里），返回停止函数。

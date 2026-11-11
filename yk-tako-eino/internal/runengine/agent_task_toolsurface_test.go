@@ -11,7 +11,7 @@ import (
 // TestTaskToolSurfaces 钉住三类角色的工具面（施工包 §11.1 第 8 条）：
 //   - Task 执行者拿得到 ask_user，但不能改图、不能再建编排、不能走来源会话的计划审批；
 //   - 计划复核 run 只留只读与两把决策工具（新工具默认不可用，失败方向与执行者相反）；
-//   - 交付 run 去掉一切等人与再编排，保证「协调 run complete」能收口。
+//   - 交付 run 是严格只读白名单（doc/73 §10）：bash／等人／再编排都不进池。
 func TestTaskToolSurfaces(t *testing.T) {
 	ctx := context.Background()
 	all := []tool.BaseTool{}
@@ -63,11 +63,14 @@ func TestTaskToolSurfaces(t *testing.T) {
 		}
 	}
 
-	delivery := gotNames(dropDeliveryNoTools(ctx, all))
+	delivery := gotNames(keepDeliveryReadOnlyTools(ctx, all))
 	if delivery["ask_user"] || delivery["revise_orchestration"] || delivery["delegate_task"] {
 		t.Fatalf("交付 run 还留着等人／再编排工具：%v", delivery)
 	}
-	if !delivery["read_text_file"] || !delivery["bash"] {
-		t.Fatalf("交付 run 被误删了只读／执行工具：%v", delivery)
+	if delivery["bash"] || delivery["submit_task_result"] || delivery["memory"] || delivery["use_skill"] {
+		t.Fatalf("交付 run 拿到了非只读工具：%v", delivery)
+	}
+	if !delivery["read_text_file"] {
+		t.Fatalf("交付 run 被误删了只读工具：%v", delivery)
 	}
 }

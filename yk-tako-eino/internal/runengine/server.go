@@ -51,6 +51,9 @@ type Server struct {
 	// taskInputTimeout 是 Task 提问的截止时长（-task-input-timeout，doc/72 §7.1）：装配与
 	// resume 都从这里注入执行身份盒；0 = 不限时。
 	taskInputTimeout time.Duration
+	// tasks 是持久 Task 调度器（AttachTaskScheduler 注入）：人工重新处理要复用它的
+	// 协调装配口与启动函数（doc/73 §8.2）。未挂调度器时重试端点回内部错误。
+	tasks *TaskScheduler
 }
 
 // SetTaskInputTimeout 注入 Task 提问超时（main 在起调度器与 HTTP 之前调用）。
@@ -194,6 +197,9 @@ func (s *Server) RouterFor() *gin.Engine {
 	r.POST("/api/orchestrations/:id/stop", authn, s.auth.RequireTenantRole("member"), s.stopAgentOrchestration)
 	// 任务级恢复（doc/70 §10.1）：复用 ClaimResume / 账本重放 / Redis seed，装配口换执行者。
 	r.POST("/api/tasks/:id/resume", traceIngress(), authn, s.resumeAgentTask)
+	// 协调通知的读面与人工重新处理（doc/73 §4.1/§4.2）：读面 authn + 属主链，写面 member。
+	r.GET("/api/notifications/:id", authn, s.getAgentNotification)
+	r.POST("/api/notifications/:id/retry", traceIngress(), authn, s.auth.RequireTenantRole("member"), s.retryAgentNotification)
 	r.GET("/api/tenants", authn, s.listTenants)
 	r.GET("/api/me/invitations", authn, s.myInvitations)
 	r.POST("/api/me/invitations/:id/accept", authn, s.acceptInvitation)
@@ -707,6 +713,22 @@ func (s *Server) resumeRun(c *gin.Context) {
 	if denyRunWrite(c, s.viewRun(c, runID)) {
 		return
 	}
+	// 协调 run 的身份必须在 ClaimResume 之前定下来（doc/73 §6.4）：通知当前 claim 指向这场
+	// run 且仍 claimed 才是合法恢复；只是历史 attempt（通知已被人工新尝试接手）按既有 112102
+	// 拒绝，不执行认领——旧交付不得借恢复复活。
+	var coord *coordinationClaim
+	if cc, cerr := s.store.CoordinationClaimForRun(ctx, runID); cerr != nil {
+		internal(c, cerr)
+		return
+	} else if cc != nil {
+		coord = cc
+	} else if stale, serr := s.store.IsStaleCoordinationAttempt(ctx, runID); serr != nil {
+		internal(c, serr)
+		return
+	} else if stale {
+		writeEnvelope(c, http.StatusConflict, codeNotResumable, "这场 run 已经定稿，没有可续的", nil)
+		return
+	}
 	claim, err := s.store.ClaimResume(ctx, runID, s.resumeMax)
 	switch {
 	case errors.Is(err, errRunNotFound):
@@ -752,6 +774,37 @@ func (s *Server) resumeRun(c *gin.Context) {
 	if err := s.store.seedResume(ctx, runID, claim.Epoch, string(frameJSON)); err != nil {
 		_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
 		internal(c, err)
+		return
+	}
+	// 协调 run 以来源会话的 mAgent 身份醒来（doc/73 §6.4）：附通知身份盒，并按 kind 重新裁剪
+	// 工具面——崩溃恢复不得因为「走的是普通 resume」而拿回全权限池。装配失败同样 AbandonClaim。
+	if coord != nil {
+		p, ok := principalFrom(c)
+		if !ok {
+			_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
+			writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
+			return
+		}
+		if s.worker == nil || s.worker.models == nil {
+			_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
+			internal(c, errors.New("tenant models not configured"))
+			return
+		}
+		prof, aerr := s.assembleRun(ctx, p, coord.AgentID)
+		if aerr != nil {
+			_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
+			writeEnvelope(c, aerr.Status, aerr.Code, aerr.Message, nil)
+			return
+		}
+		bg := launchContext(c.Request.Context())
+		bg = withPrincipal(bg, p)
+		bg = withCoordinationBox(bg, &coordinationBox{
+			OrchestrationID: coord.OrchestrationID, NotificationID: coord.NotificationID,
+			Kind: coord.Kind, Attempt: coord.Attempt,
+		})
+		prof.Tools = coordinationTools(bg, coord.Kind, prof.Tools)
+		go s.worker.RunResume(withRunProfile(bg, prof), claim.SessionID, runID, claim.Epoch, replay)
+		writeEnvelope(c, http.StatusAccepted, codeOK, "", resumeResponse{RunID: runID, Status: "running", ResumeCount: int(claim.Epoch - 1)})
 		return
 	}
 	// Task 执行 run 也要以执行者身份醒来（doc/70 §10.1）：普通装配会给它管理员的池子——

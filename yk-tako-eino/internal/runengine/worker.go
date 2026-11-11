@@ -592,6 +592,7 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 			attribute.String("tako.orchestration.id", cb.OrchestrationID),
 			attribute.String("tako.notification.id", cb.NotificationID),
 			attribute.String("tako.notification.kind", cb.Kind),
+			attribute.Int("tako.notification.attempt", cb.Attempt),
 		)
 	}
 	if t0, ok := ingressStartFrom(ctx); ok && !t0.IsZero() {

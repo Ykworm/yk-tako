@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/cloudwego/eino/components/tool"
@@ -25,9 +26,66 @@ type coordinationBox struct {
 	OrchestrationID string
 	NotificationID  string
 	Kind            string
+	// Attempt 是这次通知的第几次处理（doc/73 §6.3）：首次认领为 1，崩溃 resume 不变，
+	// 只有人工「重新处理」才 +1。trace 与日志用它区分同一通知的不同 run。
+	Attempt int
 }
 
 type coordinationBoxKey struct{}
+
+// coordinationClaim 是 resume 前反查到的协调身份（doc/73 §6.4）：只有「通知当前 claim_run_id
+// 指向这场 run 且通知仍 claimed」才算；旧 attempt 的 run 不是当前 claim 时必须独立判出来，
+// 以便按既有 112102 拒绝、不执行 ClaimResume。
+type coordinationClaim struct {
+	NotificationID  string
+	OrchestrationID string
+	Kind            string
+	AgentID         string
+	Attempt         int
+}
+
+// CoordinationClaimForRun 按 run 反查当前协调认领。没有 = 不是协调 run 或通知已不归这场 run。
+func (s *Store) CoordinationClaimForRun(ctx context.Context, runID RunID) (*coordinationClaim, error) {
+	var row struct {
+		NotificationID  string `gorm:"column:notification_id"`
+		OrchestrationID string `gorm:"column:orchestration_id"`
+		Kind            string `gorm:"column:kind"`
+		AgentID         string `gorm:"column:agent_id"`
+		Attempt         int    `gorm:"column:attempt"`
+	}
+	res := s.db.WithContext(ctx).Raw(`
+SELECT n.id AS notification_id, n.orchestration_id, n.kind,
+       COALESCE(s.agent_id, '') AS agent_id,
+       COALESCE((SELECT MAX(a.attempt) FROM agent_notification_attempts a WHERE a.run_id = n.claim_run_id), 0) AS attempt
+  FROM agent_notifications n
+  JOIN sessions s ON s.id = n.receiver_session_id
+ WHERE n.claim_run_id = ? AND n.status = ?`, runID, notifStatusClaimed).Scan(&row)
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	if res.RowsAffected == 0 || row.NotificationID == "" {
+		return nil, nil
+	}
+	return &coordinationClaim{
+		NotificationID: row.NotificationID, OrchestrationID: row.OrchestrationID,
+		Kind: row.Kind, AgentID: row.AgentID, Attempt: row.Attempt,
+	}, nil
+}
+
+// IsStaleCoordinationAttempt 报告这场 run 是否是某条通知的历史尝试、且已不是它当前的认领者
+// （doc/73 §6.4 第 2 条）：是的话不得 ClaimResume——旧交付不能借恢复复活。
+func (s *Store) IsStaleCoordinationAttempt(ctx context.Context, runID RunID) (bool, error) {
+	var one int
+	err := s.db.WithContext(ctx).Raw(`
+SELECT 1 FROM agent_notification_attempts a
+  JOIN agent_notifications n ON n.id = a.notification_id
+ WHERE a.run_id = ? AND (n.claim_run_id <> a.run_id OR n.status <> ?) LIMIT 1`,
+		runID, notifStatusClaimed).Scan(&one).Error
+	if err != nil {
+		return false, err
+	}
+	return one == 1, nil
+}
 
 func withCoordinationBox(ctx context.Context, b *coordinationBox) context.Context {
 	return context.WithValue(ctx, coordinationBoxKey{}, b)
@@ -48,6 +106,112 @@ type coordLaunch struct {
 	TenantID       string
 	UserID         string
 	AgentID        string
+	TaskID         string
+	Attempt        int
+}
+
+// coordinationRecovery 是协调输入的恢复参数（doc/73 §6.2）：首次处理时 Attempt=1、
+// 其余为空；人工新尝试时由重试端点从 PG 现读上一场 run 的终态与已保存的 root assistant 正文。
+type coordinationRecovery struct {
+	Attempt                int
+	PreviousRunID          RunID
+	PreviousTerminalStatus string
+	PreviousRootAssistant  string
+}
+
+// CreateCoordinationAttempt 是初次认领与人工重试共用的事务内创建函数（doc/73 §6.1）：
+// 调用方已锁通知行与组行、并完成了各自的准入判定；这里只做「创建一次处理尝试」的机械动作——
+// run（epoch=1、现有租约）→ mh 首条 → internal runlog user 行 → attempts 行 → 通知翻 claimed /
+// 改写当前 claim → 整组交付翻 delivering / 改写 delivery_run_id → Redis runlive。
+// 任何一步失败整笔回滚（含 Redis），不会留下「已认领但永远没有 run」的通知。
+func (s *Store) CreateCoordinationAttempt(ctx context.Context, tx *gorm.DB, n *AgentNotification, o *AgentOrchestration,
+	rp coordinationRecovery, input string) (*coordLaunch, error) {
+	runID, err := newRunID()
+	if err != nil {
+		return nil, err
+	}
+	msgID, err := newRowID("msg_")
+	if err != nil {
+		return nil, err
+	}
+	logID, err := newRowID("rl_")
+	if err != nil {
+		return nil, err
+	}
+	attemptID, err := newRowID("ana_")
+	if err != nil {
+		return nil, err
+	}
+	if rp.Attempt < 1 {
+		rp.Attempt = 1
+	}
+	if err := tx.Exec(`
+INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, workspace_id, created_at)
+ VALUES (?, ?, 'running', 1, now() + make_interval(secs => ?), ?, now())`,
+		runID, n.ReceiverSessionID, s.leaseTTL.Seconds(), o.WorkspaceID).Error; err != nil {
+		return nil, err
+	}
+	if err := tx.Exec(`
+INSERT INTO run_model_messages (id, session_id, run_id, seq, role, text, compacted, created_at)
+ VALUES (?, ?, ?, 1, 'user', ?, false, now())`,
+		msgID, n.ReceiverSessionID, runID, input).Error; err != nil {
+		return nil, err
+	}
+	// internal=true 的 runlog user 行（doc/70 §9.2）：程序写进来的协调输入不是用户说的话，
+	// 页面不渲染；用户只看到 mAgent 的交付回答。
+	if err := tx.Exec(`
+INSERT INTO runlog_entries (id, session_id, seq, run_id, role, message_id, text, internal, created_at)
+ VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
+         ?, 'user', ?, ?, true, now())`,
+		logID, n.ReceiverSessionID, n.ReceiverSessionID, runID, msgID, input).Error; err != nil {
+		return nil, err
+	}
+	// 每次创建 run 都记一行 attempts：run_id 唯一，双击／双副本的败者在这里或前面的行锁上退出。
+	if err := tx.Exec(`
+INSERT INTO agent_notification_attempts (id, tenant_id, notification_id, attempt, run_id, created_at)
+ VALUES (?, ?, ?, ?, ?, now())`,
+		attemptID, n.TenantID, n.ID, rp.Attempt, runID).Error; err != nil {
+		return nil, err
+	}
+	if err := tx.Exec(`
+UPDATE agent_notifications
+   SET status = ?, claim_run_id = ?, claimed_at = now(), failed_at = NULL,
+       consume_error_code = '', updated_at = now()
+ WHERE id = ?`, notifStatusClaimed, runID, n.ID).Error; err != nil {
+		return nil, err
+	}
+	if n.Kind == notifKindOrchFinished {
+		if err := tx.Exec(`
+UPDATE agent_orchestrations
+   SET delivery_status = ?, delivery_run_id = ?, delivery_error_code = '', updated_at = now()
+ WHERE id = ?`, deliveryStatusDelivering, runID, o.ID).Error; err != nil {
+			return nil, err
+		}
+	}
+	var sess struct {
+		UserID  string `gorm:"column:user_id"`
+		AgentID string `gorm:"column:agent_id"`
+	}
+	if err := tx.Raw(`SELECT user_id, COALESCE(agent_id, '') AS agent_id FROM sessions WHERE id = ?`,
+		n.ReceiverSessionID).Scan(&sess).Error; err != nil {
+		return nil, err
+	}
+	if sess.UserID == "" {
+		return nil, fmt.Errorf("delivery %s: 来源会话缺失", n.ID)
+	}
+	start, err := json.Marshal(Frame{Kind: "start"})
+	if err != nil {
+		return nil, err
+	}
+	if err := s.runliveStart(ctx, runID, 1, string(start)); err != nil {
+		return nil, err
+	}
+	return &coordLaunch{
+		NotificationID: n.ID, Kind: n.Kind, OrchID: o.ID, TaskID: n.TaskID,
+		SessionID: n.ReceiverSessionID, RunID: runID,
+		TenantID: o.TenantID, UserID: sess.UserID, AgentID: sess.AgentID,
+		Attempt: rp.Attempt,
+	}, nil
 }
 
 // consumeAgentNotifications 每轮取至多 8 条 pending 通知逐条消费。assemble 为 nil（单测）时
@@ -140,6 +304,11 @@ func (ts *TaskScheduler) claimNotification(ctx context.Context, notifID string) 
 			}
 		}
 		// 来源会话忙检查（§9.2）：用户正在聊就不打断——通知留在 pending，下一轮再看。
+		// 先同 AcquireRun 清扫租约已过的死行：忙检查按「租约仍有效」判，但唯一索引只认
+		// status='running'，不清会撞 one_live_run_per_session 且每轮重试都撞（永不收敛）。
+		if err := expireDeadSessionRunsTx(tx, n.ReceiverSessionID); err != nil {
+			return err
+		}
 		var live int64
 		if err := tx.Raw(
 			`SELECT COUNT(*) FROM runs WHERE session_id = ? AND status = 'running' AND lease_until > now()`,
@@ -151,79 +320,20 @@ func (ts *TaskScheduler) claimNotification(ctx context.Context, notifID string) 
 		}
 		// 协调 run 的输入在锁内现读现拼：task_failed / task_interrupted 带单任务事实，
 		// orchestration_finished 带最终 Task 的结果与产物。
-		input, err := buildCoordinationInput(tx, n, o)
+		// attempt 取该通知已有最大值 +1：首次认领自然是 1；装配失败退回 pending 后重新认领
+		// 会铸新 run，编号必须继续（(notification_id, attempt) 唯一是并发判负的数据库事实）。
+		var maxAttempt int
+		if err := tx.Raw(`SELECT COALESCE(MAX(attempt), 0) FROM agent_notification_attempts
+ WHERE notification_id = ?`, n.ID).Scan(&maxAttempt).Error; err != nil {
+			return err
+		}
+		rp := coordinationRecovery{Attempt: maxAttempt + 1}
+		input, err := buildCoordinationInput(tx, n, o, rp)
 		if err != nil {
 			return err
 		}
-		runID, err := newRunID()
-		if err != nil {
-			return err
-		}
-		msgID, err := newRowID("msg_")
-		if err != nil {
-			return err
-		}
-		logID, err := newRowID("rl_")
-		if err != nil {
-			return err
-		}
-		if err := tx.Exec(
-			`UPDATE agent_notifications SET status = ?, claim_run_id = ?, claimed_at = now() WHERE id = ?`,
-			notifStatusClaimed, runID, n.ID).Error; err != nil {
-			return err
-		}
-		if n.Kind == notifKindOrchFinished {
-			if err := tx.Model(&AgentOrchestration{}).
-				Where("id = ? AND delivery_status = ?", o.ID, deliveryStatusPending).
-				Updates(map[string]any{"delivery_status": deliveryStatusDelivering, "delivery_run_id": runID}).Error; err != nil {
-				return err
-			}
-		}
-		if err := tx.Exec(`
-INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, workspace_id, created_at)
- VALUES (?, ?, 'running', 1, now() + make_interval(secs => ?), ?, now())`,
-			runID, n.ReceiverSessionID, ts.store.leaseTTL.Seconds(), o.WorkspaceID).Error; err != nil {
-			return err
-		}
-		if err := tx.Exec(`
-INSERT INTO run_model_messages (id, session_id, run_id, seq, role, text, compacted, created_at)
- VALUES (?, ?, ?, 1, 'user', ?, false, now())`,
-			msgID, n.ReceiverSessionID, runID, input).Error; err != nil {
-			return err
-		}
-		// internal=true 的 runlog user 行（§9.2）：程序写进来的协调输入不是用户说的话，
-		// 页面不渲染；用户只看到 mAgent 的交付回答。
-		if err := tx.Exec(`
-INSERT INTO runlog_entries (id, session_id, seq, run_id, role, message_id, text, internal, created_at)
- VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM runlog_entries WHERE session_id = ?),
-         ?, 'user', ?, ?, true, now())`,
-			logID, n.ReceiverSessionID, n.ReceiverSessionID, runID, msgID, input).Error; err != nil {
-			return err
-		}
-		var sess struct {
-			UserID  string `gorm:"column:user_id"`
-			AgentID string `gorm:"column:agent_id"`
-		}
-		if err := tx.Raw(`SELECT user_id, COALESCE(agent_id, '') AS agent_id FROM sessions WHERE id = ?`,
-			n.ReceiverSessionID).Scan(&sess).Error; err != nil {
-			return err
-		}
-		if sess.UserID == "" {
-			return fmt.Errorf("delivery %s: 来源会话缺失", n.ID)
-		}
-		start, err := json.Marshal(Frame{Kind: "start"})
-		if err != nil {
-			return err
-		}
-		if err := ts.store.runliveStart(ctx, runID, 1, string(start)); err != nil {
-			return err
-		}
-		launch = &coordLaunch{
-			NotificationID: n.ID, Kind: n.Kind, OrchID: o.ID,
-			SessionID: n.ReceiverSessionID, RunID: runID,
-			TenantID: o.TenantID, UserID: sess.UserID, AgentID: sess.AgentID,
-		}
-		return nil
+		launch, err = ts.store.CreateCoordinationAttempt(ctx, tx, &n, &o, rp, input)
+		return err
 	})
 	if err != nil {
 		log.Printf("task delivery claim %s: %v", notifID, err)
@@ -238,7 +348,7 @@ INSERT INTO runlog_entries (id, session_id, seq, run_id, role, message_id, text,
 func (ts *TaskScheduler) launchCoordinationRun(ctx context.Context, l *coordLaunch) {
 	p := principal{UserID: l.UserID, TenantID: l.TenantID, Role: "member"}
 	bg := withCoordinationBox(launchContext(ctx), &coordinationBox{
-		OrchestrationID: l.OrchID, NotificationID: l.NotificationID, Kind: l.Kind,
+		OrchestrationID: l.OrchID, NotificationID: l.NotificationID, Kind: l.Kind, Attempt: l.Attempt,
 	})
 	bg = withPrincipal(bg, p)
 	prof, aerr := ts.assemble(bg, p, l.AgentID)
@@ -251,13 +361,19 @@ func (ts *TaskScheduler) launchCoordinationRun(ctx context.Context, l *coordLaun
 		ts.retryAfter.Store(l.NotificationID, time.Now().Add(time.Minute))
 		return
 	}
-	if l.Kind == notifKindPlanReviewRequired {
-		prof.Tools = keepPlanReviewTools(bg, prof.Tools)
-	} else {
-		prof.Tools = dropDeliveryNoTools(bg, prof.Tools)
-	}
-	log.Printf("task delivery: launching %s notification %s as run %s", l.Kind, l.NotificationID, l.RunID)
+	prof.Tools = coordinationTools(bg, l.Kind, prof.Tools)
+	log.Printf("task delivery: launching %s notification %s attempt %d as run %s", l.Kind, l.NotificationID, l.Attempt, l.RunID)
 	go ts.worker.Run(withRunProfile(bg, prof), l.SessionID, l.RunID, 1)
+}
+
+// coordinationTools 是协调 run 的工具面按职责分派（doc/73 §6.3）：初次启动、人工新尝试与
+// resume 共用这一个入口。计划复核沿用 doc/72 的白名单；其他协调／交付 run 只拿只读文件工具——
+// 「读取结果并说明」与「执行新工作」分开，恢复不会顺带获得 bash／写盘／MCP／子代理。
+func coordinationTools(ctx context.Context, kind string, in []tool.BaseTool) []tool.BaseTool {
+	if kind == notifKindPlanReviewRequired {
+		return keepPlanReviewTools(ctx, in)
+	}
+	return keepDeliveryReadOnlyTools(ctx, in)
 }
 
 // planReviewToolNames 是计划复核 run 的全部工具（施工包 §4.8/§6.3）：只读文件与历史检索
@@ -266,7 +382,7 @@ func (ts *TaskScheduler) launchCoordinationRun(ctx context.Context, l *coordLaun
 var planReviewToolNames = map[string]bool{
 	"read_text_file": true, "read_file": true, "read_pdf_text": true, "read_media_file": true,
 	"list_directory": true, "directory_tree": true, "get_file_info": true, "search_files": true,
-	"search_history": true,
+	"search_history":       true,
 	"revise_orchestration": true, "continue_orchestration": true,
 }
 
@@ -286,30 +402,25 @@ func keepPlanReviewTools(ctx context.Context, in []tool.BaseTool) []tool.BaseToo
 	return kept
 }
 
-// dropDeliveryNoTools 把等人与再编排类工具从协调 run 的池子里拿掉（doc/70 §6.3「不获得超出
-// 规格的工具」用到交付角色上）：§9.2 的交付收口条件是「协调 run complete」，所以交付必须
-// 确定性终结——
-//   - ask_user / enter_plan_mode / submit_plan：问出去没人自动答，run 挂起等人，
-//     来源会话一直忙，后续交付（如 orchestration_finished）永远认领不了；
-//   - delegate_task / create_orchestration：投递不是再编排。
-//
-// 2026-11-10 崩溃活体抓过：task_interrupted 交付里模型顺手 ask_user「你希望我怎么处理？」，
-// 交付停在半路。拿不到名的工具原样保留（与既有 drop helper 同一取舍）。
-//
-// ask_user 单独列在这里而不是回到 agentTaskNoTools（doc/72 §7.1 已放开给 Task 执行者）：
-// 执行者提问有任务页承接，交付 run 的池子仍然必须确定性终结。
-func dropDeliveryNoTools(ctx context.Context, in []tool.BaseTool) []tool.BaseTool {
+// deliveryReadOnlyToolNames 是交付／说明 run 的全部工具（doc/73 §10）：只读文件与目录。
+// 白名单而不是黑名单的理由：交付面的正确失败方向是「新工具默认不可用」——未来接进来的
+// bash／写盘／MCP／子代理不需要记得再来这里补一条排除。
+var deliveryReadOnlyToolNames = map[string]bool{
+	"read_text_file": true, "read_file": true, "read_pdf_text": true, "read_media_file": true,
+	"list_directory": true, "directory_tree": true, "get_file_info": true, "search_files": true,
+}
+
+// keepDeliveryReadOnlyTools 反向过滤：名单之外一律拿掉；拿不到工具名的也拿掉（无法证明只读）。
+func keepDeliveryReadOnlyTools(ctx context.Context, in []tool.BaseTool) []tool.BaseTool {
 	kept := make([]tool.BaseTool, 0, len(in))
 	for _, t := range in {
 		info, err := t.Info(ctx)
 		if err != nil {
+			continue
+		}
+		if deliveryReadOnlyToolNames[info.Name] {
 			kept = append(kept, t)
-			continue
 		}
-		if info.Name == "ask_user" || agentTaskNoTools[info.Name] {
-			continue
-		}
-		kept = append(kept, t)
 	}
 	return kept
 }
@@ -334,88 +445,152 @@ func (s *Store) revertDeliveryClaim(ctx context.Context, l *coordLaunch) {
 	}
 }
 
-// ReconcileDeliveryRun 是交付对账（§9.3）：协调 run complete → 通知 consumed；整组完成的
-// 交付再把组推 delivered + deliveredAt（同笔事务，条件更新防重）；error → 整组交付 failed
-// （单任务事件的交付失败不动组——通知留在 claimed，run 走显式恢复，恢复后的 complete 再进这里）；
-// stopped → 不动。幂等：重复调用读到已 consumed 就空转。
+// ReconcileDeliveryRun 是交付对账（doc/73 §6.5）：RunEnd 快路径与调度慢路径都只调这一个函数。
 //
-// 协调 run 按通知的 claim_run_id 反查，不按组的 delivery_run_id：后者只有整组完成交付才写，
-// task_failed／task_interrupted 的交付 run 完成后会查无此行，通知永远停在 claimed
-// （2026-11-10 崩溃活体抓过）。
+// 裁决表（按当前 claim_run_id 反查通知与 run；查不到 = 旧 attempt／非协调 run，空转）：
+//   - running：不动作。租约过期只产生中断读面与恢复入口，不自动 resume；
+//   - complete：通知 claimed → consumed；整组交付再把组 delivering → delivered（同一事务，
+//     条件同时匹配当前 delivery_run_id 与状态，旧尝试完成不能收口新尝试）；
+//   - error：通知 claimed → failed + consume_error_code=delivery_run_error；整组当前交付
+//     同步 delivering → failed + delivery_error_code；
+//   - stopped：同样收口 failed，机器原因 = delivery_stopped；不自动重启。
+//
+// 所有状态写 updated_at，failed 写 failed_at；条件更新保证重复 EndRun／多副本对账幂等。
 func (s *Store) ReconcileDeliveryRun(ctx context.Context, runID RunID) error {
 	var row struct {
-		OrchID   string `gorm:"column:orchestration_id"`
-		TenantID string `gorm:"column:tenant_id"`
-		Status   string `gorm:"column:run_status"`
-		Kind     string `gorm:"column:kind"`
+		NotificationID string `gorm:"column:notification_id"`
+		OrchID         string `gorm:"column:orchestration_id"`
+		TaskID         string `gorm:"column:task_id"`
+		TenantID       string `gorm:"column:tenant_id"`
+		RunStatus      string `gorm:"column:run_status"`
+		Kind           string `gorm:"column:kind"`
+		NotifStatus    string `gorm:"column:notif_status"`
 	}
-	res := s.db.WithContext(ctx).Raw(
-		`SELECT n.orchestration_id, n.tenant_id, r.status AS run_status, n.kind
-		   FROM agent_notifications n JOIN runs r ON r.id = n.claim_run_id
-		  WHERE n.claim_run_id = ?`, runID).Scan(&row)
+	res := s.db.WithContext(ctx).Raw(`
+SELECT n.id AS notification_id, n.orchestration_id, n.task_id, n.tenant_id,
+       r.status AS run_status, n.kind, n.status AS notif_status
+  FROM agent_notifications n JOIN runs r ON r.id = n.claim_run_id
+ WHERE n.claim_run_id = ?`, runID).Scan(&row)
 	if res.Error != nil {
 		return res.Error
 	}
-	if res.RowsAffected == 0 {
-		return nil // 不是协调 run
+	if res.RowsAffected == 0 || row.RunStatus == "running" {
+		return nil
 	}
-	switch row.Status {
-	case "complete":
-	case "error":
-		if row.Kind != notifKindOrchFinished {
-			return nil // 单任务事件交付失败：通知留 claimed，run 显式恢复后由这里收口
-		}
-		r := s.db.WithContext(ctx).Model(&AgentOrchestration{}).
-			Where("id = ? AND delivery_status = ?", row.OrchID, deliveryStatusDelivering).
-			Update("delivery_status", deliveryStatusFailed)
-		if r.Error == nil && r.RowsAffected > 0 {
-			s.PublishEvent(ctx, row.TenantID, eventAgentOrchestrationsChanged, row.OrchID)
-		}
-		return r.Error
-	default:
-		return nil // stopped / running：留给显式恢复与下一轮
+	if row.NotifStatus != notifStatusClaimed {
+		return nil // 已 consumed／failed：重复对账空转（旧 attempt 的指针也早已不在这里）
 	}
+	changed := false
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if row.Kind == notifKindOrchFinished {
-			if r := tx.Model(&AgentOrchestration{}).
-				Where("id = ? AND delivery_status = ?", row.OrchID, deliveryStatusDelivering).
-				Updates(map[string]any{"delivery_status": deliveryStatusDelivered, "delivered_at": nowUTC()}); r.Error != nil {
+		switch row.RunStatus {
+		case "complete":
+			if row.Kind == notifKindOrchFinished {
+				r := tx.Exec(`
+UPDATE agent_orchestrations
+   SET delivery_status = ?, delivered_at = now(), delivery_error_code = '', updated_at = now()
+ WHERE id = ? AND delivery_status = ? AND delivery_run_id = ?`,
+					deliveryStatusDelivered, row.OrchID, deliveryStatusDelivering, runID)
+				if r.Error != nil {
+					return r.Error
+				}
+				if r.RowsAffected == 0 {
+					return nil // 组已不归这场 run：旧尝试的 complete 不能收口当前交付
+				}
+			}
+			r := tx.Exec(`
+UPDATE agent_notifications
+   SET status = ?, consumed_at = now(), updated_at = now()
+ WHERE id = ? AND claim_run_id = ? AND status = ?`,
+				notifStatusConsumed, row.NotificationID, runID, notifStatusClaimed)
+			if r.Error != nil {
 				return r.Error
 			}
+			changed = r.RowsAffected > 0
+			return nil
+		case "error", "stopped":
+			code := deliveryErrRunError
+			if row.RunStatus == "stopped" {
+				code = deliveryErrStopped
+			}
+			r := tx.Exec(`
+UPDATE agent_notifications
+   SET status = ?, consume_error_code = ?, failed_at = now(), updated_at = now()
+ WHERE id = ? AND claim_run_id = ? AND status = ?`,
+				notifStatusFailed, code, row.NotificationID, runID, notifStatusClaimed)
+			if r.Error != nil {
+				return r.Error
+			}
+			if r.RowsAffected == 0 {
+				return nil
+			}
+			changed = true
+			if row.Kind != notifKindOrchFinished {
+				return nil // 单件 Task 的协调失败不动组交付状态
+			}
+			return tx.Exec(`
+UPDATE agent_orchestrations
+   SET delivery_status = ?, delivery_error_code = ?, updated_at = now()
+ WHERE id = ? AND delivery_status = ? AND delivery_run_id = ?`,
+				deliveryStatusFailed, code, row.OrchID, deliveryStatusDelivering, runID).Error
+		default:
+			return nil // 未知终态：留给人工排查，不猜
 		}
-		return tx.Model(&AgentNotification{}).
-			Where("claim_run_id = ? AND status = ?", runID, notifStatusClaimed).
-			Updates(map[string]any{"status": notifStatusConsumed, "consumed_at": nowUTC()}).Error
 	})
-	if err == nil {
-		s.PublishEvent(ctx, row.TenantID, eventAgentOrchestrationsChanged, row.OrchID)
+	if err != nil {
+		return err
 	}
-	return err
+	if !changed {
+		return nil
+	}
+	if row.TaskID != "" {
+		s.PublishEvent(ctx, row.TenantID, eventAgentTasksChanged, row.TaskID)
+	}
+	s.PublishEvent(ctx, row.TenantID, eventAgentOrchestrationsChanged, row.OrchID)
+	s.PublishTaskWake(ctx, row.TenantID, "delivery_reconciled", row.OrchID)
+	return nil
 }
 
-// reconcileDeliveries 是调度侧的交付对账补偿：delivery run 已终态但组还停在 delivering 的，
-// 逐场走 ReconcileDeliveryRun。worker 活着时 EndRun 钩子先到，这里全部空转；崩溃后由这里收口。
+// reconcileDeliveries 是调度侧的交付对账补偿（§6.5）：两条来源合并——
+//   - 通知 claimed 且当前 claim run 已终态：覆盖 task_failed／task_interrupted／plan_review
+//     等所有通知，不依赖组是否有 delivery_status；
+//   - 组仍 delivering 且 delivery run 已终态：兜历史漂移。
+//
+// worker 活着时 EndRun 钩子先到，这里全部空转；崩溃后由这里收口。限批 64 条，避免一次扫全表。
 func (ts *TaskScheduler) reconcileDeliveries(ctx context.Context) {
-	var rows []struct {
-		RunID string `gorm:"column:delivery_run_id"`
-	}
+	var runIDs []string
 	if err := ts.store.db.WithContext(ctx).Raw(`
-SELECT o.delivery_run_id FROM agent_orchestrations o JOIN runs r ON r.id = o.delivery_run_id
- WHERE o.delivery_status = ? AND r.status <> 'running'`, deliveryStatusDelivering).Scan(&rows).Error; err != nil {
+SELECT r.id FROM agent_notifications n JOIN runs r ON r.id = n.claim_run_id
+ WHERE n.status = ? AND r.status <> 'running'
+ ORDER BY n.updated_at, n.id LIMIT 64`, notifStatusClaimed).Scan(&runIDs).Error; err != nil {
 		log.Printf("task delivery reconcile list: %v", err)
 		return
 	}
-	for _, r := range rows {
-		if err := ts.store.ReconcileDeliveryRun(ctx, RunID(r.RunID)); err != nil {
-			log.Printf("task delivery reconcile %s: %v", r.RunID, err)
+	for _, id := range runIDs {
+		if err := ts.store.ReconcileDeliveryRun(ctx, RunID(id)); err != nil {
+			log.Printf("task delivery reconcile %s: %v", id, err)
+		}
+	}
+	var deliveryRuns []string
+	if err := ts.store.db.WithContext(ctx).Raw(`
+SELECT o.delivery_run_id FROM agent_orchestrations o JOIN runs r ON r.id = o.delivery_run_id
+ WHERE o.delivery_status = ? AND r.status <> 'running' LIMIT 64`, deliveryStatusDelivering).
+		Scan(&deliveryRuns).Error; err != nil {
+		log.Printf("task delivery reconcile group list: %v", err)
+		return
+	}
+	for _, id := range deliveryRuns {
+		if err := ts.store.ReconcileDeliveryRun(ctx, RunID(id)); err != nil {
+			log.Printf("task delivery reconcile group %s: %v", id, err)
 		}
 	}
 }
 
-// buildCoordinationInput 在认领事务的锁内拼协调 run 的首条输入（§9.2）：
+// buildCoordinationInput 在认领事务的锁内拼协调 run 的首条输入（doc/70 §9.2；恢复参数见 doc/73 §6.2）：
 // 通知 kind + 原始 goal + 相关 Task／组状态、机器错误、结果摘要、结果版本与产物路径 +
 // 执行约定（检查这些持久事实并向用户解释／交付；不要宣称未发生的停止、恢复或外部回滚）。
-func buildCoordinationInput(tx *gorm.DB, n AgentNotification, o AgentOrchestration) (string, error) {
+// 人工新尝试（rp.Attempt>1）先声明「这是第几次处理、上次怎样结束、上次已可见的正文是什么」——
+// 只作为参考写进输入，不复制成新的 assistant 行。
+func buildCoordinationInput(tx *gorm.DB, n AgentNotification, o AgentOrchestration, rp coordinationRecovery) (string, error) {
 	var t AgentTask
 	if n.TaskID != "" {
 		if err := tx.Where("id = ?", n.TaskID).Take(&t).Error; err != nil {
@@ -429,6 +604,15 @@ func buildCoordinationInput(tx *gorm.DB, n AgentNotification, o AgentOrchestrati
 		}
 	}
 	head := fmt.Sprintf("【协调通知】%s\n编排目标：%s\n", n.Kind, o.Goal)
+	if rp.Attempt > 1 {
+		head += fmt.Sprintf("这是通知 %s 的第 %d 次人工处理。上一次 run %s 以 %s 结束，机器原因 = %s。\n",
+			n.ID, rp.Attempt, rp.PreviousRunID, rp.PreviousTerminalStatus, n.ConsumeErrorCode)
+		if txt := strings.TrimSpace(rp.PreviousRootAssistant); txt != "" {
+			head += "上一次已保存的用户可见正文（仅作参考，不要原样重发）：\n" +
+				truncatePlain(txt, 2000) + "\n"
+		}
+		head += "请核对当前持久结果，补完尚未完成的说明；不要宣称重跑了 Task，不要重复已完成的副作用。\n"
+	}
 	const contract = "请检查以上持久事实并向用户解释／交付；不要宣称未发生的停止、恢复或外部回滚。"
 	switch n.Kind {
 	case notifKindTaskFailed:

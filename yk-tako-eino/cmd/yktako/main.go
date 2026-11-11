@@ -374,17 +374,18 @@ func main() {
 	log.Printf("subagents: concurrency %d, return cap %d B", *subagentConcurrency, *subagentReturnCap)
 	log.Printf("archive ttl %s", *archiveTTL)
 	// 持久 Task 调度循环（doc/70 §8.1）：显式启动，不藏在路由注册里。每副本一个；
-	// 正确性由 PG 行锁、条件更新与唯一索引承担。interval <= 0 关闭（验收对照跑法）。
+	// 正确性由 PG 行锁、条件更新与唯一索引承担。interval <= 0 只关**循环**，装配仍挂上：
+	// 人工重试端点要借它的装配口真正启动一场恢复 run（doc/73 §4.2），循环关掉不该让它 500。
 	srv := runengine.NewServer(store, *batch, *dev, worker, *resumeMax, auth, sysSkillsAbs)
 	srv.SetTaskInputTimeout(*taskInputTimeout)
+	ts := runengine.NewTaskScheduler(store, worker, *taskInterval)
+	srv.AttachTaskScheduler(ts)
 	if *taskInterval > 0 {
-		ts := runengine.NewTaskScheduler(store, worker, *taskInterval)
-		srv.AttachTaskScheduler(ts)
 		stopTask := ts.Start(ctx)
 		_ = stopTask // 进程生命周期与 main 一致（log.Fatal 退出）
 		log.Printf("task scheduler: interval %s, input timeout %s", *taskInterval, *taskInputTimeout)
 	} else {
-		log.Printf("task scheduler off (-task-interval <= 0)")
+		log.Printf("task scheduler loop off (-task-interval <= 0; notification retry still works)")
 	}
 	r := srv.RouterFor()
 	log.Fatal(r.Run(*engine))

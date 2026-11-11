@@ -4,6 +4,8 @@ import { useChat, type AskQuestion, type Bubble, type ToolCard } from './chat'
 import { MAX_CHATS, pickEviction } from './chatpool'
 import {
   ApiError,
+  getNotification,
+  getOrchestration,
   getSessionSubagents,
   getTaskAttention,
   listSessions,
@@ -908,7 +910,7 @@ function logout() {
   // 处理项与跨页跳转都按账号算：换账号后旧 id 在新账号下必然 404，先清空。
   attentionItems.value = []
   attentionError.value = ''
-  taskFocus.value = { workspaceId: '', taskId: '', orchestrationId: '', questionId: '', nonce: 0 }
+  taskFocus.value = { workspaceId: '', taskId: '', orchestrationId: '', questionId: '', notificationId: '', nonce: 0 }
 }
 
 // undefined = 没有待切换的项目（普通「新对话」，沿用当前落点）；null = 明确回默认项目。
@@ -1042,19 +1044,47 @@ const taskFocus = ref({
   taskId: '',
   orchestrationId: '',
   questionId: '',
+  // doc/73 §7.2：交付失败处理项带着可恢复的通知 id，任务页据此打开恢复面板。
+  notificationId: '',
   nonce: 0,
 })
 function openAttention(item: AttentionItem) {
   const wid = attentionWorkspaceId.value
+  // 协调 run 中断（带通知）不是 Task 中断：进来源会话，由用户显式点「继续」复用既有续跑。
+  if (item.kind === 'interrupted' && item.notificationId) {
+    void openSessionForAttention(item)
+    return
+  }
   taskFocus.value = {
     workspaceId: wid,
     taskId: item.kind === 'question' || item.kind === 'interrupted' ? item.taskId : '',
     orchestrationId:
       item.kind === 'plan_review' || item.kind === 'delivery_failed' ? item.orchestrationId : '',
     questionId: item.kind === 'question' ? item.questionId : '',
+    notificationId: item.kind === 'delivery_failed' ? item.notificationId : '',
     nonce: taskFocus.value.nonce + 1,
   }
   goPage('tasks')
+}
+
+// 通知 → 编排组 → 来源会话：两步现读服务端，不在左侧存会话 id。
+async function openSessionForAttention(item: AttentionItem) {
+  try {
+    const n = await getNotification(item.notificationId)
+    const o = await getOrchestration(n.orchestrationId)
+    if (o.orchestration.sourceSessionId) await openSessionFromProjects(o.orchestration.sourceSessionId)
+  } catch (e) {
+    taskFocus.value = {
+      workspaceId: attentionWorkspaceId.value,
+      taskId: '',
+      orchestrationId: item.orchestrationId,
+      questionId: '',
+      notificationId: item.notificationId,
+      nonce: taskFocus.value.nonce + 1,
+    }
+    goPage('tasks')
+    void e
+  }
 }
 
 // 侧栏「运行中」：本 tab 里正在跑的实例（本地 busy），收口后自动消失，不重拉列表。
@@ -1731,7 +1761,7 @@ async function onScroll() {
           <li v-if="attentionLoading && !attentionItems.length" class="attn-note">正在加载…</li>
           <li v-else-if="attentionError" class="attn-note error" role="alert">{{ attentionError }}</li>
           <li v-else-if="!attentionItems.length" class="attn-note">没有需要你处理的事。</li>
-          <li v-for="item in attentionItems" :key="`${item.kind}:${item.taskId || item.orchestrationId}`">
+          <li v-for="item in attentionItems" :key="`${item.kind}:${item.taskId || item.orchestrationId}:${item.notificationId}`">
             <button type="button" class="attn-item" @click="openAttention(item)">
               <span class="attn-title">{{ item.title }}</span>
               <span class="attn-kind">{{ attentionLabel(item) }}</span>
@@ -1923,7 +1953,9 @@ async function onScroll() {
           :focus-task-id="taskFocus.taskId"
           :focus-orchestration-id="taskFocus.orchestrationId"
           :focus-question-id="taskFocus.questionId"
+          :focus-notification-id="taskFocus.notificationId"
           :focus-nonce="taskFocus.nonce"
+          @open-session="openSessionFromProjects"
         />
         <ToolsView v-else-if="page === 'tools'" :key="tenant.id" :prefill-name="toolsPrefill" />
         <ProjectsView
