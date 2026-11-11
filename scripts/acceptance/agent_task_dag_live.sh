@@ -50,8 +50,15 @@ eq "创建回 202 且组状态 active" "active" "$(echo "$RESP" | jq -r '.data.s
 at_orch "$OID"
 eq "组里 3 个节点" "3" "$(echo "$AT_ORCH" | jq '.tasks | length')"
 eq "2 条依赖边" "2" "$(echo "$AT_ORCH" | jq '.links | length')"
-eq "a 创建即 ready（无父）" "ready" "$(echo "$AT_ORCH" | jq -r '.tasks[] | select(.key=="a") | .status')"
-eq "b 创建即 ready（无父）" "ready" "$(echo "$AT_ORCH" | jq -r '.tasks[] | select(.key=="b") | .status')"
+# 无父节点创建即就绪；调度循环够快时读到的是已被领取的 running，两种都算「没被挡在 pending」。
+for k in a b; do
+  st=$(echo "$AT_ORCH" | jq -r --arg k "$k" '.tasks[] | select(.key==$k) | .status')
+  if [ "$st" = "ready" ] || [ "$st" = "running" ]; then
+    ok "$k 创建即就绪（ready/running，无父）"
+  else
+    no "$k 创建即就绪（ready/running，无父） —— 实际 [$st]"
+  fi
+done
 eq "c 父未成功前是 pending" "pending" "$(echo "$AT_ORCH" | jq -r '.tasks[] | select(.key=="c") | .status')"
 TID_A=$(echo "$AT_ORCH" | jq -r '.tasks[] | select(.key=="a") | .taskId')
 TID_B=$(echo "$AT_ORCH" | jq -r '.tasks[] | select(.key=="b") | .taskId')

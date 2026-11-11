@@ -801,6 +801,134 @@ func TestAgentTaskNotificationBusyReceiver(t *testing.T) {
 	_ = launch.RunID
 }
 
+// TestAgentTaskNotificationBusyNoStarvation 钉住消费候选的选择：来源会话忙的通知留在 pending，
+// 但不占本轮名额——否则积压的忙通知恒占前 8 条，别的会话的交付永远排不到（2026-11-11 活体抓过：
+// 一个挂起会话的两条旧通知把 DAG 交付饿死在 pending）。
+func TestAgentTaskNotificationBusyNoStarvation(t *testing.T) {
+	s := newTestStore(t, testLease, testTTL)
+	wsID, idleSess := seedTaskEnv(t, s, "researcher")
+	ctx := context.Background()
+	resp, err := s.CreateAgentTask(ctx, testOwner, CreateTaskCommand{
+		IdempotencyKey: "k1", WorkspaceID: wsID, SourceSessionID: idleSess, Content: "交付一件", Agent: "researcher",
+	}, planEnv{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	busySess, err := newSessionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Create(&Session{
+		ID: busySess, Title: "忙会话", TenantID: testOwner.TenantID, UserID: testOwner.UserID,
+		Visibility: "private", WorkspaceID: &wsID, Kind: sessionKindChat,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Exec(`INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at)
+		VALUES ('r_starve_busy', ?, 'running', 1, now() + make_interval(secs => 120), now())`, busySess).Error; err != nil {
+		t.Fatal(err)
+	}
+	mk := func(key string, sess SessionID) string {
+		t.Helper()
+		if err := s.insertNotificationTx(s.db, AgentNotification{
+			TenantID: testOwner.TenantID, OrchestrationID: resp.OrchestrationID,
+			ReceiverSessionID: sess, Kind: notifKindTaskFailed, DedupKey: "task_failed:starve:" + key,
+			Status: notifStatusPending,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var n AgentNotification
+		if err := s.db.Where("dedup_key = ?", "task_failed:starve:"+key).Take(&n).Error; err != nil {
+			t.Fatal(err)
+		}
+		return n.ID
+	}
+	for i := 0; i < 8; i++ {
+		mk("busy"+string(rune('a'+i)), busySess)
+	}
+	idleID := mk("idle", idleSess)
+	// 已终止的复核通知（组 active 但 plan_hold=false）与会话忙无关：它进来只为被标 consumed。
+	if err := s.insertNotificationTx(s.db, AgentNotification{
+		TenantID: testOwner.TenantID, OrchestrationID: resp.OrchestrationID,
+		ReceiverSessionID: busySess, Kind: notifKindPlanReviewRequired,
+		DedupKey: "plan_review_required:starve", Status: notifStatusPending,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var review AgentNotification
+	if err := s.db.Where("dedup_key = ?", "plan_review_required:starve").Take(&review).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	ts := &TaskScheduler{store: s}
+	ids := ts.pendingNotificationIDs(ctx)
+	if len(ids) != 2 {
+		t.Fatalf("候选 = %v, want 空闲会话的通知 + 已终止的复核", ids)
+	}
+	got := map[string]bool{}
+	for _, id := range ids {
+		got[id] = true
+	}
+	if !got[idleID] || !got[review.ID] {
+		t.Fatalf("候选 = %v, want 含 %s 与 %s", ids, idleID, review.ID)
+	}
+	if launch := ts.claimNotification(ctx, review.ID); launch != nil {
+		t.Fatalf("已终止的复核还被认领成 run")
+	}
+	if st, _ := notifStatus(t, s, review.ID); st != notifStatusConsumed {
+		t.Fatalf("已终止的复核状态 = %s, want consumed", st)
+	}
+	// 忙会话释放后回到候选里；仍按 created_at 取前 8 条，不丢行。
+	setRunStatus(t, s, "r_starve_busy", "complete")
+	ids = ts.pendingNotificationIDs(ctx)
+	if len(ids) != 8 {
+		t.Fatalf("释放后候选 = %d 条, want 8（上限）", len(ids))
+	}
+	if st, _ := notifStatus(t, s, idleID); st != notifStatusPending {
+		t.Fatalf("空闲会话通知状态 = %s, want pending（还没被认领）", st)
+	}
+}
+
+// TestAgentTaskOrchFinishedFailedGroupConsumed 钉住不可交付的整组完成通知：组 failed／cancelled
+// 没有 delivery_status，claimNotification 不铸交付 run，但通知必须收口——留在 pending 会永久
+// 占住消费名额（忙通知饥饿的另一半）。
+func TestAgentTaskOrchFinishedFailedGroupConsumed(t *testing.T) {
+	s := newTestStore(t, testLease, testTTL)
+	wsID, sessID := seedTaskEnv(t, s, "researcher")
+	ctx := context.Background()
+	resp, err := s.CreateAgentTask(ctx, testOwner, CreateTaskCommand{
+		IdempotencyKey: "k1", WorkspaceID: wsID, SourceSessionID: sessID, Content: "失败组", Agent: "researcher",
+	}, planEnv{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Exec(`UPDATE agent_orchestrations SET status = ?, finished_at = now() WHERE id = ?`,
+		orchStatusFailed, resp.OrchestrationID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.insertNotificationTx(s.db, AgentNotification{
+		TenantID: testOwner.TenantID, OrchestrationID: resp.OrchestrationID,
+		ReceiverSessionID: sessID, Kind: notifKindOrchFinished,
+		DedupKey: "orchestration_finished:failed", Status: notifStatusPending,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var n AgentNotification
+	if err := s.db.Where("dedup_key = ?", "orchestration_finished:failed").Take(&n).Error; err != nil {
+		t.Fatal(err)
+	}
+	ts := &TaskScheduler{store: s}
+	if launch := ts.claimNotification(ctx, n.ID); launch != nil {
+		t.Fatalf("失败组还被认领成交付")
+	}
+	if st, _ := notifStatus(t, s, n.ID); st != notifStatusConsumed {
+		t.Fatalf("失败组通知状态 = %s, want consumed", st)
+	}
+	if got := s.count(t, &Run{}, "session_id = ?", sessID); got != 0 {
+		t.Fatalf("失败组铸了 %d 场交付 run, want 0", got)
+	}
+}
+
 func notifStatus(t *testing.T, s *Store, id string) (string, string) {
 	t.Helper()
 	var row struct {

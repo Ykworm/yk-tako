@@ -114,7 +114,8 @@ func main() {
 	leaseRenew := flag.Duration("lease-renew", durationEnv("TAKO_LEASE_RENEW", defaultLeaseRenew), "watchdog renew interval (must be < lease-ttl; env TAKO_LEASE_RENEW)")
 	compactWindow := flag.Int("compact-window", defaultCompactWindow, "context window in tokens for compaction; limit = window - min(window/5, 16384); 0 disables")
 	resumeMax := flag.Int("resume-max", 3, "max resumes per run (doc/30); resumeCount = lease_epoch-1, resumable while below it")
-	taskInterval := flag.Duration("task-interval", time.Second, "persistent-task scheduler round interval (doc/70); <= 0 disables the loop")
+	taskInterval := flag.Duration("task-interval", 30*time.Second, "persistent-task reconcile interval (doc/72 §9.2; event wakeups run the same round); <= 0 disables the loop")
+	taskInputTimeout := flag.Duration("task-input-timeout", 24*time.Hour, "deadline for a persistent Task's ask_user question (doc/72 §7); 0 = unlimited, negative is a startup error")
 	archiveTTL := flag.Duration("archive-ttl", 168*time.Hour, "how long compacted transcripts and soft-deleted session archives stay before the sweeper removes them")
 	agentsDir := flag.String("agents-dir", "agents", "directory of sub-agent specs (*.md + YAML frontmatter); scanned at each run start (relative to CWD)")
 	workspace := flag.String("workspace", "./workspace", "workspace root for first-party file tools; created at startup, tools are confined to it")
@@ -163,6 +164,11 @@ func main() {
 	}
 	if *archiveTTL <= 0 {
 		log.Fatalf("archive-ttl %s 必须大于 0（默认 168h）", *archiveTTL)
+	}
+	// 负超时没有语义（不是「不限时」——那是 0）：手误写成 -1h 会让每个 Task 问题一落库就到期，
+	// 表现为「刚问就被判超时」，启动即退比跑起来自毁好。
+	if *taskInputTimeout < 0 {
+		log.Fatalf("task-input-timeout %s < 0：不限制请写 0（负值没有语义）", *taskInputTimeout)
 	}
 
 	ctx := context.Background()
@@ -370,12 +376,13 @@ func main() {
 	// 持久 Task 调度循环（doc/70 §8.1）：显式启动，不藏在路由注册里。每副本一个；
 	// 正确性由 PG 行锁、条件更新与唯一索引承担。interval <= 0 关闭（验收对照跑法）。
 	srv := runengine.NewServer(store, *batch, *dev, worker, *resumeMax, auth, sysSkillsAbs)
+	srv.SetTaskInputTimeout(*taskInputTimeout)
 	if *taskInterval > 0 {
 		ts := runengine.NewTaskScheduler(store, worker, *taskInterval)
 		srv.AttachTaskScheduler(ts)
 		stopTask := ts.Start(ctx)
 		_ = stopTask // 进程生命周期与 main 一致（log.Fatal 退出）
-		log.Printf("task scheduler: interval %s", *taskInterval)
+		log.Printf("task scheduler: interval %s, input timeout %s", *taskInterval, *taskInputTimeout)
 	} else {
 		log.Printf("task scheduler off (-task-interval <= 0)")
 	}

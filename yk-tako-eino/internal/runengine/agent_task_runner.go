@@ -29,11 +29,15 @@ const taskExecutorPrompt = `你是一场持久任务的执行者：你的首条�
 
 // agentTaskNoTools 是执行者基座里不给的工具名（doc/70 §6.3「不获得超出规格的工具」）：
 //   - delegate_task / create_orchestration：Task 执行者不得再创建异步编排（§6.3 第 2 条）；
-//   - ask_user / enter_plan_mode / submit_plan：等人与计划审批需要本人在场——执行 run 挂在
-//     kind=agent_task 的会话上，用户看不见它，问了也没人答。执行契约是「做完就交结果」。
+//   - enter_plan_mode / submit_plan：计划审批是**来源会话**的事，执行者没有本人在场；
+//   - revise_orchestration / continue_orchestration：改图与放行归计划复核 run，执行者不得变更计划。
+//
+// ask_user 不再排除（doc/72 §7.1）：Task 执行者可以提问，问题带 expires_at，由任务页
+// 转给来源会话的人回答；超时由调度器收口为 failed/input_timeout。
 var agentTaskNoTools = map[string]bool{
 	"delegate_task": true, "create_orchestration": true,
-	"ask_user": true, "enter_plan_mode": true, "submit_plan": true,
+	"enter_plan_mode": true, "submit_plan": true,
+	"revise_orchestration": true, "continue_orchestration": true,
 }
 
 // agentTaskExecutorBase 组执行者的工具基座：冻结池减去等人与异步创建，加上执行者专属的
@@ -262,6 +266,7 @@ SELECT t.id AS task_id, t.tenant_id, t.orchestration_id, o.source_session_id, r.
 	}
 	if taskID != "" {
 		s.PublishEvent(ctx, tenantID, eventAgentTasksChanged, taskID)
+		s.PublishTaskWake(ctx, tenantID, "task_failed", taskID)
 	}
 	return nil
 }
@@ -275,7 +280,8 @@ func (ts *TaskScheduler) launchTaskRun(ctx context.Context, c agentTaskClaim) {
 		return
 	}
 	bg := withAgentTaskRunBox(launchContext(ctx),
-		&agentTaskRunBox{TaskID: c.TaskID, OrchestrationID: c.OrchestrationID, SourceRunID: c.SourceRunID})
+		&agentTaskRunBox{TaskID: c.TaskID, OrchestrationID: c.OrchestrationID, SourceRunID: c.SourceRunID,
+			InputTimeout: ts.inputTimeout})
 	p := principal{UserID: c.UserID, TenantID: c.TenantID, Role: "member"}
 	bg = withPrincipal(bg, p)
 	prof, aerr := ts.assembleTask(bg, p, c.TaskID)
@@ -323,6 +329,19 @@ func (s *Server) resumeAgentTask(c *gin.Context) {
 		writeEnvelope(c, http.StatusConflict, codeTaskNotResumable, "这件任务还没有执行记录，不能恢复", nil)
 		return
 	}
+	// 已到期的提问先收口（doc/72 §7.3）：收口后 Task 是 failed/input_timeout，resume 不能复活它。
+	if expired, xerr := s.store.expireTaskInputsForTask(ctx, view.TaskID); xerr != nil {
+		internal(c, xerr)
+		return
+	} else if expired {
+		if _, _, serr := s.store.StopRun(ctx, RunID(view.CurrentRunID)); serr != nil {
+			log.Printf("task resume timeout stop %s: %v", view.CurrentRunID, serr)
+		}
+		s.store.PublishEvent(ctx, p.TenantID, eventAgentTasksChanged, view.TaskID)
+		s.store.PublishTaskWake(ctx, p.TenantID, "task_timeout", view.TaskID)
+		writeEnvelope(c, http.StatusConflict, codeTaskNotResumable, "这件任务现在不能恢复", nil)
+		return
+	}
 	runID := RunID(view.CurrentRunID)
 	claim, err := s.store.ClaimResume(ctx, runID, s.resumeMax)
 	switch {
@@ -367,9 +386,12 @@ func (s *Server) resumeAgentTask(c *gin.Context) {
 		return
 	}
 	bg := withAgentTaskRunBox(launchContext(c.Request.Context()),
-		&agentTaskRunBox{TaskID: view.TaskID, OrchestrationID: view.OrchestrationID})
+		&agentTaskRunBox{TaskID: view.TaskID, OrchestrationID: view.OrchestrationID,
+			InputTimeout: s.taskInputTimeout})
 	bg = withPrincipal(bg, p)
 	go s.worker.RunResume(withRunProfile(bg, prof), claim.SessionID, runID, claim.Epoch, replay)
+	s.store.PublishEvent(ctx, p.TenantID, eventAgentTasksChanged, view.TaskID)
+	s.store.PublishTaskWake(ctx, p.TenantID, "task_resume", view.TaskID)
 	writeEnvelope(c, http.StatusAccepted, codeOK, "", resumeTaskResponse{
 		TaskID: view.TaskID, RunID: runID, Status: "running", ResumeCount: int(claim.Epoch - 1),
 	})

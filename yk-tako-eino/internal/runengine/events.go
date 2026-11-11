@@ -47,6 +47,30 @@ const eventsMaxLen = 1000
 // keyEvents：tk:events:<tid> —— 租户事件流。
 func keyEvents(tenantID string) string { return keyPrefix + "events:" + tenantID }
 
+// keyTaskWake = tk:agent-task-wake —— Task 调度器的内部唤醒流（doc/72 §9.1）。
+// 与浏览器事件流分开：它只叫醒调度循环，不带状态、不承载正文；丢了由 30 秒对账兜住。
+const keyTaskWake = keyPrefix + "agent-task-wake"
+
+// PublishTaskWake 追加一条内部唤醒。fields 只作诊断（tenant/kind/id），不是事实真源。
+// PG 写成功后调用；失败只记日志，不能反过来改变业务结果。
+func (st *Store) PublishTaskWake(ctx context.Context, tenantID, kind, id string) {
+	if st == nil || st.rdb == nil {
+		return
+	}
+	if err := st.rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: keyTaskWake,
+		MaxLen: eventsMaxLen,
+		Approx: true,
+		Values: map[string]any{
+			"tenant_id": tenantID,
+			"kind":      kind,
+			"id":        id,
+		},
+	}).Err(); err != nil {
+		log.Printf("PublishTaskWake %s %s: %v", kind, id, err)
+	}
+}
+
 // publishEvent 追加一条变更事件。失败只记日志——事件是优化不是真源（doc/46 §3.1），
 // 删除/改名在 PG 早已提交，不能反过来让请求失败。
 func (s *Server) publishEvent(ctx context.Context, tenantID, typ, id string) {

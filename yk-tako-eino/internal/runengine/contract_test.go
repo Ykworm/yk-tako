@@ -146,6 +146,18 @@ func TestContractQuestionViewBytes(t *testing.T) {
 	if got != want {
 		t.Fatalf("question 行字节 = %s\nwant %s", got, want)
 	}
+	// Task 问题设了截止时间才多出 expiresAt（doc/72 §4.5）；普通会话行字节不变。
+	exp := time.Unix(86400, 0).UTC()
+	got = mustJSON(t, questionView{
+		QuestionID: "qs_2", RunID: "r_1", ToolCallID: "call_ask_2", Kind: "question",
+		Question: "选 A 还是 B？", Status: "pending", CreatedAt: time.Unix(0, 0).UTC(), ExpiresAt: &exp,
+	})
+	const wantExpires = `{"questionId":"qs_2","runId":"r_1","toolCallId":"call_ask_2","kind":"question",` +
+		`"question":"选 A 还是 B？","status":"pending","createdAt":"1970-01-01T00:00:00Z",` +
+		`"expiresAt":"1970-01-02T00:00:00Z"}`
+	if got != wantExpires {
+		t.Fatalf("Task 问题行字节 = %s\nwant %s", got, wantExpires)
+	}
 }
 
 // TestContractBusinessCodes 钉住 doc/40 §4 业务码表里的关键码值。
@@ -184,6 +196,10 @@ func TestContractBusinessCodes(t *testing.T) {
 		{"任务不可恢复", codeTaskNotResumable, 117103},
 		{"任务已结束", codeTaskFinished, 117104},
 		{"编排组已结束", codeOrchFinished, 117105},
+		{"计划版本过期", codeRevisionStale, 117106},
+		{"编排组不可修订", codeNotRevisable, 117107},
+		{"修订键命令冲突", codeRevisionConflict, 117108},
+		{"提问已过期", codeQuestionExpired, 115102},
 		{"内部错误", codeInternal, 111901},
 	}
 	for _, c := range cases {
@@ -384,7 +400,7 @@ func TestContractAgentTaskViewBytes(t *testing.T) {
 		FinishedAt:     ptrTime(time.Unix(2, 0).UTC()),
 		UpdatedAt:      time.Unix(0, 0).UTC(),
 	})
-	const wantRev = `{"taskId":"at_1","orchestrationId":"or_1","key":"C","content":"汇总成报告","agent":"coder","modelRef":"","workspaceId":"ws_1","status":"succeeded","currentRunId":"r_1",` +
+	const wantRev = `{"taskId":"at_1","orchestrationId":"or_1","key":"C","content":"汇总成报告","agent":"coder","modelRef":"","planCheckpoint":false,"createdRevision":0,"workspaceId":"ws_1","status":"succeeded","currentRunId":"r_1",` +
 		`"result":{"summary":"报告写好了","artifacts":[{"path":"reports/a.md","kind":"report"}],"metadata":null},"error":null,"resultRevision":1,` +
 		`"createdAt":"1970-01-01T00:00:00Z","startedAt":"1970-01-01T00:00:01Z","finishedAt":"1970-01-01T00:00:02Z","updatedAt":"1970-01-01T00:00:00Z"}`
 	if rev != wantRev {
@@ -398,7 +414,7 @@ func TestContractAgentTaskViewBytes(t *testing.T) {
 		UpdatedAt:  time.Unix(0, 0).UTC(),
 		FinishedAt: ptrTime(time.Unix(2, 0).UTC()),
 	})
-	const wantFail = `{"taskId":"at_2","orchestrationId":"or_1","key":"A","content":"调研","agent":"researcher","modelRef":"","workspaceId":"ws_1","status":"failed","currentRunId":"",` +
+	const wantFail = `{"taskId":"at_2","orchestrationId":"or_1","key":"A","content":"调研","agent":"researcher","modelRef":"","planCheckpoint":false,"createdRevision":0,"workspaceId":"ws_1","status":"failed","currentRunId":"",` +
 		`"result":null,"error":{"code":"run_error","message":"执行 run 失败"},"resultRevision":0,` +
 		`"createdAt":"1970-01-01T00:00:00Z","startedAt":null,"finishedAt":"1970-01-01T00:00:02Z","updatedAt":"1970-01-01T00:00:00Z"}`
 	if failed != wantFail {
@@ -425,9 +441,9 @@ func TestContractOrchestrationViewBytes(t *testing.T) {
 		}},
 		Links: []taskLinkView{{ParentTaskID: "at_2", ChildTaskID: "at_1"}},
 	})
-	const want = `{"orchestration":{"orchestrationId":"or_1","goal":"调研 A、B 后汇总","workspaceId":"ws_1","sourceSessionId":"s_1","status":"active","finalTaskId":"at_1","deliveryStatus":"","deliveryRunId":"",` +
+	const want = `{"orchestration":{"orchestrationId":"or_1","goal":"调研 A、B 后汇总","workspaceId":"ws_1","sourceSessionId":"s_1","status":"active","finalTaskId":"at_1","planRevision":0,"planHold":false,"deliveryStatus":"","deliveryRunId":"",` +
 		`"createdAt":"1970-01-01T00:00:00Z","finishedAt":null,"deliveredAt":null,"updatedAt":"1970-01-01T00:00:00Z"},` +
-		`"tasks":[{"taskId":"at_1","orchestrationId":"or_1","key":"C","content":"汇总成报告","agent":"coder","modelRef":"","workspaceId":"ws_1","status":"ready","currentRunId":"",` +
+		`"tasks":[{"taskId":"at_1","orchestrationId":"or_1","key":"C","content":"汇总成报告","agent":"coder","modelRef":"","planCheckpoint":false,"createdRevision":0,"workspaceId":"ws_1","status":"ready","currentRunId":"",` +
 		`"result":null,"error":null,"resultRevision":0,"createdAt":"1970-01-01T00:00:00Z","startedAt":null,"finishedAt":null,"updatedAt":"1970-01-01T00:00:00Z"}],` +
 		`"links":[{"parentTaskId":"at_2","childTaskId":"at_1"}]}`
 	if got != want {
@@ -463,5 +479,76 @@ func TestContractTaskResumeStopBytes(t *testing.T) {
 	const wantStop = `{"status":"cancelled","taskId":"at_1"}`
 	if got != wantStop {
 		t.Fatalf("stop 字节 = %s\nwant %s", got, wantStop)
+	}
+}
+
+// TestContractPlanRevisionBytes 钉住计划修订三个端点的 data 字节（doc/72 §4.2–§4.4）。
+// 真实字节来自隔离引擎 curl（revision 201 / continue 200 / 修订历史 200）：
+// 成功体字段序 revisionId → orchestrationId → revision → finalTaskId → planHold → addedTaskIds；
+// 继续体 orchestrationId → revision → planHold；审计行的三个数组恒为数组（空时输出 []，不是 null）。
+func TestContractPlanRevisionBytes(t *testing.T) {
+	got := mustJSON(t, revisionResp{
+		RevisionID: "pr_1", OrchestrationID: "or_1", Revision: 1,
+		FinalTaskID: "at_1", PlanHold: false, AddedTaskIDs: []string{"at_9"},
+	})
+	const wantResp = `{"revisionId":"pr_1","orchestrationId":"or_1","revision":1,"finalTaskId":"at_1","planHold":false,"addedTaskIds":["at_9"]}`
+	if got != wantResp {
+		t.Fatalf("修订成功体字节 = %s\nwant %s", got, wantResp)
+	}
+	got = mustJSON(t, revisionResp{
+		RevisionID: "pr_1", OrchestrationID: "or_1", Revision: 1,
+		FinalTaskID: "at_1", PlanHold: false, AddedTaskIDs: []string{},
+	})
+	const wantEmpty = `{"revisionId":"pr_1","orchestrationId":"or_1","revision":1,"finalTaskId":"at_1","planHold":false,"addedTaskIds":[]}`
+	if got != wantEmpty {
+		t.Fatalf("修订空 addedTaskIds 字节 = %s\nwant %s", got, wantEmpty)
+	}
+
+	got = mustJSON(t, revisionView{
+		RevisionID: "pr_1", Revision: 1, BaseRevision: 0,
+		Reason: "A 的结果表明必须补充 D",
+		AddTasks: []revisionTaskView{{
+			Key: "D", Content: "补充调研 D，写入 d.md", Agent: "researcher",
+			ModelRef: "", PlanCheckpoint: false,
+		}},
+		AddLinks: []planLink{{Parent: "D", Child: "B"}}, CancelTasks: []string{},
+		FinalTaskKey: "", SourceRunID: "", CreatedAt: time.Unix(0, 0).UTC(),
+	})
+	const wantView = `{"revisionId":"pr_1","revision":1,"baseRevision":0,"reason":"A 的结果表明必须补充 D",` +
+		`"addTasks":[{"key":"D","content":"补充调研 D，写入 d.md","agent":"researcher","modelRef":"","planCheckpoint":false}],` +
+		`"addLinks":[{"parent":"D","child":"B"}],"cancelTasks":[],"finalTaskKey":"","sourceRunId":"",` +
+		`"createdAt":"1970-01-01T00:00:00Z"}`
+	if got != wantView {
+		t.Fatalf("修订历史行字节 = %s\nwant %s", got, wantView)
+	}
+
+	got = mustJSON(t, continueResp{OrchestrationID: "or_1", Revision: 1, PlanHold: false})
+	const wantContinue = `{"orchestrationId":"or_1","revision":1,"planHold":false}`
+	if got != wantContinue {
+		t.Fatalf("继续字节 = %s\nwant %s", got, wantContinue)
+	}
+}
+
+// TestContractAttentionItemBytes 钉住「需要我处理」每行的字段序（doc/72 §4.6）：
+// 九个字段恒出现；不适用处是 "" / 0，前端不按缺字段分支。
+func TestContractAttentionItemBytes(t *testing.T) {
+	got := mustJSON(t, attentionItem{
+		Kind: "question", TaskID: "at_1", OrchestrationID: "or_1", Title: "A",
+		Count: 3, QuestionID: "qs_1", RunID: "r_1", Status: "running",
+		UpdatedAt: time.Unix(0, 0).UTC(),
+	})
+	const want = `{"kind":"question","taskId":"at_1","orchestrationId":"or_1","title":"A","count":3,` +
+		`"questionId":"qs_1","runId":"r_1","status":"running","updatedAt":"1970-01-01T00:00:00Z"}`
+	if got != want {
+		t.Fatalf("处理项字节 = %s\nwant %s", got, want)
+	}
+	got = mustJSON(t, attentionItem{
+		Kind: "plan_review", OrchestrationID: "or_1", Title: "调研",
+		Count: 1, Status: "active", UpdatedAt: time.Unix(0, 0).UTC(),
+	})
+	const wantEmpty = `{"kind":"plan_review","taskId":"","orchestrationId":"or_1","title":"调研","count":1,` +
+		`"questionId":"","runId":"","status":"active","updatedAt":"1970-01-01T00:00:00Z"}`
+	if got != wantEmpty {
+		t.Fatalf("无 Task 处理项字节 = %s\nwant %s", got, wantEmpty)
 	}
 }

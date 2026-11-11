@@ -59,11 +59,13 @@ type RunQuestion struct {
 	Kind       string    `gorm:"not null"`
 	Question   string    `gorm:"not null"`
 	Args       string    `gorm:"not null;default:''"`
-	Status     string    `gorm:"not null;index:run_questions_run,priority:3"`
+	Status     string    `gorm:"not null;index:run_questions_run,priority:3;index:run_questions_status_expires,priority:1"`
 	Answer     string    `gorm:"not null;default:''"`
 	Decision   string    `gorm:"not null;default:''"`
 	CreatedAt  time.Time `gorm:"not null"`
 	AnsweredAt *time.Time
+	// ExpiresAt 只用于 Task 问题（doc/72 §7）：普通主会话问题保持 NULL，语义仍是无限等待。
+	ExpiresAt *time.Time `gorm:"index:run_questions_status_expires,priority:2"`
 }
 
 func (RunQuestion) TableName() string { return "run_questions" }
@@ -72,6 +74,8 @@ var (
 	ErrQuestionNotFound = errors.New("question not found")
 	// ErrQuestionAnswered = CAS 没改到行，但行确实存在：已答过，或已被清扫器收成 stale。
 	ErrQuestionAnswered = errors.New("question already answered")
+	// ErrQuestionExpired = 行仍是 pending，但 expires_at 已过（Task 问题的截止时间）。
+	ErrQuestionExpired = errors.New("question expired")
 )
 
 // InsertQuestion 落一行（id 空则铸 qs_<ULID>）。状态缺省 pending。
@@ -116,13 +120,14 @@ func (s *Store) ListQuestions(ctx context.Context, runID RunID, status string) (
 	return rows, err
 }
 
-// AnswerQuestion 是「一答终答」的 CAS：只有 pending 行能被改。
+// AnswerQuestion 是「一答终答」的 CAS：只有未过期的 pending 行能被改。
 // 影响 1 行 = 这次回答赢；0 行时再判存在性——不存在回 ErrQuestionNotFound，
-// 存在（answered/stale）回 ErrQuestionAnswered。decision 只有 plan 行用得上，
-// 问题行传空串；方案行的空 decision 在 API 层已归一成 approve，这里不再猜。
+// 未答但已过 expires_at 回 ErrQuestionExpired（Task 问题），其余回 ErrQuestionAnswered。
+// decision 只有 plan 行用得上，问题行传空串；方案行的空 decision 在 API 层已归一成 approve，这里不再猜。
 func (s *Store) AnswerQuestion(ctx context.Context, id, answer, decision string) error {
 	res := s.db.WithContext(ctx).Exec(
-		`UPDATE run_questions SET status = ?, answer = ?, decision = ?, answered_at = now() WHERE id = ? AND status = ?`,
+		`UPDATE run_questions SET status = ?, answer = ?, decision = ?, answered_at = now()
+		  WHERE id = ? AND status = ? AND (expires_at IS NULL OR expires_at > now())`,
 		questionStatusAnswered, answer, decision, id, questionStatusPending)
 	if res.Error != nil {
 		return res.Error
@@ -130,12 +135,21 @@ func (s *Store) AnswerQuestion(ctx context.Context, id, answer, decision string)
 	if res.RowsAffected == 1 {
 		return nil
 	}
-	var n int64
-	if err := s.db.WithContext(ctx).Model(&RunQuestion{}).Where("id = ?", id).Count(&n).Error; err != nil {
+	var row struct {
+		Status  string `gorm:"column:status"`
+		Expired bool   `gorm:"column:expired"`
+	}
+	if err := s.db.WithContext(ctx).Raw(
+		`SELECT status, (expires_at IS NOT NULL AND expires_at <= now()) AS expired
+		   FROM run_questions WHERE id = ?`, id).Scan(&row).Error; err != nil {
 		return err
 	}
-	if n == 0 {
+	if row.Status == "" {
 		return ErrQuestionNotFound
+	}
+	// 超时收口把行翻成 stale；迟到回答要如实说「过期」，不是「答过了」（doc/72 §7.3）。
+	if row.Status != questionStatusAnswered && row.Expired {
+		return ErrQuestionExpired
 	}
 	return ErrQuestionAnswered
 }
@@ -178,6 +192,24 @@ type questionView struct {
 	Decision   string    `json:"decision,omitempty"`
 	Answer     string    `json:"answer,omitempty"`
 	CreatedAt  time.Time `json:"createdAt"`
+	// ExpiresAt 只出现在设了截止时间的 Task 问题上（doc/72 §4.5）；普通主会话行为 NULL，字节不变。
+	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
+}
+
+// publishTaskChangedForRun 在 run 属于某件 Task 的当前执行时发任务事件；否则什么都不做。
+// 只读一次、不发内部唤醒：回答问题让等待中的工具自己轮询醒来即可（doc/72 §7.2）。
+func (s *Server) publishTaskChangedForRun(ctx context.Context, runID RunID) {
+	var row struct {
+		TaskID   string `gorm:"column:task_id"`
+		TenantID string `gorm:"column:tenant_id"`
+	}
+	if err := s.store.db.WithContext(ctx).Raw(
+		`SELECT id AS task_id, tenant_id FROM agent_tasks WHERE current_run_id = ?`, runID).Scan(&row).Error; err != nil {
+		return
+	}
+	if row.TaskID != "" {
+		s.store.PublishEvent(ctx, row.TenantID, eventAgentTasksChanged, row.TaskID)
+	}
 }
 
 // listQuestions（doc/47 §5.3）= GET /api/runs/:runId/questions?status=pending。
@@ -204,6 +236,7 @@ func (s *Server) listQuestions(c *gin.Context) {
 		v := questionView{
 			QuestionID: r.ID, RunID: r.RunID, ToolCallID: r.ToolCallID, Kind: r.Kind, Question: r.Question,
 			Args: r.Args, Status: r.Status, Decision: r.Decision, Answer: r.Answer, CreatedAt: r.CreatedAt,
+			ExpiresAt: r.ExpiresAt,
 		}
 		views = append(views, v)
 	}
@@ -295,11 +328,16 @@ func (s *Server) answerQuestion(c *gin.Context) {
 	switch {
 	case errors.Is(err, ErrQuestionNotFound):
 		writeEnvelope(c, http.StatusNotFound, codeQuestionMissing, "找不到这个提问", nil)
+	case errors.Is(err, ErrQuestionExpired):
+		writeEnvelope(c, http.StatusConflict, codeQuestionExpired, "这个问题已经过期", nil)
 	case errors.Is(err, ErrQuestionAnswered):
 		writeEnvelope(c, http.StatusConflict, codeQuestionAnswered, "这个问题已经答过了", nil)
 	case err != nil:
 		internal(c, err)
 	default:
+		// Task 当前执行 run 上的问题：回答成功后发任务事件（doc/72 §7.2）。普通主会话
+		// 没有对应 Task 行，这里自然 no-op，前端流程与字节都不变。
+		s.publishTaskChangedForRun(c.Request.Context(), row.RunID)
 		data := gin.H{"questionId": row.ID, "status": questionStatusAnswered}
 		if row.Kind == questionKindInstall {
 			// 安装行的结果是**程序**写回 answer 的那句（已安装／已过期／冲突…）。装配成功

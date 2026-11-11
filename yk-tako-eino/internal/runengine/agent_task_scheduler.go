@@ -12,11 +12,13 @@ package runengine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -56,10 +58,12 @@ func (s *Store) ReconcileRun(ctx context.Context, runID RunID) error {
 		Status          string `gorm:"column:status"`
 		ResultRunID     string `gorm:"column:result_run_id"`
 		Result          string `gorm:"column:result"`
+		ResultRevision  int    `gorm:"column:result_revision"`
+		PlanCheckpoint  bool   `gorm:"column:plan_checkpoint"`
 	}
 	res := s.db.WithContext(ctx).Raw(`
 SELECT r.status AS run_status, r.lease_epoch, t.id AS task_id, t.tenant_id, t.orchestration_id,
-       o.source_session_id, t.status, t.result_run_id, t.result
+       o.source_session_id, t.status, t.result_run_id, t.result, t.result_revision, t.plan_checkpoint
   FROM runs r
   JOIN agent_tasks t ON t.current_run_id = r.id
   JOIN agent_orchestrations o ON o.id = t.orchestration_id
@@ -96,6 +100,7 @@ SELECT r.status AS run_status, r.lease_epoch, t.id AS task_id, t.tenant_id, t.or
 		updates["error_code"] = errCode
 		updates["error_message"] = errMsg
 	}
+	checkpointed := false
 	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		r := tx.Model(&AgentTask{}).Where("id = ? AND status = ?", row.TaskID, agentTaskStatusRunning).
 			Updates(updates)
@@ -113,11 +118,38 @@ SELECT r.status AS run_status, r.lease_epoch, t.id AS task_id, t.tenant_id, t.or
 				ErrorCode: errCode, Status: notifStatusPending,
 			})
 		}
-		return nil
+		if status != agentTaskStatusSucceeded || !row.PlanCheckpoint {
+			return nil
+		}
+		// 检查点（doc/72 §6.1）：Task 成功与「组暂停 + 复核通知」同事务。锁组并确认仍 active；
+		// 组已被停止或收口时不再暂停（否则会留下一个没人能继续的 hold）。
+		var o AgentOrchestration
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", row.OrchestrationID).Take(&o).Error; err != nil {
+			return err
+		}
+		if o.Status != orchStatusActive {
+			return nil
+		}
+		if err := tx.Exec(`UPDATE agent_orchestrations SET plan_hold = true, updated_at = now()
+ WHERE id = ? AND status = ?`, o.ID, orchStatusActive).Error; err != nil {
+			return err
+		}
+		checkpointed = true
+		return s.insertNotificationTx(tx, AgentNotification{
+			TenantID: row.TenantID, OrchestrationID: row.OrchestrationID, TaskID: row.TaskID,
+			ReceiverSessionID: SessionID(row.Receiver), Kind: notifKindPlanReviewRequired,
+			DedupKey: fmt.Sprintf("%s:%s:%d", notifKindPlanReviewRequired, row.TaskID, row.ResultRevision),
+			Status:   notifStatusPending,
+		})
 	}); err != nil {
 		return err
 	}
 	s.PublishEvent(ctx, row.TenantID, eventAgentTasksChanged, row.TaskID)
+	if checkpointed {
+		s.PublishEvent(ctx, row.TenantID, eventAgentOrchestrationsChanged, row.OrchestrationID)
+		s.PublishTaskWake(ctx, row.TenantID, "checkpoint", row.TaskID)
+	}
 	return nil
 }
 
@@ -217,7 +249,10 @@ SELECT t.id AS task_id, t.tenant_id, t.orchestration_id, o.source_session_id, r.
 		})
 		if err != nil {
 			log.Printf("task scheduler interrupted notify %s: %v", r.TaskID, err)
+			continue
 		}
+		// 通知落库即叫醒：来源会话空闲时下一拍就能开恢复交付，不必等慢速对账。
+		ts.store.PublishTaskWake(ctx, r.TenantID, "task_interrupted", r.TaskID)
 	}
 }
 
@@ -319,10 +354,11 @@ func (s *Store) AdvanceOrchestrations(ctx context.Context) (int, error) {
 	if err := s.db.WithContext(ctx).Raw(`
 SELECT o.id FROM agent_orchestrations o
  WHERE o.status IN (?, ?)
+   AND (o.status = ? OR o.plan_hold = false)
    AND NOT EXISTS (
      SELECT 1 FROM agent_tasks t WHERE t.orchestration_id = o.id
        AND t.status IN (?, ?, ?, ?))`,
-		orchStatusActive, orchStatusCancelling,
+		orchStatusActive, orchStatusCancelling, orchStatusCancelling,
 		agentTaskStatusPending, agentTaskStatusReady, agentTaskStatusRunning, agentTaskStatusBlocked).
 		Scan(&ids).Error; err != nil {
 		return 0, err
@@ -337,6 +373,9 @@ SELECT o.id FROM agent_orchestrations o
 			}
 			if o.Status != orchStatusActive && o.Status != orchStatusCancelling {
 				return nil // 锁后复查：另一个副本先收口了
+			}
+			if o.Status == orchStatusActive && o.PlanHold {
+				return nil // 计划暂停：锁后复查，等 continue／revision 放行
 			}
 			tenantID = o.TenantID
 			var final AgentTask
@@ -391,7 +430,8 @@ func (s *Store) ClaimReadyInGroup(ctx context.Context, orchID string) ([]agentTa
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", orchID).Take(&o).Error; err != nil {
 			return err
 		}
-		if o.Status != orchStatusActive {
+		// plan_hold = 检查点已触发：本组停止新领取（在途执行不受影响）。
+		if o.Status != orchStatusActive || o.PlanHold {
 			return nil
 		}
 		var owner struct {
@@ -546,6 +586,8 @@ type TaskScheduler struct {
 	assemble func(ctx context.Context, p principal, agentID string) (*RunProfile, *assembleError)
 	// assembleTask 装配 Task 执行者的 profile（agent_task_runner.go）；失败回 *assembleError。
 	assembleTask func(ctx context.Context, p principal, taskID string) (*RunProfile, *assembleError)
+	// inputTimeout 是 Task 提问的截止时长；装配执行者时进身份盒（openWaitRow 据此写 expires_at）。
+	inputTimeout time.Duration
 	// retryAfter 是装配失败后的进程内重试节流（通知 ID → 最早重试时刻）：只管节奏不管正确性，
 	// 认领与否的真值永远在 PG。
 	retryAfter sync.Map
@@ -560,6 +602,7 @@ func NewTaskScheduler(store *Store, worker *Worker, interval time.Duration) *Tas
 func (s *Server) AttachTaskScheduler(ts *TaskScheduler) {
 	ts.assemble = s.assembleRun
 	ts.assembleTask = s.assembleAgentTaskRun
+	ts.inputTimeout = s.taskInputTimeout
 }
 
 // Start 显式启动调度循环（§8.1：不藏在路由注册里），返回停止函数。
@@ -569,25 +612,75 @@ func (ts *TaskScheduler) Start(ctx context.Context) func() {
 	return cancel
 }
 
-// Run 启动循环：定间隔跑单轮，ctx 取消即退出。错误只记日志——任何一步失败都不该拖垮
-// 整个循环，下一轮重试（所有步骤幂等）。
+// Run 是事件唤醒 + 慢速对账的调度循环（doc/72 §9.2）：
+//   - 启动时先记下内部流位置，再完整跑一轮（启动窗口不靠事件补）；
+//   - 之后 XREAD BLOCK 等 tk:agent-task-wake，最长 5 秒空醒只检查 ctx 与对账时钟；
+//   - 有事件立即跑同一轮 RunOnce；距上次完整对账达到 interval 也跑一轮；
+//   - 单副本不并发跑 RunOnce：一次读到的多条事件合并成一轮；Redis 错误退避 1 秒；
+//   - 不用消费者组分配业务事实——各副本都可醒，执行权仍由 PG 裁决。
 func (ts *TaskScheduler) Run(ctx context.Context) {
-	t := time.NewTicker(ts.interval)
-	defer t.Stop()
+	lastID := "$"
+	if rows, err := ts.store.rdb.XRevRangeN(ctx, keyTaskWake, "+", "-", 1).Result(); err == nil && len(rows) > 0 {
+		lastID = rows[0].ID
+	}
+	ts.RunOnce(ctx)
+	lastReconcile := time.Now()
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return
-		case <-t.C:
+		}
+		wait := 5 * time.Second
+		if remaining := ts.interval - time.Since(lastReconcile); remaining < wait {
+			if remaining < 100*time.Millisecond {
+				remaining = 100 * time.Millisecond
+			}
+			wait = remaining
+		}
+		res, err := ts.store.rdb.XRead(ctx, &redis.XReadArgs{
+			Streams: []string{keyTaskWake, lastID},
+			Count:   64,
+			Block:   wait,
+		}).Result()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if !errors.Is(err, redis.Nil) {
+				log.Printf("task scheduler wake: %v", err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
+			}
+		}
+		var triggered bool
+		lastID, triggered = wakeBatch(res, lastID)
+		if triggered || time.Since(lastReconcile) >= ts.interval {
 			ts.RunOnce(ctx)
+			lastReconcile = time.Now()
 		}
 	}
+}
+
+// wakeBatch 把一次 XRead 读到的多条唤醒合并成一轮（§9.2：不按事件逐条跑）：
+// 事件只带诊断字段、不承载事实，所以只看最后一条推进位置。
+func wakeBatch(streams []redis.XStream, lastID string) (string, bool) {
+	triggered := false
+	for _, s := range streams {
+		if n := len(s.Messages); n > 0 {
+			lastID = s.Messages[n-1].ID
+			triggered = true
+		}
+	}
+	return lastID, triggered
 }
 
 // RunOnce 是一轮调度（§8.2 的顺序）。单轮函数独立成方法：测试不依赖 ticker。
 func (ts *TaskScheduler) RunOnce(ctx context.Context) {
 	ts.reconcileFinishedRuns(ctx)
 	ts.detectInterruptedTasks(ctx)
+	ts.expireTaskInputs(ctx)
 	if n, err := ts.store.PropagateBlockedTasks(ctx); err != nil {
 		log.Printf("task scheduler propagate: %v", err)
 	} else if n > 0 {
@@ -612,7 +705,7 @@ func (ts *TaskScheduler) claimReady(ctx context.Context) {
 	var orchIDs []string
 	if err := ts.store.db.WithContext(ctx).Raw(`
 SELECT o.id FROM agent_orchestrations o
- WHERE o.status = ? AND EXISTS (
+ WHERE o.status = ? AND o.plan_hold = false AND EXISTS (
    SELECT 1 FROM agent_tasks t WHERE t.orchestration_id = o.id AND t.status = ?)
  ORDER BY o.created_at, o.id`, orchStatusActive, agentTaskStatusReady).Scan(&orchIDs).Error; err != nil {
 		log.Printf("task scheduler claim list: %v", err)
@@ -629,6 +722,155 @@ SELECT o.id FROM agent_orchestrations o
 			ts.launchTaskRun(ctx, c)
 		}
 	}
+}
+
+// expiredTaskInput 是一行「Task 当前 run 上已到期的待答问题」候选。
+type expiredTaskInput struct {
+	QuestionID      string `gorm:"column:question_id"`
+	TaskID          string `gorm:"column:task_id"`
+	TenantID        string `gorm:"column:tenant_id"`
+	OrchestrationID string `gorm:"column:orchestration_id"`
+	RunID           string `gorm:"column:run_id"`
+	Epoch           int64  `gorm:"column:lease_epoch"`
+}
+
+// listExpiredTaskInputs 走 (status, expires_at) 索引取候选：普通主会话问题 expires_at 恒 NULL，
+// 永不进候选；taskID 非空时只查这一件（resume 前置检查用）；限批防积压。
+func (s *Store) listExpiredTaskInputs(ctx context.Context, taskID string) ([]expiredTaskInput, error) {
+	q := `
+SELECT q.id AS question_id, t.id AS task_id, t.tenant_id, t.orchestration_id,
+       r.id AS run_id, r.lease_epoch
+  FROM run_questions q
+  JOIN runs r ON r.id = q.run_id
+  JOIN agent_tasks t ON t.current_run_id = r.id
+ WHERE q.status = ? AND q.expires_at IS NOT NULL AND q.expires_at <= now()
+   AND t.status = ? AND r.status = 'running'`
+	args := []any{questionStatusPending, agentTaskStatusRunning}
+	if taskID != "" {
+		q += ` AND t.id = ?`
+		args = append(args, taskID)
+	}
+	q += ` ORDER BY q.expires_at, q.id LIMIT 64`
+	var rows []expiredTaskInput
+	err := s.db.WithContext(ctx).Raw(q, args...).Scan(&rows).Error
+	return rows, err
+}
+
+// expireTaskInputs 收口 Task 提问超时（doc/72 §7.3）：找当前执行 run 上「pending 且已到期」的问题，
+// 按统一锁顺序（组 → Task → 问题）逐件落失败。回答与超时由行锁/CAS 决定唯一赢家：
+// answer 先赢，这里查不到 pending；这里先赢，迟到的 answer 回 115102。
+//
+// 单件失败只记日志：下一轮同一行仍在（状态没翻就还是 pending），幂等重试；不中断整轮。
+func (ts *TaskScheduler) expireTaskInputs(ctx context.Context) {
+	rows, err := ts.store.listExpiredTaskInputs(ctx, "")
+	if err != nil {
+		log.Printf("task scheduler timeout list: %v", err)
+		return
+	}
+	for _, r := range rows {
+		runID := RunID(r.RunID)
+		failed, err := ts.store.expireTaskInput(ctx, r.TaskID, r.OrchestrationID, runID, r.QuestionID, r.Epoch)
+		if err != nil {
+			log.Printf("task scheduler timeout %s: %v", r.TaskID, err)
+			continue
+		}
+		if !failed {
+			continue
+		}
+		// Task 已 failed；停 run 走既有条件更新（已是终态则原样读回），再取消本进程内的执行。
+		if status, found, err := ts.store.StopRun(ctx, runID); err != nil {
+			log.Printf("task scheduler timeout stop %s: %v", runID, err)
+		} else if found && status == "stopped" {
+			if cancel, hit := ts.worker.runCancels.Load(runID); hit {
+				cancel.(*runCancel).cancel()
+			}
+		}
+		ts.store.PublishEvent(ctx, r.TenantID, eventAgentTasksChanged, r.TaskID)
+		ts.store.PublishTaskWake(ctx, r.TenantID, "task_timeout", r.TaskID)
+	}
+}
+
+// expireTaskInputsForTask 是 resume 前置检查：这件 Task 当前 run 若已有到期问题，先按同一服务
+// 收口（与调度器同一事务路径），收口后 resume 只能看到 failed 并回 117103。
+func (s *Store) expireTaskInputsForTask(ctx context.Context, taskID string) (bool, error) {
+	rows, err := s.listExpiredTaskInputs(ctx, taskID)
+	if err != nil {
+		return false, err
+	}
+	for _, r := range rows {
+		failed, err := s.expireTaskInput(ctx, r.TaskID, r.OrchestrationID, RunID(r.RunID), r.QuestionID, r.Epoch)
+		if err != nil {
+			return false, err
+		}
+		if failed {
+			s.PublishEvent(ctx, r.TenantID, eventAgentTasksChanged, r.TaskID)
+			s.PublishTaskWake(ctx, r.TenantID, "task_timeout", r.TaskID)
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// expireTaskInput 是超时收口的单件事务。锁顺序固定「组 → Task → 问题」：修订、领取、组收口
+// 都按这一顺序拿锁，这里不能反向。锁后复查三件事：Task 仍 running、问题仍 pending 且仍到期
+// （到期判定用数据库时钟，不用进程时钟）。返回 true = 这次真的把 Task 翻成了失败
+// （没赢的并发方返回 false，不发事件）。
+func (s *Store) expireTaskInput(ctx context.Context, taskID, orchID string, runID RunID, questionID string, epoch int64) (bool, error) {
+	failed := false
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var o AgentOrchestration
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", orchID).Take(&o).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		var t AgentTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", taskID).Take(&t).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if t.Status != agentTaskStatusRunning || t.CurrentRunID == nil || *t.CurrentRunID != string(runID) {
+			return nil // 已被对账 / 被停止收走 / 换了执行代：幂等空转
+		}
+		var q struct {
+			Status  string `gorm:"column:status"`
+			Expired bool   `gorm:"column:expired"`
+		}
+		if err := tx.Raw(`SELECT status, (expires_at IS NOT NULL AND expires_at <= now()) AS expired
+  FROM run_questions WHERE id = ? FOR UPDATE`, questionID).Scan(&q).Error; err != nil {
+			return err
+		}
+		if q.Status != questionStatusPending || !q.Expired {
+			return nil // 回答先赢，或锁等待期间这一行已经变了
+		}
+		r := tx.Model(&AgentTask{}).Where("id = ? AND status = ?", taskID, agentTaskStatusRunning).
+			Updates(map[string]any{
+				"status": agentTaskStatusFailed, "error_code": taskErrInputTimeout,
+				"error_message": "等待回答已超时", "finished_at": nowUTC(),
+			})
+		if r.Error != nil {
+			return r.Error
+		}
+		if r.RowsAffected == 0 {
+			return nil
+		}
+		failed = true
+		// 这场 run 其余 pending 问题一并 stale：Task 已经失败，再答也注不回任何执行者。
+		if err := tx.Exec(`UPDATE run_questions SET status = ? WHERE run_id = ? AND status = ?`,
+			questionStatusStale, runID, questionStatusPending).Error; err != nil {
+			return err
+		}
+		return s.insertNotificationTx(tx, AgentNotification{
+			TenantID: t.TenantID, OrchestrationID: t.OrchestrationID, TaskID: t.ID,
+			ReceiverSessionID: o.SourceSessionID, Kind: notifKindTaskFailed,
+			DedupKey:  fmt.Sprintf("%s:%s:%s:%d", notifKindTaskFailed, t.ID, runID, epoch),
+			ErrorCode: taskErrInputTimeout, Status: notifStatusPending,
+		})
+	})
+	return failed, err
 }
 
 // consumeNotifications 消费持久协调通知（§9.2）——实现在 agent_task_delivery.go。

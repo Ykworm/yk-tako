@@ -5,10 +5,12 @@ import { MAX_CHATS, pickEviction } from './chatpool'
 import {
   ApiError,
   getSessionSubagents,
+  getTaskAttention,
   listSessions,
   listWorkspaces,
   mediaUrl,
   stopRun,
+  type AttentionItem,
   type MediaRef,
   type RunID,
   type SessionID,
@@ -29,7 +31,7 @@ import SkillsView from './SkillsView.vue'
 import TasksView from './TasksView.vue'
 import ToolsView from './ToolsView.vue'
 import { authExpired, authFetch, authState, clearAuth, loginWithPassword, switchTenant, tenantState } from './auth'
-import { onMutation, ensureEventStream, closeEventStream } from './mutation'
+import { onMutation, ensureEventStream, closeEventStream, onEventStreamOpen } from './mutation'
 
 type Page = 'chat' | 'projects' | 'tasks' | 'skills' | 'tools' | 'agents' | 'team'
 
@@ -546,6 +548,9 @@ onMutation((evt) => {
     onSessionDeleted(evt.id)
   } else if (evt.type === 'workspace_deleted') {
     onWorkspaceDeleted({ id: evt.id })
+  } else if (evt.type === 'agent_tasks_changed' || evt.type === 'agent_orchestrations_changed') {
+    // 全局左侧入口也消费任务事件（doc/72 §7.3）：只重拉聚合，不在事件里带状态。
+    scheduleAttention()
   }
 })
 
@@ -900,6 +905,10 @@ async function doLogin() {
 
 function logout() {
   clearAuth()
+  // 处理项与跨页跳转都按账号算：换账号后旧 id 在新账号下必然 404，先清空。
+  attentionItems.value = []
+  attentionError.value = ''
+  taskFocus.value = { workspaceId: '', taskId: '', orchestrationId: '', questionId: '', nonce: 0 }
 }
 
 // undefined = 没有待切换的项目（普通「新对话」，沿用当前落点）；null = 明确回默认项目。
@@ -962,6 +971,90 @@ const landingValue = computed(
 function onPickLanding(ev: Event) {
   const id = (ev.target as HTMLSelectElement).value
   setActiveWorkspace(id || null)
+}
+
+// —— 左侧「任务」展开与「需要我处理」（doc/72 §7/§8.2）——
+// 数据是当前项目的聚合读面，全部现算；本页不存第二份计数，事件到了就重拉。
+const tasksExpanded = ref(sessionStorage.getItem('tako.tasksExpanded') === '1')
+watch(tasksExpanded, (v) => sessionStorage.setItem('tako.tasksExpanded', v ? '1' : '0'))
+
+const attentionItems = ref<AttentionItem[]>([])
+const attentionLoading = ref(false)
+const attentionError = ref('')
+const attentionWorkspaceId = computed(() => {
+  const active = activeWorkspaceId.value
+  if (active && sidebarGroups.value.some((g) => g.workspace.id === active)) return active
+  return landingOptions.value.find((w) => w.isDefault)?.id ?? landingOptions.value[0]?.id ?? ''
+})
+
+const ATTENTION_LABEL: Record<string, string> = {
+  question: '待回答',
+  plan_review: '计划待决策',
+  interrupted: '已中断，待恢复',
+  delivery_failed: '交付失败',
+}
+function attentionLabel(item: AttentionItem): string {
+  if (item.kind === 'question' && item.count > 1) return `待回答（${item.count}）`
+  return ATTENTION_LABEL[item.kind] ?? item.kind
+}
+
+let attentionTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleAttention() {
+  if (attentionTimer) clearTimeout(attentionTimer)
+  attentionTimer = setTimeout(() => {
+    attentionTimer = null
+    void loadAttention()
+  }, 120)
+}
+
+async function loadAttention() {
+  if (!loggedIn.value) {
+    attentionItems.value = []
+    return
+  }
+  const wid = attentionWorkspaceId.value
+  if (!wid) {
+    attentionItems.value = []
+    return
+  }
+  attentionLoading.value = true
+  attentionError.value = ''
+  try {
+    attentionItems.value = (await getTaskAttention(wid)).items
+  } catch (e) {
+    attentionItems.value = []
+    attentionError.value = e instanceof ApiError ? e.message : '处理项没拉到'
+  } finally {
+    attentionLoading.value = false
+  }
+}
+
+watch(attentionWorkspaceId, () => void loadAttention())
+// 事件流重连、窗口重新聚焦都从 PG 重建一次（重连间隙的事件可能没赶上本页）。
+onEventStreamOpen(() => scheduleAttention())
+function onWindowFocus() {
+  if (loggedIn.value) scheduleAttention()
+}
+
+// 定位：用显式 id 传给任务页，不引入路由依赖。nonce 让「同一个处理项再点一次」也生效。
+const taskFocus = ref({
+  workspaceId: '',
+  taskId: '',
+  orchestrationId: '',
+  questionId: '',
+  nonce: 0,
+})
+function openAttention(item: AttentionItem) {
+  const wid = attentionWorkspaceId.value
+  taskFocus.value = {
+    workspaceId: wid,
+    taskId: item.kind === 'question' || item.kind === 'interrupted' ? item.taskId : '',
+    orchestrationId:
+      item.kind === 'plan_review' || item.kind === 'delivery_failed' ? item.orchestrationId : '',
+    questionId: item.kind === 'question' ? item.questionId : '',
+    nonce: taskFocus.value.nonce + 1,
+  }
+  goPage('tasks')
 }
 
 // 侧栏「运行中」：本 tab 里正在跑的实例（本地 busy），收口后自动消失，不重拉列表。
@@ -1482,6 +1575,7 @@ watch(authState, async (ok) => {
   window.scrollTo(0, 0)
   await loadTenants()
   await loadSidebarTree()
+  void loadAttention()
   await reconcile()
   await nextTick()
   scrollBottom()
@@ -1509,6 +1603,7 @@ onMounted(async () => {
   mobileMq.addEventListener('change', syncMobile)
   window.addEventListener('keydown', onWindowKey)
   window.addEventListener('pointerdown', onDocPointer)
+  window.addEventListener('focus', onWindowFocus)
   // 「当前会话」可能跑着别的 tab/端发起的 run：空转时低频核对，发现就接管帧面并给出停止入口。
   // 只在页面可见时问；后台 tab 不烧请求。
   liveProbe = window.setInterval(() => {
@@ -1516,6 +1611,7 @@ onMounted(async () => {
   }, 5000)
   if (!loggedIn.value) return
   await loadTenants()
+  void loadAttention()
   await reconcile()
   await nextTick()
   scrollBottom()
@@ -1526,6 +1622,7 @@ onBeforeUnmount(() => {
   mobileMq?.removeEventListener('change', syncMobile)
   window.removeEventListener('keydown', onWindowKey)
   window.removeEventListener('pointerdown', onDocPointer)
+  window.removeEventListener('focus', onWindowFocus)
   if (liveProbe !== undefined) window.clearInterval(liveProbe)
   if (statusClock !== undefined) window.clearInterval(statusClock)
   for (const url of Object.values(mediaSrc.value)) URL.revokeObjectURL(url)
@@ -1613,10 +1710,34 @@ async function onScroll() {
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2.5 4.5h4l1.2 1.5h5.8v6.5h-11z" stroke-linejoin="round" /></svg>
           项目
         </button>
-        <button type="button" :class="{ on: page === 'tasks' }" :aria-current="page === 'tasks' ? 'page' : undefined" @click="goPage('tasks')">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3.5 4.5h9M3.5 8h9M3.5 11.5h5.5" stroke-linecap="round" /></svg>
-          任务
-        </button>
+        <div class="nav-task">
+          <button type="button" class="nav-task-main" :class="{ on: page === 'tasks' }" :aria-current="page === 'tasks' ? 'page' : undefined" @click="goPage('tasks')">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3.5 4.5h9M3.5 8h9M3.5 11.5h5.5" stroke-linecap="round" /></svg>
+            任务
+            <span v-if="attentionItems.length" class="nav-badge" data-testid="tasks-attention-count">{{ attentionItems.length }}</span>
+          </button>
+          <button
+            type="button"
+            class="nav-task-toggle"
+            :aria-expanded="tasksExpanded"
+            aria-label="展开需要我处理"
+            data-testid="tasks-attention-toggle"
+            @click="tasksExpanded = !tasksExpanded"
+          >
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          </button>
+        </div>
+        <ul v-if="tasksExpanded" class="nav-attn" data-testid="tasks-attention">
+          <li v-if="attentionLoading && !attentionItems.length" class="attn-note">正在加载…</li>
+          <li v-else-if="attentionError" class="attn-note error" role="alert">{{ attentionError }}</li>
+          <li v-else-if="!attentionItems.length" class="attn-note">没有需要你处理的事。</li>
+          <li v-for="item in attentionItems" :key="`${item.kind}:${item.taskId || item.orchestrationId}`">
+            <button type="button" class="attn-item" @click="openAttention(item)">
+              <span class="attn-title">{{ item.title }}</span>
+              <span class="attn-kind">{{ attentionLabel(item) }}</span>
+            </button>
+          </li>
+        </ul>
         <button type="button" :class="{ on: page === 'agents' }" :aria-current="page === 'agents' ? 'page' : undefined" @click="goPage('agents')">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="5.2" r="2.2" /><path d="M3.4 13.2c.7-2.2 2.4-3.2 4.6-3.2s3.9 1 4.6 3.2" stroke-linecap="round" /></svg>
           助手
@@ -1794,7 +1915,16 @@ async function onScroll() {
       <template v-else>
         <Configure v-if="page === 'agents' || page === 'team'" :key="tenant.id" :page="configPage" />
         <SkillsView v-else-if="page === 'skills'" :key="tenant.id" @upload-tool="openToolsFor" />
-        <TasksView v-else-if="page === 'tasks'" :key="tenant.id" :active-workspace-id="activeWorkspaceId" />
+        <TasksView
+          v-else-if="page === 'tasks'"
+          :key="tenant.id"
+          :active-workspace-id="activeWorkspaceId"
+          :focus-workspace-id="taskFocus.workspaceId"
+          :focus-task-id="taskFocus.taskId"
+          :focus-orchestration-id="taskFocus.orchestrationId"
+          :focus-question-id="taskFocus.questionId"
+          :focus-nonce="taskFocus.nonce"
+        />
         <ToolsView v-else-if="page === 'tools'" :key="tenant.id" :prefill-name="toolsPrefill" />
         <ProjectsView
           v-else-if="page === 'projects'"
@@ -2457,6 +2587,93 @@ async function onScroll() {
 }
 .nav button:hover:not(.on) {
   background: var(--hover);
+}
+
+/* 任务入口：主按钮切页，右侧箭头展开处理项（doc/72 §7.1）。 */
+.nav-task {
+  display: flex;
+  align-items: center;
+  gap: 0.1rem;
+}
+.nav button.nav-task-main {
+  flex: 1;
+  width: auto;
+}
+.nav button.nav-task-toggle {
+  width: 1.7rem;
+  flex: none;
+  justify-content: center;
+  padding: 0;
+}
+.nav button.nav-task-toggle svg {
+  width: 0.8rem;
+  height: 0.8rem;
+  transition: transform 0.15s ease;
+}
+.nav button.nav-task-toggle[aria-expanded='true'] svg {
+  transform: rotate(180deg);
+}
+.nav-badge {
+  margin-left: auto;
+  min-width: 1.15rem;
+  height: 1.15rem;
+  padding: 0 0.3rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10px;
+  line-height: 1.15rem;
+  text-align: center;
+}
+.nav-attn {
+  list-style: none;
+  margin: 0.1rem 0 0.25rem;
+  padding: 0 0 0 0.35rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.05rem;
+}
+.attn-note {
+  padding: 0.15rem 0.55rem;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+.attn-note.error { color: #b91c1c; }
+/* 处理项是两行文本：要压过 .nav button 的固定 32px 高与居中，否则第二行被裁掉。 */
+.nav button.attn-item {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  gap: 0.1rem;
+  height: auto;
+  min-height: 2rem;
+  width: 100%;
+  padding: 0.3rem 0.55rem;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.attn-item:hover { background: var(--hover); }
+.attn-title,
+.attn-kind {
+  /* 整行是一个点击目标：子 span 不接管指针，否则中心点判定会被子元素挡住。 */
+  pointer-events: none;
+}
+.attn-title {
+  font-size: var(--text-xs);
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attn-kind {
+  font-size: 10px;
+  color: var(--muted);
 }
 
 .rail-foot {

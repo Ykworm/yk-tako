@@ -177,6 +177,8 @@ const (
 	codeQuestionMissing = 115002
 	// 115101：问题行已答过/已失效——CAS 影响 0 行（一答终答）。
 	codeQuestionAnswered = 115101
+	// 115102：Task 问题的 expires_at 已过，不能再回答（doc/72 §7.2）。
+	codeQuestionExpired = 115102
 	// 116001：技能不存在（doc/52 §6.2）。
 	codeSkillMissing = 116001
 	// 116101：技能名/markdown 结构不合法。
@@ -225,6 +227,9 @@ const (
 	codeTaskNotResumable = 117103 // 409 这件任务现在不能恢复（非 interrupted／有活执行者／次数耗尽）
 	codeTaskFinished     = 117104 // 409 这件任务已结束，不能停止
 	codeOrchFinished     = 117105 // 409 这个编排组已结束，不能停止
+	codeRevisionStale    = 117106 // 409 计划已有新修订，请重新读取后再试（修订与继续共用）
+	codeNotRevisable     = 117107 // 409 这个编排组现在不能修订
+	codeRevisionConflict = 117108 // 409 这个修订键已经用于另一次修订
 	codeInternal         = 111901
 )
 

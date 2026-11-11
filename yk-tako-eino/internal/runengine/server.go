@@ -48,7 +48,13 @@ type Server struct {
 	systemSkillsDir string
 	// auth 是身份面。业务路由挂 RequireAuth；mcp/media/memory 在有归属模型前只放 system admin。
 	auth *Auth
+	// taskInputTimeout 是 Task 提问的截止时长（-task-input-timeout，doc/72 §7.1）：装配与
+	// resume 都从这里注入执行身份盒；0 = 不限时。
+	taskInputTimeout time.Duration
 }
+
+// SetTaskInputTimeout 注入 Task 提问超时（main 在起调度器与 HTTP 之前调用）。
+func (s *Server) SetTaskInputTimeout(d time.Duration) { s.taskInputTimeout = d }
 
 // 访问日志脱敏（doc/49 A12）：EventSource 只能把 access token 放查询串，而默认的 gin 访问日志
 // 原样打印整条 URL——日志一旦被采集/外送，凭证就跟着出去了。只打码这一个键，其余 query 照旧保留。
@@ -177,6 +183,13 @@ func (s *Server) RouterFor() *gin.Engine {
 	r.GET("/api/tasks/:id", authn, s.getAgentTask)
 	r.GET("/api/workspaces/:id/tasks", authn, s.listWorkspaceAgentTasks)
 	r.GET("/api/orchestrations/:id", authn, s.getAgentOrchestration)
+	// Task 提问与「需要我处理」聚合（doc/72 §4.5/§4.6）：读面只挂 authn，可见性在 store 层 JOIN。
+	r.GET("/api/tasks/:id/questions", authn, s.listTaskQuestions)
+	r.GET("/api/workspaces/:id/task-attention", authn, s.getTaskAttention)
+	// 计划修订与继续（doc/72 §4.2–§4.4）：写面 member，读面 authn + 属主链。
+	r.POST("/api/orchestrations/:id/revisions", authn, s.auth.RequireTenantRole("member"), s.postOrchestrationRevision)
+	r.POST("/api/orchestrations/:id/continue", authn, s.auth.RequireTenantRole("member"), s.postOrchestrationContinue)
+	r.GET("/api/orchestrations/:id/revisions", authn, s.getOrchestrationRevisions)
 	r.POST("/api/tasks/:id/stop", authn, s.auth.RequireTenantRole("member"), s.stopAgentTask)
 	r.POST("/api/orchestrations/:id/stop", authn, s.auth.RequireTenantRole("member"), s.stopAgentOrchestration)
 	// 任务级恢复（doc/70 §10.1）：复用 ClaimResume / 账本重放 / Redis seed，装配口换执行者。
@@ -757,7 +770,8 @@ func (s *Server) resumeRun(c *gin.Context) {
 			return
 		}
 		bg := withAgentTaskRunBox(launchContext(c.Request.Context()),
-			&agentTaskRunBox{TaskID: t.ID, OrchestrationID: t.OrchestrationID})
+			&agentTaskRunBox{TaskID: t.ID, OrchestrationID: t.OrchestrationID,
+				InputTimeout: s.taskInputTimeout})
 		bg = withPrincipal(bg, p)
 		go s.worker.RunResume(withRunProfile(bg, prof), claim.SessionID, runID, claim.Epoch, replay)
 		writeEnvelope(c, http.StatusAccepted, codeOK, "", resumeResponse{RunID: runID, Status: "running", ResumeCount: int(claim.Epoch - 1)})

@@ -88,6 +88,7 @@ func (s *Server) postAgentTask(c *gin.Context) {
 		Content         string `json:"content"`
 		Agent           string `json:"agent"`
 		ModelRef        string `json:"modelRef"`
+		PlanCheckpoint  bool   `json:"planCheckpoint,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
@@ -113,6 +114,7 @@ func (s *Server) postAgentTask(c *gin.Context) {
 		Content:         req.Content,
 		Agent:           req.Agent,
 		ModelRef:        req.ModelRef,
+		PlanCheckpoint:  req.PlanCheckpoint,
 	}, env)
 	if err != nil {
 		if taskStoreErr(c, err) {

@@ -21,6 +21,9 @@ type planTask struct {
 	Content  string `json:"content"`
 	Agent    string `json:"agent"`
 	ModelRef string `json:"modelRef"`
+	// PlanCheckpoint 省略时必须不进入规范化哈希字节：旧计划（没有这个字段）与显式 false
+	// 的 plan_hash 保持一致（doc/72 §4.1）。
+	PlanCheckpoint bool `json:"planCheckpoint,omitempty"`
 }
 
 type planLink struct {
@@ -49,6 +52,7 @@ type CreateTaskCommand struct {
 	Content         string
 	Agent           string
 	ModelRef        string
+	PlanCheckpoint  bool
 }
 
 // planError 是计划校验失败：API 层翻成 117101，data.reason 带具体原因（不含 SQL）。
@@ -248,7 +252,10 @@ func singleTaskCommand(cmd CreateTaskCommand) CreateOrchestrationCommand {
 		SourceSessionID: cmd.SourceSessionID,
 		SourceRunID:     cmd.SourceRunID,
 		Goal:            truncatePlain(cmd.Content, taskGoalMaxRunes),
-		Tasks:           []planTask{{Key: singleTaskKey, Content: cmd.Content, Agent: cmd.Agent, ModelRef: cmd.ModelRef}},
+		Tasks: []planTask{{
+			Key: singleTaskKey, Content: cmd.Content, Agent: cmd.Agent,
+			ModelRef: cmd.ModelRef, PlanCheckpoint: cmd.PlanCheckpoint,
+		}},
 	}
 }
 

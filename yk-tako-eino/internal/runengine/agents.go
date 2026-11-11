@@ -551,6 +551,12 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 		// resolveToolPool），这里不再附加同步子代理与 resume_subagent。
 		return ctx, runCtx, nil
 	}
+	if coordinationBoxFrom(ctx) != nil {
+		// 协调／交付 run 也不委派（doc/72 §4.8）：它们的工具面在启动后由
+		// agent_task_delivery.go 收窄（计划复核只剩只读与两把决策工具，交付剔掉再编排），
+		// 这里不装载子代理，既省装配也保证入口快照不会把委派再带回来。
+		return ctx, runCtx, nil
+	}
 	specs, err := h.loadSpecs(ctx)
 	if err != nil {
 		log.Printf("agents: 装载规格失败: %v", err)

@@ -1770,11 +1770,18 @@ func TestRunLeavesOnlyRunliveAndEpoch(t *testing.T) {
 		t.Fatalf("EndRun: ok=%v err=%v", ok, err)
 	}
 	left := s.scanTK(t, ctx)
-	if err := keysOnly(left, keyRunlive(rid)); err != nil {
+	// EndRun 提交后追加一条调度器唤醒（doc/72 §9.1）；那是调度器共享流，不是 run 自己的键。
+	if err := keysOnly(left, keyRunlive(rid), keyTaskWake); err != nil {
 		t.Fatal(err)
 	}
-	if len(left) != 1 {
-		t.Fatalf("EndRun 后键 = %v, want 只剩 runlive", left)
+	var runScoped int
+	for _, k := range left {
+		if k != keyTaskWake {
+			runScoped++
+		}
+	}
+	if runScoped != 1 {
+		t.Fatalf("EndRun 后 run 作用域键 = %v, want 只剩 runlive", left)
 	}
 }
 

@@ -49,11 +49,13 @@ const (
 	deliveryStatusFailed     = "failed"
 )
 
-// 协调通知词表（doc/70 §9.1）：只有这三类事件进模型；普通工具进度只进 run 账本。
+// 协调通知词表（doc/70 §9.1；doc/72 §6.1）：进模型的事件；普通工具进度只进 run 账本。
+// plan_review_required 是检查点——Task 成功把组推进 plan_hold，等一次计划决策。
 const (
-	notifKindTaskFailed      = "task_failed"
-	notifKindTaskInterrupted = "task_interrupted"
-	notifKindOrchFinished    = "orchestration_finished"
+	notifKindTaskFailed         = "task_failed"
+	notifKindTaskInterrupted    = "task_interrupted"
+	notifKindOrchFinished       = "orchestration_finished"
+	notifKindPlanReviewRequired = "plan_review_required"
 )
 
 // 通知状态：pending（待消费）→ claimed（已认领、协调 run 在跑）→ consumed（已消费完）。
@@ -71,6 +73,7 @@ const (
 )
 
 // agentTaskMaxCount 是一张编排组的节点数上限（施工包 §4.2）。
+// 它也是修订预算：历史节点（含已取消）计入，取消不释放；修订本身的接受上限同为 32 版。
 const agentTaskMaxCount = 32
 
 // orchestrationConcurrency 是「同组同时最多在跑的 Task 数」（施工包 §2 第 11 条，固定常量）。
@@ -87,6 +90,7 @@ const (
 	taskErrSubmitNotRunning  = "not_running"
 	taskErrArtifactBad       = "artifact_invalid"
 	taskErrSubmitBad         = "result_invalid"
+	taskErrInputTimeout      = "input_timeout"
 )
 
 // AgentOrchestration = `agent_orchestrations` 表。
@@ -112,7 +116,11 @@ type AgentOrchestration struct {
 	// DeliveryStatus：空 = 无可交付结果；pending → delivering → delivered（或 failed）。
 	DeliveryStatus string `gorm:"not null;default:''"`
 	DeliveryRunID  string `gorm:"not null;default:''"`
-	CreatedAt      time.Time
+	// PlanRevision 是图的接受版本（初始 0；每接受一次修订 +1）。它是修订 CAS 的版本号。
+	PlanRevision int `gorm:"not null;default:0"`
+	// PlanHold=true 表示检查点已触发：停止新领取与组收口，等一次 continue／revision。
+	PlanHold  bool `gorm:"not null;default:false"`
+	CreatedAt time.Time
 	FinishedAt     *time.Time
 	DeliveredAt    *time.Time
 	UpdatedAt      time.Time
@@ -143,10 +151,14 @@ type AgentTask struct {
 	ResultEpoch    int64  `gorm:"not null;default:0"`
 	ErrorCode      string `gorm:"not null;default:''"`
 	ErrorMessage   string `gorm:"not null;default:''"`
-	CreatedAt      time.Time
-	StartedAt      *time.Time
-	FinishedAt     *time.Time
-	UpdatedAt      time.Time
+	// PlanCheckpoint=true：本节点成功后触发一次计划复核（组 plan_hold + 通知）。
+	PlanCheckpoint bool `gorm:"not null;default:false"`
+	// CreatedRevision 是节点被接受的图版本（初始节点 0；修订新增 = 该修订版本）。
+	CreatedRevision int `gorm:"not null;default:0"`
+	CreatedAt       time.Time
+	StartedAt       *time.Time
+	FinishedAt      *time.Time
+	UpdatedAt       time.Time
 }
 
 func (AgentTask) TableName() string { return "agent_tasks" }
@@ -182,6 +194,24 @@ type AgentNotification struct {
 
 func (AgentNotification) TableName() string { return "agent_notifications" }
 
+// AgentPlanRevision = `agent_plan_revisions` 表（doc/72 §5.2）：每一次被接受的计划修订一行。
+// command_json 是规范化命令（数组已排序），command_hash 是它的 SHA-256——同键不同命令靠它区分。
+type AgentPlanRevision struct {
+	ID              string `gorm:"primaryKey"` // pr_<ULID>
+	TenantID        string `gorm:"not null;uniqueIndex:agent_plan_revisions_idem,priority:1"`
+	OrchestrationID string `gorm:"not null;uniqueIndex:agent_plan_revisions_idem,priority:2;uniqueIndex:agent_plan_revisions_rev,priority:1;index:agent_plan_revisions_orch_rev,priority:1"`
+	Revision        int    `gorm:"not null;uniqueIndex:agent_plan_revisions_rev,priority:2;index:agent_plan_revisions_orch_rev,priority:2"`
+	BaseRevision    int    `gorm:"not null"`
+	SourceRunID     string `gorm:"not null;default:''"`
+	IdempotencyKey  string `gorm:"not null;uniqueIndex:agent_plan_revisions_idem,priority:3;size:128"`
+	CommandHash     string `gorm:"not null"`
+	CommandJSON     string `gorm:"not null;type:text"`
+	Reason          string `gorm:"not null;type:text"`
+	CreatedAt       time.Time `gorm:"not null"`
+}
+
+func (AgentPlanRevision) TableName() string { return "agent_plan_revisions" }
+
 // TaskArtifact 是结果里的一个产物引用：项目根的相对路径 + 种类标签。
 type TaskArtifact struct {
 	Path string `json:"path"`
@@ -213,6 +243,9 @@ type agentTaskView struct {
 	Content         string      `json:"content"`
 	Agent           string      `json:"agent"`
 	ModelRef        string      `json:"modelRef"`
+	// 修订相关两列插在 modelRef 后（doc/72 §4.7）：旧字段相对顺序不变。
+	PlanCheckpoint  bool        `json:"planCheckpoint"`
+	CreatedRevision int         `json:"createdRevision"`
 	WorkspaceID     string      `json:"workspaceId"`
 	Status          string      `json:"status"`
 	CurrentRunID    string      `json:"currentRunId"`
@@ -233,6 +266,9 @@ type orchestrationBody struct {
 	SourceSessionID string     `json:"sourceSessionId"`
 	Status          string     `json:"status"`
 	FinalTaskID     string     `json:"finalTaskId"`
+	// 修订相关两列插在 finalTaskId 后（doc/72 §4.7）：旧字段相对顺序不变。
+	PlanRevision    int        `json:"planRevision"`
+	PlanHold        bool       `json:"planHold"`
 	DeliveryStatus  string     `json:"deliveryStatus"`
 	DeliveryRunID   string     `json:"deliveryRunId"`
 	CreatedAt       time.Time  `json:"createdAt"`

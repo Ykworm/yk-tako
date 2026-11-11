@@ -43,6 +43,14 @@ function dispatch(evt: MutationEvent) {
   }
 }
 
+// 事件流（重新）接通时通知一次：重连间隙里可能发生了事件、服务端补发也没覆盖到的本地派生
+// （如「需要我处理」聚合），订阅方自己拉一次 PG 对齐（doc/72 §7.3）。
+const openHandlers = new Set<() => void>()
+export function onEventStreamOpen(h: () => void): () => void {
+  openHandlers.add(h)
+  return () => openHandlers.delete(h)
+}
+
 // sourceId 挡自回声：BroadcastChannel 会送达包括发送者在内的所有 tab，
 // 而发送者已在成功回调里更新过自己的状态。
 const TAB_ID = Math.random().toString(36).slice(2)
@@ -88,6 +96,15 @@ export function ensureEventStream() {
       if (evt.type && evt.id) dispatch(evt)
     } catch {
       /* 单帧坏 JSON 不炸通道 */
+    }
+  }
+  es.onopen = () => {
+    for (const h of [...openHandlers]) {
+      try {
+        h()
+      } catch {
+        /* 忽略 */
+      }
     }
   }
   es.onerror = () => {

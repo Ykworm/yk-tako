@@ -627,6 +627,9 @@ export type AgentTask = {
   content: string
   agent: string
   modelRef: string
+  // doc/72 §4.7：两列插在 modelRef 后，旧字段相对顺序不变。
+  planCheckpoint: boolean
+  createdRevision: number
   workspaceId: string
   status: string
   currentRunId: string
@@ -642,6 +645,7 @@ export type AgentTask = {
 export type TaskListResponse = { tasks: AgentTask[] }
 
 // 编排组视图的组半：finalTaskId 指向全组唯一的最终 Task；deliveryStatus 空 = 无可交付结果。
+// doc/72 §4.7：planRevision / planHold 插在 finalTaskId 后；planHold=true 表示检查点已把新工作暂停。
 export type OrchestrationBody = {
   orchestrationId: string
   goal: string
@@ -649,6 +653,8 @@ export type OrchestrationBody = {
   sourceSessionId: string
   status: string
   finalTaskId: string
+  planRevision: number
+  planHold: boolean
   deliveryStatus: string
   deliveryRunId: string
   createdAt: string
@@ -694,5 +700,117 @@ export function stopOrchestration(orchestrationId: string): Promise<{ orchestrat
 export type TaskResumeResult = { taskId: string; runId: string; status: string; resumeCount: number }
 export function resumeAgentTask(taskId: string): Promise<TaskResumeResult> {
   return request<TaskResumeResult>(`/api/tasks/${encodeURIComponent(taskId)}/resume`, { method: 'POST' })
+}
+
+// —— 计划修订、Task 问题与「需要我处理」（doc/72）——
+export const CODE_REVISION_STALE = 117106 // 提交的 baseRevision 已不是当前版本
+export const CODE_NOT_REVISABLE = 117107 // 组不在 active，或最终 Task 已开始
+export const CODE_REVISION_CONFLICT = 117108 // 同一修订键换了一份命令
+export const CODE_QUESTION_EXPIRED = 115102 // 问题已过 expires_at
+
+// 修订命令里的新节点：形状与创建时一致（doc/72 §4.2）。
+export type PlanRevisionTaskInput = {
+  key: string
+  content: string
+  agent: string
+  modelRef?: string
+  planCheckpoint?: boolean
+}
+
+export type PlanRevisionCommand = {
+  idempotencyKey: string
+  baseRevision: number
+  reason: string
+  addTasks: PlanRevisionTaskInput[]
+  addLinks: { parent: string; child: string }[]
+  cancelTasks: string[]
+  finalTaskKey: string
+}
+
+// 201 的 data：addedTaskIds 与命令里的 addTasks 同序。
+export type PlanRevisionResult = {
+  revisionId: string
+  orchestrationId: string
+  revision: number
+  finalTaskId: string
+  planHold: boolean
+  addedTaskIds: string[]
+}
+
+// 历史行保存原命令：addLinks 里是 key（parent/child），不是任务 id。
+export type PlanRevisionRow = {
+  revisionId: string
+  revision: number
+  baseRevision: number
+  reason: string
+  addTasks: { key: string; content: string; agent: string; modelRef: string; planCheckpoint: boolean }[]
+  addLinks: { parent: string; child: string }[]
+  cancelTasks: string[]
+  finalTaskKey: string
+  sourceRunId: string
+  createdAt: string
+}
+
+export type ContinueResult = { orchestrationId: string; revision: number; planHold: boolean }
+
+// Task 当前执行上的问题行（复用 run 问题视图，doc/72 §4.5）。
+// expiresAt 只在建行时设了截止时间才出现；普通主会话的问答行没有这一键。
+export type TaskQuestion = QuestionRow & { expiresAt?: string }
+
+// 关注聚合的一行：不适用字段是空串，不省键（doc/72 §4.6）。
+export type AttentionKind = 'question' | 'plan_review' | 'interrupted' | 'delivery_failed'
+export type AttentionItem = {
+  kind: AttentionKind | string
+  taskId: string
+  orchestrationId: string
+  title: string
+  count: number
+  questionId: string
+  runId: string
+  status: string
+  updatedAt: string
+}
+
+export function createPlanRevision(
+  orchestrationId: string,
+  cmd: PlanRevisionCommand,
+): Promise<PlanRevisionResult> {
+  return request<PlanRevisionResult>(
+    `/api/orchestrations/${encodeURIComponent(orchestrationId)}/revisions`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cmd),
+    },
+  )
+}
+
+// 解除计划暂停：版本对、组 active 才放行；plan_hold 已是 false 时是幂等空操作。
+export function continueOrchestration(orchestrationId: string, baseRevision: number): Promise<ContinueResult> {
+  return request<ContinueResult>(
+    `/api/orchestrations/${encodeURIComponent(orchestrationId)}/continue`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baseRevision }),
+    },
+  )
+}
+
+export function listPlanRevisions(orchestrationId: string): Promise<{ revisions: PlanRevisionRow[] }> {
+  return request<{ revisions: PlanRevisionRow[] }>(
+    `/api/orchestrations/${encodeURIComponent(orchestrationId)}/revisions`,
+  )
+}
+
+export function listTaskQuestions(taskId: string, status?: string): Promise<TaskQuestion[]> {
+  const query = status ? `?status=${encodeURIComponent(status)}` : ''
+  return request<TaskQuestion[]>(`/api/tasks/${encodeURIComponent(taskId)}/questions${query}`)
+}
+
+export function getTaskAttention(workspaceId: string): Promise<{ items: AttentionItem[] }> {
+  return request<{ items: AttentionItem[] }>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/task-attention`,
+  )
 }
 

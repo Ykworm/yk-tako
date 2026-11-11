@@ -109,3 +109,87 @@ at_probe_run(){
   ml_run '只回复 ok' "$1"
   ml_wait_settled 60 || { echo "探针 run 60s 没落定，来源会话造不出来" >&2; exit 2; }
 }
+
+# at_http $1=METHOD $2=path $3=请求体（可省）→ sets AT_CODE / AT_BODY。
+# 带当前 TOK；-w 把状态码放最后一行，正文原样保留（JSON 本身不带换行，切分安全）。
+at_http(){
+  local out=""
+  if [ -n "${3:-}" ]; then
+    out=$(curl -sS -w '\n%{http_code}' -X "$1" "$B$2" \
+      -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d "$3" 2>/dev/null)
+  else
+    out=$(curl -sS -w '\n%{http_code}' -X "$1" "$B$2" \
+      -H "Authorization: Bearer $TOK" 2>/dev/null)
+  fi
+  if [ -z "$out" ]; then AT_CODE=""; AT_BODY=""; return 0; fi
+  AT_CODE=${out##*$'\n'}
+  AT_BODY=${out%$'\n'*}
+}
+
+# at_revision $1=orchId $2=请求体 JSON → 响应原文（POST /revisions）。
+at_revision(){
+  curl -sS -X POST "$B/api/orchestrations/$1/revisions" \
+    -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d "$2" 2>/dev/null
+}
+
+# at_continue $1=orchId $2=baseRevision → 响应原文（POST /continue）。
+at_continue(){
+  curl -sS -X POST "$B/api/orchestrations/$1/continue" \
+    -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+    -d "{\"baseRevision\":$2}" 2>/dev/null
+}
+
+# at_revisions $1=orchId → 修订历史响应原文。
+at_revisions(){
+  curl -sS "$B/api/orchestrations/$1/revisions" -H "Authorization: Bearer $TOK" 2>/dev/null
+}
+
+# at_wait_hold $1=orchId $2=超时秒（默认 240）：等到组 planHold=true。
+at_wait_hold(){
+  local deadline=$((SECONDS + ${2:-240})) v
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    v=$(at_orch_field "$1" planHold)
+    [ "$v" = "true" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# at_attention $1=workspaceId → 「需要我处理」聚合响应原文。
+at_attention(){
+  curl -sS "$B/api/workspaces/$1/task-attention" -H "Authorization: Bearer $TOK" 2>/dev/null
+}
+
+# at_task_questions $1=taskId [$2=status] → Task 问题行响应原文。
+at_task_questions(){
+  local q="$B/api/tasks/$1/questions"
+  [ -n "${2:-}" ] && q="$q?status=$2"
+  curl -sS "$q" -H "Authorization: Bearer $TOK" 2>/dev/null
+}
+
+# at_wait_task_question $1=taskId $2=超时秒（默认 180）：等这件 Task 当前执行出现 pending 问题。
+# sets AT_QID / AT_QUESTION（问题全文）。
+at_wait_task_question(){
+  local deadline=$((SECONDS + ${2:-180})) body
+  AT_QID=""; AT_QUESTION=""
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    body=$(at_task_questions "$1" pending)
+    AT_QID=$(echo "$body" | jq -r '.data[0].questionId // ""' 2>/dev/null)
+    AT_QUESTION=$(echo "$body" | jq -r '.data[0].question // ""' 2>/dev/null)
+    [ -n "$AT_QID" ] && [ "$AT_QID" != "null" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# at_answer $1=questionId $2=answer [$3=decision] → 响应原文（POST /api/questions/:id/answer）。
+at_answer(){
+  local body
+  if [ -n "${3:-}" ]; then
+    body=$(jq -cn --arg a "$2" --arg d "$3" '{answer:$a,decision:$d}')
+  else
+    body=$(jq -cn --arg a "$2" '{answer:$a}')
+  fi
+  curl -sS -X POST "$B/api/questions/$1/answer" \
+    -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d "$body" 2>/dev/null
+}

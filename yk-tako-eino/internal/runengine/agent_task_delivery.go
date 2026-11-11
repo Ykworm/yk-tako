@@ -56,14 +56,7 @@ func (ts *TaskScheduler) consumeAgentNotifications(ctx context.Context) {
 	if ts.assemble == nil {
 		return
 	}
-	var ids []string
-	if err := ts.store.db.WithContext(ctx).Raw(
-		`SELECT id FROM agent_notifications WHERE status = ? ORDER BY created_at, id LIMIT 8`,
-		notifStatusPending).Scan(&ids).Error; err != nil {
-		log.Printf("task delivery list: %v", err)
-		return
-	}
-	for _, id := range ids {
+	for _, id := range ts.pendingNotificationIDs(ctx) {
 		if v, ok := ts.retryAfter.Load(id); ok {
 			if at, ok := v.(time.Time); ok && time.Now().Before(at) {
 				continue // 进程内节流：装配刚失败过的通知歇一分钟再试（只管节奏，正确性在 PG）
@@ -74,6 +67,34 @@ func (ts *TaskScheduler) consumeAgentNotifications(ctx context.Context) {
 			ts.launchCoordinationRun(ctx, launch)
 		}
 	}
+}
+
+// pendingNotificationIDs 取本轮的候选：来源会话正忙、且认领后真会铸 run 的行留在 pending（§9.2），
+// 但**不占本轮名额**——否则积压的忙通知恒占前几条，别的会话的交付永远排不到。已经终止的通知
+// （组停/继续过了的 plan_review、已无交付可做的 orchestration_finished）与会话忙无关，照常进来收口。
+// 忙检查在 claimNotification 的事务里锁行后仍会重做一次，这里只决定「先看谁」。
+func (ts *TaskScheduler) pendingNotificationIDs(ctx context.Context) []string {
+	var ids []string
+	if err := ts.store.db.WithContext(ctx).Raw(`
+SELECT n.id FROM agent_notifications n
+  JOIN agent_orchestrations o ON o.id = n.orchestration_id
+ WHERE n.status = ?
+   AND (
+     (n.kind = ? AND (o.status <> ? OR NOT o.plan_hold))
+     OR (n.kind = ? AND o.delivery_status NOT IN (?, ?))
+     OR NOT EXISTS (SELECT 1 FROM runs r
+                     WHERE r.session_id = n.receiver_session_id
+                       AND r.status = 'running' AND r.lease_until > now())
+   )
+ ORDER BY n.created_at, n.id LIMIT 8`,
+		notifStatusPending,
+		notifKindPlanReviewRequired, orchStatusActive,
+		notifKindOrchFinished, deliveryStatusPending, deliveryStatusDelivering).
+		Scan(&ids).Error; err != nil {
+		log.Printf("task delivery list: %v", err)
+		return nil
+	}
+	return ids
 }
 
 // claimNotification 认领一条通知并铸它的协调 run（§9.2）。同一笔事务里依次：
@@ -98,16 +119,24 @@ func (ts *TaskScheduler) claimNotification(ctx context.Context, notifID string) 
 		}
 		if n.Kind == notifKindOrchFinished {
 			// 整组交付只认领 delivery_status=pending 的组（§9.3）：delivering = 已有交付 run 在跑，
-			// 重启后由对账补状态；delivered = 已交付，通知标 consumed 清账；failed = 不自动重放。
+			// 重启后由对账补状态；delivered = 已交付，通知标 consumed 清账；failed 或没有交付状态
+			// （组本身 failed／cancelled）不自动重放，通知到此终止——留在 pending 会永久占住消费名额。
 			switch o.DeliveryStatus {
 			case deliveryStatusPending:
 			case deliveryStatusDelivering:
 				return nil
-			case deliveryStatusDelivered:
+			default:
 				return tx.Model(&AgentNotification{}).Where("id = ?", n.ID).
 					Updates(map[string]any{"status": notifStatusConsumed, "consumed_at": nowUTC()}).Error
-			default:
-				return nil
+			}
+		}
+		if n.Kind == notifKindPlanReviewRequired {
+			// 计划复核只在「组仍 active 且仍暂停」时才有意义（施工包 §6.3）：人已经点了继续、
+			// 组被停止或收口后，通知没有可复核的暂停了——标 consumed 清账，不造协调 run。
+			// 计划复核不是最终交付，全程不写 delivery_status。
+			if o.Status != orchStatusActive || !o.PlanHold {
+				return tx.Model(&AgentNotification{}).Where("id = ?", n.ID).
+					Updates(map[string]any{"status": notifStatusConsumed, "consumed_at": nowUTC()}).Error
 			}
 		}
 		// 来源会话忙检查（§9.2）：用户正在聊就不打断——通知留在 pending，下一轮再看。
@@ -222,9 +251,39 @@ func (ts *TaskScheduler) launchCoordinationRun(ctx context.Context, l *coordLaun
 		ts.retryAfter.Store(l.NotificationID, time.Now().Add(time.Minute))
 		return
 	}
-	prof.Tools = dropDeliveryNoTools(bg, prof.Tools)
+	if l.Kind == notifKindPlanReviewRequired {
+		prof.Tools = keepPlanReviewTools(bg, prof.Tools)
+	} else {
+		prof.Tools = dropDeliveryNoTools(bg, prof.Tools)
+	}
 	log.Printf("task delivery: launching %s notification %s as run %s", l.Kind, l.NotificationID, l.RunID)
 	go ts.worker.Run(withRunProfile(bg, prof), l.SessionID, l.RunID, 1)
+}
+
+// planReviewToolNames 是计划复核 run 的全部工具（施工包 §4.8/§6.3）：只读文件与历史检索
+// + 两把决策工具。没有 bash、写工具、记忆、技能、新建编排、等人工具——复核 run 必须
+// 确定性终结（作出决定或什么都不做），不能把来源会话挂在这里等人。
+var planReviewToolNames = map[string]bool{
+	"read_text_file": true, "read_file": true, "read_pdf_text": true, "read_media_file": true,
+	"list_directory": true, "directory_tree": true, "get_file_info": true, "search_files": true,
+	"search_history": true,
+	"revise_orchestration": true, "continue_orchestration": true,
+}
+
+// keepPlanReviewTools 反向过滤：名单之外一律拿掉（与 dropDeliveryNoTools 的黑名单相反，
+// 因为复核面的正确失败方向是「新工具默认不可用」）。
+func keepPlanReviewTools(ctx context.Context, in []tool.BaseTool) []tool.BaseTool {
+	kept := make([]tool.BaseTool, 0, len(in))
+	for _, t := range in {
+		info, err := t.Info(ctx)
+		if err != nil {
+			continue // 拿不到名 = 不在名单里
+		}
+		if planReviewToolNames[info.Name] {
+			kept = append(kept, t)
+		}
+	}
+	return kept
 }
 
 // dropDeliveryNoTools 把等人与再编排类工具从协调 run 的池子里拿掉（doc/70 §6.3「不获得超出
@@ -236,6 +295,9 @@ func (ts *TaskScheduler) launchCoordinationRun(ctx context.Context, l *coordLaun
 //
 // 2026-11-10 崩溃活体抓过：task_interrupted 交付里模型顺手 ask_user「你希望我怎么处理？」，
 // 交付停在半路。拿不到名的工具原样保留（与既有 drop helper 同一取舍）。
+//
+// ask_user 单独列在这里而不是回到 agentTaskNoTools（doc/72 §7.1 已放开给 Task 执行者）：
+// 执行者提问有任务页承接，交付 run 的池子仍然必须确定性终结。
 func dropDeliveryNoTools(ctx context.Context, in []tool.BaseTool) []tool.BaseTool {
 	kept := make([]tool.BaseTool, 0, len(in))
 	for _, t := range in {
@@ -244,7 +306,7 @@ func dropDeliveryNoTools(ctx context.Context, in []tool.BaseTool) []tool.BaseToo
 			kept = append(kept, t)
 			continue
 		}
-		if agentTaskNoTools[info.Name] {
+		if info.Name == "ask_user" || agentTaskNoTools[info.Name] {
 			continue
 		}
 		kept = append(kept, t)
@@ -383,6 +445,47 @@ func buildCoordinationInput(tx *gorm.DB, n AgentNotification, o AgentOrchestrati
 		body := fmt.Sprintf("任务 %s（taskId %s）的执行者失去联系（进程崩溃或机器重启，租约已过期）。"+
 			"任务状态仍按执行中记录，恢复需要用户显式发起，不会自动重放。", t.TaskKey, t.ID)
 		return head + body + "\n" + contract, nil
+	case notifKindPlanReviewRequired:
+		// 复核输入 = 当前图 + 版本 + 触发 Task 的结果引用 + 必须做决定的约定（施工包 §6.3）。
+		// 不复制执行历史：要核对结果就读项目文件或本轮来源会话的历史。
+		body := fmt.Sprintf("计划暂停等待复核：组已停止领取新 Task（运行中的继续跑完），计划版本 = %d。\n"+
+			"触发：任务 %s（taskId %s）第 %d 版结果已保存。", o.PlanRevision, t.TaskKey, t.ID, t.ResultRevision)
+		if o.FinalTaskID != "" {
+			var final AgentTask
+			if err := tx.Where("id = ?", o.FinalTaskID).Take(&final).Error; err != nil {
+				return "", err
+			}
+			body += fmt.Sprintf("\n最终交付：%s（taskId %s），尚未开始 = %v。", final.TaskKey, final.ID, final.StartedAt == nil)
+		}
+		var tasks []AgentTask
+		if err := tx.Where("orchestration_id = ?", o.ID).Order("task_key").Find(&tasks).Error; err != nil {
+			return "", err
+		}
+		if len(tasks) > 0 {
+			body += "\n当前图："
+			for _, x := range tasks {
+				body += fmt.Sprintf("\n- %s [%s] %s：%s", x.TaskKey, x.Status, x.AgentName,
+					truncatePlain(x.Content, 80))
+			}
+		}
+		var links []AgentTaskLink
+		if err := tx.Where("orchestration_id = ?", o.ID).Find(&links).Error; err != nil {
+			return "", err
+		}
+		if len(links) > 0 {
+			byID := make(map[string]string, len(tasks))
+			for _, x := range tasks {
+				byID[x.ID] = x.TaskKey
+			}
+			body += "\n依赖边："
+			for _, l := range links {
+				body += fmt.Sprintf("\n- %s -> %s", byID[l.ParentTaskID], byID[l.ChildTaskID])
+			}
+		}
+		const reviewContract = "你必须现在做决定：调用 continue_orchestration 按原图继续，" +
+			"或调用 revise_orchestration 修改计划后继续（都带上面的计划版本）。" +
+			"先读项目文件核对结果再决定；不要询问用户，不要宣称尚未发生的执行。"
+		return head + body + "\n" + reviewContract, nil
 	case notifKindOrchFinished:
 		body := fmt.Sprintf("整组已收口，最终状态 = %s。", o.Status)
 		if o.Status == orchStatusSucceeded && final.ID != "" {

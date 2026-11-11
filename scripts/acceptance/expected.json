@@ -1,6 +1,6 @@
 {
- "version": "2026-11-10",
- "source": "doc/19-v6/19v6-04-验收-curl.md；持久 Task 与编排（doc/70）用例 44–50 同批",
+ "version": "2026-11-11",
+ "source": "doc/19-v6/19v6-04-验收-curl.md；持久 Task 与编排（doc/70）用例 44–50 同批；多 Agent 编排下一阶段（doc/72）用例 51–54 同批",
  "note": [
   "本文件是契约字节的**机器真源**；doc/19-v6/19v6-04-验收-curl.md 是同一份内容的人读版。",
   "两份**同批改**。check-expected.sh 守两边的用例号集合一致。",
@@ -2320,6 +2320,8 @@
        "content",
        "agent",
        "modelRef",
+       "planCheckpoint",
+       "createdRevision",
        "workspaceId",
        "status",
        "currentRunId",
@@ -2343,7 +2345,9 @@
        "currentRunId": "",
        "result": null,
        "error": null,
-       "resultRevision": 0
+       "resultRevision": 0,
+       "planCheckpoint": false,
+       "createdRevision": 0
       }
      }
     },
@@ -2914,7 +2918,9 @@
         "sourceSessionId": "{sid}",
         "status": "active",
         "deliveryStatus": "",
-        "deliveryRunId": ""
+        "deliveryRunId": "",
+        "planRevision": 0,
+        "planHold": false
        },
        "tasks": [
         {
@@ -3351,6 +3357,1009 @@
         }
        ]
       }
+     }
+    }
+   ]
+  },
+  {
+   "id": "51-plan-revision-contract",
+   "case": "用例 51",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "计划修订：形状/预算 400 117101（reason 进 data.reason）、旧版本 409 117106、同键异命令 409 117108、组已停 409 117107；成功 201 六键序 + 同键同命令幂等回原 revisionId；修订历史按 revision 升序",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-rev"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'task 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc51o",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "goal": "两节点修订",
+      "tasks": [
+       {
+        "key": "a",
+        "content": "调研 A",
+        "agent": "researcher"
+       },
+       {
+        "key": "b",
+        "content": "汇总",
+        "agent": "coder"
+       }
+      ],
+      "links": [
+       {
+        "parent": "a",
+        "child": "b"
+       }
+      ]
+     },
+     "capture": {
+      "orid": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data": {
+       "status": "active"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/revisions",
+     "body": {
+      "idempotencyKey": "acc51r0",
+      "baseRevision": 0,
+      "reason": "空命令",
+      "addTasks": [],
+      "addLinks": [],
+      "cancelTasks": [],
+      "finalTaskKey": ""
+     },
+     "expect": {
+      "http": 400,
+      "code": 117101,
+      "message": "任务计划不合法",
+      "data": {
+       "reason": "修订命令为空"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/revisions",
+     "body": {
+      "idempotencyKey": "acc51r1",
+      "baseRevision": 99,
+      "reason": "版本越界",
+      "addTasks": [
+       {
+        "key": "d",
+        "content": "补充 D",
+        "agent": "researcher"
+       }
+      ],
+      "addLinks": [],
+      "cancelTasks": [],
+      "finalTaskKey": ""
+     },
+     "expect": {
+      "http": 400,
+      "code": 117101,
+      "message": "任务计划不合法",
+      "data": {
+       "reason": "baseRevision 不合法"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/revisions",
+     "body": {
+      "idempotencyKey": "acc51r2",
+      "baseRevision": 1,
+      "reason": "旧图",
+      "addTasks": [
+       {
+        "key": "d",
+        "content": "补充 D",
+        "agent": "researcher"
+       }
+      ],
+      "addLinks": [
+       {
+        "parent": "d",
+        "child": "b"
+       }
+      ],
+      "cancelTasks": [],
+      "finalTaskKey": ""
+     },
+     "expect": {
+      "http": 409,
+      "code": 117106,
+      "message": "计划已有新修订，请重新读取后再试",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/revisions",
+     "body": {
+      "idempotencyKey": "acc51r3",
+      "baseRevision": 0,
+      "reason": "A 的结果表明必须补充 D",
+      "addTasks": [
+       {
+        "key": "d",
+        "content": "补充调研 D，写入 d.md",
+        "agent": "researcher",
+        "modelRef": "",
+        "planCheckpoint": false
+       }
+      ],
+      "addLinks": [
+       {
+        "parent": "d",
+        "child": "b"
+       }
+      ],
+      "cancelTasks": [],
+      "finalTaskKey": ""
+     },
+     "capture": {
+      "rid": "data.revisionId"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "revisionId",
+       "orchestrationId",
+       "revision",
+       "finalTaskId",
+       "planHold",
+       "addedTaskIds"
+      ],
+      "data": {
+       "orchestrationId": "{orid}",
+       "revision": 1,
+       "planHold": false
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/revisions",
+     "body": {
+      "idempotencyKey": "acc51r3",
+      "baseRevision": 0,
+      "reason": "A 的结果表明必须补充 D",
+      "addTasks": [
+       {
+        "key": "d",
+        "content": "补充调研 D，写入 d.md",
+        "agent": "researcher",
+        "modelRef": "",
+        "planCheckpoint": false
+       }
+      ],
+      "addLinks": [
+       {
+        "parent": "d",
+        "child": "b"
+       }
+      ],
+      "cancelTasks": [],
+      "finalTaskKey": ""
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": "",
+      "data": {
+       "revisionId": "{rid}",
+       "revision": 1
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/revisions",
+     "body": {
+      "idempotencyKey": "acc51r3",
+      "baseRevision": 1,
+      "reason": "换了命令",
+      "addTasks": [
+       {
+        "key": "e",
+        "content": "补充 E",
+        "agent": "researcher"
+       }
+      ],
+      "addLinks": [
+       {
+        "parent": "e",
+        "child": "b"
+       }
+      ],
+      "cancelTasks": [],
+      "finalTaskKey": ""
+     },
+     "expect": {
+      "http": 409,
+      "code": 117108,
+      "message": "这个修订键已经用于另一次修订",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/orchestrations/{orid}/revisions",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "revisions"
+      ],
+      "data": {
+       "revisions": [
+        {
+         "revisionId": "{rid}",
+         "revision": 1,
+         "baseRevision": 0,
+         "reason": "A 的结果表明必须补充 D",
+         "cancelTasks": [],
+         "finalTaskKey": "",
+         "sourceRunId": ""
+        }
+       ]
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/or_nope/revisions",
+     "body": {
+      "idempotencyKey": "acc51x",
+      "baseRevision": 0,
+      "reason": "x",
+      "addTasks": [
+       {
+        "key": "z",
+        "content": "z",
+        "agent": "researcher"
+       }
+      ],
+      "addLinks": [],
+      "cancelTasks": [],
+      "finalTaskKey": "z"
+     },
+     "expect": {
+      "http": 404,
+      "code": 117002,
+      "message": "找不到这个编排组",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-rev-stop"
+     },
+     "capture": {
+      "wid2": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid2}' from 3), 'task 来源', '{ten}', id, 'private', '{wid2}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid2"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc51o2",
+      "workspaceId": "{wid2}",
+      "sourceSessionId": "{sid2}",
+      "goal": "停组",
+      "tasks": [
+       {
+        "key": "c",
+        "content": "做一件",
+        "agent": "researcher"
+       }
+      ],
+      "links": []
+     },
+     "capture": {
+      "orid2": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid2}/stop",
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid2}/revisions",
+     "body": {
+      "idempotencyKey": "acc51r9",
+      "baseRevision": 0,
+      "reason": "组已停",
+      "addTasks": [
+       {
+        "key": "e2",
+        "content": "补一件",
+        "agent": "researcher"
+       }
+      ],
+      "addLinks": [],
+      "cancelTasks": [],
+      "finalTaskKey": "e2"
+     },
+     "expect": {
+      "http": 409,
+      "code": 117107,
+      "message": "这个编排组现在不能修订",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "52-plan-continue-contract",
+   "case": "用例 52",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "计划继续：200 三键序、旧版本 409 117106、plan_hold=true 时解除且重复调用幂等、组已停 409 117107、未知组 404",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-cont"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'task 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc52o",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "goal": "继续",
+      "tasks": [
+       {
+        "key": "a",
+        "content": "做一件",
+        "agent": "researcher"
+       }
+      ],
+      "links": []
+     },
+     "capture": {
+      "orid": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/continue",
+     "body": {
+      "baseRevision": 0
+     },
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "orchestrationId",
+       "revision",
+       "planHold"
+      ],
+      "data": {
+       "orchestrationId": "{orid}",
+       "revision": 0,
+       "planHold": false
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/continue",
+     "body": {
+      "baseRevision": 1
+     },
+     "expect": {
+      "http": 409,
+      "code": 117106,
+      "message": "计划已有新修订，请重新读取后再试",
+      "data": null
+     }
+    },
+    {
+     "sql": "UPDATE agent_orchestrations SET plan_hold = true WHERE id = '{orid}' RETURNING id",
+     "capture_stdout": [
+      "locked"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/continue",
+     "body": {
+      "baseRevision": 0
+     },
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "orchestrationId": "{orid}",
+       "revision": 0,
+       "planHold": false
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/continue",
+     "body": {
+      "baseRevision": 0
+     },
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "planHold": false
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/or_nope/continue",
+     "body": {
+      "baseRevision": 0
+     },
+     "expect": {
+      "http": 404,
+      "code": 117002,
+      "message": "找不到这个编排组",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-cont-stop"
+     },
+     "capture": {
+      "wid2": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid2}' from 3), 'task 来源', '{ten}', id, 'private', '{wid2}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid2"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc52o2",
+      "workspaceId": "{wid2}",
+      "sourceSessionId": "{sid2}",
+      "goal": "停组继续",
+      "tasks": [
+       {
+        "key": "c",
+        "content": "做一件",
+        "agent": "researcher"
+       }
+      ],
+      "links": []
+     },
+     "capture": {
+      "orid2": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid2}/stop",
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid2}/continue",
+     "body": {
+      "baseRevision": 0
+     },
+     "expect": {
+      "http": 409,
+      "code": 117107,
+      "message": "这个编排组现在不能修订",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "53-task-questions-contract",
+   "case": "用例 53",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "Task 问题列表：created_at,id 顺序、pending/answered 过滤、expiresAt 只在设了截止时间时出现；参数错误 111002、未知任务 117001；回答 CAS 200、已答 115101、过期 115102",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-q"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'task 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc53",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "问一句",
+      "agent": "researcher",
+      "planCheckpoint": true
+     },
+     "capture": {
+      "tid": "data.taskId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) SELECT 'r'||substring('{wid}' from 3), '{sid}', 'running', 1, now() + interval '1 hour', now(), '{wid}' RETURNING id",
+     "capture_stdout": [
+      "rid"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_tasks SET status='running', current_run_id='{rid}', started_at=now() WHERE id='{tid}' RETURNING id",
+     "capture_stdout": [
+      "updated"
+     ]
+    },
+    {
+     "sql": "INSERT INTO run_questions (id,tenant_id,workspace,run_id,session_id,tool_call_id,kind,question,args,status,answer,decision,created_at,expires_at) VALUES ('qs'||substring('{wid}' from 3),'{ten}','{wid}','{rid}','{sid}','call_acc53','question','要红还是蓝？','{\"question\":\"要红还是蓝？\"}','pending','','',now(),now()+interval '1 day') RETURNING id",
+     "capture_stdout": [
+      "qid"
+     ]
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tid}/questions",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": [
+       {
+        "questionId": "{qid}",
+        "runId": "{rid}",
+        "toolCallId": "call_acc53",
+        "kind": "question",
+        "question": "要红还是蓝？",
+        "args": "{\"question\":\"要红还是蓝？\"}",
+        "status": "pending",
+        "createdAt": "$any",
+        "expiresAt": "$any"
+       }
+      ]
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tid}/questions?status=answered",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": []
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tid}/questions?status=bogus",
+     "expect": {
+      "http": 400,
+      "code": 111002,
+      "message": "status 只能是 pending / answered / stale",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/at_nope/questions",
+     "expect": {
+      "http": 404,
+      "code": 117001,
+      "message": "找不到这件任务",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/questions/{qid}/answer",
+     "body": {
+      "answer": "红"
+     },
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "questionId": "{qid}",
+       "status": "answered"
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tid}/questions?status=answered",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": [
+       {
+        "questionId": "{qid}",
+        "status": "answered",
+        "answer": "红"
+       }
+      ]
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/questions/{qid}/answer",
+     "body": {
+      "answer": "再答一次"
+     },
+     "expect": {
+      "http": 409,
+      "code": 115101,
+      "message": "这个问题已经答过了",
+      "data": null
+     }
+    },
+    {
+     "sql": "INSERT INTO run_questions (id,tenant_id,workspace,run_id,session_id,tool_call_id,kind,question,args,status,answer,decision,created_at,expires_at) VALUES ('qx'||substring('{wid}' from 3),'{ten}','{wid}','{rid}','{sid}','call_x','question','过期了吗？','','pending','','',now(),now()-interval '1 minute') RETURNING id",
+     "capture_stdout": [
+      "qx"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/questions/{qx}/answer",
+     "body": {
+      "answer": "迟到的答案"
+     },
+     "expect": {
+      "http": 409,
+      "code": 115102,
+      "message": "这个问题已经过期",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "54-task-attention-contract",
+   "case": "用例 54",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "「需要我处理」聚合：question（Task 与 run 都 running、租约有效、问题未过期）、plan_review（组 active + plan_hold）、interrupted（Task running 但当前 run 不存活）、delivery_failed（组 delivery_status=failed）；未知项目 404 114001",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-attn"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'task 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc54a",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "问一句",
+      "agent": "researcher"
+     },
+     "capture": {
+      "tid": "data.taskId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) SELECT 'r'||substring('{wid}' from 3), '{sid}', 'running', 1, now() + interval '1 hour', now(), '{wid}' RETURNING id",
+     "capture_stdout": [
+      "rid"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_tasks SET status='running', current_run_id='{rid}', started_at=now() WHERE id='{tid}' RETURNING id",
+     "capture_stdout": [
+      "u1"
+     ]
+    },
+    {
+     "sql": "INSERT INTO run_questions (id,tenant_id,workspace,run_id,session_id,tool_call_id,kind,question,args,status,answer,decision,created_at,expires_at) VALUES ('qs'||substring('{wid}' from 3),'{ten}','{wid}','{rid}','{sid}','call_acc54','question','要红还是蓝？','','pending','','',now(),now()+interval '1 day') RETURNING id",
+     "capture_stdout": [
+      "qid"
+     ]
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/task-attention",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "items"
+      ],
+      "data_items_some": {
+       "path": "items",
+       "match": {
+        "kind": "question",
+        "taskId": "{tid}",
+        "count": 1,
+        "questionId": "{qid}",
+        "runId": "{rid}",
+        "status": "running"
+       }
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc54o",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "goal": "多类处理项",
+      "tasks": [
+       {
+        "key": "m",
+        "content": "做一件",
+        "agent": "researcher"
+       },
+       {
+        "key": "n",
+        "content": "汇总",
+        "agent": "coder"
+       }
+      ],
+      "links": [
+       {
+        "parent": "m",
+        "child": "n"
+       }
+      ]
+     },
+     "capture": {
+      "orid2": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "SELECT id FROM agent_tasks WHERE orchestration_id='{orid2}' AND task_key='n'",
+     "capture_stdout": [
+      "tidb"
+     ]
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 'sx'||substring('{wid}' from 3), 'task 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sdid"
+     ]
+    },
+    {
+     "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('rx'||substring('{wid}' from 3), '{sdid}', 'running', 1, now() - interval '1 minute', now(), '{wid}') RETURNING id",
+     "capture_stdout": [
+      "rdead"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_tasks SET status='running', current_run_id='{rdead}', started_at=now() WHERE id='{tidb}' RETURNING id",
+     "capture_stdout": [
+      "u2"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_orchestrations SET plan_hold=true, delivery_status='failed' WHERE id='{orid2}' RETURNING id",
+     "capture_stdout": [
+      "u3"
+     ]
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/task-attention",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_items_some": {
+       "path": "items",
+       "match": {
+        "kind": "plan_review",
+        "orchestrationId": "{orid2}",
+        "title": "多类处理项",
+        "status": "active"
+       }
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/task-attention",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_items_some": {
+       "path": "items",
+       "match": {
+        "kind": "delivery_failed",
+        "orchestrationId": "{orid2}"
+       }
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/task-attention",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_items_some": {
+       "path": "items",
+       "match": {
+        "kind": "interrupted",
+        "taskId": "{tidb}",
+        "runId": "{rdead}",
+        "status": "interrupted"
+       }
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/ws_nope/task-attention",
+     "expect": {
+      "http": 404,
+      "code": 114001,
+      "message": "找不到这个项目",
+      "data": null
      }
     }
    ]

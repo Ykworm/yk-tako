@@ -309,9 +309,14 @@
   - **已落地（2026-11-10）**：目标短写入链 = 锁内校验/操作（PG advisory lock，`filelock.go`）→ 同目录临时文件 → 原子 rename（`atomicfile.go`）→ 刷新基准；读者不排队，写者仍排队。`write_file`／`edit_file` 与 Markdown 记忆文件共用一条写盘路。活体 `memory_file_race.sh`（两台隔离引擎：串行、版本拒绝、原子读、kill -9 释放，11/11）
   - 参考核查：Kimi 的 ToolAccesses 调度器只覆盖当前工具批次，Tower 用 worktree；Hermes 普通文件确有跨 subagent 的读取版本与同路径锁，但主要是进程内；Rakazo 的 expectedRevision + Serializable 只直接适用于 PG 文档。doc/61 仍是当前机制说明，doc/65 链接本篇消费文件写入原则
 
-- **72** [多 Agent 编排下一阶段：有界修订、Task HITL 与事件驱动](72-多Agent编排下一阶段.md) ⬜（**方案待点头，未施工**）
-  - 落点：—（未施工；现有接缝为 `internal/runengine/agent_task_*.go`、`questions.go`、`waittools.go`、`events.go` 与 `web/src/{App.vue,TasksView.vue,mutation.ts,api.ts}`）
-  - 2026-11-11 成文并补可靠性边界。四条范围：有界计划修订（追加／替代未来工作、图版本防过期、累计 32 节点／32 次修订、版本时间线）、Task 内 `ask_user`（每 Task 自己的 PG 问题队列、question ID 回答与同 run 续接、可配置截止时间 + `input_timeout`）、左侧任务展开与“需要我处理”（待答／计划决策／中断／交付失败，复用账号级 SSE，不建未读表）、Task 调度事件唤醒 + 默认 30 秒 PG 对账。doc/70 V1 仍是已落地固定 DAG 真源；本方案需先点头，再另写施工包，不授权 coding
+- **72** [多 Agent 编排下一阶段：有界修订、Task HITL 与事件驱动](72-多Agent编排下一阶段.md) ✅（**2026-11-11 施工+活体验收，待用户验收，未 commit**）
+  - 落点：`internal/runengine/agent_task_{revision,revision_api,attention,scheduler,delivery}.go` + `questions.go`（`expires_at`／115102）+ `events.go`（`tk:agent-task-wake`）+ `cmd/yktako/main.go`（`-task-input-timeout`）+ `web/src/{App.vue,TasksView.vue,api.ts}`；活体 `scripts/acceptance/agent_task_{revision,hitl,attention,wakeup}_live.sh` + `expected.json` 用例 51–54（人读版 [19v6-04](19-v6/19v6-04-验收-curl.md)）
+  - 2026-11-11 成文并补可靠性边界。四条范围：有界计划修订（追加／替代未来工作、图版本防过期、累计 32 节点／32 次修订、版本时间线）、Task 内 `ask_user`（每 Task 自己的 PG 问题队列、question ID 回答与同 run 续接、可配置截止时间 + `input_timeout`）、左侧任务展开与“需要我处理”（待答／计划决策／中断／交付失败，复用账号级 SSE，不建未读表）、Task 调度事件唤醒 + 默认 30 秒 PG 对账。doc/70 V1 仍是固定 DAG 真源
+  - 验收：契约 51–54 逐字节；活体 revision 68/68、hitl 48/48、attention 39/39、wakeup 14/14；V1 五场回归 single 24/24、busy 14/14、dag 22/22、crash 20/20、two_replicas 13/13；浏览器走查左侧四类处理项、点入抽屉、答后/继续后消失、刷新重建与修订时间线（doc/72 §11.6）。施工期发现并修掉 V1 交付通知消费的两处真实缺陷（忙通知恒占队首、已终止通知永留 pending），回填 doc/72 §8.2 与新增两条单测
+
+- **73** [协调通知与交付恢复](73-协调通知与交付恢复.md) ⬜（**方案待点头，未施工**）
+  - 落点：—（未施工；现有接缝为 `internal/runengine/{agent_task_delivery,agent_task_scheduler,store,worker,journal,questions}.go` 与 `web/src/{App.vue,TasksView.vue,api.ts,mutation.ts}`）
+  - 2026-11-11 成文。区分 DAG 执行失败与来源 session 交付失败：down／interrupted 走原 run、epoch+1 显式续跑；error／stopped 保留历史并由人工创建同一通知的新处理 run；`resultRevision` 管结果版本、`lease_epoch` 管执行权、当前 claim run 管通知收尾。补通知 failed 状态、每次处理 attempt 审计、RunEnd 与慢速对账同一收尾、结果摘要与文件路径定位、交付只读工具面及双副本防重。[施工包](../tmp/73-协调通知与交付恢复/施工包.md)已随方案写成、待用户点头，不授权 coding
 
 ## 2. 历史存档（`doc/archive/`，不作施工面）
 

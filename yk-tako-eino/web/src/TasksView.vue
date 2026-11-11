@@ -6,19 +6,25 @@
 // 助手用 delegate_task / create_orchestration 派发（通用工具卡，doc/59），页面只消费
 // 服务端真源；所有「变了」都靠事件重拉（agent_tasks_changed / agent_orchestrations_changed），
 // 刷新或换标签页后仍从 PG 重建，不存本地状态。
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   ApiError,
+  continueOrchestration,
   getAgentTask,
   getOrchestration,
+  listPlanRevisions,
+  listTaskQuestions,
   listWorkspaceTasks,
   listWorkspaces,
+  postAnswer,
   resumeAgentTask,
   stopAgentTask,
   stopOrchestration,
   workspaceFileUrl,
   type AgentTask,
   type OrchestrationView,
+  type PlanRevisionRow,
+  type TaskQuestion,
   type TaskResult,
   type Workspace,
 } from './api'
@@ -26,7 +32,15 @@ import { authFetch } from './auth'
 import ConfirmDialog from './ConfirmDialog.vue'
 import { onMutation } from './mutation'
 
-const props = defineProps<{ activeWorkspaceId?: string | null }>()
+const props = defineProps<{
+  activeWorkspaceId?: string | null
+  // 左侧「任务」处理项定位（doc/72 §8.2）：App 用显式 id 传过来，不引入新路由。
+  focusWorkspaceId?: string
+  focusTaskId?: string
+  focusOrchestrationId?: string
+  focusQuestionId?: string
+  focusNonce?: number
+}>()
 
 const phase = ref<'loading' | 'ready' | 'error'>('loading')
 const banner = ref('')
@@ -43,6 +57,34 @@ const query = ref('')
 const detail = ref<AgentTask | null>(null)
 const detailLoading = ref(false)
 const orch = ref<OrchestrationView | null>(null)
+const revisions = ref<PlanRevisionRow[]>([])
+const revisionsLoading = ref(false)
+const planBusy = ref(false)
+
+// Task 问题区（doc/72 §5）：pending 按 createdAt,id 的 FIFO 排，第一张可答；
+// answered／stale 只读展示。问题正文行是 Task 当前 run 的 run_questions 行。
+const questions = ref<TaskQuestion[]>([])
+const questionsLoading = ref(false)
+const answerDraft = ref('')
+const answerPick = ref(-1)
+const answerBusy = ref(false)
+const focusedQuestionId = ref('')
+
+const pendingQuestions = computed(() => questions.value.filter((q) => q.status === 'pending'))
+const answeredQuestions = computed(() => questions.value.filter((q) => q.status !== 'pending'))
+// 只有 Task 自己还在 running 才能答：停止、中断（租约失效）、终态后遗留 pending 都不再可答。
+const canAnswer = computed(() => detail.value?.status === 'running' && !!detail.value.currentRunId)
+const activeQuestion = computed(() => (canAnswer.value ? (pendingQuestions.value[0] ?? null) : null))
+const activeOptions = computed(() => (activeQuestion.value ? questionOptions(activeQuestion.value) : []))
+
+// 换到下一张卡（上一张答完，或服务端补来更早的行）就清掉草稿，避免把作答串到另一题。
+watch(
+  () => activeQuestion.value?.questionId,
+  () => {
+    answerDraft.value = ''
+    answerPick.value = -1
+  },
+)
 
 // 停止确认：单件与整组共用一个 ConfirmDialog 桽。
 const pendingStopTask = ref<AgentTask | null>(null)
@@ -127,10 +169,30 @@ function fail(err: unknown, fallback: string) {
 
 watch(workspaceId, () => void loadTasks())
 
-async function openDetail(row: AgentTask) {
+async function loadQuestions(task: AgentTask) {
+  if (!task.currentRunId) {
+    questions.value = []
+    return
+  }
+  questionsLoading.value = true
+  try {
+    questions.value = await listTaskQuestions(task.taskId)
+  } catch (err) {
+    questions.value = []
+    fail(err, '问题列表没拉到')
+  } finally {
+    questionsLoading.value = false
+  }
+}
+
+async function openDetail(row: AgentTask, questionId = '') {
   banner.value = ''
   orch.value = null
+  revisions.value = []
   detail.value = row
+  focusedQuestionId.value = questionId
+  answerDraft.value = ''
+  answerPick.value = -1
   detailLoading.value = true
   try {
     detail.value = await getAgentTask(row.taskId)
@@ -140,6 +202,14 @@ async function openDetail(row: AgentTask) {
   } finally {
     detailLoading.value = false
   }
+  if (detail.value) await loadQuestions(detail.value)
+  if (questionId) await focusQuestionCard(questionId)
+}
+
+async function focusQuestionCard(questionId: string) {
+  await nextTick()
+  const el = document.querySelector<HTMLElement>(`[data-question="${questionId}"]`)
+  el?.scrollIntoView({ block: 'center', behavior: 'smooth' })
 }
 
 async function reloadDetail(taskId: string) {
@@ -148,6 +218,19 @@ async function reloadDetail(taskId: string) {
     detail.value = await getAgentTask(taskId)
   } catch {
     /* 抽屉里那行旧的先留着；下一次事件或重开会再对齐 */
+    return
+  }
+  await loadQuestions(detail.value)
+}
+
+async function loadRevisions(id: string) {
+  revisionsLoading.value = true
+  try {
+    revisions.value = (await listPlanRevisions(id)).revisions
+  } catch {
+    revisions.value = []
+  } finally {
+    revisionsLoading.value = false
   }
 }
 
@@ -157,24 +240,35 @@ async function reloadOrch(id: string) {
     orch.value = await getOrchestration(id)
   } catch {
     /* 同上 */
+    return
   }
+  await loadRevisions(id)
 }
 
 function closeDetail() {
   detail.value = null
   orch.value = null
+  revisions.value = []
+  questions.value = []
+  focusedQuestionId.value = ''
+  answerDraft.value = ''
+  answerPick.value = -1
 }
 
 async function openOrch(id: string) {
   banner.value = ''
+  detail.value = null
+  questions.value = []
   detailLoading.value = true
   try {
     orch.value = await getOrchestration(id)
   } catch (err) {
     fail(err, '编排组没拉到')
+    return
   } finally {
     detailLoading.value = false
   }
+  await loadRevisions(id)
 }
 
 function openTaskFromOrch(taskId: string) {
@@ -225,6 +319,61 @@ async function resume(row: AgentTask) {
     await reloadDetail(row.taskId)
   } finally {
     busy.value = false
+  }
+}
+
+async function continuePlan() {
+  const o = orch.value?.orchestration
+  if (!o || !o.planHold || planBusy.value) return
+  banner.value = ''
+  planBusy.value = true
+  try {
+    await continueOrchestration(o.orchestrationId, o.planRevision)
+    notice.value = '已继续执行：新计划从现在开始领取任务'
+    await reloadOrch(o.orchestrationId)
+    await loadTasks()
+  } catch (err) {
+    // 117106 = 版本已经变了：重拉组，界面自动换成新版本，再让用户决定。
+    fail(err, '继续失败，请再试一次')
+    await reloadOrch(o.orchestrationId)
+  } finally {
+    planBusy.value = false
+  }
+}
+
+function questionOptions(q: TaskQuestion): string[] {
+  try {
+    const parsed = JSON.parse(q.args) as { options?: unknown }
+    return Array.isArray(parsed.options)
+      ? parsed.options.filter((x): x is string => typeof x === 'string')
+      : []
+  } catch {
+    return []
+  }
+}
+
+async function submitTaskAnswer(q: TaskQuestion) {
+  const opts = questionOptions(q)
+  const picked = answerPick.value >= 0 ? (opts[answerPick.value] ?? '') : ''
+  const text = (picked || answerDraft.value).trim()
+  if (!text || answerBusy.value) return
+  banner.value = ''
+  answerBusy.value = true
+  try {
+    await postAnswer(q.questionId, text)
+    notice.value = '答案已送达，Task 会接着执行'
+    answerDraft.value = ''
+    answerPick.value = -1
+    if (detail.value) {
+      await reloadDetail(detail.value.taskId)
+      await loadTasks()
+    }
+  } catch (err) {
+    // 115101 已被别的入口答过 / 115102 已过期：重拉一次让列表回到服务端事实。
+    fail(err, '回答失败，请再试一次')
+    if (detail.value) await reloadDetail(detail.value.taskId)
+  } finally {
+    answerBusy.value = false
   }
 }
 
@@ -298,6 +447,38 @@ function onKeydown(ev: KeyboardEvent) {
   if (ev.key === 'Escape' && (detail.value || orch.value)) closeDetail()
 }
 
+// 左侧入口定位了一次就只消费一次：nonce 不变（比如从详情里关掉抽屉）不会又把抽屉弹开。
+let lastFocusNonce = -1
+async function applyFocus() {
+  const nonce = props.focusNonce ?? 0
+  if (nonce === lastFocusNonce) return
+  lastFocusNonce = nonce
+  const wid = props.focusWorkspaceId ?? ''
+  if (wid && wid !== workspaceId.value && workspaces.value.some((w) => w.id === wid)) {
+    workspaceId.value = wid
+  }
+  if (props.focusOrchestrationId) {
+    await openOrch(props.focusOrchestrationId)
+    return
+  }
+  if (!props.focusTaskId) return
+  let row = tasks.value.find((t) => t.taskId === props.focusTaskId)
+  if (!row) {
+    try {
+      row = await getAgentTask(props.focusTaskId)
+    } catch (err) {
+      fail(err, '任务没拉到')
+      return
+    }
+  }
+  await openDetail(row, props.focusQuestionId ?? '')
+}
+
+watch(
+  () => props.focusNonce,
+  () => void applyFocus(),
+)
+
 onMounted(() => {
   window.addEventListener('keydown', onKeydown)
   void (async () => {
@@ -309,6 +490,7 @@ onMounted(() => {
       return
     }
     await loadTasks()
+    await applyFocus()
   })()
 })
 
@@ -387,9 +569,19 @@ onBeforeUnmount(() => {
                   <template v-if="orch.orchestration.deliveryStatus">
                     · 交付：<span class="tag" :class="`d-${orch.orchestration.deliveryStatus}`">{{ DELIVERY_LABEL[orch.orchestration.deliveryStatus] }}</span>
                   </template>
+                  <span class="orch-rev"> · 计划 v{{ orch.orchestration.planRevision }}</span>
+                  <span v-if="orch.orchestration.planHold" class="tag hold" data-testid="orch-plan-hold">计划待决策</span>
                 </p>
               </div>
               <div class="sheet-actions">
+                <button
+                  v-if="orch.orchestration.planHold && orch.orchestration.status === 'active'"
+                  type="button"
+                  class="primary"
+                  :disabled="planBusy"
+                  data-testid="orch-continue"
+                  @click="continuePlan"
+                >继续执行</button>
                 <button
                   v-if="!['succeeded', 'failed', 'cancelled'].includes(orch.orchestration.status)"
                   type="button"
@@ -402,6 +594,13 @@ onBeforeUnmount(() => {
               </div>
             </header>
             <p class="orch-goal">{{ orch.orchestration.goal }}</p>
+            <p class="muted final-node">
+              最终节点：
+              <code>{{ taskKeyById[orch.orchestration.finalTaskId] ?? orch.orchestration.finalTaskId }}</code>
+              <template v-if="orch.orchestration.planHold">
+                · 检查点已暂停领取新工作；查看修订历史后显式继续，或回到来源对话让协调者复核。
+              </template>
+            </p>
             <div class="dep-map" data-testid="orch-deps">
               <p class="muted">依赖（parent → child）：</p>
               <ul v-if="orch.links.length">
@@ -426,6 +625,41 @@ onBeforeUnmount(() => {
                 </button>
               </li>
             </ul>
+
+            <!-- 版本时间线（doc/72 §8.2）：逐版展示原命令；修订由协调者工具或 API 触发，页面不画 JSON 编辑器。 -->
+            <section class="sec" data-testid="orch-revisions">
+              <h4>计划修订 <span class="count">{{ revisions.length }}</span></h4>
+              <p v-if="revisionsLoading" class="muted">正在读取…</p>
+              <p v-else-if="!revisions.length" class="muted">还没有修订；组按创建时的计划执行。</p>
+              <ol v-else class="rev-list">
+                <li v-for="r in revisions" :key="r.revisionId" class="rev" :data-rev="r.revision">
+                  <div class="rev-head">
+                    <strong>v{{ r.revision }}</strong>
+                    <span class="muted">基于 v{{ r.baseRevision }}</span>
+                    <span class="muted">{{ fmtWhen(r.createdAt) }}</span>
+                  </div>
+                  <p class="rev-reason">{{ r.reason }}</p>
+                  <p v-if="r.addTasks.length" class="muted rev-line">
+                    新增：
+                    <code v-for="t in r.addTasks" :key="t.key">{{ t.key }}</code>
+                  </p>
+                  <p v-if="r.addLinks.length" class="muted rev-line">
+                    依赖：
+                    <span v-for="l in r.addLinks" :key="`${l.parent}>${l.child}`" class="rev-link">
+                      <code>{{ l.parent }}</code> → <code>{{ l.child }}</code>
+                    </span>
+                  </p>
+                  <p v-if="r.cancelTasks.length" class="muted rev-line">
+                    取消：
+                    <code v-for="k in r.cancelTasks" :key="k">{{ k }}</code>
+                  </p>
+                  <p v-if="r.finalTaskKey" class="muted rev-line">
+                    最终节点改为：<code>{{ r.finalTaskKey }}</code>
+                  </p>
+                  <p v-if="r.sourceRunId" class="muted rev-line">来源 run {{ r.sourceRunId }}</p>
+                </li>
+              </ol>
+            </section>
             <p v-if="detailLoading" class="muted">正在读取…</p>
           </template>
 
@@ -436,6 +670,7 @@ onBeforeUnmount(() => {
                 <h3><code>{{ detail.key }}</code></h3>
                 <p class="muted">
                   <span class="tag" :class="detail.status" data-testid="task-status">{{ STATUS_LABEL[detail.status] ?? detail.status }}</span>
+                  <span v-if="detail.planCheckpoint" class="tag hold" data-testid="task-plan-checkpoint">检查点</span>
                   · 执行者 {{ detail.agent }}
                   <template v-if="detail.currentRunId"> · run {{ detail.currentRunId }}</template>
                 </p>
@@ -471,6 +706,69 @@ onBeforeUnmount(() => {
               <pre class="body">{{ detail.content }}</pre>
             </section>
 
+            <!-- 问题区（doc/72 §5）：FIFO，一次只放开最早一张；answered／stale 只读。 -->
+            <section v-if="questionsLoading || questions.length" class="sec" data-testid="task-questions">
+              <h4>问题 <span class="count">{{ pendingQuestions.length }}</span></h4>
+              <p v-if="questionsLoading" class="muted">正在读取…</p>
+              <ul v-else class="q-list">
+                <li
+                  v-for="q in pendingQuestions"
+                  :key="q.questionId"
+                  class="q-card"
+                  :class="{ active: activeQuestion?.questionId === q.questionId, focused: focusedQuestionId === q.questionId }"
+                  :data-question="q.questionId"
+                >
+                  <div class="q-head">
+                    <span class="tag pending">等回答</span>
+                    <span class="muted">{{ fmtWhen(q.createdAt) }}</span>
+                    <span v-if="q.expiresAt" class="muted">截止 {{ fmtWhen(q.expiresAt) }}</span>
+                  </div>
+                  <p class="q-text">{{ q.question }}</p>
+                  <template v-if="activeQuestion?.questionId === q.questionId">
+                    <div v-if="activeOptions.length" class="q-options">
+                      <button
+                        v-for="(opt, i) in activeOptions"
+                        :key="opt"
+                        type="button"
+                        class="q-option"
+                        :class="{ on: answerPick === i }"
+                        @click="answerPick = answerPick === i ? -1 : i"
+                      >{{ opt }}</button>
+                    </div>
+                    <textarea
+                      v-model="answerDraft"
+                      class="q-input"
+                      rows="2"
+                      placeholder="输入回答；也可以点上面的选项"
+                    ></textarea>
+                    <footer class="q-foot">
+                      <span class="muted">提交后这一问就定了，不能再改。</span>
+                      <button
+                        type="button"
+                        class="primary"
+                        :disabled="answerBusy || (!answerDraft.trim() && answerPick < 0)"
+                        @click="submitTaskAnswer(q)"
+                      >提交回答</button>
+                    </footer>
+                  </template>
+                  <p v-else class="muted">前面还有待答问题，按提交顺序依次回答。</p>
+                </li>
+                <li v-for="q in answeredQuestions" :key="q.questionId" class="q-card done" :data-question="q.questionId">
+                  <div class="q-head">
+                    <span class="tag" :class="q.status === 'answered' ? 'succeeded' : 'cancelled'">
+                      {{ q.status === 'answered' ? '已回答' : '已过期' }}
+                    </span>
+                    <span class="muted">{{ fmtWhen(q.createdAt) }}</span>
+                  </div>
+                  <p class="q-text">{{ q.question }}</p>
+                  <p v-if="q.answer" class="q-answer">{{ q.answer }}</p>
+                </li>
+              </ul>
+              <p v-if="pendingQuestions.length && !canAnswer" class="muted">
+                任务已不在执行，遗留问题不能再回答。
+              </p>
+            </section>
+
             <section v-if="detail.result" class="sec" data-testid="task-result">
               <h4>结果 <span class="muted">（revision {{ detail.resultRevision }}）</span></h4>
               <p class="result-summary">{{ detail.result.summary }}</p>
@@ -495,7 +793,12 @@ onBeforeUnmount(() => {
                 </button>
               </dd>
               <dt>创建</dt>
-              <dd>{{ fmtWhen(detail.createdAt) }}</dd>
+              <dd>
+                {{ fmtWhen(detail.createdAt) }}
+                <span class="muted">（计划 v{{ detail.createdRevision }}）</span>
+              </dd>
+              <dt>检查点</dt>
+              <dd>{{ detail.planCheckpoint ? '完成后暂停组，等计划复核' : '否' }}</dd>
               <dt>开始</dt>
               <dd>{{ fmtWhen(detail.startedAt) }}</dd>
               <dt>结束</dt>
@@ -642,6 +945,10 @@ h4 { margin: 0 0 0.35rem; font-size: var(--text-sm); font-weight: 600; }
 .tag.d-pending { background: #fef3c7; color: #92400e; }
 .tag.d-failed { background: #fee2e2; color: #b91c1c; }
 .tag.final { background: #fff7ed; color: #c2410c; }
+.tag.hold { background: #fef3c7; color: #92400e; }
+.orch-rev { margin-left: 0.15rem; }
+.final-node { margin: 0; font-size: var(--text-sm); }
+.final-node code { font-size: var(--text-xs); }
 
 .sheet-overlay {
   position: fixed;
@@ -745,5 +1052,119 @@ h4 { margin: 0 0 0.35rem; font-size: var(--text-sm); font-weight: 600; }
   color: var(--accent, #4f46e5);
   text-decoration: underline;
   cursor: pointer;
+}
+
+/* 修订时间线：一条版本一行块，命令原样展示（doc/72 §8.2）。 */
+.rev-list {
+  list-style: none;
+  margin: 0.3rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.rev {
+  border-left: 2px solid var(--line, #e5e7eb);
+  padding: 0.1rem 0 0.1rem 0.7rem;
+}
+.rev-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  font-size: var(--text-sm);
+}
+.rev-reason {
+  margin: 0.2rem 0;
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.rev-line {
+  margin: 0.1rem 0;
+  font-size: var(--text-xs);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem;
+}
+.rev-line code { font-size: var(--text-xs); }
+.rev-link { display: inline-flex; gap: 0.25rem; }
+
+/* Task 问题卡：主会话问询面板的简化版（doc/72 §8.2）。 */
+.q-list {
+  list-style: none;
+  margin: 0.3rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+.q-card {
+  border: 1px solid var(--line, #e5e7eb);
+  border-radius: 10px;
+  padding: 0.65rem 0.8rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+.q-card.active { border-color: var(--accent, #6366f1); }
+.q-card.focused { box-shadow: 0 0 0 3px var(--accent-soft, #eef2ff); }
+.q-card.done { background: var(--bg-soft, #f6f7f9); }
+.q-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  font-size: var(--text-xs);
+}
+.q-text {
+  margin: 0;
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.q-answer {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--ink-soft, #374151);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.q-options {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+.q-option {
+  text-align: left;
+  font: inherit;
+  font-size: var(--text-sm);
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--line, #e5e7eb);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.q-option:hover { border-color: var(--accent, #6366f1); }
+.q-option.on {
+  border-color: var(--accent, #6366f1);
+  background: var(--accent-soft, #eef2ff);
+}
+.q-input {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  font-size: var(--text-sm);
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--line, #e5e7eb);
+  border-radius: 8px;
+  resize: vertical;
+}
+.q-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  font-size: var(--text-xs);
 }
 </style>

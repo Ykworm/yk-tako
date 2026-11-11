@@ -400,7 +400,13 @@ func (s *Store) EndRun(ctx context.Context, sessionID SessionID, runID RunID, ep
 	// stopped 收尾标记（doc/17 §4，2026-10-15 用户点头 A1）：守卫 0 行不再一律空转——
 	// 行已被 stop 端点翻成 stopped 时，走 stopped 收尾（只写已配对工具行），terminal 以库为准。
 	stopped := false
+	// wakeTenant 供提交后的调度器唤醒（doc/72 §9.1「来源会话 run 结束」写点）：来源会话
+	// 一空下来，挂起的交付通知才可能认领；顺带叫醒 Task 执行 run 的对账，不必等下一轮对账。
+	var wakeTenant string
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Raw(`SELECT tenant_id FROM sessions WHERE id = ?`, sessionID).Scan(&wakeTenant).Error; err != nil {
+			return err
+		}
 		// 两类工具行的 INSERT 构造（complete 与 stopped 两分支共用同一条 SQL，字段序一致）：
 		// seq 取会话内 MAX+1（与会话其他写行同式）。
 		insertToolResult := func(e TurnEntry) error {
@@ -800,6 +806,7 @@ ON CONFLICT (tenant_id, day) DO UPDATE SET tokens = tenant_usage_daily.tokens + 
 	if stopped {
 		status = "stopped"
 	}
+	s.PublishTaskWake(ctx, wakeTenant, "run_end", string(runID))
 	terminalJSON, err := json.Marshal(Frame{Kind: "terminal", Status: status})
 	if err != nil {
 		return 0, int(nextSeq), true, err
@@ -835,6 +842,16 @@ func (s *Store) StopRun(ctx context.Context, runID RunID) (status string, found 
 		status, found = cur, true
 		return nil
 	})
+	if err == nil && found && status == "stopped" {
+		// 停止也是一次调度事实（doc/72 §9.1）：Task 停止后依赖阻断、组收口要尽快跑；
+		// 租户只作诊断字段，读不到也照样叫醒（调度器按 PG 真源工作）。
+		var tid string
+		if qerr := s.db.WithContext(ctx).Raw(
+			`SELECT tenant_id FROM sessions WHERE id = (SELECT session_id FROM runs WHERE id = ?)`,
+			runID).Scan(&tid).Error; qerr == nil {
+			s.PublishTaskWake(ctx, tid, "run_stop", string(runID))
+		}
+	}
 	return status, found, err
 }
 

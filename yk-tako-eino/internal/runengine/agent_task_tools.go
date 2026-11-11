@@ -15,17 +15,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/components/tool/utils"
 	"github.com/cloudwego/eino/compose"
 )
 
-// dropAgentOrchestrationTools 把 delegate_task / create_orchestration 从入口快照里剔掉
-// （doc/70 §6.3）。剔在 base = 继承档、exclude_tools 档、tools 白名单档三档的共同来源——
-// 一份过滤管三条路：继承档拿不到，白名单档写了名字按「未知名」拒载。
+// dropAgentOrchestrationTools 把「创建与改图」类工具从入口快照里剔掉（doc/70 §6.3、doc/72 §4.8）。
+// 剔在 base = 继承档、exclude_tools 档、tools 白名单档三档的共同来源——一份过滤管三条路。
 func dropAgentOrchestrationTools(ctx context.Context, tools []tool.BaseTool) []tool.BaseTool {
-	reserved := map[string]bool{"delegate_task": true, "create_orchestration": true}
+	reserved := map[string]bool{
+		"delegate_task": true, "create_orchestration": true,
+		"revise_orchestration": true, "continue_orchestration": true,
+	}
 	out := make([]tool.BaseTool, 0, len(tools))
 	for _, t := range tools {
 		info, err := t.Info(ctx)
@@ -49,6 +52,9 @@ type agentTaskRunBox struct {
 	OrchestrationID string
 	// SourceRunID 是创建这件编排的来源 run（trace 对读用）；产品 API 手工创建为空串。
 	SourceRunID string
+	// InputTimeout 是 Task 提问的截止时长（-task-input-timeout）：>0 时 openWaitRow 落 expires_at，
+	// 0 表示不限时。装配与 resume 两条路都从这里注入，保证启动与恢复看到同一个值。
+	InputTimeout time.Duration
 }
 
 type agentTaskRunBoxKey struct{}
@@ -105,6 +111,8 @@ type delegateTaskInput struct {
 	Content  string `json:"content" jsonschema:"description=任务全文：自包含、离开本会话也能独立执行的工作说明（目标、要写的文件、验收标准）"`
 	Agent    string `json:"agent" jsonschema:"description=执行者规格名（当前可用的子代理名）"`
 	ModelRef string `json:"modelRef,omitempty" jsonschema:"description=可选；缺省继承该执行者的模型配置"`
+	// PlanCheckpoint=true：这件 Task 成功后暂停组，等一次计划复核（doc/72 §6.1）。
+	PlanCheckpoint bool `json:"planCheckpoint,omitempty" jsonschema:"description=可选；这件任务成功后暂停整组，等一次计划复核再继续"`
 }
 
 // newDelegateTaskTool 造 delegate_task：创建一件单节点编排组（持久 Task），立即返回
@@ -145,6 +153,7 @@ func handleDelegateTask(ctx context.Context, store *Store, in delegateTaskInput)
 		Content:         in.Content,
 		Agent:           in.Agent,
 		ModelRef:        in.ModelRef,
+		PlanCheckpoint:  in.PlanCheckpoint,
 	}, planEnvFromProfile(ctx))
 	if err != nil {
 		return "", fmt.Errorf("%s", taskCreateErrText(err))
@@ -163,6 +172,8 @@ type orchestrationTaskInput struct {
 	Content  string `json:"content" jsonschema:"description=任务全文：自包含、离开本会话也能独立执行的工作说明"`
 	Agent    string `json:"agent" jsonschema:"description=执行者规格名（当前可用的子代理名）"`
 	ModelRef string `json:"modelRef,omitempty" jsonschema:"description=可选；缺省继承该执行者的模型配置"`
+	// PlanCheckpoint=true：本节点成功后暂停整组，等一次计划复核（doc/72 §4.1）。
+	PlanCheckpoint bool `json:"planCheckpoint,omitempty" jsonschema:"description=可选；本节点成功后暂停整组，等一次计划复核再继续"`
 }
 
 type orchestrationLinkInput struct {
@@ -212,7 +223,10 @@ func handleCreateOrchestration(ctx context.Context, store *Store, in createOrche
 		Goal:            in.Goal,
 	}
 	for _, t := range in.Tasks {
-		cmd.Tasks = append(cmd.Tasks, planTask{Key: t.Key, Content: t.Content, Agent: t.Agent, ModelRef: t.ModelRef})
+		cmd.Tasks = append(cmd.Tasks, planTask{
+			Key: t.Key, Content: t.Content, Agent: t.Agent, ModelRef: t.ModelRef,
+			PlanCheckpoint: t.PlanCheckpoint,
+		})
 	}
 	for _, l := range in.Links {
 		cmd.Links = append(cmd.Links, planLink{Parent: l.Parent, Child: l.Child})
@@ -231,6 +245,163 @@ func handleCreateOrchestration(ctx context.Context, store *Store, in createOrche
 // 以及「不要在 content 里要求执行者向你汇报」——执行者只向 submit_task_result 交结果。
 const delegationWaitHint = "调用后继续做你自己的事，不要等待；任务失败、中断或整组完成时你会收到通知，" +
 	"收到后再决定下一步。"
+
+// revisionToolTaskInput 是修订新增节点的工具入参（与 HTTP 的 revisionTaskInput 同形状，
+// 但 schema 要 jsonschema tag）。
+type revisionToolTaskInput struct {
+	Key            string `json:"key" jsonschema:"description=组内唯一标识（不得与已有节点重复）"`
+	Content        string `json:"content" jsonschema:"description=任务全文：自包含、离开本会话也能独立执行"`
+	Agent          string `json:"agent" jsonschema:"description=执行者规格名（当前可用的子代理名）"`
+	ModelRef       string `json:"modelRef,omitempty" jsonschema:"description=可选；缺省继承该执行者的模型配置"`
+	PlanCheckpoint bool   `json:"planCheckpoint,omitempty" jsonschema:"description=可选；本节点成功后暂停整组，等一次计划复核"`
+}
+
+type reviseOrchestrationInput struct {
+	OrchestrationID string                   `json:"orchestrationId" jsonschema:"description=要修订的编排组 id（来自创建回执或计划复核输入）"`
+	BaseRevision    int                      `json:"baseRevision" jsonschema:"description=你看到的计划版本号（组字段 planRevision）；不是最新值会被拒绝"`
+	Reason          string                   `json:"reason" jsonschema:"description=这次为什么改计划：写给用户看的说明"`
+	AddTasks        []revisionToolTaskInput  `json:"addTasks,omitempty" jsonschema:"description=新增节点"`
+	AddLinks        []orchestrationLinkInput `json:"addLinks,omitempty" jsonschema:"description=新增依赖边（端点可为已有 key 或新增 key）"`
+	CancelTasks     []string                 `json:"cancelTasks,omitempty" jsonschema:"description=取消尚未开始的节点（pending/ready/blocked）的 key"`
+	FinalTaskKey    string                   `json:"finalTaskKey,omitempty" jsonschema:"description=可选：更换最终交付节点（新 key 或已有 pending/ready 节点）"`
+}
+
+type continueOrchestrationInput struct {
+	OrchestrationID string `json:"orchestrationId" jsonschema:"description=要继续的编排组 id"`
+	BaseRevision    int    `json:"baseRevision" jsonschema:"description=你看到的计划版本号；不是最新值会被拒绝"`
+}
+
+// revisionErrText 把修订/继续服务的业务错误翻成给模型看的句子。状态类拒绝让模型先读最新计划，
+// 而不是盲目重试同一个 baseRevision。
+func revisionErrText(err error) string {
+	var pe *planError
+	switch {
+	case errors.As(err, &pe):
+		return "计划修订不合法：" + pe.reason
+	case errors.Is(err, errRevisionStale):
+		return "你手上的 baseRevision 已过期：计划已有新修订，先读取最新计划再重试"
+	case errors.Is(err, errOrchNotRevisable):
+		return "这个编排组现在不能修订或继续（不在进行中、最终 Task 已开始，或当前状态不允许）"
+	case errors.Is(err, errRevisionConflict):
+		return "这个修订键已经用于另一次修订，换一个键或改回原命令"
+	case errors.Is(err, errOrchNotFound):
+		return "找不到这个编排组"
+	case errors.Is(err, errCreateAgent), errors.Is(err, errCreateModel):
+		return taskCreateErrText(err)
+	default:
+		return "修订计划失败：" + err.Error()
+	}
+}
+
+// checkOrchOwnedByRun 校验目标组属于当前 run 的来源会话（doc/72 §4.8）：模型入参里的
+// orchestrationId 可能来自别处，归属只看 run context，不信模型自报。
+func checkOrchOwnedByRun(ctx context.Context, store *Store, box *taskBox, p principal, orchID string) error {
+	var src string
+	res := store.db.WithContext(ctx).Raw(
+		`SELECT source_session_id FROM agent_orchestrations WHERE id = ? AND tenant_id = ?`,
+		orchID, p.TenantID).Scan(&src)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return errOrchNotFound
+	}
+	if SessionID(src) != box.session {
+		return errOrchNotFound // 别人的组：与不存在同判，不泄漏存在性
+	}
+	return nil
+}
+
+// newReviseOrchestrationTool 造 revise_orchestration：把一次计划修订提交给统一服务
+// （与 POST /api/orchestrations/:id/revisions 同一份校验）。修订只改尚未开始的图，
+// 立刻生效；组处于计划暂停时修订成功后暂停解除。
+func newReviseOrchestrationTool(store *Store) (tool.BaseTool, error) {
+	return utils.InferTool("revise_orchestration",
+		"调整一个正在进行的编排组：可新增节点与依赖边、取消尚未开始的节点、更换最终交付节点。"+
+			"必须带上你看到的 baseRevision；计划已有新修订时会被拒绝，先读取最新计划再试。"+
+			"已经开始执行的节点不能改。修订原因会记入时间线并展示给用户。",
+		func(ctx context.Context, in reviseOrchestrationInput) (string, error) {
+			return handleReviseOrchestration(ctx, store, in)
+		})
+}
+
+func handleReviseOrchestration(ctx context.Context, store *Store, in reviseOrchestrationInput) (string, error) {
+	box := taskBoxFrom(ctx)
+	if box == nil {
+		return "", fmt.Errorf("revise_orchestration 不可用（没有 run 身份）")
+	}
+	p, ok := principalFromCtx(ctx)
+	if !ok {
+		return "", fmt.Errorf("revise_orchestration 不可用（没有租户身份）")
+	}
+	callID := compose.GetToolCallID(ctx)
+	if callID == "" {
+		return "", fmt.Errorf("revise_orchestration 不可用（没有工具调用坐标）")
+	}
+	if err := checkOrchOwnedByRun(ctx, store, box, p, in.OrchestrationID); err != nil {
+		return "", fmt.Errorf("%s", revisionErrText(err))
+	}
+	cmd := RevisionCommand{
+		IdempotencyKey: string(box.run) + ":" + callID,
+		BaseRevision:   in.BaseRevision,
+		Reason:         in.Reason,
+		SourceRunID:    string(box.run),
+		CancelTasks:    in.CancelTasks,
+		FinalTaskKey:   in.FinalTaskKey,
+	}
+	for _, t := range in.AddTasks {
+		cmd.AddTasks = append(cmd.AddTasks, planTask{
+			Key: t.Key, Content: t.Content, Agent: t.Agent, ModelRef: t.ModelRef,
+			PlanCheckpoint: t.PlanCheckpoint,
+		})
+	}
+	for _, l := range in.AddLinks {
+		cmd.AddLinks = append(cmd.AddLinks, planLink{Parent: l.Parent, Child: l.Child})
+	}
+	resp, err := store.CreatePlanRevision(ctx, p, in.OrchestrationID, cmd, planEnvFromProfile(ctx))
+	if err != nil {
+		return "", fmt.Errorf("%s", revisionErrText(err))
+	}
+	b, _ := json.Marshal(map[string]any{
+		"orchestrationId": resp.OrchestrationID, "revision": resp.Revision,
+		"finalTaskId": resp.FinalTaskID, "planHold": resp.PlanHold,
+		"addedTaskIds": resp.AddedTaskIDs,
+	})
+	return string(b), nil
+}
+
+// newContinueOrchestrationTool 造 continue_orchestration：确认当前计划、解除计划暂停。
+// baseRevision 与组上版本不一致即拒绝——模型看到的是旧图时不能替用户放行。
+func newContinueOrchestrationTool(store *Store) (tool.BaseTool, error) {
+	return utils.InferTool("continue_orchestration",
+		"确认当前计划并按原图继续执行（用于计划复核暂停后放行）。必须带上你看到的 baseRevision，"+
+			"计划已有新修订时会被拒绝。若计划需要调整，先用 revise_orchestration 改图。",
+		func(ctx context.Context, in continueOrchestrationInput) (string, error) {
+			return handleContinueOrchestration(ctx, store, in)
+		})
+}
+
+func handleContinueOrchestration(ctx context.Context, store *Store, in continueOrchestrationInput) (string, error) {
+	box := taskBoxFrom(ctx)
+	if box == nil {
+		return "", fmt.Errorf("continue_orchestration 不可用（没有 run 身份）")
+	}
+	p, ok := principalFromCtx(ctx)
+	if !ok {
+		return "", fmt.Errorf("continue_orchestration 不可用（没有租户身份）")
+	}
+	if err := checkOrchOwnedByRun(ctx, store, box, p, in.OrchestrationID); err != nil {
+		return "", fmt.Errorf("%s", revisionErrText(err))
+	}
+	resp, err := store.ContinueOrchestration(ctx, p, in.OrchestrationID, in.BaseRevision)
+	if err != nil {
+		return "", fmt.Errorf("%s", revisionErrText(err))
+	}
+	b, _ := json.Marshal(map[string]any{
+		"orchestrationId": resp.OrchestrationID, "revision": resp.Revision, "planHold": resp.PlanHold,
+	})
+	return string(b), nil
+}
 
 // submitTaskArtifactInput 是结果里一个产物引用的入参形状。
 type submitTaskArtifactInput struct {

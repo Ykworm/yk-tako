@@ -323,11 +323,13 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 	for _, t := range skillTools {
 		pool = append(pool, wrapToolErrors(t))
 	}
-	// 持久 Task 创建工具入池（doc/70 §5.3）：只进普通 mAgent 根池——子代理入口快照剔掉
-	// （agents.go dropAgentOrchestrationTools），Task 执行者装配也不给（agent_task_runner.go）。
+	// 持久 Task 创建与改图工具入池（doc/70 §5.3、doc/72 §4.8）：只进普通 mAgent 根池——
+	// 子代理入口快照剔掉（agents.go dropAgentOrchestrationTools），Task 执行者装配也不给
+	// （agent_task_runner.go）。交付 run 的装配另行剔掉 revise/continue。
 	// submit_task_result 不在这里：它只在 Task 执行 run 的装配里出现。
 	for _, mk := range []func(*Store) (tool.BaseTool, error){
 		newDelegateTaskTool, newCreateOrchestrationTool,
+		newReviseOrchestrationTool, newContinueOrchestrationTool,
 	} {
 		t, err := mk(store)
 		if err != nil {

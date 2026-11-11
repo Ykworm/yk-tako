@@ -658,7 +658,7 @@ func autoMigrate(db *gorm.DB) error {
 		&TenantInvitation{}, &TenantAgent{}, &AgentDefault{}, &TenantSetting{}, &TenantStorage{},
 		&Workspace{}, &CleanerState{}, &RunTask{}, &RunQuestion{},
 		&SkillRow{}, &SkillDisable{},
-		&AgentOrchestration{}, &AgentTask{}, &AgentTaskLink{}, &AgentNotification{}); err != nil {
+		&AgentOrchestration{}, &AgentTask{}, &AgentTaskLink{}, &AgentNotification{}, &AgentPlanRevision{}); err != nil {
 		return err
 	}
 	// 旧列 kind/topic **不在这里删**——它们是存量迁移的**输入**：

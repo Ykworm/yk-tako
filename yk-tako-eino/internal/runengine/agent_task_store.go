@@ -175,7 +175,7 @@ func (s *Store) CreateAgentOrchestration(ctx context.Context, p principal, cmd C
 				ID: id, OrchestrationID: orchID, TaskKey: t.Key,
 				TenantID: p.TenantID, WorkspaceID: cmd.WorkspaceID,
 				Content: t.Content, AgentName: t.Agent, ModelRef: t.ModelRef,
-				Status: status,
+				Status: status, PlanCheckpoint: t.PlanCheckpoint,
 			})
 		}
 		orch := AgentOrchestration{
@@ -232,6 +232,9 @@ func (s *Store) CreateAgentOrchestration(ctx context.Context, p principal, cmd C
 	for _, id := range createdTaskIDs {
 		s.PublishEvent(ctx, p.TenantID, eventAgentTasksChanged, id)
 	}
+	// 内部唤醒（doc/72 §9.1）：新组可能已有 ready 节点，调度器不必等 30 秒对账。
+	// PG 已提交才发；失败只丢一次叫醒，后台对账兜住。
+	s.PublishTaskWake(ctx, p.TenantID, "created", resp.OrchestrationID)
 	return resp, nil
 }
 
@@ -267,6 +270,7 @@ func taskViewFrom(t AgentTask, alive map[string]bool) agentTaskView {
 	v := agentTaskView{
 		TaskID: t.ID, OrchestrationID: t.OrchestrationID, Key: t.TaskKey,
 		Content: t.Content, Agent: t.AgentName, ModelRef: t.ModelRef,
+		PlanCheckpoint: t.PlanCheckpoint, CreatedRevision: t.CreatedRevision,
 		WorkspaceID: t.WorkspaceID, Status: t.Status,
 		Result:         parseTaskResult(t.Result),
 		ResultRevision: t.ResultRevision,
@@ -419,7 +423,8 @@ SELECT o.* FROM agent_orchestrations o
 		Orchestration: orchestrationBody{
 			OrchestrationID: o.ID, Goal: o.Goal, WorkspaceID: o.WorkspaceID,
 			SourceSessionID: string(o.SourceSessionID), Status: o.Status,
-			FinalTaskID: o.FinalTaskID, DeliveryStatus: o.DeliveryStatus, DeliveryRunID: o.DeliveryRunID,
+			FinalTaskID: o.FinalTaskID, PlanRevision: o.PlanRevision, PlanHold: o.PlanHold,
+			DeliveryStatus: o.DeliveryStatus, DeliveryRunID: o.DeliveryRunID,
 			CreatedAt: o.CreatedAt, FinishedAt: o.FinishedAt, DeliveredAt: o.DeliveredAt, UpdatedAt: o.UpdatedAt,
 		},
 		Tasks: views,
@@ -472,6 +477,7 @@ func (s *Store) StopAgentTask(ctx context.Context, p principal, id string) (stri
 	}
 	if id != "" {
 		s.PublishEvent(ctx, p.TenantID, eventAgentTasksChanged, id)
+		s.PublishTaskWake(ctx, p.TenantID, "stop_task", id)
 	}
 	return status, runID, nil
 }
@@ -535,6 +541,7 @@ func (s *Store) StopAgentOrchestration(ctx context.Context, p principal, id stri
 		return "", nil, err
 	}
 	s.PublishEvent(ctx, p.TenantID, eventAgentOrchestrationsChanged, id)
+	s.PublishTaskWake(ctx, p.TenantID, "stop_orchestration", id)
 	return status, runIDs, nil
 }
 

@@ -80,17 +80,29 @@ func openWaitRow(ctx context.Context, store *Store, kind, toolName string, paylo
 	if err != nil {
 		return RunQuestion{}, err
 	}
-	row, err := store.InsertQuestion(ctx, RunQuestion{
+	q := RunQuestion{
 		TenantID: p.TenantID, Workspace: ws, RunID: box.run, SessionID: box.session,
 		ToolCallID: compose.GetToolCallID(ctx), Kind: kind,
 		Question: text, Args: string(args), Status: questionStatusPending,
-	})
+	}
+	// Task 提问带截止时间（doc/72 §7.1）：只有执行身份盒注入了正的超时才写；普通主会话
+	// 没有这个盒，expires_at 保持 NULL（无限等待，字节与旧行为一致）。
+	if tb := agentTaskRunBoxFrom(ctx); tb != nil && tb.InputTimeout > 0 {
+		deadline := time.Now().Add(tb.InputTimeout)
+		q.ExpiresAt = &deadline
+	}
+	row, err := store.InsertQuestion(ctx, q)
 	if err != nil {
 		return RunQuestion{}, fmt.Errorf("问题落库失败: %w", err)
 	}
 	agent, _ := callerNameFrom(ctx)
 	if err := emitQuestionFrame(ctx, store, box.run, target.epoch, agent, row); err != nil {
 		return RunQuestion{}, err
+	}
+	// 问题落库并成功发帧后按 Task 通知页面（doc/72 §7.1）：事件不带正文、答案、数量或截止时间。
+	if tb := agentTaskRunBoxFrom(ctx); tb != nil {
+		store.PublishEvent(ctx, p.TenantID, eventAgentTasksChanged, tb.TaskID)
+		store.PublishTaskWake(ctx, p.TenantID, "task_question", tb.TaskID)
 	}
 	return row, nil
 }
