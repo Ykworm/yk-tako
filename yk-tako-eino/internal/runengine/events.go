@@ -34,6 +34,10 @@ const (
 	// tools_changed（doc/52 D36）：工具根变了。与 skills_changed 分开是**故意的**——
 	// 客户端按 type 决定重拉哪一页；合一个类型会让技能页为一次工具上传白拉一遍。
 	eventToolsChanged = "tools_changed"
+	// agent_tasks_changed / agent_orchestrations_changed（doc/70 §10.3）：持久 Task 与编排组的
+	// 创建、状态翻转、停止、恢复、结果与交付状态变化在 PG 成功后发；id = Task／编排组 ID。
+	eventAgentTasksChanged          = "agent_tasks_changed"
+	eventAgentOrchestrationsChanged = "agent_orchestrations_changed"
 )
 
 // eventsMaxLen：流的有界截断（doc/46 §7 开放问题第 3 条的拍定值）。
@@ -113,6 +117,12 @@ func (s *Server) getEvents(c *gin.Context) {
 	key := keyEvents(p.TenantID)
 	lastID := strings.TrimSpace(c.GetHeader("Last-Event-ID"))
 	if lastID == "" {
+		// 浏览器只在「同一条 EventSource 自动重连」时带 Last-Event-ID 头；客户端断线后退避
+		// 重建的是**新** EventSource（token 短效，旧 URL 重连只会 401），没有头——改由客户端把
+		// 收到的最后一个 seq 放进 query 续读，重连间隙的变更不丢（doc/46 §3.3 的承诺）。
+		lastID = strings.TrimSpace(c.Query("last_event_id"))
+	}
+	if lastID == "" {
 		lastID = "$" // 只推新事件
 	}
 	for {
@@ -126,7 +136,14 @@ func (s *Server) getEvents(c *gin.Context) {
 				return // 客户端断开 / 请求收尾
 			}
 			if errors.Is(err, redis.Nil) {
-				continue // BLOCK 超时：本轮无事件，继续挂读
+				// BLOCK 超时：本轮无事件。写一行 SSE 注释当心跳再继续挂读——挂读期间零字节的
+				// 连接会被中间层当闲置掐掉（2026-11-10 浏览器走查实测：任务页的连接 ~94s 被掐
+				// 一次，事件全靠断线窗口漏掉）。注释行 EventSource 不当帧，只让链路上有字节。
+				if _, wErr := fmt.Fprintf(w, ": ping\n\n"); wErr != nil {
+					return
+				}
+				flusher.Flush()
+				continue
 			}
 			log.Printf("GET /api/events XREAD: %v", err)
 			return

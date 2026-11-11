@@ -1,7 +1,7 @@
 # doc/ 文档索引
 
 > 性质：**索引**，不是方案。本文只回答「这篇文档是什么、能不能照着施工、代码在哪、被谁取代」。
-> 最后核对：2026-11-07。
+> 最后核对：2026-11-11。
 > 状态口径：✅ 已落地 · 🔶 部分落地／待收口 · ⬜ 未做 · 存档 = 历史材料，不作施工面。
 > 代码路径均相对 `yk-tako-eino/`。
 
@@ -297,15 +297,21 @@
   - Markdown 写入只给 master，锁内重读 + 操作式修改 + 同目录临时文件原子 rename（`atomicfile.go`）；多副本用 PG advisory lock 协调。Rakazo 的真实内置存储已核为 PG document + revision，Hermes 才是纯文件参照
   - 验收：观测口与守卫字节在 `expected.json` 用例 35–38 + 快闸 `TestContractMemoryObserveBytes`；活体六件——pipeline_live 20/20、markdown_live 26/26、migrate_live 42/42、file_race 11/11、project_delete 9/9、redpanda_crash（真 broker kill -9 补投与 A→B→A 不被吞）；[doc/29](29-长期记忆.md) 线一被本篇取代、线二仍现行
 
-- **70** [多 Agent 编排与持久 Task：第一版方案](70-多Agent编排与Task/03-第一版方案.md) ⬜（方案待点头）
-  - 落点：—（未施工）；预计涉及 `internal/runengine/`、`cmd/yktako/`、`web/`、`scripts/acceptance/`；方案集与调研入口见 [doc/70 README](70-多Agent编排与Task/README.md)
-  - 2026-11-09 立项并收束 V1：先落地一件可持久、执行、通知、停止与显式恢复的 Task，再完成「初始 DAG 整组原子创建 → A/B 并行 → 依赖满足后 C 汇总 → 失败阻断与最终单次交付」。V1 固定节点内容、执行者与依赖边；Goal 驱动的动态计划修订留作下一版，不做 Agent 自由群聊或无限共享历史。两篇方案初稿已由 V1 取代，调研继续以 Comma 作持久 Task／幂等／通知参照、Hermes 作依赖／调度参照、Octop 作同伴互调参照。未点头、未施工，不翻 doc/16 #9 的 🔶 状态
+- **70** [多 Agent 编排与持久 Task：第一版方案](70-多Agent编排与Task/03-第一版方案.md) ✅（**2026-11-10 施工+活体验收，commit 待用户定**）
+  - 落点：`internal/runengine/agent_task_{api,delivery,graph,runner,scheduler,store,tools,types}.go` + `auth.go`（117xxx 码，[doc/40](40-响应信封统一.md) §4.2c）+ `events.go`（`agent_tasks_changed`／`agent_orchestrations_changed`，[doc/46](46-变更同步与事件通道.md) §7.7）+ `cmd/yktako/main.go`（`-task-interval`）；`web/src/TasksView.vue`（任务页）；活体 `scripts/acceptance/agent_task_{single,busy,dag,crash,two_replicas}_live.sh` + `agent_task_live_lib.sh`；方案集与调研入口见 [doc/70 README](70-多Agent编排与Task/README.md)
+  - 2026-11-09 立项收束 V1，2026-11-10 一次施工完成：一件可持久、执行、通知、停止与显式恢复的 Task（独立执行 session，恢复复用 doc/30 的同 run epoch+1 接管），加「初始 DAG 整组原子创建 → 并行推进 → 依赖满足后 C 汇总 → 失败阻断传播 → 整组单次交付」。四张表（`agent_orchestrations`/`agent_tasks`/`agent_task_links`/`agent_notifications`）+ 模型工具 `delegate_task`/`create_orchestration`/`submit_task_result` + 八端点；V1 固定节点内容、执行者与依赖边，Goal 驱动的动态改图留作下一版
+  - 验收：单测全绿（图校验/事件/产出归一/依赖失败传播钉子）；活体五场 single 24/24、busy 14/14、dag 22/22、crash 20/20、two_replicas 13/13；浏览器走查停止链与恢复链、交付一次审计（来源会话 17 组各恰一条 `orchestration_finished`）；施工期契约缺口修复已回填 doc/40 §4.2c 与 doc/46 §7.7
+  - 与现行文档的边界：doc/25、doc/39 的同步子代理与 wire 档案不因此改变；doc/41 的 `run_tasks` 仍是一场 run 内的看板，与本 Task 不能混名；doc/71 长任务 worktree 是独立方案，V1 不做并行仓库合并
 
 - **71** [文件写入竞争：短写入互斥、版本校验、原子替换与长任务隔离](71-文件写入竞争.md) 🔶（**短写入三件套 2026-11-10 落地；长任务 worktree 归 doc/70 未开工**）
   - 落点：`internal/runengine/{filefp.go,filelock.go,atomicfile.go,filetools.go}`；长任务编排便签归 `doc/70`
   - 2026-11-09 立项。把锁、版本校验与原子 rename 分到三类故障：写者同时写、依据旧版覆盖、读者看到半截；整文件 `write_file` 保留 run/agent 级读取基准，局部 `edit_file` 与条目 Memory 在锁内按内容操作，不额外背整文件 map
   - **已落地（2026-11-10）**：目标短写入链 = 锁内校验/操作（PG advisory lock，`filelock.go`）→ 同目录临时文件 → 原子 rename（`atomicfile.go`）→ 刷新基准；读者不排队，写者仍排队。`write_file`／`edit_file` 与 Markdown 记忆文件共用一条写盘路。活体 `memory_file_race.sh`（两台隔离引擎：串行、版本拒绝、原子读、kill -9 释放，11/11）
   - 参考核查：Kimi 的 ToolAccesses 调度器只覆盖当前工具批次，Tower 用 worktree；Hermes 普通文件确有跨 subagent 的读取版本与同路径锁，但主要是进程内；Rakazo 的 expectedRevision + Serializable 只直接适用于 PG 文档。doc/61 仍是当前机制说明，doc/65 链接本篇消费文件写入原则
+
+- **72** [多 Agent 编排下一阶段：有界修订、Task HITL 与事件驱动](72-多Agent编排下一阶段.md) ⬜（**方案待点头，未施工**）
+  - 落点：—（未施工；现有接缝为 `internal/runengine/agent_task_*.go`、`questions.go`、`waittools.go`、`events.go` 与 `web/src/{App.vue,TasksView.vue,mutation.ts,api.ts}`）
+  - 2026-11-11 成文并补可靠性边界。四条范围：有界计划修订（追加／替代未来工作、图版本防过期、累计 32 节点／32 次修订、版本时间线）、Task 内 `ask_user`（每 Task 自己的 PG 问题队列、question ID 回答与同 run 续接、可配置截止时间 + `input_timeout`）、左侧任务展开与“需要我处理”（待答／计划决策／中断／交付失败，复用账号级 SSE，不建未读表）、Task 调度事件唤醒 + 默认 30 秒 PG 对账。doc/70 V1 仍是已落地固定 DAG 真源；本方案需先点头，再另写施工包，不授权 coding
 
 ## 2. 历史存档（`doc/archive/`，不作施工面）
 

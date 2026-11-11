@@ -21,6 +21,12 @@
 | `memory_migrate_live.sh` | doc/65 迁移与双向互切活体：旧结构升级、pipeline↔markdown、失败预检（活 run / pending / failed）、重放幂等。**自己起停引擎**，不打模型、不连 broker | 不要 |
 | `memory_file_race.sh` | doc/65 + doc/71 多副本文件写入竞争：跨进程锁串行、写前版本拒绝、原子替换可见性、崩溃释放锁。**自己起停两台隔离引擎**共库共 workspace | 不要 |
 | `memory_project_delete_live.sh` | doc/65 §3.3 项目删除级联：scope=workspace 的记忆两层都清、该项目 jobs 清掉；scope=user 的行、`USER.md`、运行档案不动 | 要 |
+| `agent_task_single_live.sh` | doc/70 单件 Task 活体：真模型领件 → run → `submit_task_result` → 组收口 → 来源会话交付**恰好一次**；同创建请求重打不加行 | 要 |
+| `agent_task_dag_live.sh` | doc/70 固定 DAG 活体：A/B 并行写文件交结果 → C 读上游合成 final → 依赖序断言（C 不早于父任务完成）+ 交付恰好一次 | 要 |
+| `agent_task_busy_live.sh` | doc/70 §9.2 忙会话交付活体：来源会话 `ask_user` 挂起中收口 → 通知保持 pending 不铸交付 run → 答题空闲后消费、恰好一场交付 run | 要 |
+| `agent_task_crash_live.sh` | doc/70 §10 崩溃活体：A 执行中 `kill -9` → 重启后 interrupted → 显式 resume 同代接续（epoch+1）→ 旧代交不上结果 → 交付一次 | 要 |
+| `agent_task_two_replicas_live.sh` | doc/70 §6.2 多副本领取活体：两台隔离引擎共库同时抢同一批 ready Task——每件恰好一个执行会话、恰好一场执行 run、通知与交付各恰好一次 | 要 |
+| `agent_task_live_lib.sh` | 五个 agent_task 脚本共用的底座（注册 / 拉帧 / SQL / 等待与断言帮手），**source 用，不直接执行** | — |
 | `memory_live_lib.sh` | 六个 memory 脚本共用的底座（注册 / 拉帧 / SQL 断言），**source 用，不直接执行** | — |
 | `check-expected.sh` | 守「19v6-04 散文」与「`expected.json`」的用例号集合一致 | — |
 | `harness.py` | 三个脚本共用的底座：HTTP 调用、.env 取密钥、psql 补丁、断言计数 | — |
@@ -153,6 +159,48 @@ TAKO_ENGINE_RESTART='cd <仓库根>/yk-tako-eino && nohup go run ./cmd/yktako -e
 ```
 
 依赖：`python3`、`curl`、`jq`；`psql` 只在要造忙闸时用。
+
+## 持久 Task 活体（doc/70）怎么跑
+
+五个脚本两类起法。公共纪律与 memory 活体相同（kill 只打隔离实例、不调 `/api/dev/reset`）。
+
+**预起引擎类**（single / dag / busy）：按「怎么起一个隔离引擎」起一台，**调度循环要开着**——
+默认 `-task-interval 1s` 就是开；契约断言那种 `-task-interval=-1s` 的引擎跑不了活体。
+建议配 `TAKO_MEMORY_MODE=markdown`（免 broker；这几场不验记忆行为）：
+
+```bash
+TAKO_BASE=http://127.0.0.1:8943 TAKO_ENV=yk-tako-eino/.env \
+TAKO_PG_DSN="host=127.0.0.1 port=5433 dbname=tako_acc sslmode=disable" \
+TAKO_PSQL="$PGBIN/psql" \
+  bash scripts/acceptance/agent_task_single_live.sh
+# dag / busy 同参数。busy 另要 TAKO_PSQL 直连（要读 runs 租约）。
+```
+
+**crash（预起引擎类 + 崩溃对）**：靶子就是上面那台（single/dag/busy 跑完后跑它——它会把引擎 kill -9 再重启），
+另给 `TAKO_ENGINE_PIDS` / `TAKO_ENGINE_RESTART`，契约与 `taskboard_crash.sh` 相同：
+RESTART 必须带与被杀实例相同的 `-pg` / `-redis` / `-workspace` / `TAKO_JWT_SECRET`，调度循环要开着：
+
+```bash
+TAKO_BASE=http://127.0.0.1:8943 TAKO_ENV=yk-tako-eino/.env \
+TAKO_PG_DSN="host=127.0.0.1 port=5433 dbname=tako_acc sslmode=disable" \
+TAKO_PSQL="$PGBIN/psql" \
+TAKO_ENGINE_PIDS="$(lsof -tiTCP:8943 -sTCP:LISTEN | tr '\n' ' ')" \
+TAKO_ENGINE_RESTART='cd <仓库根>/yk-tako-eino && TAKO_MEMORY_MODE=markdown \
+TAKO_JWT_SECRET="dev-only-jwt-secret-change-me-32bytes" \
+nohup /tmp/yktako-acc -engine 127.0.0.1:8943 -pg "host=127.0.0.1 port=5433 dbname=tako_acc sslmode=disable" \
+  -redis "redis://127.0.0.1:6390/7" -workspace ../tmp/workspace-acc >>/tmp/yktako-acc.log 2>&1 &' \
+  bash scripts/acceptance/agent_task_crash_live.sh
+```
+
+**two_replicas（自起停类）**：脚本自己 `go build` 并起停两台引擎（共库、双端口），不用预起；
+靶子库给**空的**隔离 PG 库，脚本自己在里面建 `pg_search` 扩展（端口默认 8956/8957，
+可用 `TAKO_ENGINE_PORT_A/B` 换；Redis 默认 `redis://127.0.0.1:6390/11`）：
+
+```bash
+TAKO_PG_DSN="host=127.0.0.1 port=5433 dbname=tako_task sslmode=disable" \
+TAKO_PSQL="$PGBIN/psql" \
+  bash scripts/acceptance/agent_task_two_replicas_live.sh
+```
 
 ## 期望字节在哪
 

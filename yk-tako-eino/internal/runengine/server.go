@@ -26,6 +26,9 @@ type Server struct {
 	store  *Store
 	w      int
 	worker *Worker
+	// dev 是 -dev 开关（dev-only 端点的注册面）。从 NewRouter 的参数移到字段：
+	// main 现在拿 *Server 本体（Task 调度装配口），RouterFor 里还要用它。
+	dev bool
 	// mediaRoot 是入口媒体落盘与 GET /api/media 的作业根（doc/32 A1/A4）——
 	// 取自 worker 的 workspace（同一根、同一把牢笼）；单测直接构造 Server 时可单独给。
 	mediaRoot string
@@ -68,6 +71,12 @@ func accessLogLine(p gin.LogFormatterParams) string {
 	)
 }
 
+// NewServer 造 Server（路由面的装配产物）。main 需要拿到 *Server 本体：Task 调度循环的
+// 两条装配口（AttachTaskScheduler）都挂在它上面。NewRouter 是「只引擎」的旧入口，包一层。
+func NewServer(store *Store, batchWindow int, dev bool, worker *Worker, resumeMax int, auth *Auth, systemSkillsDir string) *Server {
+	return &Server{store: store, w: batchWindow, dev: dev, worker: worker, mediaRoot: worker.Workspace(), mcpConfPath: defaultMcpConfPath, resumeMax: resumeMax, systemSkillsDir: systemSkillsDir, auth: auth}
+}
+
 // NewRouter 挂 v6 第一步的全部四个 API（19v6-01 §0）。整张面的心智模型就一条循环：
 // **投一条消息，轮询看着回复一点点生成、定稿**。四个端点各管一段，两条游标别混：
 //
@@ -87,7 +96,12 @@ func accessLogLine(p gin.LogFormatterParams) string {
 // 拉完即弃，不回退对齐游标。实时性 = 客户端轮询节奏（dev 建议 300–500ms），服务端无长连接、
 // 无推送、无 heartbeat。两个拉取端点一律有界：单批上限 W（-batch-window，dev 默认 200）。
 func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMax int, auth *Auth, systemSkillsDir string) *gin.Engine {
-	s := &Server{store: store, w: batchWindow, worker: worker, mediaRoot: worker.Workspace(), mcpConfPath: defaultMcpConfPath, resumeMax: resumeMax, systemSkillsDir: systemSkillsDir, auth: auth}
+	return NewServer(store, batchWindow, dev, worker, resumeMax, auth, systemSkillsDir).RouterFor()
+}
+
+// RouterFor 挂全部路由并返回引擎。路由注册从 NewRouter 拆出来，是为了让 main 先造 Server、
+// 把装配口交给 Task 调度循环之后再起 HTTP。
+func (s *Server) RouterFor() *gin.Engine {
 	r := gin.New()
 	r.Use(gin.LoggerWithFormatter(accessLogLine), gin.Recovery())
 	r.POST("/api/auth/signup", s.auth.Signup)
@@ -156,6 +170,17 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 	r.PATCH("/api/workspaces/:id", authn, s.patchWorkspace)
 	r.PATCH("/api/workspaces/:id/visibility", authn, s.patchWorkspaceVisibility)
 	r.DELETE("/api/workspaces/:id", authn, s.deleteWorkspace)
+	// 持久 Task 与编排（doc/70）：写面 member，读面 authn + store 层可见性 JOIN。
+	// resume 在 agent_task_runner.go（要复用执行装配），runner 落地后注册。
+	r.POST("/api/tasks", authn, s.auth.RequireTenantRole("member"), s.postAgentTask)
+	r.POST("/api/orchestrations", authn, s.auth.RequireTenantRole("member"), s.postAgentOrchestration)
+	r.GET("/api/tasks/:id", authn, s.getAgentTask)
+	r.GET("/api/workspaces/:id/tasks", authn, s.listWorkspaceAgentTasks)
+	r.GET("/api/orchestrations/:id", authn, s.getAgentOrchestration)
+	r.POST("/api/tasks/:id/stop", authn, s.auth.RequireTenantRole("member"), s.stopAgentTask)
+	r.POST("/api/orchestrations/:id/stop", authn, s.auth.RequireTenantRole("member"), s.stopAgentOrchestration)
+	// 任务级恢复（doc/70 §10.1）：复用 ClaimResume / 账本重放 / Redis seed，装配口换执行者。
+	r.POST("/api/tasks/:id/resume", traceIngress(), authn, s.resumeAgentTask)
 	r.GET("/api/tenants", authn, s.listTenants)
 	r.GET("/api/me/invitations", authn, s.myInvitations)
 	r.POST("/api/me/invitations/:id/accept", authn, s.acceptInvitation)
@@ -193,7 +218,7 @@ func NewRouter(store *Store, batchWindow int, dev bool, worker *Worker, resumeMa
 	sysg.POST("/promote", s.promoteAdmin)
 	sysg.POST("/revoke", s.revokeAdmin)
 	sysg.GET("/audit-log", s.systemAudit)
-	if dev {
+	if s.dev {
 		r.DELETE("/api/dev/reset", s.devReset)
 		r.GET("/api/dev/runs/:runId/journal", s.devJournal)
 		r.POST("/api/dev/memory", authn, s.postDevMemory)
@@ -714,6 +739,28 @@ func (s *Server) resumeRun(c *gin.Context) {
 	if err := s.store.seedResume(ctx, runID, claim.Epoch, string(frameJSON)); err != nil {
 		_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
 		internal(c, err)
+		return
+	}
+	// Task 执行 run 也要以执行者身份醒来（doc/70 §10.1）：普通装配会给它管理员的池子——
+	// 旧 worker 不得借普通续跑拿回 delegate_task 等执行者没有的面。执行 session 与 Task 行
+	// 同事务出生，按 session 反查即得；查到就换执行者装配，不走下面的普通分支。
+	if t, found, terr := s.store.agentTaskByExecutionSession(ctx, claim.SessionID); terr != nil {
+		_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
+		internal(c, terr)
+		return
+	} else if found {
+		p, _ := principalFrom(c)
+		prof, aerr := s.assembleAgentTaskRun(ctx, p, t.ID)
+		if aerr != nil {
+			_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
+			writeEnvelope(c, aerr.Status, aerr.Code, aerr.Message, nil)
+			return
+		}
+		bg := withAgentTaskRunBox(launchContext(c.Request.Context()),
+			&agentTaskRunBox{TaskID: t.ID, OrchestrationID: t.OrchestrationID})
+		bg = withPrincipal(bg, p)
+		go s.worker.RunResume(withRunProfile(bg, prof), claim.SessionID, runID, claim.Epoch, replay)
+		writeEnvelope(c, http.StatusAccepted, codeOK, "", resumeResponse{RunID: runID, Status: "running", ResumeCount: int(claim.Epoch - 1)})
 		return
 	}
 	// 与 POST 同一条纪律：run 的生命周期不属于这个请求。

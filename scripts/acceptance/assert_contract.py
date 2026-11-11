@@ -201,6 +201,27 @@ def run_case(case, key, tally, only_print, seed):
                 return False
             continue
 
+        if op == "require_status":
+            # 轮询断言「某个 GET 资源的状态 N 秒内保持不变」。持久 Task 的核心契约用例
+            # 需要调度关闭的引擎（起引擎带 -task-interval=-1s，施工包 §12.1）才字节确定：
+            # 真调度会在 1s 内把 ready 领走。用观测判定而不是操作员自报——状态被领走
+            # 就红在这里并说明起法，不往下跑出一串假红。
+            path = resolve_path(step["path"], vars)
+            token = vars.get(step["tokenVar"]) if step.get("tokenVar") else vars.get("tok")
+            want = step["status"]
+            seconds = int(step.get("seconds", 3))
+            deadline = time.time() + seconds
+            while time.time() < deadline:
+                _, body = harness.call("GET", path, token=token)
+                d = body.get("data", {}) if isinstance(body, dict) else {}
+                got = d.get("status") if isinstance(d, dict) else None
+                if got != want:
+                    tally.no(label, f"{seconds}s 内状态离开 {want} → {got}：引擎的 task 调度没关（起引擎要带 -task-interval=-1s）")
+                    return False
+                time.sleep(0.5)
+            tally.ok(f"{label} 状态保持 {want}")
+            continue
+
         if op == "wait_settled":
             # 等**会话落定**：terminal 帧比 DB 翻终态早一拍，
             # 只等帧会在「跑中读 session」这条上撞出假失败（liveRunId 还非空）。
@@ -302,6 +323,12 @@ def run_case(case, key, tally, only_print, seed):
             if not ok:
                 tally.no(f"{label} SQL", out)
                 return False
+            # capture_stdout：把这条 SQL 的 stdout（如 INSERT … RETURNING id 的 id）存进 vars。
+            # psql 对 DML 会追加「INSERT 0 1」命令行，取**第一行非空输出**当值。
+            # 「造一行资源再拿它的 id」目前只有 SQL 一条路——HTTP 侧没有建会话的端点。
+            lines = [l for l in out.splitlines() if l.strip()]
+            for name in step.get("capture_stdout") or []:
+                vars[name] = lines[0] if lines else ""
             tally.ok(f"{label} SQL")
             continue
 

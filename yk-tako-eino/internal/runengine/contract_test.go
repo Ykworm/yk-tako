@@ -177,6 +177,13 @@ func TestContractBusinessCodes(t *testing.T) {
 		{"默认项目不能删", codeWorkspaceDefault, 114005},
 		{"活 run 不能删", codeSessionBusy, 114007},
 		{"记忆模式不提供观测口", codeMemoryMode, 118001},
+		{"找不到任务", codeTaskMissing, 117001},
+		{"找不到编排组", codeOrchMissing, 117002},
+		{"计划不合法", codePlanInvalid, 117101},
+		{"幂等键冲突", codePlanConflict, 117102},
+		{"任务不可恢复", codeTaskNotResumable, 117103},
+		{"任务已结束", codeTaskFinished, 117104},
+		{"编排组已结束", codeOrchFinished, 117105},
 		{"内部错误", codeInternal, 111901},
 	}
 	for _, c := range cases {
@@ -355,5 +362,106 @@ func TestContractMemoryObserveBytes(t *testing.T) {
 	const wantEmptyQ = `{"code":111001,"message":"请求格式不对","data":null}`
 	if got != wantEmptyQ {
 		t.Fatalf("recall 空 q 字节 = %s\nwant %s", got, wantEmptyQ)
+	}
+}
+
+// TestContractAgentTaskViewBytes 钉住 Task 视图的字段序（doc/70 §4.3；施工包 §4.3）：
+// taskId → orchestrationId → key → content → agent → modelRef → workspaceId → status
+// → currentRunId → result → error → resultRevision → createdAt → startedAt → finishedAt → updatedAt。
+// 未提交时 result 为 null；失败时 error = {code, message}（机器原因与展示文案分开）。
+func TestContractAgentTaskViewBytes(t *testing.T) {
+	rev := mustJSON(t, agentTaskView{
+		TaskID: "at_1", OrchestrationID: "or_1", Key: "C", Content: "汇总成报告",
+		Agent: "coder", ModelRef: "", WorkspaceID: "ws_1", Status: "succeeded",
+		CurrentRunID: "r_1",
+		Result: &TaskResult{
+			Summary:   "报告写好了",
+			Artifacts: []TaskArtifact{{Path: "reports/a.md", Kind: "report"}},
+		},
+		ResultRevision: 1,
+		CreatedAt:      time.Unix(0, 0).UTC(),
+		StartedAt:      ptrTime(time.Unix(1, 0).UTC()),
+		FinishedAt:     ptrTime(time.Unix(2, 0).UTC()),
+		UpdatedAt:      time.Unix(0, 0).UTC(),
+	})
+	const wantRev = `{"taskId":"at_1","orchestrationId":"or_1","key":"C","content":"汇总成报告","agent":"coder","modelRef":"","workspaceId":"ws_1","status":"succeeded","currentRunId":"r_1",` +
+		`"result":{"summary":"报告写好了","artifacts":[{"path":"reports/a.md","kind":"report"}],"metadata":null},"error":null,"resultRevision":1,` +
+		`"createdAt":"1970-01-01T00:00:00Z","startedAt":"1970-01-01T00:00:01Z","finishedAt":"1970-01-01T00:00:02Z","updatedAt":"1970-01-01T00:00:00Z"}`
+	if rev != wantRev {
+		t.Fatalf("Task 视图字节序漂移：\n得到 %s\n期望 %s", rev, wantRev)
+	}
+	failed := mustJSON(t, agentTaskView{
+		TaskID: "at_2", OrchestrationID: "or_1", Key: "A", Content: "调研", Agent: "researcher",
+		WorkspaceID: "ws_1", Status: "failed",
+		Error:      &taskError{Code: taskErrRunError, Message: "执行 run 失败"},
+		CreatedAt:  time.Unix(0, 0).UTC(),
+		UpdatedAt:  time.Unix(0, 0).UTC(),
+		FinishedAt: ptrTime(time.Unix(2, 0).UTC()),
+	})
+	const wantFail = `{"taskId":"at_2","orchestrationId":"or_1","key":"A","content":"调研","agent":"researcher","modelRef":"","workspaceId":"ws_1","status":"failed","currentRunId":"",` +
+		`"result":null,"error":{"code":"run_error","message":"执行 run 失败"},"resultRevision":0,` +
+		`"createdAt":"1970-01-01T00:00:00Z","startedAt":null,"finishedAt":"1970-01-01T00:00:02Z","updatedAt":"1970-01-01T00:00:00Z"}`
+	if failed != wantFail {
+		t.Fatalf("失败 Task 字节漂移：\n得到 %s\n期望 %s", failed, wantFail)
+	}
+}
+
+// TestContractOrchestrationViewBytes 钉住编排组视图的字段序（doc/70 §4.3）：
+// 组体 orchestrationId → goal → workspaceId → sourceSessionId → status → finalTaskId
+// → deliveryStatus → deliveryRunId → createdAt → finishedAt → deliveredAt → updatedAt；
+// 外层 orchestration → tasks → links；边 = parentTaskId → childTaskId。
+func TestContractOrchestrationViewBytes(t *testing.T) {
+	got := mustJSON(t, orchestrationView{
+		Orchestration: orchestrationBody{
+			OrchestrationID: "or_1", Goal: "调研 A、B 后汇总", WorkspaceID: "ws_1",
+			SourceSessionID: "s_1", Status: "active", FinalTaskID: "at_1",
+			DeliveryStatus: "", DeliveryRunID: "",
+			CreatedAt: time.Unix(0, 0).UTC(), UpdatedAt: time.Unix(0, 0).UTC(),
+		},
+		Tasks: []agentTaskView{{
+			TaskID: "at_1", OrchestrationID: "or_1", Key: "C", Content: "汇总成报告",
+			Agent: "coder", WorkspaceID: "ws_1", Status: "ready",
+			CreatedAt: time.Unix(0, 0).UTC(), UpdatedAt: time.Unix(0, 0).UTC(),
+		}},
+		Links: []taskLinkView{{ParentTaskID: "at_2", ChildTaskID: "at_1"}},
+	})
+	const want = `{"orchestration":{"orchestrationId":"or_1","goal":"调研 A、B 后汇总","workspaceId":"ws_1","sourceSessionId":"s_1","status":"active","finalTaskId":"at_1","deliveryStatus":"","deliveryRunId":"",` +
+		`"createdAt":"1970-01-01T00:00:00Z","finishedAt":null,"deliveredAt":null,"updatedAt":"1970-01-01T00:00:00Z"},` +
+		`"tasks":[{"taskId":"at_1","orchestrationId":"or_1","key":"C","content":"汇总成报告","agent":"coder","modelRef":"","workspaceId":"ws_1","status":"ready","currentRunId":"",` +
+		`"result":null,"error":null,"resultRevision":0,"createdAt":"1970-01-01T00:00:00Z","startedAt":null,"finishedAt":null,"updatedAt":"1970-01-01T00:00:00Z"}],` +
+		`"links":[{"parentTaskId":"at_2","childTaskId":"at_1"}]}`
+	if got != want {
+		t.Fatalf("编排组视图字节序漂移：\n得到 %s\n期望 %s", got, want)
+	}
+}
+
+// TestContractTaskCreateRespBytes 钉住创建端点的 data（doc/70 §4.1）：
+// 单件 taskId → orchestrationId → status → currentRunId；整组 orchestrationId → status。
+func TestContractTaskCreateRespBytes(t *testing.T) {
+	got := mustJSON(t, createTaskResp{TaskID: "at_1", OrchestrationID: "or_1", Status: "ready", CurrentRunID: ""})
+	const wantTask = `{"taskId":"at_1","orchestrationId":"or_1","status":"ready","currentRunId":""}`
+	if got != wantTask {
+		t.Fatalf("创建 Task 字节 = %s\nwant %s", got, wantTask)
+	}
+	got = mustJSON(t, createOrchestrationResp{OrchestrationID: "or_1", Status: "active"})
+	const wantOrch = `{"orchestrationId":"or_1","status":"active"}`
+	if got != wantOrch {
+		t.Fatalf("创建编排组字节 = %s\nwant %s", got, wantOrch)
+	}
+}
+
+// TestContractTaskResumeStopBytes 钉住 resume 与 stop 的 data 字节（doc/70 §4.3/§4.4）。
+// resume 是结构体（taskId → runId → status → resumeCount）；stop 是 gin.H——
+// encoding/json 对 map 按键名字典序输出（status < taskId），前端拆包时键序照这个来。
+func TestContractTaskResumeStopBytes(t *testing.T) {
+	got := mustJSON(t, resumeTaskResponse{TaskID: "at_1", RunID: "r_9", Status: "running", ResumeCount: 1})
+	const wantResume = `{"taskId":"at_1","runId":"r_9","status":"running","resumeCount":1}`
+	if got != wantResume {
+		t.Fatalf("resume 字节 = %s\nwant %s", got, wantResume)
+	}
+	got = mustJSON(t, gin.H{"taskId": "at_1", "status": "cancelled"})
+	const wantStop = `{"status":"cancelled","taskId":"at_1"}`
+	if got != wantStop {
+		t.Fatalf("stop 字节 = %s\nwant %s", got, wantStop)
 	}
 }

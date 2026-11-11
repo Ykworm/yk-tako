@@ -158,10 +158,12 @@ def pick(obj, path):
 def match(expected, actual):
     """按期望比对实际。
 
+    - '$any' 是通配：**单独当一个值**用（值会变但存在即可），也可放在 dict 里当整对象通配。
     - dict：**子集**语义（只断期望里点名的键）；要连键集与键序一起断，用 expect.data_keys。
-    - '$any' 是通配（值会变但形状不变），可放在 dict 里当整对象通配。
     - list：逐位比对，长度必须相同。
     """
+    if expected == "$any":
+        return True
     if isinstance(expected, dict) and "$any" in expected:
         return True
     if isinstance(expected, dict):

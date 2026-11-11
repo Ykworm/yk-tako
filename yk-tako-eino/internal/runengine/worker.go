@@ -323,6 +323,18 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 	for _, t := range skillTools {
 		pool = append(pool, wrapToolErrors(t))
 	}
+	// 持久 Task 创建工具入池（doc/70 §5.3）：只进普通 mAgent 根池——子代理入口快照剔掉
+	// （agents.go dropAgentOrchestrationTools），Task 执行者装配也不给（agent_task_runner.go）。
+	// submit_task_result 不在这里：它只在 Task 执行 run 的装配里出现。
+	for _, mk := range []func(*Store) (tool.BaseTool, error){
+		newDelegateTaskTool, newCreateOrchestrationTool,
+	} {
+		t, err := mk(store)
+		if err != nil {
+			return nil, err
+		}
+		pool = append(pool, wrapToolErrors(t))
+	}
 	// 摘要器在 agent 装配前构造（A4，planning 裁定 9）：midfoldHandler 要拿它的 summarize 方法值——
 	// mid-run 折叠与 prepareInput 的 Run fold 共用同一个摘要器、同一道上限（C5-A7 分档）。
 	compactLimit := CompactLimitFor(compactWindow)
@@ -564,6 +576,22 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 	if ws, werr := w.store.SessionWorkspaceID(ctx, sessionID); werr == nil && ws != "" {
 		runSpan.SetAttributes(attribute.String("tako.workspace.id", ws))
 	}
+	// 持久 Task 与编排的归属属性（doc/70 §10.3）：执行 run 带任务/组/来源 run，协调 run 带
+	// 组与通知 ID。值来自装配时塞进 ctx 的身份盒，不查库。
+	if tb := agentTaskRunBoxFrom(ctx); tb != nil {
+		runSpan.SetAttributes(
+			attribute.String("tako.task.id", tb.TaskID),
+			attribute.String("tako.orchestration.id", tb.OrchestrationID),
+			attribute.String("tako.source.run.id", tb.SourceRunID),
+		)
+	}
+	if cb := coordinationBoxFrom(ctx); cb != nil {
+		runSpan.SetAttributes(
+			attribute.String("tako.orchestration.id", cb.OrchestrationID),
+			attribute.String("tako.notification.id", cb.NotificationID),
+			attribute.String("tako.notification.kind", cb.Kind),
+		)
+	}
 	if t0, ok := ingressStartFrom(ctx); ok && !t0.IsZero() {
 		runSpan.SetAttributes(attribute.Int64("tako.run.start_delay_ms", time.Since(t0).Milliseconds()))
 	}
@@ -668,6 +696,17 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 			log.Printf("endRun %s/%s (%s): %v", sessionID, runID, status, err)
 		case !ok:
 			log.Printf("endRun %s/%s (%s): 闸已不在，空转", sessionID, runID, status)
+		default:
+			// 定稿成功之后的两笔对账（doc/70 §7.2）：Task 执行 run 翻任务终态，协调 run 推进交付
+			// 状态。两条对各自的 run 形状幂等，非本行的 run 空转——调度循环每秒跑同一批函数作为
+			// 崩溃补偿，谁先到谁生效。
+			finCtx := context.WithoutCancel(finCtx)
+			if rerr := w.store.ReconcileRun(finCtx, runID); rerr != nil {
+				log.Printf("task reconcile %s: %v", runID, rerr)
+			}
+			if rerr := w.store.ReconcileDeliveryRun(finCtx, runID); rerr != nil {
+				log.Printf("task delivery reconcile %s: %v", runID, rerr)
+			}
 		}
 	}()
 

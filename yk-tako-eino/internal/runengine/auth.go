@@ -217,7 +217,15 @@ const (
 	codeToolMissing = 116119
 	// 118001：当前记忆模式不提供这个观测口（doc/65 §6.5：markdown 模式调 items/jobs/recall）。
 	codeMemoryMode = 118001
-	codeInternal   = 111901
+	// 17 = 持久 Task 与编排（doc/40 §4.2c）。1170xx 资源缺失，1171xx 计划与状态冲突。
+	codeTaskMissing      = 117001 // 404 找不到这件任务（不存在或不可见）
+	codeOrchMissing      = 117002 // 404 找不到这个编排组
+	codePlanInvalid      = 117101 // 400 任务计划不合法（具体原因进 data.reason）
+	codePlanConflict     = 117102 // 409 创建键已经用于另一份计划（同键不同 plan_hash）
+	codeTaskNotResumable = 117103 // 409 这件任务现在不能恢复（非 interrupted／有活执行者／次数耗尽）
+	codeTaskFinished     = 117104 // 409 这件任务已结束，不能停止
+	codeOrchFinished     = 117105 // 409 这个编排组已结束，不能停止
+	codeInternal         = 111901
 )
 
 var emailPattern = regexp.MustCompile(`^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$`)

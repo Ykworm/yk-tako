@@ -546,6 +546,11 @@ func (h *agentSpecHandler) loadSpecs(ctx context.Context) ([]AgentSpec, error) {
 }
 
 func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelAgentContext) (context.Context, *adk.ChatModelAgentContext, error) {
+	if agentTaskRunBoxFrom(ctx) != nil {
+		// Task 执行者不委派（doc/70 §6.3）：它的池子由装配口定死（agent_task_runner.go 的
+		// resolveToolPool），这里不再附加同步子代理与 resume_subagent。
+		return ctx, runCtx, nil
+	}
 	specs, err := h.loadSpecs(ctx)
 	if err != nil {
 		log.Printf("agents: 装载规格失败: %v", err)
@@ -571,6 +576,9 @@ func (h *agentSpecHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatMode
 	// 子代理只读当场冻结的快照，不改记忆、不主动检索。
 	// 剔在 base = 三档（继承 / exclude / 白名单）共用一份过滤。
 	base = dropMemoryAndSearchTools(ctx, base)
+	// 持久 Task 创建工具也只在 mAgent 根池（doc/70 §6.3）：普通同步子代理不再创建异步编排，
+	// Task 执行者的装配面里同样没有它们。剔在 base 同管三档。
+	base = dropAgentOrchestrationTools(ctx, base)
 	ctx = withSubagentAssembly(ctx, &subagentAssembly{base: base, snap: snap, specs: specs})
 	var loaded []string
 	for _, spec := range specs {

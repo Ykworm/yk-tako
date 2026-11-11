@@ -924,6 +924,12 @@ SELECT session_id, status, lease_epoch,
 			s.leaseTTL.Seconds(), runID).Scan(&claim.Epoch).Error; err != nil {
 			return err
 		}
+		// 接管即告知：被接管的这一代（row.LeaseEpoch）按契约要有一条 task_interrupted 通知。
+		// 与调度器的中断检测互为先后时 dedup 只留一条；普通聊天 run 的 session 不是
+		// agent_task，SELECT 落空就不插。
+		if err := s.insertInterruptedOnClaimTx(tx, runID, row.LeaseEpoch); err != nil {
+			return err
+		}
 		if err := tx.Where("run_id = ?", runID).Order("seq").Find(&claim.Rows).Error; err != nil {
 			return err
 		}
@@ -944,16 +950,17 @@ func (s *Store) AbandonClaim(ctx context.Context, runID RunID, epoch int64) erro
 		  WHERE id = ? AND lease_epoch = ?`, runID, epoch).Error
 }
 
-// Reset 全局归零（dev-only 端点 /api/dev/reset 的底座，§8.4）：PG 六表 TRUNCATE + `SCAN tk:*` + UNLINK，
+// Reset 全局归零（dev-only 端点 /api/dev/reset 的底座，§8.4）：PG 全表 TRUNCATE + `SCAN tk:*` + UNLINK，
 // 返回 Redis 删除**键数**（响应字节与旧形态一致）。
-// 五表同清：`runs` 必须清——它是闸的落点，漏清则幽灵 running 行永久残留
+// `runs` 必须清——它是准入的落点，漏清则幽灵 running 行永久残留
 // （清扫只在新 POST 时按 session_id 触发，旧 session 已 404，再没人替它扫）；
-// 记忆层（memory_items / memory_jobs）是引擎自己的状态，同属「引擎自己的东西」，全局归零一并清。
+// 记忆层（memory_items / memory_jobs）是引擎自己的状态，同属「引擎自己的东西」，全局归零一并清；
+// 持久 Task 四表（agent_orchestrations / agent_tasks / agent_task_links / agent_notifications）同批。
 // 旧的 `notes` 表已随存量迁移退役（doc/65 §6.1），不再出现在 TRUNCATE 列表里——
 // 表都不在了，还 TRUNCATE 它会直接报错。
 func (s *Store) Reset(ctx context.Context) (deleted int, err error) {
 	if err := s.db.WithContext(ctx).Exec(
-		`TRUNCATE TABLE tenant_invitations, tenant_agents, tenant_settings, tenant_usage_daily, audit_log, refresh_tokens, tenant_members, tenants, users, sessions, runs, run_model_messages, runlog_entries, memory_items, memory_jobs, run_journal`).Error; err != nil {
+		`TRUNCATE TABLE tenant_invitations, tenant_agents, tenant_settings, tenant_usage_daily, audit_log, refresh_tokens, tenant_members, tenants, users, sessions, runs, run_model_messages, runlog_entries, memory_items, memory_jobs, run_journal, agent_orchestrations, agent_tasks, agent_task_links, agent_notifications`).Error; err != nil {
 		return 0, err
 	}
 	var cursor uint64

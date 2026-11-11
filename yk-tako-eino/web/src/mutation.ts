@@ -9,13 +9,17 @@ import { readTenant, readToken, refreshAccessToken } from './auth'
 export type MutationEvent = {
   // skills_changed：租户级技能目录变了（doc/52 C3 / doc/46 §7.6）。id 是技能名。
   // tools_changed：租户工具根变了（doc/52 F1）。与技能分开是让客户端知道重拉哪一页；
-  // 两个事件都只通知、不带状态，收到就重拉。
+  //   两个事件都只通知、不带状态，收到就重拉。
+  // agent_tasks_changed / agent_orchestrations_changed：持久 Task 与编排组的状态变了
+  //   （doc/70）。id 分别是 taskId / orchestrationId；任务页收到后重拉当前列表与详情。
   type:
     | 'session_deleted'
     | 'workspace_deleted'
     | 'workspace_renamed'
     | 'skills_changed'
     | 'tools_changed'
+    | 'agent_tasks_changed'
+    | 'agent_orchestrations_changed'
   id: string
 }
 
@@ -64,6 +68,10 @@ export function broadcastMutation(evt: MutationEvent) {
 // 两个源都喂同一个 dispatch，失效逻辑只有一份（doc/46 §3.2 的关键设计）。
 let es: EventSource | null = null
 let esTimer: ReturnType<typeof setTimeout> | null = null
+// 收到的最后一个事件的 seq（Redis stream ID）。重连（断线退避、换租户、手动重建）都带着它
+// 续读：服务端从它之后补发窗口内的事件——没有它，重建连接用「只推新事件」游标，
+// 重连间隙里发生的变更就永久丢了（2026-11-10 浏览器走查抓过登录窗口内丢事件）。
+let lastSeq = ''
 
 // ensureEventStream 挂上服务端事件流（已挂则空操作；换租户先 closeEventStream 再挂）。
 export function ensureEventStream() {
@@ -71,10 +79,12 @@ export function ensureEventStream() {
   const token = readToken()
   if (!tenantId || !token) return
   if (es) return
-  es = new EventSource(`/api/events?access_token=${encodeURIComponent(token)}`)
+  const resume = lastSeq ? `&last_event_id=${encodeURIComponent(lastSeq)}` : ''
+  es = new EventSource(`/api/events?access_token=${encodeURIComponent(token)}${resume}`)
   es.onmessage = (e) => {
     try {
       const evt = JSON.parse(e.data) as MutationEvent & { seq?: string }
+      if (evt.seq) lastSeq = evt.seq
       if (evt.type && evt.id) dispatch(evt)
     } catch {
       /* 单帧坏 JSON 不炸通道 */

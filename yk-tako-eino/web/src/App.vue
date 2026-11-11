@@ -26,15 +26,17 @@ import PendingInvites from './PendingInvites.vue'
 import ProjectsView from './ProjectsView.vue'
 import SkillInstallCard from './SkillInstallCard.vue'
 import SkillsView from './SkillsView.vue'
+import TasksView from './TasksView.vue'
 import ToolsView from './ToolsView.vue'
 import { authExpired, authFetch, authState, clearAuth, loginWithPassword, switchTenant, tenantState } from './auth'
 import { onMutation, ensureEventStream, closeEventStream } from './mutation'
 
-type Page = 'chat' | 'projects' | 'skills' | 'tools' | 'agents' | 'team'
+type Page = 'chat' | 'projects' | 'tasks' | 'skills' | 'tools' | 'agents' | 'team'
 
 function readPage(): Page {
   const saved = sessionStorage.getItem('tako.page')
   return saved === 'projects' ||
+    saved === 'tasks' ||
     saved === 'skills' ||
     saved === 'tools' ||
     saved === 'agents' ||
@@ -1611,6 +1613,10 @@ async function onScroll() {
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2.5 4.5h4l1.2 1.5h5.8v6.5h-11z" stroke-linejoin="round" /></svg>
           项目
         </button>
+        <button type="button" :class="{ on: page === 'tasks' }" :aria-current="page === 'tasks' ? 'page' : undefined" @click="goPage('tasks')">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3.5 4.5h9M3.5 8h9M3.5 11.5h5.5" stroke-linecap="round" /></svg>
+          任务
+        </button>
         <button type="button" :class="{ on: page === 'agents' }" :aria-current="page === 'agents' ? 'page' : undefined" @click="goPage('agents')">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="5.2" r="2.2" /><path d="M3.4 13.2c.7-2.2 2.4-3.2 4.6-3.2s3.9 1 4.6 3.2" stroke-linecap="round" /></svg>
           助手
@@ -1788,6 +1794,7 @@ async function onScroll() {
       <template v-else>
         <Configure v-if="page === 'agents' || page === 'team'" :key="tenant.id" :page="configPage" />
         <SkillsView v-else-if="page === 'skills'" :key="tenant.id" @upload-tool="openToolsFor" />
+        <TasksView v-else-if="page === 'tasks'" :key="tenant.id" :active-workspace-id="activeWorkspaceId" />
         <ToolsView v-else-if="page === 'tools'" :key="tenant.id" :prefill-name="toolsPrefill" />
         <ProjectsView
           v-else-if="page === 'projects'"

@@ -1,6 +1,6 @@
 {
- "version": "2026-11-01",
- "source": "doc/19-v6/19v6-04-验收-curl.md",
+ "version": "2026-11-10",
+ "source": "doc/19-v6/19v6-04-验收-curl.md；持久 Task 与编排（doc/70）用例 44–50 同批",
  "note": [
   "本文件是契约字节的**机器真源**；doc/19-v6/19v6-04-验收-curl.md 是同一份内容的人读版。",
   "两份**同批改**。check-expected.sh 守两边的用例号集合一致。",
@@ -2238,6 +2238,1119 @@
       "code": 111001,
       "message": "请求格式不对",
       "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "44-tasks-create-read-idempotent",
+   "case": "用例 44",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "单件 Task：创建 202（taskId/orchestrationId/status/currentRunId 四键序）、读回 16 键序全形、同键同计划幂等返回原 id。require_status 探针顺带验证引擎是调度关闭起法（-task-interval=-1s），ready 三秒不被领走",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-task-home"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'task 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc44",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "阅读项目根目录并总结有哪些文件",
+      "agent": "researcher"
+     },
+     "capture": {
+      "tid": "data.taskId",
+      "orid": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "taskId",
+       "orchestrationId",
+       "status",
+       "currentRunId"
+      ],
+      "data": {
+       "status": "ready",
+       "currentRunId": ""
+      }
+     }
+    },
+    {
+     "op": "require_status",
+     "path": "/api/tasks/{tid}",
+     "status": "ready",
+     "seconds": 3
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tid}",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "taskId",
+       "orchestrationId",
+       "key",
+       "content",
+       "agent",
+       "modelRef",
+       "workspaceId",
+       "status",
+       "currentRunId",
+       "result",
+       "error",
+       "resultRevision",
+       "createdAt",
+       "startedAt",
+       "finishedAt",
+       "updatedAt"
+      ],
+      "data": {
+       "taskId": "{tid}",
+       "orchestrationId": "{orid}",
+       "key": "main",
+       "content": "阅读项目根目录并总结有哪些文件",
+       "agent": "researcher",
+       "modelRef": "",
+       "workspaceId": "{wid}",
+       "status": "ready",
+       "currentRunId": "",
+       "result": null,
+       "error": null,
+       "resultRevision": 0
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/tasks",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "tasks"
+      ],
+      "data_items_some": {
+       "path": "tasks",
+       "match": {
+        "taskId": "{tid}",
+        "status": "ready"
+       }
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc44",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "阅读项目根目录并总结有哪些文件",
+      "agent": "researcher"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data": {
+       "taskId": "{tid}",
+       "orchestrationId": "{orid}",
+       "status": "ready",
+       "currentRunId": ""
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "45-tasks-idempotency-conflict",
+   "case": "用例 45",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "同键不同计划：同 idempotencyKey 换 content（或换 agent）→ 409 117102，计划哈希不一致不给静默覆盖",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-task-conflict"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'task 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc45",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "阅读项目根目录并总结有哪些文件",
+      "agent": "researcher"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc45",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "换了一份内容的计划",
+      "agent": "researcher"
+     },
+     "expect": {
+      "http": 409,
+      "code": 117102,
+      "message": "这个创建键已经用于另一份计划",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc45",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "阅读项目根目录并总结有哪些文件",
+      "agent": "coder"
+     },
+     "expect": {
+      "http": 409,
+      "code": 117102,
+      "message": "这个创建键已经用于另一份计划",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "46-tasks-create-validation",
+   "case": "用例 46",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "创建校验负路径：必填缺失 400 111002；执行者/项目/来源会话缺失 404 112003/114001/112001；来源会话已删同 112001；显式 modelRef 解析不了 409 111408",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-task-valid"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'task 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {},
+     "expect": {
+      "http": 400,
+      "code": 111002,
+      "message": "idempotencyKey、workspaceId、sourceSessionId、content、agent 都是必填",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc46",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "阅读项目根目录并总结有哪些文件",
+      "agent": "ghost"
+     },
+     "expect": {
+      "http": 404,
+      "code": 112003,
+      "message": "找不到执行者规格",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc46",
+      "workspaceId": "ws_nope",
+      "sourceSessionId": "{sid}",
+      "content": "阅读项目根目录并总结有哪些文件",
+      "agent": "researcher"
+     },
+     "expect": {
+      "http": 404,
+      "code": 114001,
+      "message": "找不到这个项目",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc46",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "s_nope",
+      "content": "阅读项目根目录并总结有哪些文件",
+      "agent": "researcher"
+     },
+     "expect": {
+      "http": 404,
+      "code": 112001,
+      "message": "找不到这场会话",
+      "data": null
+     }
+    },
+    {
+     "sql": "UPDATE sessions SET deleted_at=now() WHERE id='{sid}'"
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc46",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "阅读项目根目录并总结有哪些文件",
+      "agent": "researcher"
+     },
+     "expect": {
+      "http": 404,
+      "code": 112001,
+      "message": "找不到这场会话",
+      "data": null
+     }
+    },
+    {
+     "op": "signup",
+     "no_model": true,
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-task-nomodel"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'task 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc46m",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "阅读项目根目录并总结有哪些文件",
+      "agent": "researcher",
+      "modelRef": "deepseek/deepseek-flash"
+     },
+     "expect": {
+      "http": 409,
+      "code": 111408,
+      "message": "这个工作区的模型还不可用",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "47-orchestration-plan-validation",
+   "case": "用例 47",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "编排计划形状校验（117101 带原因进 data.reason）：成环、两个最终节点、空任务表、自依赖、key 词法；必填缺失仍是 111002",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-task-plan"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'task 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc47g",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}"
+     },
+     "expect": {
+      "http": 400,
+      "code": 111002,
+      "message": "idempotencyKey、workspaceId、sourceSessionId、goal 都是必填",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc47a",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "goal": "成环图",
+      "tasks": [
+       {
+        "key": "a",
+        "content": "A",
+        "agent": "researcher"
+       },
+       {
+        "key": "b",
+        "content": "B",
+        "agent": "researcher"
+       }
+      ],
+      "links": [
+       {
+        "parent": "a",
+        "child": "b"
+       },
+       {
+        "parent": "b",
+        "child": "a"
+       }
+      ]
+     },
+     "expect": {
+      "http": 400,
+      "code": 117101,
+      "message": "任务计划不合法",
+      "data": {
+       "reason": "依赖边成环，无法拓扑排序"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc47b",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "goal": "两个最终",
+      "tasks": [
+       {
+        "key": "a",
+        "content": "A",
+        "agent": "researcher"
+       },
+       {
+        "key": "b",
+        "content": "B",
+        "agent": "researcher"
+       }
+      ],
+      "links": []
+     },
+     "expect": {
+      "http": 400,
+      "code": 117101,
+      "message": "任务计划不合法",
+      "data": {
+       "reason": "一张编排图必须恰好有一个无子节点的最终 Task，现在有 2 个"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc47c",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "goal": "空表",
+      "tasks": [],
+      "links": []
+     },
+     "expect": {
+      "http": 400,
+      "code": 117101,
+      "message": "任务计划不合法",
+      "data": {
+       "reason": "一件编排组需要 1–32 件 Task"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc47d",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "goal": "自依赖",
+      "tasks": [
+       {
+        "key": "a",
+        "content": "A",
+        "agent": "researcher"
+       }
+      ],
+      "links": [
+       {
+        "parent": "a",
+        "child": "a"
+       }
+      ]
+     },
+     "expect": {
+      "http": 400,
+      "code": 117101,
+      "message": "任务计划不合法",
+      "data": {
+       "reason": "依赖边不允许自依赖：a"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc47e",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "goal": "key 词法",
+      "tasks": [
+       {
+        "key": "-bad",
+        "content": "A",
+        "agent": "researcher"
+       }
+      ],
+      "links": []
+     },
+     "expect": {
+      "http": 400,
+      "code": 117101,
+      "message": "任务计划不合法",
+      "data": {
+       "reason": "Task key 只允许字母数字开头的 1–64 位字母数字、_ 或 -：-bad"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "48-orchestration-create-read",
+   "case": "用例 48",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "两节点编排 a→b：创建 202（orchestrationId/status 两键序）、读回组/节点/边三段键序、依赖节点创建时 pending（根才 ready）、同键同计划幂等",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-task-orch"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'task 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc48",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "goal": "两步调研后汇总",
+      "tasks": [
+       {
+        "key": "a",
+        "content": "调研主题 A",
+        "agent": "researcher"
+       },
+       {
+        "key": "b",
+        "content": "汇总调研结论",
+        "agent": "coder"
+       }
+      ],
+      "links": [
+       {
+        "parent": "a",
+        "child": "b"
+       }
+      ]
+     },
+     "capture": {
+      "orid": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "orchestrationId",
+       "status"
+      ],
+      "data": {
+       "status": "active"
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/orchestrations/{orid}",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "orchestration",
+       "tasks",
+       "links"
+      ],
+      "data": {
+       "orchestration": {
+        "orchestrationId": "{orid}",
+        "goal": "两步调研后汇总",
+        "workspaceId": "{wid}",
+        "sourceSessionId": "{sid}",
+        "status": "active",
+        "deliveryStatus": "",
+        "deliveryRunId": ""
+       },
+       "tasks": [
+        {
+         "key": "a",
+         "status": "ready",
+         "agent": "researcher",
+         "taskId": "$any"
+        },
+        {
+         "key": "b",
+         "status": "pending",
+         "agent": "coder",
+         "taskId": "$any"
+        }
+       ],
+       "links": [
+        {
+         "parentTaskId": "$any",
+         "childTaskId": "$any"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc48",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "goal": "两步调研后汇总",
+      "tasks": [
+       {
+        "key": "a",
+        "content": "调研主题 A",
+        "agent": "researcher"
+       },
+       {
+        "key": "b",
+        "content": "汇总调研结论",
+        "agent": "coder"
+       }
+      ],
+      "links": [
+       {
+        "parent": "a",
+        "child": "b"
+       }
+      ]
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data": {
+       "orchestrationId": "{orid}",
+       "status": "active"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "49-tasks-notfound-permission",
+   "case": "用例 49",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "可见性与角色：未知 id 404 117001/117002（stop/resume 同码）；不带 token 401 111102；同租户 viewer 读他人 Task 与项目任务列表同形 404（不给探测通道）、写面 403 111203；跨租户 stranger 读同形 404",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-task-perm"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'task 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc49",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "阅读项目根目录并总结有哪些文件",
+      "agent": "researcher"
+     },
+     "capture": {
+      "tid": "data.taskId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/at_nope",
+     "expect": {
+      "http": 404,
+      "code": 117001,
+      "message": "找不到这件任务",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/orchestrations/or_nope",
+     "expect": {
+      "http": 404,
+      "code": 117002,
+      "message": "找不到这个编排组",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks/at_nope/stop",
+     "expect": {
+      "http": 404,
+      "code": 117001,
+      "message": "找不到这件任务",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks/at_nope/resume",
+     "expect": {
+      "http": 404,
+      "code": 117001,
+      "message": "找不到这件任务",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/or_nope/stop",
+     "expect": {
+      "http": 404,
+      "code": 117002,
+      "message": "找不到这个编排组",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tid}",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc49noauth",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "阅读项目根目录并总结有哪些文件",
+      "agent": "researcher"
+     },
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    },
+    {
+     "op": "invite_viewer"
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tid}",
+     "tokenVar": "viewerTok",
+     "expect": {
+      "http": 404,
+      "code": 117001,
+      "message": "找不到这件任务",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/tasks",
+     "tokenVar": "viewerTok",
+     "expect": {
+      "http": 404,
+      "code": 114001,
+      "message": "找不到这个项目",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc49viewer",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "阅读项目根目录并总结有哪些文件",
+      "agent": "researcher"
+     },
+     "tokenVar": "viewerTok",
+     "expect": {
+      "http": 403,
+      "code": 111203,
+      "message": "没有权限做这件事",
+      "data": null
+     }
+    },
+    {
+     "op": "signup"
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tid}",
+     "expect": {
+      "http": 404,
+      "code": 117001,
+      "message": "找不到这件任务",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "50-tasks-stop-resume",
+   "case": "用例 50",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "停止与恢复的状态面：stop 单件 200 cancelled（status/taskId 键序）、重复 stop 幂等 200、强置 succeeded 后 stop 409 117104、无执行记录 resume 409 117103；整组 stop 202 cancelled、重复 409 117105。单件 Task 与编排组共用同一幂等键空间（同键建组 → 117102）",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-task-stop"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'task 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc50t",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "阅读项目根目录并总结有哪些文件",
+      "agent": "researcher"
+     },
+     "capture": {
+      "tid": "data.taskId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks/{tid}/stop",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "status",
+       "taskId"
+      ],
+      "data": {
+       "status": "cancelled",
+       "taskId": "{tid}"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks/{tid}/stop",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "status": "cancelled",
+       "taskId": "{tid}"
+      }
+     }
+    },
+    {
+     "sql": "UPDATE agent_tasks SET status='succeeded', finished_at=now() WHERE id='{tid}'"
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks/{tid}/stop",
+     "expect": {
+      "http": 409,
+      "code": 117104,
+      "message": "这件任务已经结束，不能停止",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks/{tid}/resume",
+     "expect": {
+      "http": 409,
+      "code": 117103,
+      "message": "这件任务还没有执行记录，不能恢复",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc50o",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "goal": "停整组",
+      "tasks": [
+       {
+        "key": "a",
+        "content": "调研 A",
+        "agent": "researcher"
+       },
+       {
+        "key": "b",
+        "content": "汇总",
+        "agent": "coder"
+       }
+      ],
+      "links": [
+       {
+        "parent": "a",
+        "child": "b"
+       }
+      ]
+     },
+     "capture": {
+      "orid": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data": {
+       "status": "active"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/stop",
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "orchestrationId",
+       "status"
+      ],
+      "data": {
+       "orchestrationId": "{orid}",
+       "status": "cancelled"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/stop",
+     "expect": {
+      "http": 409,
+      "code": 117105,
+      "message": "这个编排组已经结束，不能停止",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/orchestrations/{orid}",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "orchestration": {
+        "status": "cancelled",
+        "finishedAt": "$any"
+       },
+       "tasks": [
+        {
+         "key": "a",
+         "status": "cancelled"
+        },
+        {
+         "key": "b",
+         "status": "cancelled"
+        }
+       ]
+      }
      }
     }
    ]

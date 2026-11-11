@@ -33,7 +33,10 @@ type Session struct {
 	Visibility  string    `gorm:"not null;default:private;index:sessions_tenant_visibility,priority:2"`
 	AgentID     string    `gorm:"not null;default:''"`
 	WorkspaceID *string   `gorm:"index"` // 空 = 游离会话，作业根仍是 sessions/<sid>/
-	CreatedAt   time.Time `gorm:"not null;index:sessions_tenant_visibility,priority:3"`
+	// Kind 区分普通聊天会话与 Task 执行会话（doc/70 §5.5）：agent_task 会话不进普通聊天列表，
+	// 归属仍是原用户与原项目。
+	Kind       string    `gorm:"not null;default:chat"`
+	CreatedAt  time.Time `gorm:"not null;index:sessions_tenant_visibility,priority:3"`
 	// DeletedAt 非空表示这场会话已经随项目删掉。按 id 取、列表、抢闸都要把它当成没有这行。
 	DeletedAt *time.Time `gorm:"column:deleted_at"`
 }
@@ -110,6 +113,10 @@ type RunlogEntry struct {
 	MessageID string    // 仅 user 行（契约：assistant 行无此字段）——可空
 	Text      string    `gorm:"not null"`
 	Payload   string    // 工具扩展行的结构化 JSON（{"name","args"|"output"}）——可空
+	// Internal 标记用户没发过的行（doc/70 §5.6）：交付／协调 run 的 user 指令为 true。
+	// 历史读取与可见高水位只统计 internal=false；Task 执行 run 的 user 行仍是 false
+	//（agent_task 会话本身已被会话列表那层藏掉）。
+	Internal  bool      `gorm:"not null;default:false"`
 	CreatedAt time.Time `gorm:"not null"`
 }
 
@@ -362,6 +369,25 @@ func (s *Store) DeleteWorkspaceCascade(ctx context.Context, tenantID, userID, id
 		if n > 0 {
 			return ErrWorkspaceBusy
 		}
+		// 项目删除保护（doc/70 §10.2）：编排组没收口（active/cancelling）或还有没落终态的
+		// Task（pending/ready/running；租约过期的 running 在存储里仍是 running，自动覆盖
+		// 「interrupted 也算未收口」）。已终态的组与 Task 保留历史事实，不挡删除。
+		if err := tx.Raw(
+			`SELECT COUNT(*) FROM agent_orchestrations WHERE workspace_id = ? AND status IN ('active', 'cancelling')`,
+			id).Scan(&n).Error; err != nil {
+			return err
+		}
+		if n > 0 {
+			return ErrWorkspaceBusy
+		}
+		if err := tx.Raw(
+			`SELECT COUNT(*) FROM agent_tasks WHERE workspace_id = ? AND status IN ('pending', 'ready', 'running')`,
+			id).Scan(&n).Error; err != nil {
+			return err
+		}
+		if n > 0 {
+			return ErrWorkspaceBusy
+		}
 		// 记忆按 **scope** 清（doc/65 §3.3）：删这个项目的 scope='workspace' 的记忆，
 		// **两层都删**（resident 与 recall 不分）；scope='user' 的记忆**保留**
 		//（它跟人走，即使产生于这个被删的项目）。
@@ -416,6 +442,20 @@ func (s *Store) DeleteSession(ctx context.Context, tenantID, userID string, id S
 		var n int64
 		if err := tx.Raw(
 			`SELECT COUNT(*) FROM runs WHERE session_id = ? AND status = 'running' AND lease_until > now()`,
+			id).Scan(&n).Error; err != nil {
+			return err
+		}
+		if n > 0 {
+			return ErrSessionBusy
+		}
+		// 来源会话删除保护（doc/70 §10.2）：还有没交付完的编排组就拒绝——结果与失败通知的
+		// 接收者是这场会话，删了它们永远找不到接收者。组还在跑（active/cancelling）或交付
+		// 在途（pending/delivering）都算没交付完；已 delivered、失败组（失败通知已消费）与
+		// 用户主动取消的组不算。
+		if err := tx.Raw(
+			`SELECT COUNT(*) FROM agent_orchestrations
+			  WHERE source_session_id = ?
+			    AND (status IN ('active', 'cancelling') OR delivery_status IN ('pending', 'delivering'))`,
 			id).Scan(&n).Error; err != nil {
 			return err
 		}
@@ -617,7 +657,8 @@ func autoMigrate(db *gorm.DB) error {
 		&User{}, &Tenant{}, &TenantMember{}, &RefreshToken{}, &AuditLog{}, &TenantUsageDaily{},
 		&TenantInvitation{}, &TenantAgent{}, &AgentDefault{}, &TenantSetting{}, &TenantStorage{},
 		&Workspace{}, &CleanerState{}, &RunTask{}, &RunQuestion{},
-		&SkillRow{}, &SkillDisable{}); err != nil {
+		&SkillRow{}, &SkillDisable{},
+		&AgentOrchestration{}, &AgentTask{}, &AgentTaskLink{}, &AgentNotification{}); err != nil {
 		return err
 	}
 	// 旧列 kind/topic **不在这里删**——它们是存量迁移的**输入**：
@@ -668,6 +709,19 @@ ON run_model_messages (compacted, run_id)`).Error; err != nil {
 	if err := db.Exec(`INSERT INTO cleaner_state (key, owner, expires_at, watermark)
 VALUES ('lease', '', 'epoch', 'epoch'), ('archive', '', 'epoch', 'epoch')
 ON CONFLICT (key) DO NOTHING`).Error; err != nil {
+		return err
+	}
+	// Task 领取的唯一性（doc/70 §5.2）：execution_session_id / current_run_id 可空直到领取，
+	// 非空时唯一——一个执行 session 与一场 run 同时只归一个 Task。部分唯一索引把这条约束
+	// 放进数据库，两个副本同时领取同一 Task 时 INSERT 冲突本身就是败者。
+	if err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS agent_tasks_exec_session_once
+ON agent_tasks (execution_session_id)
+WHERE execution_session_id IS NOT NULL`).Error; err != nil {
+		return err
+	}
+	if err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS agent_tasks_current_run_once
+ON agent_tasks (current_run_id)
+WHERE current_run_id IS NOT NULL`).Error; err != nil {
 		return err
 	}
 	return db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS one_default_workspace_per_user
@@ -730,10 +784,12 @@ func (s *Store) SessionStatus(ctx context.Context, sessionID SessionID, p princi
 	}
 	var live, last string
 	var hw int64
+	// 高水位只数 internal=false 的行（doc/70 §5.6）：协调 run 的内部指令占 seq 空间但不占
+	// 用户可见历史，客户端按可见 seq 对齐游标才能收敛。
 	err = s.db.WithContext(ctx).Raw(`
 SELECT EXISTS (SELECT 1 FROM sessions WHERE id = ?),
        COALESCE((SELECT id FROM runs WHERE session_id = ? AND status = 'running' AND lease_until > now() LIMIT 1), ''),
-       COALESCE((SELECT MAX(seq) FROM runlog_entries WHERE session_id = ?), 0),
+       COALESCE((SELECT MAX(seq) FROM runlog_entries WHERE session_id = ? AND internal = false), 0),
        COALESCE((SELECT id FROM runs WHERE session_id = ? ORDER BY created_at DESC, id DESC LIMIT 1), ''),
        COALESCE((SELECT CASE WHEN status = 'running' AND lease_until > now() THEN 'running'
                              WHEN status = 'running' THEN 'interrupted'
@@ -915,7 +971,8 @@ func (s *Store) runlogUserSeq(ctx context.Context, sessionID SessionID, runID Ru
 }
 
 // ReadLog 返回 session 中 seq > from 的定稿记录（升序，最多 w 条）与 nextOffset（空批 = from）。
-// exists=false = session 未登记，log 端点据此回 404。W 截断规则与 frames 共用同一条
+// internal=true 的行（交付／协调 run 的内部指令，doc/70 §5.6）不出现：用户历史里没有自己
+// 没发过的消息。exists=false = session 未登记，log 端点据此回 404。W 截断规则与 frames 共用同一条
 // （planning §0 第 4 条），这里实现为 `WHERE seq > from ORDER BY seq LIMIT w`；w<=0 直接空批——
 // 契约里没有「一次拿全部」。seq 即 runlogOffset（列形态），读侧只做字段注入。
 func (s *Store) ReadLog(ctx context.Context, sessionID SessionID, from, w int) (rows []Row, nextOffset int, exists bool, err error) {
@@ -931,7 +988,7 @@ func (s *Store) ReadLog(ctx context.Context, sessionID SessionID, from, w int) (
 	}
 	var entries []RunlogEntry
 	if err := s.db.WithContext(ctx).
-		Where("session_id = ? AND seq > ?", sessionID, from).
+		Where("session_id = ? AND seq > ? AND internal = false", sessionID, from).
 		Order("seq").Limit(w).Find(&entries).Error; err != nil {
 		return nil, 0, false, err
 	}

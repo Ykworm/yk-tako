@@ -599,3 +599,100 @@ export function deleteTool(name: string): Promise<DeleteStatus> {
   return request<DeleteStatus>(`/api/tools/${encodeURIComponent(name)}`, { method: 'DELETE' })
 }
 
+// —— 持久 Task 与编排（doc/70）——
+// 列表按项目拉（GET /api/workspaces/:id/tasks，V1 无游标）；详情单读；停止／恢复是动作。
+// 创建不在页面表单里做：模型用 delegate_task / create_orchestration 工具发起，产品 API 由验收脚本打。
+export const CODE_TASK_MISSING = 117001 // 找不到这件任务（不存在或不可见，同形 404）
+export const CODE_ORCH_MISSING = 117002 // 找不到这个编排组
+export const CODE_TASK_NOT_RESUMABLE = 117103 // 这件任务现在不能恢复（非 interrupted / 有活执行者 / 次数耗尽）
+export const CODE_TASK_FINISHED = 117104 // 这件任务已经结束，不能停止
+export const CODE_ORCH_FINISHED = 117105 // 这个编排组已经结束，不能停止
+
+// 结果里的一个产物引用：path 是**相对项目根**的路径，取字节走项目文件的现成出口
+// （workspaceFileUrl + authFetch，见 TasksView；不能直接塞 <a href>，/api/media 要 Bearer 头）。
+export type TaskArtifact = { path: string; kind: string }
+
+// submit_task_result 提交的交接摘要；未提交的任务 result 是 null。
+export type TaskResult = { summary: string; artifacts: TaskArtifact[]; metadata: Record<string, unknown> }
+
+// 机器错误与展示文案分开（doc/70 §4.3）：code 给分支，message 直接就是给人看的句子。
+export type TaskErrorView = { code: string; message: string }
+
+// GET 返回的完整 Task。字段序是契约字节序（taskId → … → updatedAt），interrupted 不入库、
+// 是读侧派生：running 且当前 run 租约过期时服务端把 status 写成 interrupted。
+export type AgentTask = {
+  taskId: string
+  orchestrationId: string
+  key: string
+  content: string
+  agent: string
+  modelRef: string
+  workspaceId: string
+  status: string
+  currentRunId: string
+  result: TaskResult | null
+  error: TaskErrorView | null
+  resultRevision: number
+  createdAt: string
+  startedAt: string | null
+  finishedAt: string | null
+  updatedAt: string
+}
+
+export type TaskListResponse = { tasks: AgentTask[] }
+
+// 编排组视图的组半：finalTaskId 指向全组唯一的最终 Task；deliveryStatus 空 = 无可交付结果。
+export type OrchestrationBody = {
+  orchestrationId: string
+  goal: string
+  workspaceId: string
+  sourceSessionId: string
+  status: string
+  finalTaskId: string
+  deliveryStatus: string
+  deliveryRunId: string
+  createdAt: string
+  finishedAt: string | null
+  deliveredAt: string | null
+  updatedAt: string
+}
+
+export type TaskLink = { parentTaskId: string; childTaskId: string }
+export type OrchestrationView = { orchestration: OrchestrationBody; tasks: AgentTask[]; links: TaskLink[] }
+
+export function listWorkspaceTasks(workspaceId: string): Promise<TaskListResponse> {
+  return request<TaskListResponse>(`/api/workspaces/${encodeURIComponent(workspaceId)}/tasks`)
+}
+
+export function getAgentTask(taskId: string): Promise<AgentTask> {
+  return request<AgentTask>(`/api/tasks/${encodeURIComponent(taskId)}`)
+}
+
+export function getOrchestration(orchestrationId: string): Promise<OrchestrationView> {
+  return request<OrchestrationView>(`/api/orchestrations/${encodeURIComponent(orchestrationId)}`)
+}
+
+// 停一件 Task：幂等（已 cancelled 再停仍回 200）；已 succeeded/failed 是 409 117104。
+// running 之外的未完成状态（pending/ready/blocked）当场翻 cancelled；running 由服务端顺带收尾 run。
+export function stopAgentTask(taskId: string): Promise<{ taskId: string; status: string }> {
+  return request<{ taskId: string; status: string }>(`/api/tasks/${encodeURIComponent(taskId)}/stop`, {
+    method: 'POST',
+  })
+}
+
+// 停整组：回 cancelling（还有 running 节点在收）或 cancelled（当场收完）；
+// 已终态的组是 409 117105。组状态由服务端调度轮推进，前端收到事件后重拉。
+export function stopOrchestration(orchestrationId: string): Promise<{ orchestrationId: string; status: string }> {
+  return request<{ orchestrationId: string; status: string }>(
+    `/api/orchestrations/${encodeURIComponent(orchestrationId)}/stop`,
+    { method: 'POST' },
+  )
+}
+
+// 恢复一件 interrupted 的 Task：202 = 已有新执行者接管在跑。409 117103 = 现在不能恢复
+// （可能刚被别人抢先恢复——多 tab 并发，收到后重拉详情即可）。
+export type TaskResumeResult = { taskId: string; runId: string; status: string; resumeCount: number }
+export function resumeAgentTask(taskId: string): Promise<TaskResumeResult> {
+  return request<TaskResumeResult>(`/api/tasks/${encodeURIComponent(taskId)}/resume`, { method: 'POST' })
+}
+

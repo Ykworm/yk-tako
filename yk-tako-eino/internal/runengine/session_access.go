@@ -70,12 +70,13 @@ func (s *Store) RunSession(ctx context.Context, runID RunID) (SessionID, bool, e
 }
 
 // ListSessions：scope=own（默认）只列本人；scope=tenant 只列本租户 visibility=tenant 的会话。
-// workspaceID 非空时再按项目筛。空串表示不筛，游离会话留在结果里。
+// 只列 kind='chat'（doc/70 §5.5）：Task 执行会话（agent_task）是内部现场，不进普通聊天列表，
+// 侧栏与项目会话列表同此口径。workspaceID 非空时再按项目筛。空串表示不筛，游离会话留在结果里。
 // 创建者用默认列表筛自己的项目时，返回挂在上面的全部会话，含别人的私人会话。
 // scope=tenant 不放宽，避免借项目筛把别人的私人会话带出来。
 // deleted_at 非空的行不出现，已删会话不在列表里复活。
 func (s *Store) ListSessions(ctx context.Context, p principal, scope, workspaceID string) ([]Session, error) {
-	q := s.db.WithContext(ctx).Where("tenant_id = ? AND deleted_at IS NULL", p.TenantID)
+	q := s.db.WithContext(ctx).Where("tenant_id = ? AND deleted_at IS NULL AND kind = 'chat'", p.TenantID)
 	if scope == "tenant" {
 		q = q.Where("visibility = ?", "tenant")
 	} else if workspaceID != "" {

@@ -114,6 +114,7 @@ func main() {
 	leaseRenew := flag.Duration("lease-renew", durationEnv("TAKO_LEASE_RENEW", defaultLeaseRenew), "watchdog renew interval (must be < lease-ttl; env TAKO_LEASE_RENEW)")
 	compactWindow := flag.Int("compact-window", defaultCompactWindow, "context window in tokens for compaction; limit = window - min(window/5, 16384); 0 disables")
 	resumeMax := flag.Int("resume-max", 3, "max resumes per run (doc/30); resumeCount = lease_epoch-1, resumable while below it")
+	taskInterval := flag.Duration("task-interval", time.Second, "persistent-task scheduler round interval (doc/70); <= 0 disables the loop")
 	archiveTTL := flag.Duration("archive-ttl", 168*time.Hour, "how long compacted transcripts and soft-deleted session archives stay before the sweeper removes them")
 	agentsDir := flag.String("agents-dir", "agents", "directory of sub-agent specs (*.md + YAML frontmatter); scanned at each run start (relative to CWD)")
 	workspace := flag.String("workspace", "./workspace", "workspace root for first-party file tools; created at startup, tools are confined to it")
@@ -366,6 +367,18 @@ func main() {
 	}
 	log.Printf("subagents: concurrency %d, return cap %d B", *subagentConcurrency, *subagentReturnCap)
 	log.Printf("archive ttl %s", *archiveTTL)
-	r := runengine.NewRouter(store, *batch, *dev, worker, *resumeMax, auth, sysSkillsAbs)
+	// 持久 Task 调度循环（doc/70 §8.1）：显式启动，不藏在路由注册里。每副本一个；
+	// 正确性由 PG 行锁、条件更新与唯一索引承担。interval <= 0 关闭（验收对照跑法）。
+	srv := runengine.NewServer(store, *batch, *dev, worker, *resumeMax, auth, sysSkillsAbs)
+	if *taskInterval > 0 {
+		ts := runengine.NewTaskScheduler(store, worker, *taskInterval)
+		srv.AttachTaskScheduler(ts)
+		stopTask := ts.Start(ctx)
+		_ = stopTask // 进程生命周期与 main 一致（log.Fatal 退出）
+		log.Printf("task scheduler: interval %s", *taskInterval)
+	} else {
+		log.Printf("task scheduler off (-task-interval <= 0)")
+	}
+	r := srv.RouterFor()
 	log.Fatal(r.Run(*engine))
 }
