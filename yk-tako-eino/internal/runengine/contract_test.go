@@ -200,6 +200,9 @@ func TestContractBusinessCodes(t *testing.T) {
 		{"编排组不可修订", codeNotRevisable, 117107},
 		{"修订键命令冲突", codeRevisionConflict, 117108},
 		{"提问已过期", codeQuestionExpired, 115102},
+		{"工作区配置不合法", codeWorkspaceConfigInvalid, 117111},
+		{"任务不可重新发布", codeTaskNotRepublishable, 117112},
+		{"项目正在发布结果", codeWorkspacePublishing, 117113},
 		{"内部错误", codeInternal, 111901},
 	}
 	for _, c := range cases {
@@ -452,6 +455,74 @@ func TestContractOrchestrationViewBytes(t *testing.T) {
 	}
 }
 
+// TestContractWorkspaceViewBytes 钉住隔离组的工作区读面字节（doc/74 §4.3）。
+// 真实字节来自 2026-11-12 隔离引擎 curl（tmp/74 探针 P9/P14）：workspace 恒在视图**末尾**，
+// 键序 mode → provider → verification(configured → status，收尾证据追加 exitCode → outputPath)
+// → publication(status → errorCode → epoch)。
+// shared 组不带 workspace 键——那半由 TestContractAgentTaskViewBytes / TestContractOrchestrationViewBytes
+// 的既有字节钉着（它们就是 doc/74 之前的形状，一个字节都不能动）。
+func TestContractWorkspaceViewBytes(t *testing.T) {
+	ws := &taskWorkspaceView{
+		Mode: "isolated", Provider: "pending",
+		Verification: workspaceVerificationView{Configured: true, Status: ""},
+		Publication:  workspacePublicationView{Status: "", ErrorCode: "", Epoch: 0},
+	}
+	got := mustJSON(t, agentTaskView{
+		TaskID: "at_1", OrchestrationID: "or_1", Key: "main", Content: "探针单件",
+		Agent: "coder", WorkspaceID: "ws_1", Status: "ready",
+		CreatedAt: time.Unix(0, 0).UTC(), UpdatedAt: time.Unix(0, 0).UTC(),
+		Workspace: ws,
+	})
+	const wantTask = `{"taskId":"at_1","orchestrationId":"or_1","key":"main","content":"探针单件","agent":"coder","modelRef":"","planCheckpoint":false,"createdRevision":0,"workspaceId":"ws_1","status":"ready","currentRunId":"","result":null,"error":null,"resultRevision":0,` +
+		`"createdAt":"1970-01-01T00:00:00Z","startedAt":null,"finishedAt":null,"updatedAt":"1970-01-01T00:00:00Z",` +
+		`"workspace":{"mode":"isolated","provider":"pending","verification":{"configured":true,"status":""},"publication":{"status":"","errorCode":"","epoch":0}}}`
+	if got != wantTask {
+		t.Fatalf("隔离 Task 视图字节漂移：\n得到 %s\n期望 %s", got, wantTask)
+	}
+	got = mustJSON(t, orchestrationBody{
+		OrchestrationID: "or_1", Goal: "探针组", WorkspaceID: "ws_1",
+		SourceSessionID: "s_1", Status: "active", FinalTaskID: "at_1",
+		CreatedAt: time.Unix(0, 0).UTC(), UpdatedAt: time.Unix(0, 0).UTC(),
+		Workspace: ws,
+	})
+	const wantOrch = `{"orchestrationId":"or_1","goal":"探针组","workspaceId":"ws_1","sourceSessionId":"s_1","status":"active","finalTaskId":"at_1","planRevision":0,"planHold":false,"deliveryStatus":"","deliveryRunId":"","deliveryErrorCode":"",` +
+		`"createdAt":"1970-01-01T00:00:00Z","finishedAt":null,"deliveredAt":null,"updatedAt":"1970-01-01T00:00:00Z",` +
+		`"workspace":{"mode":"isolated","provider":"pending","verification":{"configured":true,"status":""},"publication":{"status":"","errorCode":"","epoch":0}}}`
+	if got != wantOrch {
+		t.Fatalf("隔离组体字节漂移：\n得到 %s\n期望 %s", got, wantOrch)
+	}
+	// 发布 blocked 的形状（errorCode/epoch 有值时键序不变）。
+	blocked := mustJSON(t, taskWorkspaceView{
+		Mode: "isolated", Provider: "git",
+		Verification: workspaceVerificationView{Configured: true, Status: "passed"},
+		Publication:  workspacePublicationView{Status: "blocked", ErrorCode: "workspace_changed", Epoch: 3},
+	})
+	const wantBlocked = `{"mode":"isolated","provider":"git","verification":{"configured":true,"status":"passed"},"publication":{"status":"blocked","errorCode":"workspace_changed","epoch":3}}`
+	if blocked != wantBlocked {
+		t.Fatalf("blocked 工作区字节漂移：\n得到 %s\n期望 %s", blocked, wantBlocked)
+	}
+	// 验证证据收尾后追加 exitCode → outputPath（真实字节来自 tmp/74 探针 probe7.out V1/V3）；
+	// 无证据/running 时这两键不出现——上面几段字节就是无证据形状，保持不变。
+	exit3 := 3
+	failed := mustJSON(t, workspaceVerificationView{
+		Configured: true, Status: "failed", ExitCode: &exit3,
+		OutputPath: "verification/at_01M7784TJ59P82HYAR3V44YV19.out",
+	})
+	const wantFailed = `{"configured":true,"status":"failed","exitCode":3,"outputPath":"verification/at_01M7784TJ59P82HYAR3V44YV19.out"}`
+	if failed != wantFailed {
+		t.Fatalf("验证失败证据字节漂移：\n得到 %s\n期望 %s", failed, wantFailed)
+	}
+	exit0 := 0
+	passed := mustJSON(t, workspaceVerificationView{
+		Configured: true, Status: "passed", ExitCode: &exit0,
+		OutputPath: "verification/at_01M7784YT324ZSZ6AG3PJXY4XN.out",
+	})
+	const wantPassed = `{"configured":true,"status":"passed","exitCode":0,"outputPath":"verification/at_01M7784YT324ZSZ6AG3PJXY4XN.out"}`
+	if passed != wantPassed {
+		t.Fatalf("验证通过证据字节漂移：\n得到 %s\n期望 %s", passed, wantPassed)
+	}
+}
+
 // TestContractTaskCreateRespBytes 钉住创建端点的 data（doc/70 §4.1）：
 // 单件 taskId → orchestrationId → status → currentRunId；整组 orchestrationId → status。
 func TestContractTaskCreateRespBytes(t *testing.T) {
@@ -628,5 +699,62 @@ func TestContractNotificationRetryBytes(t *testing.T) {
 		if got != c.want {
 			t.Fatalf("重试失败信封字节 = %s\nwant %s", got, c.want)
 		}
+	}
+}
+
+// TestContractPublicationRetryBytes 钉住 retry-publication 的 data 与两个端点的失败信封
+// （doc/74 §4.4/§4.5；施工包 §4.4/§4.5）。真实字节来自 2026-11-12 隔离引擎 curl
+// （tmp/74 探针 probe6.out B3/B4/A2–A9/B5/B6/C3）：
+// data 字段序 taskId → runId → status → publicationEpoch；202 新处理 run 与 200 幂等命中同形。
+func TestContractPublicationRetryBytes(t *testing.T) {
+	got := mustJSON(t, publicationRetryView{
+		TaskID: "at_01M777EHF1QR09R69TKCWKY7Y5", RunID: "r_01M777EQG8HF8W38GDJPZZGRG5",
+		Status: "running", PublicationEpoch: 2,
+	})
+	const want = `{"taskId":"at_01M777EHF1QR09R69TKCWKY7Y5","runId":"r_01M777EQG8HF8W38GDJPZZGRG5","status":"running","publicationEpoch":2}`
+	if got != want {
+		t.Fatalf("重新发布字节 = %s\nwant %s", got, want)
+	}
+
+	cases := []struct {
+		code    int
+		message string
+		want    string
+	}{
+		{codeArtifactInvalid, "结果产物已不可读取", `{"code":117110,"message":"结果产物已不可读取","data":null}`},
+		{codeTaskMissing, "找不到这件任务", `{"code":117001,"message":"找不到这件任务","data":null}`},
+		{codeMissingToken, "请先登录", `{"code":111102,"message":"请先登录","data":null}`},
+		{codeBadInput, "这件任务的结果产物请从项目文件读取", `{"code":111002,"message":"这件任务的结果产物请从项目文件读取","data":null}`},
+		{codeTaskNotRepublishable, "这件任务现在不能重新发布", `{"code":117112,"message":"这件任务现在不能重新发布","data":null}`},
+		{codeForbidden, "没有权限做这件事", `{"code":111203,"message":"没有权限做这件事","data":null}`},
+	}
+	for _, c := range cases {
+		got = mustJSON(t, envelope{Code: c.code, Message: c.message, Data: nil})
+		if got != c.want {
+			t.Fatalf("产物/重新发布失败信封字节 = %s\nwant %s", got, c.want)
+		}
+	}
+}
+
+// TestContractWorkspaceConfigErrBytes 钉住工作区配置/发布准入的失败信封（doc/74 §4.1/§4.3）。
+// 真实字节来自隔离引擎 curl（8948，2026-11-12）：117111 的 data 是 gin.H{"reason":…}（map 按键序），
+// 117113 在 POST /api/runs 准入处挡下（workspaces.publication_orchestration_id 非空），data 恒 null。
+func TestContractWorkspaceConfigErrBytes(t *testing.T) {
+	reasons := []string{
+		"workspaceMode 只允许 shared 或 isolated",
+		"共享工作区不接受 verifyCommand",
+		"verifyCommand 超过 4000 字节",
+	}
+	for _, r := range reasons {
+		got := mustJSON(t, envelope{Code: codeWorkspaceConfigInvalid, Message: "工作区配置不合法", Data: gin.H{"reason": r}})
+		want := `{"code":117111,"message":"工作区配置不合法","data":{"reason":"` + r + `"}}`
+		if got != want {
+			t.Fatalf("工作区配置失败信封字节 = %s\nwant %s", got, want)
+		}
+	}
+	got := mustJSON(t, envelope{Code: codeWorkspacePublishing, Message: "项目正在发布结果，请稍后再试", Data: nil})
+	const wantPublishing = `{"code":117113,"message":"项目正在发布结果，请稍后再试","data":null}`
+	if got != wantPublishing {
+		t.Fatalf("发布准入失败信封字节 = %s\nwant %s", got, wantPublishing)
 	}
 }

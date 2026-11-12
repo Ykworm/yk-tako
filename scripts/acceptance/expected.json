@@ -1,6 +1,6 @@
 {
- "version": "2026-11-11",
- "source": "doc/19-v6/19v6-04-验收-curl.md；持久 Task 与编排（doc/70）用例 44–50 同批；多 Agent 编排下一阶段（doc/72）用例 51–54 同批",
+ "version": "2026-11-12",
+ "source": "doc/19-v6/19v6-04-验收-curl.md；持久 Task 与编排（doc/70）用例 44–50 同批；多 Agent 编排下一阶段（doc/72）用例 51–54 同批；并行任务工作区隔离（doc/74）用例 57–60 同批",
  "note": [
   "本文件是契约字节的**机器真源**；doc/19-v6/19v6-04-验收-curl.md 是同一份内容的人读版。",
   "两份**同批改**。check-expected.sh 守两边的用例号集合一致。",
@@ -4364,595 +4364,1440 @@
     }
    ]
   },
-{
- "id": "55-notification-detail",
- "case": "用例 55",
- "tier": "core",
- "needs": "pg",
- "desc": "通知详情（doc/73 §4.1）：失败通知 200 的十五字段序＋结果定位＋attempt 历史（status 现读自 runs）；未认领 pending 的 runId=\"\"、attempt 0、attempts 空、三个时间 null；未知／跨租户／viewer 一律 404 117003，不带 token 401 111102",
- "steps": [
   {
-   "op": "signup",
-   "no_model": true,
-   "expect": {
-    "http": 201,
-    "code": 0,
-    "message": ""
-   }
-  },
-  {
-   "method": "POST",
-   "path": "/api/workspaces",
-   "body": {
-    "name": "acc-notif-detail"
-   },
-   "capture": {
-    "wid": "data.workspace.id"
-   },
-   "expect": {
-    "http": 201,
-    "code": 0,
-    "message": ""
-   }
-  },
-  {
-   "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'notif 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
-   "capture_stdout": [
-    "sid"
-   ]
-  },
-  {
-   "method": "POST",
-   "path": "/api/orchestrations",
-   "body": {
-    "idempotencyKey": "acc55o",
-    "workspaceId": "{wid}",
-    "sourceSessionId": "{sid}",
-    "goal": "交付恢复契约",
-    "tasks": [
-     {
-      "key": "a",
-      "content": "做一件",
-      "agent": "researcher"
+   "id": "55-notification-detail",
+   "case": "用例 55",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "通知详情（doc/73 §4.1）：失败通知 200 的十五字段序＋结果定位＋attempt 历史（status 现读自 runs）；未认领 pending 的 runId=\"\"、attempt 0、attempts 空、三个时间 null；未知／跨租户／viewer 一律 404 117003，不带 token 401 111102",
+   "steps": [
+    {
+     "op": "signup",
+     "no_model": true,
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
      }
-    ],
-    "links": []
-   },
-   "capture": {
-    "orid": "data.orchestrationId"
-   },
-   "expect": {
-    "http": 202,
-    "code": 0,
-    "message": ""
-   }
-  },
-  {
-   "sql": "SELECT id FROM agent_tasks WHERE orchestration_id='{orid}' AND task_key='a'",
-   "capture_stdout": [
-    "tid"
-   ]
-  },
-  {
-   "sql": "UPDATE agent_tasks SET status='completed', result='{\"summary\":\"交付摘要正文\",\"artifacts\":[],\"metadata\":{}}', result_revision=1, finished_at=now(), updated_at=now() WHERE id='{tid}' RETURNING id",
-   "capture_stdout": [
-    "u1"
-   ]
-  },
-  {
-   "sql": "UPDATE agent_orchestrations SET status='finished', final_task_id='{tid}', final_result_revision=1, delivery_status='failed', delivery_error_code='delivery_run_error', finished_at=now(), updated_at=now() WHERE id='{orid}' RETURNING id",
-   "capture_stdout": [
-    "u2"
-   ]
-  },
-  {
-   "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('ra'||substring('{wid}' from 3), '{sid}', 'error', 1, now(), now(), '{wid}') RETURNING id",
-   "capture_stdout": [
-    "drid"
-   ]
-  },
-  {
-   "sql": "INSERT INTO agent_notifications (id, tenant_id, orchestration_id, task_id, receiver_session_id, kind, dedup_key, status, claim_run_id, error_code, consume_error_code, created_at, claimed_at, failed_at, updated_at) VALUES ('an'||substring('{wid}' from 3), '{ten}', '{orid}', '{tid}', '{sid}', 'orchestration_finished', 'dk'||substring('{wid}' from 3), 'failed', 'ra'||substring('{wid}' from 3), '', 'delivery_run_error', now()-interval '10 minutes', now()-interval '9 minutes', now()-interval '1 minute', now()-interval '1 minute') RETURNING id",
-   "capture_stdout": [
-    "nid"
-   ]
-  },
-  {
-   "sql": "INSERT INTO agent_notification_attempts (id, tenant_id, notification_id, attempt, run_id, created_at) VALUES ('aaa'||substring('{wid}' from 3), '{ten}', 'an'||substring('{wid}' from 3), 1, 'ra'||substring('{wid}' from 3), now()-interval '9 minutes') RETURNING id",
-   "capture_stdout": [
-    "a1"
-   ]
-  },
-  {
-   "method": "GET",
-   "path": "/api/notifications/{nid}",
-   "expect": {
-    "http": 200,
-    "code": 0,
-    "message": "",
-    "data_keys": [
-     "notificationId",
-     "orchestrationId",
-     "taskId",
-     "kind",
-     "status",
-     "runId",
-     "attempt",
-     "errorCode",
-     "result",
-     "createdAt",
-     "claimedAt",
-     "failedAt",
-     "consumedAt",
-     "updatedAt",
-     "attempts"
-    ],
-    "data": {
-     "notificationId": "{nid}",
-     "orchestrationId": "{orid}",
-     "taskId": "{tid}",
-     "kind": "orchestration_finished",
-     "status": "failed",
-     "runId": "{drid}",
-     "attempt": 1,
-     "errorCode": "delivery_run_error",
-     "result": {
-      "finalTaskId": "{tid}",
-      "resultRevision": 1,
-      "summary": "交付摘要正文",
-      "artifacts": []
+    },
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-notif-detail"
      },
-     "consumedAt": null,
-     "attempts": [
-      {
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'notif 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc55o",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "goal": "交付恢复契约",
+      "tasks": [
+       {
+        "key": "a",
+        "content": "做一件",
+        "agent": "researcher"
+       }
+      ],
+      "links": []
+     },
+     "capture": {
+      "orid": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "SELECT id FROM agent_tasks WHERE orchestration_id='{orid}' AND task_key='a'",
+     "capture_stdout": [
+      "tid"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_tasks SET status='completed', result='{\"summary\":\"交付摘要正文\",\"artifacts\":[],\"metadata\":{}}', result_revision=1, finished_at=now(), updated_at=now() WHERE id='{tid}' RETURNING id",
+     "capture_stdout": [
+      "u1"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_orchestrations SET status='finished', final_task_id='{tid}', final_result_revision=1, delivery_status='failed', delivery_error_code='delivery_run_error', finished_at=now(), updated_at=now() WHERE id='{orid}' RETURNING id",
+     "capture_stdout": [
+      "u2"
+     ]
+    },
+    {
+     "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('ra'||substring('{wid}' from 3), '{sid}', 'error', 1, now(), now(), '{wid}') RETURNING id",
+     "capture_stdout": [
+      "drid"
+     ]
+    },
+    {
+     "sql": "INSERT INTO agent_notifications (id, tenant_id, orchestration_id, task_id, receiver_session_id, kind, dedup_key, status, claim_run_id, error_code, consume_error_code, created_at, claimed_at, failed_at, updated_at) VALUES ('an'||substring('{wid}' from 3), '{ten}', '{orid}', '{tid}', '{sid}', 'orchestration_finished', 'dk'||substring('{wid}' from 3), 'failed', 'ra'||substring('{wid}' from 3), '', 'delivery_run_error', now()-interval '10 minutes', now()-interval '9 minutes', now()-interval '1 minute', now()-interval '1 minute') RETURNING id",
+     "capture_stdout": [
+      "nid"
+     ]
+    },
+    {
+     "sql": "INSERT INTO agent_notification_attempts (id, tenant_id, notification_id, attempt, run_id, created_at) VALUES ('aaa'||substring('{wid}' from 3), '{ten}', 'an'||substring('{wid}' from 3), 1, 'ra'||substring('{wid}' from 3), now()-interval '9 minutes') RETURNING id",
+     "capture_stdout": [
+      "a1"
+     ]
+    },
+    {
+     "method": "GET",
+     "path": "/api/notifications/{nid}",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "notificationId",
+       "orchestrationId",
+       "taskId",
+       "kind",
+       "status",
+       "runId",
+       "attempt",
+       "errorCode",
+       "result",
+       "createdAt",
+       "claimedAt",
+       "failedAt",
+       "consumedAt",
+       "updatedAt",
+       "attempts"
+      ],
+      "data": {
+       "notificationId": "{nid}",
+       "orchestrationId": "{orid}",
+       "taskId": "{tid}",
+       "kind": "orchestration_finished",
+       "status": "failed",
        "runId": "{drid}",
        "attempt": 1,
-       "status": "error"
+       "errorCode": "delivery_run_error",
+       "result": {
+        "finalTaskId": "{tid}",
+        "resultRevision": 1,
+        "summary": "交付摘要正文",
+        "artifacts": []
+       },
+       "consumedAt": null,
+       "attempts": [
+        {
+         "runId": "{drid}",
+         "attempt": 1,
+         "status": "error"
+        }
+       ]
       }
+     }
+    },
+    {
+     "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('rb'||substring('{wid}' from 3), '{sid}', 'running', 1, now()+interval '1 hour', now(), '{wid}') RETURNING id",
+     "capture_stdout": [
+      "brun"
+     ]
+    },
+    {
+     "sql": "INSERT INTO agent_notifications (id, tenant_id, orchestration_id, task_id, receiver_session_id, kind, dedup_key, status, claim_run_id, error_code, consume_error_code, created_at, updated_at) VALUES ('ab'||substring('{wid}' from 3), '{ten}', '{orid}', '{tid}', '{sid}', 'task_failed', 'dkp'||substring('{wid}' from 3), 'pending', '', 'task_failed', '', now(), now()) RETURNING id",
+     "capture_stdout": [
+      "nid2"
+     ]
+    },
+    {
+     "method": "GET",
+     "path": "/api/notifications/{nid2}",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "notificationId": "{nid2}",
+       "kind": "task_failed",
+       "status": "pending",
+       "runId": "",
+       "attempt": 0,
+       "errorCode": "",
+       "result": null,
+       "claimedAt": null,
+       "failedAt": null,
+       "consumedAt": null,
+       "attempts": []
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/notifications/an_nope",
+     "expect": {
+      "http": 404,
+      "code": 117003,
+      "message": "找不到这条通知",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/notifications/{nid}",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    },
+    {
+     "op": "invite_viewer"
+    },
+    {
+     "method": "GET",
+     "path": "/api/notifications/{nid}",
+     "tokenVar": "viewerTok",
+     "expect": {
+      "http": 404,
+      "code": 117003,
+      "message": "找不到这条通知",
+      "data": null
+     }
+    },
+    {
+     "op": "signup",
+     "no_model": true,
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/notifications/{nid}",
+     "expect": {
+      "http": 404,
+      "code": 117003,
+      "message": "找不到这条通知",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "56-notification-retry",
+   "case": "用例 56",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "人工重试（doc/73 §4.2）：failed＋run 终态 202 新 attempt（字段序 notificationId→runId→status→attempt，attempt=2）；claimed 且 run 在跑 200 现状；pending／claimed 且 run 终态 409 117109；产物缺失 409 117110；来源会话忙 409 112101；未知／跨租户 404 117003；viewer 被角色门拒 403 111203",
+   "steps": [
+    {
+     "op": "signup",
+     "no_model": true,
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-notif-retry"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'notif 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc56o",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "goal": "人工重试契约",
+      "tasks": [
+       {
+        "key": "a",
+        "content": "做一件",
+        "agent": "researcher"
+       }
+      ],
+      "links": []
+     },
+     "capture": {
+      "orid": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "SELECT id FROM agent_tasks WHERE orchestration_id='{orid}' AND task_key='a'",
+     "capture_stdout": [
+      "tid"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_tasks SET status='completed', result='{\"summary\":\"交付摘要正文\",\"artifacts\":[],\"metadata\":{}}', result_revision=1, finished_at=now(), updated_at=now() WHERE id='{tid}' RETURNING id",
+     "capture_stdout": [
+      "u1"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_orchestrations SET status='finished', final_task_id='{tid}', final_result_revision=1, delivery_status='failed', delivery_error_code='delivery_run_error', finished_at=now(), updated_at=now() WHERE id='{orid}' RETURNING id",
+     "capture_stdout": [
+      "u2"
+     ]
+    },
+    {
+     "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('ra'||substring('{wid}' from 3), '{sid}', 'error', 1, now(), now(), '{wid}') RETURNING id",
+     "capture_stdout": [
+      "drid"
+     ]
+    },
+    {
+     "sql": "INSERT INTO agent_notifications (id, tenant_id, orchestration_id, task_id, receiver_session_id, kind, dedup_key, status, claim_run_id, error_code, consume_error_code, created_at, claimed_at, failed_at, updated_at) VALUES ('an'||substring('{wid}' from 3), '{ten}', '{orid}', '{tid}', '{sid}', 'orchestration_finished', 'dk'||substring('{wid}' from 3), 'failed', 'ra'||substring('{wid}' from 3), '', 'delivery_run_error', now()-interval '10 minutes', now()-interval '9 minutes', now()-interval '1 minute', now()-interval '1 minute') RETURNING id",
+     "capture_stdout": [
+      "nid"
+     ]
+    },
+    {
+     "sql": "INSERT INTO agent_notification_attempts (id, tenant_id, notification_id, attempt, run_id, created_at) VALUES ('aaa'||substring('{wid}' from 3), '{ten}', 'an'||substring('{wid}' from 3), 1, 'ra'||substring('{wid}' from 3), now()-interval '9 minutes') RETURNING id",
+     "capture_stdout": [
+      "a1"
+     ]
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 'sb'||substring('{wid}' from 3), '忙会话', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "bsid"
+     ]
+    },
+    {
+     "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('rl'||substring('{wid}' from 3), 'sb'||substring('{wid}' from 3), 'running', 1, now()+interval '1 hour', now(), '{wid}') RETURNING id",
+     "capture_stdout": [
+      "lrun"
+     ]
+    },
+    {
+     "sql": "INSERT INTO agent_notifications (id, tenant_id, orchestration_id, task_id, receiver_session_id, kind, dedup_key, status, claim_run_id, error_code, consume_error_code, created_at, updated_at) VALUES ('ab'||substring('{wid}' from 3), '{ten}', '{orid}', '{tid}', 'sb'||substring('{wid}' from 3), 'task_failed', 'dkp'||substring('{wid}' from 3), 'pending', '', 'task_failed', '', now(), now()) RETURNING id",
+     "capture_stdout": [
+      "nid2"
+     ]
+    },
+    {
+     "sql": "INSERT INTO agent_notifications (id, tenant_id, orchestration_id, task_id, receiver_session_id, kind, dedup_key, status, claim_run_id, error_code, consume_error_code, created_at, claimed_at, failed_at, updated_at) VALUES ('ac'||substring('{wid}' from 3), '{ten}', '{orid}', '{tid}', 'sb'||substring('{wid}' from 3), 'task_failed', 'dkb'||substring('{wid}' from 3), 'failed', 'ra'||substring('{wid}' from 3), '', 'delivery_run_error', now()-interval '5 minutes', now()-interval '4 minutes', now()-interval '1 minute', now()-interval '1 minute') RETURNING id",
+     "capture_stdout": [
+      "nid3"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/notifications/{nid2}/retry",
+     "expect": {
+      "http": 409,
+      "code": 117109,
+      "message": "这条通知现在不能重新处理",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/notifications/{nid3}/retry",
+     "expect": {
+      "http": 409,
+      "code": 112101,
+      "message": "这场会话正在生成，请稍后再试",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc56o2",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "goal": "产物缺失",
+      "tasks": [
+       {
+        "key": "x",
+        "content": "做另一件",
+        "agent": "researcher"
+       }
+      ],
+      "links": []
+     },
+     "capture": {
+      "orid2": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "SELECT id FROM agent_tasks WHERE orchestration_id='{orid2}' AND task_key='x'",
+     "capture_stdout": [
+      "tid2"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_tasks SET status='completed', result='{\"summary\":\"有产物\",\"artifacts\":[{\"path\":\"nope/missing.txt\",\"kind\":\"file\"}],\"metadata\":{}}', result_revision=1, finished_at=now(), updated_at=now() WHERE id='{tid2}' RETURNING id",
+     "capture_stdout": [
+      "u3"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_orchestrations SET status='finished', final_task_id='{tid2}', final_result_revision=1, delivery_status='failed', delivery_error_code='delivery_run_error', finished_at=now(), updated_at=now() WHERE id='{orid2}' RETURNING id",
+     "capture_stdout": [
+      "u4"
+     ]
+    },
+    {
+     "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('rc'||substring('{wid}' from 3), '{sid}', 'error', 1, now(), now(), '{wid}') RETURNING id",
+     "capture_stdout": [
+      "drid2"
+     ]
+    },
+    {
+     "sql": "INSERT INTO agent_notifications (id, tenant_id, orchestration_id, task_id, receiver_session_id, kind, dedup_key, status, claim_run_id, error_code, consume_error_code, created_at, claimed_at, failed_at, updated_at) VALUES ('ad'||substring('{wid}' from 3), '{ten}', '{orid2}', '{tid2}', '{sid}', 'orchestration_finished', 'dkx'||substring('{wid}' from 3), 'failed', 'rc'||substring('{wid}' from 3), '', 'delivery_run_error', now()-interval '5 minutes', now()-interval '4 minutes', now()-interval '1 minute', now()-interval '1 minute') RETURNING id",
+     "capture_stdout": [
+      "nid4"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/notifications/{nid4}/retry",
+     "expect": {
+      "http": 409,
+      "code": 117110,
+      "message": "结果产物已不可读取",
+      "data": null
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 'sc'||substring('{wid}' from 3), '已认领', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "csid"
+     ]
+    },
+    {
+     "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('rm'||substring('{wid}' from 3), 'sc'||substring('{wid}' from 3), 'running', 1, now()+interval '1 hour', now(), '{wid}') RETURNING id",
+     "capture_stdout": [
+      "mrun"
+     ]
+    },
+    {
+     "sql": "INSERT INTO agent_notifications (id, tenant_id, orchestration_id, task_id, receiver_session_id, kind, dedup_key, status, claim_run_id, error_code, consume_error_code, created_at, claimed_at, updated_at) VALUES ('ae'||substring('{wid}' from 3), '{ten}', '{orid}', '{tid}', 'sc'||substring('{wid}' from 3), 'task_failed', 'dkc'||substring('{wid}' from 3), 'claimed', 'rm'||substring('{wid}' from 3), '', '', now()-interval '2 minutes', now()-interval '2 minutes', now()-interval '2 minutes') RETURNING id",
+     "capture_stdout": [
+      "nid5"
+     ]
+    },
+    {
+     "sql": "INSERT INTO agent_notification_attempts (id, tenant_id, notification_id, attempt, run_id, created_at) VALUES ('aac'||substring('{wid}' from 3), '{ten}', 'ae'||substring('{wid}' from 3), 1, 'rm'||substring('{wid}' from 3), now()-interval '2 minutes') RETURNING id",
+     "capture_stdout": [
+      "a2"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/notifications/{nid5}/retry",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "notificationId",
+       "runId",
+       "status",
+       "attempt"
+      ],
+      "data": {
+       "notificationId": "{nid5}",
+       "runId": "{mrun}",
+       "status": "claimed",
+       "attempt": 1
+      }
+     }
+    },
+    {
+     "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('rd'||substring('{wid}' from 3), 'sc'||substring('{wid}' from 3), 'error', 1, now(), now(), '{wid}') RETURNING id",
+     "capture_stdout": [
+      "drun2"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_notifications SET claim_run_id='rd'||substring('{wid}' from 3) WHERE id='ae'||substring('{wid}' from 3) RETURNING id",
+     "capture_stdout": [
+      "u5"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_notification_attempts SET run_id='rd'||substring('{wid}' from 3) WHERE notification_id='ae'||substring('{wid}' from 3) RETURNING id",
+     "capture_stdout": [
+      "u6"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/notifications/{nid5}/retry",
+     "expect": {
+      "http": 409,
+      "code": 117109,
+      "message": "这条通知现在不能重新处理",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/notifications/an_nope/retry",
+     "expect": {
+      "http": 404,
+      "code": 117003,
+      "message": "找不到这条通知",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/notifications/{nid}/retry",
+     "capture": {
+      "rid": "data.runId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "notificationId",
+       "runId",
+       "status",
+       "attempt"
+      ],
+      "data": {
+       "notificationId": "{nid}",
+       "status": "claimed",
+       "attempt": 2
+      }
+     }
+    },
+    {
+     "op": "invite_viewer"
+    },
+    {
+     "method": "POST",
+     "path": "/api/notifications/{nid}/retry",
+     "tokenVar": "viewerTok",
+     "expect": {
+      "http": 403,
+      "code": 111203,
+      "message": "没有权限做这件事",
+      "data": null
+     }
+    },
+    {
+     "op": "signup",
+     "no_model": true,
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/notifications/{nid}/retry",
+     "expect": {
+      "http": 404,
+      "code": 117003,
+      "message": "找不到这条通知",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "57-workspace-create-config",
+   "case": "用例 57",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "shared／isolated 创建与通用 workspace 读面（doc/74 §4.1/§4.3）：shared 详情 18 键不带 workspace（字节不变）、isolated 详情 19 键末尾 workspace（mode→provider→verification→publication）、组体同形；配置错误 117111 三种 reason、幂等冲突 117102、发布标记期间同项目新 run 409 117113",
+   "steps": [
+    {
+     "op": "signup",
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-ws-config"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'task 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc57s",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "共享件",
+      "agent": "researcher"
+     },
+     "capture": {
+      "tids": "data.taskId",
+      "orids": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "taskId",
+       "orchestrationId",
+       "status",
+       "currentRunId"
+      ],
+      "data": {
+       "status": "ready",
+       "currentRunId": ""
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tids}",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "taskId",
+       "orchestrationId",
+       "key",
+       "content",
+       "agent",
+       "modelRef",
+       "planCheckpoint",
+       "createdRevision",
+       "workspaceId",
+       "status",
+       "currentRunId",
+       "result",
+       "error",
+       "resultRevision",
+       "createdAt",
+       "startedAt",
+       "finishedAt",
+       "updatedAt"
+      ],
+      "data": {
+       "taskId": "{tids}",
+       "workspaceId": "{wid}",
+       "status": "ready"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc57i",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "隔离件",
+      "agent": "researcher",
+      "workspaceMode": "isolated",
+      "verifyCommand": "exit 0"
+     },
+     "capture": {
+      "tidi": "data.taskId",
+      "oridi": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data": {
+       "status": "ready",
+       "currentRunId": ""
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tidi}",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "taskId",
+       "orchestrationId",
+       "key",
+       "content",
+       "agent",
+       "modelRef",
+       "planCheckpoint",
+       "createdRevision",
+       "workspaceId",
+       "status",
+       "currentRunId",
+       "result",
+       "error",
+       "resultRevision",
+       "createdAt",
+       "startedAt",
+       "finishedAt",
+       "updatedAt",
+       "workspace"
+      ],
+      "data": {
+       "taskId": "{tidi}",
+       "status": "ready",
+       "workspace": {
+        "mode": "isolated",
+        "provider": "pending",
+        "verification": {
+         "configured": true,
+         "status": ""
+        },
+        "publication": {
+         "status": "",
+         "errorCode": "",
+         "epoch": 0
+        }
+       }
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/orchestrations/{oridi}",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "orchestration": {
+        "orchestrationId": "{oridi}",
+        "finalTaskId": "{tidi}",
+        "workspace": {
+         "mode": "isolated",
+         "provider": "pending",
+         "verification": {
+          "configured": true,
+          "status": ""
+         },
+         "publication": {
+          "status": "",
+          "errorCode": "",
+          "epoch": 0
+         }
+        }
+       }
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc57e1",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "x",
+      "agent": "researcher",
+      "workspaceMode": "weird"
+     },
+     "expect": {
+      "http": 400,
+      "code": 117111,
+      "message": "工作区配置不合法",
+      "data": {
+       "reason": "workspaceMode 只允许 shared 或 isolated"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc57e2",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "x",
+      "agent": "researcher",
+      "verifyCommand": "exit 0"
+     },
+     "expect": {
+      "http": 400,
+      "code": 117111,
+      "message": "工作区配置不合法",
+      "data": {
+       "reason": "共享工作区不接受 verifyCommand"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc57e3",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "x",
+      "agent": "researcher",
+      "workspaceMode": "isolated",
+      "verifyCommand": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     },
+     "expect": {
+      "http": 400,
+      "code": 117111,
+      "message": "工作区配置不合法",
+      "data": {
+       "reason": "verifyCommand 超过 4000 字节"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc57i",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "不同内容",
+      "agent": "researcher",
+      "workspaceMode": "isolated",
+      "verifyCommand": "exit 0"
+     },
+     "expect": {
+      "http": 409,
+      "code": 117102,
+      "message": "这个创建键已经用于另一份计划",
+      "data": null
+     }
+    },
+    {
+     "sql": "UPDATE workspaces SET publication_orchestration_id='{oridi}', publication_epoch=1 WHERE id='{wid}' RETURNING id",
+     "capture_stdout": [
+      "mark"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/runs",
+     "body": {
+      "sessionId": "{sid}",
+      "messageId": "m57",
+      "text": "只回复 ok"
+     },
+     "expect": {
+      "http": 409,
+      "code": 117113,
+      "message": "项目正在发布结果，请稍后再试",
+      "data": null
+     }
+    },
+    {
+     "sql": "UPDATE workspaces SET publication_orchestration_id='', publication_epoch=0 WHERE id='{wid}' RETURNING id",
+     "capture_stdout": [
+      "unmark"
      ]
     }
-   }
-  },
-  {
-   "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('rb'||substring('{wid}' from 3), '{sid}', 'running', 1, now()+interval '1 hour', now(), '{wid}') RETURNING id",
-   "capture_stdout": [
-    "brun"
    ]
   },
   {
-   "sql": "INSERT INTO agent_notifications (id, tenant_id, orchestration_id, task_id, receiver_session_id, kind, dedup_key, status, claim_run_id, error_code, consume_error_code, created_at, updated_at) VALUES ('ab'||substring('{wid}' from 3), '{ten}', '{orid}', '{tid}', '{sid}', 'task_failed', 'dkp'||substring('{wid}' from 3), 'pending', '', 'task_failed', '', now(), now()) RETURNING id",
-   "capture_stdout": [
-    "nid2"
-   ]
-  },
-  {
-   "method": "GET",
-   "path": "/api/notifications/{nid2}",
-   "expect": {
-    "http": 200,
-    "code": 0,
-    "message": "",
-    "data": {
-     "notificationId": "{nid2}",
-     "kind": "task_failed",
-     "status": "pending",
-     "runId": "",
-     "attempt": 0,
-     "errorCode": "",
-     "result": null,
-     "claimedAt": null,
-     "failedAt": null,
-     "consumedAt": null,
-     "attempts": []
-    }
-   }
-  },
-  {
-   "method": "GET",
-   "path": "/api/notifications/an_nope",
-   "expect": {
-    "http": 404,
-    "code": 117003,
-    "message": "找不到这条通知",
-    "data": null
-   }
-  },
-  {
-   "method": "GET",
-   "path": "/api/notifications/{nid}",
-   "auth": false,
-   "expect": {
-    "http": 401,
-    "code": 111102,
-    "message": "请先登录",
-    "data": null
-   }
-  },
-  {
-   "op": "invite_viewer"
-  },
-  {
-   "method": "GET",
-   "path": "/api/notifications/{nid}",
-   "tokenVar": "viewerTok",
-   "expect": {
-    "http": 404,
-    "code": 117003,
-    "message": "找不到这条通知",
-    "data": null
-   }
-  },
-  {
-   "op": "signup",
-   "no_model": true,
-   "expect": {
-    "http": 201,
-    "code": 0,
-    "message": ""
-   }
-  },
-  {
-   "method": "GET",
-   "path": "/api/notifications/{nid}",
-   "expect": {
-    "http": 404,
-    "code": 117003,
-    "message": "找不到这条通知",
-    "data": null
-   }
-  }
- ]
-},
-{
- "id": "56-notification-retry",
- "case": "用例 56",
- "tier": "core",
- "needs": "pg",
- "desc": "人工重试（doc/73 §4.2）：failed＋run 终态 202 新 attempt（字段序 notificationId→runId→status→attempt，attempt=2）；claimed 且 run 在跑 200 现状；pending／claimed 且 run 终态 409 117109；产物缺失 409 117110；来源会话忙 409 112101；未知／跨租户 404 117003；viewer 被角色门拒 403 111203",
- "steps": [
-  {
-   "op": "signup",
-   "no_model": true,
-   "expect": {
-    "http": 201,
-    "code": 0,
-    "message": ""
-   }
-  },
-  {
-   "method": "POST",
-   "path": "/api/workspaces",
-   "body": {
-    "name": "acc-notif-retry"
-   },
-   "capture": {
-    "wid": "data.workspace.id"
-   },
-   "expect": {
-    "http": 201,
-    "code": 0,
-    "message": ""
-   }
-  },
-  {
-   "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'notif 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
-   "capture_stdout": [
-    "sid"
-   ]
-  },
-  {
-   "method": "POST",
-   "path": "/api/orchestrations",
-   "body": {
-    "idempotencyKey": "acc56o",
-    "workspaceId": "{wid}",
-    "sourceSessionId": "{sid}",
-    "goal": "人工重试契约",
-    "tasks": [
-     {
-      "key": "a",
-      "content": "做一件",
-      "agent": "researcher"
+   "id": "58-task-artifact",
+   "case": "用例 58",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "artifact 读不可变结果（doc/74 §4.4）：成功回原始字节逐字（不进信封）、验证证据收尾读面（exitCode/outputPath）；产物缺失／不在清单／越界 409 117110、shared 400 111002、未知 404 117001、未登录 401 111102、跨租户 404 117001",
+   "steps": [
+    {
+     "op": "signup",
+     "no_model": true,
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
      }
-    ],
-    "links": []
-   },
-   "capture": {
-    "orid": "data.orchestrationId"
-   },
-   "expect": {
-    "http": 202,
-    "code": 0,
-    "message": ""
-   }
-  },
-  {
-   "sql": "SELECT id FROM agent_tasks WHERE orchestration_id='{orid}' AND task_key='a'",
-   "capture_stdout": [
-    "tid"
-   ]
-  },
-  {
-   "sql": "UPDATE agent_tasks SET status='completed', result='{\"summary\":\"交付摘要正文\",\"artifacts\":[],\"metadata\":{}}', result_revision=1, finished_at=now(), updated_at=now() WHERE id='{tid}' RETURNING id",
-   "capture_stdout": [
-    "u1"
-   ]
-  },
-  {
-   "sql": "UPDATE agent_orchestrations SET status='finished', final_task_id='{tid}', final_result_revision=1, delivery_status='failed', delivery_error_code='delivery_run_error', finished_at=now(), updated_at=now() WHERE id='{orid}' RETURNING id",
-   "capture_stdout": [
-    "u2"
-   ]
-  },
-  {
-   "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('ra'||substring('{wid}' from 3), '{sid}', 'error', 1, now(), now(), '{wid}') RETURNING id",
-   "capture_stdout": [
-    "drid"
-   ]
-  },
-  {
-   "sql": "INSERT INTO agent_notifications (id, tenant_id, orchestration_id, task_id, receiver_session_id, kind, dedup_key, status, claim_run_id, error_code, consume_error_code, created_at, claimed_at, failed_at, updated_at) VALUES ('an'||substring('{wid}' from 3), '{ten}', '{orid}', '{tid}', '{sid}', 'orchestration_finished', 'dk'||substring('{wid}' from 3), 'failed', 'ra'||substring('{wid}' from 3), '', 'delivery_run_error', now()-interval '10 minutes', now()-interval '9 minutes', now()-interval '1 minute', now()-interval '1 minute') RETURNING id",
-   "capture_stdout": [
-    "nid"
-   ]
-  },
-  {
-   "sql": "INSERT INTO agent_notification_attempts (id, tenant_id, notification_id, attempt, run_id, created_at) VALUES ('aaa'||substring('{wid}' from 3), '{ten}', 'an'||substring('{wid}' from 3), 1, 'ra'||substring('{wid}' from 3), now()-interval '9 minutes') RETURNING id",
-   "capture_stdout": [
-    "a1"
-   ]
-  },
-  {
-   "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 'sb'||substring('{wid}' from 3), '忙会话', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
-   "capture_stdout": [
-    "bsid"
-   ]
-  },
-  {
-   "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('rl'||substring('{wid}' from 3), 'sb'||substring('{wid}' from 3), 'running', 1, now()+interval '1 hour', now(), '{wid}') RETURNING id",
-   "capture_stdout": [
-    "lrun"
-   ]
-  },
-  {
-   "sql": "INSERT INTO agent_notifications (id, tenant_id, orchestration_id, task_id, receiver_session_id, kind, dedup_key, status, claim_run_id, error_code, consume_error_code, created_at, updated_at) VALUES ('ab'||substring('{wid}' from 3), '{ten}', '{orid}', '{tid}', 'sb'||substring('{wid}' from 3), 'task_failed', 'dkp'||substring('{wid}' from 3), 'pending', '', 'task_failed', '', now(), now()) RETURNING id",
-   "capture_stdout": [
-    "nid2"
-   ]
-  },
-  {
-   "sql": "INSERT INTO agent_notifications (id, tenant_id, orchestration_id, task_id, receiver_session_id, kind, dedup_key, status, claim_run_id, error_code, consume_error_code, created_at, claimed_at, failed_at, updated_at) VALUES ('ac'||substring('{wid}' from 3), '{ten}', '{orid}', '{tid}', 'sb'||substring('{wid}' from 3), 'task_failed', 'dkb'||substring('{wid}' from 3), 'failed', 'ra'||substring('{wid}' from 3), '', 'delivery_run_error', now()-interval '5 minutes', now()-interval '4 minutes', now()-interval '1 minute', now()-interval '1 minute') RETURNING id",
-   "capture_stdout": [
-    "nid3"
-   ]
-  },
-  {
-   "method": "POST",
-   "path": "/api/notifications/{nid2}/retry",
-   "expect": {
-    "http": 409,
-    "code": 117109,
-    "message": "这条通知现在不能重新处理",
-    "data": null
-   }
-  },
-  {
-   "method": "POST",
-   "path": "/api/notifications/{nid3}/retry",
-   "expect": {
-    "http": 409,
-    "code": 112101,
-    "message": "这场会话正在生成，请稍后再试",
-    "data": null
-   }
-  },
-  {
-   "method": "POST",
-   "path": "/api/orchestrations",
-   "body": {
-    "idempotencyKey": "acc56o2",
-    "workspaceId": "{wid}",
-    "sourceSessionId": "{sid}",
-    "goal": "产物缺失",
-    "tasks": [
-     {
-      "key": "x",
-      "content": "做另一件",
-      "agent": "researcher"
+    },
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-artifact"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
      }
-    ],
-    "links": []
-   },
-   "capture": {
-    "orid2": "data.orchestrationId"
-   },
-   "expect": {
-    "http": 202,
-    "code": 0,
-    "message": ""
-   }
-  },
-  {
-   "sql": "SELECT id FROM agent_tasks WHERE orchestration_id='{orid2}' AND task_key='x'",
-   "capture_stdout": [
-    "tid2"
-   ]
-  },
-  {
-   "sql": "UPDATE agent_tasks SET status='completed', result='{\"summary\":\"有产物\",\"artifacts\":[{\"path\":\"nope/missing.txt\",\"kind\":\"file\"}],\"metadata\":{}}', result_revision=1, finished_at=now(), updated_at=now() WHERE id='{tid2}' RETURNING id",
-   "capture_stdout": [
-    "u3"
-   ]
-  },
-  {
-   "sql": "UPDATE agent_orchestrations SET status='finished', final_task_id='{tid2}', final_result_revision=1, delivery_status='failed', delivery_error_code='delivery_run_error', finished_at=now(), updated_at=now() WHERE id='{orid2}' RETURNING id",
-   "capture_stdout": [
-    "u4"
-   ]
-  },
-  {
-   "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('rc'||substring('{wid}' from 3), '{sid}', 'error', 1, now(), now(), '{wid}') RETURNING id",
-   "capture_stdout": [
-    "drid2"
-   ]
-  },
-  {
-   "sql": "INSERT INTO agent_notifications (id, tenant_id, orchestration_id, task_id, receiver_session_id, kind, dedup_key, status, claim_run_id, error_code, consume_error_code, created_at, claimed_at, failed_at, updated_at) VALUES ('ad'||substring('{wid}' from 3), '{ten}', '{orid2}', '{tid2}', '{sid}', 'orchestration_finished', 'dkx'||substring('{wid}' from 3), 'failed', 'rc'||substring('{wid}' from 3), '', 'delivery_run_error', now()-interval '5 minutes', now()-interval '4 minutes', now()-interval '1 minute', now()-interval '1 minute') RETURNING id",
-   "capture_stdout": [
-    "nid4"
-   ]
-  },
-  {
-   "method": "POST",
-   "path": "/api/notifications/{nid4}/retry",
-   "expect": {
-    "http": 409,
-    "code": 117110,
-    "message": "结果产物已不可读取",
-    "data": null
-   }
-  },
-  {
-   "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 'sc'||substring('{wid}' from 3), '已认领', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
-   "capture_stdout": [
-    "csid"
-   ]
-  },
-  {
-   "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('rm'||substring('{wid}' from 3), 'sc'||substring('{wid}' from 3), 'running', 1, now()+interval '1 hour', now(), '{wid}') RETURNING id",
-   "capture_stdout": [
-    "mrun"
-   ]
-  },
-  {
-   "sql": "INSERT INTO agent_notifications (id, tenant_id, orchestration_id, task_id, receiver_session_id, kind, dedup_key, status, claim_run_id, error_code, consume_error_code, created_at, claimed_at, updated_at) VALUES ('ae'||substring('{wid}' from 3), '{ten}', '{orid}', '{tid}', 'sc'||substring('{wid}' from 3), 'task_failed', 'dkc'||substring('{wid}' from 3), 'claimed', 'rm'||substring('{wid}' from 3), '', '', now()-interval '2 minutes', now()-interval '2 minutes', now()-interval '2 minutes') RETURNING id",
-   "capture_stdout": [
-    "nid5"
-   ]
-  },
-  {
-   "sql": "INSERT INTO agent_notification_attempts (id, tenant_id, notification_id, attempt, run_id, created_at) VALUES ('aac'||substring('{wid}' from 3), '{ten}', 'ae'||substring('{wid}' from 3), 1, 'rm'||substring('{wid}' from 3), now()-interval '2 minutes') RETURNING id",
-   "capture_stdout": [
-    "a2"
-   ]
-  },
-  {
-   "method": "POST",
-   "path": "/api/notifications/{nid5}/retry",
-   "expect": {
-    "http": 200,
-    "code": 0,
-    "message": "",
-    "data_keys": [
-     "notificationId",
-     "runId",
-     "status",
-     "attempt"
-    ],
-    "data": {
-     "notificationId": "{nid5}",
-     "runId": "{mrun}",
-     "status": "claimed",
-     "attempt": 1
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'task 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc58i",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "隔离件",
+      "agent": "researcher",
+      "workspaceMode": "isolated"
+     },
+     "capture": {
+      "tidi": "data.taskId",
+      "oridi": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc58s",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "共享件",
+      "agent": "researcher"
+     },
+     "capture": {
+      "tids": "data.taskId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "UPDATE agent_tasks SET status='succeeded', result='{\"summary\":\"报告\",\"artifacts\":[{\"path\":\"report.md\",\"kind\":\"report\"},{\"path\":\"gone.md\",\"kind\":\"report\"}],\"metadata\":{}}', result_revision=1, execution_session_id='{sid}', finished_at=now(), updated_at=now() WHERE id='{tidi}' RETURNING id",
+     "capture_stdout": [
+      "u1"
+     ]
+    },
+    {
+     "op": "seed_group",
+     "orchestration": "{oridi}",
+     "provider": "directory",
+     "results": [
+      {
+       "task": "{tidi}",
+       "revision": 1,
+       "reference": "seed-ref",
+       "artifacts": [
+        {
+         "path": "report.md",
+         "kind": "report",
+         "content": "隔离结果正文第一行\n第二行 with spaces\n"
+        },
+        {
+         "path": "gone.md",
+         "kind": "report"
+        }
+       ]
+      }
+     ],
+     "verification": [
+      {
+       "task": "{tidi}",
+       "status": "passed",
+       "exitCode": 0,
+       "outputPath": "verification/{tidi}.out",
+       "output": "ok\n"
+      }
+     ]
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tidi}",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data": {
+       "workspace": {
+        "mode": "isolated",
+        "provider": "directory",
+        "verification": {
+         "configured": false,
+         "status": "passed",
+         "exitCode": 0,
+         "outputPath": "verification/{tidi}.out"
+        },
+        "publication": {
+         "status": "",
+         "errorCode": "",
+         "epoch": 0
+        }
+       }
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tidi}/artifact?path=report.md",
+     "raw": true,
+     "expect": {
+      "http": 200,
+      "raw": "隔离结果正文第一行\n第二行 with spaces\n"
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tidi}/artifact?path=gone.md",
+     "expect": {
+      "http": 409,
+      "code": 117110,
+      "message": "结果产物已不可读取",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tidi}/artifact?path=../secret",
+     "expect": {
+      "http": 409,
+      "code": 117110,
+      "message": "结果产物已不可读取",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tidi}/artifact?path=/etc/passwd",
+     "expect": {
+      "http": 409,
+      "code": 117110,
+      "message": "结果产物已不可读取",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tids}/artifact?path=report.md",
+     "expect": {
+      "http": 400,
+      "code": 111002,
+      "message": "这件任务的结果产物请从项目文件读取",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/at_nope/artifact?path=report.md",
+     "expect": {
+      "http": 404,
+      "code": 117001,
+      "message": "找不到这件任务",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tidi}/artifact?path=report.md",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    },
+    {
+     "op": "signup",
+     "no_model": true,
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/tasks/{tidi}/artifact?path=report.md",
+     "expect": {
+      "http": 404,
+      "code": 117001,
+      "message": "找不到这件任务",
+      "data": null
+     }
     }
-   }
-  },
-  {
-   "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('rd'||substring('{wid}' from 3), 'sc'||substring('{wid}' from 3), 'error', 1, now(), now(), '{wid}') RETURNING id",
-   "capture_stdout": [
-    "drun2"
    ]
   },
   {
-   "sql": "UPDATE agent_notifications SET claim_run_id='rd'||substring('{wid}' from 3) WHERE id='ae'||substring('{wid}' from 3) RETURNING id",
-   "capture_stdout": [
-    "u5"
-   ]
-  },
-  {
-   "sql": "UPDATE agent_notification_attempts SET run_id='rd'||substring('{wid}' from 3) WHERE notification_id='ae'||substring('{wid}' from 3) RETURNING id",
-   "capture_stdout": [
-    "u6"
-   ]
-  },
-  {
-   "method": "POST",
-   "path": "/api/notifications/{nid5}/retry",
-   "expect": {
-    "http": 409,
-    "code": 117109,
-    "message": "这条通知现在不能重新处理",
-    "data": null
-   }
-  },
-  {
-   "method": "POST",
-   "path": "/api/notifications/an_nope/retry",
-   "expect": {
-    "http": 404,
-    "code": 117003,
-    "message": "找不到这条通知",
-    "data": null
-   }
-  },
-  {
-   "method": "POST",
-   "path": "/api/notifications/{nid}/retry",
-   "capture": {
-    "rid": "data.runId"
-   },
-   "expect": {
-    "http": 202,
-    "code": 0,
-    "message": "",
-    "data_keys": [
-     "notificationId",
-     "runId",
-     "status",
-     "attempt"
-    ],
-    "data": {
-     "notificationId": "{nid}",
-     "status": "claimed",
-     "attempt": 2
+   "id": "59-publication-retry",
+   "case": "用例 59",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "retry-publication（doc/74 §4.5）：blocked＋发布三码＋结果有效 202 新处理 run（taskId→runId→status→publicationEpoch，epoch=当前+1）；已有活 run 200 幂等命中；租户容量满 429 113001；结果缺失 409 117110；非 blocked／shared 409 117112；未知 404 117001；viewer 403 111203；跨租户 404 117001",
+   "steps": [
+    {
+     "op": "signup",
+     "no_model": true,
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-pub-retry"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'task 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc59i",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "隔离件",
+      "agent": "researcher",
+      "workspaceMode": "isolated"
+     },
+     "capture": {
+      "tidi": "data.taskId",
+      "oridi": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "op": "seed_group",
+     "orchestration": "{oridi}",
+     "provider": "directory",
+     "results": [
+      {
+       "task": "{tidi}",
+       "revision": 1,
+       "reference": "seed-ref",
+       "artifacts": [
+        {
+         "path": "report.md",
+         "kind": "report",
+         "content": "结果乙\n"
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "sql": "UPDATE agent_tasks SET status='blocked', error_code='workspace_changed', error_message='项目已前进', result='{\"summary\":\"乙\",\"artifacts\":[{\"path\":\"report.md\",\"kind\":\"report\"}],\"metadata\":{}}', result_revision=1, execution_session_id='{sid}', finished_at=now(), updated_at=now() WHERE id='{tidi}' RETURNING id",
+     "capture_stdout": [
+      "u1"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_orchestrations SET status='active', publication_status='blocked', publication_error_code='workspace_changed', publication_epoch=1, final_task_id='{tidi}', updated_at=now() WHERE id='{oridi}' RETURNING id",
+     "capture_stdout": [
+      "u2"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks/{tidi}/retry-publication",
+     "capture": {
+      "rid": "data.runId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "taskId",
+       "runId",
+       "status",
+       "publicationEpoch"
+      ],
+      "data": {
+       "taskId": "{tidi}",
+       "status": "running",
+       "publicationEpoch": 2
+      }
+     }
+    },
+    {
+     "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('rl59'||substring('{wid}' from 3), '{sid}', 'running', 1, now()+interval '1 hour', now(), '{wid}') RETURNING id",
+     "capture_stdout": [
+      "liverun"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_tasks SET status='running', current_run_id='rl59'||substring('{wid}' from 3), error_code='', error_message='', finished_at=NULL, updated_at=now() WHERE id='{tidi}' RETURNING id",
+     "capture_stdout": [
+      "u3"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_orchestrations SET publication_status='', publication_error_code='', publication_epoch=1 WHERE id='{oridi}' RETURNING id",
+     "capture_stdout": [
+      "u4"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks/{tidi}/retry-publication",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "taskId",
+       "runId",
+       "status",
+       "publicationEpoch"
+      ],
+      "data": {
+       "taskId": "{tidi}",
+       "runId": "{liverun}",
+       "status": "running",
+       "publicationEpoch": 2
+      }
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 'sb59'||substring('{wid}' from 3), '忙会话', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "bsid"
+     ]
+    },
+    {
+     "sql": "UPDATE runs SET session_id='{bsid}' WHERE id='rl59'||substring('{wid}' from 3) RETURNING id",
+     "capture_stdout": [
+      "u5"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_tasks SET status='blocked', error_code='workspace_changed', current_run_id=NULL, result='{\"summary\":\"乙\",\"artifacts\":[{\"path\":\"report.md\",\"kind\":\"report\"}],\"metadata\":{}}', result_revision=1, updated_at=now() WHERE id='{tidi}' RETURNING id",
+     "capture_stdout": [
+      "u6"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_orchestrations SET publication_status='blocked', publication_error_code='workspace_changed' WHERE id='{oridi}' RETURNING id",
+     "capture_stdout": [
+      "u7"
+     ]
+    },
+    {
+     "sql": "UPDATE tenants SET max_concurrent_runs=1 WHERE id='{ten}' RETURNING id",
+     "capture_stdout": [
+      "u8"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks/{tidi}/retry-publication",
+     "expect": {
+      "http": 429,
+      "code": 113001,
+      "message": "同时在跑的任务已达上限，请稍后再试",
+      "data": null
+     }
+    },
+    {
+     "sql": "UPDATE tenants SET max_concurrent_runs=0 WHERE id='{ten}' RETURNING id",
+     "capture_stdout": [
+      "u9"
+     ]
+    },
+    {
+     "sql": "UPDATE agent_tasks SET result='', result_revision=0, error_code='workspace_dirty', updated_at=now() WHERE id='{tidi}' RETURNING id",
+     "capture_stdout": [
+      "u10"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks/{tidi}/retry-publication",
+     "expect": {
+      "http": 409,
+      "code": 117110,
+      "message": "结果产物已不可读取",
+      "data": null
+     }
+    },
+    {
+     "sql": "UPDATE agent_tasks SET status='succeeded', error_code='', result='{\"summary\":\"乙\",\"artifacts\":[],\"metadata\":{}}', result_revision=1, updated_at=now() WHERE id='{tidi}' RETURNING id",
+     "capture_stdout": [
+      "u11"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks/{tidi}/retry-publication",
+     "expect": {
+      "http": 409,
+      "code": 117112,
+      "message": "这件任务现在不能重新发布",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc59s",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "content": "共享件",
+      "agent": "researcher"
+     },
+     "capture": {
+      "tids": "data.taskId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks/{tids}/retry-publication",
+     "expect": {
+      "http": 409,
+      "code": 117112,
+      "message": "这件任务现在不能重新发布",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks/at_nope/retry-publication",
+     "expect": {
+      "http": 404,
+      "code": 117001,
+      "message": "找不到这件任务",
+      "data": null
+     }
+    },
+    {
+     "op": "invite_viewer"
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks/{tidi}/retry-publication",
+     "tokenVar": "viewerTok",
+     "expect": {
+      "http": 403,
+      "code": 111203,
+      "message": "没有权限做这件事",
+      "data": null
+     }
+    },
+    {
+     "op": "signup",
+     "no_model": true,
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks/{tidi}/retry-publication",
+     "expect": {
+      "http": 404,
+      "code": 117001,
+      "message": "找不到这件任务",
+      "data": null
+     }
     }
-   }
-  },
-  {
-   "op": "invite_viewer"
-  },
-  {
-   "method": "POST",
-   "path": "/api/notifications/{nid}/retry",
-   "tokenVar": "viewerTok",
-   "expect": {
-    "http": 403,
-    "code": 111203,
-    "message": "没有权限做这件事",
-    "data": null
-   }
-  },
-  {
-   "op": "signup",
-   "no_model": true,
-   "expect": {
-    "http": 201,
-    "code": 0,
-    "message": ""
-   }
-  },
-  {
-   "method": "POST",
-   "path": "/api/notifications/{nid}/retry",
-   "expect": {
-    "http": 404,
-    "code": 117003,
-    "message": "找不到这条通知",
-    "data": null
-   }
+   ]
   }
- ]
-}
  ],
  "declared_not_asserted": {
   "用例 30": "禁用对 run 的生效面（doc/52 E2）——目录里消失、use_skill/read_skill 回 116107、正在跑的 run 盒子不回缩，都只在真跑模型时出现，core tier 没有 HTTP 入口；纯函数与存储侧由 go test 的 skills_test.go（SetSkillDisabled 幂等、ListSkillDisables）与 skilltools_test.go（116107 信封逐字）钉住，活体字节见 19v6-04 用例 30",
@@ -4975,6 +5820,7 @@
   "用例 40": "消费者崩溃补投恰好一次（doc/65 §13.3-2）——要 kill -9 正在处理任务的引擎 + 真 broker 重投，快闸造不出；kill -9、租约过期补投、A→B→A 不被去重吞由 scripts/acceptance/memory_redpanda_crash.sh 判红",
   "用例 41": "文件锁竞争与原子替换（doc/65 §13.3-4）——要两个隔离引擎共连同一 PG/共享 workspace 才造得出跨进程竞争；flock 串行、写前版本拒绝、kill -9 释放由 scripts/acceptance/memory_file_race.sh 判红，存储侧不变量由 go test 的 memory_filelock_test.go 钉住",
   "用例 42": "旧 notes/memory_items 升级迁移与模式互切（doc/65 §13.3-5）——要预置旧形态数据的库 + 双向互切命令；由 scripts/acceptance/memory_migrate_live.sh 判红（42 断言），幂等重放与失败预检在其中逐条断",
-  "用例 43": "项目删除的连带清理（doc/65 §13.3-6）——workspace 两类行都清、user 行跨项目仍可见、USER.md 不变、runs/runlog 不变：要真删一个挂了记忆的项目；由 scripts/acceptance/memory_project_delete_live.sh 判红，删除级联的存储侧由 go test 的 delete_cascade_test.go 钉住"
+  "用例 43": "项目删除的连带清理（doc/65 §13.3-6）——workspace 两类行都清、user 行跨项目仍可见、USER.md 不变、runs/runlog 不变：要真删一个挂了记忆的项目；由 scripts/acceptance/memory_project_delete_live.sh 判红，删除级联的存储侧由 go test 的 delete_cascade_test.go 钉住",
+  "用例 60": "模型执行、Provider 故障与崩溃场景（doc/74 §12.3）——并行成功／父冲突／验证返工／主分支前进／不可变产物／非 Git 并行／结果清单／同路径冲突／部分发布恢复／忙脏受阻／人工重新发布／多标签页事件／各窗口 kill -9 与双副本对账，都要真模型＋真 Git／文件现场＋特殊起引擎才造得出，core tier 没有对应 HTTP 路径；由 scripts/acceptance/workspace_git_live.sh、workspace_directory_live.sh、workspace_publication_live.sh、workspace_crash_live.sh 判红，纯函数与存储侧由 go test 的 workspace_*_test.go 钉住"
  }
 }

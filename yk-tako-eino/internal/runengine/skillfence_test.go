@@ -81,7 +81,7 @@ func TestSandboxProfileNetworkAndExtraRoots(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	profile := sandboxProfile("/tmp/tako-root", []string{skillDir})
+	profile := sandboxProfile("/tmp/tako-root", []string{skillDir}, nil)
 	if !strings.Contains(profile, "(allow network-outbound)\n") {
 		t.Error("profile 缺 network-outbound")
 	}

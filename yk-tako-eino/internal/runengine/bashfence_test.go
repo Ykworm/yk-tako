@@ -15,6 +15,7 @@ package runengine
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -104,5 +105,38 @@ func TestBashFenceSurvivesSymlinkedRoot(t *testing.T) {
 	out2, _ := runBash(ctx, link, "echo y > "+filepath.Join(link, "out.txt")+" && cat "+filepath.Join(link, "out.txt"), 10*time.Second, true)
 	if !strings.Contains(out2, "y") {
 		t.Fatalf("symlink 路径下应能写项目内文件，得到 %q", out2)
+	}
+}
+
+// TestBashFenceGitCommitInGitWorkRoot：隔离 Git 工作现场里，执行者要能在围栏内完成
+// git init/add/commit（doc/74 §7 程序校验「产物在 HEAD」的前提是 git 跑得起来）。
+// 两个实测坑：seatbelt 只放读 /dev 时 git 起手 O_RDWR 打开 /dev/null 直接 fatal；
+// 宿主 ~/.gitconfig 在围栏外，git 对「存在但读不到」按 fatal 处理——gitSandboxEnv
+// 把全局/系统配置与忽略清单指到 /dev/null、给固定提交身份。缺 git 的机器跳过。
+func TestBashFenceGitCommitInGitWorkRoot(t *testing.T) {
+	if !sandboxAvailable() {
+		t.Skip("这台机器没有可用的沙箱（seatbelt/bwrap 都探测失败）")
+	}
+	gitBin := "/Library/Developer/CommandLineTools/usr/bin/git"
+	if _, err := os.Stat(gitBin); err != nil {
+		p, lerr := exec.LookPath("git")
+		if lerr != nil {
+			t.Skip("这台机器没有 git，无法证明围栏内 git 路径")
+		}
+		gitBin = p
+	}
+	root := t.TempDir()
+	ctx := withAgentTaskRunBox(context.Background(), &agentTaskRunBox{
+		TaskID: "at_fence", WorkspaceMode: workspaceModeIsolated,
+		WorkspaceProvider: workspaceProviderGit, WorkRoot: root,
+	})
+	cmd := gitBin + " init -q -b main . && echo hi > f.txt && " + gitBin + " add f.txt && " +
+		gitBin + " commit -qm probe && " + gitBin + " log --oneline"
+	out, err := runBash(ctx, root, cmd, 30*time.Second, true)
+	if err != nil {
+		t.Fatalf("围栏内 git 命令报错: %v", err)
+	}
+	if !strings.Contains(out, "退出码：0") {
+		t.Fatalf("围栏内 git init/add/commit 应成功，得到 %q", out)
 	}
 }

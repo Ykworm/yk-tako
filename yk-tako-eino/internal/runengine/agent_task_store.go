@@ -184,6 +184,7 @@ func (s *Store) CreateAgentOrchestration(ctx context.Context, p principal, cmd C
 			Goal: plan.Goal, Status: orchStatusActive,
 			FinalTaskID:    taskIDs[plan.finalKey()],
 			IdempotencyKey: cmd.IdempotencyKey, PlanHash: hash,
+			WorkspaceMode: plan.storageMode(), VerifyCommand: plan.VerifyCommand,
 		}
 		if err := tx.Create(&orch).Error; err != nil {
 			if isUniqueViolation(err) {
@@ -266,7 +267,8 @@ func (t *AgentTask) currentRunID() string {
 
 // taskViewFrom 把一行 Task 翻成 API 视图。interrupted 在这里派生（存储仍是 running）：
 // 当前 run 不在 alive 集合（租约过期或 run 行已不在）→ interrupted。
-func taskViewFrom(t AgentTask, alive map[string]bool) agentTaskView {
+// ws 是隔离组的工作区摘要（shared 组为 nil，响应不出现该键）。
+func taskViewFrom(t AgentTask, alive map[string]bool, ws *taskWorkspaceView) agentTaskView {
 	v := agentTaskView{
 		TaskID: t.ID, OrchestrationID: t.OrchestrationID, Key: t.TaskKey,
 		Content: t.Content, Agent: t.AgentName, ModelRef: t.ModelRef,
@@ -275,6 +277,7 @@ func taskViewFrom(t AgentTask, alive map[string]bool) agentTaskView {
 		Result:         parseTaskResult(t.Result),
 		ResultRevision: t.ResultRevision,
 		CreatedAt:      t.CreatedAt, StartedAt: t.StartedAt, FinishedAt: t.FinishedAt, UpdatedAt: t.UpdatedAt,
+		Workspace: ws,
 	}
 	v.CurrentRunID = t.currentRunID()
 	if t.ErrorCode != "" || t.ErrorMessage != "" {
@@ -327,7 +330,11 @@ func (s *Store) GetAgentTask(ctx context.Context, p principal, id string) (agent
 	if err != nil {
 		return agentTaskView{}, err
 	}
-	return taskViewFrom(rows[0], alive), nil
+	orchs, err := s.orchRowsByID(ctx, []string{rows[0].OrchestrationID})
+	if err != nil {
+		return agentTaskView{}, err
+	}
+	return taskViewFrom(rows[0], alive, s.workspaceSummary(orchs[rows[0].OrchestrationID], rows[0].ID)), nil
 }
 
 // taskByKey 按 (orchestration, key) 读单节点组的唯一 Task（CreateAgentTask 的回读用）。
@@ -370,9 +377,21 @@ func (s *Store) ListWorkspaceTasks(ctx context.Context, p principal, workspaceID
 	if err != nil {
 		return nil, err
 	}
+	orchIDs := make([]string, 0, len(rows))
+	seenOrch := make(map[string]bool, len(rows))
+	for _, t := range rows {
+		if !seenOrch[t.OrchestrationID] {
+			seenOrch[t.OrchestrationID] = true
+			orchIDs = append(orchIDs, t.OrchestrationID)
+		}
+	}
+	orchs, err := s.orchRowsByID(ctx, orchIDs)
+	if err != nil {
+		return nil, err
+	}
 	views := make([]agentTaskView, 0, len(rows))
 	for _, t := range rows {
-		views = append(views, taskViewFrom(t, alive))
+		views = append(views, taskViewFrom(t, alive, s.workspaceSummary(orchs[t.OrchestrationID], t.ID)))
 	}
 	return views, nil
 }
@@ -413,7 +432,7 @@ SELECT o.* FROM agent_orchestrations o
 	o := orows[0]
 	views := make([]agentTaskView, 0, len(trows))
 	for _, t := range trows {
-		views = append(views, taskViewFrom(t, alive))
+		views = append(views, taskViewFrom(t, alive, s.workspaceSummary(o, t.ID)))
 	}
 	links := make([]taskLinkView, 0, len(lrows))
 	for _, l := range lrows {
@@ -427,6 +446,7 @@ SELECT o.* FROM agent_orchestrations o
 			DeliveryStatus: o.DeliveryStatus, DeliveryRunID: o.DeliveryRunID,
 			DeliveryErrorCode: o.DeliveryErrorCode,
 			CreatedAt:         o.CreatedAt, FinishedAt: o.FinishedAt, DeliveredAt: o.DeliveredAt, UpdatedAt: o.UpdatedAt,
+			Workspace: s.workspaceSummary(o, o.FinalTaskID),
 		},
 		Tasks: views,
 		Links: links,
@@ -436,6 +456,8 @@ SELECT o.* FROM agent_orchestrations o
 // StopAgentTask 停一件 Task（施工包 §4.3/§8.4）。终态 succeeded/failed 拒绝（117104）；
 // 重复停止幂等。running 行先翻 cancelled——submit_task_result 立刻失效——再把当前 run 交给
 // 调用方在提交后补 StopRun 与进程内取消（取消链路不属于存储事务）。
+// publishing/blocked 没有活 run，直接 cancelled（doc/74 §4.6）；残留的发布状态与项目标记
+// 由发布对账的放弃分支收口，已发布内容不撤销。
 func (s *Store) StopAgentTask(ctx context.Context, p principal, id string) (string, RunID, error) {
 	if _, err := s.GetAgentTask(ctx, p, id); err != nil {
 		return "", "", err
@@ -454,7 +476,7 @@ func (s *Store) StopAgentTask(ctx context.Context, p principal, id string) (stri
 		case agentTaskStatusCancelled:
 			status = agentTaskStatusCancelled
 			return nil
-		case agentTaskStatusPending, agentTaskStatusReady, agentTaskStatusBlocked:
+		case agentTaskStatusPending, agentTaskStatusReady, agentTaskStatusBlocked, agentTaskStatusPublishing:
 			if err := tx.Model(&AgentTask{}).Where("id = ? AND status = ?", id, t.Status).
 				Updates(map[string]any{"status": agentTaskStatusCancelled, "finished_at": nowUTC()}).Error; err != nil {
 				return err
@@ -483,10 +505,12 @@ func (s *Store) StopAgentTask(ctx context.Context, p principal, id string) (stri
 	return status, runID, nil
 }
 
-// StopAgentOrchestration 停整组（施工包 §8.4）：先持久化取消请求。pending/ready/blocked
+// StopAgentOrchestration 停整组（施工包 §8.4）：先持久化取消请求。pending/ready/blocked/publishing
 // 直接 cancelled；running 节点留给调用方（调度轮）复用 StopRun 收尾。组内已全部终态时
 // 当场落 cancelled（响应就回 cancelled，不用等下一轮调度），否则回 cancelling。
 // 已 succeeded/failed/cancelled 的组拒绝（117105）。
+// 发布状态不在这里复位：pending/publishing/blocked 留给发布对账的放弃分支清项目标记并复位
+//（直接复位会让标记失去主人，项目永远拒新 run）；published 是既成事实，停止不撤销。
 func (s *Store) StopAgentOrchestration(ctx context.Context, p principal, id string) (string, []RunID, error) {
 	if _, err := s.GetAgentOrchestration(ctx, p, id); err != nil {
 		return "", nil, err
@@ -506,7 +530,7 @@ func (s *Store) StopAgentOrchestration(ctx context.Context, p principal, id stri
 		if o.Status == orchStatusActive {
 			if err := tx.Model(&AgentTask{}).
 				Where("orchestration_id = ? AND status IN ?", id,
-					[]string{agentTaskStatusPending, agentTaskStatusReady, agentTaskStatusBlocked}).
+					[]string{agentTaskStatusPending, agentTaskStatusReady, agentTaskStatusBlocked, agentTaskStatusPublishing}).
 				Updates(map[string]any{"status": agentTaskStatusCancelled, "finished_at": nowUTC()}).Error; err != nil {
 				return err
 			}
@@ -523,7 +547,7 @@ func (s *Store) StopAgentOrchestration(ctx context.Context, p principal, id stri
 		}
 		var remaining int64
 		if err := tx.Model(&AgentTask{}).Where("orchestration_id = ? AND status IN ?", id,
-			[]string{agentTaskStatusPending, agentTaskStatusReady, agentTaskStatusRunning, agentTaskStatusBlocked}).
+			[]string{agentTaskStatusPending, agentTaskStatusReady, agentTaskStatusRunning, agentTaskStatusBlocked, agentTaskStatusPublishing}).
 			Count(&remaining).Error; err != nil {
 			return err
 		}
@@ -550,6 +574,7 @@ func (s *Store) StopAgentOrchestration(ctx context.Context, p principal, id stri
 // Task 必须 running；run 必须还是当前代（runs 行 running 且 lease_epoch 相等——旧 worker
 // 被接管后提交在这里被拒）；内容限额；artifact 真实路径；同代同字节幂等返回原 revision。
 // 提交只写结果列，不翻 Task 状态（succeeded 归对账）。
+// shared 组走单事务；isolated 组走 submitIsolatedTaskResult（先固化不可变结果再存 PG，doc/74 §9.2）。
 func (s *Store) SubmitTaskResult(ctx context.Context, taskID string, runID RunID, epoch int64, result TaskResult, wsRoot string) (int, error) {
 	if strings.TrimSpace(result.Summary) == "" {
 		return 0, fmt.Errorf("%w: summary 必填", errSubmitBad)
@@ -579,6 +604,17 @@ func (s *Store) SubmitTaskResult(ctx context.Context, taskID string, runID RunID
 	raw, err := json.Marshal(result)
 	if err != nil {
 		return 0, fmt.Errorf("%w: %v", errSubmitBad, err)
+	}
+
+	t, o, err := s.agentTaskRow(ctx, taskID)
+	if err != nil {
+		if errors.Is(err, errTaskNotFound) {
+			return 0, fmt.Errorf("%w: task 不存在", errSubmitNotRunning)
+		}
+		return 0, err
+	}
+	if o.WorkspaceMode == workspaceModeIsolated {
+		return s.submitIsolatedTaskResult(ctx, t, o, runID, epoch, result, string(raw))
 	}
 
 	tenantID := ""
@@ -628,6 +664,119 @@ func (s *Store) SubmitTaskResult(ctx context.Context, taskID string, runID RunID
 		return 0, err
 	}
 	s.PublishEvent(ctx, tenantID, eventAgentTasksChanged, taskID)
+	return revision, nil
+}
+
+// submitIsolatedTaskResult 是 isolated 组的提交链（doc/74 §9.2）：整段在同一把 Task 共享锁内——
+// 计算候选 revision → Provider 验证并固化不可变结果（staging → final）→ PG 再校验 run/epoch
+// 并保存通用结果。Provider 操作不进 PG 事务。
+//
+// 候选 revision：同 run/epoch/同字节重提 → 原 revision（固化时核验身份后复用）；否则 +1。
+// 固化报身份冲突（该 revision 已有不同内容的 final——上次崩溃留下的孤儿，或重提时工作现场
+// 变了）→ 候选 +1 重试，绝不覆盖旧版本的字节。
+// Provider final 已存在但 PG 未保存时，这里保存成功才算接受；ReconcileRun 另行核验 final 完整性。
+func (s *Store) submitIsolatedTaskResult(ctx context.Context, t AgentTask, o AgentOrchestration, runID RunID, epoch int64, result TaskResult, raw string) (int, error) {
+	g, err := s.workspaceGroupHandle(o)
+	if err != nil {
+		return 0, err
+	}
+	provider, err := s.workspaceProvider(g)
+	if err != nil {
+		return 0, err
+	}
+	rel, err := g.Locker.Lock(ctx, []string{g.taskLockKey(t.ID)})
+	if err != nil {
+		return 0, err
+	}
+	defer rel()
+
+	// 锁内重读并预检：锁只挡同 Task 的提交，run 接管发生在 PG 侧，必须看最新行。
+	var cur AgentTask
+	if err := s.db.WithContext(ctx).Where("id = ?", t.ID).Take(&cur).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return 0, fmt.Errorf("%w: task 不存在", errSubmitNotRunning)
+		}
+		return 0, err
+	}
+	if cur.Status != agentTaskStatusRunning {
+		return 0, errSubmitNotRunning
+	}
+	var runRow struct {
+		Status string
+		Epoch  int64
+	}
+	if err := s.db.WithContext(ctx).Raw(`SELECT status, lease_epoch AS epoch FROM runs WHERE id = ?`, runID).
+		Scan(&runRow).Error; err != nil {
+		return 0, err
+	}
+	if runRow.Status == "" {
+		return 0, fmt.Errorf("%w: run 不存在", errSubmitStale)
+	}
+	if runRow.Status != "running" || runRow.Epoch != epoch {
+		return 0, errSubmitStale
+	}
+
+	candidate := cur.ResultRevision + 1
+	if cur.ResultRunID == string(runID) && cur.ResultEpoch == epoch && cur.Result == raw && cur.ResultRevision > 0 {
+		candidate = cur.ResultRevision
+	}
+	work := TaskWork{Root: g.workDir(t.ID)}
+	for attempt := 0; ; attempt++ {
+		_, err = provider.AcceptResult(ctx, g, cur, candidate, result, work)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, errImmutableIdentityConflict) && attempt < 8 {
+			candidate++
+			continue
+		}
+		return 0, err
+	}
+
+	// PG 保存半：FOR UPDATE 再校验一次（固化期间 run 可能被接管），同代同字节已保存则幂等返回。
+	tenantID := cur.TenantID
+	revision := 0
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var locked AgentTask
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", t.ID).Take(&locked).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("%w: task 不存在", errSubmitNotRunning)
+			}
+			return err
+		}
+		if locked.Status != agentTaskStatusRunning {
+			return errSubmitNotRunning
+		}
+		var rr struct {
+			Status string
+			Epoch  int64
+		}
+		if err := tx.Raw(`SELECT status, lease_epoch AS epoch FROM runs WHERE id = ?`, runID).
+			Scan(&rr).Error; err != nil {
+			return err
+		}
+		if rr.Status == "" {
+			return fmt.Errorf("%w: run 不存在", errSubmitStale)
+		}
+		if rr.Status != "running" || rr.Epoch != epoch {
+			return errSubmitStale
+		}
+		if locked.ResultRunID == string(runID) && locked.ResultEpoch == epoch && locked.Result == raw {
+			revision = locked.ResultRevision
+			return nil
+		}
+		revision = candidate
+		return tx.Model(&AgentTask{}).Where("id = ?", t.ID).
+			Updates(map[string]any{
+				"result": raw, "result_revision": revision,
+				"result_run_id": string(runID), "result_epoch": epoch,
+			}).Error
+	})
+	if err != nil {
+		return 0, err
+	}
+	s.PublishEvent(ctx, tenantID, eventAgentTasksChanged, t.ID)
 	return revision, nil
 }
 

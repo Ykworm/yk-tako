@@ -586,6 +586,13 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 			attribute.String("tako.orchestration.id", tb.OrchestrationID),
 			attribute.String("tako.source.run.id", tb.SourceRunID),
 		)
+		if tb.WorkspaceMode != "" {
+			runSpan.SetAttributes(
+				attribute.String("tako.workspace.mode", tb.WorkspaceMode),
+				attribute.String("tako.workspace.provider", tb.WorkspaceProvider),
+				attribute.Int("tako.workspace.conflict_count", tb.ConflictCount),
+			)
+		}
 	}
 	if cb := coordinationBoxFrom(ctx); cb != nil {
 		runSpan.SetAttributes(
@@ -646,12 +653,18 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 				finishSpan(wsSpan, err)
 				log.Printf("workspace %s/%s: %v", sessionID, runID, err)
 			} else {
+				ref := WorkspaceRef{TenantID: p.TenantID, SessionID: sessionID, Root: dir, TenantRoot: tenantStorageRoot(w.workspace, p.TenantID), WorkspaceID: wid, MaxBytes: maxBytes}
+				// doc/74：隔离 Task 的工具根是领取时备好的工作目录，不是原项目；
+				// 额外可写根（Git 的组中间仓库）随沙箱注入。shared 组 WorkRoot 为空，原样走项目目录。
+				if tb := agentTaskRunBoxFrom(ctx); tb != nil && tb.WorkRoot != "" {
+					ref.Root = tb.WorkRoot
+					ctx = withExtraWriteRoots(ctx, tb.ExtraWriteRoots)
+				}
 				wsSpan.SetAttributes(
-					attribute.String("tako.workspace.id", dir),
+					attribute.String("tako.workspace.id", ref.Root),
 					attribute.Int64("tako.workspace.max_bytes", maxBytes),
 				)
 				finishSpan(wsSpan, nil)
-				ref := WorkspaceRef{TenantID: p.TenantID, SessionID: sessionID, Root: dir, TenantRoot: tenantStorageRoot(w.workspace, p.TenantID), WorkspaceID: wid, MaxBytes: maxBytes}
 				if maxBytes > 0 {
 					tenantID := p.TenantID
 					ref.Reserve = func(adding int) (func(), error) {

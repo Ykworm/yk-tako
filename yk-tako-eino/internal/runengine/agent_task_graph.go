@@ -41,6 +41,10 @@ type CreateOrchestrationCommand struct {
 	Goal        string
 	Tasks       []planTask
 	Links       []planLink
+	// WorkspaceMode / VerifyCommand 是组级工作区配置（doc/74 §4.1）：
+	// 省略或 shared = 既有共享行为；isolated = 整组独立工作现场 + 可选通用验证命令。
+	WorkspaceMode string
+	VerifyCommand string
 }
 
 // CreateTaskCommand 是单件 Task 的入参；创建服务内部把它转成单节点编排命令。
@@ -53,12 +57,20 @@ type CreateTaskCommand struct {
 	Agent           string
 	ModelRef        string
 	PlanCheckpoint  bool
+	WorkspaceMode   string
+	VerifyCommand   string
 }
 
 // planError 是计划校验失败：API 层翻成 117101，data.reason 带具体原因（不含 SQL）。
 type planError struct{ reason string }
 
 func (e *planError) Error() string { return e.reason }
+
+// workspaceConfigError 是工作区配置校验失败（doc/74 §4.1）：API 层翻成 117111，
+// 与计划形状错误（117101）分开——前端按码分支，不靠拆 message。
+type workspaceConfigError struct{ reason string }
+
+func (e *workspaceConfigError) Error() string { return e.reason }
 
 // taskKeyRe 是 Task key 的词法（施工包 §4.2）：字母数字开头，可含 _ 与 -，1–64 字符。
 var taskKeyRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
@@ -71,6 +83,8 @@ const (
 	taskSummaryMaxRunes  = 8000
 	taskArtifactsMax     = 32
 	taskMetadataMaxBytes = 16 << 10
+	// verifyCommandMaxBytes 是隔离组验证命令的字节上限（doc/74 §4.1，trim 后按字节）。
+	verifyCommandMaxBytes = 4000
 	// singleTaskKey 是单件 Task 转成单节点编排时的组内 key（施工包未定名；取合规则的固定值，
 	// 单节点组里 key 不参与任何语义，只满足 (orchestration_id, task_key) 唯一约束）。
 	singleTaskKey = "main"
@@ -84,6 +98,36 @@ type orchPlan struct {
 	Goal            string     `json:"goal"`
 	Tasks           []planTask `json:"tasks"`
 	Links           []planLink `json:"links"`
+	// 工作区配置（doc/74 §4.2）：shared／空 verifyCommand 必须 omitempty——
+	// 规范化时 shared 不落字段，旧计划与显式 shared 的 plan_hash 与现状逐字节一致。
+	WorkspaceMode string `json:"workspaceMode,omitempty"`
+	VerifyCommand string `json:"verifyCommand,omitempty"`
+}
+
+// normalizeWorkspaceConfig 校验并规范化组级工作区配置（doc/74 §4.1）。
+// 返回的 mode 恒为 shared/isolated；verify 已 trim。shared 时 verify 恒空。
+// 规范化规则是 hash 兼容的关键：shared 不把 "shared" 写进计划字段（omitempty 丢空串），
+// 显式 shared 与省略因此同哈希。
+func normalizeWorkspaceConfig(mode, verify string) (string, string, error) {
+	mode = strings.TrimSpace(mode)
+	verify = strings.TrimSpace(verify)
+	switch mode {
+	case "", workspaceModeShared:
+		if verify != "" {
+			return "", "", &workspaceConfigError{"共享工作区不接受 verifyCommand"}
+		}
+		return workspaceModeShared, "", nil
+	case workspaceModeIsolated:
+		if len(verify) > verifyCommandMaxBytes {
+			return "", "", &workspaceConfigError{"verifyCommand 超过 4000 字节"}
+		}
+		if strings.ContainsRune(verify, 0) {
+			return "", "", &workspaceConfigError{"verifyCommand 不允许包含 NUL"}
+		}
+		return workspaceModeIsolated, verify, nil
+	default:
+		return "", "", &workspaceConfigError{"workspaceMode 只允许 shared 或 isolated"}
+	}
 }
 
 // normalizeOrchestrationPlan 做全部纯校验并产出规范计划。任何一条不过都回 *planError。
@@ -95,6 +139,10 @@ func normalizeOrchestrationPlan(cmd CreateOrchestrationCommand) (*orchPlan, erro
 	}
 	if len(cmd.IdempotencyKey) > idempotencyMaxBytes {
 		return nil, &planError{"idempotencyKey 超过 128 字节"}
+	}
+	mode, verify, err := normalizeWorkspaceConfig(cmd.WorkspaceMode, cmd.VerifyCommand)
+	if err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(cmd.Goal) == "" {
 		return nil, &planError{"goal 必填"}
@@ -163,6 +211,11 @@ func normalizeOrchestrationPlan(cmd CreateOrchestrationCommand) (*orchPlan, erro
 		Tasks:           append([]planTask(nil), cmd.Tasks...),
 		Links:           append([]planLink(nil), cmd.Links...),
 	}
+	// shared 不落工作区字段：omitempty 丢空串，旧计划与显式 shared 的哈希字节不变。
+	if mode == workspaceModeIsolated {
+		plan.WorkspaceMode = workspaceModeIsolated
+		plan.VerifyCommand = verify
+	}
 	sort.Slice(plan.Tasks, func(i, j int) bool { return plan.Tasks[i].Key < plan.Tasks[j].Key })
 	sort.Slice(plan.Links, func(i, j int) bool {
 		if plan.Links[i].Parent != plan.Links[j].Parent {
@@ -219,6 +272,15 @@ func (p *orchPlan) hash() (string, error) {
 	return fmt.Sprintf("%x", sum), nil
 }
 
+// storageMode 把规范计划里的模式翻成存储词表：计划里 shared 不落字段（hash 兼容），
+// 存储列恒有值（shared/isolated）。
+func (p *orchPlan) storageMode() string {
+	if p.WorkspaceMode == workspaceModeIsolated {
+		return workspaceModeIsolated
+	}
+	return workspaceModeShared
+}
+
 // finalKey 返回最终 Task 的 key（出度为 0 的那一个；校验已保证恰好一个）。
 func (p *orchPlan) finalKey() string {
 	hasChild := make(map[string]bool, len(p.Links))
@@ -256,6 +318,8 @@ func singleTaskCommand(cmd CreateTaskCommand) CreateOrchestrationCommand {
 			Key: singleTaskKey, Content: cmd.Content, Agent: cmd.Agent,
 			ModelRef: cmd.ModelRef, PlanCheckpoint: cmd.PlanCheckpoint,
 		}},
+		WorkspaceMode: cmd.WorkspaceMode,
+		VerifyCommand: cmd.VerifyCommand,
 	}
 }
 

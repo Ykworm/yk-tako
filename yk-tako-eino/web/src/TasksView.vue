@@ -18,14 +18,17 @@ import {
   listWorkspaces,
   postAnswer,
   resumeAgentTask,
+  retryTaskPublication,
   stopAgentTask,
   stopOrchestration,
+  taskArtifactUrl,
   workspaceFileUrl,
   type AgentTask,
   type OrchestrationView,
   type PlanRevisionRow,
   type TaskQuestion,
   type TaskResult,
+  type TaskWorkspaceView,
   type Workspace,
 } from './api'
 import { authFetch } from './auth'
@@ -329,6 +332,26 @@ async function resume(row: AgentTask) {
   }
 }
 
+// 人工重新发布（doc/74 §10.3）：只从 blocked 出发，服务端铸同一执行 session 的新处理 run。
+// 动作期间防双击，但不吞服务端冲突——409 117112（别的入口抢先／状态已推进）重拉对齐再显示文案。
+const republishBusy = ref(false)
+async function republish(row: AgentTask) {
+  if (republishBusy.value) return
+  banner.value = ''
+  republishBusy.value = true
+  try {
+    const res = await retryTaskPublication(row.taskId)
+    notice.value = `重新发布已开始（发布轮次 ${res.publicationEpoch}）`
+    await reloadDetail(row.taskId)
+    await loadTasks()
+  } catch (err) {
+    fail(err, '重新发布失败，请再试一次')
+    await reloadDetail(row.taskId)
+  } finally {
+    republishBusy.value = false
+  }
+}
+
 async function continuePlan() {
   const o = orch.value?.orchestration
   if (!o || !o.planHold || planBusy.value) return
@@ -384,28 +407,43 @@ async function submitTaskAnswer(q: TaskQuestion) {
   }
 }
 
-// 产物下载复用项目文件出口（doc/48 B1 的字节面）：path 是相对项目根的路径，
-// /api/media 要 Bearer 头，先 fetch 成 blob 再触发下载（不能直接 <a href>，会 401）。
+// 产物下载：隔离结果走新 artifact 出口——按当前结果版本读不可变结果（doc/74 §11.1），
+// 不读主项目里的同路径文件；shared 保持原项目文件出口。两个出口都要 Bearer 头，
+// 先 fetch 成 blob 再触发下载（不能直接 <a href>，会 401）。
 async function downloadArtifact(task: AgentTask, artifactPath: string) {
+  const url =
+    task.workspace?.mode === 'isolated'
+      ? taskArtifactUrl(task.taskId, artifactPath)
+      : workspaceFileUrl(task.workspaceId, artifactPath)
+  await downloadUrl(url, artifactPath)
+}
+
+// 「查看项目当前文件」恒走项目文件出口：隔离任务看的也是原项目现状，
+// 与结果版本产物是两个出口，不混用（施工包 §11.2）。
+async function downloadProjectFile(task: AgentTask, path: string) {
+  await downloadUrl(workspaceFileUrl(task.workspaceId, path), path)
+}
+
+async function downloadUrl(url: string, path: string) {
   banner.value = ''
   try {
-    const res = await authFetch(workspaceFileUrl(task.workspaceId, artifactPath))
+    const res = await authFetch(url)
     if (!res.ok) {
-      banner.value = `取不到 ${artifactPath}`
+      banner.value = `取不到 ${path}`
       return
     }
     const blob = await res.blob()
-    const url = URL.createObjectURL(blob)
+    const blobUrl = URL.createObjectURL(blob)
     const a = document.createElement('a')
-    a.href = url
-    a.download = artifactPath.split('/').pop() || 'artifact'
+    a.href = blobUrl
+    a.download = path.split('/').pop() || 'artifact'
     document.body.appendChild(a)
     a.click()
     a.remove()
     // 留一会儿再回收：浏览器还在读这个 blob，立刻 revoke 会让下载拿到空文件。
-    window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
+    window.setTimeout(() => URL.revokeObjectURL(blobUrl), 10_000)
   } catch {
-    banner.value = `取不到 ${artifactPath}`
+    banner.value = `取不到 ${path}`
   }
 }
 
@@ -441,6 +479,45 @@ const DELIVERY_ERR_LABEL: Record<string, string> = {
   delivery_run_error: '交付执行出错',
   delivery_stopped: '交付被停止',
   artifact_invalid: '结果产物已不可读取',
+}
+// 工作区读面词表（doc/74 §4.3）：全是通用值，页面不认识 Git 内部状态。
+const PROVIDER_LABEL: Record<string, string> = {
+  pending: '准备中',
+  git: 'Git 项目',
+  directory: '普通目录',
+}
+const VERIFY_LABEL: Record<string, string> = {
+  '': '未运行',
+  running: '运行中',
+  passed: '通过',
+  failed: '未通过',
+}
+const PUB_LABEL: Record<string, string> = {
+  '': '未发布',
+  pending: '待发布',
+  publishing: '发布中',
+  published: '已发布',
+  blocked: '发布受阻',
+}
+// 发布受阻的通用机器原因（doc/74 §4.5）：blocked 只带这三码，其余原因不进发布面板。
+const PUB_ERR_LABEL: Record<string, string> = {
+  workspace_changed: '项目已变化',
+  workspace_dirty: '项目有未保存内容',
+  publication_recovery_required: '需要人工检查',
+}
+
+function isPublicationError(code: string): boolean {
+  return code in PUB_ERR_LABEL
+}
+
+function verificationText(ws: TaskWorkspaceView): string {
+  if (!ws.verification.configured) return '未配置验证'
+  const label = VERIFY_LABEL[ws.verification.status] ?? ws.verification.status
+  // 验证失败展示退出状态（施工包 §11.2）；退出码只在证据收尾后出现。
+  if (ws.verification.status === 'failed' && ws.verification.exitCode !== undefined) {
+    return `${label}（退出码 ${ws.verification.exitCode}）`
+  }
+  return label
 }
 
 function fmtWhen(iso: string | null): string {
@@ -606,9 +683,23 @@ onBeforeUnmount(() => {
                   </template>
                   <span class="orch-rev"> · 计划 v{{ orch.orchestration.planRevision }}</span>
                   <span v-if="orch.orchestration.planHold" class="tag hold" data-testid="orch-plan-hold">计划待决策</span>
+                  · <span data-testid="orch-workspace-mode">{{ orch.orchestration.workspace ? '隔离工作区' : '共享工作区' }}</span>
+                  <template v-if="orch.orchestration.workspace">
+                    （{{ PROVIDER_LABEL[orch.orchestration.workspace.provider] ?? orch.orchestration.workspace.provider }}）
+                    <template v-if="orch.orchestration.workspace.publication.status">
+                      · 发布：<span class="tag" :class="`p-${orch.orchestration.workspace.publication.status}`" data-testid="orch-pub-status">{{ PUB_LABEL[orch.orchestration.workspace.publication.status] ?? orch.orchestration.workspace.publication.status }}</span>
+                    </template>
+                  </template>
                 </p>
               </div>
               <div class="sheet-actions">
+                <button
+                  v-if="orch.orchestration.workspace?.publication.status === 'blocked'"
+                  type="button"
+                  class="primary"
+                  data-testid="orch-pub-blocked"
+                  @click="openTaskFromOrch(orch.orchestration.finalTaskId)"
+                >处理发布受阻</button>
                 <button
                   v-if="orch.orchestration.planHold && orch.orchestration.status === 'active'"
                   type="button"
@@ -706,6 +797,7 @@ onBeforeUnmount(() => {
                 <p class="muted">
                   <span class="tag" :class="detail.status" data-testid="task-status">{{ STATUS_LABEL[detail.status] ?? detail.status }}</span>
                   <span v-if="detail.planCheckpoint" class="tag hold" data-testid="task-plan-checkpoint">检查点</span>
+                  <span class="tag ws" data-testid="task-workspace-mode">{{ detail.workspace ? '隔离工作区' : '共享工作区' }}</span>
                   · 执行者 {{ detail.agent }}
                   <template v-if="detail.currentRunId"> · run {{ detail.currentRunId }}</template>
                 </p>
@@ -731,10 +823,49 @@ onBeforeUnmount(() => {
               </div>
             </header>
 
-            <p v-if="detail.error" class="task-error" role="alert">
+            <!-- 发布三码的错误正文是 Provider 诊断（可能很长）：不在顶层横幅展开，
+                 收进发布面板的折叠详情（施工包 §11.2）；其余错误照旧横幅。 -->
+            <p v-if="detail.error && !isPublicationError(detail.error.code)" class="task-error" role="alert">
               <strong>{{ detail.error.message }}</strong>
               <code class="err-code">{{ detail.error.code }}</code>
             </p>
+
+            <!-- 工作区与发布面板（doc/74 §11.3）：只有隔离组有 workspace 读面。 -->
+            <section v-if="detail.workspace" class="sec ws-panel" data-testid="task-workspace">
+              <h4>工作区与发布</h4>
+              <p class="muted">
+                {{ PROVIDER_LABEL[detail.workspace.provider] ?? detail.workspace.provider }}
+                · 验证：<span data-testid="task-verify-status">{{ verificationText(detail.workspace) }}</span>
+                <template v-if="detail.workspace.verification.status === 'failed' && detail.workspace.verification.outputPath">
+                  · 输出位置 <code>{{ detail.workspace.verification.outputPath }}</code>（相对组目录）
+                </template>
+              </p>
+              <p class="muted">
+                发布：<span class="tag" :class="`p-${detail.workspace.publication.status || 'none'}`" data-testid="task-pub-status">{{ PUB_LABEL[detail.workspace.publication.status] ?? detail.workspace.publication.status }}</span>
+                <template v-if="detail.workspace.publication.epoch"> · 轮次 {{ detail.workspace.publication.epoch }}</template>
+                <strong
+                  v-if="detail.workspace.publication.status === 'blocked' && detail.workspace.publication.errorCode"
+                  class="pub-reason"
+                  data-testid="task-pub-reason"
+                >{{ PUB_ERR_LABEL[detail.workspace.publication.errorCode] ?? detail.workspace.publication.errorCode }}</strong>
+              </p>
+              <template v-if="detail.workspace.publication.status === 'blocked'">
+                <p class="muted">
+                  结果已保存，写回项目没有完成。处理上面的原因后重新发布；父任务不会重跑。
+                </p>
+                <details v-if="detail.error" class="ws-diag">
+                  <summary>Provider 诊断详情</summary>
+                  <pre class="body">{{ detail.error.message }}</pre>
+                </details>
+                <button
+                  type="button"
+                  class="primary ws-republish"
+                  :disabled="republishBusy"
+                  data-testid="task-republish"
+                  @click="republish(detail)"
+                >{{ republishBusy ? '正在创建处理执行…' : '重新发布' }}</button>
+              </template>
+            </section>
 
             <section class="sec">
               <h4>指令</h4>
@@ -808,13 +939,22 @@ onBeforeUnmount(() => {
               <h4>结果 <span class="muted">（revision {{ detail.resultRevision }}）</span></h4>
               <p class="result-summary">{{ detail.result.summary }}</p>
               <div v-if="detail.result.artifacts.length" class="artifacts">
-                <p class="muted">产物（{{ artifactName(detail.result) }}，存放在项目目录里）：</p>
+                <!-- 隔离结果的产物按不可变版本读取；shared 仍在项目目录里（施工包 §11.2）。 -->
+                <p v-if="detail.workspace" class="muted">产物（{{ artifactName(detail.result) }}，该结果版本）：</p>
+                <p v-else class="muted">产物（{{ artifactName(detail.result) }}，存放在项目目录里）：</p>
                 <ul>
                   <li v-for="a in detail.result.artifacts" :key="a.path">
                     <button type="button" class="artifact" @click="downloadArtifact(detail!, a.path)">
                       {{ a.path }}
                     </button>
                     <span class="muted">{{ a.kind }}</span>
+                    <button
+                      v-if="detail.workspace"
+                      type="button"
+                      class="artifact alt"
+                      data-testid="task-project-file"
+                      @click="downloadProjectFile(detail!, a.path)"
+                    >查看项目当前文件</button>
                   </li>
                 </ul>
               </div>
@@ -982,6 +1122,12 @@ h4 { margin: 0 0 0.35rem; font-size: var(--text-sm); font-weight: 600; }
 .tag.d-failed { background: #fee2e2; color: #b91c1c; }
 .tag.final { background: #fff7ed; color: #c2410c; }
 .tag.hold { background: #fef3c7; color: #92400e; }
+.tag.ws { background: #eef2ff; color: #4338ca; }
+.tag.p-none { background: var(--bg-soft, #f3f4f6); color: var(--muted); }
+.tag.p-pending { background: #fef3c7; color: #92400e; }
+.tag.p-publishing { background: #e0f2fe; color: #0369a1; }
+.tag.p-published { background: #dcfce7; color: #15803d; }
+.tag.p-blocked { background: #fee2e2; color: #b91c1c; }
 .orch-rev { margin-left: 0.15rem; }
 .final-node { margin: 0; font-size: var(--text-sm); }
 .final-node code { font-size: var(--text-xs); }
@@ -1071,6 +1217,20 @@ h4 { margin: 0 0 0.35rem; font-size: var(--text-sm); font-weight: 600; }
   text-decoration: underline;
   cursor: pointer;
 }
+.artifact.alt { color: var(--muted); font-size: var(--text-xs); }
+
+/* 工作区与发布面板：受阻时是处理入口，诊断默认折叠（施工包 §11.2）。 */
+.ws-panel {
+  border: 1px solid var(--line, #e5e7eb);
+  border-radius: 10px;
+  padding: 0.7rem 0.9rem;
+}
+.ws-panel p { margin: 0.25rem 0; }
+.pub-reason { color: #b91c1c; margin-left: 0.35rem; }
+.ws-diag { margin: 0.35rem 0; font-size: var(--text-sm); }
+.ws-diag summary { cursor: pointer; color: var(--muted); }
+.ws-diag .body { margin-top: 0.35rem; max-height: 12rem; }
+.ws-republish { margin-top: 0.35rem; }
 .facts {
   display: grid;
   grid-template-columns: 4.5rem 1fr;

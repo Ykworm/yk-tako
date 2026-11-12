@@ -41,9 +41,12 @@ func (s *Server) taskPlanEnv(ctx context.Context, p principal) (planEnv, error) 
 // taskStoreErr 把 store 层业务错误翻成信封。true = 已写响应；false = 不认识的错，调用方走 internal。
 func taskStoreErr(c *gin.Context, err error) bool {
 	var pe *planError
+	var wce *workspaceConfigError
 	switch {
 	case errors.As(err, &pe):
 		writeEnvelope(c, http.StatusBadRequest, codePlanInvalid, "任务计划不合法", gin.H{"reason": pe.reason})
+	case errors.As(err, &wce):
+		writeEnvelope(c, http.StatusBadRequest, codeWorkspaceConfigInvalid, "工作区配置不合法", gin.H{"reason": wce.reason})
 	case errors.Is(err, errPlanConflict):
 		writeEnvelope(c, http.StatusConflict, codePlanConflict, "这个创建键已经用于另一份计划", nil)
 	case errors.Is(err, errCreateSource):
@@ -62,6 +65,14 @@ func taskStoreErr(c *gin.Context, err error) bool {
 		writeEnvelope(c, http.StatusConflict, codeTaskFinished, "这件任务已经结束，不能停止", nil)
 	case errors.Is(err, errOrchNotStoppable):
 		writeEnvelope(c, http.StatusConflict, codeOrchFinished, "这个编排组已经结束，不能停止", nil)
+	case errors.Is(err, errArtifactShared):
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "这件任务的结果产物请从项目文件读取", nil)
+	case errors.Is(err, errArtifactUnreadable):
+		writeEnvelope(c, http.StatusConflict, codeArtifactInvalid, "结果产物已不可读取", nil)
+	case errors.Is(err, errTaskNotRepublishable):
+		writeEnvelope(c, http.StatusConflict, codeTaskNotRepublishable, "这件任务现在不能重新发布", nil)
+	case errors.Is(err, errTenantFull):
+		writeEnvelope(c, http.StatusTooManyRequests, codeQuota, "同时在跑的任务已达上限，请稍后再试", nil)
 	default:
 		return false
 	}
@@ -89,6 +100,8 @@ func (s *Server) postAgentTask(c *gin.Context) {
 		Agent           string `json:"agent"`
 		ModelRef        string `json:"modelRef"`
 		PlanCheckpoint  bool   `json:"planCheckpoint,omitempty"`
+		WorkspaceMode   string `json:"workspaceMode"`
+		VerifyCommand   string `json:"verifyCommand"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
@@ -115,6 +128,8 @@ func (s *Server) postAgentTask(c *gin.Context) {
 		Agent:           req.Agent,
 		ModelRef:        req.ModelRef,
 		PlanCheckpoint:  req.PlanCheckpoint,
+		WorkspaceMode:   req.WorkspaceMode,
+		VerifyCommand:   req.VerifyCommand,
 	}, env)
 	if err != nil {
 		if taskStoreErr(c, err) {
@@ -141,6 +156,8 @@ func (s *Server) postAgentOrchestration(c *gin.Context) {
 		Goal            string     `json:"goal"`
 		Tasks           []planTask `json:"tasks"`
 		Links           []planLink `json:"links"`
+		WorkspaceMode   string     `json:"workspaceMode"`
+		VerifyCommand   string     `json:"verifyCommand"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
@@ -165,6 +182,8 @@ func (s *Server) postAgentOrchestration(c *gin.Context) {
 		Goal:            req.Goal,
 		Tasks:           req.Tasks,
 		Links:           req.Links,
+		WorkspaceMode:   req.WorkspaceMode,
+		VerifyCommand:   req.VerifyCommand,
 	}, env)
 	if err != nil {
 		if taskStoreErr(c, err) {

@@ -74,19 +74,26 @@ at_wait_delivered(){
 }
 
 # at_create_task $1=idempotencyKey $2=workspaceId $3=sourceSessionId $4=content $5=agent
+#   [$6=workspaceMode $7=verifyCommand]（doc/74：省略 = shared，字节与旧调用完全一致）
 # → 回应原文（调用方自己 jq）。请求体用 jq 拼，content 里的引号不用手工转义。
 at_create_task(){
   jq -cn --arg k "$1" --arg w "$2" --arg s "$3" --arg c "$4" --arg a "$5" \
-    '{idempotencyKey:$k,workspaceId:$w,sourceSessionId:$s,content:$c,agent:$a}' |
+    --arg m "${6:-}" --arg v "${7:-}" \
+    '{idempotencyKey:$k,workspaceId:$w,sourceSessionId:$s,content:$c,agent:$a}
+     + (if $m != "" then {workspaceMode:$m} else {} end)
+     + (if $v != "" then {verifyCommand:$v} else {} end)' |
   curl -sS -X POST "$B/api/tasks" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d @-
 }
 
 # at_create_orch $1=idempotencyKey $2=workspaceId $3=sourceSessionId $4=goal $5=tasksJSON $6=linksJSON
+#   [$7=workspaceMode $8=verifyCommand]（doc/74：组级工作区配置，省略 = shared）
 # tasksJSON/linksJSON 是已经拼好的 JSON 数组字面量（脚本里用 jq -cn 现拼）。
 at_create_orch(){
   jq -cn --arg k "$1" --arg w "$2" --arg s "$3" --arg g "$4" \
-    --argjson t "$5" --argjson l "$6" \
-    '{idempotencyKey:$k,workspaceId:$w,sourceSessionId:$s,goal:$g,tasks:$t,links:$l}' |
+    --argjson t "$5" --argjson l "$6" --arg m "${7:-}" --arg v "${8:-}" \
+    '{idempotencyKey:$k,workspaceId:$w,sourceSessionId:$s,goal:$g,tasks:$t,links:$l}
+     + (if $m != "" then {workspaceMode:$m} else {} end)
+     + (if $v != "" then {verifyCommand:$v} else {} end)' |
   curl -sS -X POST "$B/api/orchestrations" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d @-
 }
 

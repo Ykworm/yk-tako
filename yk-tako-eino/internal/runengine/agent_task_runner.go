@@ -60,7 +60,9 @@ func (w *Worker) agentTaskExecutorBase(ctx context.Context, mcpTools []tool.Base
 	base = dropSkillTools(ctx, base)
 	base = append(base, mcpTools...)
 	if st, err := newSubmitTaskResultTool(w.store); err == nil {
-		base = append(base, st)
+		// 与池内工具同款包错误：提交被拒（如验证未过）要回注「错误：…」让执行者返工，
+		// 裸 append 会让 ToolsNode 把拒绝当 NodeRunError 直接打挂整场 run。
+		base = append(base, wrapToolErrors(st))
 	} else {
 		log.Printf("task executor: submit_task_result 装配失败: %v", err)
 	}
@@ -271,9 +273,9 @@ SELECT t.id AS task_id, t.tenant_id, t.orchestration_id, o.source_session_id, r.
 	return nil
 }
 
-// launchTaskRun 启动一场刚领取的执行（§6.2 第 5 步）：装配执行者 → 失败收尾（FailClaimedTaskRun
-// + terminal 帧给轮询的客户端）→ 成功则 go Worker.Run。装配口为 nil（单测）时只记日志：
-// run 行留给显式续跑或死行清扫，这是测试模式的已知边界。
+// launchTaskRun 启动一场刚领取的执行（§6.2 第 5 步）：准备工作现场（isolated）→ 装配执行者
+// → 失败收尾（FailClaimedTaskRun + terminal 帧给轮询的客户端）→ 成功则 go Worker.Run。
+// 装配口为 nil（单测）时只记日志：run 行留给显式续跑或死行清扫，这是测试模式的已知边界。
 func (ts *TaskScheduler) launchTaskRun(ctx context.Context, c agentTaskClaim) {
 	if ts.assembleTask == nil {
 		log.Printf("task runner %s: 没有装配口（测试模式），run %s 留待显式接管", c.TaskID, c.RunID)
@@ -284,23 +286,48 @@ func (ts *TaskScheduler) launchTaskRun(ctx context.Context, c agentTaskClaim) {
 			InputTimeout: ts.inputTimeout})
 	p := principal{UserID: c.UserID, TenantID: c.TenantID, Role: "member"}
 	bg = withPrincipal(bg, p)
+	// doc/74：isolated 组先备工作现场（幂等），失败与装配失败同一条收尾链——
+	// 不能留下 running 但永远没有 worker 的行。shared 返回零值，走既有路径。
+	work, providerKind, werr := ts.store.prepareTaskWork(bg, c.TaskID)
+	if werr != nil {
+		log.Printf("task runner %s: 工作区准备失败: %v", c.TaskID, werr)
+		ts.failTaskLaunch(bg, c, "工作区准备失败，无法建立隔离工作现场")
+		return
+	}
 	prof, aerr := ts.assembleTask(bg, p, c.TaskID)
 	if aerr != nil {
 		log.Printf("task runner %s: 装配失败 (%s): %v", c.TaskID, aerr.Message, aerr.Err)
-		finCtx := context.WithoutCancel(bg)
-		if err := ts.store.FailClaimedTaskRun(finCtx, c.RunID, aerr.Message); err != nil {
-			log.Printf("task runner %s: 装配失败收尾也失败: %v", c.TaskID, err)
-			return
-		}
-		if tj, jerr := json.Marshal(Frame{Kind: "terminal", Status: "error"}); jerr == nil {
-			if _, ferr := ts.store.runliveFinish(finCtx, c.RunID, string(tj)); ferr != nil {
-				log.Printf("task runner %s: terminal 帧写入失败（runlive 走 TTL 收敛）: %v", c.RunID, ferr)
-			}
-		}
+		ts.failTaskLaunch(bg, c, aerr.Message)
 		return
+	}
+	if work.Root != "" {
+		tb := agentTaskRunBoxFrom(bg)
+		tb.WorkRoot = work.Root
+		tb.ExtraWriteRoots = work.ExtraWriteRoots
+		tb.WorkspaceMode = workspaceModeIsolated
+		tb.WorkspaceProvider = providerKind
+		tb.ConflictCount = work.Conflicts
+		if work.PromptOverlay != "" {
+			prof.Instruction += "\n\n" + work.PromptOverlay
+		}
 	}
 	log.Printf("task runner: launching task %s (key %s) as run %s", c.TaskID, c.TaskKey, c.RunID)
 	go ts.worker.Run(withRunProfile(bg, prof), c.SessionID, c.RunID, c.Epoch)
+}
+
+// failTaskLaunch 是领取后启动失败的统一收尾：run 翻 error + Task failed/assembly_failed +
+// terminal 帧（runlive 写失败走 TTL 收敛）。准备失败与装配失败共用，不另造错误码。
+func (ts *TaskScheduler) failTaskLaunch(bg context.Context, c agentTaskClaim, message string) {
+	finCtx := context.WithoutCancel(bg)
+	if err := ts.store.FailClaimedTaskRun(finCtx, c.RunID, message); err != nil {
+		log.Printf("task runner %s: 启动失败收尾也失败: %v", c.TaskID, err)
+		return
+	}
+	if tj, jerr := json.Marshal(Frame{Kind: "terminal", Status: "error"}); jerr == nil {
+		if _, ferr := ts.store.runliveFinish(finCtx, c.RunID, string(tj)); ferr != nil {
+			log.Printf("task runner %s: terminal 帧写入失败（runlive 走 TTL 收敛）: %v", c.RunID, ferr)
+		}
+	}
 }
 
 // resumeAgentTask 是 POST /api/tasks/:id/resume（doc/70 §10.1；施工包 §10.1）：
@@ -379,6 +406,14 @@ func (s *Server) resumeAgentTask(c *gin.Context) {
 		internal(c, err)
 		return
 	}
+	// doc/74：isolated 组恢复前重绑工作现场（PrepareTask 幂等：已存在直接返回，不重新 merge）。
+	// 失败放弃认领（租约改到过期，下一发立刻可接），不把 Task 打成 failed——准备失败可能是暂时的。
+	work, providerKind, werr := s.store.prepareTaskWork(ctx, view.TaskID)
+	if werr != nil {
+		_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
+		internal(c, werr)
+		return
+	}
 	prof, aerr := s.assembleAgentTaskRun(ctx, p, view.TaskID)
 	if aerr != nil {
 		_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
@@ -388,6 +423,17 @@ func (s *Server) resumeAgentTask(c *gin.Context) {
 	bg := withAgentTaskRunBox(launchContext(c.Request.Context()),
 		&agentTaskRunBox{TaskID: view.TaskID, OrchestrationID: view.OrchestrationID,
 			InputTimeout: s.taskInputTimeout})
+	if work.Root != "" {
+		tb := agentTaskRunBoxFrom(bg)
+		tb.WorkRoot = work.Root
+		tb.ExtraWriteRoots = work.ExtraWriteRoots
+		tb.WorkspaceMode = workspaceModeIsolated
+		tb.WorkspaceProvider = providerKind
+		tb.ConflictCount = work.Conflicts
+		if work.PromptOverlay != "" {
+			prof.Instruction += "\n\n" + work.PromptOverlay
+		}
+	}
 	bg = withPrincipal(bg, p)
 	go s.worker.RunResume(withRunProfile(bg, prof), claim.SessionID, runID, claim.Epoch, replay)
 	s.store.PublishEvent(ctx, p.TenantID, eventAgentTasksChanged, view.TaskID)

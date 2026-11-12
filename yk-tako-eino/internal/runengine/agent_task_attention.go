@@ -74,14 +74,16 @@ type attentionItem struct {
 	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
-// TaskAttention 现算一个项目下的四类处理项（§8.1；doc/73 §4.4 扩了通知归属）：
+// TaskAttention 现算一个项目下的五类处理项（§8.1；doc/73 §4.4 扩了通知归属；doc/74 §4.6 扩了发布受阻）：
 //   - question：Task 与当前 run 都 running、租约有效、问题 pending 且未过期（每件 Task 一行，
 //     questionId 取最早待答、count 为活跃待答数）；
 //   - plan_review：组 active + plan_hold（notificationId 指向待决策的 plan_review_required）；
 //   - interrupted：Task running 但当前 run 已不是有效存活；或通知 claimed 但它的消费 run
 //     已不是有效存活（读侧派生同一规则）；
 //   - delivery_failed：组的 delivery_status=failed，以及非整组通知自身 status=failed
-//     （taskId／标题按通知内容给出，不因组没有 delivery_status 而隐身）。
+//     （taskId／标题按通知内容给出，不因组没有 delivery_status 而隐身）；
+//   - publication_blocked：隔离最终 Task blocked 且错误码是通用发布三码——没有通知行，
+//     前端据此进发布面板调 retry-publication。
 //
 // 排序 updatedAt ASC, kind, taskId, orchestrationId, notificationId——刷新不随机跳动。
 func (s *Store) TaskAttention(ctx context.Context, p principal, workspaceID string) ([]attentionItem, error) {
@@ -249,6 +251,31 @@ SELECT n.task_id, n.orchestration_id,
 			Kind: "interrupted", TaskID: n.TaskID, OrchestrationID: n.OrchestrationID, Title: n.Title,
 			Count: 1, RunID: RunID(n.RunID), NotificationID: n.NotificationID,
 			Status: agentTaskStatusInterrupted, UpdatedAt: n.UpdatedAt,
+		})
+	}
+	// 发布受阻（doc/74 §4.6）：隔离最终 Task blocked 且带通用发布三码。没有通知行——
+	// 处理入口是发布面板的 retry-publication，不是通知恢复。
+	var pubBlocked []struct {
+		TaskID          string    `gorm:"column:task_id"`
+		OrchestrationID string    `gorm:"column:orchestration_id"`
+		Title           string    `gorm:"column:title"`
+		RunID           string    `gorm:"column:run_id"`
+		UpdatedAt       time.Time `gorm:"column:updated_at"`
+	}
+	if err := s.db.WithContext(ctx).Raw(`
+SELECT t.id AS task_id, t.orchestration_id, t.task_key AS title,
+       COALESCE(t.current_run_id, '') AS run_id, t.updated_at
+  FROM agent_tasks t
+ WHERE t.tenant_id = ? AND t.workspace_id = ? AND t.status = ?
+   AND t.error_code IN (?, ?, ?)`,
+		p.TenantID, workspaceID, agentTaskStatusBlocked,
+		taskErrWorkspaceChanged, taskErrWorkspaceDirty, taskErrPublicationRecovery).Scan(&pubBlocked).Error; err != nil {
+		return nil, err
+	}
+	for _, t := range pubBlocked {
+		items = append(items, attentionItem{
+			Kind: "publication_blocked", TaskID: t.TaskID, OrchestrationID: t.OrchestrationID, Title: t.Title,
+			Count: 1, RunID: RunID(t.RunID), Status: agentTaskStatusBlocked, UpdatedAt: t.UpdatedAt,
 		})
 	}
 	sort.Slice(items, func(i, j int) bool {

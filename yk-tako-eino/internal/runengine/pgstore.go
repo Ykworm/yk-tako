@@ -158,6 +158,10 @@ type Workspace struct {
 	// IsDefault 标记「当前租户 × 这个用户」的默认工作区。部分唯一索引保证每对至多一个。
 	IsDefault bool      `gorm:"not null;default:false"`
 	CreatedAt time.Time `gorm:"not null"`
+	// 当前发布标记（doc/74 §9.1）：只表示「这个项目正在发布某组的结果」的短窗口，
+	// 不保存 Provider 历史。发布准入与新 run 准入共用 workspaceID 的 advisory lock。
+	PublicationOrchestrationID string `gorm:"not null;default:''"`
+	PublicationEpoch           int64  `gorm:"not null;default:0"`
 }
 
 func (Workspace) TableName() string { return "workspaces" }
@@ -330,6 +334,18 @@ func (s *Store) DeleteWorkspaceCascade(ctx context.Context, tenantID, userID, id
 		if err := lockOwnedWorkspace(tx, id, tenantID, userID); err != nil {
 			return err
 		}
+		// doc/74 §9.1 第 7 条：删除与发布准入共用同一把 workspaceID advisory lock。
+		// 锁项目行在前、advisory 在后，与 AcquireRun／发布器同序；有发布标记 = 短发布窗口内，拒删。
+		if err := lockWorkspacePublicationTx(tx, id); err != nil {
+			return err
+		}
+		var mark string
+		if err := tx.Raw(`SELECT publication_orchestration_id FROM workspaces WHERE id = ?`, id).Scan(&mark).Error; err != nil {
+			return err
+		}
+		if mark != "" {
+			return ErrWorkspaceBusy
+		}
 		var flags []bool
 		if err := tx.Raw(`SELECT is_default FROM workspaces WHERE id = ?`, id).Scan(&flags).Error; err != nil {
 			return err
@@ -370,8 +386,9 @@ func (s *Store) DeleteWorkspaceCascade(ctx context.Context, tenantID, userID, id
 			return ErrWorkspaceBusy
 		}
 		// 项目删除保护（doc/70 §10.2）：编排组没收口（active/cancelling）或还有没落终态的
-		// Task（pending/ready/running；租约过期的 running 在存储里仍是 running，自动覆盖
-		// 「interrupted 也算未收口」）。已终态的组与 Task 保留历史事实，不挡删除。
+		// Task（pending/ready/running/publishing；租约过期的 running 在存储里仍是 running，
+		// 自动覆盖「interrupted 也算未收口」）。已终态的组与 Task 保留历史事实，不挡删除。
+		// doc/74 §4.6：publishing 的 Task 与 publishing／blocked 的发布同样挡删除。
 		if err := tx.Raw(
 			`SELECT COUNT(*) FROM agent_orchestrations WHERE workspace_id = ? AND status IN ('active', 'cancelling')`,
 			id).Scan(&n).Error; err != nil {
@@ -381,7 +398,15 @@ func (s *Store) DeleteWorkspaceCascade(ctx context.Context, tenantID, userID, id
 			return ErrWorkspaceBusy
 		}
 		if err := tx.Raw(
-			`SELECT COUNT(*) FROM agent_tasks WHERE workspace_id = ? AND status IN ('pending', 'ready', 'running')`,
+			`SELECT COUNT(*) FROM agent_orchestrations WHERE workspace_id = ? AND publication_status IN ('publishing', 'blocked')`,
+			id).Scan(&n).Error; err != nil {
+			return err
+		}
+		if n > 0 {
+			return ErrWorkspaceBusy
+		}
+		if err := tx.Raw(
+			`SELECT COUNT(*) FROM agent_tasks WHERE workspace_id = ? AND status IN ('pending', 'ready', 'running', 'publishing')`,
 			id).Scan(&n).Error; err != nil {
 			return err
 		}
@@ -738,6 +763,13 @@ WHERE claim_run_id <> ''`).Error; err != nil {
 	}
 	if err := db.Exec(`CREATE INDEX IF NOT EXISTS agent_orchestrations_delivery_run
 ON agent_orchestrations (delivery_status, delivery_run_id)`).Error; err != nil {
+		return err
+	}
+	// 发布对账索引（doc/74 §5.1）：慢速对账按 publication_status 扫 pending/publishing/blocked
+	// 的隔离组；shared 组恒空串，不进这支部分索引。存量组由列默认值回填 shared/空/0。
+	if err := db.Exec(`CREATE INDEX IF NOT EXISTS agent_orchestrations_publication
+ON agent_orchestrations (publication_status)
+WHERE publication_status <> ''`).Error; err != nil {
 		return err
 	}
 	// 回填（doc/73 §5：升级库上的存量行必须能被新读面与状态机解释，重复启动安全）：

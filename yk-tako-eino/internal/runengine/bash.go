@@ -70,6 +70,10 @@ func runBash(ctx context.Context, workspace, command string, timeout time.Durati
 			cmd.Env = append(cmd.Env, k+"="+v)
 		}
 	}
+	// doc/74：隔离 Git 工作现场里的 git 要围栏内可用的配置与身份（见 gitSandboxEnv）。
+	if tb := agentTaskRunBoxFrom(ctx); tb != nil && tb.WorkspaceProvider == workspaceProviderGit {
+		cmd.Env = append(cmd.Env, gitSandboxEnv()...)
+	}
 	spill := newBashSpill(ctx, workspace)
 	stdout := &tailCollector{cap: bashOutputCap, spill: spill, ext: "out"}
 	stderr := &tailCollector{cap: bashOutputCap, spill: spill, ext: "err"}

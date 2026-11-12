@@ -40,6 +40,9 @@ var (
 	// errTenantFull = 租户并发闸满了（同一租户同时在跑的场数到上限，doc/43）。
 	// 与 errGateBusy 分开：会话忙回 409，租户满回 429（字节见 server.go 的 postRuns）。
 	errTenantFull = errors.New("tenant concurrent runs full")
+	// errWorkspacePublishing = 项目正在发布隔离结果（doc/74 §9.1）：workspaces 上有当前
+	// 发布标记时，同项目新 run 回 409 117113；无标记时既有行为不变。
+	errWorkspacePublishing = errors.New("workspace publishing")
 )
 
 // Store 是四个 API 的存储后端（A4-3 裁：具体结构体，不抽接口；名字不再带介质——它跨两存储）。
@@ -59,6 +62,17 @@ type Store struct {
 	memoryCfg MemoryConfig
 	// tenantModels 是记忆抽取用的租户模型口。空的时候抽取仍走启动时的 getModel。
 	tenantModels *TenantModels
+	// workspaceRoot 是 -workspace 作业根（NewServer 装配时注入，与 Server.mediaRoot 同值）。
+	// 隔离组的工作区摘要要现读组目录 state.json 与验证证据（doc/74 §4.3）；
+	// 空 = 没有文件面（单测直接构造 Store），摘要退化为 pending/未运行。
+	workspaceRoot string
+}
+
+// SetWorkspaceRoot 注入作业根（NewServer 装配时调用一次，之后只读）。
+func (s *Store) SetWorkspaceRoot(root string) {
+	if s != nil {
+		s.workspaceRoot = root
+	}
 }
 
 func (s *Store) SetTenantModels(m *TenantModels) {
@@ -201,6 +215,13 @@ func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID
 				runWorkspace = *existing[0].WorkspaceID
 			}
 		}
+		// doc/74 §9.1：可见性判完后、动活 run 之前，按 workspaceID 取与发布器同一把
+		// transaction advisory lock，再看发布标记——有标记 = 短发布窗口内，拒新 run。
+		if ws, ok := runWorkspace.(string); ok && ws != "" {
+			if err := checkWorkspacePublicationTx(tx, ws); err != nil {
+				return err
+			}
+		}
 		// 清扫死行（§8.3）：上一任进程死掉的活行按 lease 判死翻 error，唯一索引随之放行本 run。
 		if err := expireDeadSessionRunsTx(tx, sessionID); err != nil {
 			return err
@@ -281,6 +302,9 @@ func (s *Store) AcquireRun(ctx context.Context, sessionID SessionID, runID RunID
 		}
 		if errors.Is(err, errTenantFull) {
 			return false, errTenantFull
+		}
+		if errors.Is(err, errWorkspacePublishing) {
+			return false, errWorkspacePublishing
 		}
 		return false, err
 	}

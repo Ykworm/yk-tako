@@ -38,6 +38,7 @@ type bashSpill struct {
 	dirRel string // 相对作业根的目录，如 .tako/bash/r_01ABC
 	dirAbs string // 绝对目录
 	seq    int    // 本 run 内第几次 bash 调用（从 1 起）
+	name   string // 非空时文件名用它（如验证证据的 <taskId>），空 = 默认 <seq>
 }
 
 // newBashSpill 算本次调用的落盘位置。
@@ -101,6 +102,7 @@ type tailCollector struct {
 	file     *os.File
 	relPath  string // 相对作业根的路径（落盘成功后才有）
 	spillOff bool   // 落盘关掉了（写失败或装不下全文）
+	force    bool   //  true = 首块就落盘（验证证据要总有输出文件），false = 首次溢出才落
 }
 
 // Write 收一段字节：先算总长，再按需落盘，最后推进尾窗。
@@ -109,7 +111,7 @@ type tailCollector struct {
 // 字节补写进去——此刻内存里装的是整条流的前缀（此前没丢过字节），补上就是全文。
 func (c *tailCollector) Write(p []byte) (int, error) {
 	c.total += int64(len(p))
-	if c.spill != nil && !c.spillOff && (len(c.tail)+len(p) > c.cap || c.file != nil) {
+	if c.spill != nil && !c.spillOff && (c.force || len(c.tail)+len(p) > c.cap || c.file != nil) {
 		c.spillAll(p)
 	}
 	c.tail = append(c.tail, p...)
@@ -159,6 +161,9 @@ func (c *tailCollector) openSpill() (*os.File, string, error) {
 		return nil, "", err
 	}
 	name := fmt.Sprintf("%d.%s", c.spill.seq, c.ext)
+	if c.spill.name != "" {
+		name = c.spill.name + "." + c.ext
+	}
 	full := filepath.Join(c.spill.dirAbs, name)
 	f, err := os.OpenFile(full, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {

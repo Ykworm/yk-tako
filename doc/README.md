@@ -45,6 +45,8 @@
 - 改读文件（`read_file` 怎么分页）或 bash 大输出（留尾／全文落盘）：`doc/58`。
 - 改对话页的工具卡（哪些工具进气泡、摘要／失败／截断口径）：`doc/59`。
 - 改多会话并发（切走保留／实例上限／空对话项目落点／侧栏运行中）：`doc/60`。
+- 改持久 Task／多 Agent 编排：`doc/70`、`doc/72`、`doc/73`；并行任务的工作区隔离、结果交接与发布恢复：`doc/74`（已落地）。
+- 改目标可行性判断、继任编排组与 handoff：`doc/75`（方案已点头、与 76 合并施工包待审）；改项目内容根、运行资源容器与整容器删除：`doc/76`（方案已点头、与 75 合并施工包待审）。
 - 想知道某个设计当时为什么这么裁、代价是什么：`doc/problems/`（问题档案，按模块分组）。
 
 **不要先读：** `doc/archive/`（旧线 01–15、18 与引擎 v3／v4／v5）与 `doc/log/`（历史交接与文章）。这些是历史材料，不是现行施工面。
@@ -319,6 +321,21 @@
   - 2026-11-11 成文并同日落地。区分 DAG 执行失败与来源 session 交付失败：down／interrupted 走原 run、epoch+1 显式续跑；error／stopped 保留历史并由人工创建同一通知的新处理 run；`resultRevision` 管结果版本、`lease_epoch` 管执行权、当前 claim run 管通知收尾。补通知 failed 状态、每次处理 attempt 审计、RunEnd 与慢速对账同一收尾、结果摘要与文件路径定位、交付只读工具面及双副本防重
   - 验收：契约 55–56 逐字节（`assert_contract.py` 344 条）；活体十场 109/109，doc/72 的 attention/revision/hitl/wakeup（39/68/48/14）与 V1 五场回归（single 24、busy 14、dag 22、crash 20、two_replicas 13）全绿；`spotcheck.sh` 37/37。施工期修掉「崩溃留下的中断 run 卡死后续认领」的收敛缺陷（认领／重试先跑与 `AcquireRun` 同一条过期行扫尾）
 
+- **74** [并行任务工作区隔离](74-并行任务工作区隔离.md) ✅（已落地 2026-11-12）
+  - 落点：`internal/runengine/workspace_{provider,engine,git,directory,result,publish,verify,view}.go` + `agent_task_artifact.go`（artifact / retry-publication）+ `agent_task_{graph,api,tools,scheduler,runner,store,types,attention}.go`、`worker.go`、`sandbox.go`/`bash.go`/`bashspill.go`、`store.go`/`pgstore.go`、`auth.go`（117111–117113）、`server.go`；前端 `web/src/{TasksView.vue,App.vue,api.ts}`；活体 `scripts/acceptance/workspace_{git,directory,publication,crash}_live.sh`
+  - 2026-11-11 按责任边界重写。Task／DAG 永远通用；**LLM 决定节点、依赖与隔离需求，WorkspaceProvider 按真实项目选择 Git 或非 Git 目录实现，引擎调用 Provider 创建现场并协调执行与发布，system prompt 只指导模型配合**。默认 shared 不变
+  - Git 只在已有仓库、需要持久修改并合回项目时启用；非 Git 由 DirectoryProvider 完成目录副本、文件变更清单、冲突与发布恢复。PG 不保存 branch／commit／repo path／worktree path／文件哈希；Provider 状态与不可变结果在共享持久卷
+  - 验收：活体四场 git 51／directory 42／publication 34／crash 57 全绿；契约用例 57–59 逐字节、用例 60 登记 declared_not_asserted（模型与真实现场场景由活体判红）；既有 70–73 回归（single 24、busy 14、dag 22、crash 20、two_replicas 13、revision 68、attention 39、hitl 48、wakeup 14、delivery_recovery 109）与 `spotcheck.sh` 37/37 全绿；浏览器走查隔离标识／发布面板／验证失败／受阻后重新发布闭环
+
+- **75** [目标重规划与继任编排组](75-目标重规划与继任编排组.md) ⬜（方案已点头、与 76 合并施工包待审，未施工）
+  - 落点：—（设计阶段；预计为继任创建服务、handoff、结果引用复用、任务页与活体）
+  - 2026-11-12 立项。先判断目标可行性，再决定 doc/72 同组修订或创建继任编排组；不可行／不确定时告知或问用户，不盲目新建。继任组写 `handoff.md`（frontmatter 机器读、正文给人读），按 `(taskId,resultRevision)` 复用旧组不可变结果；原组先收口、预算不重置、外部副作用不自动重放
+  - 明确不做跨组调度依赖边、无限重规划、多继任组竞争与 Git 字段入 PG；验收含同组修订、继任复用、不可行、不确定、并发、预算、副作用与崩溃
+
+- **76** [项目内容目录与运行资源容器](76-项目内容目录与运行资源容器.md) ⬜（方案已点头、与 75 合并施工包待审，未施工）
+  - 落点：—（设计阶段；预计为项目路径函数、WorkspaceRef、Provider 路径、媒体／记忆／输出、迁移与整容器删除）
+  - 2026-11-12 立项。把 `workspaces/<wid>` 改为项目资源容器，用户只看 `content/`，异步工作区、不可变结果、临时文件、媒体与项目记忆归 `runtime/`；shared 是同组共享工作现场，isolated 是每 Task 独立现场，两者中间结果都不直接写 content，最终才发布
+  - 存量迁移采用复制 → 校验 → 原子切换；删除时清整个项目容器但不误删租户技能／工具、系统技能与用户记忆。用户级 skill／plugin 本期不做；验收含迁移、可见性、shared／isolated、Git／Directory、崩溃与删除
 
 ## 2. 历史存档（`doc/archive/`，不作施工面）
 

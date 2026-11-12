@@ -20,6 +20,8 @@ import (
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/components/tool/utils"
 	"github.com/cloudwego/eino/compose"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // dropAgentOrchestrationTools 把「创建与改图」类工具从入口快照里剔掉（doc/70 §6.3、doc/72 §4.8）。
@@ -55,6 +57,13 @@ type agentTaskRunBox struct {
 	// InputTimeout 是 Task 提问的截止时长（-task-input-timeout）：>0 时 openWaitRow 落 expires_at，
 	// 0 表示不限时。装配与 resume 两条路都从这里注入，保证启动与恢复看到同一个值。
 	InputTimeout time.Duration
+	// doc/74：隔离执行的工作区信息，领取时由 prepareTaskWork 填好。
+	// WorkRoot 非空 = worker 用它顶掉原项目目录作为工具根（执行者不直接碰原项目）。
+	WorkRoot        string
+	ExtraWriteRoots []string
+	WorkspaceMode   string
+	WorkspaceProvider string
+	ConflictCount   int
 }
 
 type agentTaskRunBoxKey struct{}
@@ -86,9 +95,12 @@ func planEnvFromProfile(ctx context.Context) planEnv {
 // 「错误：」开头的 tool 结果回注，模型可以改参数重试。
 func taskCreateErrText(err error) string {
 	var pe *planError
+	var wce *workspaceConfigError
 	switch {
 	case errors.As(err, &pe):
 		return "任务计划不合法：" + pe.reason
+	case errors.As(err, &wce):
+		return "工作区配置不合法：" + wce.reason
 	case errors.Is(err, errPlanConflict):
 		return "这个创建键已经用于另一份计划，换一个键或改回原计划"
 	case errors.Is(err, errCreateSource):
@@ -113,6 +125,9 @@ type delegateTaskInput struct {
 	ModelRef string `json:"modelRef,omitempty" jsonschema:"description=可选；缺省继承该执行者的模型配置"`
 	// PlanCheckpoint=true：这件 Task 成功后暂停组，等一次计划复核（doc/72 §6.1）。
 	PlanCheckpoint bool `json:"planCheckpoint,omitempty" jsonschema:"description=可选；这件任务成功后暂停整组，等一次计划复核再继续"`
+	// 工作区配置（doc/74 §4.1）：schema 只讲独立工作现场与通用验证，不出现 Git 要求。
+	WorkspaceMode string `json:"workspaceMode,omitempty" jsonschema:"description=可选；isolated=在独立工作现场执行（与其他并行任务互不覆盖，结果验证后发布回项目），缺省 shared=直接在项目目录工作"`
+	VerifyCommand string `json:"verifyCommand,omitempty" jsonschema:"description=可选；仅 isolated 可用：结果接受前在工作现场内运行的通用检查命令（如 npm test），通过才接受结果"`
 }
 
 // newDelegateTaskTool 造 delegate_task：创建一件单节点编排组（持久 Task），立即返回
@@ -154,6 +169,8 @@ func handleDelegateTask(ctx context.Context, store *Store, in delegateTaskInput)
 		Agent:           in.Agent,
 		ModelRef:        in.ModelRef,
 		PlanCheckpoint:  in.PlanCheckpoint,
+		WorkspaceMode:   in.WorkspaceMode,
+		VerifyCommand:   in.VerifyCommand,
 	}, planEnvFromProfile(ctx))
 	if err != nil {
 		return "", fmt.Errorf("%s", taskCreateErrText(err))
@@ -185,6 +202,9 @@ type createOrchestrationInput struct {
 	Goal  string                   `json:"goal" jsonschema:"description=整个编排要达成的目标，写清最终要交付什么"`
 	Tasks []orchestrationTaskInput `json:"tasks" jsonschema:"description=全部节点（1–32 件），恰好一个没有下游的节点是最终交付"`
 	Links []orchestrationLinkInput `json:"links,omitempty" jsonschema:"description=依赖边：parent 成功后 child 才具备执行资格"`
+	// 工作区配置（doc/74 §4.1）：整组一个模式，不允许每节点混合。
+	WorkspaceMode string `json:"workspaceMode,omitempty" jsonschema:"description=可选；isolated=整组在各自独立工作现场执行（并行任务互不覆盖，结果验证后发布回项目），缺省 shared=直接在项目目录工作"`
+	VerifyCommand string `json:"verifyCommand,omitempty" jsonschema:"description=可选；仅 isolated 可用：结果接受前在工作现场内运行的通用检查命令（如 npm test），通过才接受结果"`
 }
 
 // newCreateOrchestrationTool 造 create_orchestration：一次提交整张初始 DAG，原子建组——
@@ -221,6 +241,8 @@ func handleCreateOrchestration(ctx context.Context, store *Store, in createOrche
 		SourceSessionID: box.session,
 		SourceRunID:     string(box.run),
 		Goal:            in.Goal,
+		WorkspaceMode:   in.WorkspaceMode,
+		VerifyCommand:   in.VerifyCommand,
 	}
 	for _, t := range in.Tasks {
 		cmd.Tasks = append(cmd.Tasks, planTask{
@@ -466,6 +488,7 @@ func handleSubmitTaskResult(ctx context.Context, store *Store, in submitTaskResu
 	if err != nil {
 		return "", fmt.Errorf("%s", submitErrText(err))
 	}
+	trace.SpanFromContext(ctx).SetAttributes(attribute.Int("tako.workspace.result_revision", revision))
 	b, _ := json.Marshal(map[string]any{
 		"taskId": tb.TaskID, "resultRevision": revision, "status": agentTaskStatusRunning,
 	})

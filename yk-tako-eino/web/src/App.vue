@@ -994,6 +994,7 @@ const ATTENTION_LABEL: Record<string, string> = {
   plan_review: '计划待决策',
   interrupted: '已中断，待恢复',
   delivery_failed: '交付失败',
+  publication_blocked: '发布受阻',
 }
 function attentionLabel(item: AttentionItem): string {
   if (item.kind === 'question' && item.count > 1) return `待回答（${item.count}）`
@@ -1057,7 +1058,11 @@ function openAttention(item: AttentionItem) {
   }
   taskFocus.value = {
     workspaceId: wid,
-    taskId: item.kind === 'question' || item.kind === 'interrupted' ? item.taskId : '',
+    // 发布受阻进最终 Task 的发布面板（doc/74 §11.3），不是组视图也不是通知恢复。
+    taskId:
+      item.kind === 'question' || item.kind === 'interrupted' || item.kind === 'publication_blocked'
+        ? item.taskId
+        : '',
     orchestrationId:
       item.kind === 'plan_review' || item.kind === 'delivery_failed' ? item.orchestrationId : '',
     questionId: item.kind === 'question' ? item.questionId : '',

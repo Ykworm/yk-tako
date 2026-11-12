@@ -2,6 +2,7 @@ package runengine
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/cloudwego/eino/schema"
@@ -72,5 +73,35 @@ func TestTaskToolSurfaces(t *testing.T) {
 	}
 	if !delivery["read_text_file"] {
 		t.Fatalf("交付 run 被误删了只读工具：%v", delivery)
+	}
+}
+
+// TestSubmitTaskResultErrorAsResult 钉住 submit_task_result 进执行者池时包了 wrapToolErrors：
+// 提交被拒（验证未过／没有 run 身份等业务错误）必须回注「错误：…」结果让执行者返工，
+// 而不是裸抛 error 被 ToolsNode 当 NodeRunError 打挂整场 run（doc/74 §8.2 验证返工的前提）。
+func TestSubmitTaskResultErrorAsResult(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	w := &Worker{store: s}
+	var submit tool.InvokableTool
+	for _, x := range w.agentTaskExecutorBase(ctx, nil) {
+		info, err := x.Info(ctx)
+		if err != nil {
+			t.Fatalf("Info: %v", err)
+		}
+		if info.Name == "submit_task_result" {
+			submit, _ = x.(tool.InvokableTool)
+		}
+	}
+	if submit == nil {
+		t.Fatal("执行者池里没有 submit_task_result")
+	}
+	// 没有 run 身份 → 工具返回业务错误；包装后应是 nil error + 「错误：…」文本。
+	out, err := submit.InvokableRun(ctx, `{"summary":"x","artifacts":[]}`)
+	if err != nil {
+		t.Fatalf("submit_task_result 拒绝裸抛了 error（漏包 wrapToolErrors，会打挂 run）：%v", err)
+	}
+	if !strings.HasPrefix(out, "错误：") || !strings.Contains(out, "没有 run 身份") {
+		t.Fatalf("拒绝应回注错误文本供返工，got %q", out)
 	}
 }

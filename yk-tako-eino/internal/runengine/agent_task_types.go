@@ -37,8 +37,49 @@ const (
 	agentTaskStatusFailed    = "failed"
 	agentTaskStatusBlocked   = "blocked"
 	agentTaskStatusCancelled = "cancelled"
+	// agentTaskStatusPublishing 是隔离组最终 Task 的存储状态（doc/74 §4.6）：最终 run 已
+	// complete、结果已接受，但发布仍 pending/publishing。不是 interrupted，不占模型执行容量。
+	agentTaskStatusPublishing = "publishing"
 	// agentTaskStatusInterrupted 只在 API 视图出现（读侧派生），永不入库。
 	agentTaskStatusInterrupted = "interrupted"
+)
+
+// 工作区模式词表（doc/74 §4.1）：组级配置。shared 是既有正式行为（默认）；isolated 整组
+// 使用 WorkspaceProvider 的独立工作现场。Task 与 DAG 不认识 Git——模式只有这两个通用值。
+const (
+	workspaceModeShared   = "shared"
+	workspaceModeIsolated = "isolated"
+)
+
+// Provider 类型词表（doc/74 §4.3）：详情读面从组目录 state.json 现读，不从 PG 取。
+// pending = 尚未准备（组目录或 state.json 还不存在）。
+const (
+	workspaceProviderPending   = "pending"
+	workspaceProviderGit       = "git"
+	workspaceProviderDirectory = "directory"
+)
+
+// 发布状态词表（doc/74 §5.1，agent_orchestrations.publication_status）：
+// 空 = 无发布（shared 组恒空）；pending → publishing → published，或 blocked 等处理。
+const (
+	publicationStatusPending    = "pending"
+	publicationStatusPublishing = "publishing"
+	publicationStatusBlocked    = "blocked"
+	publicationStatusPublished  = "published"
+)
+
+// 发布受阻的通用机器原因（doc/74 §4.5/§7.3/§8.3）：retry-publication 只认这三个。
+const (
+	taskErrWorkspaceChanged    = "workspace_changed"           // 项目已前进，旧结果不能覆盖
+	taskErrWorkspaceDirty      = "workspace_dirty"             // 项目有未保存内容
+	taskErrPublicationRecovery = "publication_recovery_required" // 现场无法解释，需人工检查
+)
+
+// 验证证据状态词表（doc/74 §4.3）："" = 未运行；证据文件在共享卷，不在 PG。
+const (
+	verificationStatusRunning = "running"
+	verificationStatusPassed  = "passed"
+	verificationStatusFailed  = "failed"
 )
 
 // 交付状态词表（doc/70 §9.3）。空串 = 没有可交付结果（组 failed / 单件通知）。
@@ -133,11 +174,19 @@ type AgentOrchestration struct {
 	// PlanRevision 是图的接受版本（初始 0；每接受一次修订 +1）。它是修订 CAS 的版本号。
 	PlanRevision int `gorm:"not null;default:0"`
 	// PlanHold=true 表示检查点已触发：停止新领取与组收口，等一次 continue／revision。
-	PlanHold    bool `gorm:"not null;default:false"`
-	CreatedAt   time.Time
-	FinishedAt  *time.Time
-	DeliveredAt *time.Time
-	UpdatedAt   time.Time
+	PlanHold bool `gorm:"not null;default:false"`
+	// 工作区配置与发布状态（doc/74 §5.1）：PG 只存通用业务事实。
+	// Provider 内部字段（branch/commit/repo/worktree/哈希）一律不进这张表。
+	WorkspaceMode        string `gorm:"not null;default:shared"` // shared / isolated
+	VerifyCommand        string `gorm:"not null;default:''"`
+	PublicationStatus    string `gorm:"not null;default:''"` // '' / pending / publishing / blocked / published
+	PublicationErrorCode string `gorm:"not null;default:''"`
+	PublicationEpoch     int64  `gorm:"not null;default:0"`
+	PublishedAt          *time.Time
+	CreatedAt            time.Time
+	FinishedAt           *time.Time
+	DeliveredAt          *time.Time
+	UpdatedAt            time.Time
 }
 
 func (AgentOrchestration) TableName() string { return "agent_orchestrations" }
@@ -289,6 +338,37 @@ type agentTaskView struct {
 	StartedAt       *time.Time  `json:"startedAt"`
 	FinishedAt      *time.Time  `json:"finishedAt"`
 	UpdatedAt       time.Time   `json:"updatedAt"`
+	// Workspace 是隔离组的通用工作区摘要（doc/74 §4.3），追加在视图末尾；
+	// shared 响应不出现这个键（omitempty + nil）。
+	Workspace *taskWorkspaceView `json:"workspace,omitempty"`
+}
+
+// taskWorkspaceView 是隔离组详情的 workspace 读面（doc/74 §4.3）。
+// 键序固定：mode → provider → verification → publication。
+// provider 从组目录现读；verification 证据在共享卷；publication 来自通用 PG 状态。
+type taskWorkspaceView struct {
+	Mode         string                    `json:"mode"`
+	Provider     string                    `json:"provider"`
+	Verification workspaceVerificationView `json:"verification"`
+	Publication  workspacePublicationView  `json:"publication"`
+}
+
+// workspaceVerificationView 键序：configured → status（→ exitCode → outputPath）。
+// status：""/running/passed/failed。exitCode／outputPath 只在证据已收尾（passed/failed）
+// 时追加，供发布面板展示退出状态与输出位置（施工包 §11.2）；未运行/running 不出现这两键，
+// 无证据时的字节与既有契约完全一致。
+type workspaceVerificationView struct {
+	Configured bool   `json:"configured"`
+	Status     string `json:"status"`
+	ExitCode   *int   `json:"exitCode,omitempty"`
+	OutputPath string `json:"outputPath,omitempty"`
+}
+
+// workspacePublicationView 键序：status → errorCode → epoch。
+type workspacePublicationView struct {
+	Status    string `json:"status"`
+	ErrorCode string `json:"errorCode"`
+	Epoch     int64  `json:"epoch"`
 }
 
 // orchestrationBody 是编排组视图的组半。
@@ -311,6 +391,9 @@ type orchestrationBody struct {
 	FinishedAt        *time.Time `json:"finishedAt"`
 	DeliveredAt       *time.Time `json:"deliveredAt"`
 	UpdatedAt         time.Time  `json:"updatedAt"`
+	// Workspace 与 agentTaskView 同一形状（doc/74 §4.3），追加在组半末尾；shared 不出现。
+	// 组摘要的验证状态取最终 Task 的证据文件。
+	Workspace *taskWorkspaceView `json:"workspace,omitempty"`
 }
 
 // taskLinkView 是依赖边视图：parent → child。

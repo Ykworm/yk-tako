@@ -83,6 +83,7 @@ func accessLogLine(p gin.LogFormatterParams) string {
 // NewServer 造 Server（路由面的装配产物）。main 需要拿到 *Server 本体：Task 调度循环的
 // 两条装配口（AttachTaskScheduler）都挂在它上面。NewRouter 是「只引擎」的旧入口，包一层。
 func NewServer(store *Store, batchWindow int, dev bool, worker *Worker, resumeMax int, auth *Auth, systemSkillsDir string) *Server {
+	store.SetWorkspaceRoot(worker.Workspace())
 	return &Server{store: store, w: batchWindow, dev: dev, worker: worker, mediaRoot: worker.Workspace(), mcpConfPath: defaultMcpConfPath, resumeMax: resumeMax, systemSkillsDir: systemSkillsDir, auth: auth}
 }
 
@@ -197,6 +198,9 @@ func (s *Server) RouterFor() *gin.Engine {
 	r.POST("/api/orchestrations/:id/stop", authn, s.auth.RequireTenantRole("member"), s.stopAgentOrchestration)
 	// 任务级恢复（doc/70 §10.1）：复用 ClaimResume / 账本重放 / Redis seed，装配口换执行者。
 	r.POST("/api/tasks/:id/resume", traceIngress(), authn, s.resumeAgentTask)
+	// 隔离结果产物与人工重新发布（doc/74 §4.4/§4.5）：产物读面 authn + 属主链，写面 member。
+	r.GET("/api/tasks/:id/artifact", authn, s.getTaskArtifact)
+	r.POST("/api/tasks/:id/retry-publication", traceIngress(), authn, s.auth.RequireTenantRole("member"), s.retryTaskPublication)
 	// 协调通知的读面与人工重新处理（doc/73 §4.1/§4.2）：读面 authn + 属主链，写面 member。
 	r.GET("/api/notifications/:id", authn, s.getAgentNotification)
 	r.POST("/api/notifications/:id/retry", traceIngress(), authn, s.auth.RequireTenantRole("member"), s.retryAgentNotification)
@@ -546,6 +550,11 @@ func (s *Server) postRuns(c *gin.Context) {
 	// doc/42 §4.3 第 2 条的事，不同批做。
 	if errors.Is(err, errTenantFull) {
 		writeEnvelope(c, http.StatusTooManyRequests, codeQuota, "这个工作区的额度用完了", nil)
+		return
+	}
+	// doc/74 §9.1：项目正在发布隔离结果的短窗口内，同项目新 run 稍后再试。
+	if errors.Is(err, errWorkspacePublishing) {
+		writeEnvelope(c, http.StatusConflict, codeWorkspacePublishing, "项目正在发布结果，请稍后再试", nil)
 		return
 	}
 	// errProjectBusy（项目忙 409）已随项目闸退役（doc/42，2026-10-22）——同项目并发不再被拒。

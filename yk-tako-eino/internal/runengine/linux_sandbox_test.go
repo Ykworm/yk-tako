@@ -42,7 +42,7 @@ func TestBwrapArgsGolden(t *testing.T) {
 		}
 		return false
 	}
-	got := bwrapArgs(root, []string{inside, extra}, []string{"/bin/bash", "-c", "echo hi"}, exists)
+	got := bwrapArgs(root, []string{inside, extra}, nil, []string{"/bin/bash", "-c", "echo hi"}, exists)
 	want := []string{
 		"--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup",
 		"--die-with-parent", "--new-session",

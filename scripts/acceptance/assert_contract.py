@@ -60,6 +60,19 @@ def check_step(expect, http, body, vars, tally, label):
 
     if "http" in expect:
         want(http == expect["http"], f"HTTP {http} ≠ {expect['http']}")
+    # 原始字节响应（artifact 端点不进信封）：body 是 bytes，逐字比 raw / 含 raw_contains。
+    if isinstance(body, (bytes, bytearray)):
+        text = bytes(body).decode("utf-8", "replace")
+        if "raw" in expect:
+            want(text == expect["raw"], f"原始字节 {text!r} ≠ {expect['raw']!r}")
+        if "raw_contains" in expect:
+            missing = [s for s in expect["raw_contains"] if s not in text]
+            want(not missing, f"原始字节里缺 {missing}（实有 {text[:160]!r}）")
+        if bad:
+            tally.no(label, "；".join(bad))
+            return False
+        tally.ok(label)
+        return True
     if not isinstance(body, dict):
         bad.append(f"响应不是 JSON 信封：{body!r}")
     else:
@@ -262,6 +275,60 @@ def run_case(case, key, tally, only_print, seed):
             tally.ok("%s 造文件 %s" % (label, wid))
             continue
 
+        if op == "seed_group":
+            # 往**组工作区目录**里造隔离组的现场（doc/74 §5.2）：state.json + 不可变结果
+            # （result.json 清单 + artifacts/ 字节）+ 验证证据。布局 =
+            # <WS_ROOT>/tenants/<tid>/.tako/orchestrations/<orchID>/workspace/。
+            # 这些是文件系统上的产物，SQL 造不出来；artifact / retry-publication 的 core 用例
+            # 靠它把「已固化结果」摆到位，不必真跑模型。
+            # artifacts 条目带 content = 写文件；不带 content = 只进清单不写文件（造「产物缺失」117110）。
+            orid = resolve_path(step["orchestration"], vars)
+            gdir = Path(harness.WS_ROOT) / "tenants" / vars["ten"] / ".tako" / "orchestrations" / orid / "workspace"
+            provider = step.get("provider", "directory")
+            try:
+                gdir.mkdir(parents=True, exist_ok=True)
+                now = "2026-11-12T00:00:00Z"
+                (gdir / "state.json").write_text(json.dumps({
+                    "formatVersion": 1, "workspaceMode": "isolated", "provider": provider,
+                    "createdAt": now, "updatedAt": now,
+                }, ensure_ascii=False))
+                for res in step.get("results") or []:
+                    tid = resolve_path(res["task"], vars)
+                    rev = int(res["revision"])
+                    rdir = gdir / "results" / tid / str(rev)
+                    (rdir / "artifacts").mkdir(parents=True, exist_ok=True)
+                    manifest = []
+                    for a in res.get("artifacts") or []:
+                        ap = resolve_path(a["path"], vars)
+                        manifest.append({"path": ap, "kind": a.get("kind", "")})
+                        if "content" in a:
+                            f = rdir / "artifacts" / ap
+                            f.parent.mkdir(parents=True, exist_ok=True)
+                            f.write_text(subst(a["content"], vars))
+                    (rdir / "result.json").write_text(json.dumps({
+                        "taskId": tid, "resultRevision": rev, "provider": provider,
+                        "artifacts": manifest, "createdAt": now,
+                        "reference": res.get("reference", "seed-ref"),
+                    }, ensure_ascii=False))
+                for ev in step.get("verification") or []:
+                    tid = resolve_path(ev["task"], vars)
+                    vdir = gdir / "verification"
+                    vdir.mkdir(parents=True, exist_ok=True)
+                    out = ev.get("outputPath", "")
+                    (vdir / (tid + ".json")).write_text(json.dumps({
+                        "taskId": tid, "status": ev.get("status", "passed"),
+                        "exitCode": int(ev.get("exitCode", 0)), "outputPath": out,
+                        "startedAt": now, "finishedAt": now,
+                    }, ensure_ascii=False))
+                    if out and "output" in ev:
+                        (gdir / out).parent.mkdir(parents=True, exist_ok=True)
+                        (gdir / out).write_text(subst(ev["output"], vars))
+            except OSError as e:
+                tally.no(label, "造组现场失败：%s" % e)
+                return False
+            tally.ok("%s 造组现场 %s" % (label, orid))
+            continue
+
         if op == "seed_skill":
             # 往本租户的技能根里造一个技能目录（doc/52）：<WS_ROOT>/tenants/<tid>/skills/<name>/SKILL.md。
             # 造完要跟一步 POST /api/skills/rescan 才进表——盘是正文，表是目录。
@@ -346,7 +413,7 @@ def run_case(case, key, tally, only_print, seed):
             token = vars.get(step["tokenVar"])
         else:
             token = vars.get("tok") if step.get("auth", True) else None
-        http, body = harness.call(step["method"], path, body_in, token)
+        http, body = harness.call(step["method"], path, body_in, token, raw=bool(step.get("raw")))
 
         for name, expr in (step.get("capture") or {}).items():
             val = harness.pick(body, expr)
@@ -354,7 +421,8 @@ def run_case(case, key, tally, only_print, seed):
                 vars[name] = val
 
         if only_print:
-            print(f"  {label} {step['method']} {path} → HTTP {http} {json.dumps(body, ensure_ascii=False)[:300]}")
+            shown = repr(body[:200]) if isinstance(body, (bytes, bytearray)) else json.dumps(body, ensure_ascii=False)[:300]
+            print(f"  {label} {step['method']} {path} → HTTP {http} {shown}")
             continue
 
         if not check_step(step.get("expect", {}), http, body, vars, tally, label):

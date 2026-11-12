@@ -608,8 +608,9 @@ export const CODE_TASK_NOT_RESUMABLE = 117103 // 这件任务现在不能恢复�
 export const CODE_TASK_FINISHED = 117104 // 这件任务已经结束，不能停止
 export const CODE_ORCH_FINISHED = 117105 // 这个编排组已经结束，不能停止
 
-// 结果里的一个产物引用：path 是**相对项目根**的路径，取字节走项目文件的现成出口
-// （workspaceFileUrl + authFetch，见 TasksView；不能直接塞 <a href>，/api/media 要 Bearer 头）。
+// 结果里的一个产物引用：path 是**相对项目根**的路径。取字节分两条出口（doc/74 §4.4）：
+// 隔离结果走 taskArtifactUrl（不可变结果版本）；shared 结果与「项目当前文件」走
+// workspaceFileUrl。两者都要 authFetch 带 Bearer 头，不能直接塞 <a href>。
 export type TaskArtifact = { path: string; kind: string }
 
 // submit_task_result 提交的交接摘要；未提交的任务 result 是 null。
@@ -617,6 +618,18 @@ export type TaskResult = { summary: string; artifacts: TaskArtifact[]; metadata:
 
 // 机器错误与展示文案分开（doc/70 §4.3）：code 给分支，message 直接就是给人看的句子。
 export type TaskErrorView = { code: string; message: string }
+
+// 隔离组的通用工作区摘要（doc/74 §4.3）：shared 响应**没有** workspace 键，类型上可选。
+// provider 词表 pending（尚未准备）/ git / directory；验证 status ""/running/passed/failed，
+// 收尾证据才带 exitCode 与 outputPath（相对组目录的输出留存位置）。
+// publication：status ""/pending/publishing/published/blocked；errorCode 是通用发布三码
+// （workspace_changed / workspace_dirty / publication_recovery_required）；epoch 是发布代次。
+export type TaskWorkspaceView = {
+  mode: string
+  provider: string
+  verification: { configured: boolean; status: string; exitCode?: number; outputPath?: string }
+  publication: { status: string; errorCode: string; epoch: number }
+}
 
 // GET 返回的完整 Task。字段序是契约字节序（taskId → … → updatedAt），interrupted 不入库、
 // 是读侧派生：running 且当前 run 租约过期时服务端把 status 写成 interrupted。
@@ -640,6 +653,8 @@ export type AgentTask = {
   startedAt: string | null
   finishedAt: string | null
   updatedAt: string
+  // doc/74 §4.3：隔离组追加在视图末尾；shared 响应不出现这个键。
+  workspace?: TaskWorkspaceView
 }
 
 export type TaskListResponse = { tasks: AgentTask[] }
@@ -664,6 +679,8 @@ export type OrchestrationBody = {
   finishedAt: string | null
   deliveredAt: string | null
   updatedAt: string
+  // doc/74 §4.3：与 Task 同一形状，追加在组半末尾；shared 不出现。
+  workspace?: TaskWorkspaceView
 }
 
 export type TaskLink = { parentTaskId: string; childTaskId: string }
@@ -761,7 +778,9 @@ export type ContinueResult = { orchestrationId: string; revision: number; planHo
 export type TaskQuestion = QuestionRow & { expiresAt?: string }
 
 // 关注聚合的一行：不适用字段是空串，不省键（doc/72 §4.6）。
-export type AttentionKind = 'question' | 'plan_review' | 'interrupted' | 'delivery_failed'
+// doc/74 §4.6：publication_blocked = 隔离最终 Task 发布受阻，没有通知行，
+// 处理入口是任务页发布面板的 retry-publication。
+export type AttentionKind = 'question' | 'plan_review' | 'interrupted' | 'delivery_failed' | 'publication_blocked'
 export type AttentionItem = {
   kind: AttentionKind | string
   taskId: string
@@ -878,6 +897,33 @@ export function getNotification(notificationId: string): Promise<NotificationDet
 export function retryNotification(notificationId: string): Promise<NotificationRetryResult> {
   return request<NotificationRetryResult>(
     `/api/notifications/${encodeURIComponent(notificationId)}/retry`,
+    { method: 'POST' },
+  )
+}
+
+// —— 隔离工作区的产物与重新发布（doc/74）——
+export const CODE_TASK_NOT_REPUBLISHABLE = 117112 // 这件任务现在不能重新发布
+
+// 隔离结果的不可变产物字节出口：按 Task 当前 resultRevision 读，不读主项目同路径文件。
+// 与 workspaceFileUrl 一样要 authFetch 带 Bearer 头；shared 任务打这个端点是 400 111002。
+export function taskArtifactUrl(taskId: string, relPath: string): string {
+  return `/api/tasks/${encodeURIComponent(taskId)}/artifact?path=${encodeURIComponent(relPath)}`
+}
+
+// POST retry-publication 的 data（202 新处理 run / 200 已有在处理的 run，同形）：
+// taskId → runId → status → publicationEpoch。publicationEpoch 是本次处理完成后发布将使用的代次。
+export type PublicationRetryResult = {
+  taskId: string
+  runId: RunID
+  status: string
+  publicationEpoch: number
+}
+
+// 人工重新发布：只认 isolated 最终 Task 的发布受阻；服务端在同一执行 session 铸新 run。
+// 409 117112 = 现在不能重新发布（可能别的 tab 抢先、已发布或结果失效）；409 117110 = 产物不可读。
+export function retryTaskPublication(taskId: string): Promise<PublicationRetryResult> {
+  return request<PublicationRetryResult>(
+    `/api/tasks/${encodeURIComponent(taskId)}/retry-publication`,
     { method: 'POST' },
   )
 }

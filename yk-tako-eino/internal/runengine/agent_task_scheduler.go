@@ -47,6 +47,9 @@ type agentTaskClaim struct {
 // complete + 没有有效提交 → failed/result_not_submitted；error → failed/run_error；
 // stopped → cancelled。崩溃可能发生在 run complete 与 Task 翻转之间，所以条件 UPDATE
 // （WHERE status='running'）是幂等的本体：下一次看到同一 run 仍能完成同一转换，不新增行。
+//
+// 隔离最终 Task 例外（doc/74 §9.2/§9.3）：有效提交还要求不可变结果完整，缺失不得标 succeeded；
+// 完整则落 publishing（组 publication_status=pending 同事务），提交后当场走发布收尾快路径。
 func (s *Store) ReconcileRun(ctx context.Context, runID RunID) error {
 	var row struct {
 		RunStatus       string `gorm:"column:run_status"`
@@ -60,10 +63,13 @@ func (s *Store) ReconcileRun(ctx context.Context, runID RunID) error {
 		Result          string `gorm:"column:result"`
 		ResultRevision  int    `gorm:"column:result_revision"`
 		PlanCheckpoint  bool   `gorm:"column:plan_checkpoint"`
+		WorkspaceMode   string `gorm:"column:workspace_mode"`
+		FinalTaskID     string `gorm:"column:final_task_id"`
 	}
 	res := s.db.WithContext(ctx).Raw(`
 SELECT r.status AS run_status, r.lease_epoch, t.id AS task_id, t.tenant_id, t.orchestration_id,
-       o.source_session_id, t.status, t.result_run_id, t.result, t.result_revision, t.plan_checkpoint
+       o.source_session_id, t.status, t.result_run_id, t.result, t.result_revision, t.plan_checkpoint,
+       o.workspace_mode, o.final_task_id
   FROM runs r
   JOIN agent_tasks t ON t.current_run_id = r.id
   JOIN agent_orchestrations o ON o.id = t.orchestration_id
@@ -77,10 +83,20 @@ SELECT r.status AS run_status, r.lease_epoch, t.id AS task_id, t.tenant_id, t.or
 	status := ""
 	errCode := ""
 	errMsg := ""
+	publishing := false
 	switch row.RunStatus {
 	case "complete":
 		if row.ResultRunID == string(runID) && row.Result != "" {
 			status = agentTaskStatusSucceeded
+			if row.WorkspaceMode == workspaceModeIsolated && row.TaskID == row.FinalTaskID {
+				if s.isolatedResultPresent(row.TenantID, row.OrchestrationID, row.TaskID, row.ResultRevision) {
+					publishing = true
+				} else {
+					status = agentTaskStatusFailed
+					errCode = taskErrResultNotSubmit
+					errMsg = "执行正常结束但不可变结果缺失"
+				}
+			}
 		} else {
 			status = agentTaskStatusFailed
 			errCode = taskErrResultNotSubmit
@@ -101,7 +117,34 @@ SELECT r.status AS run_status, r.lease_epoch, t.id AS task_id, t.tenant_id, t.or
 		updates["error_message"] = errMsg
 	}
 	checkpointed := false
+	publishingSet := false
 	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if publishing {
+			// 先组后 Task（与停止／发布收尾同序）：组仍 active 且没有发布状态才落 pending。
+			// 组已停止或已有发布状态 → 回落普通 succeeded 收口，不留没人管的 publishing。
+			r := tx.Model(&AgentOrchestration{}).
+				Where("id = ? AND status = ? AND publication_status = ''", row.OrchestrationID, orchStatusActive).
+				Updates(map[string]any{"publication_status": publicationStatusPending, "updated_at": nowUTC()})
+			if r.Error != nil {
+				return r.Error
+			}
+			if r.RowsAffected > 0 {
+				r2 := tx.Model(&AgentTask{}).Where("id = ? AND status = ?", row.TaskID, agentTaskStatusRunning).
+					Updates(map[string]any{"status": agentTaskStatusPublishing, "error_code": "", "error_message": ""})
+				if r2.Error != nil {
+					return r2.Error
+				}
+				if r2.RowsAffected == 0 {
+					// 组行锁在手，能抢先翻 Task 的只有停止：撤掉刚落的 pending，
+					// 不留没人认领的发布状态（幂等：另一副本先到的情形进不了这里）。
+					return tx.Model(&AgentOrchestration{}).
+						Where("id = ? AND publication_status = ?", row.OrchestrationID, publicationStatusPending).
+						Updates(map[string]any{"publication_status": "", "updated_at": nowUTC()}).Error
+				}
+				publishingSet = true
+				return nil
+			}
+		}
 		r := tx.Model(&AgentTask{}).Where("id = ? AND status = ?", row.TaskID, agentTaskStatusRunning).
 			Updates(updates)
 		if r.Error != nil {
@@ -121,36 +164,68 @@ SELECT r.status AS run_status, r.lease_epoch, t.id AS task_id, t.tenant_id, t.or
 		if status != agentTaskStatusSucceeded || !row.PlanCheckpoint {
 			return nil
 		}
-		// 检查点（doc/72 §6.1）：Task 成功与「组暂停 + 复核通知」同事务。锁组并确认仍 active；
-		// 组已被停止或收口时不再暂停（否则会留下一个没人能继续的 hold）。
-		var o AgentOrchestration
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ?", row.OrchestrationID).Take(&o).Error; err != nil {
+		cp, err := s.applyPlanCheckpointTx(tx, row.TenantID, row.OrchestrationID, row.TaskID, row.Receiver, row.ResultRevision)
+		if err != nil {
 			return err
 		}
-		if o.Status != orchStatusActive {
-			return nil
-		}
-		if err := tx.Exec(`UPDATE agent_orchestrations SET plan_hold = true, updated_at = now()
- WHERE id = ? AND status = ?`, o.ID, orchStatusActive).Error; err != nil {
-			return err
-		}
-		checkpointed = true
-		return s.insertNotificationTx(tx, AgentNotification{
-			TenantID: row.TenantID, OrchestrationID: row.OrchestrationID, TaskID: row.TaskID,
-			ReceiverSessionID: SessionID(row.Receiver), Kind: notifKindPlanReviewRequired,
-			DedupKey: fmt.Sprintf("%s:%s:%d", notifKindPlanReviewRequired, row.TaskID, row.ResultRevision),
-			Status:   notifStatusPending,
-		})
+		checkpointed = cp
+		return nil
 	}); err != nil {
 		return err
 	}
 	s.PublishEvent(ctx, row.TenantID, eventAgentTasksChanged, row.TaskID)
+	if publishingSet {
+		s.PublishEvent(ctx, row.TenantID, eventAgentOrchestrationsChanged, row.OrchestrationID)
+		// 快路径：与调度慢路径（reconcilePublications）调用同一个收尾服务。
+		// 失败只记日志——pending 已落库，慢路径会重试。
+		if err := s.reconcileOrchestrationPublication(ctx, row.OrchestrationID); err != nil {
+			log.Printf("publication fast path %s: %v", row.OrchestrationID, err)
+		}
+	}
 	if checkpointed {
 		s.PublishEvent(ctx, row.TenantID, eventAgentOrchestrationsChanged, row.OrchestrationID)
 		s.PublishTaskWake(ctx, row.TenantID, "checkpoint", row.TaskID)
 	}
 	return nil
+}
+
+// isolatedResultPresent 核验不可变结果确实完整（doc/74 §9.2：PG 已保存必须以 Provider final
+// 完整为前提）。作业根未配置、结果缺失或 result.json 损坏都算缺失——ReconcileRun 不得只凭
+// resultRunID 把这样的 Task 标 succeeded。
+func (s *Store) isolatedResultPresent(tenantID, orchID, taskID string, revision int) bool {
+	if s.workspaceRoot == "" {
+		return false
+	}
+	g := &GroupHandle{Dir: orchWorkspaceDir(s.workspaceRoot, tenantID, orchID)}
+	_, err := readImmutableResult(g, ResultRef{TaskID: taskID, ResultRevision: revision})
+	return err == nil
+}
+
+// applyPlanCheckpointTx 是检查点落库（doc/72 §6.1）：Task 成功与「组暂停 + 复核通知」同事务。
+// 锁组并确认仍 active；组已被停止或收口时不再暂停（否则会留下一个没人能继续的 hold）。
+// 普通成功链（ReconcileRun）与隔离发布收尾（finishPublication）共用。
+func (s *Store) applyPlanCheckpointTx(tx *gorm.DB, tenantID, orchID, taskID, receiver string, resultRevision int) (bool, error) {
+	var o AgentOrchestration
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ?", orchID).Take(&o).Error; err != nil {
+		return false, err
+	}
+	if o.Status != orchStatusActive {
+		return false, nil
+	}
+	if err := tx.Exec(`UPDATE agent_orchestrations SET plan_hold = true, updated_at = now()
+ WHERE id = ? AND status = ?`, o.ID, orchStatusActive).Error; err != nil {
+		return false, err
+	}
+	if err := s.insertNotificationTx(tx, AgentNotification{
+		TenantID: tenantID, OrchestrationID: orchID, TaskID: taskID,
+		ReceiverSessionID: SessionID(receiver), Kind: notifKindPlanReviewRequired,
+		DedupKey: fmt.Sprintf("%s:%s:%d", notifKindPlanReviewRequired, taskID, resultRevision),
+		Status:   notifStatusPending,
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // insertNotificationTx 落一条协调通知：dedup_key 唯一索引 + ON CONFLICT DO NOTHING，
@@ -357,9 +432,10 @@ SELECT o.id FROM agent_orchestrations o
    AND (o.status = ? OR o.plan_hold = false)
    AND NOT EXISTS (
      SELECT 1 FROM agent_tasks t WHERE t.orchestration_id = o.id
-       AND t.status IN (?, ?, ?, ?))`,
+       AND t.status IN (?, ?, ?, ?, ?))`,
 		orchStatusActive, orchStatusCancelling, orchStatusCancelling,
-		agentTaskStatusPending, agentTaskStatusReady, agentTaskStatusRunning, agentTaskStatusBlocked).
+		agentTaskStatusPending, agentTaskStatusReady, agentTaskStatusRunning, agentTaskStatusBlocked,
+		agentTaskStatusPublishing).
 		Scan(&ids).Error; err != nil {
 		return 0, err
 	}
@@ -678,6 +754,8 @@ func wakeBatch(streams []redis.XStream, lastID string) (string, bool) {
 }
 
 // RunOnce 是一轮调度（§8.2 的顺序）。单轮函数独立成方法：测试不依赖 ticker。
+// 发布对账排在 AdvanceOrchestrations 之前：同一轮里 publishing 收口成 succeeded 后，
+// 组收口不必再等下一轮（doc/74 §9.3 快慢路径同一服务）。
 func (ts *TaskScheduler) RunOnce(ctx context.Context) {
 	ts.reconcileFinishedRuns(ctx)
 	ts.detectInterruptedTasks(ctx)
@@ -693,12 +771,14 @@ func (ts *TaskScheduler) RunOnce(ctx context.Context) {
 		log.Printf("task scheduler: promoted %d tasks", n)
 	}
 	ts.finishCancellingRuns(ctx)
+	ts.reconcilePublications(ctx)
 	if _, err := ts.store.AdvanceOrchestrations(ctx); err != nil {
 		log.Printf("task scheduler advance: %v", err)
 	}
 	ts.reconcileDeliveries(ctx)
 	ts.claimReady(ctx)
 	ts.consumeNotifications(ctx)
+	ts.cleanupWorkspaces(ctx)
 }
 
 // claimReady 找有 ready 节点的 active 组逐组领取；领取成功后装配并启动（提交后启动，§6.2 第 5 步）。

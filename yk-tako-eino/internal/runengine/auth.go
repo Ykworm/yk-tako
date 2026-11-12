@@ -233,7 +233,11 @@ const (
 	codeRevisionConflict  = 117108 // 409 这个修订键已经用于另一次修订
 	codeNotifNotRetryable = 117109 // 409 这条通知现在不能重新处理（非 failed、状态矛盾、旧 attempt 或已消费）
 	codeArtifactInvalid   = 117110 // 409 结果产物已不可读取（恢复前发现路径失效、越界或文件不存在）
-	codeInternal          = 111901
+	// 117111–117113：并行任务工作区隔离（doc/74 §4.7）。
+	codeWorkspaceConfigInvalid = 117111 // 400 工作区配置不合法（mode 词表、shared 携带验证命令、验证命令超限/NUL；原因进 data.reason）
+	codeTaskNotRepublishable   = 117112 // 409 这件任务现在不能重新发布（非最终、非 blocked、非发布错误等）
+	codeWorkspacePublishing    = 117113 // 409 项目正在发布结果，请稍后再试（只在 workspaces 有当前发布标记时挡同项目新 run）
+	codeInternal               = 111901
 )
 
 var emailPattern = regexp.MustCompile(`^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$`)

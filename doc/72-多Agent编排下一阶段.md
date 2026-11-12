@@ -35,7 +35,7 @@ doc/70 V1 已经证明：一件持久 Task 可以独立执行、提交结果、�
 ### 2.2 非目标
 
 - 不开放任意改图：不改写 running／succeeded Task 的指令、执行者、模型或历史结果，不删除历史执行事实。
-- 不做 Agent 自由群聊、无限共享历史、默认嵌套 DAG、独立协调 Agent 或并行仓库 worktree 合并。
+- 不做 Agent 自由群聊、无限共享历史、默认嵌套 DAG 或独立协调 Agent；并行 Task 的工作区隔离、结果交接与发布恢复不在本篇，专项方案见 [doc/74](74-并行任务工作区隔离.md)（已落地 2026-11-12）。目标可行性判断与继任编排组也不在本篇，见 [doc/75](75-目标重规划与继任编排组.md)（方案已点头、与 76 合并施工包待审）。
 - 不把 Task 的问题平铺进主会话现有 `pendingAsks`；mAgent 与同步子代理的问答交互保持现状。
 - 不新增 WebSocket；回答仍走普通 HTTP POST，浏览器只通过既有账号级 SSE 收提醒。
 - 不把所有轮询都改成事件：run 帧拉取、`ask_user` 的行等待、watchdog 续约等不在本次范围。
@@ -404,6 +404,7 @@ Task 的 `ask_user` 落行时写入 `expires_at = created_at + 当前配置`；�
 | `plan_review` | 编排组 `plan_hold=true` | 打开编排详情，查看当前图与修订历史，显式继续或要求 mAgent 复核 |
 | `interrupted` | Task 当前 run 租约过期，读侧为 interrupted | 打开 Task 详情，走既有显式恢复 |
 | `delivery_failed` | 编排组 `delivery_status=failed` | 打开编排与来源会话查看失败；按 doc/73 由人工显式恢复，不自动重试 |
+| `publication_blocked`（doc/74 增） | 隔离组最终 Task `blocked` 且 `errorCode` 是通用发布三码 | 打开 Task 发布面板，按 doc/74 调 `retry-publication`；没有通知行，不重跑父 Task |
 
 - 展开列表和处理项都消费真实 API；待答项显示当前数量和最早待答时间。
 - 完整问题卡、依赖图与修订时间线不塞进狭窄左侧栏，点击后进入对应 Task／编排详情。
@@ -441,7 +442,7 @@ GET /api/workspaces/:id/task-attention
 }
 ```
 
-`kind` 使用上表四个值。`questionId` 是该 Task 当前最早待答问题；组级 `plan_review`／`delivery_failed` 项的 `taskId`、`questionId` 可为空。`count` 只对待答问题表示当前条数，其余处理项为 1。实际字段是否省略由契约拍确定，本图不是已验收字节。
+`kind` 使用上表五个值（`publication_blocked` 由 doc/74 增，判定与跳转见该篇 §4.6）。`questionId` 是该 Task 当前最早待答问题；组级 `plan_review`／`delivery_failed` 项的 `taskId`、`questionId` 可为空。`count` 只对待答问题表示当前条数，其余处理项为 1。实际字段是否省略由契约拍确定，本图不是已验收字节。
 
 所有处理项都由 PG 现查现算，不建未读表，也不保存第二份计数：
 

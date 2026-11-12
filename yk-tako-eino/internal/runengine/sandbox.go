@@ -138,12 +138,16 @@ func SandboxStatus() string {
 // 而 /private/etc 不在系统读白名单里。这一条只放证书与配置（公开材料），不放 /private/etc 全树，
 // /etc/passwd 的显式拒绝照旧。
 //
+// /dev/null 单独放写（doc/74 实测）：git 起手以 O_RDWR 打开它，只读 /dev 会让任何 git 命令
+// 直接 fatal。它是丢弃数据的汇，不是存储——放写不扩大持久写边界。bwrap 的 --dev 自建可写
+// devtmpfs，天然满足；这条只补 seatbelt。
+//
 // ⚠️ root 与每条 extra 都必须用**解析后的真实路径**：seatbelt 的 subpath 匹配走真实路径，
 // 而 macOS 的 `/tmp` 是指向 `/private/tmp` 的符号链接 → 若把 root 写成 `/tmp/xxx`，
 // (subpath root) 匹配不上，agent 会连**自己项目里的文件都读不到**（Operation not permitted）。
-func sandboxProfile(root string, extraReadRoots []string) string {
+func sandboxProfile(root string, extraReadRoots []string, extraWriteRoots []string) string {
 	root = sandboxRealPath(root)
-	var system, extra strings.Builder
+	var system, extra, write strings.Builder
 	for _, r := range sandboxReadRoots("", "") {
 		fmt.Fprintf(&system, " (subpath %q)", r)
 	}
@@ -152,6 +156,19 @@ func sandboxProfile(root string, extraReadRoots []string) string {
 			continue
 		}
 		fmt.Fprintf(&extra, "(allow file-read* (subpath %q))\n", sandboxRealPath(r))
+	}
+	// Provider 声明的附加可写根（doc/74 §7.1：Git 组的本组 repo.git）。已在主根里的不重复放。
+	seenWrite := map[string]bool{}
+	for _, r := range extraWriteRoots {
+		if r == "" {
+			continue
+		}
+		r = sandboxRealPath(r)
+		if seenWrite[r] || pathWithin(root, r) {
+			continue
+		}
+		seenWrite[r] = true
+		fmt.Fprintf(&write, "(allow file-read* file-write* (subpath %q))\n", r)
 	}
 	return fmt.Sprintf(`(version 1)
 (deny default)
@@ -167,8 +184,27 @@ func sandboxProfile(root string, extraReadRoots []string) string {
 (allow file-read*%s)
 (allow file-read* (subpath "/private/etc/ssl"))
 %s(allow file-read* file-write* (subpath %q))
-(deny file-read-data (literal "/etc/passwd") (literal "/private/etc/passwd"))
-`, system.String(), extra.String(), root)
+(allow file-write* (literal "/dev/null"))
+%s(deny file-read-data (literal "/etc/passwd") (literal "/private/etc/passwd"))
+`, system.String(), extra.String(), root, write.String())
+}
+
+// gitSandboxEnv 是隔离 Git 工作现场里跑 git 的环境（doc/74 §7）：执行者 bash 与验证命令
+// 可能在围栏内跑 git，而宿主的 ~/.gitconfig 与系统配置在围栏外——git 对「存在但读不到」
+// 的配置文件按 fatal 处理（不是跳过）。全局配置与全局忽略清单指到 /dev/null、关掉系统
+// 配置，提交身份给固定程序值：执行者提交不借宿主用户的身份，也不依赖宿主配置可读。
+func gitSandboxEnv() []string {
+	return []string{
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=core.excludesFile",
+		"GIT_CONFIG_VALUE_0=/dev/null",
+		"GIT_AUTHOR_NAME=tako",
+		"GIT_AUTHOR_EMAIL=tako@localhost",
+		"GIT_COMMITTER_NAME=tako",
+		"GIT_COMMITTER_EMAIL=tako@localhost",
+	}
 }
 
 // sandboxReadRoots 是围栏的只读根清单（doc/52 D39）：系统可执行目录 + 项目根 + 租户工具根。
@@ -215,9 +251,9 @@ func sandboxWrap(cmd *exec.Cmd, root string) (*exec.Cmd, error) {
 	b := currentSandboxBackend()
 	switch b.kind {
 	case "bwrap":
-		return exec.Command(b.path, bwrapArgs(root, nil, cmd.Args, pathExists)...), nil
+		return exec.Command(b.path, bwrapArgs(root, nil, nil, cmd.Args, pathExists)...), nil
 	case "seatbelt":
-		args := append([]string{"-p", sandboxProfile(root, nil)}, cmd.Args...)
+		args := append([]string{"-p", sandboxProfile(root, nil, nil)}, cmd.Args...)
 		return exec.Command(b.path, args...), nil
 	default:
 		return nil, fmt.Errorf("这台机器没有可用的沙箱（%s），不能把租户 MCP server 当成已隔离", b.reason)
@@ -244,7 +280,7 @@ var bwrapEtcFiles = []string{
 // doc/problems/没有沙箱的系统怎么办/问题与方案.md。
 //
 // exists 注入是为了单测金样；生产传 pathExists。
-func bwrapArgs(root string, extraReadRoots []string, command []string, exists func(string) bool) []string {
+func bwrapArgs(root string, extraReadRoots []string, extraWriteRoots []string, command []string, exists func(string) bool) []string {
 	root = sandboxRealPath(root)
 	args := []string{
 		// 逐个卸命名空间（不用 --unshare-all：它含 net）
@@ -282,6 +318,19 @@ func bwrapArgs(root string, extraReadRoots []string, command []string, exists fu
 		}
 		seen[p] = true
 		args = append(args, "--ro-bind", p, p)
+	}
+	// Provider 声明的附加可写根（doc/74 §7.1）：--bind 读写挂载。已在主根里/重复/不存在的不挂。
+	seenWrite := map[string]bool{}
+	for _, p := range extraWriteRoots {
+		if p == "" {
+			continue
+		}
+		p = sandboxRealPath(p)
+		if seenWrite[p] || pathWithin(root, p) || !exists(p) {
+			continue
+		}
+		seenWrite[p] = true
+		args = append(args, "--bind", p, p)
 	}
 	args = append(args, "--bind", root, root, "--chdir", root, "--")
 	return append(args, command...)
@@ -350,8 +399,9 @@ func startBash(ctx context.Context, workspace, command string, timeout time.Dura
 		return cmd, cancel, false, runCtx, nil
 	}
 	extraReadRoots := append(skillReadRoots(ctx), toolsRootFor(ctx, workspace))
+	extraWriteRoots := extraWriteRootsFrom(ctx)
 	if backend.kind == "bwrap" {
-		cmd := exec.CommandContext(runCtx, backend.path, bwrapArgs(workspace, extraReadRoots, []string{"/bin/bash", "-c", command}, pathExists)...)
+		cmd := exec.CommandContext(runCtx, backend.path, bwrapArgs(workspace, extraReadRoots, extraWriteRoots, []string{"/bin/bash", "-c", command}, pathExists)...)
 		cmd.Dir = workspace
 		return cmd, cancel, true, runCtx, nil
 	}
@@ -360,7 +410,7 @@ func startBash(ctx context.Context, workspace, command string, timeout time.Dura
 		cancel()
 		return nil, func() {}, false, nil, err
 	}
-	if _, err := f.WriteString(sandboxProfile(workspace, extraReadRoots)); err != nil {
+	if _, err := f.WriteString(sandboxProfile(workspace, extraReadRoots, extraWriteRoots)); err != nil {
 		f.Close()
 		os.Remove(f.Name())
 		cancel()
@@ -374,4 +424,20 @@ func startBash(ctx context.Context, workspace, command string, timeout time.Dura
 		cancel()
 		os.Remove(name)
 	}, true, runCtx, nil
+}
+
+// extraWriteRoots 是 Provider 声明的沙箱附加可写根（doc/74 §7.1：Git 组的本组 repo.git）。
+// worker.run 从 Task 身份盒塞进 ctx，startBash 取出传给围栏；普通聊天 run 没有它（nil）。
+type extraWriteRootsKey struct{}
+
+func withExtraWriteRoots(ctx context.Context, roots []string) context.Context {
+	if len(roots) == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, extraWriteRootsKey{}, roots)
+}
+
+func extraWriteRootsFrom(ctx context.Context) []string {
+	roots, _ := ctx.Value(extraWriteRootsKey{}).([]string)
+	return roots
 }
