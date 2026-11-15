@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -396,6 +397,7 @@ func startBash(ctx context.Context, workspace, command string, timeout time.Dura
 		}
 		cmd := exec.CommandContext(runCtx, "bash", "-c", command)
 		cmd.Dir = workspace
+		cmd.SysProcAttr = procGroupAttr()
 		return cmd, cancel, false, runCtx, nil
 	}
 	extraReadRoots := append(skillReadRoots(ctx), toolsRootFor(ctx, workspace))
@@ -403,6 +405,7 @@ func startBash(ctx context.Context, workspace, command string, timeout time.Dura
 	if backend.kind == "bwrap" {
 		cmd := exec.CommandContext(runCtx, backend.path, bwrapArgs(workspace, extraReadRoots, extraWriteRoots, []string{"/bin/bash", "-c", command}, pathExists)...)
 		cmd.Dir = workspace
+		cmd.SysProcAttr = procGroupAttr()
 		return cmd, cancel, true, runCtx, nil
 	}
 	f, err := os.CreateTemp("", "tako-sb-*.sb")
@@ -420,10 +423,27 @@ func startBash(ctx context.Context, workspace, command string, timeout time.Dura
 	name := f.Name()
 	cmd := exec.CommandContext(runCtx, backend.path, "-f", name, "/bin/bash", "-c", command)
 	cmd.Dir = workspace
+	cmd.SysProcAttr = procGroupAttr()
 	return cmd, func() {
 		cancel()
 		os.Remove(name)
 	}, true, runCtx, nil
+}
+
+// procGroupAttr 让子进程自成进程组（pgid = 子进程 pid）。停止一条长命令时要连孙进程
+// 一起收（npm run build 会 fork 出一串），只杀直接子进程会留下一堆孤儿继续写工作目录。
+// 进程组是内核对一组进程的标识：kill(-pgid, …) 一次命中整组。
+func procGroupAttr() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{Setpgid: true}
+}
+
+// killProcessGroup 对整组发 SIGKILL（负号 = 组）。pgid <= 0 时什么都不做
+// （启动失败或调用方没记下 pid，不要拿 0/-1 当组号乱杀）。
+func killProcessGroup(pgid int64) {
+	if pgid <= 0 {
+		return
+	}
+	_ = syscall.Kill(-int(pgid), syscall.SIGKILL)
 }
 
 // extraWriteRoots 是 Provider 声明的沙箱附加可写根（doc/74 §7.1：Git 组的本组 repo.git）。

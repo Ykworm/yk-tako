@@ -31,7 +31,9 @@ const taskExecutorPrompt = `你是一场持久任务的执行者：你的首条�
 //   - delegate_task / create_orchestration／create_successor_orchestration：Task 执行者不得再
 //     创建异步编排或继任组（§6.3 第 2 条，doc/75 §4.4 重规划归来源会话）；
 //   - enter_plan_mode / submit_plan：计划审批是**来源会话**的事，执行者没有本人在场；
-//   - revise_orchestration / continue_orchestration：改图与放行归计划复核 run，执行者不得变更计划。
+//   - revise_orchestration / continue_orchestration：改图与放行归计划复核 run，执行者不得变更计划；
+//   - wait_task：按任务号等待是**来源会话**的能力（doc/82 §4-10）——执行者没有本会话的其它 Task
+//     可等，它的「等结果」是同步子代理。执行者统一从这张表过滤。
 //
 // ask_user 不再排除（doc/72 §7.1）：Task 执行者可以提问，问题带 expires_at，由任务页
 // 转给来源会话的人回答；超时由调度器收口为 failed/input_timeout。
@@ -39,6 +41,7 @@ var agentTaskNoTools = map[string]bool{
 	"delegate_task": true, "create_orchestration": true, "create_successor_orchestration": true,
 	"enter_plan_mode": true, "submit_plan": true,
 	"revise_orchestration": true, "continue_orchestration": true,
+	"wait_task": true,
 }
 
 // agentTaskExecutorBase 组执行者的工具基座：冻结池减去等人与异步创建，再并上本场连上的 MCP。

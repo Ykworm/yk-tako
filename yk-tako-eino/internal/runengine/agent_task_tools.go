@@ -15,6 +15,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 
 	"github.com/cloudwego/eino/components/tool"
@@ -24,6 +26,26 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// executionModePrompt 是「执行方式」规则块（doc/82 §6.7；施工包 §6.7 逐字）：静态拼进系统提示，
+// 与 taskBoardPrompt 同层。它回答「先判断工作怎样完成，再选工具」——同步子代理、持久 Task、
+// 后台命令、编排组各自的适用面，以及不许为显得有计划而造执行单元。
+const executionModePrompt = `## 执行方式
+先判断工作怎样完成，再选工具。不要为了显得有计划而创建执行单元。
+1. 当前上下文能完成：直接做。
+2. 需要独立上下文，且下一步就依赖结果：调用同步子代理，等它返回。
+3. 工作能离开当前 run、需要持久身份、后台推进或恢复：使用持久 Task。
+   拿到 taskId 后，先做不依赖它的工作；需要结果时用 wait_task；
+   没有别的工作可结束本轮，等待持久通知。
+4. 多件工作共享一个最终交付，且依赖已经确认：创建编排组。
+   只连真实结果依赖；最终节点由 finalTaskId 指向。
+5. 图执行中发现新工作：最终节点尚未开始时，读取最新 planRevision 后修订；
+   已交付或目标整体失效时，走继任组，不重写历史。
+6. 命令可能超过前台等待窗口：bash 启动后拿命令号；
+   继续独立工作；需要结果时用 bash_output 读取或等待，必要时 stop_bash 停止。
+7. shared 组不要并行写同一工作根；需要并行修改时使用 isolated 工作现场。
+不要：为了画出复杂图而增加节点；把文件写入冲突伪装成结果依赖；
+预先编造尚未确认的未来节点；用提示词代替权限、隔离或执行权。`
+
 // dropAgentOrchestrationTools 把「创建与改图」类工具从入口快照里剔掉（doc/70 §6.3、doc/72 §4.8）。
 // 剔在 base = 继承档、exclude_tools 档、tools 白名单档三档的共同来源——一份过滤管三条路。
 func dropAgentOrchestrationTools(ctx context.Context, tools []tool.BaseTool) []tool.BaseTool {
@@ -31,6 +53,9 @@ func dropAgentOrchestrationTools(ctx context.Context, tools []tool.BaseTool) []t
 		"delegate_task": true, "create_orchestration": true,
 		"revise_orchestration": true, "continue_orchestration": true,
 		"create_successor_orchestration": true,
+		// wait_task 属于根池（来源会话按任务号等待），子代理入口快照统一剔掉（施工包 §4-10）：
+		// 这里是继承档/排除档/白名单档三档的共同来源，不在这里剔新规格会默认继承它。
+		"wait_task": true,
 	}
 	out := make([]tool.BaseTool, 0, len(tools))
 	for _, t := range tools {
@@ -139,7 +164,8 @@ type delegateTaskInput struct {
 // 因此不需要模型自己发明键。
 func newDelegateTaskTool(store *Store) (tool.BaseTool, error) {
 	return utils.InferTool("delegate_task",
-		"把一件工作委派给独立执行者异步完成：立即返回任务号，不等结果；完成/失败会以持久通知回到本会话。"+
+		"把一件工作委派给独立执行者异步完成：立即返回任务号；需要结果时用 `wait_task` 等待；"+
+			"完成/失败会以持久通知回到本会话。"+
 			"content 必须自包含（执行者看不到本会话的任何历史，也看不到本次对话）。"+delegationWaitHint,
 		func(ctx context.Context, in delegateTaskInput) (string, error) {
 			return handleDelegateTask(ctx, store, in)
@@ -210,11 +236,12 @@ type createOrchestrationInput struct {
 	VerifyCommand string `json:"verifyCommand,omitempty" jsonschema:"description=可选；仅 isolated 可用：结果接受前在工作现场内运行的通用检查命令（如 npm test），通过才接受结果"`
 }
 
-// newCreateOrchestrationTool 造 create_orchestration：一次提交整张初始 DAG，原子建组——
-// 不存在「先建 A 再补 B」的中间态。建好后调度程序按依赖与容量自动推进。
+// newCreateOrchestrationTool 造 create_orchestration：一次提交当前已知的节点与边（初始 DAG），
+// 原子建组——不存在「先建 A 再补 B」的中间态。建好后调度程序按依赖与容量自动推进。
 func newCreateOrchestrationTool(store *Store) (tool.BaseTool, error) {
 	return utils.InferTool("create_orchestration",
-		"一次提交整张固定的任务依赖图（例如并行调研 A、B 后汇总成报告）：原子创建整组，立即返回编排组号；"+
+		"一次提交当前已知的节点与边，之后可按事实修订（例如并行调研 A、B 后汇总成报告）："+
+			"原子创建整组，立即返回编排组号与最终节点号；"+
 			"各节点完成后按依赖自动推进，整组完成/失败以持久通知回到本会话。"+delegationWaitHint,
 		func(ctx context.Context, in createOrchestrationInput) (string, error) {
 			return handleCreateOrchestration(ctx, store, in)
@@ -260,16 +287,17 @@ func handleCreateOrchestration(ctx context.Context, store *Store, in createOrche
 	if err != nil {
 		return "", fmt.Errorf("%s", taskCreateErrText(err))
 	}
-	b, _ := json.Marshal(map[string]string{
-		"orchestrationId": resp.OrchestrationID, "status": resp.Status,
-	})
+	// 回执与 POST /api/orchestrations 同形同序（orchestrationId → status → finalTaskId）：
+	// finalTaskId 是组的终点任务号，调用方据此 wait_task／修订（doc/82 §6.3）。
+	// 直接 marshal 结构体——map 会按字母序重排键，字节与 HTTP 端点对不上。
+	b, _ := json.Marshal(resp)
 	return string(b), nil
 }
 
-// delegationWaitHint 是两把创建工具共有的行为提示：结果怎么回来（持久通知 + 恢复 run），
+// delegationWaitHint 是两把创建工具共有的行为提示：结果怎么回来（持久通知 + 恢复 run + wait_task），
 // 以及「不要在 content 里要求执行者向你汇报」——执行者只向 submit_task_result 交结果。
-const delegationWaitHint = "调用后继续做你自己的事，不要等待；任务失败、中断或整组完成时你会收到通知，" +
-	"收到后再决定下一步。"
+const delegationWaitHint = "有不依赖结果的工作就继续；需要结果时用 `wait_task` 等待；" +
+	"也可以结束本轮，任务失败、中断或整组完成时你会收到持久通知，收到后再决定下一步。"
 
 // revisionToolTaskInput 是修订新增节点的工具入参（与 HTTP 的 revisionTaskInput 同形状，
 // 但 schema 要 jsonschema tag）。
@@ -557,6 +585,8 @@ func submitErrText(err error) string {
 		return "这次执行已经不是当前一代（执行者被接管或已收尾），提交被拒绝，结果不会生效"
 	case errors.Is(err, errSubmitNotRunning):
 		return "任务不在运行中（已取消或已被对账收尾），提交被拒绝"
+	case errors.Is(err, errSubmitJobsRunning):
+		return "任务仍有后台命令未收口（running 或 stopping），先等待或停止并确认终态后再提交"
 	default:
 		return err.Error()
 	}
@@ -607,4 +637,245 @@ func handleSubmitTaskResult(ctx context.Context, store *Store, in submitTaskResu
 		"taskId": tb.TaskID, "resultRevision": revision, "status": agentTaskStatusRunning,
 	})
 	return string(b), nil
+}
+
+// waitTaskInput 是 wait_task 的入参 schema（doc/82 §6.2）。
+type waitTaskInput struct {
+	TaskID string `json:"taskId" jsonschema:"description=要读取或等待的任务号（创建回执里的 taskId 或 finalTaskId）"`
+	Wait   bool   `json:"wait,omitempty" jsonschema:"description=可选；true=最多等到一个等待窗口，任务到终态立即返回；缺省 false=立即返回当前状态"`
+}
+
+// waitTaskView 是 wait_task 的返回体（doc/82 §6.2）：键序固定
+// taskId → orchestrationId → status → result → error。status 派生规则与 API 视图同一
+// （存储 running 而当前 run 租约过期 → interrupted，读侧派生不写回）。
+type waitTaskView struct {
+	TaskID          string      `json:"taskId"`
+	OrchestrationID string      `json:"orchestrationId"`
+	Status          string      `json:"status"`
+	Result          *TaskResult `json:"result"`
+	Error           *taskError  `json:"error"`
+}
+
+// newWaitTaskTool 造 wait_task（doc/82 §6.2）：按任务号读取或等待一件持久 Task 的状态与结果。
+// 只能读当前来源会话创建的 Task（其他会话、其他租户与不存在同形拒绝）。唯一写副作用：读到
+// 最终 Task 成功时先收口组、再就地认领整组完成通知（§4-12）——让来源 run 自己消费这次交付，
+// 不再铸第二场交付 run；读到失败/中断时认领对应的 pending 通知，消掉重复交付。
+// 描述里给 publishing 的指引是软提示不是保证：发布准入按项目静默（doc/76 §10.5.1），而
+// delegate_task 强制发起 run 挂项目——发起 run 活着时发布进不了准入，继续轮询只会把自己
+// 占住项目，收不到终态（2026-11-15 活体三轮实测确认的死锁形态）。
+func newWaitTaskTool(store *Store) (tool.BaseTool, error) {
+	return utils.InferTool("wait_task",
+		"按任务号读取或等待一件持久 Task 的状态与结果。wait=true 最多等一个等待窗口，"+
+			"任务到终态立即返回（含租约过期的中断）；wait=false 立即返回当前快照。"+
+			"拿到任务号后先做不依赖它的工作，需要结果时再用它等待。"+
+			"若等待后仍返回 publishing：结果已保存、发布收尾要等项目里没有其他活 run，"+
+			"继续轮询不会推进——请结束本轮回复，整组完成通知会稍后送达。",
+		func(ctx context.Context, in waitTaskInput) (string, error) {
+			return handleWaitTask(ctx, store, in)
+		})
+}
+
+func handleWaitTask(ctx context.Context, store *Store, in waitTaskInput) (string, error) {
+	box := taskBoxFrom(ctx)
+	if box == nil {
+		return "", fmt.Errorf("wait_task 不可用（没有 run 身份）")
+	}
+	taskID := strings.TrimSpace(in.TaskID)
+	if taskID == "" {
+		return "", fmt.Errorf("wait_task 需要 taskId")
+	}
+	t, o, err := store.readWaitTask(ctx, box.session, taskID)
+	if err != nil {
+		if errors.Is(err, errTaskNotFound) {
+			return "", fmt.Errorf("找不到这个任务")
+		}
+		return "", err
+	}
+	status, err := store.waitTaskStatus(ctx, t)
+	if err != nil {
+		return "", err
+	}
+	// wait=true 且当前仍在推进：短轮询到终态或窗口结束（§4-3）。
+	if in.Wait && taskAwaitable(status) {
+		if t, o, err = store.pollTaskUntilFinal(ctx, box.session, taskID); err != nil {
+			return "", err
+		}
+		if status, err = store.waitTaskStatus(ctx, t); err != nil {
+			return "", err
+		}
+	}
+	// 读到终态时的唯一写副作用（§4-12）：不改返回字节，只顺手把这次交付收进当前 run。
+	store.claimTaskNotification(ctx, box, t, o, status)
+	// 等待窗口、读到的状态与结果版本记在当前 span 上（§6.6）：轮询本身不打面向用户的进度帧。
+	waitSpan := trace.SpanFromContext(ctx)
+	waitSpan.SetAttributes(
+		attribute.Bool("tako.task.wait", in.Wait),
+		attribute.String("tako.task.id", t.ID),
+		attribute.String("tako.task.observed_status", status),
+		attribute.Int("tako.task.result_revision", t.ResultRevision),
+	)
+	if in.Wait {
+		waitSpan.SetAttributes(attribute.Int64("tako.task.wait_window_ms", waitWindow.Milliseconds()))
+	}
+	view := waitTaskView{
+		TaskID: t.ID, OrchestrationID: t.OrchestrationID,
+		Status: status, Result: parseTaskResult(t.Result),
+	}
+	if t.ErrorCode != "" || t.ErrorMessage != "" {
+		view.Error = &taskError{Code: t.ErrorCode, Message: t.ErrorMessage}
+	}
+	b, _ := json.Marshal(view)
+	return string(b), nil
+}
+
+// taskAwaitable 报告 wait_task 是否还应继续等待：pending/ready/running/publishing 都还在推进
+// （publishing 不是终态，继续等，§4-12）；其余（succeeded/failed/blocked/cancelled/interrupted
+// 派生）立即返回。
+func taskAwaitable(status string) bool {
+	switch status {
+	case agentTaskStatusPending, agentTaskStatusReady, agentTaskStatusRunning, agentTaskStatusPublishing:
+		return true
+	}
+	return false
+}
+
+// readWaitTask 按任务号读 Task 与它的组，限定「当前来源会话创建」——其他会话、其他租户与不存在
+// 同形拒绝（doc/82 §6.2）。归属只看 run context 的来源会话（box.session），不信模型自报。
+func (s *Store) readWaitTask(ctx context.Context, sessionID SessionID, taskID string) (AgentTask, AgentOrchestration, error) {
+	var rows []AgentTask
+	if err := s.db.WithContext(ctx).Raw(`
+SELECT t.* FROM agent_tasks t
+  JOIN agent_orchestrations o ON o.id = t.orchestration_id
+ WHERE t.id = ? AND o.source_session_id = ?`, taskID, sessionID).Scan(&rows).Error; err != nil {
+		return AgentTask{}, AgentOrchestration{}, err
+	}
+	if len(rows) == 0 {
+		return AgentTask{}, AgentOrchestration{}, errTaskNotFound
+	}
+	var o AgentOrchestration
+	if err := s.db.WithContext(ctx).Where("id = ?", rows[0].OrchestrationID).Take(&o).Error; err != nil {
+		return AgentTask{}, AgentOrchestration{}, err
+	}
+	return rows[0], o, nil
+}
+
+// waitTaskStatus 按 API 视图同一规则派生状态：存储 running 且当前 run 不在 alive 集合
+// （租约过期或 run 行已不在）→ interrupted（读侧派生，不写回）。
+func (s *Store) waitTaskStatus(ctx context.Context, t AgentTask) (string, error) {
+	if t.Status != agentTaskStatusRunning || t.CurrentRunID == nil {
+		return t.Status, nil
+	}
+	alive, err := s.aliveRuns(ctx, []string{*t.CurrentRunID})
+	if err != nil {
+		return "", err
+	}
+	if !alive[*t.CurrentRunID] {
+		return agentTaskStatusInterrupted, nil
+	}
+	return t.Status, nil
+}
+
+// pollTaskUntilFinal 短轮询一件 Task 到终态或窗口结束（doc/82 §4-3）：主键读、不加锁、起始
+// 200ms 指数退避到 1s；命中终态（含租约过期的 interrupted 派生）立即返回。
+func (s *Store) pollTaskUntilFinal(ctx context.Context, sessionID SessionID, taskID string) (AgentTask, AgentOrchestration, error) {
+	deadline := time.Now().Add(waitWindow)
+	interval := 200 * time.Millisecond
+	for {
+		t, o, err := s.readWaitTask(ctx, sessionID, taskID)
+		if err != nil {
+			return AgentTask{}, AgentOrchestration{}, err
+		}
+		status, err := s.waitTaskStatus(ctx, t)
+		if err != nil {
+			return AgentTask{}, AgentOrchestration{}, err
+		}
+		if !taskAwaitable(status) || !time.Now().Before(deadline) {
+			return t, o, nil
+		}
+		select {
+		case <-ctx.Done():
+			return t, o, ctx.Err()
+		case <-time.After(interval):
+		}
+		if interval < time.Second {
+			interval *= 2
+			if interval > time.Second {
+				interval = time.Second
+			}
+		}
+	}
+}
+
+// claimTaskNotification 是 wait_task 读到终态时的唯一写副作用（doc/82 §4-12），三种查找范围
+// 拍定，不按猜测扩大：
+//   - 最终节点成功：先跑一次单组收口（收口事务含 orchestration_finished 通知），再按 dedup 键
+//     orchestration_finished:<组id>:<结果版本> 找 pending 行就地认领；收不了口 = 查不到 → 不认领。
+//   - 当前 Task 失败：按 task_id + kind=task_failed + status=pending 取最新一条认领。
+//   - 派生的 interrupted：只有中断通知已落库为 pending 才认领（读侧派生本身不认领）。
+//
+// 除这三种外不认领别的 kind（含 plan_review_required）。认领失败只记日志不报错——通知的最终
+// 消费由本 run 的 RunEnd 对账与调度器兜底，工具只是顺手把「来源 run 还活着」这场交付收掉。
+func (s *Store) claimTaskNotification(ctx context.Context, box *taskBox, t AgentTask, o AgentOrchestration, status string) {
+	var notifID string
+	switch {
+	case status == agentTaskStatusSucceeded && o.FinalTaskID != "" && t.ID == o.FinalTaskID:
+		if _, err := s.advanceOrchestration(ctx, o.ID); err != nil {
+			log.Printf("wait_task advance %s: %v", o.ID, err)
+			return
+		}
+		key := fmt.Sprintf("%s:%s:%d", notifKindOrchFinished, o.ID, t.ResultRevision)
+		id, err := s.pendingNotifIDByDedup(ctx, key)
+		if err != nil {
+			log.Printf("wait_task find notif %s: %v", key, err)
+			return
+		}
+		notifID = id
+	case status == agentTaskStatusFailed:
+		id, err := s.pendingTaskNotifID(ctx, t.ID, notifKindTaskFailed)
+		if err != nil {
+			log.Printf("wait_task find failed notif %s: %v", t.ID, err)
+			return
+		}
+		notifID = id
+	case status == agentTaskStatusInterrupted:
+		id, err := s.pendingTaskNotifID(ctx, t.ID, notifKindTaskInterrupted)
+		if err != nil {
+			log.Printf("wait_task find interrupted notif %s: %v", t.ID, err)
+			return
+		}
+		notifID = id
+	}
+	if notifID == "" {
+		return
+	}
+	if _, err := s.ClaimNotificationInline(ctx, notifID, box.run, box.session); err != nil {
+		log.Printf("wait_task claim %s: %v", notifID, err)
+	}
+}
+
+// pendingNotifIDByDedup 按去重键找一条仍 pending 的通知 id（找不到 = 空串）。
+func (s *Store) pendingNotifIDByDedup(ctx context.Context, dedupKey string) (string, error) {
+	var id string
+	res := s.db.WithContext(ctx).Raw(
+		`SELECT id FROM agent_notifications WHERE dedup_key = ? AND status = ? LIMIT 1`,
+		dedupKey, notifStatusPending).Scan(&id)
+	if res.Error != nil {
+		return "", res.Error
+	}
+	return id, nil
+}
+
+// pendingTaskNotifID 按 task_id + kind 取最新一条仍 pending 的通知 id（找不到 = 空串）：
+// 失败与中断通知去重键里含 run/epoch，工具视图拿不到 epoch，不重建键，直接按行取最新一条。
+func (s *Store) pendingTaskNotifID(ctx context.Context, taskID, kind string) (string, error) {
+	var id string
+	res := s.db.WithContext(ctx).Raw(
+		`SELECT id FROM agent_notifications
+		 WHERE task_id = ? AND kind = ? AND status = ?
+		 ORDER BY created_at DESC, id DESC LIMIT 1`,
+		taskID, kind, notifStatusPending).Scan(&id)
+	if res.Error != nil {
+		return "", res.Error
+	}
+	return id, nil
 }

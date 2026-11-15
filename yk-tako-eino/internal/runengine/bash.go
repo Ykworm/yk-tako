@@ -26,7 +26,8 @@ var bashEnvWhitelist = []string{"HOME", "TMPDIR", "LANG", "LC_ALL"}
 
 // bashIn 是 bash 的入参 schema：由 InferTool 按 struct tag 反射生成。
 type bashIn struct {
-	Command string `json:"command" jsonschema:"description=要执行的 bash 命令，在 workspace 根目录下运行；无单次时长限制，stdout/stderr 各保留尾部 64000 字节，完整输出落盘后给出路径"`
+	Command         string `json:"command" jsonschema:"description=在 workspace 根目录下运行；前台窗口内返回输出，超时转后台并返回命令号。输出超 64000 字节只保留尾部，全文落盘并给路径。"`
+	RunInBackground bool   `json:"runInBackground,omitempty" jsonschema:"description=可选；true=立即返回命令号、命令继续在后台运行，需要结果时用 bash_output 读取或等待"`
 }
 
 // outputSections 拼装 stdout/stderr 两段，成功结果与被终止错误共用同形。
@@ -43,15 +44,14 @@ func outputSections(stdout, stderr *tailCollector) string {
 // 启动失败返回 Go error；被终止 =「bash 被终止，死前输出：<已收输出>＋原因」经 wrapToolErrors
 // 变「错误：…」结果文本——记录制（命令+最终输出落 runlog）在非正常死亡时不缺角，
 // 卡死的命令事后可查「死前做到哪」（Qoder 记录形态同款）。
-// 时长上限 30 秒，到点把已收到的输出交回工具结果，不把父 run 打成 error。
 // 工作目录来自 ctx 里的会话根；这只是默认目录，不是牢笼。有围栏后端时同一条命令再套一层配置。
-func newBashTool(workspace string) (tool.BaseTool, error) {
+// 走 runBashJob：登记一行 job 并把两路输出从首字节落到 job 固定目录（doc/82 §6）。
+// requireSandbox 恒真——没有可用的围栏后端就拒绝（cwd 不是安全边界）。
+func newBashTool(store *Store, workspace string) (tool.BaseTool, error) {
 	return utils.InferTool("bash", "在 workspace 根目录下执行一条 bash 命令并返回退出码与 stdout/stderr。"+
-		"输出超过 64000 字节时只保留尾部，完整输出会落盘并给出路径（用 read_file 分页读它）。"+
-		"单次最长 30 秒，大输出请先写进文件再读。",
+		"前台最多等待 30 秒；超时命令继续运行并返回命令号。输出超过 64000 字节时只保留尾部，完整输出落盘并给出路径（用 read_file 分页读它）。",
 		func(ctx context.Context, in bashIn) (string, error) {
-			// 没有可用的围栏后端就拒绝。cwd 只是默认目录，不能当成隔离。
-			return runBash(ctx, activeRoot(ctx, workspace), in.Command, bashTimeout, true)
+			return runBashJob(ctx, store, workspace, in)
 		})
 }
 

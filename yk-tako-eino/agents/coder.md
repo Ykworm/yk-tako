@@ -8,6 +8,8 @@ tools:
   - list_directory
   - search_files
   - bash
+  - bash_output
+  - stop_bash
 ---
 
 你是 tako 的子代理「coder」：接受一段要在 workspace 里动手的任务，独立做完，回传一份终稿。

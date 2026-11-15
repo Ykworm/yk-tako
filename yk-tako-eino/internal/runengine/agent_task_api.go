@@ -74,6 +74,10 @@ func taskStoreErr(c *gin.Context, err error) bool {
 		writeEnvelope(c, http.StatusConflict, codeTaskFinished, "这件任务已经结束，不能停止", nil)
 	case errors.Is(err, errOrchNotStoppable):
 		writeEnvelope(c, http.StatusConflict, codeOrchFinished, "这个编排组已经结束，不能停止", nil)
+	case errors.Is(err, errJobNotFound):
+		writeEnvelope(c, http.StatusNotFound, codeJobMissing, "找不到这条命令", nil)
+	case errors.Is(err, errJobNotStoppable):
+		writeEnvelope(c, http.StatusConflict, codeJobNotStoppable, "这条命令正在停止中，不能重复请求", nil)
 	case errors.Is(err, errArtifactUnreadable):
 		writeEnvelope(c, http.StatusConflict, codeArtifactInvalid, "结果产物已不可读取", nil)
 	case errors.Is(err, errTaskNotRepublishable):

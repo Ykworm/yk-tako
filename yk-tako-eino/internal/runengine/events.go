@@ -38,6 +38,9 @@ const (
 	// 创建、状态翻转、停止、恢复、结果与交付状态变化在 PG 成功后发；id = Task／编排组 ID。
 	eventAgentTasksChanged          = "agent_tasks_changed"
 	eventAgentOrchestrationsChanged = "agent_orchestrations_changed"
+	// background_jobs_changed（doc/82 §6.6）：后台命令登记为后台、进入 stopping、进入终态时发；
+	// 事件不带终态正文，浏览器收到后重拉命令列表。
+	eventBackgroundJobsChanged = "background_jobs_changed"
 )
 
 // eventsMaxLen：流的有界截断（doc/46 §7 开放问题第 3 条的拍定值）。

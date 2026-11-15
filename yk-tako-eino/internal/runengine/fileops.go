@@ -110,6 +110,12 @@ var firstPartyFileEffects = map[string]string{
 	// bash（doc/17 §3）：command 字段由 ③ shell 写意图表扫写路径——登记 write 这条链才通
 	// （登记 none/留空在 classifyToolCall 提前返回，command 不被扫，折叠丢写路径）。
 	"bash": fileEffectWrite,
+	// bash_output / stop_bash（doc/82 §6.2）：读/停一条后台命令，只碰 job 的落盘输出与状态，
+	// 参数里只有 jobId、不读写 workspace 路径——显式表态 none（与 memory 同表态方式）。
+	// 登记进注册表的两重理由：① 新一手工具按惯例显式表态（doc/22 §3）；② 出厂规格金样
+	// （agents_test.go 的名字宇宙）从本表派生，登记后这两把才进护栏视野。
+	"bash_output": fileEffectNone,
+	"stop_bash":   fileEffectNone,
 	// web_search（doc/22 §3，2026-10-18 切新 API 二稿）：每次搜索把结果全文写 workspace 的
 	// .tako/search/（程序命名新文件、一次一写不覆盖，沿 search_history 的 spill 机制）——
 	// 声明 write。提取程序只扫调用参数、参数里只有 query 没有 path，不会去猜 query 字符串。

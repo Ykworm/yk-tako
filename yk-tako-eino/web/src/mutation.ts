@@ -12,6 +12,8 @@ export type MutationEvent = {
   //   两个事件都只通知、不带状态，收到就重拉。
   // agent_tasks_changed / agent_orchestrations_changed：持久 Task 与编排组的状态变了
   //   （doc/70）。id 分别是 taskId / orchestrationId；任务页收到后重拉当前列表与详情。
+  // background_jobs_changed：后台命令登记为后台、进入 stopping、进入终态时发（doc/82 §10.4）。
+  //   id 是 jobId；事件不携带终态正文，任务页收到后重拉命令分组（终态靠重拉对齐）。
   type:
     | 'session_deleted'
     | 'workspace_deleted'
@@ -20,6 +22,7 @@ export type MutationEvent = {
     | 'tools_changed'
     | 'agent_tasks_changed'
     | 'agent_orchestrations_changed'
+    | 'background_jobs_changed'
   id: string
 }
 

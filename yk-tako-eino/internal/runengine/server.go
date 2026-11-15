@@ -202,6 +202,8 @@ func (s *Server) RouterFor() *gin.Engine {
 	// 目标重规划与继任组（doc/75 §4）：写面 member，读面 authn + 属主链。
 	r.POST("/api/orchestrations/:id/successors", traceIngress(), authn, s.auth.RequireTenantRole("member"), s.postOrchestrationSuccessor)
 	r.GET("/api/orchestrations/:id/handoff", authn, s.getOrchestrationHandoff)
+	// 路径账本（doc/82 §10.3）：只读投影，读面 authn + 属主链（跨租户/不可见 404 117002）。
+	r.GET("/api/orchestrations/:id/journey", authn, s.getOrchestrationJourney)
 	// 任务级恢复（doc/70 §10.1）：复用 ClaimResume / 账本重放 / Redis seed，装配口换执行者。
 	r.POST("/api/tasks/:id/resume", traceIngress(), authn, s.resumeAgentTask)
 	// 隔离结果产物与人工重新发布（doc/74 §4.4/§4.5）：产物读面 authn + 属主链，写面 member。
@@ -210,6 +212,12 @@ func (s *Server) RouterFor() *gin.Engine {
 	// 协调通知的读面与人工重新处理（doc/73 §4.1/§4.2）：读面 authn + 属主链，写面 member。
 	r.GET("/api/notifications/:id", authn, s.getAgentNotification)
 	r.POST("/api/notifications/:id/retry", traceIngress(), authn, s.auth.RequireTenantRole("member"), s.retryAgentNotification)
+	// 后台命令（doc/82 §6.3）：读面 authn + 属主链（不可见统一 404 117117）；
+	// 停止是写面，挂 RequireTenantRole("member")（viewer 403 111203，中间件直接给）。
+	r.GET("/api/workspaces/:id/jobs", authn, s.listWorkspaceJobs)
+	r.GET("/api/jobs/:id", authn, s.getJob)
+	r.GET("/api/jobs/:id/output", authn, s.getJobOutput)
+	r.POST("/api/jobs/:id/stop", authn, s.auth.RequireTenantRole("member"), s.stopJob)
 	r.GET("/api/tenants", authn, s.listTenants)
 	r.GET("/api/me/invitations", authn, s.myInvitations)
 	r.POST("/api/me/invitations/:id/accept", authn, s.acceptInvitation)

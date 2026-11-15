@@ -258,16 +258,14 @@ func TestStoreSharedFinalResultPublishesIntoContent(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(content, "report.md"), []byte("原始"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	orch, err := s.CreateAgentOrchestration(ctx, testOwner, mkTwoLayerCmd(wsID, sessID, "shared-pub"), planEnv{})
+	cmd := mkTwoLayerCmd(wsID, sessID, "shared-pub")
+	cmd.WorkspaceMode = workspaceModeShared
+	orch, err := s.CreateAgentOrchestration(ctx, testOwner, cmd, planEnv{})
 	if err != nil {
 		t.Fatalf("CreateAgentOrchestration: %v", err)
 	}
-	claims := claimAll(t, s, orch.OrchestrationID)
-	if len(claims) != 2 {
-		t.Fatalf("首批领 %d 件, want 2（A、B）", len(claims))
-	}
-	claimA := pickClaim(t, claims, "A")
-	claimB := pickClaim(t, claims, "B")
+	// shared 组串行（doc/82 §9.2）：一次只领一件，A 收尾后才领 B；两件仍共用同一棵 work/shared 现场。
+	claimA := claimOne(t, s, orch.OrchestrationID)
 	workA, kind, err := s.prepareTaskWork(ctx, claimA.TaskID)
 	if err != nil {
 		t.Fatalf("prepareTaskWork(A): %v", err)
@@ -278,13 +276,6 @@ func TestStoreSharedFinalResultPublishesIntoContent(t *testing.T) {
 	wantWork := filepath.Join(runtimeDir, "orchestrations", orch.OrchestrationID, "workspace", "work", "shared")
 	if workA.Root != wantWork {
 		t.Fatalf("shared 工作现场应落在 runtime/orchestrations 下：%s != %s", workA.Root, wantWork)
-	}
-	workB, _, err := s.prepareTaskWork(ctx, claimB.TaskID)
-	if err != nil {
-		t.Fatalf("prepareTaskWork(B): %v", err)
-	}
-	if workB.Root != wantWork {
-		t.Fatalf("同组应共用一棵现场：%s != %s", workB.Root, wantWork)
 	}
 	if err := os.WriteFile(filepath.Join(workA.Root, "a.txt"), []byte("共享中间产物"), 0o644); err != nil {
 		t.Fatal(err)
@@ -307,6 +298,15 @@ func TestStoreSharedFinalResultPublishesIntoContent(t *testing.T) {
 	setRunStatus(t, s, claimA.RunID, "complete")
 	if err := s.ReconcileRun(ctx, claimA.RunID); err != nil {
 		t.Fatal(err)
+	}
+	// A 收尾后领 B：同一 shared 组共用一棵现场。
+	claimB := claimOne(t, s, orch.OrchestrationID)
+	workB, _, err := s.prepareTaskWork(ctx, claimB.TaskID)
+	if err != nil {
+		t.Fatalf("prepareTaskWork(B): %v", err)
+	}
+	if workB.Root != wantWork {
+		t.Fatalf("同组应共用一棵现场：%s != %s", workB.Root, wantWork)
 	}
 	submitOK(t, s, claimB.TaskID, claimB.RunID, claimB.Epoch)
 	setRunStatus(t, s, claimB.RunID, "complete")

@@ -46,6 +46,9 @@ var (
 	errArtifactBad      = errors.New("submit: artifact invalid")
 	errSubmitStale      = errors.New("submit: stale execution")
 	errSubmitNotRunning = errors.New("submit: task not running")
+	// errSubmitJobsRunning：执行者名下还有 running/stopping 的后台命令就提交结果（doc/82 §7）——
+	// 结果可能是在半截命令的输出上得出的；先等待或停止并确认终态再提交。
+	errSubmitJobsRunning = errors.New("submit: background jobs still running")
 )
 
 // createTaskResp 是 POST /api/tasks 的 data（施工包 §4.1）：未领取时 currentRunId 必须是空串。
@@ -57,9 +60,12 @@ type createTaskResp struct {
 }
 
 // createOrchestrationResp 是 POST /api/orchestrations 的 data（施工包 §4.2）。
+// finalTaskId 是该组的汇总节点任务 id（doc/82 §6.3）：编排组的「终点」显式给出，
+// 调用方（模型工具与任务页）不必再自己从图里推。追加在字节序末尾，不动已有两键。
 type createOrchestrationResp struct {
 	OrchestrationID string `json:"orchestrationId"`
 	Status          string `json:"status"`
+	FinalTaskID     string `json:"finalTaskId"`
 }
 
 // CreateAgentTask 创建单件 Task：内部转成单节点编排命令，与整组共享同一条创建与幂等路径。
@@ -150,7 +156,7 @@ func (s *Store) CreateAgentOrchestration(ctx context.Context, p principal, cmd C
 			if existing.PlanHash != hash {
 				return errPlanConflict
 			}
-			resp = createOrchestrationResp{OrchestrationID: existing.ID, Status: existing.Status}
+			resp = createOrchestrationResp{OrchestrationID: existing.ID, Status: existing.Status, FinalTaskID: existing.FinalTaskID}
 			return nil
 		} else if !errors.Is(qerr, gorm.ErrRecordNotFound) {
 			return qerr
@@ -198,7 +204,7 @@ func (s *Store) CreateAgentOrchestration(ctx context.Context, p principal, cmd C
 				if winner.PlanHash != hash {
 					return errPlanConflict
 				}
-				resp = createOrchestrationResp{OrchestrationID: winner.ID, Status: winner.Status}
+				resp = createOrchestrationResp{OrchestrationID: winner.ID, Status: winner.Status, FinalTaskID: winner.FinalTaskID}
 				return nil
 			}
 			return err
@@ -218,7 +224,7 @@ func (s *Store) CreateAgentOrchestration(ctx context.Context, p principal, cmd C
 				return err
 			}
 		}
-		resp = createOrchestrationResp{OrchestrationID: orchID, Status: orchStatusActive}
+		resp = createOrchestrationResp{OrchestrationID: orchID, Status: orchStatusActive, FinalTaskID: orch.FinalTaskID}
 		createdTaskIDs = make([]string, 0, len(rows))
 		for _, r := range rows {
 			createdTaskIDs = append(createdTaskIDs, r.ID)
@@ -628,6 +634,18 @@ func (s *Store) SubmitTaskResult(ctx context.Context, taskID string, runID RunID
 	raw, err := json.Marshal(result)
 	if err != nil {
 		return 0, fmt.Errorf("%w: %v", errSubmitBad, err)
+	}
+
+	// 后台命令未收口就提交（doc/82 §7）：执行者名下还有 running/stopping 的命令，说明结果可能
+	// 建立在半截输出上——先等它到终态（bash_output 等待）或停止它，再提交。
+	var runningJobs int64
+	if err := s.db.WithContext(ctx).Model(&BackgroundJob{}).
+		Where("source_task_id = ? AND status IN ?", taskID, []string{jobStatusRunning, jobStatusStopping}).
+		Count(&runningJobs).Error; err != nil {
+		return 0, err
+	}
+	if runningJobs > 0 {
+		return 0, errSubmitJobsRunning
 	}
 
 	t, o, err := s.agentTaskRow(ctx, taskID)

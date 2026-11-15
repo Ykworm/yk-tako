@@ -203,6 +203,8 @@ func TestContractBusinessCodes(t *testing.T) {
 		{"工作区配置不合法", codeWorkspaceConfigInvalid, 117111},
 		{"任务不可重新发布", codeTaskNotRepublishable, 117112},
 		{"项目正在发布结果", codeWorkspacePublishing, 117113},
+		{"找不到命令", codeJobMissing, 117117},
+		{"命令不可停止", codeJobNotStoppable, 117118},
 		{"内部错误", codeInternal, 111901},
 	}
 	for _, c := range cases {
@@ -582,18 +584,127 @@ func TestContractWorkspaceViewBytes(t *testing.T) {
 	}
 }
 
-// TestContractTaskCreateRespBytes 钉住创建端点的 data（doc/70 §4.1）：
-// 单件 taskId → orchestrationId → status → currentRunId；整组 orchestrationId → status。
+// TestContractTaskCreateRespBytes 钉住创建端点的 data（doc/70 §4.1；doc/82 §6）：
+// 单件 taskId → orchestrationId → status → currentRunId；
+// 整组 orchestrationId → status → finalTaskId（finalTaskId 只追加在末尾，旧字段顺序不变）。
 func TestContractTaskCreateRespBytes(t *testing.T) {
 	got := mustJSON(t, createTaskResp{TaskID: "at_1", OrchestrationID: "or_1", Status: "ready", CurrentRunID: ""})
 	const wantTask = `{"taskId":"at_1","orchestrationId":"or_1","status":"ready","currentRunId":""}`
 	if got != wantTask {
 		t.Fatalf("创建 Task 字节 = %s\nwant %s", got, wantTask)
 	}
-	got = mustJSON(t, createOrchestrationResp{OrchestrationID: "or_1", Status: "active"})
-	const wantOrch = `{"orchestrationId":"or_1","status":"active"}`
+	got = mustJSON(t, createOrchestrationResp{OrchestrationID: "or_1", Status: "active", FinalTaskID: "at_1"})
+	const wantOrch = `{"orchestrationId":"or_1","status":"active","finalTaskId":"at_1"}`
 	if got != wantOrch {
 		t.Fatalf("创建编排组字节 = %s\nwant %s", got, wantOrch)
+	}
+}
+
+// TestContractJobBytes 钉住后台命令（doc/82 §6.3）四个端点的 data 字节与失败信封。
+// 真实字节来自 2026-11-15 隔离引擎（8943）实打：一条真实 bash 工具调用（echo hello-82）
+// 登记成一行 job，再分别读详情/输出/停止。
+//
+//   - jobView（列表行与详情同形）：键序 jobId → workspaceId → sourceSessionId → sourceRunId
+//     → sourceTaskId → sourceOrchestrationId → status → exitCode → stopRequested → backgrounded
+//     → command → stdoutPath → stderrPath → createdAt → startedAt → endedAt；
+//     非终态 exitCode/endedAt 是 null（不省略），chat 来源 sourceTaskId/sourceOrchestrationId 是空串。
+//   - jobOutputView（/output 与 bash_output 同形）：jobId → status → exitCode → stdout → stderr
+//     → stdoutPath → stderrPath。
+//   - jobStopView：jobId → status → stopRequested（running → stopping+true；
+//     已终态 → 当前态+false；仍 stopping → 409 117118，不是 200）。
+func TestContractJobBytes(t *testing.T) {
+	cst := time.FixedZone("CST", 8*3600)
+	started := time.Date(2026, 11, 15, 12, 20, 44, 801376000, cst)
+	ended := time.Date(2026, 11, 15, 12, 20, 44, 822077000, cst)
+	zero := 0
+	base := jobView{
+		JobID:           "bj_01M7EPZA41EEWV0G90BGEZFBN8",
+		WorkspaceID:     "ws_01M7EPZ8F3ANYRAJMW6EVDCCF1",
+		SourceSessionID: "s_01M7EPZ8F3ANYRAJMW6EVDCCF1",
+		SourceRunID:     "r_01M7EPZ8HFRNRJ5ZE8VYNVM9XX",
+		Command:         "echo hello-82",
+		StdoutPath:      "runtime/tmp/bash/jobs/bj_01M7EPZA41EEWV0G90BGEZFBN8/stdout.out",
+		StderrPath:      "runtime/tmp/bash/jobs/bj_01M7EPZA41EEWV0G90BGEZFBN8/stderr.out",
+		CreatedAt:       started,
+		StartedAt:       &started,
+	}
+
+	// 运行中（后台身份）：exitCode/endedAt 为 null，键序不变。
+	running := base
+	running.Status = jobStatusRunning
+	running.Backgrounded = true
+	const wantRunning = `{"jobId":"bj_01M7EPZA41EEWV0G90BGEZFBN8","workspaceId":"ws_01M7EPZ8F3ANYRAJMW6EVDCCF1","sourceSessionId":"s_01M7EPZ8F3ANYRAJMW6EVDCCF1","sourceRunId":"r_01M7EPZ8HFRNRJ5ZE8VYNVM9XX","sourceTaskId":"","sourceOrchestrationId":"","status":"running","exitCode":null,"stopRequested":false,"backgrounded":true,"command":"echo hello-82","stdoutPath":"runtime/tmp/bash/jobs/bj_01M7EPZA41EEWV0G90BGEZFBN8/stdout.out","stderrPath":"runtime/tmp/bash/jobs/bj_01M7EPZA41EEWV0G90BGEZFBN8/stderr.out","createdAt":"2026-11-15T12:20:44.801376+08:00","startedAt":"2026-11-15T12:20:44.801376+08:00","endedAt":null}`
+	if got := mustJSON(t, running); got != wantRunning {
+		t.Fatalf("命令详情（运行中）字节 = %s\nwant %s", got, wantRunning)
+	}
+
+	// 停止中（中间态，非终态）：stopRequested=true，exitCode/endedAt 仍是 null。
+	stopping := running
+	stopping.Status = jobStatusStopping
+	stopping.StopRequested = true
+	const wantStopping = `{"jobId":"bj_01M7EPZA41EEWV0G90BGEZFBN8","workspaceId":"ws_01M7EPZ8F3ANYRAJMW6EVDCCF1","sourceSessionId":"s_01M7EPZ8F3ANYRAJMW6EVDCCF1","sourceRunId":"r_01M7EPZ8HFRNRJ5ZE8VYNVM9XX","sourceTaskId":"","sourceOrchestrationId":"","status":"stopping","exitCode":null,"stopRequested":true,"backgrounded":true,"command":"echo hello-82","stdoutPath":"runtime/tmp/bash/jobs/bj_01M7EPZA41EEWV0G90BGEZFBN8/stdout.out","stderrPath":"runtime/tmp/bash/jobs/bj_01M7EPZA41EEWV0G90BGEZFBN8/stderr.out","createdAt":"2026-11-15T12:20:44.801376+08:00","startedAt":"2026-11-15T12:20:44.801376+08:00","endedAt":null}`
+	if got := mustJSON(t, stopping); got != wantStopping {
+		t.Fatalf("命令详情（停止中）字节 = %s\nwant %s", got, wantStopping)
+	}
+
+	// 前台短命令（Backgrounded=false）终态：succeeded=0、endedAt 有值。
+	done := base
+	done.Status = jobStatusSucceeded
+	done.ExitCode = &zero
+	done.EndedAt = &ended
+	const wantDone = `{"jobId":"bj_01M7EPZA41EEWV0G90BGEZFBN8","workspaceId":"ws_01M7EPZ8F3ANYRAJMW6EVDCCF1","sourceSessionId":"s_01M7EPZ8F3ANYRAJMW6EVDCCF1","sourceRunId":"r_01M7EPZ8HFRNRJ5ZE8VYNVM9XX","sourceTaskId":"","sourceOrchestrationId":"","status":"succeeded","exitCode":0,"stopRequested":false,"backgrounded":false,"command":"echo hello-82","stdoutPath":"runtime/tmp/bash/jobs/bj_01M7EPZA41EEWV0G90BGEZFBN8/stdout.out","stderrPath":"runtime/tmp/bash/jobs/bj_01M7EPZA41EEWV0G90BGEZFBN8/stderr.out","createdAt":"2026-11-15T12:20:44.801376+08:00","startedAt":"2026-11-15T12:20:44.801376+08:00","endedAt":"2026-11-15T12:20:44.822077+08:00"}`
+	if got := mustJSON(t, done); got != wantDone {
+		t.Fatalf("命令详情（终态）字节 = %s\nwant %s", got, wantDone)
+	}
+
+	// /output（运行中）：exitCode null，stdout 是当前尾部，两个路径恒在。
+	outRunning := mustJSON(t, jobOutputView{
+		JobID: running.JobID, Status: jobStatusRunning,
+		Stdout: "hello-82\n", Stderr: "",
+		StdoutPath: running.StdoutPath, StderrPath: running.StderrPath,
+	})
+	const wantOutRunning = `{"jobId":"bj_01M7EPZA41EEWV0G90BGEZFBN8","status":"running","exitCode":null,"stdout":"hello-82\n","stderr":"","stdoutPath":"runtime/tmp/bash/jobs/bj_01M7EPZA41EEWV0G90BGEZFBN8/stdout.out","stderrPath":"runtime/tmp/bash/jobs/bj_01M7EPZA41EEWV0G90BGEZFBN8/stderr.out"}`
+	if outRunning != wantOutRunning {
+		t.Fatalf("命令输出（运行中）字节 = %s\nwant %s", outRunning, wantOutRunning)
+	}
+	outDone := mustJSON(t, jobOutputView{
+		JobID: done.JobID, Status: jobStatusSucceeded, ExitCode: &zero,
+		Stdout: "hello-82\n", Stderr: "",
+		StdoutPath: done.StdoutPath, StderrPath: done.StderrPath,
+	})
+	const wantOutDone = `{"jobId":"bj_01M7EPZA41EEWV0G90BGEZFBN8","status":"succeeded","exitCode":0,"stdout":"hello-82\n","stderr":"","stdoutPath":"runtime/tmp/bash/jobs/bj_01M7EPZA41EEWV0G90BGEZFBN8/stdout.out","stderrPath":"runtime/tmp/bash/jobs/bj_01M7EPZA41EEWV0G90BGEZFBN8/stderr.out"}`
+	if outDone != wantOutDone {
+		t.Fatalf("命令输出（终态）字节 = %s\nwant %s", outDone, wantOutDone)
+	}
+
+	// 停止端点三态：running → stopping+true；已终态 → 当前态+false。
+	stopRunning := mustJSON(t, jobStopView{JobID: done.JobID, Status: jobStatusStopping, StopRequested: true})
+	const wantStopRunning = `{"jobId":"bj_01M7EPZA41EEWV0G90BGEZFBN8","status":"stopping","stopRequested":true}`
+	if stopRunning != wantStopRunning {
+		t.Fatalf("停止（运行中）字节 = %s\nwant %s", stopRunning, wantStopRunning)
+	}
+	stopDone := mustJSON(t, jobStopView{JobID: done.JobID, Status: jobStatusSucceeded, StopRequested: false})
+	const wantStopDone = `{"jobId":"bj_01M7EPZA41EEWV0G90BGEZFBN8","status":"succeeded","stopRequested":false}`
+	if stopDone != wantStopDone {
+		t.Fatalf("停止（终态）字节 = %s\nwant %s", stopDone, wantStopDone)
+	}
+
+	// 失败信封（实打）：未知/不可见 404 117117、不可停止 409 117118、项目不见 404 114001、缺 token 401 111102。
+	envCases := []struct {
+		code    int
+		message string
+		want    string
+	}{
+		{codeJobMissing, "找不到这条命令", `{"code":117117,"message":"找不到这条命令","data":null}`},
+		{codeJobNotStoppable, "这条命令正在停止中，不能重复请求", `{"code":117118,"message":"这条命令正在停止中，不能重复请求","data":null}`},
+		{codeWorkspaceMissing, "找不到这个项目", `{"code":114001,"message":"找不到这个项目","data":null}`},
+		{codeMissingToken, "请先登录", `{"code":111102,"message":"请先登录","data":null}`},
+	}
+	for _, c := range envCases {
+		got := mustJSON(t, envelope{Code: c.code, Message: c.message, Data: nil})
+		if got != c.want {
+			t.Fatalf("命令失败信封字节 = %s\nwant %s", got, c.want)
+		}
 	}
 }
 
@@ -685,11 +796,12 @@ func TestContractAttentionItemBytes(t *testing.T) {
 	}
 }
 
-// TestContractNotificationDetailBytes 钉住通知详情的字段序（doc/73 §4.1；施工包 §4.1）。
+// TestContractNotificationDetailBytes 钉住通知详情的字段序（doc/73 §4.1；施工包 §4.1；doc/82 §6.5）。
 // 真实字节来自隔离引擎 curl（2026-11-11，-task-interval=-1s 起法）：
 // notificationId → orchestrationId → taskId → kind → status → runId → attempt → errorCode
-// → result → createdAt → claimedAt → failedAt → consumedAt → updatedAt → attempts；
+// → result → createdAt → claimedAt → failedAt → consumedAt → updatedAt → attempts → backgroundJobId；
 // 无认领时 runId=""、attempt=0、attempts=[]、三个时间 null；非整组交付通知的 result 为 null。
+// backgroundJobId 是 doc/82 §6.5 追加的末位字段：编排类通知恒空串，bash_job_finished 才带命令号。
 func TestContractNotificationDetailBytes(t *testing.T) {
 	first := time.Unix(9, 0).UTC()
 	got := mustJSON(t, agentNotificationView{
@@ -706,7 +818,7 @@ func TestContractNotificationDetailBytes(t *testing.T) {
 	const want = `{"notificationId":"an_1","orchestrationId":"or_1","taskId":"at_1","kind":"orchestration_finished","status":"failed","runId":"r_1","attempt":1,"errorCode":"delivery_run_error",` +
 		`"result":{"finalTaskId":"at_1","resultRevision":1,"summary":"交付摘要正文","artifacts":[]},` +
 		`"createdAt":"1970-01-01T00:00:00Z","claimedAt":"1970-01-01T00:00:01Z","failedAt":"1970-01-01T00:00:02Z","consumedAt":null,"updatedAt":"1970-01-01T00:00:02Z",` +
-		`"attempts":[{"runId":"r_1","attempt":1,"status":"error","createdAt":"1970-01-01T00:00:09Z"}]}`
+		`"attempts":[{"runId":"r_1","attempt":1,"status":"error","createdAt":"1970-01-01T00:00:09Z"}],"backgroundJobId":""}`
 	if got != want {
 		t.Fatalf("通知详情字节 = %s\nwant %s", got, want)
 	}
@@ -717,9 +829,22 @@ func TestContractNotificationDetailBytes(t *testing.T) {
 		Attempts: []notificationAttemptView{},
 	})
 	const wantPending = `{"notificationId":"an_2","orchestrationId":"or_1","taskId":"at_1","kind":"task_failed","status":"pending","runId":"","attempt":0,"errorCode":"",` +
-		`"result":null,"createdAt":"1970-01-01T00:00:00Z","claimedAt":null,"failedAt":null,"consumedAt":null,"updatedAt":"1970-01-01T00:00:00Z","attempts":[]}`
+		`"result":null,"createdAt":"1970-01-01T00:00:00Z","claimedAt":null,"failedAt":null,"consumedAt":null,"updatedAt":"1970-01-01T00:00:00Z","attempts":[],"backgroundJobId":""}`
 	if got != wantPending {
 		t.Fatalf("无认领通知详情字节 = %s\nwant %s", got, wantPending)
+	}
+	// bash 来源（doc/82 §6.5）：orchestrationId 与 taskId 为空串，末位 backgroundJobId 带命令号，
+	// 前端据此打开命令详情；result 恒 null（结果走 job 的输出端点，不走 Task 结果视图）。
+	got = mustJSON(t, agentNotificationView{
+		NotificationID: "an_3", Kind: "bash_job_finished", Status: notifStatusPending,
+		BackgroundJobID: "bj_1",
+		CreatedAt:       time.Unix(0, 0).UTC(), UpdatedAt: time.Unix(0, 0).UTC(),
+		Attempts:        []notificationAttemptView{},
+	})
+	const wantBash = `{"notificationId":"an_3","orchestrationId":"","taskId":"","kind":"bash_job_finished","status":"pending","runId":"","attempt":0,"errorCode":"",` +
+		`"result":null,"createdAt":"1970-01-01T00:00:00Z","claimedAt":null,"failedAt":null,"consumedAt":null,"updatedAt":"1970-01-01T00:00:00Z","attempts":[],"backgroundJobId":"bj_1"}`
+	if got != wantBash {
+		t.Fatalf("bash 通知详情字节 = %s\nwant %s", got, wantBash)
 	}
 }
 

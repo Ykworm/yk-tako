@@ -39,6 +39,15 @@ func newGetTimeTool() (tool.BaseTool, error) {
 		})
 }
 
+// unknownToolReplier 兜住模型调了未装配工具的场景（eino ToolsNode 默认直接失败，
+// compose/tool_node.go:928 上抛 `tool %s not found in toolsNode indexes`，整场 run error）。
+// 最常见的触发是「窄工具面 × 会话历史回喂」：历史里的 bash 调用会诱导只读工具面
+// （交付／说明 run，doc/73 §10）去调它。语义与 wrapToolErrors 同族：按「错误：」文本
+// 回注模型、run 照跑，挂在两处装配点（NewWorker 主面、子代理面）。
+func unknownToolReplier(_ context.Context, name, _ string) (string, error) {
+	return fmt.Sprintf("错误：工具 %s 不在当前工具面里（未装配），请只用已声明的工具。", name), nil
+}
+
 // wrapToolErrors 把第一方工具包成「错误 → 结果」。为什么必须有这一层（2026-10-11 F1 实读
 // eino v0.9.21 源码，纠正 19v6-08 §2 原「ADK 内建语义」表述）：compose.ToolsNode 对工具返回的
 // error 是**直接失败**——非 interrupt 一律 `failed to invoke tool[name:id]` 上抛（tool_node.go

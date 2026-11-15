@@ -116,6 +116,11 @@ func main() {
 	resumeMax := flag.Int("resume-max", 3, "max resumes per run (doc/30); resumeCount = lease_epoch-1, resumable while below it")
 	taskInterval := flag.Duration("task-interval", 30*time.Second, "persistent-task reconcile interval (doc/72 §9.2; event wakeups run the same round); <= 0 disables the loop")
 	taskInputTimeout := flag.Duration("task-input-timeout", 24*time.Hour, "deadline for a persistent Task's ask_user question (doc/72 §7); 0 = unlimited, negative is a startup error")
+	bashForegroundWait := flag.Duration("bash-foreground-wait", durationEnv("TAKO_BASH_FOREGROUND_WAIT", 30*time.Second), "how long the bash tool waits in the foreground before returning a job id (doc/82 §6; env TAKO_BASH_FOREGROUND_WAIT)")
+	waitWindow := flag.Duration("wait-window", durationEnv("TAKO_WAIT_WINDOW", 30*time.Second), "shared wait window for wait_task and bash_output(wait=true) (doc/82 §6; env TAKO_WAIT_WINDOW)")
+	jobLeaseTTL := flag.Duration("job-lease-ttl", durationEnv("TAKO_JOB_LEASE_TTL", 30*time.Second), "background-job owner lease TTL (doc/82 §7; env TAKO_JOB_LEASE_TTL)")
+	jobLeaseRenew := flag.Duration("job-lease-renew", durationEnv("TAKO_JOB_LEASE_RENEW", 10*time.Second), "background-job lease renew interval (must be < job-lease-ttl; env TAKO_JOB_LEASE_RENEW)")
+	jobReconcileInterval := flag.Duration("job-reconcile-interval", durationEnv("TAKO_JOB_RECONCILE_INTERVAL", 15*time.Second), "background-job reconcile interval (doc/82 §7); <= 0 disables the loop, stop/query endpoints stay available")
 	archiveTTL := flag.Duration("archive-ttl", 168*time.Hour, "how long compacted transcripts and soft-deleted session archives stay before the sweeper removes them")
 	agentsDir := flag.String("agents-dir", "agents", "directory of sub-agent specs (*.md + YAML frontmatter); scanned at each run start (relative to CWD)")
 	workspace := flag.String("workspace", "./workspace", "workspace root for first-party file tools; created at startup, tools are confined to it")
@@ -420,6 +425,18 @@ func main() {
 		log.Printf("task scheduler: interval %s, input timeout %s", *taskInterval, *taskInputTimeout)
 	} else {
 		log.Printf("task scheduler loop off (-task-interval <= 0; notification retry still works)")
+	}
+	// 后台命令的工程参数（施工包 §4/§5）：前台等待窗口、共用等待窗口与租约/对账时长都由旗标注入。
+	// 必须在 worker 跑第一条 bash 之前生效——所以放在装配好的 worker 之后、真正服务之前。
+	runengine.ConfigureBashJobs(*bashForegroundWait, *waitWindow, *jobLeaseTTL, *jobLeaseRenew, *jobReconcileInterval)
+	// 后台命令对账/清理循环（doc/82 §7）：与 TaskScheduler 同形，每副本一个、显式启动。
+	// interval <= 0 只关对账循环；停止与查询端点照常可用（它们不依赖这个循环）。
+	if *jobReconcileInterval > 0 {
+		stopJobs := store.StartJobSupervisor(ctx)
+		_ = stopJobs
+		log.Printf("job supervisor: reconcile %s, foreground wait %s, wait window %s", *jobReconcileInterval, *bashForegroundWait, *waitWindow)
+	} else {
+		log.Printf("job supervisor loop off (-job-reconcile-interval <= 0; stop/query endpoints still work)")
 	}
 	r := srv.RouterFor()
 	log.Fatal(r.Run(*engine))

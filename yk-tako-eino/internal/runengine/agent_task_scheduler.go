@@ -230,7 +230,9 @@ func (s *Store) applyPlanCheckpointTx(tx *gorm.DB, tenantID, orchID, taskID, rec
 }
 
 // insertNotificationTx 落一条协调通知：dedup_key 唯一索引 + ON CONFLICT DO NOTHING，
-// 同一件事（同一 run 的失败 / 同一代的中断 / 同一 revision 的整组完成）无论写多少次只留一行。
+// 同一件事（同一 run 的失败 / 同一代的中断 / 同一 revision 的整组完成 / 同一条后台命令的终态）
+// 无论写多少次只留一行。orchestration_id 与 background_job_id 二选一：编排通知带前者、bash 通知带后者，
+// 另一个为空/NULL（doc/82 §6.4/§6.5）。
 func (s *Store) insertNotificationTx(tx *gorm.DB, n AgentNotification) error {
 	id, err := newRowID("an_")
 	if err != nil {
@@ -238,10 +240,10 @@ func (s *Store) insertNotificationTx(tx *gorm.DB, n AgentNotification) error {
 	}
 	n.ID = id
 	return tx.Exec(`INSERT INTO agent_notifications
-		(id, tenant_id, orchestration_id, task_id, receiver_session_id, kind, dedup_key, status, error_code, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, now())
+		(id, tenant_id, orchestration_id, task_id, background_job_id, receiver_session_id, kind, dedup_key, status, error_code, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
 		ON CONFLICT (dedup_key) DO NOTHING`,
-		n.ID, n.TenantID, n.OrchestrationID, n.TaskID, n.ReceiverSessionID, n.Kind, n.DedupKey, n.Status, n.ErrorCode).Error
+		n.ID, n.TenantID, n.OrchestrationID, n.TaskID, n.BackgroundJobID, n.ReceiverSessionID, n.Kind, n.DedupKey, n.Status, n.ErrorCode).Error
 }
 
 // insertInterruptedOnClaimTx 在接管事务里补写被接管代的 task_interrupted 通知（§9.1）：
@@ -442,54 +444,94 @@ SELECT o.id FROM agent_orchestrations o
 	}
 	advanced := 0
 	for _, id := range ids {
-		tenantID := ""
-		err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			var o AgentOrchestration
-			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", id).Take(&o).Error; err != nil {
-				return err
-			}
-			if o.Status != orchStatusActive && o.Status != orchStatusCancelling {
-				return nil // 锁后复查：另一个副本先收口了
-			}
-			if o.Status == orchStatusActive && o.PlanHold {
-				return nil // 计划暂停：锁后复查，等 continue／revision 放行
-			}
-			tenantID = o.TenantID
-			var final AgentTask
-			if err := tx.Where("id = ?", o.FinalTaskID).Take(&final).Error; err != nil {
-				return err
-			}
-			group := orchStatusFailed
-			if o.Status == orchStatusCancelling {
-				group = orchStatusCancelled
-			} else if final.Status == agentTaskStatusSucceeded {
-				group = orchStatusSucceeded
-			}
-			updates := map[string]any{"status": group, "finished_at": nowUTC()}
-			if group == orchStatusSucceeded {
-				updates["delivery_status"] = deliveryStatusPending
-			}
-			if err := tx.Model(&AgentOrchestration{}).Where("id = ?", id).Updates(updates).Error; err != nil {
-				return err
-			}
-			if o.Status == orchStatusCancelling {
-				return nil // 取消收口不写通知（§9.1：只有失败/中断/整组完成进模型）
-			}
-			return s.insertNotificationTx(tx, AgentNotification{
-				TenantID: o.TenantID, OrchestrationID: o.ID,
-				ReceiverSessionID: o.SourceSessionID, Kind: notifKindOrchFinished,
-				DedupKey: fmt.Sprintf("%s:%s:%d", notifKindOrchFinished, o.ID, final.ResultRevision),
-				Status:   notifStatusPending,
-			})
-		})
+		ok, err := s.advanceOrchestration(ctx, id)
 		if err != nil {
 			log.Printf("task scheduler advance %s: %v", id, err)
 			continue
 		}
-		advanced++
+		if ok {
+			advanced++
+		}
+	}
+	return advanced, nil
+}
+
+// advanceOrchestration 收口**一个**组（doc/82 §7.2）：调度循环与 wait_task 调同一份。
+//
+// 单组收口是 wait_task「先收口、再认领」的核心：Task 状态在 ReconcileRun 的事务里翻，
+// 整组收口却要等调度器下一轮——中间这段时间 orchestration_finished 通知还不存在，
+// 只按 dedup 键找会打空、run 结束后多一场重复交付。让工具自己先跑一次这份收口，
+// 收口成功的那笔事务已含通知，随后查找必然命中。
+//
+// 锁组行 → 锁后复查（状态非 active/cancelling 直接空转；active 且 plan_hold 空转；
+// 还有未终态节点空转）→ 写组状态与通知（同一事务）→ 提交后发组事件。
+// 返回 advanced=true 仅当这次真的收了口（调度器先收口只空转，结果一样）。
+func (s *Store) advanceOrchestration(ctx context.Context, orchID string) (bool, error) {
+	advanced := false
+	tenantID := ""
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var o AgentOrchestration
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", orchID).Take(&o).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if o.Status != orchStatusActive && o.Status != orchStatusCancelling {
+			return nil // 锁后复查：另一个副本（或另一个入口）先收口了
+		}
+		if o.Status == orchStatusActive && o.PlanHold {
+			return nil // 计划暂停：锁后复查，等 continue／revision 放行
+		}
+		// 锁后复查「无未终态节点」：调用方可能绕过候选列表直接调（wait_task），
+		// 组还没收得了口就空转，绝不早收。
+		var unfinished int64
+		if err := tx.Model(&AgentTask{}).
+			Where("orchestration_id = ? AND status IN ?", orchID,
+				[]string{agentTaskStatusPending, agentTaskStatusReady, agentTaskStatusRunning,
+					agentTaskStatusBlocked, agentTaskStatusPublishing}).
+			Count(&unfinished).Error; err != nil {
+			return err
+		}
+		if unfinished > 0 {
+			return nil
+		}
+		tenantID = o.TenantID
+		var final AgentTask
+		if err := tx.Where("id = ?", o.FinalTaskID).Take(&final).Error; err != nil {
+			return err
+		}
+		group := orchStatusFailed
+		if o.Status == orchStatusCancelling {
+			group = orchStatusCancelled
+		} else if final.Status == agentTaskStatusSucceeded {
+			group = orchStatusSucceeded
+		}
+		updates := map[string]any{"status": group, "finished_at": nowUTC()}
+		if group == orchStatusSucceeded {
+			updates["delivery_status"] = deliveryStatusPending
+		}
+		if err := tx.Model(&AgentOrchestration{}).Where("id = ?", orchID).Updates(updates).Error; err != nil {
+			return err
+		}
+		advanced = true
+		if o.Status == orchStatusCancelling {
+			return nil // 取消收口不写通知（§9.1：只有失败/中断/整组完成进模型）
+		}
+		return s.insertNotificationTx(tx, AgentNotification{
+			TenantID: o.TenantID, OrchestrationID: o.ID,
+			ReceiverSessionID: o.SourceSessionID, Kind: notifKindOrchFinished,
+			DedupKey: fmt.Sprintf("%s:%s:%d", notifKindOrchFinished, o.ID, final.ResultRevision),
+			Status:   notifStatusPending,
+		})
+	})
+	if err != nil {
+		return false, err
+	}
+	if advanced {
 		// 组事件按真实租户发：PublishEvent 对空租户是空操作，早先这里发空串——
 		// 组收口／交付翻转在页面上永远等不到事件，全靠任务事件捎带刷新。
-		s.PublishEvent(ctx, tenantID, eventAgentOrchestrationsChanged, id)
+		s.PublishEvent(ctx, tenantID, eventAgentOrchestrationsChanged, orchID)
 	}
 	return advanced, nil
 }
@@ -527,7 +569,7 @@ SELECT COUNT(*) FROM agent_tasks t JOIN runs r ON r.id = t.current_run_id
 			orchID, agentTaskStatusRunning).Scan(&live).Error; err != nil {
 			return err
 		}
-		budget := orchestrationConcurrency - int(live)
+		budget := orchestrationModeConcurrency(o.WorkspaceMode) - int(live)
 		if budget <= 0 {
 			return nil
 		}

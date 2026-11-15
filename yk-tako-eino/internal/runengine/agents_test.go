@@ -265,6 +265,11 @@ func TestShippedAgentSpecToolGuards(t *testing.T) {
 		"create_directory", "list_directory", "directory_tree", "get_file_info", "search_files",
 		"read_media_file", "read_pdf_text", "bash", "memory", "search_history", "web_search",
 		"web_fetch", "ask_user", "enter_plan_mode", "submit_plan",
+		// bash_output／stop_bash（doc/82 §6.2）：出厂规格（coder 白名单／researcher 排除）会点名它们，
+		// 池序没有则 resolveToolPool 按「未知名」报错——两把都在 firstPartyFileEffects 显式表态 none
+		// （不碰 workspace 路径），登记后自动进下面的名字宇宙。wait_task 不进池序：出厂规格不点名它，
+		// 子代理入口过滤（dropAgentOrchestrationTools）会把它剔出快照，金样无须表态。
+		"bash_output", "stop_bash",
 	}
 	// 名字宇宙从注册表派生（不另抄一份名单，两份会各自腐化）：父池加一把登记过 file_effect 的
 	// 新工具 ⇒ 集合与写死的池序不等 ⇒ 红。get_time 按 fileops.go:86 的说明不进注册表，显式并进来。
@@ -294,7 +299,7 @@ func TestShippedAgentSpecToolGuards(t *testing.T) {
 	// 金样 = 每条出厂规格今天应有的**有效名单**（逐名逐序；researcher 走排除路 = 池序，
 	// coder 走白名单路 = 它 frontmatter 里写的顺序）。子代理结构性没有 memory／search_memory
 	// （doc/65 §4.5/§5.2 的 drop helper），规格里也不该再列它们。
-	// researcher 的金样 = 父池去掉 bash，逐名写死；不写总数——数字会随父池变化而腐化。
+	// researcher 的金样 = 父池去掉 bash／bash_output／stop_bash，逐名写死；不写总数——数字会随父池变化而腐化。
 	// 给 researcher read_pdf_text，是因为它本来就能读 workspace 里的文件，PDF 文本属于同一类读。
 	golden := map[string][]string{
 		"researcher": {"get_time", "write_file", "read_text_file", "read_file", "edit_file", "move_file",
@@ -302,7 +307,8 @@ func TestShippedAgentSpecToolGuards(t *testing.T) {
 			"read_media_file", "read_pdf_text", "memory", "search_history", "web_search", "web_fetch",
 			"ask_user",
 			"enter_plan_mode", "submit_plan"},
-		"coder": {"write_file", "read_text_file", "edit_file", "list_directory", "search_files", "bash"},
+		"coder": {"write_file", "read_text_file", "edit_file", "list_directory", "search_files", "bash",
+			"bash_output", "stop_bash"},
 	}
 	// inheritOK：出厂规格默认必须写 tools: 或 exclude_tools: 之一——两行都不写 = 整份继承，
 	// 继承正是 doc/26 §2 那条「新工具自动到达」的通道。哪条规格有意整份继承，在这里显式表态，

@@ -332,6 +332,25 @@ func lockWorkspace(tx *gorm.DB, id, tenantID, userID string) error {
 // 数到就整笔回滚。磁盘清理不在这笔事务里：提交后由调用方走 CleanupProjectStorage
 // （doc/76 §6.4），删不掉也不回滚业务删除，记录留 pending 由调度器补偿。
 func (s *Store) DeleteWorkspaceCascade(ctx context.Context, tenantID, userID, id string) error {
+	// doc/82 §8「先请求停止…再按忙拒绝」：停止请求必须先在**独立提交**的事务里落库——
+	// 放进下面这笔会因忙拒绝整笔回滚的事务，flag 一起被回滚，owner 永远看不到（2026-11-15 活体实翻）。
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockOwnedWorkspace(tx, id, tenantID, userID); err != nil {
+			return err
+		}
+		var flags []bool
+		if err := tx.Raw(`SELECT is_default FROM workspaces WHERE id = ?`, id).Scan(&flags).Error; err != nil {
+			return err
+		}
+		if len(flags) > 0 && flags[0] {
+			return ErrWorkspaceDefault
+		}
+		return tx.Exec(
+			`UPDATE background_jobs SET stop_requested = true, updated_at = now()
+			  WHERE workspace_id = ? AND tenant_id = ? AND status = 'running'`, id, tenantID).Error
+	}); err != nil {
+		return err
+	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := lockOwnedWorkspace(tx, id, tenantID, userID); err != nil {
 			return err
@@ -371,6 +390,29 @@ func (s *Store) DeleteWorkspaceCascade(ctx context.Context, tenantID, userID, id
 		// 第一次计数若早于那次提交，会看不见刚插入的 running 行。锁到手后再数一次，有活 run 就整笔回滚。
 		if err := tx.Raw(
 			`SELECT COUNT(*) FROM runs WHERE workspace_id = ? AND status = 'running' AND lease_until > now()`,
+			id).Scan(&n).Error; err != nil {
+			return err
+		}
+		if n > 0 {
+			return ErrWorkspaceBusy
+		}
+		// 后台命令停止保护（doc/82 §8）：数「非终态 job > 0」并入忙检查。停止请求已在上面
+		// 独立事务里先落库（忙拒绝回滚不了它）；已置终止请求的行由 owner 看到后杀组收终态，
+		// 确认终态后重试即可删。
+		if err := tx.Raw(
+			`SELECT COUNT(*) FROM background_jobs WHERE workspace_id = ? AND status IN ('running', 'stopping')`,
+			id).Scan(&n).Error; err != nil {
+			return err
+		}
+		if n > 0 {
+			return ErrWorkspaceBusy
+		}
+		// 通知接收保护（doc/82 §8）：项目里的会话是还没消费通知的接收者（bash 完成通知的
+		// 接收者 = 来源会话）——级联软删后交付认领永远找不到接收者。与单场会话删除同一闸。
+		if err := tx.Raw(
+			`SELECT COUNT(*) FROM agent_notifications n
+			  JOIN sessions s ON s.id = n.receiver_session_id
+			 WHERE s.workspace_id = ? AND n.status IN ('pending', 'claimed')`,
 			id).Scan(&n).Error; err != nil {
 			return err
 		}
@@ -443,7 +485,9 @@ func (s *Store) DeleteWorkspaceCascade(ctx context.Context, tenantID, userID, id
 // 活 run 的谓词与读侧相同：status='running' AND lease_until > now()。数到就整笔回滚。
 // 这里不删 runs / runlog，也不碰目录。目录由调用方在提交之后只清 .tako 与 .media。
 func (s *Store) DeleteSession(ctx context.Context, tenantID, userID string, id SessionID) error {
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	// doc/82 §8「先请求停止…再按忙拒绝」：停止请求先在**独立提交**的事务里落库——
+	// 放进下面这笔会因忙拒绝整笔回滚的事务，flag 一起被回滚，owner 永远看不到（2026-11-15 活体实翻）。
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var rows []Session
 		if err := tx.Raw(
 			`SELECT id, tenant_id, user_id, visibility FROM sessions WHERE id = ? AND deleted_at IS NULL FOR UPDATE`,
@@ -460,9 +504,26 @@ func (s *Store) DeleteSession(ctx context.Context, tenantID, userID string, id S
 		if kind != accessOwner {
 			return ErrSessionForbidden
 		}
+		return tx.Exec(
+			`UPDATE background_jobs SET stop_requested = true, updated_at = now()
+			  WHERE source_session_id = ? AND status = 'running'`, id).Error
+	}); err != nil {
+		return err
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var n int64
 		if err := tx.Raw(
 			`SELECT COUNT(*) FROM runs WHERE session_id = ? AND status = 'running' AND lease_until > now()`,
+			id).Scan(&n).Error; err != nil {
+			return err
+		}
+		if n > 0 {
+			return ErrSessionBusy
+		}
+		// 停止请求已在上面独立事务里先落库（忙拒绝回滚不了它）；这里只数非终态 job 并入忙检查。
+		// 后台命令停止保护（doc/82 §7）：软删后命令不能还在往会话目录写，通知也失去接收会话。
+		if err := tx.Raw(
+			`SELECT COUNT(*) FROM background_jobs WHERE source_session_id = ? AND status IN ('running', 'stopping')`,
 			id).Scan(&n).Error; err != nil {
 			return err
 		}
@@ -479,6 +540,18 @@ func (s *Store) DeleteSession(ctx context.Context, tenantID, userID string, id S
 			  WHERE source_session_id = ?
 			    AND (status IN ('active', 'cancelling', 'preparing', 'waiting_previous')
 			         OR delivery_status IN ('pending', 'delivering'))`,
+			id).Scan(&n).Error; err != nil {
+			return err
+		}
+		if n > 0 {
+			return ErrSessionBusy
+		}
+		// 通知接收保护（与上一条同一原则）：还没消费的通知以这场会话为接收者
+		// （bash_job_finished 的接收者 = 来源会话，doc/82 §6.5）——删了它交付认领永远
+		// 找不到接收者，通知卡死在 pending 每秒重试（2026-11-15 活体实翻）。
+		if err := tx.Raw(
+			`SELECT COUNT(*) FROM agent_notifications
+			  WHERE receiver_session_id = ? AND status IN ('pending', 'claimed')`,
 			id).Scan(&n).Error; err != nil {
 			return err
 		}

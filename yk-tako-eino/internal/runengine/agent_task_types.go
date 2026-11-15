@@ -155,9 +155,23 @@ const (
 // 它也是修订预算：历史节点（含已取消）计入，取消不释放；修订本身的接受上限同为 32 版。
 const agentTaskMaxCount = 32
 
-// orchestrationConcurrency 是「同组同时最多在跑的 Task 数」（施工包 §2 第 11 条，固定常量）。
+// 组容量按 workspace_mode 取值（doc/82 §9.2）：shared 组串行——同组同时只跑一件 Task，
+// 其余 ready 等前一件收尾；isolated 组给每个 Task 独立现场，可并行 2 件。
+// 不把常量直接压成 1：那会把 isolated 组的并行也一起拿走。
 // interrupted 不占容量（租约已过期，不算 live run）。
-const orchestrationConcurrency = 2
+const (
+	orchestrationConcurrencyShared   = 1
+	orchestrationConcurrencyIsolated = 2
+)
+
+// orchestrationModeConcurrency 把组行的 workspace_mode 翻成同组并发预算。空模式按 isolated——
+// 与 newGroupHandle／orchestrationStorageMode 同一条约定（空 = 未声明，走隔离语义）。
+func orchestrationModeConcurrency(mode string) int {
+	if mode == workspaceModeShared {
+		return orchestrationConcurrencyShared
+	}
+	return orchestrationConcurrencyIsolated
+}
 
 // 机器错误码（error_code 列 / API error.code）。展示文案与机器原因分开（doc/70 §4.3）。
 const (

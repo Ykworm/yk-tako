@@ -10,14 +10,16 @@ import (
 )
 
 // TestTaskToolSurfaces 钉住三类角色的工具面（施工包 §11.1 第 8 条）：
-//   - Task 执行者拿得到 ask_user，但不能改图、不能再建编排、不能走来源会话的计划审批；
+//   - Task 执行者拿得到 ask_user 与后台命令的读/停（bash_output／stop_bash），但不能改图、
+//     不能再建编排、不能走来源会话的计划审批，也拿不到 wait_task（按任务号等待是来源会话的能力）；
 //   - 计划复核 run 只留只读与两把决策工具（新工具默认不可用，失败方向与执行者相反）；
 //   - 交付 run 是严格只读白名单（doc/73 §10）：bash／等人／再编排都不进池。
 func TestTaskToolSurfaces(t *testing.T) {
 	ctx := context.Background()
 	all := []tool.BaseTool{}
 	names := []string{
-		"ask_user", "bash", "read_text_file", "revise_orchestration", "continue_orchestration",
+		"ask_user", "bash", "bash_output", "stop_bash", "wait_task",
+		"read_text_file", "revise_orchestration", "continue_orchestration",
 		"delegate_task", "create_orchestration", "enter_plan_mode", "submit_plan", "memory", "use_skill",
 	}
 	for _, n := range names {
@@ -42,7 +44,7 @@ func TestTaskToolSurfaces(t *testing.T) {
 		execTools = append(execTools, st)
 	}
 	exec := gotNames(execTools)
-	for _, want := range []string{"ask_user", "bash", "read_text_file", "submit_task_result"} {
+	for _, want := range []string{"ask_user", "bash", "bash_output", "stop_bash", "read_text_file", "submit_task_result"} {
 		if !exec[want] {
 			t.Fatalf("Task 执行者缺工具 %q：%v", want, exec)
 		}
@@ -50,6 +52,8 @@ func TestTaskToolSurfaces(t *testing.T) {
 	for _, denied := range []string{
 		"revise_orchestration", "continue_orchestration", "delegate_task", "create_orchestration",
 		"enter_plan_mode", "submit_plan", "memory", "use_skill",
+		// wait_task 由 agentTaskNoTools 剔出（执行者没有本会话的其它 Task 可等，doc/82 §4-10）。
+		"wait_task",
 	} {
 		if exec[denied] {
 			t.Fatalf("Task 执行者拿到了 %q：%v", denied, exec)

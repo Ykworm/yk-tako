@@ -8,10 +8,15 @@ import {
   ApiError,
   CODE_ARTIFACT_INVALID,
   CODE_NOTIFICATION_NOT_RETRYABLE,
+  getJob,
+  getJobOutput,
   getNotification,
   getOrchestration,
+  JOB_STATUS_LABEL,
   retryNotification,
   workspaceFileUrl,
+  type Job,
+  type JobOutput,
   type NotificationDetail,
 } from './api'
 import { authFetch } from './auth'
@@ -27,6 +32,10 @@ const emit = defineEmits<{
 const detail = ref<NotificationDetail | null>(null)
 const sourceSessionId = ref('')
 const workspaceId = ref('')
+// bash 来源通知（doc/82 §6.5）：命令详情在 job 端点，不塞进通知详情。载入通知后按
+// backgroundJobId 现读命令与输出；这两份只读，不参与通知状态判定。
+const job = ref<Job | null>(null)
+const jobOutput = ref<JobOutput | null>(null)
 const phase = ref<'loading' | 'ready' | 'error'>('loading')
 const error = ref('')
 const notice = ref('')
@@ -37,6 +46,7 @@ const KIND_LABEL: Record<string, string> = {
   task_interrupted: 'Task 中断',
   orchestration_finished: '整组完成交付',
   plan_review_required: '计划待决策',
+  bash_job_finished: '后台命令完成',
 }
 const NOTIF_STATUS_LABEL: Record<string, string> = {
   pending: '待处理',
@@ -66,16 +76,26 @@ async function load() {
   if (!props.notificationId) return
   phase.value = 'loading'
   error.value = ''
+  job.value = null
+  jobOutput.value = null
   try {
     const n = await getNotification(props.notificationId)
     detail.value = n
     phase.value = 'ready'
-    // 来源会话与项目根不在通知详情里：从编排组视图取（产物下载要用项目 id）。
-    try {
-      const o = await getOrchestration(n.orchestrationId)
-      sourceSessionId.value = o.orchestration.sourceSessionId
-      workspaceId.value = o.orchestration.workspaceId
-    } catch {
+    // 来源会话与项目根不在通知详情里：编排类从编排组取、bash 类从命令取
+    // （产物下载与「进入来源会话」都要这两个 id）。
+    if (n.backgroundJobId) {
+      await loadBashJob(n.backgroundJobId)
+    } else if (n.orchestrationId) {
+      try {
+        const o = await getOrchestration(n.orchestrationId)
+        sourceSessionId.value = o.orchestration.sourceSessionId
+        workspaceId.value = o.orchestration.workspaceId
+      } catch {
+        sourceSessionId.value = ''
+        workspaceId.value = ''
+      }
+    } else {
       sourceSessionId.value = ''
       workspaceId.value = ''
     }
@@ -86,6 +106,23 @@ async function load() {
   }
 }
 
+// 命令详情现读（doc/82 §6.5）：前端按通知给的命令号打开命令详情，不按 orchestrationId 猜。
+// 命令可能在通知之后被清理 → GET 404；这时只提示「命令详情没拉到」，通知本身仍完整可读、
+// 仍可重试——命令终态已经写进通知，不因为命令行没了就把整块恢复面板判失败。
+async function loadBashJob(jobId: string) {
+  try {
+    const j = await getJob(jobId)
+    job.value = j
+    sourceSessionId.value = j.sourceSessionId
+    workspaceId.value = j.workspaceId
+    jobOutput.value = await getJobOutput(jobId)
+  } catch (e) {
+    job.value = null
+    jobOutput.value = null
+    error.value = e instanceof ApiError ? e.message : '命令详情没拉到'
+  }
+}
+
 watch(() => props.notificationId, () => void load(), { immediate: true })
 
 const offMutation = onMutation((evt) => {
@@ -93,6 +130,10 @@ const offMutation = onMutation((evt) => {
   if (!n) return
   if (evt.type === 'agent_orchestrations_changed' && evt.id === n.orchestrationId) void load()
   if (evt.type === 'agent_tasks_changed' && n.taskId && evt.id === n.taskId) void load()
+  // bash 命令进入终态／停止后事件到了：只重拉命令详情，通知行本身由认领链改变时另走上面两支。
+  if (evt.type === 'background_jobs_changed' && n.backgroundJobId && evt.id === n.backgroundJobId) {
+    void loadBashJob(evt.id)
+  }
 })
 onBeforeUnmount(offMutation)
 
@@ -232,6 +273,26 @@ function fmtWhen(iso: string | null): string {
         <p v-else class="muted">这份结果没有声明产物。</p>
       </section>
 
+      <section v-if="job" class="notif-job" data-testid="notification-job">
+        <h4>后台命令</h4>
+        <p class="muted">
+          <span class="tag" :class="job.status" data-testid="notification-job-status">{{ JOB_STATUS_LABEL[job.status] ?? job.status }}</span>
+          · 退出码 {{ job.exitCode === null ? '—' : job.exitCode }}
+          <template v-if="job.stopRequested"> · 已请求停止</template>
+        </p>
+        <p class="notif-cmd"><code>{{ job.command }}</code></p>
+        <template v-if="jobOutput">
+          <p v-if="jobOutput.stdout" class="muted">stdout 尾部</p>
+          <pre v-if="jobOutput.stdout" class="job-out" data-testid="notification-job-stdout">{{ jobOutput.stdout }}</pre>
+          <p v-if="jobOutput.stderr" class="muted">stderr 尾部</p>
+          <pre v-if="jobOutput.stderr" class="job-out" data-testid="notification-job-stderr">{{ jobOutput.stderr }}</pre>
+          <p class="muted notif-paths">
+            全文：<code>{{ jobOutput.stdoutPath }}</code>
+            <template v-if="jobOutput.stderrPath"> / <code>{{ jobOutput.stderrPath }}</code></template>
+          </p>
+        </template>
+      </section>
+
       <section class="notif-attempts" data-testid="notification-attempts">
         <h4>处理历史 <span class="count">{{ detail.attempts.length }}</span></h4>
         <p v-if="!detail.attempts.length" class="muted">还没有处理过。</p>
@@ -289,16 +350,38 @@ function fmtWhen(iso: string | null): string {
   cursor: default;
 }
 .notif-result,
+.notif-job,
 .notif-attempts {
   margin-top: 14px;
 }
 .notif-result h4,
+.notif-job h4,
 .notif-attempts h4 {
   margin: 0 0 6px;
   font-size: 13px;
 }
 .notif-summary {
   white-space: pre-wrap;
+  margin: 6px 0;
+}
+.notif-cmd {
+  margin: 6px 0;
+  word-break: break-all;
+}
+.notif-paths {
+  word-break: break-all;
+}
+.job-out {
+  max-height: 220px;
+  overflow: auto;
+  background: #0f172a;
+  color: #e2e8f0;
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
   margin: 6px 0;
 }
 .notif-artifacts {

@@ -13,6 +13,13 @@
 #
 # 纪律：kill 只打脚本自己起或调用方明确指定的隔离 PID；不调 /api/dev/reset；
 # 注册密码每次随机生成（脚本里不出现密码字面量）；模型密钥只从 .env 读。
+#
+# **隐式契约：帮手函数会覆写调用方身份变量（2026-11-15 实翻，调用方必须知道）**
+#   - ml_signup 覆写 TOK / TEN / ML_UID：注册后全场换成新租户；要回原身份必须先存
+#     （XTOK=$TOK; XTEN=$TEN）再用后还原。跨租户段忘存还原，后面所有请求都以新租户发出
+#     ——404/403 断言会「同码但错因」地假绿。
+#   - ml_run / ml_run_retry 覆写 RID / SID：多会话串场时 SID 被换成新 run 的会话，
+#     后续对原会话的投递要用另行保存的旧 SID（完整契约清单见 agent_task_live_lib.sh 头注）。
 
 ML_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 B="${TAKO_BASE:-http://127.0.0.1:8943}"

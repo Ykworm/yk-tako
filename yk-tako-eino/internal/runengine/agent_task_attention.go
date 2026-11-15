@@ -180,13 +180,14 @@ SELECT kind, orchestration_id, title, run_id, notification_id, status, updated_a
 	}
 	if err := s.db.WithContext(ctx).Raw(`
 SELECT n.task_id, n.orchestration_id,
-       COALESCE(NULLIF(t.task_key, ''), o.goal) AS title,
+       COALESCE(NULLIF(t.task_key, ''), o.goal, left(j.command, 80)) AS title,
        n.claim_run_id AS run_id, n.id AS notification_id, n.status,
        COALESCE(n.failed_at, n.updated_at) AS updated_at
   FROM agent_notifications n
-  JOIN agent_orchestrations o ON o.id = n.orchestration_id
+  LEFT JOIN agent_orchestrations o ON o.id = n.orchestration_id
+  LEFT JOIN background_jobs j ON j.id = n.background_job_id
   LEFT JOIN agent_tasks t ON t.id = n.task_id
- WHERE n.tenant_id = ? AND o.workspace_id = ?
+ WHERE n.tenant_id = ? AND COALESCE(o.workspace_id, j.workspace_id) = ?
    AND n.kind <> ? AND n.status = ?`,
 		p.TenantID, workspaceID, notifKindOrchFinished, notifStatusFailed).Scan(&failedNotifs).Error; err != nil {
 		return nil, err
@@ -234,13 +235,14 @@ SELECT t.id AS task_id, t.orchestration_id, t.task_key AS title,
 	}
 	if err := s.db.WithContext(ctx).Raw(`
 SELECT n.task_id, n.orchestration_id,
-       COALESCE(NULLIF(t.task_key, ''), o.goal) AS title,
+       COALESCE(NULLIF(t.task_key, ''), o.goal, left(j.command, 80)) AS title,
        n.claim_run_id AS run_id, n.id AS notification_id, n.updated_at
   FROM agent_notifications n
-  JOIN agent_orchestrations o ON o.id = n.orchestration_id
+  LEFT JOIN agent_orchestrations o ON o.id = n.orchestration_id
+  LEFT JOIN background_jobs j ON j.id = n.background_job_id
   LEFT JOIN agent_tasks t ON t.id = n.task_id
   LEFT JOIN runs r ON r.id = n.claim_run_id
- WHERE n.tenant_id = ? AND o.workspace_id = ?
+ WHERE n.tenant_id = ? AND COALESCE(o.workspace_id, j.workspace_id) = ?
    AND n.status = ? AND n.claim_run_id <> ''
    AND (r.id IS NULL OR r.status <> 'running' OR r.lease_until <= now())`,
 		p.TenantID, workspaceID, notifStatusClaimed).Scan(&coordInterrupted).Error; err != nil {

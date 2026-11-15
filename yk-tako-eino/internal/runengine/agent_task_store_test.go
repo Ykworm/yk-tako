@@ -66,11 +66,14 @@ func seedTaskEnv(t *testing.T, s *Store, name string) (string, SessionID) {
 }
 
 // mkTwoLayerCmd 造「A、B 并行 → C 汇总」的标准两层图命令。
+// 用 isolated 模式：A、B 是并行兄弟（doc/82 §9.2），只有 isolated 组才允许同组多件并行；
+// shared 组串行（同组一次只跑一件），需要串行语义的用例自行改成 shared。
 func mkTwoLayerCmd(wsID string, sessID SessionID, key string) CreateOrchestrationCommand {
 	return CreateOrchestrationCommand{
 		IdempotencyKey:  key,
 		WorkspaceID:     wsID,
 		SourceSessionID: sessID,
+		WorkspaceMode:   workspaceModeIsolated,
 		Goal:            "调研 A、B 后汇总",
 		Tasks: []planTask{
 			{Key: "A", Content: "调研 A", Agent: "researcher"},
@@ -413,13 +416,14 @@ func TestAgentTaskPromoteAfterAllParentsSucceed(t *testing.T) {
 	}
 }
 
-// TestAgentTaskGroupCap 钉住组容量（施工包 §2 第 11 条）：一组 4 件 ready，
-// 第一轮最多领 2 件；1 件收尾后再领 1 件（活数下降才放新位）。
+// TestAgentTaskGroupCap 钉住 isolated 组容量（施工包 §12.1）：一组 4 件 ready，
+// 第一轮最多领 2 件；1 件收尾后再领 1 件（活数下降才放新位）。shared 组串行见
+// TestAgentTaskSharedGroupSerial。
 func TestAgentTaskGroupCap(t *testing.T) {
 	s := newTestStore(t, testLease, testTTL)
 	wsID, sessID := seedTaskEnv(t, s, "researcher")
 	ctx := context.Background()
-	cmd := CreateOrchestrationCommand{IdempotencyKey: "k", WorkspaceID: wsID, SourceSessionID: sessID, Goal: "四件并行"}
+	cmd := CreateOrchestrationCommand{IdempotencyKey: "k", WorkspaceID: wsID, SourceSessionID: sessID, WorkspaceMode: workspaceModeIsolated, Goal: "四件并行"}
 	for i := 0; i < 4; i++ {
 		cmd.Tasks = append(cmd.Tasks, planTask{Key: fmt.Sprintf("t%d", i), Content: "并行件", Agent: "researcher"})
 		cmd.Links = append(cmd.Links, planLink{Parent: fmt.Sprintf("t%d", i), Child: "final"})
@@ -433,8 +437,8 @@ func TestAgentTaskGroupCap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(first) != orchestrationConcurrency {
-		t.Fatalf("第一轮领 %d 件, want %d", len(first), orchestrationConcurrency)
+	if len(first) != orchestrationConcurrencyIsolated {
+		t.Fatalf("第一轮领 %d 件, want %d", len(first), orchestrationConcurrencyIsolated)
 	}
 	// 活数未降：再领为空。
 	more, err := s.ClaimReadyInGroup(ctx, orch.OrchestrationID)
@@ -459,14 +463,60 @@ func TestAgentTaskGroupCap(t *testing.T) {
 	}
 }
 
+// TestAgentTaskSharedGroupSerial 钉住 shared 组串行（doc/82 §9.2）：同组 2 件 ready 一次只领 1 件，
+// 一件收尾后才放下一件（isolated 组并行 2 件见 TestAgentTaskGroupCap）。
+func TestAgentTaskSharedGroupSerial(t *testing.T) {
+	s := newTestStore(t, testLease, testTTL)
+	wsID, sessID := seedTaskEnv(t, s, "researcher")
+	ctx := context.Background()
+	cmd := CreateOrchestrationCommand{IdempotencyKey: "k", WorkspaceID: wsID, SourceSessionID: sessID, WorkspaceMode: workspaceModeShared, Goal: "两件串行"}
+	for i := 0; i < 2; i++ {
+		cmd.Tasks = append(cmd.Tasks, planTask{Key: fmt.Sprintf("t%d", i), Content: "串行件", Agent: "researcher"})
+		cmd.Links = append(cmd.Links, planLink{Parent: fmt.Sprintf("t%d", i), Child: "final"})
+	}
+	cmd.Tasks = append(cmd.Tasks, planTask{Key: "final", Content: "汇总", Agent: "researcher"})
+	orch, err := s.CreateAgentOrchestration(ctx, testOwner, cmd, planEnv{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.ClaimReadyInGroup(ctx, orch.OrchestrationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != orchestrationConcurrencyShared {
+		t.Fatalf("shared 组首轮领 %d 件, want %d", len(first), orchestrationConcurrencyShared)
+	}
+	// 活数未降：再领为空。
+	more, err := s.ClaimReadyInGroup(ctx, orch.OrchestrationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(more) != 0 {
+		t.Fatalf("shared 容量未释放还能领 %d 件", len(more))
+	}
+	// 一件收尾：budget 回到 1。
+	submitOK(t, s, first[0].TaskID, first[0].RunID, first[0].Epoch)
+	setRunStatus(t, s, first[0].RunID, "complete")
+	if err := s.ReconcileRun(ctx, first[0].RunID); err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.ClaimReadyInGroup(ctx, orch.OrchestrationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != orchestrationConcurrencyShared {
+		t.Fatalf("shared 收尾一件后领 %d 件, want %d", len(second), orchestrationConcurrencyShared)
+	}
+}
+
 // TestAgentTaskClaimRaceTwoStores 钉住多副本领取（施工包 §12.2）：两个 Store 实例
-// （= 两个进程读同一份 PG）同时领同一组，3 件 ready 只能产出 2 场 run（组容量），
+// （= 两个进程读同一份 PG）同时领同一组，3 件 ready 只能产出 2 场 run（isolated 组容量），
 // 每件 Task 恰有一条 current_run_id。
 func TestAgentTaskClaimRaceTwoStores(t *testing.T) {
 	s1, dsn := newTestStoreWithDSN(t, testLease, testTTL)
 	wsID, sessID := seedTaskEnv(t, s1, "researcher")
 	ctx := context.Background()
-	cmd := CreateOrchestrationCommand{IdempotencyKey: "k", WorkspaceID: wsID, SourceSessionID: sessID, Goal: "三件并行"}
+	cmd := CreateOrchestrationCommand{IdempotencyKey: "k", WorkspaceID: wsID, SourceSessionID: sessID, WorkspaceMode: workspaceModeIsolated, Goal: "三件并行"}
 	for i := 0; i < 3; i++ {
 		cmd.Tasks = append(cmd.Tasks, planTask{Key: fmt.Sprintf("t%d", i), Content: "并行件", Agent: "researcher"})
 		cmd.Links = append(cmd.Links, planLink{Parent: fmt.Sprintf("t%d", i), Child: "final"})
@@ -495,8 +545,8 @@ func TestAgentTaskClaimRaceTwoStores(t *testing.T) {
 		}(st)
 	}
 	wg.Wait()
-	if total != orchestrationConcurrency {
-		t.Fatalf("两副本合计领 %d 件, want %d（组容量）", total, orchestrationConcurrency)
+	if total != orchestrationConcurrencyIsolated {
+		t.Fatalf("两副本合计领 %d 件, want %d（isolated 组容量）", total, orchestrationConcurrencyIsolated)
 	}
 	// 每件被领的 Task 恰一条 run；没被领的保持 ready。
 	var withRun int64

@@ -1,7 +1,7 @@
 # doc/ 文档索引
 
 > 性质：**索引**，不是方案。本文只回答「这篇文档是什么、能不能照着施工、代码在哪、被谁取代」。
-> 最后核对：2026-11-14。
+> 最后核对：2026-11-15。
 > 状态口径：✅ 已落地 · 🔶 部分落地／待收口 · ⬜ 未做 · 存档 = 历史材料，不作施工面。
 > 代码路径均相对 `yk-tako-eino/`。
 
@@ -46,6 +46,7 @@
 - 改对话页的工具卡（哪些工具进气泡、摘要／失败／截断口径）：`doc/59`。
 - 改多会话并发（切走保留／实例上限／空对话项目落点／侧栏运行中）：`doc/60`。
 - 改持久 Task／多 Agent 编排：`doc/70`、`doc/72`、`doc/73`；并行任务的工作区隔离、结果交接与发布恢复：`doc/74`（已落地）。
+- 改后台命令（前台等待窗口／job 输出／停止／失联恢复）、`wait_task` 就地认领与路径账本：`doc/82`（已落地）。
 - 改目标可行性判断、继任编排组与 handoff：`doc/75`；改项目内容根、运行资源容器与整容器删除：`doc/76`（两篇 2026-11-13 已落地）。
 - 改对话页右侧任务面板（项目 Task 常驻、处理项就地打开）：`doc/77`（已落地）。
 - 改对话页右侧工作区（项目目录树、任务、Todo、文件标签与「改动的文件」回执）：`doc/78`（已落地；取代 doc/77 §3「Todo 不进面板」）。
@@ -361,11 +362,10 @@
   - 落点：`web/src/auth.ts`（`RefreshOutcome` / `readRefreshOutcome` / `isEnvelope` 三态判定，`doRefresh` 按三态分支）、`web/test/authrefresh.test.ts`（新增回归网 8 条）；纯前端、契约字节零变化
   - 病灶：`doRefresh` 把「`/api/auth/refresh` 拿到任何非 2xx」都当登录失效并 `clearAuth('expired')`；dev 重启引擎时 Vite 代理回 500（`text/plain`），开着的标签页被无端登出。改为只有「HTTP 401 且响应是引擎信封且 `code≠0`」才登出，5xx／代理 500／非信封 401 都是暂时性故障、静默保留 token 等下一拍
 
-- **82** [可组合执行原语与后台任务](82-可组合执行原语与后台任务.md) ⬜（**方案待点头，未施工**）
-  - 落点（预计）：`internal/runengine/{bash,bashspill,sandbox,bash_job_*,agent_task_tools,agent_task_delivery,agent_task_scheduler,agent_task_runner,server,auth}.go`、`internal/config/model.go`、`web/src/`、机器验收 `scripts/acceptance/`
-  - 2026-11-15 立项。bash 的 30 秒改为前台等待窗口，超时保留进程并返回 `bj_…`，补输出读取／有限等待／停止／持久通知与失联处理；Task 新增 `wait_task`，当前 run 已读结果时认领通知，避免重复交付；创建编排补 `finalTaskId`
-  - 不增加用户可见 DAG 模式或 JS 引擎：同步子代理、持久 Task、等待和依赖保持可组合；新工作继续走 doc/72 同组修订，已交付后走 doc/75 继任组；shared 组改为串行，需并行修改时使用 doc/74 isolated 现场。方案含多副本、崩溃、Task／项目生命周期与完整验收线
-  - 页面不只给最终结果：新增路径账本（`GET /api/orchestrations/:id/journey` 提案），从计划修订、Task 终态与失败原因、结果复用、通知尝试与继任 handoff 派生；计划版本、失败／取消节点、替代路径、交付次数都可见，刷新与换副本一致
+- **82** [可组合执行原语与后台任务](82-可组合执行原语与后台任务.md) ✅（**2026-11-15 落地**：`internal/runengine/{bash_job,bash_job_sweeper,bashspill,agent_task_*}.go` 等 + `scripts/acceptance/` 用例 82–83，活体四脚本全绿）
+  - 落点：`internal/runengine/{bash_job.go,bash_job_sweeper.go,bashspill.go,agent_task_tools.go,agent_task_delivery.go,agent_task_scheduler.go,agent_task_store.go,agent_task_runner.go,agent_task_recovery.go,agent_task_attention.go,agent_task_api.go,orchestration_journey.go,sandbox.go}`、`internal/config/model.go`、`cmd/yktako/main.go`（5 旗标）、`agents/{coder,researcher}.md`、`web/src/{api.ts,TasksView.vue,NotificationRecovery.vue}`、`scripts/acceptance/`（expected.json 用例 82–83 + bash_job_live.sh 等）、[19v6-04](19-v6/19v6-04-验收-curl.md)、[doc/40](40-响应信封统一.md) §4.2e（117117/117118/117119）
+  - 2026-11-15 立项并落地。bash 的 30 秒改为前台等待窗口（默认 8s，超时保留进程并返回 `bj_…`），补输出读取／有限等待／停止（SIGKILL 整进程组）／持久通知与失联处理（owner watcher 续租写终态、sweeper 对账 interrupted）；`wait_task` 让当前 run 已读结果时就地认领通知（`claimed_in_place=true`，不建 run、不写 attempt 行），避免重复交付；编排组内并发按 `workspace_mode` 取值（shared=1、isolated=2）；创建编排补 `finalTaskId`；新增路径账本 `GET /api/orchestrations/:id/journey`（只读投影，从计划修订、Task 终态、结果复用、通知尝试与继任 handoff 派生，刷新与换副本一致）
+  - 不增加用户可见 DAG 模式或 JS 引擎：同步子代理、持久 Task、等待和依赖保持可组合；新工作继续走 doc/72 同组修订，已交付后走 doc/75 继任组；shared 组改为串行，需并行修改时使用 doc/74 isolated 现场。验收：单测/契约 506/0、活体四脚本（bash job 62/0、编排 49/49、journey 22/0、orchestration 回归）+ `spotcheck.sh` 37/0 + 浏览器走查（桌面/移动端 390 断言）；doc/58 的 bash 落盘落点与清扫触发点被本篇改定
 
 ## 2. 历史存档（`doc/archive/`，不作施工面）
 

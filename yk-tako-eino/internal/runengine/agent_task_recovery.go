@@ -25,13 +25,20 @@ var (
 	errNotifArtifactInvalid = errors.New("notification result artifact invalid")
 )
 
-// notificationOwnerQuery 是通知可见性链的公共 SQL：通知 → 编排组 → 来源会话 → 本人。
+// notificationOwnerQuery 是通知可见性链的公共 SQL：通知 → 来源会话 → 本人。
 // 与 taskOwnerQuery 同一条纪律：非本人与不存在同形（117003），不给探测通道。
 // 软删的会话整条落空——「来源会话已删除」与「不存在」也不区分。
+//
+// 来源会话按 kind 二选一取（doc/82 §6.5）：编排通知经编排组（o.source_session_id），bash 通知
+// 经 job（j.source_session_id）——bash 行的 orchestration_id 是空串，只 JOIN 组会让它整条查不到、
+// 详情与重试全 404。两个 LEFT JOIN 互不冲突：编排行 background_job_id 为 NULL，bash 行
+// orchestration_id 为空串，各自只命中一个；两条来源都取不到时 COALESCE 为 NULL，`s.id = NULL`
+// 不成立，整条落空——这正是「来源会话已删除」要的 404。
 const notificationOwnerQuery = `
 SELECT n.* FROM agent_notifications n
-  JOIN agent_orchestrations o ON o.id = n.orchestration_id
-  JOIN sessions s ON s.id = o.source_session_id
+  LEFT JOIN agent_orchestrations o ON o.id = n.orchestration_id
+  LEFT JOIN background_jobs j ON j.id = n.background_job_id
+  JOIN sessions s ON s.id = COALESCE(o.source_session_id, j.source_session_id)
  WHERE n.tenant_id = ? AND s.user_id = ? AND s.deleted_at IS NULL`
 
 // notificationResultView 是详情里的结果定位（doc/73 §9）：finalTaskId + resultRevision 永远
@@ -54,7 +61,8 @@ type notificationAttemptView struct {
 
 // agentNotificationView 是 GET 的完整视图。字段顺序 = 施工包 §4.1 的契约字节序：
 // notificationId → orchestrationId → taskId → kind → status → runId → attempt → errorCode
-// → result → createdAt → claimedAt → failedAt → consumedAt → updatedAt → attempts。
+// → result → createdAt → claimedAt → failedAt → consumedAt → updatedAt → attempts
+// → backgroundJobId（doc/82 §6.5 追加，旧字段不重排）。
 type agentNotificationView struct {
 	NotificationID  string                    `json:"notificationId"`
 	OrchestrationID string                    `json:"orchestrationId"`
@@ -71,6 +79,10 @@ type agentNotificationView struct {
 	ConsumedAt      *time.Time                `json:"consumedAt"`
 	UpdatedAt       time.Time                 `json:"updatedAt"`
 	Attempts        []notificationAttemptView `json:"attempts"`
+	// BackgroundJobID 指向后台命令（doc/82 §6.5）：bash_job_finished 通知的 orchestration_id 为空串，
+	// 前端据它打开命令详情；编排类通知该引用为 NULL，这里恒空串。空串不等于「没有这条命令」——
+	// 命令是否还在由 GET /api/jobs/:id 自己判 404（被清理后按 404）。
+	BackgroundJobID string `json:"backgroundJobId"`
 }
 
 // notificationRetryView 是 POST retry 的响应体（施工包 §4.2，字段序固定）。
@@ -97,6 +109,11 @@ func (s *Store) GetAgentNotification(ctx context.Context, p principal, id string
 	if err != nil {
 		return agentNotificationView{}, err
 	}
+	// background_job_id 是 NULL 可空列：编排类通知为 NULL，扫成空串给前端（与 orchestrationId 同口径）。
+	bgJobID := ""
+	if n.BackgroundJobID != nil {
+		bgJobID = *n.BackgroundJobID
+	}
 	view := agentNotificationView{
 		NotificationID: n.ID, OrchestrationID: n.OrchestrationID, TaskID: n.TaskID,
 		Kind: n.Kind, Status: n.Status, RunID: RunID(n.ClaimRunID),
@@ -104,7 +121,8 @@ func (s *Store) GetAgentNotification(ctx context.Context, p principal, id string
 		ErrorCode: n.ConsumeErrorCode,
 		CreatedAt: n.CreatedAt, ClaimedAt: n.ClaimedAt, FailedAt: n.FailedAt,
 		ConsumedAt: n.ConsumedAt, UpdatedAt: n.UpdatedAt,
-		Attempts: attempts,
+		Attempts:        attempts,
+		BackgroundJobID: bgJobID,
 	}
 	if n.Kind == notifKindOrchFinished {
 		result, err := s.finalTaskResultView(ctx, n.OrchestrationID)
@@ -219,9 +237,22 @@ func (s *Store) RetryAgentNotification(ctx context.Context, p principal, notifID
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", pre.ID).Take(&n).Error; err != nil {
 			return err
 		}
+		// 按 kind 二选一取事实源（§5 表）：bash 通知没有编排组，锁组行会 `id = ''` 空手而归、
+		// 整笔事务回滚；它的租户/项目/来源会话全从 job 读（`notificationJob` 在 delivery 面）。
 		var o AgentOrchestration
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", n.OrchestrationID).Take(&o).Error; err != nil {
-			return err
+		if n.Kind != notifKindBashJobFinished {
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", n.OrchestrationID).Take(&o).Error; err != nil {
+				return err
+			}
+		}
+		// 组租户门按 kind 取（bash 行 o 是零值，用组租户会锁错租户的门）。
+		tenantID := o.TenantID
+		if n.Kind == notifKindBashJobFinished {
+			j, jerr := notificationJob(tx, n)
+			if jerr != nil {
+				return jerr
+			}
+			tenantID = j.TenantID
 		}
 		var cur struct {
 			Status string `gorm:"column:status"`
@@ -278,7 +309,7 @@ UPDATE agent_notifications
 		if live > 0 {
 			return ErrSessionBusy
 		}
-		if err := s.lockTenantGate(tx, o.TenantID); err != nil {
+		if err := s.lockTenantGate(tx, tenantID); err != nil {
 			return err
 		}
 		// 上一次用户可见正文：从 PG runlog 现读 root assistant（不是易失 Redis），

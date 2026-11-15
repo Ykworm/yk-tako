@@ -2891,7 +2891,8 @@
       "message": "",
       "data_keys": [
        "orchestrationId",
-       "status"
+       "status",
+       "finalTaskId"
       ],
       "data": {
        "status": "active"
@@ -4485,7 +4486,8 @@
        "failedAt",
        "consumedAt",
        "updatedAt",
-       "attempts"
+       "attempts",
+       "backgroundJobId"
       ],
       "data": {
        "notificationId": "{nid}",
@@ -4509,7 +4511,8 @@
          "attempt": 1,
          "status": "error"
         }
-       ]
+       ],
+       "backgroundJobId": ""
       }
      }
     },
@@ -4543,7 +4546,8 @@
        "claimedAt": null,
        "failedAt": null,
        "consumedAt": null,
-       "attempts": []
+       "attempts": [],
+       "backgroundJobId": ""
       }
      }
     },
@@ -7088,6 +7092,370 @@
       "data": {
        "tasks": []
       }
+     }
+    }
+   ]
+  },
+  {
+   "id": "82-jobs-endpoints",
+   "case": "用例 82",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "后台命令端点（doc/82 §6.3）：列表默认只含后台化/非终态、详情 jobView 键序、/output 读落盘尾部、停止三态（running→stopping、仍 stopping→409 117118、终态幂等）、未知 id 404 117117、未知项目 404 114001、无 token 401 111102。造一行 job 用 SQL + seed_ws 造输出文件，字节与 2026-11-15 隔离引擎实打一致",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-job-endpoints"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), '82 job 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "op": "seed_ws",
+     "workspace": "{wid}",
+     "files": {
+      ".tako/bash/jobs/bj_acc82/stdout.out": "hello-82\n"
+     }
+    },
+    {
+     "sql": "INSERT INTO background_jobs (id, tenant_id, workspace_id, source_session_id, source_run_id, tool_call_id, source_task_id, source_orchestration_id, command, status, exit_code, stop_requested, backgrounded, executor_id, epoch, lease_until, stdout_rel_path, stderr_rel_path, created_at, started_at, updated_at) VALUES ('bj_acc82','{ten}','{wid}','{sid}','r_acc82','tc_acc82','','','echo hello-82','running',NULL,false,true,'acc82',1, now(), 'runtime/tmp/bash/jobs/bj_acc82/stdout.out','runtime/tmp/bash/jobs/bj_acc82/stderr.out', now(), now(), now()) ON CONFLICT (id) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, workspace_id=EXCLUDED.workspace_id, source_session_id=EXCLUDED.source_session_id, source_run_id=EXCLUDED.source_run_id, tool_call_id=EXCLUDED.tool_call_id, command=EXCLUDED.command, status=EXCLUDED.status, exit_code=EXCLUDED.exit_code, stop_requested=EXCLUDED.stop_requested, backgrounded=EXCLUDED.backgrounded, epoch=EXCLUDED.epoch, lease_until=EXCLUDED.lease_until, stdout_rel_path=EXCLUDED.stdout_rel_path, stderr_rel_path=EXCLUDED.stderr_rel_path, created_at=EXCLUDED.created_at, started_at=EXCLUDED.started_at, ended_at=NULL, updated_at=EXCLUDED.updated_at"
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/jobs",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "jobs"
+      ],
+      "data": {
+       "jobs": [
+        {
+         "jobId": "bj_acc82",
+         "workspaceId": "{wid}",
+         "sourceSessionId": "{sid}",
+         "sourceRunId": "r_acc82",
+         "sourceTaskId": "",
+         "sourceOrchestrationId": "",
+         "status": "running",
+         "exitCode": null,
+         "stopRequested": false,
+         "backgrounded": true,
+         "command": "echo hello-82",
+         "stdoutPath": "runtime/tmp/bash/jobs/bj_acc82/stdout.out",
+         "stderrPath": "runtime/tmp/bash/jobs/bj_acc82/stderr.out",
+         "createdAt": "$any",
+         "startedAt": "$any",
+         "endedAt": null
+        }
+       ]
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/jobs/bj_acc82",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "jobId",
+       "workspaceId",
+       "sourceSessionId",
+       "sourceRunId",
+       "sourceTaskId",
+       "sourceOrchestrationId",
+       "status",
+       "exitCode",
+       "stopRequested",
+       "backgrounded",
+       "command",
+       "stdoutPath",
+       "stderrPath",
+       "createdAt",
+       "startedAt",
+       "endedAt"
+      ],
+      "data": {
+       "jobId": "bj_acc82",
+       "workspaceId": "{wid}",
+       "sourceSessionId": "{sid}",
+       "sourceRunId": "r_acc82",
+       "sourceTaskId": "",
+       "sourceOrchestrationId": "",
+       "status": "running",
+       "exitCode": null,
+       "stopRequested": false,
+       "backgrounded": true,
+       "command": "echo hello-82",
+       "stdoutPath": "runtime/tmp/bash/jobs/bj_acc82/stdout.out",
+       "stderrPath": "runtime/tmp/bash/jobs/bj_acc82/stderr.out",
+       "createdAt": "$any",
+       "startedAt": "$any",
+       "endedAt": null
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/jobs/bj_acc82/output",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "jobId",
+       "status",
+       "exitCode",
+       "stdout",
+       "stderr",
+       "stdoutPath",
+       "stderrPath"
+      ],
+      "data": {
+       "jobId": "bj_acc82",
+       "status": "running",
+       "exitCode": null,
+       "stdout": "hello-82\n",
+       "stderr": "",
+       "stdoutPath": "runtime/tmp/bash/jobs/bj_acc82/stdout.out",
+       "stderrPath": "runtime/tmp/bash/jobs/bj_acc82/stderr.out"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/jobs/bj_acc82/stop",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "jobId",
+       "status",
+       "stopRequested"
+      ],
+      "data": {
+       "jobId": "bj_acc82",
+       "status": "stopping",
+       "stopRequested": true
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/jobs/bj_acc82/stop",
+     "expect": {
+      "http": 409,
+      "code": 117118,
+      "message": "这条命令正在停止中，不能重复请求",
+      "data": null
+     }
+    },
+    {
+     "sql": "UPDATE background_jobs SET status='succeeded', exit_code=0, ended_at=now() WHERE id='bj_acc82'"
+    },
+    {
+     "method": "POST",
+     "path": "/api/jobs/bj_acc82/stop",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "jobId",
+       "status",
+       "stopRequested"
+      ],
+      "data": {
+       "jobId": "bj_acc82",
+       "status": "succeeded",
+       "stopRequested": false
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/jobs/bj_nope",
+     "expect": {
+      "http": 404,
+      "code": 117117,
+      "message": "找不到这条命令",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/ws_nope/jobs",
+     "expect": {
+      "http": 404,
+      "code": 114001,
+      "message": "找不到这个项目",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/jobs/bj_acc82",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "83-journey-endpoints",
+   "case": "用例 83",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "路径账本端点（doc/82 §10.3）：读侧合成初始计划步骤（revision 0 / reason=initial / added=两个任务键）、summary 全量计数、未知组 404 117002、无 token 401 111102",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-journey"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'journey 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc83",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "goal": "两步调研后汇总",
+      "tasks": [
+       {
+        "key": "a",
+        "content": "调研主题 A",
+        "agent": "researcher"
+       },
+       {
+        "key": "b",
+        "content": "汇总调研结论",
+        "agent": "coder"
+       }
+      ],
+      "links": [
+       {
+        "parent": "a",
+        "child": "b"
+       }
+      ]
+     },
+     "capture": {
+      "orid": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "orchestrationId",
+       "status",
+       "finalTaskId"
+      ]
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/orchestrations/{orid}/journey",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "orchestrationId",
+       "planRevision",
+       "summary",
+       "steps",
+       "relatedOrchestrationIds"
+      ],
+      "data": {
+       "orchestrationId": "{orid}",
+       "planRevision": 0,
+       "summary": {
+        "planRevisions": 1,
+        "tasksCreated": 2,
+        "succeeded": 0,
+        "failed": 0,
+        "cancelled": 0,
+        "blocked": 0,
+        "reusedResults": 0,
+        "successorGroups": 0,
+        "deliveryAttempts": 0
+       },
+       "steps": [
+        {
+         "type": "plan_revision",
+         "revision": 0,
+         "at": "$any",
+         "reason": "initial",
+         "added": [
+          "a",
+          "b"
+         ]
+        }
+       ],
+       "relatedOrchestrationIds": []
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/orchestrations/or_journey_unknown00000000/journey",
+     "expect": {
+      "http": 404,
+      "code": 117002,
+      "message": "找不到这个编排组",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/orchestrations/{orid}/journey",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
      }
     }
    ]

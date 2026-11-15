@@ -926,6 +926,9 @@ export type NotificationDetail = {
   consumedAt: string | null
   updatedAt: string
   attempts: NotificationAttempt[]
+  // doc/82 §6.5：bash_job_finished 通知的编排引用为空串，命令号在这（末位追加字段）；
+  // 编排类通知恒空串。前端据它打开命令详情，不按 orchestrationId 猜。
+  backgroundJobId: string
 }
 
 // POST retry 的 data（202 新尝试 / 200 已有在处理的 run 或计划决策已接受）。
@@ -973,6 +976,112 @@ export function retryTaskPublication(taskId: string): Promise<PublicationRetryRe
   return request<PublicationRetryResult>(
     `/api/tasks/${encodeURIComponent(taskId)}/retry-publication`,
     { method: 'POST' },
+  )
+}
+
+// —— 后台命令与路径账本（doc/82）——
+// 后台命令进现有任务页的命令分组（复用一个入口，不做两个重复列表）：列表按项目拉，
+// 详情／输出单读，停止是写面动作。可见性失败一律 404 117117（非本人与不存在同形）。
+export const CODE_JOB_MISSING = 117117 // 找不到这条命令（不存在／不可见／跨租户同形 404）
+export const CODE_JOB_NOT_STOPPABLE = 117118 // 这条命令正在停止中，不能重复请求
+
+// 一条后台命令（GET /api/jobs/:id 与列表行同形，键序固定）。status：
+// running / stopping / succeeded / failed / stopped / interrupted。路径是相对运行资源根的逻辑路径。
+export type Job = {
+  jobId: string
+  workspaceId: string
+  sourceSessionId: string
+  sourceRunId: string
+  sourceTaskId: string
+  sourceOrchestrationId: string
+  status: string
+  exitCode: number | null
+  stopRequested: boolean
+  backgrounded: boolean
+  command: string
+  stdoutPath: string
+  stderrPath: string
+  createdAt: string
+  startedAt: string | null
+  endedAt: string | null
+}
+
+// GET /api/jobs/:id/output（与 bash_output 同形同序）：stdout/stderr 是当前尾部 ≤64000 字节，
+// 全文按路径经 /output 分页读；路径恒给出（文件未落成时内容是空串）。
+export type JobOutput = {
+  jobId: string
+  status: string
+  exitCode: number | null
+  stdout: string
+  stderr: string
+  stdoutPath: string
+  stderrPath: string
+}
+
+export type JobStopResult = { jobId: string; status: string; stopRequested: boolean }
+
+// 命令状态词表（doc/82 §6.2）：与后端一致，含 stopping。stopping 不是终态——进程还在退出。
+// 放这里与 Job 类型同处：命令分组与通知恢复面板共用同一份，避免两处各写一套而漂移。
+export const JOB_STATUS_LABEL: Record<string, string> = {
+  running: '运行中',
+  stopping: '停止中',
+  succeeded: '已完成',
+  failed: '失败',
+  stopped: '已停止',
+  interrupted: '已中断',
+}
+
+export function listWorkspaceJobs(workspaceId: string, sessionId?: string): Promise<{ jobs: Job[] }> {
+  const q = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ''
+  return request<{ jobs: Job[] }>(`/api/workspaces/${encodeURIComponent(workspaceId)}/jobs${q}`)
+}
+
+export function getJob(jobId: string): Promise<Job> {
+  return request<Job>(`/api/jobs/${encodeURIComponent(jobId)}`)
+}
+
+export function getJobOutput(jobId: string): Promise<JobOutput> {
+  return request<JobOutput>(`/api/jobs/${encodeURIComponent(jobId)}/output`)
+}
+
+// 停止一条命令：running → stopping（进程仍在退出），已终态回当前态，stopping 重复请求 409 117118。
+export function stopJob(jobId: string): Promise<JobStopResult> {
+  return request<JobStopResult>(`/api/jobs/${encodeURIComponent(jobId)}/stop`, { method: 'POST' })
+}
+
+// 路径账本（doc/82 §10.3）：由程序从持久记录派生的只读投影，前端不从模型回答重建。
+// planRevisions 是含初始版本的版本总数（= planRevision + 1）。
+export type JourneySummary = {
+  planRevisions: number
+  tasksCreated: number
+  succeeded: number
+  failed: number
+  cancelled: number
+  blocked: number
+  reusedResults: number
+  successorGroups: number
+  deliveryAttempts: number
+}
+
+// steps 是混合类型的时间线，按 type 分支：计划修订 / 节点终态 / 结果复用 / 继任组 / 交付尝试。
+export type JourneyStep =
+  | { type: 'plan_revision'; revision: number; at: string; reason: string; added: string[]; cancelled?: string[] }
+  | { type: 'task'; taskId: string; taskKey: string; status: string; reason?: string }
+  | { type: 'reuse'; taskId: string; resultRevision: number; at: string }
+  | { type: 'successor'; orchestrationId: string; at: string }
+  | { type: 'delivery_attempt'; attempt: number; runId: string; at: string }
+
+export type OrchestrationJourney = {
+  orchestrationId: string
+  planRevision: number
+  summary: JourneySummary
+  steps: JourneyStep[]
+  relatedOrchestrationIds: string[]
+}
+
+export function getOrchestrationJourney(orchestrationId: string): Promise<OrchestrationJourney> {
+  return request<OrchestrationJourney>(
+    `/api/orchestrations/${encodeURIComponent(orchestrationId)}/journey`,
   )
 }
 

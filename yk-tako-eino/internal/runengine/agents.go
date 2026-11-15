@@ -372,7 +372,10 @@ func (h *agentSpecHandler) assembleSubagentTool(ctx context.Context, spec AgentS
 		Model:       subModel,
 		// 子代理与主代理同一条上限（agentMaxIterations，2026-10-16 用户裁定放开到 50）。
 		MaxIterations: agentMaxIterations,
-		ToolsConfig:   adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: pool}},
+		ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{
+			Tools:               pool,
+			UnknownToolsHandler: unknownToolReplier,
+		}},
 		// handler 每次调用新造（callerStamp / toolSearch / wireAppend / fold 链上均无
 		// per-delegation 字段——2026-10-16 禁令二，新造无副作用）。
 		Handlers: h.subagentHandlers(spec.Name, wantSearch),

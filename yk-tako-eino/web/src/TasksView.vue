@@ -9,23 +9,32 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   ApiError,
+  CODE_JOB_NOT_STOPPABLE,
   continueOrchestration,
   getAgentTask,
+  getJobOutput,
   getOrchestration,
   getOrchestrationHandoff,
+  getOrchestrationJourney,
+  JOB_STATUS_LABEL,
   listPlanRevisions,
   listTaskQuestions,
+  listWorkspaceJobs,
   listWorkspaceTasks,
   listWorkspaces,
   postAnswer,
   resumeAgentTask,
   retryTaskPublication,
   stopAgentTask,
+  stopJob,
   stopOrchestration,
   taskArtifactUrl,
   workspaceFileUrl,
   type AgentTask,
+  type Job,
+  type JobOutput,
   type OrchestrationHandoff,
+  type OrchestrationJourney,
   type OrchestrationView,
   type PlanRevisionRow,
   type TaskQuestion,
@@ -94,6 +103,23 @@ const handoffOpen = ref(false)
 const handoffLoading = ref(false)
 const handoffError = ref('')
 
+// 路径账本（doc/82 §10.3）：打开一个编排组时从 journey 端点读只读投影，前端不从模型回答重建。
+// 与 handoff 同规矩——打开详情时清空，避免把上一组的账本显示给下一组。
+const journey = ref<OrchestrationJourney | null>(null)
+const journeyLoading = ref(false)
+const journeyError = ref('')
+
+// 后台命令分组（doc/82 §10.2）：行=命令摘要+状态+来源；展开=尾部输出+全文路径；
+// running 可停、stopping 置灰显示「停止中」。列表随项目拉，事件到了重拉（终态靠重拉对齐）。
+const jobs = ref<Job[]>([])
+const jobsPhase = ref<'loading' | 'ready' | 'error'>('loading')
+const jobsError = ref('')
+const expandedJobs = ref<string[]>([])
+const jobOutputs = ref<Record<string, JobOutput>>({})
+const jobStopBusy = ref('')
+let jobsTimer: ReturnType<typeof setInterval> | null = null
+let jobsLoading = false
+
 // Task 问题区（doc/72 §5）：pending 按 createdAt,id 的 FIFO 排，第一张可答；
 // answered／stale 只读展示。问题正文行是 Task 当前 run 的 run_questions 行。
 const questions = ref<TaskQuestion[]>([])
@@ -138,6 +164,76 @@ const filtered = computed(() => {
   )
 })
 
+// 账本时间线（doc/82 §10.3）：把端点的五种步骤归一成可渲染的一行——前端只做形状适配，
+// 不补任何事实（失败／取消节点、复用、继任、交付尝试都照端点给的写）。
+type JourneyRow = {
+  id: string
+  at: string
+  kind: 'plan' | 'task' | 'reuse' | 'successor' | 'delivery'
+  label: string
+  text: string
+  added: string[]
+  cancelled: string[]
+}
+const journeyRows = computed<JourneyRow[]>(() => {
+  const rows: JourneyRow[] = []
+  const steps = journey.value?.steps ?? []
+  steps.forEach((s, i) => {
+    if (s.type === 'plan_revision') {
+      rows.push({
+        id: `rev-${s.revision}-${i}`,
+        at: s.at,
+        kind: 'plan',
+        label: `计划 v${s.revision}`,
+        text: s.reason,
+        added: s.added,
+        cancelled: s.cancelled ?? [],
+      })
+    } else if (s.type === 'task') {
+      rows.push({
+        id: `task-${s.taskId}`,
+        at: '',
+        kind: 'task',
+        label: `${s.taskKey} · ${STATUS_LABEL[s.status] ?? s.status}`,
+        text: s.reason ?? '',
+        added: [],
+        cancelled: [],
+      })
+    } else if (s.type === 'reuse') {
+      rows.push({
+        id: `reuse-${s.taskId}-${i}`,
+        at: s.at,
+        kind: 'reuse',
+        label: '复用前代结果',
+        text: `${s.taskId}（resultRevision ${s.resultRevision}）`,
+        added: [],
+        cancelled: [],
+      })
+    } else if (s.type === 'successor') {
+      rows.push({
+        id: `succ-${s.orchestrationId}-${i}`,
+        at: s.at,
+        kind: 'successor',
+        label: '继任组',
+        text: s.orchestrationId,
+        added: [],
+        cancelled: [],
+      })
+    } else {
+      rows.push({
+        id: `del-${s.attempt}-${i}`,
+        at: s.at,
+        kind: 'delivery',
+        label: `交付尝试 ${s.attempt}`,
+        text: `run ${s.runId}`,
+        added: [],
+        cancelled: [],
+      })
+    }
+  })
+  return rows
+})
+
 // 停止门槛（doc/70 §11.6）：running（含读侧派生的 interrupted——存储仍是 running）
 // 与尚未执行（pending/ready/blocked）可停；已终态不显示按钮。
 const STOPPABLE = new Set(['pending', 'ready', 'blocked', 'running', 'interrupted'])
@@ -149,6 +245,12 @@ let reloadDelay: ReturnType<typeof setTimeout> | null = null
 function scheduleReload() {
   if (reloadDelay) clearTimeout(reloadDelay)
   reloadDelay = setTimeout(() => void loadTasks(), 120)
+}
+
+let jobsReloadDelay: ReturnType<typeof setTimeout> | null = null
+function scheduleJobsReload() {
+  if (jobsReloadDelay) clearTimeout(jobsReloadDelay)
+  jobsReloadDelay = setTimeout(() => void loadJobs(true), 120)
 }
 
 const offMutation = onMutation((evt) => {
@@ -163,6 +265,10 @@ const offMutation = onMutation((evt) => {
     scheduleReload()
     if (orch.value?.orchestration.orchestrationId === evt.id) void reloadOrch(evt.id)
     if (detail.value && detail.value.orchestrationId === evt.id) void reloadDetail(detail.value.taskId)
+  } else if (evt.type === 'background_jobs_changed') {
+    // 命令事件不带终态正文（doc/82 §10.4）：重拉列表；展开着的那条同时刷尾部输出。
+    scheduleJobsReload()
+    if (expandedJobs.value.includes(evt.id)) void loadJobOutput(evt.id)
   }
 })
 
@@ -201,6 +307,101 @@ function onWorkspacePick(e: Event) {
   scope.value = 'project'
 }
 
+// —— 后台命令分组（doc/82 §10.2）——
+// silent=true 是事件/轮询触发的重拉：不动 phase，避免闪烁；失败也只在列表空时提示。
+async function loadJobs(silent = false) {
+  if (!workspaceId.value) {
+    jobs.value = []
+    jobsPhase.value = 'ready'
+    syncJobsTimer()
+    return
+  }
+  if (jobsLoading) return
+  jobsLoading = true
+  if (!silent) jobsPhase.value = 'loading'
+  try {
+    const sid = scope.value === 'session' ? (props.activeSessionId ?? '') : ''
+    const res = await listWorkspaceJobs(workspaceId.value, sid)
+    jobs.value = res.jobs
+    jobsPhase.value = 'ready'
+    // 展开着的命令若输出可能变了（非终态），顺手刷一次尾部输出。
+    for (const id of expandedJobs.value) {
+      const row = jobs.value.find((j) => j.jobId === id)
+      if (row && (row.status === 'running' || row.status === 'stopping')) void loadJobOutput(id)
+    }
+  } catch (err) {
+    // 显式拉取失败进错误态；silent 重拉失败时手里还有旧列表就原样保留等下一轮，只在列表空时降级。
+    if (!silent || jobs.value.length === 0) {
+      jobsPhase.value = 'error'
+      jobsError.value = err instanceof ApiError ? err.message : '命令列表没拉到'
+    }
+  } finally {
+    jobsLoading = false
+    syncJobsTimer()
+  }
+}
+
+// 轮询快照（施工包 §6.3：不新增「等待 30 秒」端点，页面轮询快照 + 事件重拉）。
+// 只在列表里还有未终态命令时开表，全终态就停表——终态由事件到达后的一次重拉对齐。
+function syncJobsTimer() {
+  const live = jobs.value.some((j) => j.status === 'running' || j.status === 'stopping')
+  if (live && !jobsTimer) {
+    jobsTimer = setInterval(() => void loadJobs(true), 4000)
+  } else if (!live && jobsTimer) {
+    clearInterval(jobsTimer)
+    jobsTimer = null
+  }
+}
+
+async function loadJobOutput(jobId: string) {
+  try {
+    jobOutputs.value[jobId] = await getJobOutput(jobId)
+  } catch {
+    /* 输出暂时读不到就留旧值；下一次事件或轮询会对齐 */
+  }
+}
+
+// 展开/收起一条命令；首次展开拉尾部输出与全文路径。
+function toggleJob(job: Job) {
+  const i = expandedJobs.value.indexOf(job.jobId)
+  if (i >= 0) {
+    expandedJobs.value = expandedJobs.value.filter((id) => id !== job.jobId)
+    return
+  }
+  expandedJobs.value = [...expandedJobs.value, job.jobId]
+  if (!jobOutputs.value[job.jobId]) void loadJobOutput(job.jobId)
+}
+
+// running 与 stopping 都显示停止按钮（stopping 置灰显示「停止中」）；终态不显示。
+function jobStoppable(job: Job): boolean {
+  return job.status === 'running' || job.status === 'stopping'
+}
+
+async function stopJobNow(job: Job) {
+  if (jobStopBusy.value || !jobStoppable(job)) return
+  banner.value = ''
+  jobStopBusy.value = job.jobId
+  try {
+    const res = await stopJob(job.jobId)
+    notice.value = res.status === 'stopping' ? '停止请求已受理，进程正在退出' : '这条命令已经是终态'
+    await loadJobs(true)
+    void loadJobOutput(job.jobId)
+  } catch (err) {
+    // 409 117118 = 已经在停止中（别的入口抢先）：重拉显示服务端现状。
+    const api = err instanceof ApiError ? err : null
+    if (api?.code === CODE_JOB_NOT_STOPPABLE) notice.value = api.message || '这条命令正在停止中'
+    else fail(err, '停止失败，请再试一次')
+    await loadJobs(true)
+  } finally {
+    jobStopBusy.value = ''
+  }
+}
+
+function jobSummary(job: Job): string {
+  const one = job.command.replace(/\s+/g, ' ').trim()
+  return one.length > 80 ? `${one.slice(0, 80)}…` : one
+}
+
 function fail(err: unknown, fallback: string) {
   if (err instanceof ApiError) {
     banner.value = err.message
@@ -209,8 +410,13 @@ function fail(err: unknown, fallback: string) {
   banner.value = fallback
 }
 
-// 档位或项目变了就重拉；两者同一次 flush 一起变时只拉一次。
-watch([workspaceId, scope], () => void loadTasks())
+// 档位或项目变了就重拉（任务与命令各一份）；两者同一次 flush 一起变时只拉一次。
+watch([workspaceId, scope], () => {
+  void loadTasks()
+  expandedJobs.value = []
+  jobOutputs.value = {}
+  void loadJobs()
+})
 
 // 换会话（doc/80 §4.3）：档位回到默认（能拿到会话就本会话）。任务页不换 key，靠这条重拉；
 // 嵌入实例换会话时由 ChatDock 换 key 整体重挂载，这条只在任务页内生效。
@@ -220,8 +426,12 @@ watch(
     const next = v ? 'session' : 'project'
     // 档位变了由上面的 watch 重拉；档位没变（会话 A→B 仍是「本会话」）时这里必须自己重拉，
     // 否则列表停在上一场会话的结果上。
-    if (scope.value === next) void loadTasks()
-    else scope.value = next
+    if (scope.value === next) {
+      void loadTasks()
+      void loadJobs(true)
+    } else {
+      scope.value = next
+    }
   },
 )
 
@@ -249,6 +459,7 @@ async function openDetail(row: AgentTask, questionId = '') {
   orch.value = null
   revisions.value = []
   resetHandoff()
+  resetJourney()
   detail.value = row
   focusedQuestionId.value = questionId
   answerDraft.value = ''
@@ -294,6 +505,27 @@ async function loadRevisions(id: string) {
   }
 }
 
+// 路径账本（doc/82 §10.3）：只读投影，「变了」靠组事件重拉；打开一个组时先清空，
+// 拉到后填上。前端只呈现端点给的事实，不从模型回答或本地状态重建账本。
+function resetJourney() {
+  journey.value = null
+  journeyLoading.value = false
+  journeyError.value = ''
+}
+
+async function loadJourney(id: string) {
+  journeyLoading.value = true
+  journeyError.value = ''
+  try {
+    journey.value = await getOrchestrationJourney(id)
+  } catch (err) {
+    journey.value = null
+    journeyError.value = err instanceof ApiError ? err.message : '路径账本没拉到'
+  } finally {
+    journeyLoading.value = false
+  }
+}
+
 async function reloadOrch(id: string) {
   if (orch.value?.orchestration.orchestrationId !== id) return
   try {
@@ -303,6 +535,7 @@ async function reloadOrch(id: string) {
     return
   }
   await loadRevisions(id)
+  await loadJourney(id)
 }
 
 function resetHandoff() {
@@ -346,6 +579,7 @@ function closeDetail() {
   answerDraft.value = ''
   answerPick.value = -1
   resetHandoff()
+  resetJourney()
 }
 
 async function openOrch(id: string) {
@@ -353,6 +587,7 @@ async function openOrch(id: string) {
   detail.value = null
   questions.value = []
   resetHandoff()
+  resetJourney()
   detailLoading.value = true
   try {
     orch.value = await getOrchestration(id)
@@ -363,6 +598,7 @@ async function openOrch(id: string) {
     detailLoading.value = false
   }
   await loadRevisions(id)
+  await loadJourney(id)
 }
 
 function openTaskFromOrch(taskId: string) {
@@ -541,6 +777,7 @@ const STATUS_LABEL: Record<string, string> = {
   cancelled: '已取消',
   interrupted: '已中断',
 }
+// 命令状态词表（doc/82 §6.2）与通知恢复面板共用一份，定义在 api.ts。
 const ORCH_STATUS_LABEL: Record<string, string> = {
   active: '进行中',
   succeeded: '已完成',
@@ -668,6 +905,7 @@ watch(
   () => props.reloadNonce,
   () => {
     void loadTasks()
+    void loadJobs(true)
     if (detail.value) void reloadDetail(detail.value.taskId)
     if (orch.value) void reloadOrch(orch.value.orchestration.orchestrationId)
   },
@@ -682,6 +920,7 @@ onMounted(() => {
       workspaceId.value = props.activeWorkspaceId ?? ''
       lastFocusNonce = props.focusNonce ?? 0
       await loadTasks()
+      await loadJobs()
       return
     }
     try {
@@ -692,6 +931,7 @@ onMounted(() => {
       return
     }
     await loadTasks()
+    await loadJobs()
     await applyFocus()
   })()
 })
@@ -700,6 +940,8 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeydown)
   offMutation()
   if (reloadDelay) clearTimeout(reloadDelay)
+  if (jobsReloadDelay) clearTimeout(jobsReloadDelay)
+  if (jobsTimer) clearInterval(jobsTimer)
 })
 </script>
 
@@ -778,6 +1020,61 @@ onBeforeUnmount(() => {
               <span>更新于 {{ fmtWhen(row.updatedAt) }}</span>
             </span>
           </button>
+        </li>
+      </ul>
+    </section>
+
+    <!-- 命令分组（doc/82 §10.2）：后台命令活过前台等待窗口后从这里观察与干预；
+         与任务共用一个入口，不做独立视图。终态靠事件重拉对齐，未终态期间页面轮询快照。 -->
+    <section class="card" data-testid="jobs-card">
+      <div class="list-head">
+        <h3>命令 <span class="count">{{ jobs.length }}</span></h3>
+        <p class="muted">助手启动的后台命令：输出落在运行资源目录，活过前台等待窗口。</p>
+      </div>
+      <p v-if="jobsPhase === 'loading'" class="muted">正在加载…</p>
+      <p v-else-if="jobsPhase === 'error'" class="muted">{{ jobsError }}</p>
+      <p v-else-if="!workspaceId" class="muted">{{ embedded ? '先在左侧选一个项目。' : '先在上面选一个项目。' }}</p>
+      <p v-else-if="!jobs.length" class="muted">这个项目还没有后台命令。</p>
+      <ul v-else class="job-list" data-testid="jobs-list">
+        <li v-for="j in jobs" :key="j.jobId" class="job" :data-job="j.jobId">
+          <div class="job-main">
+            <button type="button" class="job-toggle" @click="toggleJob(j)">
+              <span class="job-title">
+                <code class="job-cmd">{{ jobSummary(j) }}</code>
+                <span class="tag" :class="j.status" data-testid="job-status">{{ JOB_STATUS_LABEL[j.status] ?? j.status }}</span>
+              </span>
+              <span class="meta">
+                <span v-if="j.sourceTaskId">来源 Task {{ j.sourceTaskId.slice(0, 12) }}…</span>
+                <span v-else>来源会话 {{ j.sourceSessionId.slice(0, 12) }}…</span>
+                <span>开始 {{ fmtWhen(j.startedAt) }}</span>
+              </span>
+            </button>
+            <button
+              v-if="jobStoppable(j)"
+              type="button"
+              class="danger job-stop"
+              :disabled="j.status === 'stopping' || jobStopBusy === j.jobId"
+              data-testid="job-stop"
+              @click="stopJobNow(j)"
+            >{{ j.status === 'stopping' ? '停止中' : '停止' }}</button>
+          </div>
+          <div v-if="expandedJobs.includes(j.jobId)" class="job-detail" data-testid="job-detail">
+            <template v-if="jobOutputs[j.jobId]">
+              <p class="muted">退出码：{{ jobOutputs[j.jobId].exitCode ?? '—' }}</p>
+              <p class="muted">stdout 尾部：</p>
+              <pre class="body job-out">{{ jobOutputs[j.jobId].stdout || '（还没有输出）' }}</pre>
+              <template v-if="jobOutputs[j.jobId].stderr">
+                <p class="muted">stderr 尾部：</p>
+                <pre class="body job-out err">{{ jobOutputs[j.jobId].stderr }}</pre>
+              </template>
+              <p class="muted job-paths">
+                全文路径：
+                <code>{{ jobOutputs[j.jobId].stdoutPath }}</code>
+                <template v-if="jobOutputs[j.jobId].stderrPath"> · <code>{{ jobOutputs[j.jobId].stderrPath }}</code></template>
+              </p>
+            </template>
+            <p v-else class="muted">正在读取输出…</p>
+          </div>
         </li>
       </ul>
     </section>
@@ -937,6 +1234,51 @@ onBeforeUnmount(() => {
                   <p v-if="r.sourceRunId" class="muted rev-line">来源 run {{ r.sourceRunId }}</p>
                 </li>
               </ol>
+            </section>
+
+            <!-- 路径账本（doc/82 §10.3）：程序从持久记录派生的只读投影，页面不从模型回答重建。
+                 概览计数 + 时间线 + 计划差异 + 继 handoff，全部照端点的 bytes 呈现。 -->
+            <section class="sec" data-testid="orch-journey">
+              <h4>路径账本</h4>
+              <p v-if="journeyLoading" class="muted">正在读取…</p>
+              <p v-else-if="journeyError" class="banner error" role="alert">{{ journeyError }}</p>
+              <template v-else-if="journey">
+                <p class="muted journey-sum" data-testid="orch-journey-summary">
+                  计划版本 {{ journey.summary.planRevisions }} · 节点 {{ journey.summary.tasksCreated }}
+                  （成功 {{ journey.summary.succeeded }}／失败 {{ journey.summary.failed }}／取消 {{ journey.summary.cancelled }}／受阻 {{ journey.summary.blocked }}）
+                  · 复用 {{ journey.summary.reusedResults }} · 继任组 {{ journey.summary.successorGroups }}
+                  · 交付尝试 {{ journey.summary.deliveryAttempts }}
+                </p>
+                <ol v-if="journeyRows.length" class="rev-list" data-testid="orch-journey-steps">
+                  <li v-for="row in journeyRows" :key="row.id" class="rev" :class="`k-${row.kind}`">
+                    <div class="rev-head">
+                      <strong>{{ row.label }}</strong>
+                      <span v-if="row.at" class="muted">{{ fmtWhen(row.at) }}</span>
+                    </div>
+                    <p v-if="row.text" class="rev-reason">{{ row.text }}</p>
+                    <p v-if="row.added.length" class="muted rev-line">
+                      新增：
+                      <code v-for="k in row.added" :key="k">{{ k }}</code>
+                    </p>
+                    <p v-if="row.cancelled.length" class="muted rev-line">
+                      取消：
+                      <code v-for="k in row.cancelled" :key="k">{{ k }}</code>
+                    </p>
+                  </li>
+                </ol>
+                <p v-else class="muted">还没有可呈现的账本记录。</p>
+                <p v-if="journey.relatedOrchestrationIds.length" class="muted journey-related">
+                  关联组：
+                  <button
+                    v-for="rid in journey.relatedOrchestrationIds"
+                    :key="rid"
+                    type="button"
+                    class="orch-link"
+                    data-testid="orch-journey-related"
+                    @click="openOrch(rid)"
+                  >{{ rid }}</button>
+                </p>
+              </template>
             </section>
             <p v-if="detailLoading" class="muted">正在读取…</p>
           </template>
@@ -1259,6 +1601,68 @@ h4 { margin: 0 0 0.35rem; font-size: var(--text-sm); font-weight: 600; }
   cursor: pointer;
   text-decoration: underline;
 }
+
+/* 命令分组（doc/82 §10.2）：行=命令摘要+状态+来源，展开=尾部输出+全文路径。 */
+.job-list {
+  list-style: none;
+  margin: 0.4rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.job-main {
+  display: flex;
+  align-items: stretch;
+  gap: 0.5rem;
+}
+.job-toggle {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: 1px solid var(--line, #e5e7eb);
+  border-radius: 10px;
+  padding: 0.6rem 0.8rem;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.job-toggle:hover { border-color: var(--accent, #6366f1); }
+.job-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+.job-cmd {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.job-stop { align-self: center; }
+.job-detail {
+  border: 1px solid var(--line, #e5e7eb);
+  border-top: 0;
+  border-radius: 0 0 10px 10px;
+  padding: 0.6rem 0.8rem;
+  margin-top: -1px;
+}
+.job-out {
+  max-height: 16rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0.2rem 0 0.5rem;
+}
+.job-out.err { color: #b91c1c; }
+.job-paths { overflow-wrap: anywhere; }
+
+/* 账本时间线（doc/82 §10.3）：与计划修订同一个 ol 皮肤，按步骤类型加一点色彩区分。 */
+.journey-sum { overflow-wrap: anywhere; }
+.journey-related { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.rev.k-task { border-left: 3px solid var(--accent, #6366f1); }
+.rev.k-successor { border-left: 3px solid #b45309; }
+.rev.k-delivery { border-left: 3px solid #0e7490; }
 
 .task-list {
   list-style: none;

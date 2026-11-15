@@ -8,8 +8,35 @@
 #     （默认 -task-interval 1s 就是开；契约断言那种 -task-interval=-1s 的引擎跑不了活体）；
 #   - 建议给引擎配 TAKO_MEMORY_MODE=markdown（免 broker；这几场不验记忆行为）。
 #   - kill 只打 TAKO_ENGINE_PIDS 明确指定的隔离实例或脚本自己起的进程；不调 /api/dev/reset。
+#
+# **隐式契约（调用方必须知道，否则串场时身份被静默换掉，2026-11-15 实翻）**：
+#   - ml_signup 会覆写 TOK / TEN / ML_UID —— 注册新租户后全场上下文换成新租户；
+#     要回原身份必须自己先存（XTOK=$TOK; XTEN=$TEN）再用后还原。
+#   - ml_run / at_run_retry 会覆写 RID / SID（还可能改 SRC/MAIN_SID 之类由调用方传名的变量，
+#     以各脚本实际用法为准）—— 多会话串场时 SID 被换成新 run 的会话，后续对原会话的
+#     投递要用它返回值之外另行保存的旧 SID。
 
 source "$(dirname "${BASH_SOURCE[0]}")/memory_live_lib.sh"
+
+# at_run_retry $1=正文 $2=workspaceId [$3=sessionId]：ml_run 的重试版（Task 活体专用）。
+# 交付 run 也占会话闸（one_live_run_per_session），前一场刚落定就投下一场会撞 112101
+# 「这场会话正在跑」——原消息没进闸，等 3s 重投是安全的，最多 120s；其他失败照旧退出。
+at_run_retry(){
+  local text="$1" wid="$2" sid="${3:-}" deadline=$((SECONDS + 120)) resp code body
+  while :; do
+    body=$(jq -cn --arg t "$text" --arg m "m_live_$(date +%s)_$RANDOM" --arg w "$wid" --arg s "$sid" \
+      '{messageId:$m,text:$t} + (if $w != "" then {workspaceId:$w} else {} end) + (if $s != "" then {sessionId:$s} else {} end)')
+    resp=$(curl -sS -X POST "$B/api/runs" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d "$body" 2>/dev/null)
+    code=$(printf '%s' "$resp" | jq -r '.code // ""' 2>/dev/null)
+    if [ "$code" = "0" ]; then
+      RID=$(printf '%s' "$resp" | jq -r .data.runId)
+      SID=$(printf '%s' "$resp" | jq -r .data.sessionId)
+      return 0
+    fi
+    if [ "$code" = "112101" ] && [ "$SECONDS" -lt "$deadline" ]; then sleep 3; continue; fi
+    echo "投递失败：$resp" >&2; exit 2
+  done
+}
 
 # at_task $1=taskId → 把 GET /api/tasks/:id 的 data 存进 AT_TASK。
 at_task(){

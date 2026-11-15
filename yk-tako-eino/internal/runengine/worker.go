@@ -218,7 +218,7 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 	pool = append(pool, wrapToolErrors(readPDF))
 	// bash 执行工具入池（doc/17 第 3 节）：文件工具之后、memory 前——批量活先写脚本再跑；
 	// 作业根 workspace（相对路径在 workspace 内解析），32 KB 上限 / 环境白名单在 bash.go（无自动超时，2026-10-15 用户裁）。
-	bash, err := newBashTool(workspace)
+	bash, err := newBashTool(store, workspace)
 	if err != nil {
 		return nil, err
 	}
@@ -338,6 +338,26 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 		}
 		pool = append(pool, wrapToolErrors(t))
 	}
+	// 后台命令的读取与停止（doc/82 §6.2；施工包 §4-10）：进基座与根池——来源会话按命令号读/停
+	// 自己启动的后台命令；执行者也要能读停自己 Task 名下的命令（所以不进 agentTaskNoTools）。
+	// 子代理可见性由规格决定：coder 白名单显式列入、researcher exclude_tools 显式排除。
+	bashOut, err := newBashOutputTool(store)
+	if err != nil {
+		return nil, err
+	}
+	pool = append(pool, wrapToolErrors(bashOut))
+	stopBash, err := newStopBashTool(store)
+	if err != nil {
+		return nil, err
+	}
+	pool = append(pool, wrapToolErrors(stopBash))
+	// wait_task（doc/82 §6.2）：进根池；子代理入口快照与 Task 执行者都剔掉（dropAgentOrchestrationTools
+	// 的 reserved 集合 + agentTaskNoTools）——按任务号等待是来源会话的能力。
+	waitTask, err := newWaitTaskTool(store)
+	if err != nil {
+		return nil, err
+	}
+	pool = append(pool, wrapToolErrors(waitTask))
 	// 摘要器在 agent 装配前构造（A4，planning 裁定 9）：midfoldHandler 要拿它的 summarize 方法值——
 	// mid-run 折叠与 prepareInput 的 Run fold 共用同一个摘要器、同一道上限（C5-A7 分档）。
 	compactLimit := CompactLimitFor(compactWindow)
@@ -385,7 +405,10 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 	handlers = append(handlers, &planGuardHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}})
 	// 看板使用约定静态拼进系统提示（doc/41 §3.3）：约定写在提示词里，不写状态机——
 	// 「提示词和工具，一个都不能少」。子代理的规格文件（agents/*.md）自带各自的约定。
-	system = system + "\n\n" + taskBoardPrompt + "\n\n" + askUserPrompt + "\n\n" + planPrompt
+	// 执行方式规则块（doc/82 §6.7；施工包 §6.7）同层静态拼接：它讲「先判断怎么完成、再选工具」，
+	// 与 taskBoardPrompt（待办步骤）分工不同，篇幅固定不随 run 变化。
+	system = system + "\n\n" + taskBoardPrompt + "\n\n" + askUserPrompt + "\n\n" + planPrompt +
+		"\n\n" + executionModePrompt
 	w := &Worker{store: store, sum: sum, chat: wrapChatModel(chat, modelRef), tools: pool, handlers: handlers, translate: translate, system: system,
 		rootRef: modelRef, leaseRenew: leaseRenew, workspace: workspace, compactWindow: compactWindow, compactLimit: compactLimit, archiveTTL: archiveTTL, counter: counter}
 	// 启动时先建一次，配置坏了立刻退出。每场 run 再新建，避免多个租户共用一个 agent 实例时取消互相踩掉。
@@ -489,7 +512,8 @@ func (w *Worker) newRunAgent(ctx context.Context) (adk.Agent, error) {
 		MaxIterations: agentMaxIterations,
 		ToolsConfig: adk.ToolsConfig{
 			ToolsNodeConfig: compose.ToolsNodeConfig{
-				Tools: tools,
+				Tools:               tools,
+				UnknownToolsHandler: unknownToolReplier,
 			},
 			EmitInternalEvents: true,
 		},
