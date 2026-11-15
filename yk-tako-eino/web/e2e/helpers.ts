@@ -46,7 +46,7 @@ export async function apiLogin(): Promise<{ token: string; tenantId: string }> {
   const res = await fetch(`${BASE}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, password }),
+    body: JSON.stringify({ identifier: email, password }),
   })
   const body = await res.json()
   if (body?.code !== 0) {

@@ -566,6 +566,10 @@ onMutation((evt) => {
     onSessionDeleted(evt.id)
   } else if (evt.type === 'workspace_deleted') {
     onWorkspaceDeleted({ id: evt.id })
+    // 侧栏自己存着项目行与项目名，不清不拉就会一直躺着一个死项目（doc/50 A5）。
+    void loadSidebarTree()
+  } else if (evt.type === 'workspace_renamed') {
+    void loadSidebarTree()
   } else if (evt.type === 'agent_tasks_changed' || evt.type === 'agent_orchestrations_changed') {
     // 全局左侧入口也消费任务事件（doc/72 §7.3）：只重拉聚合，不在事件里带状态。
     scheduleAttention()
