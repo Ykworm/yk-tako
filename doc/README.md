@@ -231,9 +231,9 @@
   - 落点：`internal/runengine/{agents.go,product_api.go,server.go,accesslog_test.go,agents_test.go}`、`web/src/{chat.ts,App.vue,Configure.vue,ProjectsView.vue,InviteLanding.vue,markdown.ts,auth.ts}`、`web/test/markdown.test.ts`
   - 2026-10-23 立项并于同日落地。doc/48 落地后的**第二次**全站走查：Playwright 逐页点击 + 真停止 + 跨标签页 + 窄屏 + 引擎日志对读，逐条验出 **12 项**。**1 项 P0**：子代理名字含空格/中文 → 厂商 `tools[i].function.name` 400 → **整个租户所有 run 失败**（保存/导入/落盘三个入口都没校验）；**5 项 P1**：停止/失败刷新后整轮消失、等人面板被别端停掉后卡死输入框且等待期间无停止入口、删除会话事件不剪侧栏（死链点进空对话）、新建同名内置助手静默清空说明/规格/工具、导入默认可见性（团队）与手工新建（仅自己）相反；**6 项 P2/P3**：报错带 HTTP 状态码、refresh 失效静默登出、邀请页印错邮箱、复制失败无反馈、密钥空名行谎报成功、灯箱不能关/不放大、名字无长度上限、自动链接吞中文标点、项目页两句话与行为不符、访问日志含完整 `access_token`。四问按推荐值落地（§14），落地与验收记录见 §15。台账 `tmp/49-走查缺陷修复/`（不入库）
 
-- **50** [侧栏项目树（方案）](50-侧栏项目树.md) 🔶（A1–A4 已落地 2026-10-24；A5 待做）
+- **50** [侧栏项目树（方案）](50-侧栏项目树.md) ✅（A1–A5 已落地 2026-11-15）
   - 落点：`web/src/App.vue`（只此一处）
-  - 2026-10-24 立项。侧栏从「最近 10 条扁平会话 + 内部滚动条」改为**全部项目 → 各自对话**的二级树（手风琴、默认全展开、空项目显示「还没有对话」）：整栏合计 10 条、超出点「展示更多」就地 +10、全展开后变「收起」；**每个项目再限 10 条**，项目内超出时该项目下出「展示全部」，点开只放开这一个项目；项目名前是文件夹图标（开口=展开、合口=折叠）。列表内滚动条已删。**后端零改动**（`GET /api/workspaces` + `GET /api/sessions` 现有字段够拼）。A1 数据层／A2 树与空态／A3 展示更多／A4 双层上限与图标均已浏览器验收；**A5（`workspace_renamed`/`workspace_deleted` 事件重载、窄屏、文档回填）未开工**。台账 `tmp/50-侧栏项目树/`（不入库）
+  - 2026-10-24 立项。侧栏从「最近 10 条扁平会话 + 内部滚动条」改为**全部项目 → 各自对话**的二级树（手风琴、默认全展开、空项目显示「还没有对话」）：整栏合计 10 条、超出点「展示更多」就地 +10、全展开后变「收起」；**每个项目再限 10 条**，项目内超出时该项目下出「展示全部」，点开只放开这一个项目；项目名前是文件夹图标（开口=展开、合口=折叠）。列表内滚动条已删。**后端零改动**（`GET /api/workspaces` + `GET /api/sessions` 现有字段够拼）。A1 数据层／A2 树与空态／A3 展示更多／A4 双层上限与图标均已浏览器验收；**A5（`workspace_renamed`/`workspace_deleted` 事件重载、窄屏、文档回填）已于 2026-11-15 收口**（`App.vue` 的 `onMutation` 对上两类事件即重拉侧栏树，窄屏一项由 doc/51 U6 覆盖；Playwright `web/e2e/sidebar-events.spec.ts`，commit `cba0339`）。台账 `tmp/50-侧栏项目树/`（不入库）
 
 - **51** [UI 视觉重做](51-UI视觉重做.md) ✅（已落地，2026-10-24）
   - 落点：`web/src/base.css` + `web/src/App.vue` + `web/src/{ProjectsView,Configure,MembersView,ConfirmDialog,InviteLanding,PendingInvites,PlanDoc}.vue`（样式段；后端零改动）
