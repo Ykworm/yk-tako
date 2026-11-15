@@ -57,3 +57,28 @@ func TestAccessTokenTampered(t *testing.T) {
 		t.Fatalf("token segments: %s", raw)
 	}
 }
+
+func TestNormalizeIdentifier(t *testing.T) {
+	cases := []struct {
+		in      string
+		value   string
+		byEmail bool
+		ok      bool
+	}{
+		{"root", "root", false, true},
+		{"  Root ", "root", false, true},
+		{"a7-envelope-test@example.com", "a7-envelope-test@example.com", true, true},
+		{"A7-Envelope-Test@Example.com", "a7-envelope-test@example.com", true, true},
+		{"", "", false, false},
+		{"@example.com", "", true, false},
+		{"ro ot", "", false, false},
+		{"-root", "", false, false},
+	}
+	for _, tc := range cases {
+		value, byEmail, ok := normalizeIdentifier(tc.in)
+		if value != tc.value || byEmail != tc.byEmail || ok != tc.ok {
+			t.Fatalf("normalizeIdentifier(%q) = (%q,%v,%v), want (%q,%v,%v)",
+				tc.in, value, byEmail, ok, tc.value, tc.byEmail, tc.ok)
+		}
+	}
+}

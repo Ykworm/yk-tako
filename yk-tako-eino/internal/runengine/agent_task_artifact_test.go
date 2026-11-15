@@ -21,11 +21,8 @@ func seedIsolatedSubmitted(t *testing.T, s *Store, agentName, key string) (projD
 	wsID, sessID := seedTaskEnv(t, s, agentName)
 	root := t.TempDir()
 	s.SetWorkspaceRoot(root)
-	projDir, err := workspaceDir(root, testOwner.TenantID, wsID)
+	projDir, _, err := ensureProjectLayout(root, testOwner.TenantID, wsID)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(projDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(projDir, "report.md"), []byte("原始"), 0o644); err != nil {
@@ -145,7 +142,7 @@ func TestTaskArtifactSharedAndLost(t *testing.T) {
 	s := newTestStore(t, testLease, testTTL)
 	ctx := context.Background()
 
-	// shared 组：即使已提交结果也没有隔离产物。
+	// shared 组也有不可变结果（doc/76 §4），产物读口与 isolated 同一条。
 	wsID, sessID := seedTaskEnv(t, s, "researcher")
 	resp, err := s.CreateAgentTask(ctx, testOwner, CreateTaskCommand{
 		IdempotencyKey: "k-shared", WorkspaceID: wsID, SourceSessionID: sessID,
@@ -155,9 +152,19 @@ func TestTaskArtifactSharedAndLost(t *testing.T) {
 		t.Fatal(err)
 	}
 	cs := claimOne(t, s, resp.OrchestrationID)
-	submitOK(t, s, cs.TaskID, cs.RunID, cs.Epoch)
-	if _, err := s.TaskArtifact(ctx, testOwner, cs.TaskID, "a.txt"); !errors.Is(err, errArtifactShared) {
-		t.Fatalf("shared err = %v, want errArtifactShared", err)
+	sharedWork, _, err := s.prepareTaskWork(ctx, cs.TaskID)
+	if err != nil {
+		t.Fatalf("prepareTaskWork: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sharedWork.Root, "a.txt"), []byte("共享结果"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SubmitTaskResult(ctx, cs.TaskID, cs.RunID, cs.Epoch,
+		TaskResult{Summary: "完成", Artifacts: []TaskArtifact{{Path: "a.txt", Kind: "file"}}}, sharedWork.Root); err != nil {
+		t.Fatalf("shared 提交: %v", err)
+	}
+	if b, err := s.TaskArtifact(ctx, testOwner, cs.TaskID, "a.txt"); err != nil || string(b) != "共享结果" {
+		t.Fatalf("shared 读产物 = %q, %v; want 共享结果", b, err)
 	}
 
 	// isolated 尚未提交：结果引用缺失（同项目另造一件只领取不提交的）。
@@ -355,6 +362,81 @@ func TestRetryTaskPublicationFullLoop(t *testing.T) {
 	}
 }
 
+func TestRetryTaskPublicationShared(t *testing.T) {
+	s := newTestStore(t, testLease, testTTL)
+	ctx := context.Background()
+	wsID, sessID := seedTaskEnv(t, s, "researcher-shared-full")
+	root := t.TempDir()
+	s.SetWorkspaceRoot(root)
+	projDir, _, err := ensureProjectLayout(root, testOwner.TenantID, wsID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projDir, "shared.md"), []byte("原始"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := s.CreateAgentTask(ctx, testOwner, CreateTaskCommand{
+		IdempotencyKey: "k-shared-full", WorkspaceID: wsID, SourceSessionID: sessID,
+		Content: "改共享报告", Agent: "researcher-shared-full",
+	}, planEnv{})
+	if err != nil {
+		t.Fatalf("创建 shared 单件: %v", err)
+	}
+	c := claimOne(t, s, resp.OrchestrationID)
+	work, _, err := s.prepareTaskWork(ctx, c.TaskID)
+	if err != nil {
+		t.Fatalf("prepareTaskWork: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(work.Root, "shared.md"), []byte("结果v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SubmitTaskResult(ctx, c.TaskID, c.RunID, c.Epoch,
+		TaskResult{Summary: "完成", Artifacts: []TaskArtifact{{Path: "shared.md", Kind: "report"}}}, work.Root); err != nil {
+		t.Fatalf("shared 提交: %v", err)
+	}
+	// 与 isolated 同一场戏：项目被人前进 → 发布受阻。
+	if err := os.WriteFile(filepath.Join(projDir, "shared.md"), []byte("人改"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	setRunStatus(t, s, c.RunID, "complete")
+	if err := s.ReconcileRun(ctx, c.RunID); err != nil {
+		t.Fatalf("ReconcileRun: %v", err)
+	}
+	if st, code := taskStatus(t, s, c.TaskID); st != agentTaskStatusBlocked || code != taskErrWorkspaceChanged {
+		t.Fatalf("shared 发布受阻后 task = %s/%s, want blocked/workspace_changed", st, code)
+	}
+
+	view, claim, err := s.RetryTaskPublication(ctx, testOwner, c.TaskID)
+	if err != nil {
+		t.Fatalf("shared retry: %v", err)
+	}
+	if claim == nil || view.Status != agentTaskStatusRunning || view.PublicationEpoch != 2 {
+		t.Fatalf("shared retry = %+v claim=%v, want 新处理 run/running/epoch 2", view, claim)
+	}
+
+	// 处理 run 修好项目现场并重提 → 同一发布链成功。
+	if err := os.WriteFile(filepath.Join(projDir, "shared.md"), []byte("原始"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(work.Root, "shared.md"), []byte("结果v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SubmitTaskResult(ctx, c.TaskID, claim.RunID, claim.Epoch,
+		TaskResult{Summary: "冲突已裁决", Artifacts: []TaskArtifact{{Path: "shared.md", Kind: "report"}}}, work.Root); err != nil {
+		t.Fatalf("shared 重提: %v", err)
+	}
+	setRunStatus(t, s, claim.RunID, "complete")
+	if err := s.ReconcileRun(ctx, claim.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if st, code := taskStatus(t, s, c.TaskID); st != agentTaskStatusSucceeded || code != "" {
+		t.Fatalf("shared 重新发布后 task = %s/%s, want succeeded", st, code)
+	}
+	if b, _ := os.ReadFile(filepath.Join(projDir, "shared.md")); string(b) != "结果v2" {
+		t.Fatalf("shared 项目未写成结果：%q", b)
+	}
+}
+
 func TestRetryTaskPublicationRejections(t *testing.T) {
 	s := newTestStore(t, testLease, testTTL)
 	ctx := context.Background()
@@ -392,7 +474,9 @@ func TestRetryTaskPublicationRejections(t *testing.T) {
 		t.Fatalf("死 run err = %v, want errTaskNotRepublishable", err)
 	}
 
-	// shared 组。
+	// shared 组：doc/76 §4 之后 shared 也走发布链，受阻后与 isolated 走同一条 retry，
+	// 不再按模式拒绝（残留的 mode 闸会让「需要我处理」里的发布项永远点不动）。
+	// 这里只钉「没有可复用结果时不冒充创建处理 run」；正循环见 TestRetryTaskPublicationShared。
 	wsID2, sessID2 := seedTaskEnv(t, s, "researcher-shared")
 	resp2, err := s.CreateAgentTask(ctx, testOwner, CreateTaskCommand{
 		IdempotencyKey: "k-shared", WorkspaceID: wsID2, SourceSessionID: sessID2,
@@ -402,8 +486,8 @@ func TestRetryTaskPublicationRejections(t *testing.T) {
 		t.Fatal(err)
 	}
 	csh := claimOne(t, s, resp2.OrchestrationID)
-	if _, _, err := s.RetryTaskPublication(ctx, testOwner, csh.TaskID); !errors.Is(err, errTaskNotRepublishable) {
-		t.Fatalf("shared err = %v, want errTaskNotRepublishable", err)
+	if _, _, err := s.RetryTaskPublication(ctx, testOwner, csh.TaskID); !errors.Is(err, errArtifactUnreadable) {
+		t.Fatalf("shared 未提交 err = %v, want errArtifactUnreadable", err)
 	}
 
 	// 属主链：非本人与未知 id 同形。

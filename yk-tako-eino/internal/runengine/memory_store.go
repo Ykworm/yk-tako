@@ -546,46 +546,46 @@ func ensureMemoryViews(db *gorm.DB) error {
 // BM25 索引需要 pg_search 扩展已安装；缺失时返回错误由调用方决定退出
 // （与 EnsureDialogueIndex 的 fail fast 一致，但这里不自己 log.Fatal）。
 func (s *Store) EnsureMemoryIndexes(ctx context.Context) error {
-	db := s.db.WithContext(ctx)
-
-	if err := ensureMemoryViews(db); err != nil {
-		return err
-	}
-
-	// 普通索引（幂等）：
-	//   - 常驻快照读取：常驻层按 tenant + user 读，按 created_at 倒序取。
-	//   - 状态筛选：默认读只认 active。
-	for _, ddl := range []string{
-		`CREATE INDEX IF NOT EXISTS memory_items_resident_read ON memory_items (tenant_id, user_id, created_at DESC) WHERE layer = 'resident'`,
-		`CREATE INDEX IF NOT EXISTS memory_items_state_idx ON memory_items (state)`,
-	} {
-		if err := db.Exec(ddl).Error; err != nil {
+	return withStartupDDLLock(s.db.WithContext(ctx), func(db *gorm.DB) error {
+		if err := ensureMemoryViews(db); err != nil {
 			return err
 		}
-	}
 
-	// BM25 索引：pg_search 未预加载 / 扩展缺失 → 明确报错（调用方 fail fast）。
-	// 错误文案不建议 TAKO_RAG=off——那只控制 dialogue_chunks，与记忆索引无关（施工包 §5.1）。
-	var preload string
-	if err := db.Raw(`SELECT current_setting('shared_preload_libraries')`).Scan(&preload).Error; err != nil {
-		return err
-	}
-	loaded := false
-	for _, p := range strings.Split(preload, ",") {
-		if strings.TrimSpace(p) == "pg_search" {
-			loaded = true
-			break
+		// 普通索引（幂等）：
+		//   - 常驻快照读取：常驻层按 tenant + user 读，按 created_at 倒序取。
+		//   - 状态筛选：默认读只认 active。
+		for _, ddl := range []string{
+			`CREATE INDEX IF NOT EXISTS memory_items_resident_read ON memory_items (tenant_id, user_id, created_at DESC) WHERE layer = 'resident'`,
+			`CREATE INDEX IF NOT EXISTS memory_items_state_idx ON memory_items (state)`,
+		} {
+			if err := db.Exec(ddl).Error; err != nil {
+				return err
+			}
 		}
-	}
-	if !loaded {
-		return fmt.Errorf("pg_search 未预加载（shared_preload_libraries=%q）：给 PG 加 shared_preload_libraries='pg_search' 并重启", preload)
-	}
-	var ext int
-	if err := db.Raw(`SELECT COUNT(*) FROM pg_extension WHERE extname = 'pg_search'`).Scan(&ext).Error; err != nil {
-		return err
-	}
-	if ext == 0 {
-		return fmt.Errorf("pg_search 扩展未安装：psql -p <port> -d <db> -c 'CREATE EXTENSION pg_search CASCADE'（依赖 vector）")
-	}
-	return db.Exec(memorySearchIndexDDL).Error
+
+		// BM25 索引：pg_search 未预加载 / 扩展缺失 → 明确报错（调用方 fail fast）。
+		// 错误文案不建议 TAKO_RAG=off——那只控制 dialogue_chunks，与记忆索引无关（施工包 §5.1）。
+		var preload string
+		if err := db.Raw(`SELECT current_setting('shared_preload_libraries')`).Scan(&preload).Error; err != nil {
+			return err
+		}
+		loaded := false
+		for _, p := range strings.Split(preload, ",") {
+			if strings.TrimSpace(p) == "pg_search" {
+				loaded = true
+				break
+			}
+		}
+		if !loaded {
+			return fmt.Errorf("pg_search 未预加载（shared_preload_libraries=%q）：给 PG 加 shared_preload_libraries='pg_search' 并重启", preload)
+		}
+		var ext int
+		if err := db.Raw(`SELECT COUNT(*) FROM pg_extension WHERE extname = 'pg_search'`).Scan(&ext).Error; err != nil {
+			return err
+		}
+		if ext == 0 {
+			return fmt.Errorf("pg_search 扩展未安装：psql -p <port> -d <db> -c 'CREATE EXTENSION pg_search CASCADE'（依赖 vector）")
+		}
+		return db.Exec(memorySearchIndexDDL).Error
+	})
 }

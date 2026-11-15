@@ -14,14 +14,14 @@ import (
 	"time"
 )
 
-// orchWorkspaceDir 是组工作区目录（doc/74 §5.2 的共享持久卷布局）：
-// <workspace>/tenants/<tid>/.tako/orchestrations/<orchID>/workspace/。
-// 路径全部由 tenant/orchestration ID 推导，模型输入不能指定内部路径。
-func orchWorkspaceDir(root, tenantID, orchID string) string {
-	if root == "" || tenantID == "" || orchID == "" {
+// orchWorkspaceDir 是组工作区目录（doc/74 §5.2，doc/76 §6.1 起挂在项目运行资源区）：
+// <workspace>/tenants/<tid>/workspaces/<wid>/runtime/orchestrations/<orchID>/workspace/。
+// 路径全部由 tenant/workspace/orchestration ID 推导，模型输入不能指定内部路径。
+func orchWorkspaceDir(root, tenantID, workspaceID, orchID string) string {
+	if root == "" || tenantID == "" || workspaceID == "" || orchID == "" {
 		return ""
 	}
-	return filepath.Join(tenantStorageRoot(root, tenantID), ".tako", "orchestrations", orchID, "workspace")
+	return filepath.Join(filepath.Join(root, "tenants", tenantID, "workspaces", workspaceID, projectRuntimeDirName, "orchestrations"), orchID, "workspace")
 }
 
 // workspaceGroupState 是组目录 state.json 的形状（doc/74 §5.2）。
@@ -64,7 +64,7 @@ func (s *Store) workspaceSummary(o AgentOrchestration, taskID string) *taskWorks
 			Epoch:     o.PublicationEpoch,
 		},
 	}
-	dir := orchWorkspaceDir(s.workspaceRoot, o.TenantID, o.ID)
+	dir := orchWorkspaceDir(s.workspaceRoot, o.TenantID, o.WorkspaceID, o.ID)
 	if dir == "" {
 		return v
 	}

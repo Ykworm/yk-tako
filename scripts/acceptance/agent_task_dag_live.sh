@@ -82,7 +82,8 @@ ORDER=$(ml_sql "SELECT count(*) FROM agent_tasks c JOIN agent_tasks a ON a.id='$
 eq "c.started_at ≥ 两个父任务的 finished_at（依赖序）" "1" "$ORDER"
 
 # ── 4. 产物字节：final.txt 里两份证据都在（上游结果真的流进了下游输入）────────────
-PROJ="$WS_ROOT/tenants/$TEN/workspaces/$WID"
+# doc/76：发布目标是用户内容根 content/（容器根另有 layout.json 与 runtime/）。
+PROJ="$WS_ROOT/tenants/$TEN/workspaces/$WID/content"
 FINAL="$PROJ/final.txt"
 if [ -f "$FINAL" ]; then
   ok "final.txt 落盘"

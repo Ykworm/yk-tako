@@ -27,7 +27,10 @@ var (
 )
 
 type User struct {
-	ID              string `gorm:"primaryKey"`
+	ID string `gorm:"primaryKey"`
+	// Username 可选：空串表示没设。登录名全局唯一，所以只能用部分唯一索引——
+	// 普通唯一索引会把所有未设用户名的空串也当成重复。
+	Username        string `gorm:"not null;default:'';uniqueIndex:users_username,where:username <> ''"`
 	Email           string `gorm:"not null;uniqueIndex"`
 	PasswordHash    string `gorm:"not null"`
 	IsSystemAdmin   bool   `gorm:"not null"`
@@ -162,6 +165,12 @@ func (s *Store) CreateTeamTenant(ctx context.Context, ownerID, name string) (Ten
 func (s *Store) GetUserByEmail(ctx context.Context, email string) (User, error) {
 	var u User
 	err := s.db.WithContext(ctx).Where("email = ?", email).Take(&u).Error
+	return u, err
+}
+
+func (s *Store) GetUserByUsername(ctx context.Context, username string) (User, error) {
+	var u User
+	err := s.db.WithContext(ctx).Where("username = ?", username).Take(&u).Error
 	return u, err
 }
 

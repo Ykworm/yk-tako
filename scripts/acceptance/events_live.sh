@@ -41,7 +41,7 @@ def call(method, path, body=None, tok=None):
         with urllib.request.urlopen(req, data, timeout=15) as r: return r.status, json.loads(r.read())
     except urllib.error.HTTPError as e: return e.code, json.loads(e.read())
 
-c, b = call("POST", "/api/auth/login", {"email": gv("TAKO_DEV_TEST_EMAIL"), "password": gv("TAKO_DEV_TEST_PASSWORD")})
+c, b = call("POST", "/api/auth/login", {"identifier": gv("TAKO_DEV_TEST_EMAIL"), "password": gv("TAKO_DEV_TEST_PASSWORD")})
 if b.get("code") != 0:
     print(f"  ❌ 登录失败 {b}"); sys.exit(1)
 TOK = b["data"]["accessToken"]

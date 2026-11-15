@@ -203,7 +203,7 @@ yk-tako/
 ```
 
 ```json
-{"code":111101,"message":"邮箱或密码不正确","data":null}
+{"code":111101,"message":"账号或密码不正确","data":null}
 ```
 
 页面上的拦截器只写一次。用户登录失败时，它看 `code` 决定要不要跳登录页，把 `message` 弹出来。`data` 里才是这个接口自己的内容。

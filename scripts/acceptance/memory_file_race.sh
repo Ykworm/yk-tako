@@ -110,8 +110,10 @@ else no "A 释放后 B 还在等（waitedMs=${BW2:-?}）——锁没释放"; fi
 WID=$(curl -sS -X POST "$BA/api/workspaces" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
   -d '{"name":"race-ws"}' | jq -r .data.workspace.id)
 if [ -z "$WID" ] || [ "$WID" = "null" ]; then no "建项目失败"; ml_summary; fi
-PROJ="$WS/tenants/$TEN/workspaces/$WID"
-# 项目目录是首次使用时才在盘上建的；夹具先建目录再落 v1——否则 read_file 落空，版本拒绝不会触发。
+# doc/76：先打一次文件清单初始化 layout.json 与 content/runtime；用户内容根是 content/。
+curl -sS -o /dev/null "$BA/api/workspaces/$WID/files" -H "Authorization: Bearer $TOK"
+PROJ="$WS/tenants/$TEN/workspaces/$WID/content"
+# 夹具先落 v1——否则 read_file 落空，版本拒绝不会触发。
 mkdir -p "$PROJ"
 printf 'SCRIPT-VERSION-1\n' > "$PROJ/race.txt"
 B="$BA"

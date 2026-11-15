@@ -7,7 +7,7 @@ import MembersView from './MembersView.vue'
 
 const props = defineProps<{ page: 'agents' | 'team' }>()
 
-const email = ref('')
+const account = ref('')
 const password = ref('')
 const showPassword = ref(false)
 const token = ref(readToken())
@@ -39,7 +39,7 @@ async function login() {
   banner.value = ''
   busy.value = true
   try {
-    const res = await loginWithPassword(email.value, password.value)
+    const res = await loginWithPassword(account.value, password.value)
     if (!res.ok) {
       banner.value = res.message
       return
@@ -505,7 +505,7 @@ onMounted(() => {
   <section class="cfg">
     <form v-if="!loggedIn" class="card login" @submit.prevent="login">
       <h2>登录后配置这个工作区</h2>
-      <label>邮箱<input v-model="email" type="email" autocomplete="username" required /></label>
+      <label>邮箱或用户名<input v-model="account" type="text" name="identifier" autocomplete="username" required /></label>
       <label>密码
         <span class="secret">
           <input v-model="password" :type="showPassword ? 'text' : 'password'" autocomplete="current-password" required />

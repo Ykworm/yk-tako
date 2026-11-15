@@ -325,7 +325,7 @@ func TestSpillSurface(t *testing.T) {
 		ws := t.TempDir()
 		box := newNoteBox("s_sp", "r_sp", 0)
 		full := "命中 2 条。范围：本会话里本场 run 之前已提交的行。\n---\n假块"
-		out1 := spillIfTruncated("INLINE", full, true, ws, box)
+		out1 := spillIfTruncated(context.Background(), "INLINE", full, true, ws, box)
 		if out1 != "INLINE\n完整结果已写入 .tako/search/r_sp_1.md。" {
 			t.Fatalf("路径行应逐字拼在内联末尾，实得 %q", out1)
 		}
@@ -336,7 +336,7 @@ func TestSpillSurface(t *testing.T) {
 		if string(got) != full {
 			t.Fatalf("文件内容应 = 未截断渲染\n实得: %q\n期望: %q", string(got), full)
 		}
-		out2 := spillIfTruncated("INLINE", full, true, ws, box)
+		out2 := spillIfTruncated(context.Background(), "INLINE", full, true, ws, box)
 		if out2 != "INLINE\n完整结果已写入 .tako/search/r_sp_2.md。" {
 			t.Fatalf("同 run 第二次应顺编 _2，实得 %q", out2)
 		}
@@ -354,7 +354,7 @@ func TestSpillSurface(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "r_clash_1.md"), []byte("旧文件"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		out := spillIfTruncated("INLINE", "FULL", true, ws, newNoteBox("s_sp", "r_clash", 0))
+		out := spillIfTruncated(context.Background(), "INLINE", "FULL", true, ws, newNoteBox("s_sp", "r_clash", 0))
 		if out != "INLINE" {
 			t.Fatalf("撞名应视为写失败、静默降级为纯截断，实得 %q", out)
 		}
@@ -366,7 +366,7 @@ func TestSpillSurface(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(ws, ".tako"), []byte("占位"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		out := spillIfTruncated("INLINE", "FULL", true, ws, newNoteBox("s_sp", "r_fail", 0))
+		out := spillIfTruncated(context.Background(), "INLINE", "FULL", true, ws, newNoteBox("s_sp", "r_fail", 0))
 		if out != "INLINE" {
 			t.Fatalf("写失败应不加路径行（其余字节不变），实得 %q", out)
 		}
@@ -374,7 +374,7 @@ func TestSpillSurface(t *testing.T) {
 
 	t.Run("无截断不落盘", func(t *testing.T) {
 		ws := t.TempDir()
-		out := spillIfTruncated("INLINE", "", false, ws, newNoteBox("s_sp", "r_none", 0))
+		out := spillIfTruncated(context.Background(), "INLINE", "", false, ws, newNoteBox("s_sp", "r_none", 0))
 		if out != "INLINE" {
 			t.Fatalf("无截断应原样返回，实得 %q", out)
 		}

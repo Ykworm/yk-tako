@@ -22,12 +22,14 @@ import {
   type Usage,
   type Workspace,
 } from './api'
-import { renderSafe } from './markdown'
+import { MD_BODY_CLASS, renderSafe } from './markdown'
 import Configure from './Configure.vue'
+import ChatDock from './ChatDock.vue'
 import InviteLanding from './InviteLanding.vue'
 import PlanDoc from './PlanDoc.vue'
 import PendingInvites from './PendingInvites.vue'
 import ProjectsView from './ProjectsView.vue'
+import RunChangedFiles from './RunChangedFiles.vue'
 import SkillInstallCard from './SkillInstallCard.vue'
 import SkillsView from './SkillsView.vue'
 import TasksView from './TasksView.vue'
@@ -176,6 +178,7 @@ async function openChat(id: string) {
   activate(inst)
   if (inst.sessionId.value !== id) await inst.openSession(id as SessionID)
   await nextTick()
+  await fillOlderUntilScrollable()
   scrollBottom()
 }
 
@@ -509,12 +512,25 @@ function askStatusLabel(q: AskQuestion): string {
 
 // 看板是 run 的实时进度（doc/41 §5.2），按 kimi 的 TodoPanel 挂在输入区上方：
 // 取对话里最后一条看板帧；完成数/总数与折叠都在前端算。
-const board = computed(() => {
+// 右侧 Todo 标签读的是 run_tasks（doc/78），boardText 只当重拉信号。
+const latestBoardText = computed(() => {
   for (let i = bubbles.value.length - 1; i >= 0; i--) {
     const text = bubbles.value[i].board
-    if (text) return boardRows(text)
+    if (text) return text
   }
-  return []
+  return ''
+})
+// 当前会话最后一条带 runId 的助手气泡：Todo 标签按它去读本场看板。
+const latestRunId = computed<RunID | null>(() => {
+  for (let i = bubbles.value.length - 1; i >= 0; i--) {
+    const b = bubbles.value[i]
+    if (b.role === 'assistant' && b.runId) return b.runId
+  }
+  return null
+})
+const board = computed(() => {
+  const text = latestBoardText.value
+  return text ? boardRows(text) : []
 })
 const todoRows = computed(() => board.value.filter((r) => r.status !== 'deleted'))
 const todoDone = computed(() => todoRows.value.filter((r) => r.status === 'completed').length)
@@ -588,7 +604,7 @@ const showPassword = ref(false)
 const loggedIn = computed(() => authState.value)
 const tenant = computed(() => tenantState.value)
 const initial = computed(() => (tenant.value.name || '我').slice(0, 1))
-const email = ref('')
+const account = ref('')
 const password = ref('')
 const authBusy = ref(false)
 const authError = ref('')
@@ -893,7 +909,7 @@ async function doLogin() {
   authError.value = ''
   authBusy.value = true
   try {
-    const res = await loginWithPassword(email.value, password.value)
+    const res = await loginWithPassword(account.value, password.value)
     if (!res.ok) {
       // 状态码是给网关分类的，用户只需要知道哪不对（409：… 这种前缀只会让人去搜错误码）。
       authError.value = res.message
@@ -1001,6 +1017,48 @@ function attentionLabel(item: AttentionItem): string {
   return ATTENTION_LABEL[item.kind] ?? item.kind
 }
 
+// —— 对话页右侧任务面板（doc/77）——
+// 作用域跟当前项目（与左侧处理项同一份解析），不跟会话；偏好只存展开状态。
+const taskDockOpen = ref(localStorage.getItem('tako.chatTaskDock') !== '0')
+watch(taskDockOpen, (v) => localStorage.setItem('tako.chatTaskDock', v ? '1' : '0'))
+// 面板自己的一份定位参数：对话页是 v-show 常驻，与任务页共用 nonce 会让隐藏面板弹重复抽屉。
+const dockReloadNonce = ref(0)
+const dockFocus = ref({
+  workspaceId: '',
+  taskId: '',
+  orchestrationId: '',
+  questionId: '',
+  notificationId: '',
+  nonce: 0,
+})
+function openAttentionInline(item: AttentionItem) {
+  if (item.kind === 'interrupted' && item.notificationId) {
+    void openSessionForAttention(item)
+    return
+  }
+  dockFocus.value = {
+    workspaceId: attentionWorkspaceId.value,
+    taskId:
+      item.kind === 'question' || item.kind === 'interrupted' || item.kind === 'publication_blocked'
+        ? item.taskId
+        : '',
+    orchestrationId:
+      item.kind === 'plan_review' || item.kind === 'delivery_failed' ? item.orchestrationId : '',
+    questionId: item.kind === 'question' ? item.questionId : '',
+    notificationId: item.kind === 'delivery_failed' ? item.notificationId : '',
+    nonce: dockFocus.value.nonce + 1,
+  }
+}
+
+// 回复结尾的改动清单点进来：展开工作区并请求打开那个文件（nonce 让同一路径再点也生效）。
+// 工作区自己决定「新建标签还是只切换」。
+const dockFileRequest = ref({ path: '', nonce: 0 })
+function openDockFile(path: string) {
+  if (!path) return
+  taskDockOpen.value = true
+  dockFileRequest.value = { path, nonce: dockFileRequest.value.nonce + 1 }
+}
+
 let attentionTimer: ReturnType<typeof setTimeout> | null = null
 function scheduleAttention() {
   if (attentionTimer) clearTimeout(attentionTimer)
@@ -1034,9 +1092,14 @@ async function loadAttention() {
 
 watch(attentionWorkspaceId, () => void loadAttention())
 // 事件流重连、窗口重新聚焦都从 PG 重建一次（重连间隙的事件可能没赶上本页）。
-onEventStreamOpen(() => scheduleAttention())
+onEventStreamOpen(() => {
+  scheduleAttention()
+  dockReloadNonce.value++
+})
 function onWindowFocus() {
-  if (loggedIn.value) scheduleAttention()
+  if (!loggedIn.value) return
+  scheduleAttention()
+  if (taskDockOpen.value) dockReloadNonce.value++
 }
 
 // 定位：用显式 id 传给任务页，不引入路由依赖。nonce 让「同一个处理项再点一次」也生效。
@@ -1613,6 +1676,7 @@ watch(authState, async (ok) => {
   void loadAttention()
   await reconcile()
   await nextTick()
+  await fillOlderUntilScrollable()
   scrollBottom()
   composerEl.value?.focus()
 })
@@ -1628,6 +1692,7 @@ watch(
     await showTenantSession()
     await loadTenants()
     await nextTick()
+    await fillOlderUntilScrollable()
     scrollBottom()
   },
 )
@@ -1649,6 +1714,7 @@ onMounted(async () => {
   void loadAttention()
   await reconcile()
   await nextTick()
+  await fillOlderUntilScrollable()
   scrollBottom()
   composerEl.value?.focus()
 })
@@ -1673,6 +1739,35 @@ async function onScroll() {
     await nextTick()
     el.scrollTop += el.scrollHeight - before
   }
+}
+
+// 窗口只有最近五轮，内容不足一屏时 .list 滚不动，scroll 事件永远不会来——
+// 「上滚」就无从发生。这里主动往更早补页，直到列表能滚或到会话开头。
+// 上限 20 页：整页都是工具账本行的会话不至于空转。
+async function fillOlderUntilScrollable() {
+  for (let i = 0; i < 20; i++) {
+    await nextTick()
+    const el = listEl.value
+    if (!el || atStart.value || el.scrollHeight > el.clientHeight) return
+    const before = el.scrollHeight
+    await loadOlder()
+    await nextTick()
+    if (!listEl.value || listEl.value.scrollHeight <= before) return
+  }
+}
+
+// 提示条点击：先确保往前翻一页（能滚时用户也可能直接点它），再在仍不足一屏时继续补页。
+// 保持原来的阅读位置：本来贴底就回到底，否则按新增高度把视口往下让。
+async function loadOlderFromHint() {
+  const el = listEl.value
+  if (!el || loadingOlder.value) return
+  const before = el.scrollHeight
+  const wasPinned = pinned.value
+  await loadOlder()
+  await nextTick()
+  if (wasPinned) scrollBottom()
+  else if (listEl.value) listEl.value.scrollTop += listEl.value.scrollHeight - before
+  await fillOlderUntilScrollable()
 }
 </script>
 
@@ -1932,8 +2027,8 @@ async function onScroll() {
           <!-- 被系统踢回来 vs 自己退出：同一张表单，得说清是哪一种。 -->
           <p v-if="authExpired" class="auth-note">登录已过期，请重新登录</p>
           <label>
-            邮箱
-            <input v-model="email" type="email" autocomplete="username" required autofocus />
+            邮箱或用户名
+            <input v-model="account" type="text" name="identifier" autocomplete="username" required autofocus />
           </label>
           <label>
             密码
@@ -1954,6 +2049,7 @@ async function onScroll() {
           v-else-if="page === 'tasks'"
           :key="tenant.id"
           :active-workspace-id="activeWorkspaceId"
+          :active-session-id="sessionId"
           :focus-workspace-id="taskFocus.workspaceId"
           :focus-task-id="taskFocus.taskId"
           :focus-orchestration-id="taskFocus.orchestrationId"
@@ -1975,7 +2071,8 @@ async function onScroll() {
           @clear-active="setActiveWorkspace(null)"
         />
 
-        <div v-show="page === 'chat'" class="thread">
+        <div v-show="page === 'chat'" class="chat-wrap">
+        <div class="thread">
           <p v-if="sessionGone" class="session-gone" role="alert">{{ sessionGone }}</p>
           <!-- 有子代理才显示这条（doc/48 A4）：没有子代理时它白占一行，
                还带一个「展开」按钮诱导用户去点空的。
@@ -2025,7 +2122,14 @@ async function onScroll() {
             <div v-if="loadingOlder" class="older">
               <span class="spinner" aria-hidden="true"></span>正在加载更早的记录
             </div>
-            <div v-else-if="bubbles.length && !atStart" class="older muted">上滚查看更早的记录</div>
+            <button
+              v-else-if="bubbles.length && !atStart"
+              type="button"
+              class="older muted"
+              @click="loadOlderFromHint"
+            >
+              上滚查看更早的记录
+            </button>
 
             <article v-for="b in bubbles" :key="b.key" class="turn" :class="b.role">
               <!-- empty = 提问切出来的空段（doc/47 §5.5）：不画空气泡框，只留它挂的问题卡。
@@ -2058,7 +2162,7 @@ async function onScroll() {
                        正文与工具卡谁在上按 toolsFirst 排（doc/59 §6）：runlog 的行序是
                        tool_call → tool_result → assistant，卡片先发生就先画。 -->
                   <template v-for="blk in bubbleBlocks(b)" :key="`${b.key}:${blk}`">
-                    <div v-if="blk === 'text'" class="bubble-text" v-html="renderSafe(b.text)" v-memo="[b.text]" />
+                    <div v-if="blk === 'text'" class="bubble-text" :class="MD_BODY_CLASS" v-html="renderSafe(b.text)" v-memo="[b.text]" />
                     <!-- 工具卡（doc/59）：每调一次工具一行，默认只露摘要；展开是参数与回执原文，
                          与模型当时看到的是同一份（不重新读盘）。失败把「错误：…」直接摆出来。 -->
                     <div v-else class="tool-cards">
@@ -2122,6 +2226,15 @@ async function onScroll() {
                   @click="copyBubble(b.key, b.text)"
                 >{{ copyFailedKey === b.key ? '复制失败' : copiedKey === b.key ? '已复制' : '复制' }}</button>
               </div>
+
+              <!-- 改动的文件（doc/78）：只挂助手气泡最后一段，清单由服务端从 runlog 派生；
+                   点开在右侧文件标签里查看。 -->
+              <RunChangedFiles
+                v-if="b.role === 'assistant' && b.runId && !b.segmentCallId"
+                :run-id="b.runId"
+                :state="b.state"
+                @open="openDockFile"
+              />
 
               <!-- 问答记录（doc/47 §5.2）：互动本身在底部 dock，这里留的是可回看的档案。
                    方案按文档渲染（标题/列表/代码），问题连同选项与答案一起留档。 -->
@@ -2424,6 +2537,26 @@ async function onScroll() {
             </div>
           </form>
           <button v-if="!pinned && bubbles.length && !ask" type="button" class="jump" @click="jumpBottom">回到最新</button>
+        </div>
+
+        <!-- 右侧工作区（doc/78）：项目目录 / 任务 / Todo 三个固定标签 + 临时文件标签；
+             收起后是窄轨，三个入口都还在。≤860px 整体隐藏，移动端仍走左侧「任务」入口。 -->
+        <ChatDock
+          v-if="page === 'chat' && attentionWorkspaceId"
+          :workspace-id="attentionWorkspaceId"
+          :session-id="sessionId"
+          :open="taskDockOpen"
+          :attention-items="attentionItems"
+          :reload-nonce="dockReloadNonce"
+          :dock-focus="dockFocus"
+          :file-request="dockFileRequest"
+          :todo-run-id="latestRunId"
+          :board-text="latestBoardText"
+          @update:open="taskDockOpen = $event"
+          @attention="openAttentionInline"
+          @open-session="openSessionFromProjects"
+          @show-tasks-page="goPage('tasks')"
+        />
         </div>
       </template>
     </div>
@@ -3187,9 +3320,19 @@ async function onScroll() {
   background: var(--warn-soft);
 }
 
+/* 对话页外壳（doc/77）：对话区与右侧工作区横向并排。
+   .stage 是纵向 flex，工作区不能直接挂在它下面，否则会掉到输入框下方。 */
+.chat-wrap {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
 .thread {
   /* 铺满对话区（doc/47 §5.5）：宽屏不再留 45rem 白边，左右各留 1.5rem 呼吸位。 */
   width: 100%;
+  min-width: 0; /* 右侧任务面板出现时允许收缩（doc/77） */
   margin: 0 auto;
   padding-left: 1.5rem;
   padding-right: 1.5rem;
@@ -3395,6 +3538,14 @@ async function onScroll() {
   background: transparent;
   border-color: transparent;
 }
+button.older {
+  font: inherit;
+  cursor: pointer;
+}
+button.older:hover {
+  color: var(--ink);
+  border-color: var(--line);
+}
 .spinner {
   width: 0.75rem;
   height: 0.75rem;
@@ -3466,8 +3617,8 @@ async function onScroll() {
   animation: caret 1s steps(1) infinite;
 }
 
-/* 气泡正文的 markdown 排版（doc/48 A1）。
-   **v-html 注入的内容没有 scoped 的 data-v 属性** → 这些规则必须走 :deep()，
+/* 气泡容器自身（排版规则在全局 markdown.css 的 .md-body）。
+   **v-html 注入的内容没有 scoped 的 data-v 属性** → 组件内要影响注入内容必须走 :deep()，
    否则一条都不生效（写普通后代选择器是最容易踩的坑）。 */
 .bubble-text {
   margin: 0;
@@ -3476,47 +3627,10 @@ async function onScroll() {
      也画成一行——每个气泡底部都多出一条空白。 */
   white-space: normal;
 }
-.bubble-text :deep(h1),
-.bubble-text :deep(h2),
-.bubble-text :deep(h3),
-.bubble-text :deep(h4) {
-  margin: 0.65rem 0 0.3rem;
-  line-height: 1.35;
-  font-weight: 650;
-}
-.bubble-text :deep(h1) { font-size: 1.22rem; }
-.bubble-text :deep(h2) { font-size: 1.1rem; }
-.bubble-text :deep(h3) { font-size: 1rem; }
-.bubble-text :deep(h4) { font-size: 0.93rem; }
-.bubble-text :deep(p) { margin: 0.32rem 0; }
-.bubble-text :deep(ul),
-.bubble-text :deep(ol) {
-  margin: 0.32rem 0;
-  padding-left: 1.35rem;
-}
-.bubble-text :deep(li) { margin: 0.12rem 0; }
-.bubble-text :deep(code) {
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 5px;
-  padding: 0.05rem 0.28rem;
-  font-size: 0.86em;
-}
-.bubble-text :deep(pre) {
-  margin: 0.45rem 0;
-  padding: 0.55rem 0.65rem;
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  overflow-x: auto;
-}
-.bubble-text :deep(pre code) {
-  background: transparent;
-  border: 0;
-  padding: 0;
-  font-size: 0.82rem;
-}
-/* 用户气泡是深色底（--ink + --on-ink 字）：上面那套是给浅色助手气泡写的，
+/* 气泡正文的 markdown 排版在**全局** `markdown.css`（`.md-body`）：scoped 样式不跨组件，
+   排版要被聊天气泡与两个文件视图共用，就必须抽成全局样式表 + 一个中性类名。
+   气泡正文挂 `md-body`（模板里 `:class="MD_BODY_CLASS"`），下面这段只留**气泡专属**的深底反色。
+   用户气泡是深色底（--ink + --on-ink 字）：共享那套是给浅色助手气泡写的，
    浅底深字的 code / pre / 表头搬进深色气泡就变成白字浅底＝隐形（doc/49 补记 #13）。
    这里只把「浅底深字」的几项在深色气泡里反过来，助手气泡不动。 */
 .bubble.user .bubble-text :deep(code) {
@@ -3545,46 +3659,6 @@ async function onScroll() {
 .bubble.user .bubble-text :deep(hr) {
   border-top-color: rgba(245, 247, 250, 0.22);
 }
-.bubble-text :deep(blockquote) {
-  margin: 0.4rem 0;
-  padding: 0.05rem 0 0.05rem 0.7rem;
-  border-left: 3px solid var(--line-strong);
-  color: var(--ink-soft);
-}
-/* 表格滚动壳（markdown.ts 里生成）：窄屏列多时只滚表格，不把整条正文变成滚动区。 */
-.bubble-text :deep(.table-scroll) {
-  overflow-x: auto;
-  max-width: 100%;
-  -webkit-overflow-scrolling: touch;
-}
-.bubble-text :deep(table) {
-  width: 100%;
-  border-collapse: collapse;
-  margin: 0.45rem 0;
-  font-size: 0.86rem;
-}
-.bubble-text :deep(.table-scroll) table {
-  width: max-content;
-  min-width: 100%;
-  margin: 0.15rem 0;
-}
-.bubble-text :deep(th),
-.bubble-text :deep(td) {
-  border: 1px solid var(--line);
-  padding: 0.28rem 0.45rem;
-  text-align: left;
-}
-.bubble-text :deep(th) {
-  background: var(--bg);
-  font-weight: 650;
-}
-.bubble-text :deep(a) { color: var(--accent-ink); }
-.bubble-text :deep(hr) {
-  border: 0;
-  border-top: 1px solid var(--line);
-  margin: 0.55rem 0;
-}
-.bubble-text :deep(img) { max-width: 100%; }
 @keyframes caret {
   50% { opacity: 0; }
 }
@@ -4242,14 +4316,19 @@ async function onScroll() {
 }
 .qa-note.error { color: var(--danger); }
 
-/* 看板（doc/41 §5.2 / kimi TodoPanel）：输入区上方，超过 5 条折叠 */
+/* 看板（doc/41 §5.2 / kimi TodoPanel）：桌面端由右侧 Todo 标签承担（doc/78），
+   输入框上方这条只在 ≤860px 显示（那里没有工作区），模板与折叠逻辑原样保留。 */
 .todo-dock {
+  display: none;
   flex: none;
   margin: 0 0 0.5rem;
   border: 1px solid var(--line);
   border-radius: 14px;
   background: rgba(255, 253, 248, 0.9);
   padding: 0.3rem 0.45rem;
+}
+@media (max-width: 860px) {
+  .todo-dock { display: block; }
 }
 .todo-head {
   display: flex;

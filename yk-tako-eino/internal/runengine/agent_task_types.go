@@ -26,6 +26,11 @@ const (
 	orchStatusFailed     = "failed"
 	orchStatusCancelling = "cancelling"
 	orchStatusCancelled  = "cancelled"
+	// orchStatusPreparing 是继任组的出生状态（doc/75 §4.2）：记录已存在，正在写 handoff／
+	// 标记继任关系或停止原组。不可调度、不占模型容量，但阻止项目与会话删除。
+	orchStatusPreparing = "preparing"
+	// orchStatusWaitingPrevious：handoff 完整，但原组尚未终态。调度器确认原组终态后转 active。
+	orchStatusWaitingPrevious = "waiting_previous"
 )
 
 // Task 状态词表（doc/70 §7）。没有 skipped（V1 拍定）；blocked 带 machine reason（error_code）。
@@ -70,8 +75,8 @@ const (
 
 // 发布受阻的通用机器原因（doc/74 §4.5/§7.3/§8.3）：retry-publication 只认这三个。
 const (
-	taskErrWorkspaceChanged    = "workspace_changed"           // 项目已前进，旧结果不能覆盖
-	taskErrWorkspaceDirty      = "workspace_dirty"             // 项目有未保存内容
+	taskErrWorkspaceChanged    = "workspace_changed"             // 项目已前进，旧结果不能覆盖
+	taskErrWorkspaceDirty      = "workspace_dirty"               // 项目有未保存内容
 	taskErrPublicationRecovery = "publication_recovery_required" // 现场无法解释，需人工检查
 )
 
@@ -394,6 +399,10 @@ type orchestrationBody struct {
 	// Workspace 与 agentTaskView 同一形状（doc/74 §4.3），追加在组半末尾；shared 不出现。
 	// 组摘要的验证状态取最终 Task 的证据文件。
 	Workspace *taskWorkspaceView `json:"workspace,omitempty"`
+	// 重规划关系（doc/75 §4.4）：只有继任组出现这两个键，追加在末尾；非继任组字节不变。
+	// replanOf／replanDepth 从 handoff 现读，PG 不存这两列。
+	ReplanOf    string `json:"replanOf,omitempty"`
+	ReplanDepth int    `json:"replanDepth,omitempty"`
 }
 
 // taskLinkView 是依赖边视图：parent → child。

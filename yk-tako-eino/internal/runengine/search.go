@@ -132,7 +132,7 @@ func newSearchHistoryTool(store *Store, workspace string) (tool.BaseTool, error)
 				return "", err
 			}
 			inline, full, truncated := renderSearchWindow(rows, in.AroundSeq, window)
-			return spillIfTruncated(inline, full, truncated, activeRoot(ctx, workspace), box), nil
+			return spillIfTruncated(ctx, inline, full, truncated, activeRoot(ctx, workspace), box), nil
 		}
 		words := strings.Fields(in.Query)
 		switch {
@@ -166,37 +166,40 @@ func newSearchHistoryTool(store *Store, workspace string) (tool.BaseTool, error)
 			return "", err
 		}
 		inline, full, truncated := renderSearchHits(hits, words[0])
-		return spillIfTruncated(inline, full, truncated, activeRoot(ctx, workspace), box), nil
+		return spillIfTruncated(ctx, inline, full, truncated, activeRoot(ctx, workspace), box), nil
 	})
 }
 
 // spillIfTruncated 是截断落盘出口（H3，doc/21 §3.2）：真丢行时把不设上限的全文写进
-// <workspace>/.tako/search/<runId>_<n>.md，内联结果在「其余命中已截断。」之后加一行路径；
-// 写失败静默退化（不加路径行，其余字节与落盘机制存在前相同）。无截断 = 原样返回，不碰文件系统。
-func spillIfTruncated(inline, full string, truncated bool, workspace string, box *noteBox) string {
+// 运行资源区（项目 runtime/tmp/search 或纯会话 .tako/search）的 <runId>_<n>.md，内联结果在
+// 「其余命中已截断。」之后加一行路径；写失败静默退化（不加路径行，其余字节与落盘机制存在前相同）。
+// 无截断 = 原样返回，不碰文件系统。
+func spillIfTruncated(ctx context.Context, inline, full string, truncated bool, workspace string, box *noteBox) string {
 	if !truncated {
 		return inline
 	}
-	rel, ok := spillSearchResult(workspace, box, full)
+	rel, ok := spillSearchResult(ctx, workspace, box, full)
 	if !ok {
 		return inline
 	}
 	return inline + "\n完整结果已写入 " + rel + "。"
 }
 
-// spillSearchResult 把完整渲染写进 <workspace>/.tako/search/<runId>_<n>.md（n = noteBox 每 run
-// 计数器顺编；主/子代理共用同一份 noteBox = 同序列天然不撞）。一次一写：O_EXCL 撞名即视为写失败；
+// spillSearchResult 把完整渲染写进运行资源区的 search/ 下（n = noteBox 每 run 计数器顺编；
+// 主/子代理共用同一份 noteBox = 同序列天然不撞）。一次一写：O_EXCL 撞名即视为写失败；
 // 路径闸复用 resolveInWorkspace，MkdirAll / 打开 / 写入任一步失败都返回 ok=false
 // （doc/21 §3.2：写失败不报错，退化为纯截断行为）。
-func spillSearchResult(workspace string, box *noteBox, full string) (string, bool) {
-	return spillNote(workspace, box, ".tako/search", full)
+func spillSearchResult(ctx context.Context, workspace string, box *noteBox, full string) (string, bool) {
+	return spillNote(ctx, workspace, box, ".tako/search", full)
 }
 
-// spillNote 是两类落盘的共同实现（doc/21 的搜索截断、doc/57 的整页抓取）：subdir 下的
-// <runId>_<n>.md，其余语义与 spillSearchResult 一致。
-func spillNote(workspace string, box *noteBox, subdir, full string) (string, bool) {
-	rel := fmt.Sprintf("%s/%s_%d.md", subdir, box.run, box.tickSpill())
-	fullPath, err := resolveInWorkspace(workspace, rel)
+// spillNote 是两类落盘的共同实现（doc/21 的搜索截断、doc/57 的整页抓取）：subdir 是逻辑
+// 路径（.tako/search、.tako/fetch），物理落点由 runtimeOutputDir 决定（doc/76 §6.1）。
+func spillNote(ctx context.Context, workspace string, box *noteBox, subdir, full string) (string, bool) {
+	kind := strings.TrimPrefix(subdir, ".tako/")
+	physDir, relDir := runtimeOutputDir(ctx, workspace, kind)
+	name := fmt.Sprintf("%s_%d.md", box.run, box.tickSpill())
+	fullPath, err := resolveInWorkspace(physDir, name)
 	if err != nil {
 		return "", false
 	}
@@ -214,7 +217,7 @@ func spillNote(workspace string, box *noteBox, subdir, full string) (string, boo
 	if err := f.Close(); err != nil {
 		return "", false
 	}
-	return rel, true
+	return relDir + "/" + name, true
 }
 
 // parseSearchRoles 解析 roles 参数：空 = 默认三档；按逗号拆、逐项去空白，任一项不在四个

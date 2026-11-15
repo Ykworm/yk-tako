@@ -28,23 +28,25 @@ const taskExecutorPrompt = `你是一场持久任务的执行者：你的首条�
 不要把工具回执当作已经成功交付：结果由程序对账裁决，成功与否以任务状态为准。`
 
 // agentTaskNoTools 是执行者基座里不给的工具名（doc/70 §6.3「不获得超出规格的工具」）：
-//   - delegate_task / create_orchestration：Task 执行者不得再创建异步编排（§6.3 第 2 条）；
+//   - delegate_task / create_orchestration／create_successor_orchestration：Task 执行者不得再
+//     创建异步编排或继任组（§6.3 第 2 条，doc/75 §4.4 重规划归来源会话）；
 //   - enter_plan_mode / submit_plan：计划审批是**来源会话**的事，执行者没有本人在场；
 //   - revise_orchestration / continue_orchestration：改图与放行归计划复核 run，执行者不得变更计划。
 //
 // ask_user 不再排除（doc/72 §7.1）：Task 执行者可以提问，问题带 expires_at，由任务页
 // 转给来源会话的人回答；超时由调度器收口为 failed/input_timeout。
 var agentTaskNoTools = map[string]bool{
-	"delegate_task": true, "create_orchestration": true,
+	"delegate_task": true, "create_orchestration": true, "create_successor_orchestration": true,
 	"enter_plan_mode": true, "submit_plan": true,
 	"revise_orchestration": true, "continue_orchestration": true,
 }
 
-// agentTaskExecutorBase 组执行者的工具基座：冻结池减去等人与异步创建，加上执行者专属的
-// submit_task_result，再并上本场连上的 MCP。记忆/检索与技能工具随后由既有 drop helper 剔除
-// （执行者是子代理规格当根，子代理结构性没有这两类，doc/52 §2.8 / doc/65 §5.2）。
+// agentTaskExecutorBase 组执行者的工具基座：冻结池减去等人与异步创建，再并上本场连上的 MCP。
+// 记忆/检索与技能工具随后由既有 drop helper 剔除（执行者是子代理规格当根，子代理结构性没有
+// 这两类，doc/52 §2.8 / doc/65 §5.2）。submit_task_result 不在这里——它不属于规格能力，
+// 由装配在规格过滤之后追加（agentTaskSubmitTool 的注释）。
 func (w *Worker) agentTaskExecutorBase(ctx context.Context, mcpTools []tool.BaseTool) []tool.BaseTool {
-	base := make([]tool.BaseTool, 0, len(w.tools)+len(mcpTools)+1)
+	base := make([]tool.BaseTool, 0, len(w.tools)+len(mcpTools))
 	for _, t := range w.tools {
 		info, err := t.Info(ctx)
 		if err != nil {
@@ -59,14 +61,21 @@ func (w *Worker) agentTaskExecutorBase(ctx context.Context, mcpTools []tool.Base
 	base = dropMemoryAndSearchTools(ctx, base)
 	base = dropSkillTools(ctx, base)
 	base = append(base, mcpTools...)
-	if st, err := newSubmitTaskResultTool(w.store); err == nil {
-		// 与池内工具同款包错误：提交被拒（如验证未过）要回注「错误：…」让执行者返工，
-		// 裸 append 会让 ToolsNode 把拒绝当 NodeRunError 直接打挂整场 run。
-		base = append(base, wrapToolErrors(st))
-	} else {
-		log.Printf("task executor: submit_task_result 装配失败: %v", err)
-	}
 	return base
+}
+
+// agentTaskSubmitTool 是执行者专属的交付工具，装配时追加在规格过滤**之后**：
+// 带 tools: 白名单的规格（coder 就是）只能拿到白名单里写过的工具，把 submit 放在基座里
+// 会被 resolveToolPool 裁掉——执行者于是永远交不出结果（result_not_submitted）。
+// 与池内工具同款包错误：提交被拒（如验证未过）要回注「错误：…」让执行者返工，
+// 裸 append 会让 ToolsNode 把拒绝当 NodeRunError 直接打挂整场 run。
+func (w *Worker) agentTaskSubmitTool() tool.BaseTool {
+	st, err := newSubmitTaskResultTool(w.store)
+	if err != nil {
+		log.Printf("task executor: submit_task_result 装配失败: %v", err)
+		return nil
+	}
+	return wrapToolErrors(st)
 }
 
 // agentTaskRow 按 id 读 Task 与它的组（内部路径：领取/恢复前刚做过可见性判定，这里不再 JOIN 权限）。
@@ -103,7 +112,8 @@ func (s *Store) agentTaskByExecutionSession(ctx context.Context, sessID SessionI
 //   - 执行者规格按 agent_name 在当前租户重解析（规格可能在创建后被删或改）；
 //   - 模型：Task 行写了具体 ref 用 ref；否则继承来源会话 mAgent 的模型（继承档语义 = 父 run 的主模型，
 //     对 Task 而言父 = 来源会话），再落到租户默认；
-//   - 工具：agentTaskExecutorBase 过一遍规格的四态策略（resolveToolPool），MCP 按租户配置现连；
+//   - 工具：agentTaskExecutorBase 过一遍规格的四态策略（resolveToolPool），再用执行者专属的
+//     submit_task_result 补齐交付口（白名单规格裁不到它），MCP 按租户配置现连；
 //   - Instruction = 规格正文 + 租户规范 + 笔记快照 + 交付契约（taskExecutorPrompt）。
 //
 // 与 assembleRun 的差别：这里不拒 subagent 规格、不附子代理委派（agentSpecHandler 在执行 run
@@ -176,6 +186,9 @@ func (s *Server) assembleAgentTaskRun(ctx context.Context, p principal, taskID s
 		closeMCP(conns)
 		return nil, failAssemble(http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次",
 			fmt.Errorf("task %s: 执行者规格 %q 工具解析失败: %w", t.ID, t.AgentName, terr))
+	}
+	if st := s.worker.agentTaskSubmitTool(); st != nil {
+		pool = append(pool, st)
 	}
 	instruction := spec.Prompt
 	if team := teamInstructionsSection(s.store.teamInstructionsFor(ctx)); team != "" {
@@ -286,8 +299,8 @@ func (ts *TaskScheduler) launchTaskRun(ctx context.Context, c agentTaskClaim) {
 			InputTimeout: ts.inputTimeout})
 	p := principal{UserID: c.UserID, TenantID: c.TenantID, Role: "member"}
 	bg = withPrincipal(bg, p)
-	// doc/74：isolated 组先备工作现场（幂等），失败与装配失败同一条收尾链——
-	// 不能留下 running 但永远没有 worker 的行。shared 返回零值，走既有路径。
+	// doc/74／doc/76：先备工作现场（幂等；shared 为 work/shared，isolated 为 work/<taskId>），
+	// 失败与装配失败同一条收尾链——不能留下 running 但永远没有 worker 的行。
 	work, providerKind, werr := ts.store.prepareTaskWork(bg, c.TaskID)
 	if werr != nil {
 		log.Printf("task runner %s: 工作区准备失败: %v", c.TaskID, werr)
@@ -303,6 +316,7 @@ func (ts *TaskScheduler) launchTaskRun(ctx context.Context, c agentTaskClaim) {
 	if work.Root != "" {
 		tb := agentTaskRunBoxFrom(bg)
 		tb.WorkRoot = work.Root
+		tb.RuntimeRoot = work.RuntimeRoot
 		tb.ExtraWriteRoots = work.ExtraWriteRoots
 		tb.WorkspaceMode = workspaceModeIsolated
 		tb.WorkspaceProvider = providerKind
@@ -406,8 +420,9 @@ func (s *Server) resumeAgentTask(c *gin.Context) {
 		internal(c, err)
 		return
 	}
-	// doc/74：isolated 组恢复前重绑工作现场（PrepareTask 幂等：已存在直接返回，不重新 merge）。
-	// 失败放弃认领（租约改到过期，下一发立刻可接），不把 Task 打成 failed——准备失败可能是暂时的。
+	// doc/74／doc/76：恢复前重绑工作现场（PrepareTask 幂等：已存在直接返回，不重新 merge；
+	// shared 现场是整组共用那一棵）。失败放弃认领（租约改到过期，下一发立刻可接），
+	// 不把 Task 打成 failed——准备失败可能是暂时的。
 	work, providerKind, werr := s.store.prepareTaskWork(ctx, view.TaskID)
 	if werr != nil {
 		_ = s.store.AbandonClaim(context.WithoutCancel(ctx), runID, claim.Epoch)
@@ -426,6 +441,7 @@ func (s *Server) resumeAgentTask(c *gin.Context) {
 	if work.Root != "" {
 		tb := agentTaskRunBoxFrom(bg)
 		tb.WorkRoot = work.Root
+		tb.RuntimeRoot = work.RuntimeRoot
 		tb.ExtraWriteRoots = work.ExtraWriteRoots
 		tb.WorkspaceMode = workspaceModeIsolated
 		tb.WorkspaceProvider = providerKind

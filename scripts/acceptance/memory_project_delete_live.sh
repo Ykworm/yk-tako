@@ -44,6 +44,8 @@ UF_HASH=$(shasum -a 256 "$UF" | cut -d' ' -f1)
 # ── 删项目 ─────────────────────────────────────────────────────────────────────
 resp=$(curl -sS -X DELETE "$B/api/workspaces/$WID" -H "Authorization: Bearer $TOK")
 eq "DELETE 成功" "deleted" "$(echo "$resp" | jq -r .data.status)"
+# doc/76 §6.4：磁盘清理同步收口时 cleanup=done（整容器已删，不留 pending 补偿）。
+eq "磁盘清理收口 done" "done" "$(echo "$resp" | jq -r .data.cleanup)"
 
 eq "workspace resident 行已清" "" "$(ml_sql "SELECT id FROM memory_items WHERE id='$MW_R'")"
 eq "workspace recall 行已清" "" "$(ml_sql "SELECT id FROM memory_items WHERE id='$MW_C'")"

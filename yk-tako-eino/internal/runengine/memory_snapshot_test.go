@@ -259,7 +259,7 @@ func TestDeleteWorkspaceCascadeClearsScopedMemories(t *testing.T) {
 	if _, err := s.WriteMemoryItems(ctx, items); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.DeleteWorkspaceCascade(ctx, testOwner.TenantID, testOwner.UserID, ws.ID); err != nil {
+	if err := s.DeleteWorkspaceCascade(ctx, testOwner.TenantID, testOwner.UserID, ws.ID); err != nil {
 		t.Fatal(err)
 	}
 	if n := s.count(t, &MemoryItem{}, "id IN ('mem_del_1','mem_del_2')"); n != 0 {

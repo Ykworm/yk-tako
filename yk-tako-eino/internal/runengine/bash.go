@@ -58,7 +58,7 @@ func newBashTool(workspace string) (tool.BaseTool, error) {
 // runBash 执行一条命令。cwd 不是安全边界：requireSandbox 为真时没有可用的围栏后端就拒绝执行。
 func runBash(ctx context.Context, workspace, command string, timeout time.Duration, requireSandbox bool) (string, error) {
 	// 清扫过期落盘（doc/58 §4.4）：每次 bash 调用前扫一次 .tako/bash/。
-	sweepBashSpills(workspace, time.Now())
+	sweepBashSpills(ctx, workspace, time.Now())
 	cmd, cleanup, _, runCtx, err := startBash(ctx, workspace, command, timeout, requireSandbox)
 	if err != nil {
 		return "", err

@@ -85,7 +85,10 @@ jq -cn --arg n "$AGENT" \
 WID=$(curl -sS -X POST "$B/api/workspaces" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
   -d '{"name":"ws-dir-live"}' | jq -r .data.workspace.id)
 [ -n "$WID" ] && [ "$WID" != "null" ] || { no "建项目失败"; ml_summary; }
-PROJ="$WS_ROOT/tenants/$TEN/workspaces/$WID"
+# doc/76 容器布局：先打一次文件清单让引擎建好 layout.json 与 content/runtime，
+# 再往 content/ 写基线。反序会把容器写成「无 layout.json 却有旧字节」，入口一律 409 117116。
+curl -sS "$B/api/workspaces/$WID/files" -H "Authorization: Bearer $TOK" >/dev/null
+PROJ="$WS_ROOT/tenants/$TEN/workspaces/$WID/content"
 mkdir -p "$PROJ"
 printf '基线内容\n' > "$PROJ/report.md"
 printf '待删\n' > "$PROJ/gone.md"
@@ -93,7 +96,7 @@ printf '共享基线\n' > "$PROJ/shared.txt"
 at_probe_run "$WID"
 echo "  项目 $WID · 来源会话 $SID"
 
-ws_dir(){ echo "$WS_ROOT/tenants/$TEN/.tako/orchestrations/$1/workspace"; }
+ws_dir(){ echo "$WS_ROOT/tenants/$TEN/workspaces/$1/runtime/orchestrations/$2/workspace"; }
 artifact_eq(){ # $1=taskId $2=path $3=期望内容 $4=标签
   curl -sS "$B/api/tasks/$1/artifact?path=$2" -H "Authorization: Bearer $TOK" -o "$SCRATCH/got.bin"
   printf '%s' "$3" > "$SCRATCH/want.bin"
@@ -118,7 +121,7 @@ TID_B=$(echo "$AT_ORCH" | jq -r '.tasks[] | select(.key=="b") | .taskId')
 TID_C=$(echo "$AT_ORCH" | jq -r '.tasks[] | select(.key=="c") | .taskId')
 echo "  场1 orchId=$OID a=$TID_A b=$TID_B c=$TID_C"
 if at_wait_orch "$OID" "succeeded" 300; then ok "场1 整组收口 succeeded"; else no "场1 没收口（$AT_LAST）"; at_orch "$OID"; echo "$AT_ORCH" | jq -c '.tasks[] | {key,status,error}'; ml_summary; fi
-GD=$(ws_dir "$OID")
+GD=$(ws_dir "$WID" "$OID")
 eq "组 Provider 固定为 directory" "directory" "$(jq -r .provider "$GD/state.json")"
 # 结果清单与真实字节对账：a 增 alpha 改 report，b 增 beta 删 gone。
 MA="$GD/results/$TID_A/1/manifest.json"
@@ -155,7 +158,7 @@ TID_C2=$(echo "$AT_ORCH" | jq -r '.tasks[] | select(.key=="c") | .taskId')
 TID_B2=$(echo "$AT_ORCH" | jq -r '.tasks[] | select(.key=="b") | .taskId')
 echo "  场2 orchId=$OID2 c=$TID_C2"
 if at_wait_orch "$OID2" "succeeded" 300; then ok "场2 整组收口 succeeded"; else no "场2 没收口（$AT_LAST）"; at_orch "$OID2"; echo "$AT_ORCH" | jq -c '.tasks[] | {key,status,error}'; ml_summary; fi
-GD2=$(ws_dir "$OID2")
+GD2=$(ws_dir "$WID" "$OID2")
 [ -s "$GD2/provider/conflicts/$TID_C2.json" ] && ok "c 的冲突记录在组目录（程序检出）" || no "c 没有冲突记录"
 [ -f "$GD2/work/$TID_C2/.tako/conflicts/$TID_B2/shared.txt" ] && ok "后到父版本留在 c 工作目录的 .tako/conflicts（不覆盖）" || no "冲突父版本没留进 .tako/conflicts"
 artifact_eq "$TID_C2" "shared.txt" "甲改-$STAMP2
@@ -172,7 +175,7 @@ RESP=$(at_create_task "acc-wsdir-chg-$STAMP3" "$WID" "$SID" "$CONTENT3" "researc
 TID3=$(echo "$RESP" | jq -r '.data.taskId // ""')
 OID3=$(echo "$RESP" | jq -r '.data.orchestrationId // ""')
 [ -n "$TID3" ] && [ "$TID3" != "null" ] || { echo "创建失败：$RESP" >&2; exit 2; }
-GD3=$(ws_dir "$OID3")
+GD3=$(ws_dir "$WID" "$OID3")
 echo "  场3 taskId=$TID3 orchId=$OID3"
 for i in $(seq 1 60); do [ -f "$GD3/state.json" ] && break; sleep 1; done
 [ -f "$GD3/state.json" ] || { no "60s 没等到组准备"; ml_summary; }
@@ -199,7 +202,7 @@ RESP=$(at_create_task "acc-wsdir-partial-$STAMP4" "$WID" "$SID" "$CONTENT4" "$AG
 TID4=$(echo "$RESP" | jq -r '.data.taskId // ""')
 OID4=$(echo "$RESP" | jq -r '.data.orchestrationId // ""')
 [ -n "$TID4" ] && [ "$TID4" != "null" ] || { echo "创建失败：$RESP" >&2; exit 2; }
-GD4=$(ws_dir "$OID4")
+GD4=$(ws_dir "$WID" "$OID4")
 echo "  场4 taskId=$TID4 orchId=$OID4"
 # 等发布真的开始且只完成一部分（0 < done < 400）再 kill -9。
 PUBFILE=""
@@ -220,7 +223,14 @@ ok "发布到一半（done=$DONE_AT_KILL/400，epoch=$EPOCH）→ kill -9"
 kill_engine
 sleep 1
 # 崩后现场：发布记录留着部分进度，项目里只落了已 done 的那部分。
-eq "崩后发布记录仍在（部分进度）" "$DONE_AT_KILL" "$(jq '[.entries[] | select(.status=="done")] | length' "$PUBFILE")"
+# 采样（DONE_AT_KILL）到 kill -9 之间引擎仍在推进，落盘数只会 >= 采样值；
+# 断言的是「记录没被清空/重置、仍是部分进度（< 400）」，不是冻结在采样那一瞬。
+DONE_AFTER_KILL=$(jq '[.entries[] | select(.status=="done")] | length' "$PUBFILE")
+if [ "$DONE_AFTER_KILL" -ge "$DONE_AT_KILL" ] && [ "$DONE_AFTER_KILL" -lt 400 ]; then
+  ok "崩后发布记录仍在（部分进度：采样 $DONE_AT_KILL → 落盘 $DONE_AFTER_KILL/400）"
+else
+  no "崩后发布记录不符（采样 $DONE_AT_KILL，落盘 $DONE_AFTER_KILL/400）"
+fi
 start_engine
 # 重启对账：按记录续发，done 的核验、pending 的补上，同一 epoch 不重铸。
 if at_wait_task "$TID4" "succeeded" 300; then ok "场4 重启续发后 succeeded"; else no "场4 没到 succeeded（$AT_LAST）"; at_task "$TID4"; echo "$AT_TASK" | jq -c '{status,workspace}'; tail -30 "$ELOG"; ml_summary; fi

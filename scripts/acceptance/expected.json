@@ -1,6 +1,6 @@
 {
- "version": "2026-11-12",
- "source": "doc/19-v6/19v6-04-验收-curl.md；持久 Task 与编排（doc/70）用例 44–50 同批；多 Agent 编排下一阶段（doc/72）用例 51–54 同批；并行任务工作区隔离（doc/74）用例 57–60 同批",
+ "version": "2026-11-13",
+ "source": "doc/19-v6/19v6-04-验收-curl.md；持久 Task 与编排（doc/70）用例 44–50 同批；多 Agent 编排下一阶段（doc/72）用例 51–54 同批；并行任务工作区隔离（doc/74）用例 57–60 同批；对话页右侧工作区与改动文件（doc/78）用例 65 同批",
  "note": [
   "本文件是契约字节的**机器真源**；doc/19-v6/19v6-04-验收-curl.md 是同一份内容的人读版。",
   "两份**同批改**。check-expected.sh 守两边的用例号集合一致。",
@@ -5268,7 +5268,7 @@
    "case": "用例 58",
    "tier": "core",
    "needs": "pg",
-   "desc": "artifact 读不可变结果（doc/74 §4.4）：成功回原始字节逐字（不进信封）、验证证据收尾读面（exitCode/outputPath）；产物缺失／不在清单／越界 409 117110、shared 400 111002、未知 404 117001、未登录 401 111102、跨租户 404 117001",
+   "desc": "artifact 读不可变结果（doc/74 §4.4；doc/76 §5.1 起 shared 也有不可变结果，读口同一条）：成功回原始字节逐字（不进信封）、验证证据收尾读面（exitCode/outputPath）；产物缺失／不在清单／越界／shared 尚无结果 409 117110、未知 404 117001、未登录 401 111102、跨租户 404 117001",
    "steps": [
     {
      "op": "signup",
@@ -5349,6 +5349,7 @@
     {
      "op": "seed_group",
      "orchestration": "{oridi}",
+     "workspace": "{wid}",
      "provider": "directory",
      "results": [
       {
@@ -5447,9 +5448,9 @@
      "method": "GET",
      "path": "/api/tasks/{tids}/artifact?path=report.md",
      "expect": {
-      "http": 400,
-      "code": 111002,
-      "message": "这件任务的结果产物请从项目文件读取",
+      "http": 409,
+      "code": 117110,
+      "message": "结果产物已不可读取",
       "data": null
      }
     },
@@ -5500,7 +5501,7 @@
    "case": "用例 59",
    "tier": "core",
    "needs": "pg",
-   "desc": "retry-publication（doc/74 §4.5）：blocked＋发布三码＋结果有效 202 新处理 run（taskId→runId→status→publicationEpoch，epoch=当前+1）；已有活 run 200 幂等命中；租户容量满 429 113001；结果缺失 409 117110；非 blocked／shared 409 117112；未知 404 117001；viewer 403 111203；跨租户 404 117001",
+   "desc": "retry-publication（doc/74 §4.5＋doc/76 §10.5）：blocked＋发布三码＋结果有效 202 新处理 run（taskId→runId→status→publicationEpoch，epoch=当前+1）；已有活 run 200 幂等命中；租户容量满 429 113001；结果缺失 409 117110；非 blocked 409 117112（shared 与 isolated 同判据，shared 夹具当前非 blocked）；未知 404 117001；viewer 403 111203；跨租户 404 117001",
    "steps": [
     {
      "op": "signup",
@@ -5556,6 +5557,7 @@
     {
      "op": "seed_group",
      "orchestration": "{oridi}",
+     "workspace": "{wid}",
      "provider": "directory",
      "results": [
       {
@@ -5797,6 +5799,1298 @@
      }
     }
    ]
+  },
+  {
+   "id": "61-goal-replan",
+   "case": "用例 61",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "继任创建与 handoff（doc/75 §4.1/§4.3）：202 四键序、原组无活任务时直接 active、handoff 200 五键序与正文分节、结果复用快照、同键同方案幂等、同键异方案 409 117102、已有继任 409 117114、方案不合法 409 117115（reason 进 data.reason）、无交接 404 117004、未知组 404 117002、viewer 403 111203",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-replan"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-replan-next"
+     },
+     "capture": {
+      "wid2": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/files",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid2}/files",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's'||substring('{wid}' from 3), 'task 来源', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc61o",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sid}",
+      "goal": "原目标",
+      "workspaceMode": "isolated",
+      "tasks": [
+       {
+        "key": "a",
+        "content": "做一件小事",
+        "agent": "researcher"
+       }
+      ]
+     },
+     "capture": {
+      "orid": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "SELECT id FROM agent_tasks WHERE orchestration_id='{orid}' AND task_key='a'",
+     "capture_stdout": [
+      "tida"
+     ]
+    },
+    {
+     "op": "seed_group",
+     "orchestration": "{orid}",
+     "workspace": "{wid}",
+     "provider": "directory",
+     "results": [
+      {
+       "task": "{tida}",
+       "revision": 1,
+       "reference": "seed-ref",
+       "artifacts": [
+        {
+         "path": "report.md",
+         "kind": "report",
+         "content": "旧产出正文\n"
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "sql": "UPDATE agent_tasks SET status='succeeded', result='{\"summary\":\"旧产出\",\"artifacts\":[{\"path\":\"report.md\",\"kind\":\"report\"}],\"metadata\":{}}', result_revision=1, finished_at=now(), updated_at=now() WHERE id='{tida}' RETURNING id",
+     "capture_stdout": [
+      "u1"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/successors",
+     "body": {
+      "idempotencyKey": "acc61s",
+      "goalAssessment": {
+       "outcome": "feasible",
+       "evidence": "旧结果仍有效"
+      },
+      "reason": "局部换路",
+      "successorReason": "复用旧产出",
+      "reuse": [
+       {
+        "taskId": "{tida}",
+        "resultRevision": 1
+       }
+      ],
+      "workspaceId": "{wid2}",
+      "workspaceMode": "isolated",
+      "goal": "用旧产出重做",
+      "tasks": [
+       {
+        "key": "b",
+        "content": "基于 report.md 重做",
+        "agent": "researcher"
+       }
+      ]
+     },
+     "capture": {
+      "suc": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "orchestrationId",
+       "status",
+       "replanOf",
+       "replanDepth"
+      ],
+      "data": {
+       "orchestrationId": "{suc}",
+       "status": "active",
+       "replanOf": "{orid}",
+       "replanDepth": 1
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/orchestrations/{suc}/handoff",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "orchestrationId",
+       "replanOf",
+       "replanDepth",
+       "reuse",
+       "body"
+      ],
+      "data": {
+       "orchestrationId": "{suc}",
+       "replanOf": "{orid}",
+       "replanDepth": 1,
+       "reuse": [
+        {
+         "taskId": "{tida}",
+         "resultRevision": 1
+        }
+       ]
+      },
+      "data_contains": {
+       "path": "body",
+       "contains": [
+        "# 为什么重规划",
+        "局部换路",
+        "# 为什么创建继任组",
+        "复用旧产出",
+        "程序记录的工作区配置变更（其余配置沿用原组）：",
+        "# 目标可行性证据",
+        "旧结果仍有效",
+        "# 哪些结果仍有效",
+        "（resultRevision 1）；产物：report.md",
+        "# 不得重放的动作",
+        "（模型没有声明不可重放的动作）",
+        "以上由模型声明，程序未验证，也不会自动重放。"
+       ]
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/orchestrations/{suc}",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "orchestration",
+       "tasks",
+       "links"
+      ],
+      "data": {
+       "orchestration": {
+        "orchestrationId": "{suc}",
+        "goal": "用旧产出重做",
+        "workspaceId": "{wid2}",
+        "status": "active",
+        "replanOf": "{orid}",
+        "replanDepth": 1,
+        "workspace": {
+         "mode": "isolated"
+        }
+       },
+       "tasks": [
+        {
+         "key": "b",
+         "status": "ready",
+         "agent": "researcher",
+         "taskId": "$any"
+        }
+       ],
+       "links": []
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/successors",
+     "body": {
+      "idempotencyKey": "acc61s",
+      "goalAssessment": {
+       "outcome": "feasible",
+       "evidence": "旧结果仍有效"
+      },
+      "reason": "局部换路",
+      "successorReason": "复用旧产出",
+      "reuse": [
+       {
+        "taskId": "{tida}",
+        "resultRevision": 1
+       }
+      ],
+      "workspaceId": "{wid2}",
+      "workspaceMode": "isolated",
+      "goal": "用旧产出重做",
+      "tasks": [
+       {
+        "key": "b",
+        "content": "基于 report.md 重做",
+        "agent": "researcher"
+       }
+      ]
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "orchestrationId",
+       "status",
+       "replanOf",
+       "replanDepth"
+      ],
+      "data": {
+       "orchestrationId": "{suc}",
+       "status": "active",
+       "replanOf": "{orid}",
+       "replanDepth": 1
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/successors",
+     "body": {
+      "idempotencyKey": "acc61s",
+      "goalAssessment": {
+       "outcome": "feasible",
+       "evidence": "旧结果仍有效"
+      },
+      "reason": "局部换路",
+      "successorReason": "复用旧产出",
+      "reuse": [
+       {
+        "taskId": "{tida}",
+        "resultRevision": 1
+       }
+      ],
+      "workspaceId": "{wid2}",
+      "workspaceMode": "isolated",
+      "goal": "换一个目标",
+      "tasks": [
+       {
+        "key": "b",
+        "content": "基于 report.md 重做",
+        "agent": "researcher"
+       }
+      ]
+     },
+     "expect": {
+      "http": 409,
+      "code": 117102,
+      "message": "这个创建键已经用于另一份计划",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{suc}/successors",
+     "body": {
+      "idempotencyKey": "acc61s2",
+      "goalAssessment": {
+       "outcome": "feasible",
+       "evidence": "再换一条路"
+      },
+      "reason": "再换",
+      "successorReason": "再换",
+      "workspaceId": "{wid2}",
+      "workspaceMode": "isolated",
+      "goal": "第三代目标",
+      "tasks": [
+       {
+        "key": "c",
+        "content": "第三代任务",
+        "agent": "researcher"
+       }
+      ]
+     },
+     "capture": {
+      "suc2": "data.orchestrationId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "orchestrationId",
+       "status",
+       "replanOf",
+       "replanDepth"
+      ],
+      "data": {
+       "orchestrationId": "{suc2}",
+       "status": "active",
+       "replanOf": "{suc}",
+       "replanDepth": 2
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/successors",
+     "body": {
+      "idempotencyKey": "acc61s3",
+      "goalAssessment": {
+       "outcome": "feasible",
+       "evidence": "再换一条路"
+      },
+      "reason": "再换",
+      "successorReason": "再换",
+      "workspaceId": "{wid2}",
+      "workspaceMode": "isolated",
+      "goal": "第四个目标",
+      "tasks": [
+       {
+        "key": "d",
+        "content": "第四个任务",
+        "agent": "researcher"
+       }
+      ]
+     },
+     "expect": {
+      "http": 409,
+      "code": 117114,
+      "message": "这个编排组现在不能创建继任组",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/successors",
+     "body": {
+      "idempotencyKey": "acc61s4",
+      "goalAssessment": {
+       "outcome": "不确定",
+       "evidence": "证据不足"
+      },
+      "reason": "再换",
+      "successorReason": "再换",
+      "workspaceId": "{wid2}",
+      "workspaceMode": "isolated",
+      "goal": "第五个目标",
+      "tasks": [
+       {
+        "key": "e",
+        "content": "第五个任务",
+        "agent": "researcher"
+       }
+      ]
+     },
+     "expect": {
+      "http": 400,
+      "code": 117115,
+      "message": "继任方案不合法",
+      "data": {
+       "reason": "目标可行性判定必须是 feasible 才能创建继任组（当前 \"不确定\"）"
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/successors",
+     "body": {
+      "idempotencyKey": "acc61s5",
+      "goalAssessment": {
+       "outcome": "feasible",
+       "evidence": "证据充分"
+      },
+      "reason": "",
+      "successorReason": "再换",
+      "workspaceId": "{wid2}",
+      "workspaceMode": "isolated",
+      "goal": "第六个目标",
+      "tasks": [
+       {
+        "key": "f",
+        "content": "第六个任务",
+        "agent": "researcher"
+       }
+      ]
+     },
+     "expect": {
+      "http": 400,
+      "code": 117115,
+      "message": "继任方案不合法",
+      "data": {
+       "reason": "重规划原因必填"
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/orchestrations/{orid}/handoff",
+     "expect": {
+      "http": 404,
+      "code": 117004,
+      "message": "找不到这次重规划交接",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/orchestrations/or_nope/handoff",
+     "expect": {
+      "http": 404,
+      "code": 117002,
+      "message": "找不到这个编排组",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/successors",
+     "auth": false,
+     "body": {
+      "idempotencyKey": "acc61s6",
+      "goal": "x",
+      "tasks": [
+       {
+        "key": "g",
+        "content": "x",
+        "agent": "researcher"
+       }
+      ]
+     },
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    },
+    {
+     "op": "invite_viewer"
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations/{orid}/successors",
+     "tokenVar": "viewerTok",
+     "body": {
+      "idempotencyKey": "acc61s7",
+      "goalAssessment": {
+       "outcome": "feasible",
+       "evidence": "证据充分"
+      },
+      "reason": "再换",
+      "successorReason": "再换",
+      "workspaceId": "{wid2}",
+      "workspaceMode": "isolated",
+      "goal": "第七个目标",
+      "tasks": [
+       {
+        "key": "h",
+        "content": "第七个任务",
+        "agent": "researcher"
+       }
+      ]
+     },
+     "expect": {
+      "http": 403,
+      "code": 111203,
+      "message": "没有权限做这件事",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "62-project-layout",
+   "case": "用例 62",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "项目内容目录（doc/76 §4/§5）：文件清单只枚举 content（目录在前、runtime 不列）、媒体别名 .media/… 读 runtime/media 字节、runtime 路径经媒体读 404 114101、无 layout 的非空容器在文件/任务/编排/media 入口一律 409 117116",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-layout"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "op": "seed_ws",
+     "workspace": "{wid}",
+     "files": {
+      "docs/readme.md": "文档正文\n",
+      "hello.txt": "hello\n",
+      ".media/note.txt": "媒体正文\n",
+      ".tako/bash/out.txt": "输出\n"
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/files",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "path",
+       "entries"
+      ],
+      "data": {
+       "path": ".",
+       "entries": [
+        {
+         "name": "docs",
+         "kind": "dir"
+        },
+        {
+         "name": "hello.txt",
+         "kind": "file",
+         "size": 6,
+         "modifiedAt": "$any"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/media?path=workspaces/{wid}/.media/note.txt",
+     "raw": true,
+     "expect": {
+      "http": 200,
+      "raw": "媒体正文\n"
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/media?path=workspaces/{wid}/hello.txt",
+     "raw": true,
+     "expect": {
+      "http": 200,
+      "raw": "hello\n"
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/files?path=runtime",
+     "expect": {
+      "http": 404,
+      "code": 114101,
+      "message": "找不到这个文件",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/media?path=workspaces/{wid}/runtime/media/note.txt",
+     "expect": {
+      "http": 404,
+      "code": 114101,
+      "message": "找不到这个文件",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-layout-old"
+     },
+     "capture": {
+      "wid3": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "op": "seed_unmigrated",
+     "workspace": "{wid3}",
+     "files": {
+      "content/old.txt": "旧字节\n"
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid3}/files",
+     "expect": {
+      "http": 409,
+      "code": 117116,
+      "message": "这个项目还需要迁移目录后才能使用",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc62t",
+      "workspaceId": "{wid3}",
+      "sourceSessionId": "s_x",
+      "content": "x",
+      "agent": "researcher"
+     },
+     "expect": {
+      "http": 409,
+      "code": 117116,
+      "message": "这个项目还需要迁移目录后才能使用",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/orchestrations",
+     "body": {
+      "idempotencyKey": "acc62o",
+      "workspaceId": "{wid3}",
+      "sourceSessionId": "s_x",
+      "goal": "x",
+      "tasks": [
+       {
+        "key": "a",
+        "content": "x",
+        "agent": "researcher"
+       }
+      ]
+     },
+     "expect": {
+      "http": 409,
+      "code": 117116,
+      "message": "这个项目还需要迁移目录后才能使用",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/media?path=workspaces/{wid3}/.media/note.txt",
+     "expect": {
+      "http": 409,
+      "code": 117116,
+      "message": "这个项目还需要迁移目录后才能使用",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "63-project-delete-cleanup",
+   "case": "用例 63",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "项目删除整容器（doc/76 §6.4）：成功体在 status 后加 cleanup（done／pending）、容器已清、待补偿只记 pending 不回滚业务删除、重复删除 404 114001",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-del"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "op": "seed_ws",
+     "workspace": "{wid}",
+     "files": {
+      "keep.txt": "x\n"
+     }
+    },
+    {
+     "method": "DELETE",
+     "path": "/api/workspaces/{wid}",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "status",
+       "cleanup"
+      ],
+      "data": {
+       "status": "deleted",
+       "cleanup": "done"
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/files",
+     "expect": {
+      "http": 404,
+      "code": 114001,
+      "message": "找不到这个项目",
+      "data": null
+     }
+    },
+    {
+     "method": "DELETE",
+     "path": "/api/workspaces/{wid}",
+     "expect": {
+      "http": 404,
+      "code": 114001,
+      "message": "找不到这个项目",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-del-pend"
+     },
+     "capture": {
+      "widp": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "op": "seed_ws",
+     "workspace": "{widp}",
+     "files": {
+      "keep.txt": "x\n"
+     }
+    },
+    {
+     "op": "chmod",
+     "workspace": "{widp}",
+     "path": ".",
+     "mode": "0555"
+    },
+    {
+     "method": "DELETE",
+     "path": "/api/workspaces/{widp}",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "status",
+       "cleanup"
+      ],
+      "data": {
+       "status": "deleted",
+       "cleanup": "pending"
+      }
+     }
+    },
+    {
+     "op": "chmod",
+     "workspace": "{widp}",
+     "path": ".",
+     "mode": "0755"
+    },
+    {
+     "sql": "DELETE FROM project_cleanups WHERE workspace_id='{widp}' RETURNING workspace_id",
+     "capture_stdout": [
+      "gone"
+     ]
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{widp}/files",
+     "expect": {
+      "http": 404,
+      "code": 114001,
+      "message": "找不到这个项目",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "65-run-views",
+   "case": "用例 65",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "对话页右侧工作区的两个只读读口（doc/78 §4）：改动文件从 runlog 派生（桶判定 + 路径归一 + 只留现存普通文件）、看板 deleted 不列、看不见与不存在同 404 112002",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-runviews"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "op": "seed_ws",
+     "workspace": "{wid}",
+     "files": {
+      "quote.py": "def total(a, b):\n    return a + b\n",
+      "test_quote.py": "from quote import total\n",
+      "notes.txt": "notes\n",
+      "new.txt": "n\n",
+      "copy.py": "c\n",
+      ".tako/bash/out.txt": "o\n"
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's65'||substring('{wid}' from 3), 'run views', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('r65'||substring('{wid}' from 3), '{sid}', 'complete', 1, now(), now(), '{wid}') RETURNING id",
+     "capture_stdout": [
+      "rid"
+     ]
+    },
+    {
+     "sql": "INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, payload, created_at) VALUES ('rl65a'||substring('{wid}' from 3),'{sid}',1,'r65'||substring('{wid}' from 3),'tool_call','','','','write_file({\"path\":\"quote.py\"})','{\"name\":\"write_file\",\"args\":\"{\\\"path\\\":\\\"quote.py\\\"}\",\"toolCallId\":\"tc65_a\"}',now()),('rl65b'||substring('{wid}' from 3),'{sid}',2,'r65'||substring('{wid}' from 3),'tool_call','','','','edit_file({\"path\":\"test_quote.py\"})','{\"name\":\"edit_file\",\"args\":\"{\\\"path\\\":\\\"test_quote.py\\\"}\",\"toolCallId\":\"tc65_b\"}',now()),('rl65c'||substring('{wid}' from 3),'{sid}',3,'r65'||substring('{wid}' from 3),'tool_call','','','','read_file({\"path\":\"notes.txt\"})','{\"name\":\"read_file\",\"args\":\"{\\\"path\\\":\\\"notes.txt\\\"}\",\"toolCallId\":\"tc65_c\"}',now()),('rl65d'||substring('{wid}' from 3),'{sid}',4,'r65'||substring('{wid}' from 3),'tool_call','','','','bash({\"command\":\"echo x > new.txt && cp quote.py copy.py\"})','{\"name\":\"bash\",\"args\":\"{\\\"command\\\":\\\"echo x > new.txt && cp quote.py copy.py\\\"}\",\"toolCallId\":\"tc65_d\"}',now()),('rl65e'||substring('{wid}' from 3),'{sid}',5,'r65'||substring('{wid}' from 3),'tool_call','','','','write_file({\"path\":\".tako/hidden.txt\"})','{\"name\":\"write_file\",\"args\":\"{\\\"path\\\":\\\".tako/hidden.txt\\\"}\",\"toolCallId\":\"tc65_e\"}',now())"
+    },
+    {
+     "sql": "INSERT INTO run_tasks (id, tenant_id, run_id, task_no, session_id, subject, skill_name, description, active_form, result, status, created_at, updated_at) VALUES ('rt65a'||substring('{wid}' from 3),'{ten}','r65'||substring('{wid}' from 3),1,'{sid}','实现报价计算','','','','读取两份文件并生成 quote.py','completed',now(),now()),('rt65b'||substring('{wid}' from 3),'{ten}','r65'||substring('{wid}' from 3),2,'{sid}','跑单测','','','','','in_progress',now(),now()),('rt65c'||substring('{wid}' from 3),'{ten}','r65'||substring('{wid}' from 3),3,'{sid}','不要了的一条','','','','','deleted',now(),now())"
+    },
+    {
+     "method": "GET",
+     "path": "/api/runs/{rid}/changed-files",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "runId",
+       "files"
+      ],
+      "data": {
+       "runId": "{rid}",
+       "files": [
+        {
+         "path": "quote.py",
+         "op": "write"
+        },
+        {
+         "path": "test_quote.py",
+         "op": "edit"
+        },
+        {
+         "path": "new.txt",
+         "op": "write"
+        },
+        {
+         "path": "copy.py",
+         "op": "write"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/runs/{rid}/tasks",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "runId",
+       "rows",
+       "total",
+       "done"
+      ],
+      "data": {
+       "runId": "{rid}",
+       "rows": [
+        {
+         "no": 1,
+         "subject": "实现报价计算",
+         "status": "completed",
+         "description": "",
+         "result": "读取两份文件并生成 quote.py",
+         "skillName": "",
+         "updatedAt": "$any"
+        },
+        {
+         "no": 2,
+         "subject": "跑单测",
+         "status": "in_progress",
+         "description": "",
+         "result": "",
+         "skillName": "",
+         "updatedAt": "$any"
+        }
+       ],
+       "total": 2,
+       "done": 1
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-runviews-old"
+     },
+     "capture": {
+      "wid3": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "op": "seed_unmigrated",
+     "workspace": "{wid3}",
+     "files": {
+      "content/old.txt": "旧字节\n"
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's65old'||substring('{wid3}' from 3), 'run views old', '{ten}', id, 'private', '{wid3}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid3"
+     ]
+    },
+    {
+     "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, workspace_id) VALUES ('r65old'||substring('{wid3}' from 3), '{sid3}', 'complete', 1, now(), now(), '{wid3}') RETURNING id",
+     "capture_stdout": [
+      "rid3"
+     ]
+    },
+    {
+     "method": "GET",
+     "path": "/api/runs/{rid3}/changed-files",
+     "expect": {
+      "http": 409,
+      "code": 117116,
+      "message": "这个项目还需要迁移目录后才能使用",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/runs/{rid3}/tasks",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "runId",
+       "rows",
+       "total",
+       "done"
+      ],
+      "data": {
+       "runId": "{rid3}",
+       "rows": [],
+       "total": 0,
+       "done": 0
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/runs/r_nope_65/changed-files",
+     "expect": {
+      "http": 404,
+      "code": 112002,
+      "message": "找不到这次运行",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/runs/r_nope_65/tasks",
+     "expect": {
+      "http": 404,
+      "code": 112002,
+      "message": "找不到这次运行",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/runs/{rid}/changed-files",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/runs/{rid}/tasks",
+     "auth": false,
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    },
+    {
+     "op": "invite_viewer"
+    },
+    {
+     "method": "GET",
+     "path": "/api/runs/{rid}/changed-files",
+     "tokenVar": "viewerTok",
+     "expect": {
+      "http": 404,
+      "code": 112002,
+      "message": "找不到这次运行",
+      "data": null
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/runs/{rid}/tasks",
+     "tokenVar": "viewerTok",
+     "expect": {
+      "http": 404,
+      "code": 112002,
+      "message": "找不到这次运行",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "80-tasks-session-filter",
+   "case": "用例 80",
+   "tier": "core",
+   "needs": "pg",
+   "desc": "任务列表按会话过滤（doc/80）：?sessionId= 只列「所属编排组 source_session_id 等于它」的 Task；不传/空串 = 全部（createdAt/id 倒序）；未知会话 = 200 空列表（读面缩小范围参数，不校验存在性）。两条来源会话与两条 Task 行由 SQL/HTTP 造出，created_at 由 SQL 固定以钉住倒序",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-task-scope"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 'sa'||substring('{wid}' from 3), 'scope A', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sidA"
+     ]
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 'sb'||substring('{wid}' from 3), 'scope B', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sidB"
+     ]
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc80a",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sidA}",
+      "content": "会话 A 派发的任务",
+      "agent": "researcher"
+     },
+     "capture": {
+      "tidA": "data.taskId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "taskId",
+       "orchestrationId",
+       "status",
+       "currentRunId"
+      ],
+      "data": {
+       "status": "ready",
+       "currentRunId": ""
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/tasks",
+     "body": {
+      "idempotencyKey": "acc80b",
+      "workspaceId": "{wid}",
+      "sourceSessionId": "{sidB}",
+      "content": "会话 B 派发的任务",
+      "agent": "researcher"
+     },
+     "capture": {
+      "tidB": "data.taskId"
+     },
+     "expect": {
+      "http": 202,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "taskId",
+       "orchestrationId",
+       "status",
+       "currentRunId"
+      ],
+      "data": {
+       "status": "ready",
+       "currentRunId": ""
+      }
+     }
+    },
+    {
+     "sql": "UPDATE agent_tasks SET created_at = timestamptz '2026-01-02 00:00:00Z' WHERE id='{tidB}'"
+    },
+    {
+     "sql": "UPDATE agent_tasks SET created_at = timestamptz '2026-01-01 00:00:00Z' WHERE id='{tidA}'"
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/tasks",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "tasks"
+      ],
+      "data": {
+       "tasks": [
+        {
+         "taskId": "{tidB}"
+        },
+        {
+         "taskId": "{tidA}"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/tasks?sessionId={sidA}",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "tasks"
+      ],
+      "data": {
+       "tasks": [
+        {
+         "taskId": "{tidA}"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/tasks?sessionId={sidB}",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "tasks"
+      ],
+      "data": {
+       "tasks": [
+        {
+         "taskId": "{tidB}"
+        }
+       ]
+      }
+     }
+    },
+    {
+     "method": "GET",
+     "path": "/api/workspaces/{wid}/tasks?sessionId=s_nope",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "tasks"
+      ],
+      "data": {
+       "tasks": []
+      }
+     }
+    }
+   ]
   }
  ],
  "declared_not_asserted": {
@@ -5821,6 +7115,7 @@
   "用例 41": "文件锁竞争与原子替换（doc/65 §13.3-4）——要两个隔离引擎共连同一 PG/共享 workspace 才造得出跨进程竞争；flock 串行、写前版本拒绝、kill -9 释放由 scripts/acceptance/memory_file_race.sh 判红，存储侧不变量由 go test 的 memory_filelock_test.go 钉住",
   "用例 42": "旧 notes/memory_items 升级迁移与模式互切（doc/65 §13.3-5）——要预置旧形态数据的库 + 双向互切命令；由 scripts/acceptance/memory_migrate_live.sh 判红（42 断言），幂等重放与失败预检在其中逐条断",
   "用例 43": "项目删除的连带清理（doc/65 §13.3-6）——workspace 两类行都清、user 行跨项目仍可见、USER.md 不变、runs/runlog 不变：要真删一个挂了记忆的项目；由 scripts/acceptance/memory_project_delete_live.sh 判红，删除级联的存储侧由 go test 的 delete_cascade_test.go 钉住",
-  "用例 60": "模型执行、Provider 故障与崩溃场景（doc/74 §12.3）——并行成功／父冲突／验证返工／主分支前进／不可变产物／非 Git 并行／结果清单／同路径冲突／部分发布恢复／忙脏受阻／人工重新发布／多标签页事件／各窗口 kill -9 与双副本对账，都要真模型＋真 Git／文件现场＋特殊起引擎才造得出，core tier 没有对应 HTTP 路径；由 scripts/acceptance/workspace_git_live.sh、workspace_directory_live.sh、workspace_publication_live.sh、workspace_crash_live.sh 判红，纯函数与存储侧由 go test 的 workspace_*_test.go 钉住"
+  "用例 60": "模型执行、Provider 故障与崩溃场景（doc/74 §12.3）——并行成功／父冲突／验证返工／主分支前进／不可变产物／非 Git 并行／结果清单／同路径冲突／部分发布恢复／忙脏受阻／人工重新发布／多标签页事件／各窗口 kill -9 与双副本对账，都要真模型＋真 Git／文件现场＋特殊起引擎才造得出，core tier 没有对应 HTTP 路径；由 scripts/acceptance/workspace_git_live.sh、workspace_directory_live.sh、workspace_publication_live.sh、workspace_crash_live.sh 判红，纯函数与存储侧由 go test 的 workspace_*_test.go 钉住",
+  "用例 64": "迁移命令、真实模型重规划与故障场景（doc/75 §10.2；doc/76 §6）——存量迁移与幂等、真模型对「不可行／不确定／同组可修订」的判定、Git／Directory 两类 Provider 的结果复用、创建各窗口 kill -9、双副本只创建一个继任组与旧 epoch 防写，都要真模型＋真 Git／文件现场＋特殊起引擎／双实例才造得出，core tier 没有对应 HTTP 路径；由 scripts/acceptance/project_layout_live.sh、project_layout_migration_live.sh、goal_replan_live.sh、goal_replan_crash_live.sh 判红，纯函数与存储侧由 go test 的 project_layout_test.go / project_cleanup_test.go / agent_task_successor_test.go 钉住"
  }
 }

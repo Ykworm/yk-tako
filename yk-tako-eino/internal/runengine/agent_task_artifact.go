@@ -27,8 +27,6 @@ import (
 )
 
 var (
-	// errArtifactShared：shared 组没有不可变结果，产物请从项目文件读取（400 111002）。
-	errArtifactShared = errors.New("shared 任务没有隔离结果产物")
 	// errArtifactUnreadable：结果引用缺失、产物不在清单、越界或文件已不可读（409 117110）。
 	errArtifactUnreadable = errors.New("结果产物已不可读取")
 	// errTaskNotRepublishable：非最终、非发布受阻、状态矛盾等（409 117112）。
@@ -36,8 +34,9 @@ var (
 )
 
 // TaskArtifact 读一件 Task 当前结果版本里声明的产物字节（施工包 §4.4 的存储半）。
-// 属主链与任务详情同一条（非本人与不存在同形 117001）；shared 拒绝；结果缺失/路径失效
-// 归 errArtifactUnreadable，Provider 内部异常原样上抛（handler 翻 500）。
+// 属主链与任务详情同一条（非本人与不存在同形 117001）；shared 与 isolated 都有不可变结果
+// （doc/76 §4/§5），读口同一条；结果缺失/路径失效归 errArtifactUnreadable，Provider 内部
+// 异常原样上抛（handler 翻 500）。
 func (s *Store) TaskArtifact(ctx context.Context, p principal, taskID, path string) ([]byte, error) {
 	var rows []AgentTask
 	if err := s.db.WithContext(ctx).Raw(taskOwnerQuery+` AND t.id = ?`, p.TenantID, p.UserID, taskID).
@@ -51,9 +50,6 @@ func (s *Store) TaskArtifact(ctx context.Context, p principal, taskID, path stri
 	var o AgentOrchestration
 	if err := s.db.WithContext(ctx).Where("id = ?", t.OrchestrationID).Take(&o).Error; err != nil {
 		return nil, err
-	}
-	if o.WorkspaceMode != workspaceModeIsolated {
-		return nil, errArtifactShared
 	}
 	if t.ResultRevision == 0 || parseTaskResult(t.Result) == nil {
 		return nil, errArtifactUnreadable
@@ -110,8 +106,9 @@ type publicationRetryView struct {
 	PublicationEpoch int64  `json:"publicationEpoch"`
 }
 
-// RetryTaskPublication 是人工重新发布（施工包 §4.5）：只在 isolated 最终 Task 存储 blocked
+// RetryTaskPublication 是人工重新发布（施工包 §4.5）：只在最终 Task 存储 blocked
 // 且错误码是发布三码、当前结果版本与不可变结果仍有效时，在**同一执行 session** 铸一场新 run。
+// shared 与 isolated 同一判据——doc/76 §4 让 shared 也走发布链，受阻后同样需要这条恢复路径。
 // 返回 claim 非空 = 真的创建了处理 run（调用方提交后启动）；claim 为空 = 幂等命中
 // （已有当前处理 run 活着），只回现状。
 //
@@ -132,7 +129,7 @@ func (s *Store) RetryTaskPublication(ctx context.Context, p principal, taskID st
 	if err := s.db.WithContext(ctx).Where("id = ?", pre.OrchestrationID).Take(&o).Error; err != nil {
 		return publicationRetryView{}, nil, err
 	}
-	if o.WorkspaceMode != workspaceModeIsolated || pre.ID != o.FinalTaskID {
+	if pre.ID != o.FinalTaskID {
 		return publicationRetryView{}, nil, errTaskNotRepublishable
 	}
 	if pre.Status != agentTaskStatusBlocked && pre.Status != agentTaskStatusRunning {
@@ -180,7 +177,7 @@ func (s *Store) RetryTaskPublication(ctx context.Context, p principal, taskID st
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", pre.ID).Take(&t).Error; err != nil {
 			return err
 		}
-		if locked.Status != orchStatusActive || locked.WorkspaceMode != workspaceModeIsolated || t.ID != locked.FinalTaskID {
+		if locked.Status != orchStatusActive || t.ID != locked.FinalTaskID {
 			return errTaskNotRepublishable
 		}
 		switch t.Status {

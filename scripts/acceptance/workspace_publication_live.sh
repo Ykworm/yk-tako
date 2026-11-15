@@ -31,8 +31,11 @@ jq -cn --arg n "$AGENT" \
 WG=$(curl -sS -X POST "$B/api/workspaces" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d '{"name":"ws-pub-git"}' | jq -r .data.workspace.id)
 WD=$(curl -sS -X POST "$B/api/workspaces" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d '{"name":"ws-pub-dir"}' | jq -r .data.workspace.id)
 { [ -n "$WG" ] && [ "$WG" != "null" ] && [ -n "$WD" ] && [ "$WD" != "null" ]; } || { no "建项目失败"; ml_summary; }
-PROJ_G="$WS_ROOT/tenants/$TEN/workspaces/$WG"
-PROJ_D="$WS_ROOT/tenants/$TEN/workspaces/$WD"
+# doc/76：先打文件清单初始化 layout.json 与 content/runtime，再往 content/ 写基线。
+curl -sS -o /dev/null "$B/api/workspaces/$WG/files" -H "Authorization: Bearer $TOK"
+curl -sS -o /dev/null "$B/api/workspaces/$WD/files" -H "Authorization: Bearer $TOK"
+PROJ_G="$WS_ROOT/tenants/$TEN/workspaces/$WG/content"
+PROJ_D="$WS_ROOT/tenants/$TEN/workspaces/$WD/content"
 mkdir -p "$PROJ_G" "$PROJ_D"
 git -C "$PROJ_G" init -q -b main
 printf '基线内容\n' > "$PROJ_G/report.md"
@@ -43,7 +46,7 @@ at_probe_run "$WG"; SID_G="$SID"
 at_probe_run "$WD"; SID_D="$SID"
 echo "  Git 项目 $WG（会话 $SID_G）· Directory 项目 $WD（会话 $SID_D）"
 
-ws_dir(){ echo "$WS_ROOT/tenants/$TEN/.tako/orchestrations/$1/workspace"; }
+ws_dir(){ echo "$WS_ROOT/tenants/$TEN/workspaces/$1/runtime/orchestrations/$2/workspace"; }
 task_field(){ at_task "$1"; echo "$AT_TASK" | jq -r "$2 // empty"; }
 
 # ── 1. 忙：同项目另有活 run → 发布准入按住 → 空闲后自动发布 ───────────────────────
@@ -87,7 +90,7 @@ RESP=$(at_create_task "acc-wspub-dirty-$STAMP2" "$WG" "$SID_G" \
 TID2=$(echo "$RESP" | jq -r '.data.taskId // ""')
 OID2=$(echo "$RESP" | jq -r '.data.orchestrationId // ""')
 [ -n "$TID2" ] && [ "$TID2" != "null" ] || { echo "创建失败：$RESP" >&2; exit 2; }
-GD2=$(ws_dir "$OID2")
+GD2=$(ws_dir "$WG" "$OID2")
 echo "  场2 taskId=$TID2 orchId=$OID2"
 for i in $(seq 1 60); do [ -f "$GD2/state.json" ] && break; sleep 1; done
 [ -f "$GD2/state.json" ] || { no "60s 没等到组准备"; ml_summary; }
@@ -115,7 +118,7 @@ RESP=$(at_create_task "acc-wspub-block-$STAMP3" "$WD" "$SID_D" \
 TID3=$(echo "$RESP" | jq -r '.data.taskId // ""')
 OID3=$(echo "$RESP" | jq -r '.data.orchestrationId // ""')
 [ -n "$TID3" ] && [ "$TID3" != "null" ] || { echo "创建失败：$RESP" >&2; exit 2; }
-GD3=$(ws_dir "$OID3")
+GD3=$(ws_dir "$WD" "$OID3")
 echo "  场3 taskId=$TID3 orchId=$OID3"
 for i in $(seq 1 60); do [ -f "$GD3/state.json" ] && break; sleep 1; done
 [ -f "$GD3/state.json" ] || { no "60s 没等到组准备"; ml_summary; }
@@ -129,7 +132,7 @@ INV=$(curl -sS -X POST "$B/api/tenants/$TEN/invitations" -H "Authorization: Bear
 ITOK=$(echo "$INV" | jq -r '.data.inviteToken // ""')
 [ -n "$ITOK" ] && [ "$ITOK" != "null" ] || { no "发 viewer 邀请失败：$INV"; ml_summary; }
 curl -sS -X POST "$B/api/auth/register-by-invite" -H 'Content-Type: application/json' -d '{"token":"'"$ITOK"'","email":"'"$VEM"'","password":"'"$VPW"'"}' >/dev/null
-VLOGIN=$(curl -sS -X POST "$B/api/auth/login" -H 'Content-Type: application/json' -d '{"email":"'"$VEM"'","password":"'"$VPW"'"}')
+VLOGIN=$(curl -sS -X POST "$B/api/auth/login" -H 'Content-Type: application/json' -d '{"identifier":"'"$VEM"'","password":"'"$VPW"'"}')
 VACCESS=$(echo "$VLOGIN" | jq -r .data.accessToken); VREFRESH=$(echo "$VLOGIN" | jq -r .data.refreshToken)
 VSW=$(curl -sS -X POST "$B/api/auth/switch-tenant" -H "Authorization: Bearer $VACCESS" -H 'Content-Type: application/json' -d '{"tenantId":"'"$TEN"'","refreshToken":"'"$VREFRESH"'"}')
 VTOK=$(echo "$VSW" | jq -r .data.accessToken)

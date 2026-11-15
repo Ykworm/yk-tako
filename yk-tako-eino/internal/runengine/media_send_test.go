@@ -769,7 +769,7 @@ func TestMediaSendBoundaries(t *testing.T) {
 
 	root := t.TempDir()
 	resolve := func(ctx context.Context, path string) (string, error) {
-		return resolveReadMediaPath(ctx, nil, root, path)
+		return resolveReadMediaPath(ctx, nil, root, root, path)
 	}
 	write := func(rel string, body []byte) {
 		t.Helper()

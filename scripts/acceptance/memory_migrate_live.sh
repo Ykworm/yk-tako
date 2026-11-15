@@ -134,7 +134,7 @@ stop_engine
 migrate markdown
 eq "互切 →markdown 退出码 0" "0" "$MIG_RC"
 UF="$WS/tenants/$TEN/users/$ML_UID/USER.md"
-MF="$WS/tenants/$TEN/workspaces/$DEF_W/MEMORY.md"
+MF="$WS/tenants/$TEN/workspaces/$DEF_W/runtime/memory/MEMORY.md"
 if [ -f "$UF" ] && grep -q '旧笔记里的个人偏好' "$UF" && grep -q '导入前就有的常驻偏好' "$UF"; then
   ok "USER.md 含两条 user 条目：$(cat "$UF")"
 else no "USER.md 内容不对：$(cat "$UF" 2>/dev/null)"; fi

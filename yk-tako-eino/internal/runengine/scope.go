@@ -61,6 +61,10 @@ type WorkspaceRef struct {
 	// WorkspaceID 是这场会话挂着的项目 id。没挂项目 = 空串。
 	// markdown 记忆的项目文件（MEMORY.md）按它定位——作业根目录本身不告诉你是哪个项目。
 	WorkspaceID string
+	// RuntimeRoot 是本次 run 的运行资源根（doc/76 §6.1）：
+	// 普通聊天 = 项目容器的 runtime/；异步 Task = 该组的运行资源区。
+	// 空串 = 没有项目容器（纯会话目录），bash/fetch/搜索仍写旧的 .tako/ 布局。
+	RuntimeRoot string
 	MaxBytes    int64
 	// Reserve 在落盘前占住字节。没设时 write_file 仍用目录大小做一次检查。
 	Reserve func(adding int) (func(), error)
@@ -110,19 +114,24 @@ func workspaceRoot(root, tenantID, workspaceID string) (string, error) {
 	return dir, nil
 }
 
-// runWorkspace 按会话行选作业根。挂了项目就用项目目录，否则仍是这场会话自己的目录。
-// 第二个返回值是项目 id（没挂项目 = 空串）：markdown 记忆的项目文件要按它定位。
-func runWorkspace(ctx context.Context, w *Worker, tenantID string, sessionID SessionID) (string, string, error) {
-	wid, err := w.store.SessionWorkspaceID(ctx, sessionID)
+// runWorkspace 按会话行选作业根。挂了项目就用项目容器的 content/ 作内容根、
+// runtime/ 作运行资源根（doc/76 §6.1）；未挂项目的纯会话仍用自己的目录，且没有运行资源根
+// （bash/fetch/搜索继续写会话目录下的 .tako/，迁移范围不扩散到纯会话）。
+// 第三个返回值是项目 id（没挂项目 = 空串）：markdown 记忆的项目文件要按它定位。
+func runWorkspace(ctx context.Context, w *Worker, tenantID string, sessionID SessionID) (root, runtimeRoot, wid string, err error) {
+	wid, err = w.store.SessionWorkspaceID(ctx, sessionID)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	if wid != "" {
-		dir, err := workspaceRoot(w.workspace, tenantID, wid)
-		return dir, wid, err
+		content, runtime, err := ensureProjectLayout(w.workspace, tenantID, wid)
+		if err != nil {
+			return "", "", "", err
+		}
+		return content, runtime, wid, nil
 	}
 	dir, err := sessionWorkspace(w.workspace, tenantID, sessionID)
-	return dir, "", err
+	return dir, "", "", err
 }
 
 // userDir 算出用户目录，不创建它。id 只允许单段路径，避免从库里的值走出去。

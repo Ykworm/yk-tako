@@ -27,12 +27,14 @@ import (
 )
 
 // secondStore 在同一个 PG 库上再开一个 Store 实例（= 另一个进程读同一份持久化数据）。
-func secondStore(t *testing.T, dsn string) *Store {
+// 作业根必须与第一个实例相同（多副本共享同一份磁盘），否则结果固化/对账看不到现场。
+func secondStore(t *testing.T, dsn, root string) *Store {
 	t.Helper()
 	st, err := OpenStore(context.Background(), testRedisURL, dsn, testTTL, testLease)
 	if err != nil {
 		t.Fatalf("OpenStore(2nd): %v", err)
 	}
+	st.SetWorkspaceRoot(root)
 	t.Cleanup(func() { st.Close() })
 	return st
 }
@@ -137,11 +139,16 @@ func setRunStatus(t *testing.T, s *Store, runID RunID, status string) {
 	}
 }
 
-// submitOK 提交一份合法结果（wsRoot 由调用方给；无产物）。
+// submitOK 提交一份合法结果（无产物）。先按真实执行链准备工作现场——shared 与 isolated
+// 的提交都要在 Provider 的工作现场里验证并固化结果（doc/76 §4），不能绕过。
 func submitOK(t *testing.T, s *Store, taskID string, runID RunID, epoch int64) int {
 	t.Helper()
-	rev, err := s.SubmitTaskResult(context.Background(), taskID, runID, epoch,
-		TaskResult{Summary: "完成"}, t.TempDir())
+	ctx := context.Background()
+	work, _, err := s.prepareTaskWork(ctx, taskID)
+	if err != nil {
+		t.Fatalf("prepareTaskWork: %v", err)
+	}
+	rev, err := s.SubmitTaskResult(ctx, taskID, runID, epoch, TaskResult{Summary: "完成"}, work.Root)
 	if err != nil {
 		t.Fatalf("SubmitTaskResult: %v", err)
 	}
@@ -469,7 +476,7 @@ func TestAgentTaskClaimRaceTwoStores(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s2 := secondStore(t, dsn)
+	s2 := secondStore(t, dsn, s1.workspaceRoot)
 	var mu sync.Mutex
 	var total int
 	var wg sync.WaitGroup
@@ -510,13 +517,6 @@ func TestAgentTaskSubmitValidation(t *testing.T) {
 	s := newTestStore(t, testLease, testTTL)
 	wsID, sessID := seedTaskEnv(t, s, "researcher")
 	ctx := context.Background()
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "out"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "out", "report.md"), []byte("# 报告"), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	resp, err := s.CreateAgentTask(ctx, testOwner, CreateTaskCommand{
 		IdempotencyKey: "k1", WorkspaceID: wsID, SourceSessionID: sessID, Content: "写报告", Agent: "researcher",
 	}, planEnv{})
@@ -524,6 +524,18 @@ func TestAgentTaskSubmitValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := claimOne(t, s, resp.OrchestrationID)
+	// 真实执行链在领取后准备工作现场；提交校验与固化都在这个现场里。
+	work, _, err := s.prepareTaskWork(ctx, c.TaskID)
+	if err != nil {
+		t.Fatalf("prepareTaskWork: %v", err)
+	}
+	root := work.Root
+	if err := os.MkdirAll(filepath.Join(root, "out"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "out", "report.md"), []byte("# 报告"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := s.SubmitTaskResult(ctx, c.TaskID, c.RunID, c.Epoch, TaskResult{Summary: "  "}, root); !errors.Is(err, errSubmitBad) {
 		t.Fatalf("空 summary err = %v, want errSubmitBad", err)
@@ -659,7 +671,7 @@ func TestAgentTaskMissedEndRunReconcile(t *testing.T) {
 	setRunStatus(t, s1, c.RunID, "complete")
 	// s1 没有 ReconcileRun——崩溃点。
 
-	s2 := secondStore(t, dsn)
+	s2 := secondStore(t, dsn, s1.workspaceRoot)
 	if err := s2.ReconcileRun(ctx, c.RunID); err != nil {
 		t.Fatal(err)
 	}
@@ -1142,7 +1154,7 @@ func TestAgentTaskDeleteProtection(t *testing.T) {
 	if err := s.DeleteSession(ctx, testOwner.TenantID, testOwner.UserID, sessID); !errors.Is(err, ErrSessionBusy) {
 		t.Fatalf("有活跃组时删会话 err = %v, want ErrSessionBusy", err)
 	}
-	if _, err := s.DeleteWorkspaceCascade(ctx, testOwner.TenantID, testOwner.UserID, wsID); !errors.Is(err, ErrWorkspaceBusy) {
+	if err := s.DeleteWorkspaceCascade(ctx, testOwner.TenantID, testOwner.UserID, wsID); !errors.Is(err, ErrWorkspaceBusy) {
 		t.Fatalf("有活跃组时删项目 err = %v, want ErrWorkspaceBusy", err)
 	}
 	// 取消整组 → 组 cancelled → 删除放行。

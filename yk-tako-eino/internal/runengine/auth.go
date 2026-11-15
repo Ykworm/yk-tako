@@ -223,6 +223,7 @@ const (
 	codeTaskMissing       = 117001 // 404 找不到这件任务（不存在或不可见）
 	codeOrchMissing       = 117002 // 404 找不到这个编排组
 	codeNotifMissing      = 117003 // 404 找不到这条通知（不存在、不可见、跨租户或来源会话已删除）
+	codeHandoffMissing    = 117004 // 404 找不到这次重规划交接（组没有 handoff，或不存在/不可见）
 	codePlanInvalid       = 117101 // 400 任务计划不合法（具体原因进 data.reason）
 	codePlanConflict      = 117102 // 409 创建键已经用于另一份计划（同键不同 plan_hash）
 	codeTaskNotResumable  = 117103 // 409 这件任务现在不能恢复（非 interrupted／有活执行者／次数耗尽）
@@ -237,10 +238,17 @@ const (
 	codeWorkspaceConfigInvalid = 117111 // 400 工作区配置不合法（mode 词表、shared 携带验证命令、验证命令超限/NUL；原因进 data.reason）
 	codeTaskNotRepublishable   = 117112 // 409 这件任务现在不能重新发布（非最终、非 blocked、非发布错误等）
 	codeWorkspacePublishing    = 117113 // 409 项目正在发布结果，请稍后再试（只在 workspaces 有当前发布标记时挡同项目新 run）
-	codeInternal               = 111901
+	// 117114–117116：目标重规划与项目目录（doc/75／doc/76）。
+	codeSuccessorNotAllowed = 117114 // 409 这个编排组现在不能创建继任组（已有继任者／状态不允许）
+	codeSuccessorInvalid    = 117115 // 400 继任方案不合法（可行性判定、原因、复用或画布；原因进 data.reason）
+	codeLayoutUnmigrated    = 117116 // 409 这个项目还是旧目录布局，需要先跑显式迁移
+	codeInternal            = 111901
 )
 
-var emailPattern = regexp.MustCompile(`^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$`)
+var (
+	emailPattern    = regexp.MustCompile(`^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$`)
+	usernamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.\-]{0,31}$`)
+)
 
 func writeEnvelope(c *gin.Context, status, code int, message string, data any) {
 	c.JSON(status, envelope{Code: code, Message: message, Data: data})
@@ -340,17 +348,27 @@ func (a *Auth) Signup(c *gin.Context) {
 
 func (a *Auth) Login(c *gin.Context) {
 	var req struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
+		Identifier string `json:"identifier"`
+		Password   string `json:"password"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
 		return
 	}
-	email, _ := normalizeEmail(req.Email)
-	user, err := a.store.GetUserByEmail(c.Request.Context(), email)
+	identifier, byEmail, ok := normalizeIdentifier(req.Identifier)
+	if !ok {
+		writeEnvelope(c, http.StatusUnauthorized, codeBadCredentials, "账号或密码不正确", nil)
+		return
+	}
+	var user User
+	var err error
+	if byEmail {
+		user, err = a.store.GetUserByEmail(c.Request.Context(), identifier)
+	} else {
+		user, err = a.store.GetUserByUsername(c.Request.Context(), identifier)
+	}
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		writeEnvelope(c, http.StatusUnauthorized, codeBadCredentials, "邮箱或密码不正确", nil)
+		writeEnvelope(c, http.StatusUnauthorized, codeBadCredentials, "账号或密码不正确", nil)
 		return
 	}
 	if err != nil {
@@ -358,7 +376,7 @@ func (a *Auth) Login(c *gin.Context) {
 		return
 	}
 	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil || user.Disabled {
-		writeEnvelope(c, http.StatusUnauthorized, codeBadCredentials, "邮箱或密码不正确", nil)
+		writeEnvelope(c, http.StatusUnauthorized, codeBadCredentials, "账号或密码不正确", nil)
 		return
 	}
 	data, access, exp, refresh, err := a.sessionFor(c, user)
@@ -685,6 +703,25 @@ func normalizeEmail(raw string) (string, bool) {
 		return "", false
 	}
 	return email, true
+}
+
+// normalizeIdentifier 把登录名分成两类：带 @ 的按邮箱校验，其余按用户名校验。
+// 格式不合法与查不到都回同一句凭据错误，不把「这个账号存不存在」泄漏给调用方。
+func normalizeIdentifier(raw string) (value string, byEmail bool, ok bool) {
+	id := strings.ToLower(strings.TrimSpace(raw))
+	if id == "" {
+		return "", false, false
+	}
+	if strings.ContainsRune(id, '@') {
+		if !emailPattern.MatchString(id) {
+			return "", true, false
+		}
+		return id, true, true
+	}
+	if !usernamePattern.MatchString(id) {
+		return "", false, false
+	}
+	return id, false, true
 }
 
 func toItems(rows []MemberListing) []membershipItem {

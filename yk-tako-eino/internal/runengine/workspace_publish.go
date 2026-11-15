@@ -65,9 +65,6 @@ func (s *Store) reconcileOrchestrationPublication(ctx context.Context, orchID st
 	default:
 		return nil // ''（无发布）或 published（已成事实）：幂等 no-op
 	}
-	if o.WorkspaceMode != workspaceModeIsolated {
-		return s.abandonPublication(ctx, o)
-	}
 	var final AgentTask
 	if err := s.db.WithContext(ctx).Where("id = ?", o.FinalTaskID).Take(&final).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -415,7 +412,8 @@ SELECT id FROM agent_orchestrations
 	}
 }
 
-// cleanupWorkspaces 过窗清理隔离组的工作现场（doc/74 §10.8）：只清终态且过 archiveTTL 的组；
+// cleanupWorkspaces 过窗清理组的工作现场（doc/74 §10.8；doc/76 §4）：只清终态且过 archiveTTL
+// 的组；shared 与 isolated 都有组工作现场（work/shared 或 work/<taskId>），同一判据。
 // Provider 自己判定哪些现场能证明安全（未提交内容、进行中 Git 操作、部分发布未收口的保留）。
 // 清理失败只记日志，不改业务状态。archiveTTL <= 0（未配置）= 不清理。
 func (ts *TaskScheduler) cleanupWorkspaces(ctx context.Context) {
@@ -429,9 +427,9 @@ func (ts *TaskScheduler) cleanupWorkspaces(ctx context.Context) {
 	var orchs []AgentOrchestration
 	if err := ts.store.db.WithContext(ctx).Raw(`
 SELECT * FROM agent_orchestrations
- WHERE workspace_mode = ? AND status IN (?, ?, ?) AND finished_at IS NOT NULL AND finished_at < ?
+ WHERE status IN (?, ?, ?) AND finished_at IS NOT NULL AND finished_at < ?
  ORDER BY finished_at LIMIT 32`,
-		workspaceModeIsolated, orchStatusSucceeded, orchStatusFailed, orchStatusCancelled,
+		orchStatusSucceeded, orchStatusFailed, orchStatusCancelled,
 		time.Now().UTC().Add(-ttl)).Scan(&orchs).Error; err != nil {
 		log.Printf("task scheduler workspace cleanup list: %v", err)
 		return

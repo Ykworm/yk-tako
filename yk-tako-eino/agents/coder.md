@@ -7,7 +7,6 @@ tools:
   - edit_file
   - list_directory
   - search_files
-  - memory
   - bash
 ---
 

@@ -89,7 +89,7 @@ func TestMemoryModeMigrationExportGroupsAndArchives(t *testing.T) {
 	if got := readMigrationFile(t, root, "tenants/t1/users/u2/USER.md"); got != "二号用户" {
 		t.Fatalf("u2 文件 = %q", got)
 	}
-	if got := readMigrationFile(t, root, "tenants/t1/workspaces/w1/MEMORY.md"); got != "项目用 Go" {
+	if got := readMigrationFile(t, root, "tenants/t1/workspaces/w1/runtime/memory/MEMORY.md"); got != "项目用 Go" {
 		t.Fatalf("w1 文件 = %q", got)
 	}
 	if n := residentCount(t, s, "archived"); n != 5 {
@@ -224,7 +224,7 @@ func TestMemoryModeMigrationImportConflictParseAndReplay(t *testing.T) {
 	s, dsn := newTestStoreWithDSN(t, testLease, testTTL)
 	root := t.TempDir()
 	userFile := filepath.Join(root, "tenants/t1/users/u1/USER.md")
-	wsFile := filepath.Join(root, "tenants/t1/workspaces/w1/MEMORY.md")
+	wsFile := filepath.Join(root, "tenants/t1/workspaces/w1/runtime/memory/MEMORY.md")
 	writeFile := func(path, content string) {
 		t.Helper()
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

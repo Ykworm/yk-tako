@@ -36,7 +36,10 @@ jq -cn --arg n "$AGENT" \
 WID=$(curl -sS -X POST "$B/api/workspaces" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
   -d '{"name":"ws-git-live"}' | jq -r .data.workspace.id)
 [ -n "$WID" ] && [ "$WID" != "null" ] || { no "建项目失败"; ml_summary; }
-PROJ="$WS_ROOT/tenants/$TEN/workspaces/$WID"
+# doc/76 容器布局：先打一次文件清单让引擎建好 layout.json 与 content/runtime，
+# 再往 content/ 写基线并 git init。反序会把容器写成「无 layout.json 却有旧字节」（409 117116）。
+curl -sS "$B/api/workspaces/$WID/files" -H "Authorization: Bearer $TOK" >/dev/null
+PROJ="$WS_ROOT/tenants/$TEN/workspaces/$WID/content"
 mkdir -p "$PROJ"
 # 夹具：只在隔离测试项目里 init + commit（不碰任何真实项目）。
 git -C "$PROJ" init -q -b main
@@ -49,7 +52,7 @@ at_probe_run "$WID"
 echo "  项目 $WID · 夹具 seed=$SEED · 来源会话 $SID"
 
 # 组目录（断言 worktree / 结果引用 / 冲突记录用）。
-ws_dir(){ echo "$WS_ROOT/tenants/$TEN/.tako/orchestrations/$1/workspace"; }
+ws_dir(){ echo "$WS_ROOT/tenants/$TEN/workspaces/$1/runtime/orchestrations/$2/workspace"; }
 # 字节断言：artifact 端点回的原始字节与期望逐字一致（cmp，不靠 shell 字符串吞换行）。
 artifact_eq(){ # $1=taskId $2=path $3=期望内容 $4=标签
   curl -sS "$B/api/tasks/$1/artifact?path=$2" -H "Authorization: Bearer $TOK" -o "$SCRATCH/got.bin"
@@ -60,8 +63,8 @@ task_field(){ at_task "$1"; echo "$AT_TASK" | jq -r "$2 // empty"; }
 
 # ── 1. 并行成功：a/b 各写一份、c 汇合；执行期间原项目不动 ─────────────────────────
 STAMP="$(date +%s)-$$"
-TASKS=$(jq -cn --arg a "在工作目录创建文件 alpha.txt，内容恰好一行「甲-$STAMP」。git add 并 git commit，然后调用 submit_task_result，summary 写文件路径，artifacts 声明 alpha.txt（kind=file）。" \
-  --arg b "在工作目录创建文件 beta.txt，内容恰好一行「乙-$STAMP」。git add 并 git commit，然后调用 submit_task_result，summary 写文件路径，artifacts 声明 beta.txt（kind=file）。" \
+TASKS=$(jq -cn --arg a "在工作目录创建文件 alpha.txt，内容恰好一行「甲-$STAMP」，行末带一个换行符。git add 并 git commit，然后调用 submit_task_result，summary 写文件路径，artifacts 声明 alpha.txt（kind=file）。" \
+  --arg b "在工作目录创建文件 beta.txt，内容恰好一行「乙-$STAMP」，行末带一个换行符。git add 并 git commit，然后调用 submit_task_result，summary 写文件路径，artifacts 声明 beta.txt（kind=file）。" \
   --arg c "工作目录里已有上游留下的 alpha.txt 与 beta.txt。读齐两份，创建 final.txt：第一行是 alpha.txt 的原文，第二行是 beta.txt 的原文（各一行，不多不少）。git add 并 git commit，然后调用 submit_task_result，summary 写 final.txt 路径，artifacts 声明 final.txt（kind=file）。" \
   --arg g "$AGENT" \
   '[{key:"a",content:$a,agent:$g},{key:"b",content:$b,agent:$g},{key:"c",content:$c,agent:$g}]')
@@ -86,7 +89,7 @@ eq "a 领取时原项目 HEAD 仍是 seed（执行不碰原项目）" "$SEED" "$
 [ ! -f "$PROJ/alpha.txt" ] && [ ! -f "$PROJ/beta.txt" ] && ok "a 领取时项目里没有执行者的文件" || no "执行期间项目出现了执行者的文件"
 
 if at_wait_orch "$OID" "succeeded" 300; then ok "场1 整组收口 succeeded"; else no "场1 没收口（$AT_LAST）"; at_orch "$OID"; echo "$AT_ORCH" | jq -c '.tasks[] | {key,status,error}'; ml_summary; fi
-GD=$(ws_dir "$OID")
+GD=$(ws_dir "$WID" "$OID")
 eq "组 Provider 固定为 git" "git" "$(jq -r .provider "$GD/state.json")"
 # 隔离：a 的 worktree 只有 alpha，b 的只有 beta，c 汇合两份。
 [ -f "$GD/work/$TID_A/alpha.txt" ] && [ ! -f "$GD/work/$TID_A/beta.txt" ] && ok "a 的 worktree 看不到 b 的文件（并行隔离）" || no "a 的 worktree 隔离被破坏"
@@ -126,7 +129,7 @@ at_orch "$OID2"
 TID_C2=$(echo "$AT_ORCH" | jq -r '.tasks[] | select(.key=="c") | .taskId')
 echo "  场2 orchId=$OID2 c=$TID_C2"
 if at_wait_orch "$OID2" "succeeded" 300; then ok "场2 整组收口 succeeded"; else no "场2 没收口（$AT_LAST）"; at_orch "$OID2"; echo "$AT_ORCH" | jq -c '.tasks[] | {key,status,error}'; ml_summary; fi
-GD2=$(ws_dir "$OID2")
+GD2=$(ws_dir "$WID" "$OID2")
 # 冲突是程序检出的（mergeParents 写冲突记录），不是模型自述。
 [ -s "$GD2/provider/conflicts/$TID_C2.json" ] && ok "c 的冲突记录在组目录（程序检出）" || no "c 没有冲突记录（父冲突没被程序发现）"
 artifact_eq "$TID_C2" "shared.txt" "甲改-$STAMP2
@@ -167,11 +170,13 @@ RESP=$(at_create_task "acc-wsgit-adv-$STAMP4" "$WID" "$SID" "$CONTENT4" "$AGENT"
 TID4=$(echo "$RESP" | jq -r '.data.taskId // ""')
 OID4=$(echo "$RESP" | jq -r '.data.orchestrationId // ""')
 [ -n "$TID4" ] && [ "$TID4" != "null" ] || { echo "创建失败：$RESP" >&2; exit 2; }
-GD4=$(ws_dir "$OID4")
+GD4=$(ws_dir "$WID" "$OID4")
 echo "  场4 taskId=$TID4 orchId=$OID4"
-# 组目录一出现（准备完成、执行刚开始）就在原项目 main 上推一个用户提交。
-for i in $(seq 1 60); do [ -f "$GD4/state.json" ] && break; sleep 1; done
-[ -f "$GD4/state.json" ] || { no "60s 没等到组准备"; ml_summary; }
+# 本组基线固定（provider/git.json 已写 baseCommit）且本件 worktree 已切出之后，才在 main 上推用户提交。
+# 只看 state.json 不够：它在 PrepareGroup 开头就落盘，bare 仓克隆与基线捕获还没完成，
+# 此时推 main 会被并进基线，发布自然 ff 成功——测不到受阻。
+for i in $(seq 1 60); do [ -f "$GD4/provider/git.json" ] && [ -f "$GD4/work/$TID4/.git" ] && break; sleep 1; done
+[ -f "$GD4/work/$TID4/.git" ] || { no "60s 没等到基线固定与 worktree 切出"; ml_summary; }
 printf '用户前进\n' > "$PROJ/user.txt"
 git -C "$PROJ" add user.txt
 git -C "$PROJ" -c user.name=probe -c user.email=probe@tako.test commit -qm user-advance

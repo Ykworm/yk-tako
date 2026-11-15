@@ -149,7 +149,7 @@ func (s *Store) memoryFileRefFor(ctx context.Context, target string) (memoryFile
 		if !ok || ref.WorkspaceID == "" {
 			return memoryFileRef{}, "当前会话没有绑定项目，没有项目记忆文件"
 		}
-		dir, err := workspaceDir(root, ref.TenantID, ref.WorkspaceID)
+		dir, err := projectMemoryDir(root, ref.TenantID, ref.WorkspaceID)
 		if err != nil {
 			return memoryFileRef{}, "项目 id 不合法，定位不到项目记忆文件"
 		}

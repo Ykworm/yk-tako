@@ -1,7 +1,7 @@
 // 本文件是持久 Task 的统一创建服务、读取、停止与结果提交（方案真源 = doc/70 §4/§6/§7/§10；施工包 §6/§7）。
 //
 // HTTP handler 与模型工具都走这里的 CreateAgentTask / CreateAgentOrchestration，校验只有一份
-//（施工包 §6.1）。纯形状校验在 agent_task_graph.go；这里的校验要读库：来源会话归属、项目绑定、
+// （施工包 §6.1）。纯形状校验在 agent_task_graph.go；这里的校验要读库：来源会话归属、项目绑定、
 // 执行者规格、模型 ref、幂等键比对。读取统一带可见性：Task／编排组的「本人」由
 // orchestration → source_session → sessions.user_id 这条链判定，非本人一律当成不存在。
 package runengine
@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -351,7 +352,9 @@ func (s *Store) taskByKey(ctx context.Context, p principal, orchID, key string) 
 }
 
 // ListWorkspaceTasks 列本人项目下的 Task（施工包 §4.3：只列本人项目，createdAt/id 倒序）。
-func (s *Store) ListWorkspaceTasks(ctx context.Context, p principal, workspaceID string) ([]agentTaskView, error) {
+// sessionID 非空时按「所属编排组的 source_session_id」缩小范围（doc/80）；会话不存在 / 不是本人
+// 的返回空列表（读面的缩小范围参数，不校验存在性）。
+func (s *Store) ListWorkspaceTasks(ctx context.Context, p principal, workspaceID, sessionID string) ([]agentTaskView, error) {
 	var one int
 	if err := s.db.WithContext(ctx).Raw(
 		`SELECT 1 FROM workspaces WHERE id = ? AND tenant_id = ? AND user_id = ?`,
@@ -361,10 +364,13 @@ func (s *Store) ListWorkspaceTasks(ctx context.Context, p principal, workspaceID
 	if one == 0 {
 		return nil, ErrWorkspaceNotFound
 	}
+	q := s.db.WithContext(ctx).Where("tenant_id = ? AND workspace_id = ?", p.TenantID, workspaceID)
+	if sessionID != "" {
+		q = q.Where("orchestration_id IN (SELECT id FROM agent_orchestrations WHERE tenant_id = ? AND source_session_id = ?)",
+			p.TenantID, sessionID)
+	}
 	var rows []AgentTask
-	if err := s.db.WithContext(ctx).
-		Where("tenant_id = ? AND workspace_id = ?", p.TenantID, workspaceID).
-		Order("created_at DESC, id DESC").Find(&rows).Error; err != nil {
+	if err := q.Order("created_at DESC, id DESC").Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	runIDs := make([]string, 0, len(rows))
@@ -438,6 +444,12 @@ SELECT o.* FROM agent_orchestrations o
 	for _, l := range lrows {
 		links = append(links, taskLinkView{ParentTaskID: l.ParentTaskID, ChildTaskID: l.ChildTaskID})
 	}
+	// 重规划关系从 handoff 现读（PG 不存这两列）：非继任组读空，响应字节不变；
+	// 文件损坏只记日志、不挡详情（详情不是交接真源，GET handoff 会如实报错）。
+	replanOf, replanDepth, err := s.handoffReplanOf(o)
+	if err != nil {
+		log.Printf("orchestration detail %s: 读 handoff 失败: %v", o.ID, err)
+	}
 	return orchestrationView{
 		Orchestration: orchestrationBody{
 			OrchestrationID: o.ID, Goal: o.Goal, WorkspaceID: o.WorkspaceID,
@@ -446,7 +458,9 @@ SELECT o.* FROM agent_orchestrations o
 			DeliveryStatus: o.DeliveryStatus, DeliveryRunID: o.DeliveryRunID,
 			DeliveryErrorCode: o.DeliveryErrorCode,
 			CreatedAt:         o.CreatedAt, FinishedAt: o.FinishedAt, DeliveredAt: o.DeliveredAt, UpdatedAt: o.UpdatedAt,
-			Workspace: s.workspaceSummary(o, o.FinalTaskID),
+			Workspace:   s.workspaceSummary(o, o.FinalTaskID),
+			ReplanOf:    replanOf,
+			ReplanDepth: replanDepth,
 		},
 		Tasks: views,
 		Links: links,
@@ -510,12 +524,20 @@ func (s *Store) StopAgentTask(ctx context.Context, p principal, id string) (stri
 // 当场落 cancelled（响应就回 cancelled，不用等下一轮调度），否则回 cancelling。
 // 已 succeeded/failed/cancelled 的组拒绝（117105）。
 // 发布状态不在这里复位：pending/publishing/blocked 留给发布对账的放弃分支清项目标记并复位
-//（直接复位会让标记失去主人，项目永远拒新 run）；published 是既成事实，停止不撤销。
+// （直接复位会让标记失去主人，项目永远拒新 run）；published 是既成事实，停止不撤销。
 func (s *Store) StopAgentOrchestration(ctx context.Context, p principal, id string) (string, []RunID, error) {
 	if _, err := s.GetAgentOrchestration(ctx, p, id); err != nil {
 		return "", nil, err
 	}
+	status, runIDs, _, err := s.stopOrchestrationCore(ctx, id)
+	return status, runIDs, err
+}
+
+// stopOrchestrationCore 是停止的存储半，不校验调用方可见性（继任创建与对账用）。
+// preparing/waiting_previous 同样只取消自己的 pending/ready/blocked，不激活继任组。
+func (s *Store) stopOrchestrationCore(ctx context.Context, id string) (string, []RunID, string, error) {
 	status := ""
+	tenantID := ""
 	var runIDs []RunID
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var o AgentOrchestration
@@ -523,11 +545,12 @@ func (s *Store) StopAgentOrchestration(ctx context.Context, p principal, id stri
 			Where("id = ?", id).Take(&o).Error; err != nil {
 			return err
 		}
+		tenantID = o.TenantID
 		switch o.Status {
 		case orchStatusSucceeded, orchStatusFailed, orchStatusCancelled:
 			return errOrchNotStoppable
 		}
-		if o.Status == orchStatusActive {
+		if o.Status == orchStatusActive || o.Status == orchStatusPreparing || o.Status == orchStatusWaitingPrevious {
 			if err := tx.Model(&AgentTask{}).
 				Where("orchestration_id = ? AND status IN ?", id,
 					[]string{agentTaskStatusPending, agentTaskStatusReady, agentTaskStatusBlocked, agentTaskStatusPublishing}).
@@ -563,18 +586,19 @@ func (s *Store) StopAgentOrchestration(ctx context.Context, p principal, id stri
 		return nil
 	})
 	if err != nil {
-		return "", nil, err
+		return "", nil, "", err
 	}
-	s.PublishEvent(ctx, p.TenantID, eventAgentOrchestrationsChanged, id)
-	s.PublishTaskWake(ctx, p.TenantID, "stop_orchestration", id)
-	return status, runIDs, nil
+	s.PublishEvent(ctx, tenantID, eventAgentOrchestrationsChanged, id)
+	s.PublishTaskWake(ctx, tenantID, "stop_orchestration", id)
+	return status, runIDs, tenantID, nil
 }
 
 // SubmitTaskResult 是 submit_task_result 工具的落库半（施工包 §7.1）。裁决都在这里：
 // Task 必须 running；run 必须还是当前代（runs 行 running 且 lease_epoch 相等——旧 worker
 // 被接管后提交在这里被拒）；内容限额；artifact 真实路径；同代同字节幂等返回原 revision。
 // 提交只写结果列，不翻 Task 状态（succeeded 归对账）。
-// shared 组走单事务；isolated 组走 submitIsolatedTaskResult（先固化不可变结果再存 PG，doc/74 §9.2）。
+// 两种工作区模式都走 submitWorkspaceTaskResult（先固化不可变结果再存 PG，doc/74 §9.2；
+// doc/76 §4 把 shared 也纳入同一条结果与发布链）。
 func (s *Store) SubmitTaskResult(ctx context.Context, taskID string, runID RunID, epoch int64, result TaskResult, wsRoot string) (int, error) {
 	if strings.TrimSpace(result.Summary) == "" {
 		return 0, fmt.Errorf("%w: summary 必填", errSubmitBad)
@@ -613,69 +637,19 @@ func (s *Store) SubmitTaskResult(ctx context.Context, taskID string, runID RunID
 		}
 		return 0, err
 	}
-	if o.WorkspaceMode == workspaceModeIsolated {
-		return s.submitIsolatedTaskResult(ctx, t, o, runID, epoch, result, string(raw))
-	}
-
-	tenantID := ""
-	var revision int
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var t AgentTask
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ?", taskID).Take(&t).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return fmt.Errorf("%w: task 不存在", errSubmitNotRunning)
-			}
-			return err
-		}
-		tenantID = t.TenantID
-		if t.Status != agentTaskStatusRunning {
-			return errSubmitNotRunning
-		}
-		// 当前代判定以 runs 行为准：租约 epoch 是接管令牌，旧 worker 的提交（epoch 落后）
-		// 与已定稿 run 上的提交都算 stale。
-		var runRow struct {
-			Status string
-			Epoch  int64
-		}
-		if err := tx.Raw(`SELECT status, lease_epoch AS epoch FROM runs WHERE id = ?`, runID).
-			Scan(&runRow).Error; err != nil {
-			return err
-		}
-		if runRow.Status == "" {
-			return fmt.Errorf("%w: run 不存在", errSubmitStale)
-		}
-		if runRow.Status != "running" || runRow.Epoch != epoch {
-			return errSubmitStale
-		}
-		if t.ResultRunID == string(runID) && t.ResultEpoch == epoch && t.Result == string(raw) {
-			// 同代同字节重提：返回原 revision，不递增（施工包 §7.1）。
-			revision = t.ResultRevision
-			return nil
-		}
-		revision = t.ResultRevision + 1
-		return tx.Model(&AgentTask{}).Where("id = ?", taskID).
-			Updates(map[string]any{
-				"result": string(raw), "result_revision": revision,
-				"result_run_id": string(runID), "result_epoch": epoch,
-			}).Error
-	})
-	if err != nil {
-		return 0, err
-	}
-	s.PublishEvent(ctx, tenantID, eventAgentTasksChanged, taskID)
-	return revision, nil
+	return s.submitWorkspaceTaskResult(ctx, t, o, runID, epoch, result, string(raw))
 }
 
-// submitIsolatedTaskResult 是 isolated 组的提交链（doc/74 §9.2）：整段在同一把 Task 共享锁内——
-// 计算候选 revision → Provider 验证并固化不可变结果（staging → final）→ PG 再校验 run/epoch
-// 并保存通用结果。Provider 操作不进 PG 事务。
+// submitWorkspaceTaskResult 是 shared／isolated 共用的提交链（doc/74 §9.2；doc/76 §4）：
+// 整段在同一把工作区共享锁内——计算候选 revision → Provider 验证并固化不可变结果
+// （staging → final）→ PG 再校验 run/epoch 并保存通用结果。Provider 操作不进 PG 事务。
+// shared 组共用 work/shared，锁取组锁；isolated 只挡同 Task，取 Task 锁。
 //
 // 候选 revision：同 run/epoch/同字节重提 → 原 revision（固化时核验身份后复用）；否则 +1。
 // 固化报身份冲突（该 revision 已有不同内容的 final——上次崩溃留下的孤儿，或重提时工作现场
 // 变了）→ 候选 +1 重试，绝不覆盖旧版本的字节。
 // Provider final 已存在但 PG 未保存时，这里保存成功才算接受；ReconcileRun 另行核验 final 完整性。
-func (s *Store) submitIsolatedTaskResult(ctx context.Context, t AgentTask, o AgentOrchestration, runID RunID, epoch int64, result TaskResult, raw string) (int, error) {
+func (s *Store) submitWorkspaceTaskResult(ctx context.Context, t AgentTask, o AgentOrchestration, runID RunID, epoch int64, result TaskResult, raw string) (int, error) {
 	g, err := s.workspaceGroupHandle(o)
 	if err != nil {
 		return 0, err
@@ -684,7 +658,11 @@ func (s *Store) submitIsolatedTaskResult(ctx context.Context, t AgentTask, o Age
 	if err != nil {
 		return 0, err
 	}
-	rel, err := g.Locker.Lock(ctx, []string{g.taskLockKey(t.ID)})
+	lockKey := g.taskLockKey(t.ID)
+	if g.sharedMode() {
+		lockKey = g.groupLockKey()
+	}
+	rel, err := g.Locker.Lock(ctx, []string{lockKey})
 	if err != nil {
 		return 0, err
 	}

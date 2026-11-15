@@ -16,7 +16,9 @@ test('侧边栏有最近会话，能直接回到旧对话', async ({ page }) => 
 
 test('默认项目有徽标，且不提供删除/重命名', async ({ page }) => {
   await login(page)
-  await page.getByRole('button', { name: '项目', exact: true }).click()
+  // 点**左侧主导航**的「项目」进项目页。doc/78 的对话页右侧工作区也有一枚「项目」标签，
+  // 页面上因此有两个同名按钮，不收窄范围就是 strict mode 歧义（选择器歧义，不是功能坏了）。
+  await page.getByRole('navigation', { name: '页面' }).getByRole('button', { name: '项目', exact: true }).click()
   const card = page.locator('.project').filter({ has: page.locator('.badge.default') }).first()
   await expect(card).toBeVisible({ timeout: 15_000 })
   await expect(card.locator('.badge.default')).toHaveText('默认')
@@ -87,7 +89,9 @@ test('个人工作区的成员页说人话，并给一条出路', async ({ page 
 
 test('会话列表不再把内部 session id 当主信息', async ({ page }) => {
   await login(page)
-  await page.getByRole('button', { name: '项目', exact: true }).click()
+  // 点**左侧主导航**的「项目」进项目页。doc/78 的对话页右侧工作区也有一枚「项目」标签，
+  // 页面上因此有两个同名按钮，不收窄范围就是 strict mode 歧义（选择器歧义，不是功能坏了）。
+  await page.getByRole('navigation', { name: '页面' }).getByRole('button', { name: '项目', exact: true }).click()
   const card = page.locator('.project').first()
   await card.getByRole('button', { name: '查看对话', exact: true }).click()
   const session = card.locator('.session').first()

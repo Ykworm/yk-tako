@@ -330,6 +330,7 @@ func NewWorker(store *Store, chat model.BaseChatModel, translate Translator, sys
 	for _, mk := range []func(*Store) (tool.BaseTool, error){
 		newDelegateTaskTool, newCreateOrchestrationTool,
 		newReviseOrchestrationTool, newContinueOrchestrationTool,
+		newCreateSuccessorOrchestrationTool,
 	} {
 		t, err := mk(store)
 		if err != nil {
@@ -549,7 +550,7 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 	// base 与 Run fold 的 staged，defer 从这里取货落库。
 	box := newFoldBox(sessionID, runID)
 	box.setMediaResolve(func(ctx context.Context, path string) (string, error) {
-		return resolveReadMediaPath(ctx, w.store, w.workspace, path)
+		return resolveReadMediaPath(ctx, w.store, w.workspace, w.workspace, path)
 	})
 	ctx = withFoldBox(ctx, box)
 	// 崩溃账本坐标（doc/30 A2）：本 run 的 id 与接管令牌（POST 路径 1，续跑路径 = claim 返回值，
@@ -647,17 +648,20 @@ func (w *Worker) run(ctx context.Context, sessionID SessionID, runID RunID, epoc
 			}
 			finishSpan(quotaSpan, qerr)
 			wsCtx, wsSpan := startStep(ctx, "tako.step.workspace")
-			// 第二个返回值是项目 id（没挂项目 = 空串）：markdown 记忆的项目文件按它定位。
-			if dir, wid, err := runWorkspace(wsCtx, w, p.TenantID, sessionID); err != nil {
+			// 第二个返回值是项目运行资源根（属性 run 内部输出），第三个是项目 id（没挂项目 = 空串）。
+			if dir, runtimeDir, wid, err := runWorkspace(wsCtx, w, p.TenantID, sessionID); err != nil {
 				wsSpan.SetAttributes(attribute.String("error.type", "workspace_error"))
 				finishSpan(wsSpan, err)
 				log.Printf("workspace %s/%s: %v", sessionID, runID, err)
 			} else {
-				ref := WorkspaceRef{TenantID: p.TenantID, SessionID: sessionID, Root: dir, TenantRoot: tenantStorageRoot(w.workspace, p.TenantID), WorkspaceID: wid, MaxBytes: maxBytes}
-				// doc/74：隔离 Task 的工具根是领取时备好的工作目录，不是原项目；
-				// 额外可写根（Git 的组中间仓库）随沙箱注入。shared 组 WorkRoot 为空，原样走项目目录。
+				ref := WorkspaceRef{TenantID: p.TenantID, SessionID: sessionID, Root: dir, RuntimeRoot: runtimeDir, TenantRoot: tenantStorageRoot(w.workspace, p.TenantID), WorkspaceID: wid, MaxBytes: maxBytes}
+				// doc/74：隔离 Task 的工具根是领取时备好的工作现场，不是原项目；运行资源根换成
+				// 该组的运行资源区（bash/fetch/搜索全文落那里，不污染项目 content）。
 				if tb := agentTaskRunBoxFrom(ctx); tb != nil && tb.WorkRoot != "" {
 					ref.Root = tb.WorkRoot
+					if tb.RuntimeRoot != "" {
+						ref.RuntimeRoot = tb.RuntimeRoot
+					}
 					ctx = withExtraWriteRoots(ctx, tb.ExtraWriteRoots)
 				}
 				wsSpan.SetAttributes(
@@ -1434,7 +1438,7 @@ func (w *Worker) prepareInputFrom(ctx context.Context, sessionID SessionID, runI
 		sys := w.instruction(ctx)
 		// 图片 token 先标在行上。这一次的超限判断，以及紧接着的 foldInput，用的是同一份 history。
 		resolve := func(ctx context.Context, path string) (string, error) {
-			return resolveReadMediaPath(ctx, w.store, w.workspace, path)
+			return resolveReadMediaPath(ctx, w.store, w.workspace, w.workspace, path)
 		}
 		box := foldBoxFrom(ctx)
 		if box != nil {

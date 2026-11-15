@@ -103,7 +103,7 @@ func TestSweepBashSpills(t *testing.T) {
 	if err := os.Chtimes(old, past, past); err != nil {
 		t.Fatal(err)
 	}
-	sweepBashSpills(root, time.Now())
+	sweepBashSpills(context.Background(), root, time.Now())
 	if _, err := os.Stat(old); !os.IsNotExist(err) {
 		t.Fatalf("31 天前的目录该被删: %v", err)
 	}

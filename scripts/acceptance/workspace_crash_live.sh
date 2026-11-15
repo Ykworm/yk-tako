@@ -98,11 +98,13 @@ jq -cn --arg n "$AGENT" \
   '{name:$n,kind:"subagent",description:"隔离工作区执行者",spec:"你是隔离工作目录的执行者。按任务内容改动文件，完成后调用 submit_task_result 提交，artifacts 声明本次交付的文件（相对路径）。如果提交被中断，重新提交。"}' |
   curl -sS -X POST "$B/api/tenants/$TEN/agents" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d @- >/dev/null
 
-ws_dir(){ echo "$WS_ROOT/tenants/$TEN/.tako/orchestrations/$1/workspace"; }
+ws_dir(){ echo "$WS_ROOT/tenants/$TEN/workspaces/$1/runtime/orchestrations/$2/workspace"; }
 task_field(){ at_task "$1"; echo "$AT_TASK" | jq -r "$2 // empty"; }
-mk_ws(){ # $1=name → echo wid（并建项目目录）
+mk_ws(){ # $1=name → echo wid（并初始化项目容器布局，doc/76）
   local w; w=$(curl -sS -X POST "$B/api/workspaces" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d '{"name":"'"$1"'"}' | jq -r .data.workspace.id)
-  mkdir -p "$WS_ROOT/tenants/$TEN/workspaces/$w"; echo "$w"
+  # 先打一次文件清单建好 layout.json 与 content/runtime；反序写文件会造出未迁移容器（409 117116）。
+  curl -sS -o /dev/null "$B/api/workspaces/$w/files" -H "Authorization: Bearer $TOK"
+  echo "$w"
 }
 # 崩溃恢复：等读侧派生 interrupted（租约过期）→ resume 同一场 run → succeeded；
 # 若 kill 落在领取前（直接 succeeded）也认。$1=taskId $2=超时秒。
@@ -128,7 +130,8 @@ artifact_eq(){ # $1=taskId $2=path $3=期望内容 $4=标签
 
 # ── 1. 双副本对账：两台同时调度同一隔离组 ────────────────────────────────────────
 W1=$(mk_ws ws-crash-replica)
-printf '基线\n' > "$WS_ROOT/tenants/$TEN/workspaces/$W1/report.md"
+mkdir -p "$WS_ROOT/tenants/$TEN/workspaces/$W1/content"
+printf '基线\n' > "$WS_ROOT/tenants/$TEN/workspaces/$W1/content/report.md"
 at_probe_run "$W1"
 STAMP="$(date +%s)-$$"
 TASKS=$(jq -cn --arg a "在工作目录创建 alpha.txt，内容恰好一行「甲-$STAMP」。然后调用 submit_task_result，artifacts 声明 alpha.txt（kind=file）。" \
@@ -155,7 +158,8 @@ echo "  ℹ️ 引擎 A 领取：$(grep -c 'task scheduler: claimed task' "$ELOG
 
 # ── 2. 准备中 kill：基线/工作目录复制到一半 ──────────────────────────────────────
 W2=$(mk_ws ws-crash-prepare)
-head -c 33554432 /dev/zero | tr '\0' 'S' > "$WS_ROOT/tenants/$TEN/workspaces/$W2/seed.bin"  # 32MB 撑宽准备窗口
+mkdir -p "$WS_ROOT/tenants/$TEN/workspaces/$W2/content"
+head -c 33554432 /dev/zero | tr '\0' 'S' > "$WS_ROOT/tenants/$TEN/workspaces/$W2/content/seed.bin"  # 32MB 撑宽准备窗口
 at_probe_run "$W2"
 STAMP2="$(date +%s)-$$"
 RESP=$(at_create_task "acc-wscrash-prep-$STAMP2" "$W2" "$SID" \
@@ -164,7 +168,7 @@ RESP=$(at_create_task "acc-wscrash-prep-$STAMP2" "$W2" "$SID" \
 TID2=$(echo "$RESP" | jq -r '.data.taskId // ""')
 OID2=$(echo "$RESP" | jq -r '.data.orchestrationId // ""')
 [ -n "$TID2" ] && [ "$TID2" != "null" ] || { echo "创建失败：$RESP" >&2; exit 2; }
-GD2=$(ws_dir "$OID2")
+GD2=$(ws_dir "$W2" "$OID2")
 echo "  场2 taskId=$TID2 orchId=$OID2"
 # 等领取后准备真的开始（staging 目录出现）再 kill。
 SAW=""
@@ -195,7 +199,7 @@ RESP=$(at_create_task "acc-wscrash-exec-$STAMP3" "$W3" "$SID" \
 TID3=$(echo "$RESP" | jq -r '.data.taskId // ""')
 OID3=$(echo "$RESP" | jq -r '.data.orchestrationId // ""')
 [ -n "$TID3" ] && [ "$TID3" != "null" ] || { echo "创建失败：$RESP" >&2; exit 2; }
-GD3=$(ws_dir "$OID3")
+GD3=$(ws_dir "$W3" "$OID3")
 echo "  场3 taskId=$TID3 orchId=$OID3"
 KILLED=0
 for i in $(seq 1 90); do
@@ -237,7 +241,7 @@ RESP=$(at_create_task "acc-wscrash-verify-$STAMP4" "$W4" "$SID" \
 TID4=$(echo "$RESP" | jq -r '.data.taskId // ""')
 OID4=$(echo "$RESP" | jq -r '.data.orchestrationId // ""')
 [ -n "$TID4" ] && [ "$TID4" != "null" ] || { echo "创建失败：$RESP" >&2; exit 2; }
-GD4=$(ws_dir "$OID4")
+GD4=$(ws_dir "$W4" "$OID4")
 echo "  场4 taskId=$TID4 orchId=$OID4"
 VSAW=""
 for i in $(seq 1 900); do
@@ -268,7 +272,7 @@ RESP=$(at_create_task "acc-wscrash-accept-$STAMP5" "$W5" "$SID" \
 TID5=$(echo "$RESP" | jq -r '.data.taskId // ""')
 OID5=$(echo "$RESP" | jq -r '.data.orchestrationId // ""')
 [ -n "$TID5" ] && [ "$TID5" != "null" ] || { echo "创建失败：$RESP" >&2; exit 2; }
-GD5=$(ws_dir "$OID5")
+GD5=$(ws_dir "$W5" "$OID5")
 echo "  场5 taskId=$TID5 orchId=$OID5"
 ASAW=""
 for i in $(seq 1 1800); do
@@ -290,7 +294,7 @@ if at_wait_delivered "$OID5" 180; then ok "场5 交付完成"; else no "场5 没
 # ── 6. 发布中 kill：400 个文件发布到一半 → 标记仍持 → 重启同 epoch 续发 ─────────────
 W6=$(mk_ws ws-crash-publish)
 at_probe_run "$W6"
-PROJ6="$WS_ROOT/tenants/$TEN/workspaces/$W6"
+PROJ6="$WS_ROOT/tenants/$TEN/workspaces/$W6/content"
 STAMP6="$(date +%s)-$$"
 RESP=$(at_create_task "acc-wscrash-pub-$STAMP6" "$W6" "$SID" \
   "用 bash 在工作目录执行：mkdir -p data && for i in \$(seq -w 1 400); do head -c 262144 /dev/zero | tr '\\0' 'A' > \"data/f\$i.bin\"; done（造 400 个 256KB 文件）。然后调用 submit_task_result，summary 写「400 个文件」，artifacts 只声明 data/f001.bin（kind=file）即可（发布按改动清单全量应用）。" \
@@ -298,7 +302,7 @@ RESP=$(at_create_task "acc-wscrash-pub-$STAMP6" "$W6" "$SID" \
 TID6=$(echo "$RESP" | jq -r '.data.taskId // ""')
 OID6=$(echo "$RESP" | jq -r '.data.orchestrationId // ""')
 [ -n "$TID6" ] && [ "$TID6" != "null" ] || { echo "创建失败：$RESP" >&2; exit 2; }
-GD6=$(ws_dir "$OID6")
+GD6=$(ws_dir "$W6" "$OID6")
 echo "  场6 taskId=$TID6 orchId=$OID6"
 PUBFILE=""
 for i in $(seq 1 1200); do

@@ -311,7 +311,7 @@ func TestNotificationRetryTwoStoresSingleLaunch(t *testing.T) {
 	s, dsn := newTestStoreWithDSN(t, testLease, testTTL)
 	wsID, sessID := seedTaskEnv(t, s, "researcher")
 	seed := seedFailedDelivery(t, s, wsID, sessID, "race")
-	s2 := secondStore(t, dsn)
+	s2 := secondStore(t, dsn, s.workspaceRoot)
 	ctx := context.Background()
 	root := t.TempDir()
 
@@ -515,13 +515,13 @@ func TestNotificationMigrationBackfillIdempotent(t *testing.T) {
 		testOwner.TenantID, resp.OrchestrationID, resp.TaskID, sessID, notifKindOrchFinished)
 
 	// 第一次重开 = 第二次启动：回填生效。
-	if st := secondStore(t, dsn); st != nil {
+	if st := secondStore(t, dsn, s.workspaceRoot); st != nil {
 		if got := st.count(t, &AgentNotificationAttempt{}, "notification_id = 'an_backfill'"); got != 1 {
 			t.Fatalf("回填 attempt = %d, want 1", got)
 		}
 	}
 	// 第二次重开：不重复插、不改已填的码。
-	st := secondStore(t, dsn)
+	st := secondStore(t, dsn, s.workspaceRoot)
 	var code string
 	if err := st.db.Raw(`SELECT delivery_error_code FROM agent_orchestrations WHERE id = ?`,
 		resp.OrchestrationID).Scan(&code).Error; err != nil {

@@ -124,7 +124,41 @@ func main() {
 	subagentReturnCap := flag.Int("subagent-return-cap", 51200, "max bytes of a subagent's return text handed back to the parent; excess is truncated with a notice (<=0 disables)")
 	rebuildDialogue := flag.Bool("rebuild-dialogue", false, "clear dialogue_chunks at startup and let the indexer rebuild them from complete runs (requires TAKO_RAG=on)")
 	migrateTo := flag.String("memory-migrate-to", "", "offline memory mode migration: markdown|pipeline; stop all engine replicas first; does not start HTTP/worker/consumer (doc/65 §6.2)")
+	migrateProjectLayout := flag.Bool("migrate-project-layout", false, "offline project container layout migration: content/ + runtime/ split (doc/76 §8); stop all engine replicas first; does not start HTTP/worker/consumer")
+	migrateProjectID := flag.String("migrate-project-id", "", "with -migrate-project-layout, migrate only this workspace id (default: every project, at most 32 per run)")
 	flag.Parse()
+
+	// 离线迁移项目容器布局（doc/76 §8）：与 memory-migrate-to 同一处置——不起 HTTP /
+	// Worker / 消费者 / 定时器，只连 PG 与工作区。迁移全程持有项目级 advisory lock，
+	// 但正确性前提仍是「没有旧代码的副本还在写这些容器」，所以要求先停引擎。
+	if *migrateProjectID != "" && !*migrateProjectLayout {
+		fmt.Fprintf(os.Stderr, "-migrate-project-id 只能和 -migrate-project-layout 一起用\n")
+		flag.Usage()
+		os.Exit(2)
+	}
+	if *migrateProjectLayout {
+		wsAbs, err := filepath.Abs(*workspace)
+		if err != nil {
+			log.Fatalf("workspace %q 绝对化: %v", *workspace, err)
+		}
+		report, err := runengine.RunProjectLayoutMigration(context.Background(), *pgDSN, wsAbs, strings.TrimSpace(*migrateProjectID))
+		if err != nil {
+			log.Fatalf("project layout migration: %v", err)
+		}
+		for _, res := range report.Results {
+			fmt.Printf("项目 %s（租户 %s）：%s，文件 %d，编排组 %d\n", res.WorkspaceID, res.TenantID, res.Status, res.Files, res.Orches)
+			for _, w := range res.Warnings {
+				fmt.Printf("  警告：%s\n", w)
+			}
+			if res.Err != nil {
+				fmt.Printf("  错误：%v\n", res.Err)
+			}
+		}
+		if report.Failed() {
+			os.Exit(1)
+		}
+		return
+	}
 
 	// 离线互切形态（doc/65 §6.2）：不起 HTTP / Worker / 消费者 / 定时器，只连 PG 与工作区。
 	// 放在所有引擎校验之前：lease/subagent/resume 这些参数与迁移无关，不该挡住迁移。

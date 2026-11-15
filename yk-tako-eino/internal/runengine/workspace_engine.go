@@ -2,8 +2,8 @@
 // 接成 Provider 需要的组句柄与配额口，并在领取/恢复时调用 Provider 准备工作现场。
 //
 // 分工：引擎裁决 run/epoch、结果版本、发布准入与 Task 状态；Provider 只做文件/Git 操作。
-// shared 组不走这里（doc/74 §6）——prepareTaskWork 对 shared 返回零值 TaskWork，
-// 调用方据 Root == "" 走既有路径。
+// shared 与 isolated 都走这里（doc/76 §4）：shared 共用 work/shared，isolated 每 Task 一个
+// work/<taskId>；两种模式的结果都经接受与发布才进用户内容根。
 package runengine
 
 import (
@@ -18,7 +18,8 @@ func (s *Store) workspaceGroupHandle(o AgentOrchestration) (*GroupHandle, error)
 	if s.workspaceRoot == "" {
 		return nil, fmt.Errorf("引擎未配置作业根，无法装配组工作区")
 	}
-	projectRoot, err := workspaceDir(s.workspaceRoot, o.TenantID, o.WorkspaceID)
+	// 发布目标与基线都是用户内容根 content（doc/76 §6.1），运行资源在 runtime。
+	projectRoot, _, err := ensureProjectLayout(s.workspaceRoot, o.TenantID, o.WorkspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -104,18 +105,16 @@ SELECT t.* FROM agent_task_links l JOIN agent_tasks t ON t.id = l.parent_task_id
 	return refs, nil
 }
 
-// prepareTaskWork 在领取/恢复时准备工作现场（doc/74 §7.1/§8.1）：
-// shared 返回零值（Root == ""，调用方走既有路径）；isolated 先 PrepareGroup（幂等固定 Provider
-// 与基线）再 PrepareTask（幂等：现场已存在直接返回，不重新应用父结果/merge）。
-// 第二个返回值是 Provider 类型（进 trace；shared 为空串）。
+// prepareTaskWork 在领取/恢复时准备工作现场（doc/74 §7.1/§8.1；doc/76 §4）：
+// shared 与 isolated 都先 PrepareGroup（幂等固定 Provider 与基线）再 PrepareTask
+// （幂等：现场已存在直接返回，不重新应用父结果/merge）。shared 的现场是同组共用的
+// work/shared，isolated 是每件 Task 的 work/<taskId>。
+// 第二个返回值是 Provider 类型（进 trace）。
 // 所有文件/Git 操作都在 PG 事务外，由调用方在领取事务提交后调用。
 func (s *Store) prepareTaskWork(ctx context.Context, taskID string) (TaskWork, string, error) {
 	t, o, err := s.agentTaskRow(ctx, taskID)
 	if err != nil {
 		return TaskWork{}, "", err
-	}
-	if o.WorkspaceMode != workspaceModeIsolated {
-		return TaskWork{}, "", nil
 	}
 	g, err := s.workspaceGroupHandle(o)
 	if err != nil {

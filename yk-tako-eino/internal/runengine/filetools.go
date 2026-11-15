@@ -217,7 +217,7 @@ func newReadFileTool(root string) (tool.BaseTool, error) {
 func buildReadTool(name, desc, root string) (tool.BaseTool, error) {
 	return utils.InferTool(name, desc,
 		func(ctx context.Context, in readTextFileInput) (string, error) {
-			full, err := resolveInWorkspace(activeRoot(ctx, root), in.Path)
+			full, err := resolveToolReadPath(ctx, root, in.Path)
 			if err != nil {
 				return "", err
 			}
@@ -722,11 +722,23 @@ func newSearchFilesTool(root string) (tool.BaseTool, error) {
 		})
 }
 
+// resolveToolReadPath 解析读工具的路径：runtime/ 前缀与历史 .tako 输出先映射到项目运行资源区
+// （doc/76 §6.1），其余仍按作业根解析。映射后仍走同一把牢笼，越界一律拒。
+func resolveToolReadPath(ctx context.Context, fallbackRoot, path string) (string, error) {
+	if ref, ok := workspaceFrom(ctx); ok {
+		full, matched, err := resolveRuntimeReadPath(ctx, ref, path)
+		if err != nil || matched {
+			return full, err
+		}
+	}
+	return resolveInWorkspace(activeRoot(ctx, fallbackRoot), path)
+}
+
 // resolveReadMediaPath 决定 read_media_file 读哪一个文件。
 // 占位 path 是 workspaces/<wid>/... 时，先按清完的 wid 做 VisibleWorkspace，
-// 再从租户根下的这个工作区读。范围不是这场会话的作业根。
-// sessions/<sid>/... 不再解析。其余相对路径仍落在作业根里。
-func resolveReadMediaPath(ctx context.Context, store *Store, fallbackRoot, path string) (string, error) {
+// 再从租户根下的这个工作区读：.media/ 映射到 runtime/media，其余映射到 content。
+// 范围不是这场会话的作业根。sessions/<sid>/... 不再解析。其余相对路径仍落在作业根里。
+func resolveReadMediaPath(ctx context.Context, store *Store, fallbackRoot, rootBase, path string) (string, error) {
 	if wid, rel, ok := parseSessionMediaPath(path); ok {
 		who, hasWho := principalFromCtx(ctx)
 		ref, hasRef := workspaceFrom(ctx)
@@ -736,13 +748,24 @@ func resolveReadMediaPath(ctx context.Context, store *Store, fallbackRoot, path 
 		if _, err := store.VisibleWorkspace(ctx, wid, who.TenantID, who.UserID); err != nil {
 			return "", fmt.Errorf("文件不存在：%s", path)
 		}
-		return resolveInWorkspace(filepath.Join(ref.TenantRoot, "workspaces", wid), rel)
+		needs, err := projectLayoutNeedsMigration(rootBase, who.TenantID, wid)
+		if err != nil || needs {
+			return "", fmt.Errorf("文件不存在：%s", path)
+		}
+		contentDir, runtimeDir, err := ensureProjectLayout(rootBase, who.TenantID, wid)
+		if err != nil {
+			return "", err
+		}
+		if relPath, ok := strings.CutPrefix(rel, mediaDirName+"/"); ok {
+			return resolveInWorkspace(filepath.Join(runtimeDir, projectMediaDirName), relPath)
+		}
+		return resolveInWorkspace(contentDir, rel)
 	}
 	cleaned := filepath.ToSlash(filepath.Clean(filepath.ToSlash(strings.TrimSpace(path))))
 	if cleaned == "sessions" || strings.HasPrefix(cleaned, "sessions/") {
 		return "", fmt.Errorf("文件不存在：%s", path)
 	}
-	return resolveInWorkspace(activeRoot(ctx, fallbackRoot), path)
+	return resolveToolReadPath(ctx, fallbackRoot, path)
 }
 
 // readMediaFileInput 是 read_media_file 的入参 schema。
@@ -768,7 +791,7 @@ func newReadMediaFileTool(store *Store, root string) (tool.BaseTool, error) {
 		"读取媒体文件的元信息（path/mime/size/sha 占位行；媒体字节不会写入对话记录）。"+
 			"path 用对话里占位行的 path 原文（workspaces/<id>/.media/<file>），不要改写。文件超过 5MB 会拒绝。",
 		func(ctx context.Context, in readMediaFileInput) (string, error) {
-			full, err := resolveReadMediaPath(ctx, store, root, in.Path)
+			full, err := resolveReadMediaPath(ctx, store, root, root, in.Path)
 			if err != nil {
 				return "", err
 			}

@@ -52,21 +52,22 @@ var canonicalMediaExt = map[string]string{
 
 // ingestImages 把图写进 root/.media，占位 path 相对这个 root。会话入口走 ingestImagesAt。
 func ingestImages(root string, images []postImage, seqStart int) (string, error) {
-	return ingestImagesAt(root, images, seqStart, "", nil)
+	return ingestImagesAt(filepath.Join(root, mediaDirName), images, seqStart, "", nil)
 }
 
 // ingestImagesAt 校验并落盘一批入口图，返回拼好的占位行块（每图一行、按入参序；
 // 无图返回空串）。任何一项不合法整批拒收（调用方回 400）。seqStart 是本消息首图的
-// 全会话序号。relPrefix 拼在占位 path 前面（入口图用 workspaces/<wid>/，
-// GET /api/media 读同一条路径）。quota 在落盘前数本张字节；nil 表示不限额。
-func ingestImagesAt(root string, images []postImage, seqStart int, relPrefix string, quota func(int) (func(), error)) (string, error) {
+// 全会话序号。mediaDir 是**物理**落点（项目容器里是 runtime/media）；relPrefix 拼在
+// 占位 path 前面（入口图用 workspaces/<wid>/，占位里仍是 .media/，逐字不变）。
+// quota 在落盘前数本张字节；nil 表示不限额。
+func ingestImagesAt(mediaDir string, images []postImage, seqStart int, relPrefix string, quota func(int) (func(), error)) (string, error) {
 	if len(images) == 0 {
 		return "", nil
 	}
 	if len(images) > mediaMaxPerMsg {
 		return "", fmt.Errorf("images 最多 %d 张，收到 %d 张", mediaMaxPerMsg, len(images))
 	}
-	if err := os.MkdirAll(filepath.Join(root, mediaDirName), 0o755); err != nil {
+	if err := os.MkdirAll(mediaDir, 0o755); err != nil {
 		return "", fmt.Errorf("创建 %s 失败: %v", mediaDirName, err)
 	}
 	lines := make([]string, 0, len(images))
@@ -97,7 +98,7 @@ func ingestImagesAt(root string, images []postImage, seqStart int, relPrefix str
 		sum := sha256.Sum256(raw)
 		shaHex := hex.EncodeToString(sum[:])
 		rel := relPrefix + mediaDirName + "/" + shaHex[:16] + ext
-		if err := writeFileOnce(filepath.Join(root, mediaDirName, shaHex[:16]+ext), raw); err != nil {
+		if err := writeFileOnce(filepath.Join(mediaDir, shaHex[:16]+ext), raw); err != nil {
 			return "", fmt.Errorf("images[%d]: 落盘失败: %v", i, err)
 		}
 		lines = append(lines, mediaPlaceholder(im.Name, seqStart+i, rel, im.MIME, len(raw), shaHex))

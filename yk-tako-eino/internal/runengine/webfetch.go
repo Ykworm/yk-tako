@@ -95,7 +95,7 @@ func webFetchFn(ctx context.Context, in webFetchInput, workspace string, counter
 	full := renderFetchFile(page)
 	rel := ""
 	if box := noteBoxFrom(ctx); box != nil {
-		rel, _ = spillNote(activeRoot(ctx, workspace), box, ".tako/fetch", full)
+		rel, _ = spillNote(ctx, activeRoot(ctx, workspace), box, ".tako/fetch", full)
 	}
 	return describeFetchResult(page, rel, counter, full), nil
 }

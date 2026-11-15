@@ -328,7 +328,7 @@ func (ts *TaskScheduler) claimNotification(ctx context.Context, notifID string) 
 			return err
 		}
 		rp := coordinationRecovery{Attempt: maxAttempt + 1}
-		input, err := buildCoordinationInput(tx, n, o, rp)
+		input, err := ts.store.buildCoordinationInput(ctx, tx, n, o, rp)
 		if err != nil {
 			return err
 		}
@@ -377,13 +377,14 @@ func coordinationTools(ctx context.Context, kind string, in []tool.BaseTool) []t
 }
 
 // planReviewToolNames 是计划复核 run 的全部工具（施工包 §4.8/§6.3）：只读文件与历史检索
-// + 两把决策工具。没有 bash、写工具、记忆、技能、新建编排、等人工具——复核 run 必须
-// 确定性终结（作出决定或什么都不做），不能把来源会话挂在这里等人。
+// + 三把决策工具（改图、放行、换继任组）。没有 bash、写工具、记忆、技能、新建编排、等人工具——
+// 复核 run 必须确定性终结（作出决定或什么都不做），不能把来源会话挂在这里等人。
 var planReviewToolNames = map[string]bool{
 	"read_text_file": true, "read_file": true, "read_pdf_text": true, "read_media_file": true,
 	"list_directory": true, "directory_tree": true, "get_file_info": true, "search_files": true,
 	"search_history":       true,
 	"revise_orchestration": true, "continue_orchestration": true,
+	"create_successor_orchestration": true,
 }
 
 // keepPlanReviewTools 反向过滤：名单之外一律拿掉（与 dropDeliveryNoTools 的黑名单相反，
@@ -585,12 +586,28 @@ SELECT o.delivery_run_id FROM agent_orchestrations o JOIN runs r ON r.id = o.del
 	}
 }
 
-// buildCoordinationInput 在认领事务的锁内拼协调 run 的首条输入（doc/70 §9.2；恢复参数见 doc/73 §6.2）：
-// 通知 kind + 原始 goal + 相关 Task／组状态、机器错误、结果摘要、结果版本与产物路径 +
-// 执行约定（检查这些持久事实并向用户解释／交付；不要宣称未发生的停止、恢复或外部回滚）。
+// groupToolNames 取一个编排组执行者用过的工具名（doc/75 §7.1 的决策输入之一）：
+// runlog 的 tool_call 文本是「工具名({参数})」，只取 root 行的前缀、去重、封顶。
+// 拿不到名字的行（空文本）不计；读失败只让调用方决定要不要当错误——这里是查询错误原样返回。
+func groupToolNames(tx *gorm.DB, orchID string) ([]string, error) {
+	var names []string
+	err := tx.Raw(`
+SELECT DISTINCT btrim(split_part(e.text, '(', 1)) AS name
+  FROM agent_tasks t
+  JOIN runs r ON r.session_id = t.execution_session_id
+  JOIN runlog_entries e ON e.run_id = r.id AND e.role = 'tool_call' AND e.agent IS NULL
+ WHERE t.orchestration_id = ? AND btrim(e.text) <> ''
+ ORDER BY name LIMIT 40`, orchID).Scan(&names).Error
+	return names, err
+}
+
+// buildCoordinationInput 在认领事务的锁内拼协调 run 的首条输入（doc/70 §9.2；恢复参数见 doc/73 §6.2；
+// 决策输入见 doc/75 §7.1）：通知 kind + 原始 goal + 相关 Task／组状态、机器错误、结果摘要、
+// 结果版本与产物路径、原组已用工具名、handoff 链与 replanDepth + 执行约定
+// （检查这些持久事实并向用户解释／交付；不要宣称未发生的停止、恢复或外部回滚）。
 // 人工新尝试（rp.Attempt>1）先声明「这是第几次处理、上次怎样结束、上次已可见的正文是什么」——
 // 只作为参考写进输入，不复制成新的 assistant 行。
-func buildCoordinationInput(tx *gorm.DB, n AgentNotification, o AgentOrchestration, rp coordinationRecovery) (string, error) {
+func (s *Store) buildCoordinationInput(ctx context.Context, tx *gorm.DB, n AgentNotification, o AgentOrchestration, rp coordinationRecovery) (string, error) {
 	var t AgentTask
 	if n.TaskID != "" {
 		if err := tx.Where("id = ?", n.TaskID).Take(&t).Error; err != nil {
@@ -630,8 +647,9 @@ func buildCoordinationInput(tx *gorm.DB, n AgentNotification, o AgentOrchestrati
 			"任务状态仍按执行中记录，恢复需要用户显式发起，不会自动重放。", t.TaskKey, t.ID)
 		return head + body + "\n" + contract, nil
 	case notifKindPlanReviewRequired:
-		// 复核输入 = 当前图 + 版本 + 触发 Task 的结果引用 + 必须做决定的约定（施工包 §6.3）。
-		// 不复制执行历史：要核对结果就读项目文件或本轮来源会话的历史。
+		// 复核输入 = 当前图 + 版本 + 触发 Task 的结果引用 + 原组已用工具 + 重规划链 +
+		// 必须做决定的约定（施工包 §6.3 / doc/75 §7.1）。不复制执行历史：要核对结果就读项目
+		// 文件、查历史或直接读结果目录。
 		body := fmt.Sprintf("计划暂停等待复核：组已停止领取新 Task（运行中的继续跑完），计划版本 = %d。\n"+
 			"触发：任务 %s（taskId %s）第 %d 版结果已保存。", o.PlanRevision, t.TaskKey, t.ID, t.ResultRevision)
 		if o.FinalTaskID != "" {
@@ -648,8 +666,21 @@ func buildCoordinationInput(tx *gorm.DB, n AgentNotification, o AgentOrchestrati
 		if len(tasks) > 0 {
 			body += "\n当前图："
 			for _, x := range tasks {
-				body += fmt.Sprintf("\n- %s [%s] %s：%s", x.TaskKey, x.Status, x.AgentName,
-					truncatePlain(x.Content, 80))
+				body += fmt.Sprintf("\n- %s [%s] %s（taskId %s）：%s", x.TaskKey, x.Status, x.AgentName,
+					x.ID, truncatePlain(x.Content, 80))
+				if x.ErrorCode != "" {
+					body += fmt.Sprintf("；失败原因 %s：%s", x.ErrorCode, truncatePlain(x.ErrorMessage, 200))
+				}
+				if r := parseTaskResult(x.Result); r != nil && x.ResultRevision > 0 {
+					line := fmt.Sprintf("；第 %d 版结果", x.ResultRevision)
+					if sum := strings.TrimSpace(r.Summary); sum != "" {
+						line += "：" + truncatePlain(sum, 300)
+					}
+					for _, a := range r.Artifacts {
+						line += fmt.Sprintf("\n    产物 %s（%s）", a.Path, a.Kind)
+					}
+					body += line
+				}
 			}
 		}
 		var links []AgentTaskLink
@@ -666,9 +697,32 @@ func buildCoordinationInput(tx *gorm.DB, n AgentNotification, o AgentOrchestrati
 				body += fmt.Sprintf("\n- %s -> %s", byID[l.ParentTaskID], byID[l.ChildTaskID])
 			}
 		}
-		const reviewContract = "你必须现在做决定：调用 continue_orchestration 按原图继续，" +
-			"或调用 revise_orchestration 修改计划后继续（都带上面的计划版本）。" +
-			"先读项目文件核对结果再决定；不要询问用户，不要宣称尚未发生的执行。"
+		if names, err := groupToolNames(tx, o.ID); err != nil {
+			return "", err
+		} else if len(names) > 0 {
+			body += "\n原组执行者已用过的工具：" + strings.Join(names, "、") +
+				"（判断「不得重放的动作」时参考：这些工具可能已产生外部副作用）"
+		}
+		// 重规划链：本组已是第几代、前代是谁。候选复用条目只能用这些组里的成功结果。
+		if chain, err := s.replanChain(ctx, o); err != nil {
+			return "", err
+		} else if len(chain) > 1 {
+			ids := make([]string, 0, len(chain)-1)
+			for _, g := range chain[1:] {
+				ids = append(ids, g.ID)
+			}
+			body += fmt.Sprintf("\n本次是第 %d 层继任组，前代依次为：%s。复用条目只能取自这条链上已成功的结果。",
+				len(chain)-1, strings.Join(ids, " → "))
+		}
+		const reviewContract = "你必须现在做决定，先判断目标本身是否仍然可行：\n" +
+			"1. 可行（feasible）：原图仍适合 → 调用 continue_orchestration 按原图继续；只是局部要调整 → 调用 revise_orchestration 改图后继续；" +
+			"原计划整体走不通、需要换一条路径 → 调用 create_successor_orchestration 建继任组（目标不变、计划换一套，必须给可行性证据、复用仍有效的结果、声明不得重放的动作）。\n" +
+			"2. 不可行（infeasible）：用证据向用户说明目标为什么达不成，不调用任何创建／继续工具。\n" +
+			"3. 没把握（uncertain）：先读项目文件、查历史或换个办法调查；仍不确定就向用户说明现状与待定问题，不创建继任组。\n" +
+			"4. 先分清执行故障与方案失效：单次模型／工具瞬断、限流、网络错误属于执行故障，先考虑恢复或重试同一计划，不要据此重规划；" +
+			"只有计划本身不可行时才改图或换继任组。\n" +
+			"5. 同组修订（revise_orchestration）与继任组的区别：图还能改、已开始节点仍有效 → 修订；目标没变但路径整体失效、需要全新 DAG → 继任。\n" +
+			"先读项目文件核对结果再决定；不要询问用户以外的方式把本场挂起，不要宣称尚未发生的执行。"
 		return head + body + "\n" + reviewContract, nil
 	case notifKindOrchFinished:
 		body := fmt.Sprintf("整组已收口，最终状态 = %s。", o.Status)

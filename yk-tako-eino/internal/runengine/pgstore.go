@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/cloudwego/eino/schema"
@@ -35,8 +36,8 @@ type Session struct {
 	WorkspaceID *string   `gorm:"index"` // 空 = 游离会话，作业根仍是 sessions/<sid>/
 	// Kind 区分普通聊天会话与 Task 执行会话（doc/70 §5.5）：agent_task 会话不进普通聊天列表，
 	// 归属仍是原用户与原项目。
-	Kind       string    `gorm:"not null;default:chat"`
-	CreatedAt  time.Time `gorm:"not null;index:sessions_tenant_visibility,priority:3"`
+	Kind      string    `gorm:"not null;default:chat"`
+	CreatedAt time.Time `gorm:"not null;index:sessions_tenant_visibility,priority:3"`
 	// DeletedAt 非空表示这场会话已经随项目删掉。按 id 取、列表、抢闸都要把它当成没有这行。
 	DeletedAt *time.Time `gorm:"column:deleted_at"`
 }
@@ -325,12 +326,13 @@ func lockWorkspace(tx *gorm.DB, id, tenantID, userID string) error {
 }
 
 // DeleteWorkspaceCascade 在一笔事务里删掉创建者自己的项目，并软删挂在上面的会话。
-// 顺序是：锁项目行 → 默认工作区拒绝 → 数活 run → 记下会话 id → 写 deleted_at（这一步才锁会话行）
-// → 再数一次活 run → 删项目行。活 run 的谓词与读侧相同：status='running' AND lease_until > now()。
-// 数到就整笔回滚。返回的 id 给调用方在提交之后删会话目录。这里不碰目录，避免库回滚了目录却已经没了。
-func (s *Store) DeleteWorkspaceCascade(ctx context.Context, tenantID, userID, id string) ([]SessionID, error) {
-	var sessionIDs []SessionID
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+// 顺序是：锁项目行 → 默认工作区拒绝 → 数活 run → 写 deleted_at（这一步才锁会话行）
+// → 再数一次活 run → 检查未收口的组／Task／发布 → 清项目记忆 → 写 project_cleanups.pending
+// → 删项目行。活 run 的谓词与读侧相同：status='running' AND lease_until > now()。
+// 数到就整笔回滚。磁盘清理不在这笔事务里：提交后由调用方走 CleanupProjectStorage
+// （doc/76 §6.4），删不掉也不回滚业务删除，记录留 pending 由调度器补偿。
+func (s *Store) DeleteWorkspaceCascade(ctx context.Context, tenantID, userID, id string) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := lockOwnedWorkspace(tx, id, tenantID, userID); err != nil {
 			return err
 		}
@@ -362,16 +364,6 @@ func (s *Store) DeleteWorkspaceCascade(ctx context.Context, tenantID, userID, id
 		if n > 0 {
 			return ErrWorkspaceBusy
 		}
-		var rows []struct {
-			ID string `gorm:"column:id"`
-		}
-		if err := tx.Raw(`SELECT id FROM sessions WHERE workspace_id = ?`, id).Scan(&rows).Error; err != nil {
-			return err
-		}
-		sessionIDs = make([]SessionID, 0, len(rows))
-		for _, row := range rows {
-			sessionIDs = append(sessionIDs, SessionID(row.ID))
-		}
 		if err := tx.Exec(`UPDATE sessions SET deleted_at = now() WHERE workspace_id = ?`, id).Error; err != nil {
 			return err
 		}
@@ -385,12 +377,13 @@ func (s *Store) DeleteWorkspaceCascade(ctx context.Context, tenantID, userID, id
 		if n > 0 {
 			return ErrWorkspaceBusy
 		}
-		// 项目删除保护（doc/70 §10.2）：编排组没收口（active/cancelling）或还有没落终态的
+		// 项目删除保护（doc/70 §10.2）：编排组没收口（active/cancelling，含 doc/75 的
+		// preparing/waiting_previous）或还有没落终态的
 		// Task（pending/ready/running/publishing；租约过期的 running 在存储里仍是 running，
 		// 自动覆盖「interrupted 也算未收口」）。已终态的组与 Task 保留历史事实，不挡删除。
 		// doc/74 §4.6：publishing 的 Task 与 publishing／blocked 的发布同样挡删除。
 		if err := tx.Raw(
-			`SELECT COUNT(*) FROM agent_orchestrations WHERE workspace_id = ? AND status IN ('active', 'cancelling')`,
+			`SELECT COUNT(*) FROM agent_orchestrations WHERE workspace_id = ? AND status IN ('active', 'cancelling', 'preparing', 'waiting_previous')`,
 			id).Scan(&n).Error; err != nil {
 			return err
 		}
@@ -426,6 +419,13 @@ func (s *Store) DeleteWorkspaceCascade(ctx context.Context, tenantID, userID, id
 			`DELETE FROM memory_jobs WHERE workspace = ?`, id).Error; err != nil {
 			return err
 		}
+		// 磁盘清理进度先落在同一笔事务里（doc/76 §5.4）：提交后调用方删容器，
+		// 失败时回写 pending 由调度器补偿。放事务里是为了「项目行在、清理记录一定在」。
+		if err := tx.Exec(
+			`INSERT INTO project_cleanups (workspace_id, tenant_id, status, error, created_at, updated_at)
+			 VALUES (?, ?, 'pending', '', now(), now())`, id, tenantID).Error; err != nil {
+			return err
+		}
 		res := tx.Exec(`DELETE FROM workspaces WHERE id = ?`, id)
 		if res.Error != nil {
 			return res.Error
@@ -435,10 +435,6 @@ func (s *Store) DeleteWorkspaceCascade(ctx context.Context, tenantID, userID, id
 		}
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	return sessionIDs, nil
 }
 
 // DeleteSession 软删属主自己的一场会话。锁的是 sessions 行，和 AcquireRun 抢同一把。
@@ -474,13 +470,15 @@ func (s *Store) DeleteSession(ctx context.Context, tenantID, userID string, id S
 			return ErrSessionBusy
 		}
 		// 来源会话删除保护（doc/70 §10.2）：还有没交付完的编排组就拒绝——结果与失败通知的
-		// 接收者是这场会话，删了它们永远找不到接收者。组还在跑（active/cancelling）或交付
-		// 在途（pending/delivering）都算没交付完；已 delivered、失败组（失败通知已消费）与
+		// 接收者是这场会话，删了它们永远找不到接收者。组还在跑（active/cancelling）、继任组
+		// 还在出生／等原组终态（preparing/waiting_previous，doc/75 §4.2）或交付在途
+		// （pending/delivering）都算没交付完；已 delivered、失败组（失败通知已消费）与
 		// 用户主动取消的组不算。
 		if err := tx.Raw(
 			`SELECT COUNT(*) FROM agent_orchestrations
 			  WHERE source_session_id = ?
-			    AND (status IN ('active', 'cancelling') OR delivery_status IN ('pending', 'delivering'))`,
+			    AND (status IN ('active', 'cancelling', 'preparing', 'waiting_previous')
+			         OR delivery_status IN ('pending', 'delivering'))`,
 			id).Scan(&n).Error; err != nil {
 			return err
 		}
@@ -649,6 +647,118 @@ func expandLegacyMemorySchema(db *gorm.DB) error {
 	return nil
 }
 
+// alignLegacyMemoryColumns 把存量列补成当前 model 声明的「默认值 + 可空性」。
+//
+// 为什么 AutoMigrate 不管：它只在**新增列**时按标签写默认值。空串默认值是后来才加到
+// model 标签上的，存量列不会被补；可空性同理（本机实测 dev 库上 memory_items.updated_at
+// 一直是 YES）。后果是真事故（2026-11-13）：EndRun 登记 memory_jobs 时省略
+// batch_id/batch_payload 等列 → PG 报 23502 null value in column，收尾事务回滚 →
+// run 挂到租约过期，界面显示 interrupted。
+//
+// 幂等：先查 information_schema，只改缺的；第二次跑是空操作。
+func alignLegacyMemoryColumns(db *gorm.DB) error {
+	specs := []struct {
+		table string
+		cols  []string
+	}{
+		{"memory_items", []string{"user_id", "workspace", "quote", "source_session_id", "source_run_id"}},
+		{"memory_jobs", []string{
+			"session_id", "tenant_id", "user_id", "workspace", "quote",
+			"trace_parent", "batch_id", "batch_payload", "last_error",
+		}},
+		{"dialogue_chunks", []string{"user_id"}},
+	}
+	type columnFact struct {
+		ColumnName    string
+		ColumnDefault *string
+	}
+	for _, spec := range specs {
+		var facts []columnFact
+		if err := db.Raw(
+			`SELECT column_name, column_default FROM information_schema.columns
+			  WHERE table_schema = current_schema() AND table_name = ?`, spec.table).
+			Scan(&facts).Error; err != nil {
+			return fmt.Errorf("读 %s 列定义: %w", spec.table, err)
+		}
+		have := make(map[string]columnFact, len(facts))
+		for _, f := range facts {
+			have[f.ColumnName] = f
+		}
+		for _, col := range spec.cols {
+			f, ok := have[col]
+			if !ok || f.ColumnDefault != nil {
+				continue
+			}
+			if err := db.Exec(fmt.Sprintf(
+				`ALTER TABLE %s ALTER COLUMN %s SET DEFAULT ''`, spec.table, col)).Error; err != nil {
+				return fmt.Errorf("补齐默认值 %s.%s: %w", spec.table, col, err)
+			}
+		}
+	}
+	// updated_at 是空时收紧成 NOT NULL（回填口径与 expandLegacyMemorySchema 一致：取 created_at）。
+	var nullable bool
+	if err := db.Raw(
+		`SELECT is_nullable = 'YES' FROM information_schema.columns
+		  WHERE table_schema = current_schema() AND table_name = 'memory_items' AND column_name = 'updated_at'`).
+		Scan(&nullable).Error; err != nil {
+		return fmt.Errorf("读 memory_items.updated_at 可空性: %w", err)
+	}
+	if nullable {
+		if err := db.Exec(`UPDATE memory_items SET updated_at = created_at WHERE updated_at IS NULL`).Error; err != nil {
+			return fmt.Errorf("回填 memory_items.updated_at: %w", err)
+		}
+		if err := db.Exec(`ALTER TABLE memory_items ALTER COLUMN updated_at SET NOT NULL`).Error; err != nil {
+			return fmt.Errorf("收紧 memory_items.updated_at: %w", err)
+		}
+	}
+	return nil
+}
+
+// alignDialogueScopeIndex 把同名但形状过期的索引换成当前 model 声明的那条。
+//
+// 为什么 AutoMigrate 不管：gorm v1.31 的 AutoMigrate 只判「同名索引在不在」
+// （migrator.go: HasIndex 为真就跳过），不比对列。dev 库实测残留
+// (tenant_id, workspace) 两列旧形状，而 dialogue.go 的标签要三列。
+func alignDialogueScopeIndex(db *gorm.DB) error {
+	var def string
+	if err := db.Raw(
+		`SELECT COALESCE((SELECT indexdef FROM pg_indexes
+		   WHERE schemaname = current_schema() AND indexname = 'dialogue_chunks_scope'), '')`).
+		Scan(&def).Error; err != nil {
+		return fmt.Errorf("读 dialogue_chunks_scope 定义: %w", err)
+	}
+	if strings.Contains(def, "(tenant_id, user_id, workspace)") {
+		return nil
+	}
+	if err := db.Exec(`DROP INDEX IF EXISTS dialogue_chunks_scope`).Error; err != nil {
+		return fmt.Errorf("重建 dialogue_chunks_scope（DROP）: %w", err)
+	}
+	if err := db.Exec(`CREATE INDEX dialogue_chunks_scope ON dialogue_chunks (tenant_id, user_id, workspace)`).Error; err != nil {
+		return fmt.Errorf("重建 dialogue_chunks_scope（CREATE）: %w", err)
+	}
+	return nil
+}
+
+// startupDDLLockKey 是启动期结构变更的跨副本互斥键（事务级 advisory lock，不会与 filelock
+// 的 hashtextextended 文本键撞上）。
+const startupDDLLockKey int64 = 0x74616b6f5f64646c
+
+// withStartupDDLLock 把一轮启动期结构变更放进同一个事务，并先取一把事务级 advisory lock。
+//
+// 病灶（2026-11-12 双副本活体实测）：两个副本同时启动时都会 DROP/CREATE 同名视图、
+// 跑 CREATE INDEX IF NOT EXISTS。PG 靠 pg_type / pg_class 上的唯一索引保证同名对象只有一个，
+// 并发 CREATE 时后到者撞 duplicate key（实测 pg_type_typname_nsp_index）→ 该副本直接启动失败。
+// 事务级锁在提交时自动释放；DDL 进一个事务还顺带消掉了「DROP 之后、CREATE 之前视图不存在」
+// 的读窗口——读者看到的是提交前的旧视图。
+func withStartupDDLLock(db *gorm.DB, fn func(tx *gorm.DB) error) error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`SELECT pg_advisory_xact_lock(?)`, startupDDLLockKey).Error; err != nil {
+			return err
+		}
+		return fn(tx)
+	})
+}
+
 // autoMigrate 从九个 struct 建表（dev 迁移方式，待定项①已裁：AutoMigrate 够用，无迁移文件；
 // 上生产换不换显式迁移归部署面）。部分索引（WHERE 条件）优先走 GORM index tag；
 // 若某版 GORM 表达不全，在这里补 CREATE ... IF NOT EXISTS 兜底——仍是代码内，不引迁移文件。
@@ -660,6 +770,10 @@ func expandLegacyMemorySchema(db *gorm.DB) error {
 // GORM 的 AutoMigrate **只加列不删列**：旧列（kind/topic）与旧唯一索引必须显式 DROP，
 // 否则它们会继续挡着「A→B→A 改口产生新历史行」这条正确性要求。
 func autoMigrate(db *gorm.DB) error {
+	return withStartupDDLLock(db, autoMigrateLocked)
+}
+
+func autoMigrateLocked(db *gorm.DB) error {
 	// 旧结构的两个唯一索引先丢掉（正文去重 + episode 唯一）——新结构不再有这两条语义。
 	// 这两条索引不依赖「行内容」，只依赖列，删掉不影响存量行的可读性：
 	// 迁移要读的 kind/topic **列本身**留到迁移步骤再删（见下面）。
@@ -684,7 +798,15 @@ func autoMigrate(db *gorm.DB) error {
 		&Workspace{}, &CleanerState{}, &RunTask{}, &RunQuestion{},
 		&SkillRow{}, &SkillDisable{},
 		&AgentOrchestration{}, &AgentTask{}, &AgentTaskLink{}, &AgentNotification{}, &AgentPlanRevision{},
-		&AgentNotificationAttempt{}); err != nil {
+		&AgentNotificationAttempt{}, &ProjectCleanup{}); err != nil {
+		return err
+	}
+	// AutoMigrate 只补「新增列」的结构、只管「同名索引在不在」；存量列后加的默认值/可空性
+	// 与形状过期的索引要在这里显式对齐（病灶见两个函数的注释）。
+	if err := alignLegacyMemoryColumns(db); err != nil {
+		return err
+	}
+	if err := alignDialogueScopeIndex(db); err != nil {
 		return err
 	}
 	// 旧列 kind/topic **不在这里删**——它们是存量迁移的**输入**：

@@ -22,6 +22,9 @@ ml_signup taskattention
 WID=$(curl -sS -X POST "$B/api/workspaces" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
   -d '{"name":"task-attention-ws"}' | jq -r .data.workspace.id)
 [ -n "$WID" ] && [ "$WID" != "null" ] || { no "建项目失败"; ml_summary; }
+WID2=$(curl -sS -X POST "$B/api/workspaces" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -d '{"name":"task-attention-busy-ws"}' | jq -r .data.workspace.id)
+[ -n "$WID2" ] && [ "$WID2" != "null" ] || { no "建忙线项目失败"; ml_summary; }
 at_probe_run "$WID"
 ok "建好项目 $WID，来源会话 $SID 已挂上它"
 
@@ -56,7 +59,12 @@ eq "不存在的项目回 404" "404" "$AT_CODE"
 eq "不存在的项目码 114001" "114001" "$(echo "$AT_BODY" | jq -r .code)"
 
 # 来源会话先忙线：检查点的复核通知不认领，plan_hold 不会被复核 run 自己解除。
-ml_run "调用 ask_user，问题固定为「忙线占位-$STAMP」，拿到回答后只回复 ok。" "$WID" "$SID"
+# 忙线 run 挂在另一个项目（doc/76 §4 起发布准入排除同项目的其它活 run）：最终 Task 先进
+# publishing 再进计划复核，忙线 run 若占着 WID，发布一直等不到项目静默，也就等不到 hold。
+PATCH=$(curl -sS -X PATCH "$B/api/sessions/$SID" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -d "{\"workspaceId\":\"$WID2\"}")
+eq "会话挪到忙线项目" "0" "$(echo "$PATCH" | jq -r .code)"
+ml_run "调用 ask_user，问题固定为「忙线占位-$STAMP」，拿到回答后只回复 ok。" "$WID2" "$SID"
 BUSY_QID=""
 for i in $(seq 1 120); do
   BUSY_QID=$(curl -sS "$B/api/runs/$RID/questions?status=pending" -H "Authorization: Bearer $TOK" 2>/dev/null |
@@ -65,37 +73,14 @@ for i in $(seq 1 120); do
   sleep 1
 done
 [ -n "$BUSY_QID" ] && [ "$BUSY_QID" != "null" ] || { echo "占位 run 没问出问题" >&2; exit 2; }
+PATCH=$(curl -sS -X PATCH "$B/api/sessions/$SID" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -d "{\"workspaceId\":\"$WID\"}")
+eq "会话挪回任务项目（创建 Task 要求来源会话挂在同项目）" "0" "$(echo "$PATCH" | jq -r .code)"
 
-# ── 1. question：Task 执行者的待答问题 ───────────────────────────────────────────
-RESP=$(at_create_task "acc-attn-q-$STAMP" "$WID" "$SID" \
-  "先调用 ask_user，问题必须是「请回复暗号 ATTN-$STAMP」。拿到回答后调用 submit_task_result，summary 写回答原文。" \
-  "researcher")
-TID_Q=$(echo "$RESP" | jq -r '.data.taskId // ""')
-OID_Q=$(echo "$RESP" | jq -r '.data.orchestrationId // ""')
-[ -n "$TID_Q" ] && [ "$TID_Q" != "null" ] || { echo "创建失败：$RESP" >&2; exit 2; }
-if at_wait_task_question "$TID_Q" 240; then
-  ok "问题 Task 已挂起待答"
-else no "240s 没等到问题 Task 提问"; ml_summary; fi
-Q_ID="$AT_QID"
-RUN_Q=$(ml_sql "SELECT current_run_id FROM agent_tasks WHERE id='$TID_Q'")
-# 本场验的是「处理项 → 恢复」的聚合变化，不验超时；把截止时间推远，避免中途被判 input_timeout。
-ml_sql "UPDATE run_questions SET expires_at = now() + interval '1 hour' WHERE id='$Q_ID'" >/dev/null
-
-ATT=$(at_attention "$WID")
-if has_kind "$ATT" "question" "taskId" "$TID_Q"; then
-  ok "聚合出现 question 处理项"
-else no "聚合缺 question 处理项：$ATT"; fi
-Q_ITEM=$(echo "$ATT" | jq -c --arg t "$TID_Q" '.data.items[] | select(.kind=="question" and .taskId==$t)')
-eq "question 项 count=1" "1" "$(echo "$Q_ITEM" | jq -r .count)"
-eq "question 项 questionId 指向最早待答" "$Q_ID" "$(echo "$Q_ITEM" | jq -r .questionId)"
-eq "question 项 runId 是当前执行" "$RUN_Q" "$(echo "$Q_ITEM" | jq -r .runId)"
-eq "question 项 orchestrationId" "$OID_Q" "$(echo "$Q_ITEM" | jq -r .orchestrationId)"
-[ -n "$(echo "$Q_ITEM" | jq -r .title)" ] && ok "question 项带标题" || no "question 项标题为空"
-for f in kind taskId orchestrationId title count questionId runId status updatedAt; do
-  echo "$Q_ITEM" | jq -e --arg f "$f" 'has($f)' >/dev/null || no "question 项缺字段 $f"
-done
-
-# ── 2. plan_review：检查点暂停的组 ───────────────────────────────────────────────
+# ── 1. plan_review：检查点暂停的组（必须先于挂起的问题 Task 收口）──────────────────
+# 最终 Task 的发布准入排除项目里的其它活 run（doc/76 §4）：挂起等人的问题 Task 也是一场
+# running run，同一项目里若有它，本组会一直停在 publishing，既没有发布也没有计划复核。
+# 所以先把检查点组走完，再让问题 Task 挂起。
 RESP=$(jq -cn --arg k "acc-attn-cp-$STAMP" --arg w "$WID" --arg s "$SID" \
   --arg c "在项目根创建文件 attn-cp.txt，内容写一行「CP-$STAMP」。然后调用 submit_task_result，summary 写文件路径。" \
   '{idempotencyKey:$k,workspaceId:$w,sourceSessionId:$s,content:$c,agent:"researcher",planCheckpoint:true}' |
@@ -123,6 +108,35 @@ ATT=$(at_attention "$WID")
 if has_kind "$ATT" "plan_review" "orchestrationId" "$OID_CP"; then
   no "继续后 plan_review 仍在（事实消失应即时消失）"
 else ok "继续后 plan_review 处理项消失"; fi
+
+# ── 2. question：Task 执行者的待答问题 ───────────────────────────────────────────
+RESP=$(at_create_task "acc-attn-q-$STAMP" "$WID" "$SID" \
+  "先调用 ask_user，问题必须是「请回复暗号 ATTN-$STAMP」。拿到回答后调用 submit_task_result，summary 写回答原文。" \
+  "researcher")
+TID_Q=$(echo "$RESP" | jq -r '.data.taskId // ""')
+OID_Q=$(echo "$RESP" | jq -r '.data.orchestrationId // ""')
+[ -n "$TID_Q" ] && [ "$TID_Q" != "null" ] || { echo "创建失败：$RESP" >&2; exit 2; }
+if at_wait_task_question "$TID_Q" 240; then
+  ok "问题 Task 已挂起待答"
+else no "240s 没等到问题 Task 提问"; ml_summary; fi
+Q_ID="$AT_QID"
+RUN_Q=$(ml_sql "SELECT current_run_id FROM agent_tasks WHERE id='$TID_Q'")
+# 本场验的是「处理项 → 恢复」的聚合变化，不验超时；把截止时间推远，避免中途被判 input_timeout。
+ml_sql "UPDATE run_questions SET expires_at = now() + interval '1 hour' WHERE id='$Q_ID'" >/dev/null
+
+ATT=$(at_attention "$WID")
+if has_kind "$ATT" "question" "taskId" "$TID_Q"; then
+  ok "聚合出现 question 处理项"
+else no "聚合缺 question 处理项：$ATT"; fi
+Q_ITEM=$(echo "$ATT" | jq -c --arg t "$TID_Q" '.data.items[] | select(.kind=="question" and .taskId==$t)')
+eq "question 项 count=1" "1" "$(echo "$Q_ITEM" | jq -r .count)"
+eq "question 项 questionId 指向最早待答" "$Q_ID" "$(echo "$Q_ITEM" | jq -r .questionId)"
+eq "question 项 runId 是当前执行" "$RUN_Q" "$(echo "$Q_ITEM" | jq -r .runId)"
+eq "question 项 orchestrationId" "$OID_Q" "$(echo "$Q_ITEM" | jq -r .orchestrationId)"
+[ -n "$(echo "$Q_ITEM" | jq -r .title)" ] && ok "question 项带标题" || no "question 项标题为空"
+for f in kind taskId orchestrationId title count questionId runId status updatedAt; do
+  echo "$Q_ITEM" | jq -e --arg f "$f" 'has($f)' >/dev/null || no "question 项缺字段 $f"
+done
 
 # ── 3. interrupted：running 但租约不再有效（造态：把当前执行 run 的租约推到过去）────────
 GOT=0

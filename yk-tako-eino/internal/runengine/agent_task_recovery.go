@@ -199,7 +199,8 @@ func (s *Store) RetryAgentNotification(ctx context.Context, p principal, notifID
 			return notificationRetryView{}, nil, err
 		}
 		if result != nil && len(result.Artifacts) > 0 {
-			root, err := workspaceRoot(rootBase, o.TenantID, o.WorkspaceID)
+			// 产物路径相对于用户内容根（doc/76 §5：content/），不是项目容器根。
+			root, _, err := ensureProjectLayout(rootBase, o.TenantID, o.WorkspaceID)
 			if err != nil {
 				return notificationRetryView{}, nil, errNotifArtifactInvalid
 			}
@@ -294,7 +295,7 @@ UPDATE agent_notifications
 			Attempt: maxAttempt + 1, PreviousRunID: RunID(n.ClaimRunID),
 			PreviousTerminalStatus: cur.Status, PreviousRootAssistant: prev,
 		}
-		input, err := buildCoordinationInput(tx, n, o, rp)
+		input, err := s.buildCoordinationInput(ctx, tx, n, o, rp)
 		if err != nil {
 			return err
 		}

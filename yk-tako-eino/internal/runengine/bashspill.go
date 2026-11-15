@@ -35,7 +35,7 @@ const bashSpillTTL = 30 * 24 * time.Hour
 
 // bashSpill 是本次 bash 调用的落盘上下文：目录 + 序号（两流共用同一序号，靠扩展名区分）。
 type bashSpill struct {
-	dirRel string // 相对作业根的目录，如 .tako/bash/r_01ABC
+	dirRel string // 相对作业根（或 runtime 前缀）的目录，如 runtime/tmp/bash/r_01ABC
 	dirAbs string // 绝对目录
 	seq    int    // 本 run 内第几次 bash 调用（从 1 起）
 	name   string // 非空时文件名用它（如验证证据的 <taskId>），空 = 默认 <seq>
@@ -45,6 +45,7 @@ type bashSpill struct {
 //
 // 目录段用 run id（noteBox 里那份，与搜索/抓取的落盘同一个 run 口径）：
 // 主代理与子代理共用同一份 noteBox → 同序列顺编、天然不撞。
+// 有运行资源根（项目run / 异步组）→ runtime/tmp/bash；纯会话仍写 <作业根>/.tako/bash。
 // 没有 noteBox 时（旁路调用）退回进程内的一段：段名带 pid、序号取进程内计数器——
 // 同一段名撞名会让 O_EXCL 失败、落盘被弃掉（只剩尾窗），那样的路径不该由调用方的
 // 疏忽决定。
@@ -61,9 +62,10 @@ func newBashSpill(ctx context.Context, workspace string) *bashSpill {
 		seq = int(atomic.AddInt64(&bashLocalSeq, 1))
 	}
 	runID = sanitizePathSegment(runID)
+	physDir, relDir := runtimeOutputDir(ctx, workspace, "bash")
 	return &bashSpill{
-		dirRel: ".tako/bash/" + runID,
-		dirAbs: filepath.Join(workspace, ".tako", "bash", runID),
+		dirRel: relDir + "/" + runID,
+		dirAbs: filepath.Join(physDir, runID),
 		seq:    seq,
 	}
 }
@@ -208,13 +210,23 @@ func (c *tailCollector) note(name string) string {
 	return ""
 }
 
-// sweepBashSpills 删掉 <作业根>/.tako/bash/ 下 mtime 超过 30 天的 <runId>/ 目录
+// sweepBashSpills 删掉运行资源区与旧作业根下 mtime 超过 30 天的 <runId>/ 目录
 // （doc/58 §4.4：dsh 的 cleanupPeriodDays 默认 30）。
 //
 // 触发点是**每次 bash 调用前**（dsh 是 CLI 进程、启动时扫一次；tako 是长驻引擎，
 // 启动那一刻还不存在的项目永远扫不到）。失败只记日志，不影响这条命令执行。
-func sweepBashSpills(workspace string, now time.Time) {
-	base := filepath.Join(workspace, ".tako", "bash")
+// 两处都扫：项目容器迁到 runtime/tmp/bash 后，存量与纯会话仍可能在 <作业根>/.tako/bash。
+func sweepBashSpills(ctx context.Context, workspace string, now time.Time) {
+	bases := []string{filepath.Join(workspace, ".tako", "bash")}
+	if ref, ok := workspaceFrom(ctx); ok && ref.RuntimeRoot != "" {
+		bases = append(bases, filepath.Join(ref.RuntimeRoot, "tmp", "bash"))
+	}
+	for _, base := range bases {
+		sweepBashSpillDir(base, now)
+	}
+}
+
+func sweepBashSpillDir(base string, now time.Time) {
 	entries, err := os.ReadDir(base)
 	if err != nil {
 		return // 目录不存在是常态（还没落过盘）

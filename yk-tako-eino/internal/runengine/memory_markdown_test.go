@@ -55,7 +55,7 @@ func markdownUserPath(root string) string {
 }
 
 func markdownWorkspacePath(root, wid string) string {
-	return filepath.Join(root, "tenants", "t1", "workspaces", wid, "MEMORY.md")
+	return filepath.Join(root, "tenants", "t1", "workspaces", wid, "runtime", "memory", "MEMORY.md")
 }
 
 // mustAdd 走真实的写入路径（writeMemoryMarkdown），失败即测试失败。

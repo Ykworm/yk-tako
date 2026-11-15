@@ -9,15 +9,18 @@ import { login } from './helpers'
 test('未登录时显示登录表单', async ({ page }) => {
   await page.goto('/')
   await expect(page.getByRole('heading', { name: '登录' })).toBeVisible()
-  await expect(page.locator('input[type=email]')).toBeVisible()
+  await expect(page.locator('input[name=identifier]')).toBeVisible()
   await expect(page.locator('input[type=password]')).toBeVisible()
 })
 
 test('用本地测试账号能登录进去', async ({ page }) => {
   await login(page)
   await expect(page.getByRole('button', { name: '新对话' })).toBeVisible()
-  // 侧边栏四个页面入口都在
+  // 侧边栏四个页面入口都在。
+  // 范围收窄到左侧导航：doc/78 的对话页右侧工作区也有一枚「项目」标签，
+  // 页面上因此有两个同名按钮，不收窄就是 strict mode 歧义（选择器歧义，不是功能坏了）。
+  const nav = page.getByRole('navigation', { name: '页面' })
   for (const name of ['对话', '项目', '助手', '团队']) {
-    await expect(page.getByRole('button', { name, exact: true })).toBeVisible()
+    await expect(nav.getByRole('button', { name, exact: true })).toBeVisible()
   }
 })

@@ -82,8 +82,8 @@ type attentionItem struct {
 //     已不是有效存活（读侧派生同一规则）；
 //   - delivery_failed：组的 delivery_status=failed，以及非整组通知自身 status=failed
 //     （taskId／标题按通知内容给出，不因组没有 delivery_status 而隐身）；
-//   - publication_blocked：隔离最终 Task blocked 且错误码是通用发布三码——没有通知行，
-//     前端据此进发布面板调 retry-publication。
+//   - publication_blocked：最终 Task blocked 且错误码是通用发布三码（shared 与 isolated
+//     同一条发布链，doc/76 §4）——没有通知行，前端据此进发布面板调 retry-publication。
 //
 // 排序 updatedAt ASC, kind, taskId, orchestrationId, notificationId——刷新不随机跳动。
 func (s *Store) TaskAttention(ctx context.Context, p principal, workspaceID string) ([]attentionItem, error) {
@@ -253,8 +253,8 @@ SELECT n.task_id, n.orchestration_id,
 			Status: agentTaskStatusInterrupted, UpdatedAt: n.UpdatedAt,
 		})
 	}
-	// 发布受阻（doc/74 §4.6）：隔离最终 Task blocked 且带通用发布三码。没有通知行——
-	// 处理入口是发布面板的 retry-publication，不是通知恢复。
+	// 发布受阻（doc/74 §4.6；doc/76 §4 shared 同一判据）：最终 Task blocked 且带通用发布三码。
+	// 没有通知行——处理入口是发布面板的 retry-publication，不是通知恢复。
 	var pubBlocked []struct {
 		TaskID          string    `gorm:"column:task_id"`
 		OrchestrationID string    `gorm:"column:orchestration_id"`

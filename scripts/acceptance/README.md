@@ -26,6 +26,10 @@
 | `agent_task_busy_live.sh` | doc/70 §9.2 忙会话交付活体：来源会话 `ask_user` 挂起中收口 → 通知保持 pending 不铸交付 run → 答题空闲后消费、恰好一场交付 run | 要 |
 | `agent_task_crash_live.sh` | doc/70 §10 崩溃活体：A 执行中 `kill -9` → 重启后 interrupted → 显式 resume 同代接续（epoch+1）→ 旧代交不上结果 → 交付一次 | 要 |
 | `agent_task_two_replicas_live.sh` | doc/70 §6.2 多副本领取活体：两台隔离引擎共库同时抢同一批 ready Task——每件恰好一个执行会话、恰好一场执行 run、通知与交付各恰好一次 | 要 |
+| `project_layout_live.sh` | doc/76 项目容器活体：content／runtime 分流（执行证据经发布才进 content）、媒体别名 `.media/…` 读回原字节、项目记忆落在 runtime、shared／isolated 两种模式、删除 cleanup done／pending | 要 |
+| `project_layout_migration_live.sh` | doc/76 §8 存量迁移活体：未迁移入口 409 `117116`、用户文件进 content、字节哈希不变、幂等、故障／并发／kill -9 对账、配额 | 要 |
+| `goal_replan_live.sh` | doc/75 重规划活体：同组修订不建继任组、继任创建与 handoff／复用快照（副本逐字节）、原组未终态先停后激活、不可行／不确定／错版本／链外拒绝、8 层预算、删除原项目后继任组仍可读 | 要 |
+| `goal_replan_crash_live.sh` | doc/75 §8 双副本与崩溃活体：两副本并发创建只成功一个、同键并发回同一组、PG 插入前 kill -9 后重试收敛（孤儿目录不成组）、插入后 kill -9 由调度对账补齐并激活、原组收口后执行与交付各一次 | 要 |
 | `agent_task_live_lib.sh` | 五个 agent_task 脚本共用的底座（注册 / 拉帧 / SQL / 等待与断言帮手），**source 用，不直接执行** | — |
 | `memory_live_lib.sh` | 六个 memory 脚本共用的底座（注册 / 拉帧 / SQL 断言），**source 用，不直接执行** | — |
 | `check-expected.sh` | 守「19v6-04 散文」与「`expected.json`」的用例号集合一致 | — |

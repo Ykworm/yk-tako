@@ -120,7 +120,7 @@ if at_wait_task "$TID_C" "succeeded" 300; then
 else no "c 没跑到 succeeded（最后状态 $AT_LAST）"; ml_summary; fi
 C_RUNS=$(ml_sql "SELECT count(*) FROM runs WHERE session_id=(SELECT execution_session_id FROM agent_tasks WHERE id='$TID_C')")
 eq "c 恰好一场执行 run（崩溃没有让它重影）" "1" "$C_RUNS"
-FINAL="$WS_ROOT/tenants/$TEN/workspaces/$WID/crash-final.txt"
+FINAL="$WS_ROOT/tenants/$TEN/workspaces/$WID/content/crash-final.txt"
 if [ -f "$FINAL" ] && grep -q "证据-$STAMP" "$FINAL"; then
   ok "crash-final.txt 带着崩溃前一代的证据字节"
 else no "crash-final.txt 缺证据字节（$FINAL）"; fi

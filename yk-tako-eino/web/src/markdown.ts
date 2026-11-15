@@ -67,9 +67,32 @@ marked.use({
   ],
 })
 
-/** markdown → HTML 字符串（**未消毒**）。纯函数，不依赖 DOM，可在 Node 里直接测。 */
-export function renderMarkdown(text: string): string {
-  return marked.parse(text, { async: false }) as string
+/**
+ * 渲染选项。
+ *
+ * breaks = 「单个换行要不要折行」：
+ * - 聊天气泡用 true（全局默认）：模型常把一句话拆成多行，不折行会挤成一坨。
+ * - **文件预览用 false**：文件里的换行是作者排版的结果，标准 markdown 语义下
+ *   单个换行**不**等于换行（GitHub 的 README 就是这样渲染的）。
+ */
+export interface RenderOpts {
+  breaks?: boolean
+}
+
+/** 共享排版样式的类名。样式在 `markdown.css`（全局），三个入口共用同一份。 */
+export const MD_BODY_CLASS = 'md-body'
+
+/**
+ * markdown → HTML 字符串（**未消毒**）。纯函数，不依赖 DOM，可在 Node 里直接测。
+ *
+ * 不传 opts 时行为与改动前**逐字相同**（全局 setOptions 的 gfm:true / breaks:true 照旧生效）。
+ * 传 { breaks: false } 只改**这一次**的解析：marked 的 parse(src, opts) 是
+ * 「全局默认值 + 本次 opts」合并（`{...this.defaults, ...opts}`），不回写全局。
+ * 所以 breaks 只在显式给出时才放进本次 opts——写成 `breaks: undefined` 也会覆盖掉全局值。
+ */
+export function renderMarkdown(text: string, opts?: RenderOpts): string {
+  const perCall: RenderOpts = opts?.breaks === undefined ? {} : { breaks: opts.breaks }
+  return marked.parse(text, { async: false, ...perCall }) as string
 }
 
 /** HTML → 安全 HTML：剥掉 <script>、事件属性、javascript: URL。需要 DOM。 */
@@ -77,7 +100,13 @@ export function sanitizeHtml(html: string): string {
   return DOMPurify.sanitize(html)
 }
 
-/** 气泡正文用的完整管线：模型写进来的原始 HTML 被转义、危险属性被剥掉。 */
-export function renderSafe(text: string): string {
-  return sanitizeHtml(renderMarkdown(text))
+/**
+ * 完整管线：原始 HTML 被转义、危险属性被剥掉。
+ *
+ * 聊天气泡与**项目里的 md 文件**走同一条管线 = 同一份安全保证：
+ * md 文件也是外部内容（agent 写的、用户上传的），同样可能有 <script>、onerror。
+ * v-html 只能喂这个函数的输出，不许直接喂 marked.parse 的裸结果。
+ */
+export function renderSafe(text: string, opts?: RenderOpts): string {
+  return sanitizeHtml(renderMarkdown(text, opts))
 }

@@ -64,6 +64,9 @@ func newTestStoreWithDSN(t *testing.T, leaseTTL, ttl time.Duration) (*Store, str
 	if err != nil {
 		t.Fatalf("OpenStore: %v", err)
 	}
+	// 真引擎装配时总会注入作业根；存储测试直接构造 Store，这里给同一个临时根，
+	// 让结果提交链能装配组工作区（doc/76 §4 后 shared 也走 Provider）。
+	store.SetWorkspaceRoot(t.TempDir())
 	t.Cleanup(func() {
 		store.Close()
 		if err := admin.Exec("DROP DATABASE " + dbName + " WITH (FORCE)").Error; err != nil {

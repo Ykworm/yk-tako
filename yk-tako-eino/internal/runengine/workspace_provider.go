@@ -2,15 +2,17 @@
 //
 // 分工（doc/74 §3.1）：引擎裁决 run/epoch、结果版本、发布准入与 Task 状态；Provider 只负责
 // 工作现场与不可变结果的文件/Git 操作，不决定 DAG、不直接改 Task 状态。
-// shared 组**不走这里**——不建组目录、不调用任何 Provider 操作（doc/74 §6），
-// 所以本文件没有 SharedProvider：引擎按 workspaceMode 分支，shared 走既有路径。
+// shared 与 isolated 都走这里（doc/76 §4）：区别只在工作现场是「同组共用 work/shared」还是
+// 「每件 Task 一个 work/<taskId>」；两种模式都不直接把中间产物写进用户内容根，
+// 最终结果经结果接受与发布准入后才进 content。
 //
-// 组目录布局（共享持久卷，所有引擎副本可见）：
+// 组目录布局（共享持久卷，所有引擎副本可见；位于项目容器的运行资源区）：
 //
-//	<tenant>/.tako/orchestrations/<orchestrationId>/workspace/
-//	  state.json                        组状态：Provider 类型第一次准备时固定
+//	<tenant>/workspaces/<workspaceId>/runtime/orchestrations/<orchestrationId>/workspace/
+//	  state.json                        组状态：Provider 类型与模式第一次准备时固定
 //	  provider/                         Provider 内部状态（Git bare 仓 / Directory 基线）
-//	  work/<taskId>/                    每件 Task 的独立工作现场
+//	  work/<taskId>/                    isolated：每件 Task 的独立工作现场
+//	  work/shared/                      shared：同组共用的工作现场
 //	  results/<taskId>/<resultRevision>/  不可变结果（result.json + artifacts/）
 //	  verification/<taskId>.json        验证证据
 //	  publication/<publicationEpoch>.json 发布进度记录
@@ -34,10 +36,12 @@ type ResultRef struct {
 }
 
 // TaskWork 是 Provider 交给 Worker 的工作现场。
-// Root 是 Worker 的唯一项目工作根；ExtraWriteRoots 是 Provider 明确声明的沙箱附加根
-//（如 Git 组的本组 repo.git）。PromptOverlay 只指导模型，程序判定不依赖它。
+// Root 是 Worker 的唯一项目工作根；RuntimeRoot 是该组的运行资源区（bash/fetch/搜索全文落这里，
+// 不写进任何 content）；ExtraWriteRoots 是 Provider 明确声明的沙箱附加根
+// （如 Git 组的本组 repo.git）。PromptOverlay 只指导模型，程序判定不依赖它。
 type TaskWork struct {
 	Root            string
+	RuntimeRoot     string
 	PromptOverlay   string
 	ExtraWriteRoots []string
 	// Conflicts 是父子交接冲突的路径数（进 trace 的冲突数量，doc/74 §10.9）。
@@ -64,7 +68,7 @@ type PublicationPlan struct {
 
 // PublishOutcome 的 Status 词表：published = 项目已写成；blocked = 需要执行者或用户处理；
 // retry = 暂时性失败（锁竞争等），引擎稍后重试。blocked 的 ErrorCode 用通用三码
-//（workspace_changed / workspace_dirty / publication_recovery_required）。
+// （workspace_changed / workspace_dirty / publication_recovery_required）。
 const (
 	publishOutcomePublished = "published"
 	publishOutcomeBlocked   = "blocked"
@@ -114,6 +118,7 @@ type GroupHandle struct {
 	OrchestrationID string
 	TenantID        string
 	WorkspaceID     string
+	WorkspaceMode   string // shared / isolated（空串按 isolated，供直接构造句柄的测试）
 	VerifyCommand   string
 	Dir             string // 组 workspace 目录（state.json 所在）
 	ProjectRoot     string // 原项目根（发布目标；Git 执行沙箱不开放它）
@@ -122,14 +127,19 @@ type GroupHandle struct {
 
 // newGroupHandle 装配组句柄。root 是引擎作业根（worker.Workspace()）。
 func newGroupHandle(root string, o AgentOrchestration, projectRoot string, locker FileLocker) (*GroupHandle, error) {
-	dir := orchWorkspaceDir(root, o.TenantID, o.ID)
+	dir := orchWorkspaceDir(root, o.TenantID, o.WorkspaceID, o.ID)
 	if dir == "" || projectRoot == "" || locker == nil {
 		return nil, fmt.Errorf("组工作区句柄缺装配：tenant=%q orch=%q root=%q", o.TenantID, o.ID, root)
+	}
+	mode := o.WorkspaceMode
+	if mode == "" {
+		mode = workspaceModeIsolated
 	}
 	return &GroupHandle{
 		OrchestrationID: o.ID,
 		TenantID:        o.TenantID,
 		WorkspaceID:     o.WorkspaceID,
+		WorkspaceMode:   mode,
 		VerifyCommand:   o.VerifyCommand,
 		Dir:             dir,
 		ProjectRoot:     projectRoot,
@@ -141,7 +151,15 @@ func (g *GroupHandle) statePath() string { return filepath.Join(g.Dir, "state.js
 func (g *GroupHandle) providerDir() string {
 	return filepath.Join(g.Dir, "provider")
 }
+
+// sharedMode 表示同组共用 work/shared（doc/76 §4.1）；空模式按 isolated，
+// 让直接构造 GroupHandle 的测试保持旧语义。
+func (g *GroupHandle) sharedMode() bool { return g.WorkspaceMode == workspaceModeShared }
+
 func (g *GroupHandle) workDir(taskID string) string {
+	if g.sharedMode() {
+		return filepath.Join(g.Dir, "work", "shared")
+	}
 	return filepath.Join(g.Dir, "work", taskID)
 }
 func (g *GroupHandle) resultDir(taskID string, revision int) string {
@@ -193,9 +211,13 @@ func ensureGroupState(ctx context.Context, g *GroupHandle, provider string) erro
 	if err != nil {
 		return err
 	}
+	mode := g.WorkspaceMode
+	if mode == "" {
+		mode = workspaceModeIsolated
+	}
 	if st != nil {
-		if st.Provider != provider || st.WorkspaceMode != workspaceModeIsolated {
-			return fmt.Errorf("组工作区已按 %s/%s 准备，与当前 %s 不一致", st.WorkspaceMode, st.Provider, provider)
+		if st.Provider != provider || st.WorkspaceMode != mode {
+			return fmt.Errorf("组工作区已按 %s/%s 准备，与当前 %s/%s 不一致", st.WorkspaceMode, st.Provider, mode, provider)
 		}
 		return nil
 	}
@@ -205,7 +227,7 @@ func ensureGroupState(ctx context.Context, g *GroupHandle, provider string) erro
 	now := time.Now().UTC()
 	b, err := json.Marshal(workspaceGroupState{
 		FormatVersion: workspaceStateFormatVersion,
-		WorkspaceMode: workspaceModeIsolated,
+		WorkspaceMode: mode,
 		Provider:      provider,
 		CreatedAt:     now,
 		UpdatedAt:     now,

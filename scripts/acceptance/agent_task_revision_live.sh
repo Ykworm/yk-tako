@@ -4,6 +4,8 @@
 #   A. continue：版本过期的继续回 117106，正确的继续解除暂停并让后续节点跑完；
 #   B. revision：加节点 D（a→D→b）→ 过期冲突 117106 → 幂等重打 → 同键异命令 117108 →
 #      预算超限与非法最终节点各回 117101 → 组收口、交付恰好一次、修订历史逐字段核对。
+# 忙线占位 run 挂在另一个项目：doc/76 起发布准入排除同项目的其它活 run，忙线 run 若占着
+# 任务项目，最终 Task 的发布会一直等不到静默，两条路径都收不了口。
 #
 # 起法：按 scripts/acceptance/README.md 起一个**开着调度循环**的隔离引擎
 # （默认 -task-interval 即开；建议 TAKO_MEMORY_MODE=markdown 免 broker），然后：
@@ -21,6 +23,9 @@ ml_signup taskrevision
 WID=$(curl -sS -X POST "$B/api/workspaces" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
   -d '{"name":"task-revision-ws"}' | jq -r .data.workspace.id)
 [ -n "$WID" ] && [ "$WID" != "null" ] || { no "建项目失败"; ml_summary; }
+WID2=$(curl -sS -X POST "$B/api/workspaces" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -d '{"name":"task-revision-busy-ws"}' | jq -r .data.workspace.id)
+[ -n "$WID2" ] && [ "$WID2" != "null" ] || { no "建忙线项目失败"; ml_summary; }
 at_probe_run "$WID"
 ok "建好项目 $WID，来源会话 $SID 已挂上它"
 
@@ -29,7 +34,13 @@ STAMP="$(date +%s)-$$"
 # 来源会话先挂一个等人 run：检查点的 plan_review_required 通知只在「来源会话空闲」时才被认领，
 # 会话忙 → 通知留在 pending、plan_hold 不会被计划复核 run 自己解除。这样本脚本（人）先做
 # continue／revision 决策的路径才是确定性的；不忙时复核 run 会自行调用决策工具（设计如此）。
-ml_run "调用 ask_user，问题固定为「忙线占位-$STAMP」，拿到回答后只回复 ok。" "$WID" "$SID"
+# 忙线 run 必须挂在另一个项目（doc/76 §4 起发布准入排除同项目的其它活 run）：若它占着 WID，
+# 最终 Task 的发布一直等不到项目静默，组就永远收不了口。会话在任务建成前先挪到 WID2 起忙线 run，
+# 再挪回 WID——run 的 workspace_id 在创建时固定，挪会话不会把它带走。
+PATCH=$(curl -sS -X PATCH "$B/api/sessions/$SID" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -d "{\"workspaceId\":\"$WID2\"}")
+eq "会话挪到忙线项目" "0" "$(echo "$PATCH" | jq -r .code)"
+ml_run "调用 ask_user，问题固定为「忙线占位-$STAMP」，拿到回答后只回复 ok。" "$WID2" "$SID"
 BUSY_RID="$RID"
 BUSY_QID=""
 for i in $(seq 1 120); do
@@ -39,7 +50,10 @@ for i in $(seq 1 120); do
   sleep 1
 done
 [ -n "$BUSY_QID" ] && [ "$BUSY_QID" != "null" ] || { echo "占位 run 没问出问题，无法制造忙线" >&2; exit 2; }
-ok "来源会话已忙线（占位问题 $BUSY_QID），检查点通知会留在 pending"
+PATCH=$(curl -sS -X PATCH "$B/api/sessions/$SID" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -d "{\"workspaceId\":\"$WID\"}")
+eq "会话挪回任务项目（创建 Task 要求来源会话挂在同项目）" "0" "$(echo "$PATCH" | jq -r .code)"
+ok "来源会话已忙线（占位问题 $BUSY_QID，忙线 run 挂在 $WID2），检查点通知会留在 pending"
 
 # ── A. continue：检查点暂停 → 过期版本拒绝 → 解除暂停 ────────────────────────────
 TASKS_A=$(jq -cn \
@@ -175,7 +189,7 @@ if at_wait_orch "$OID_B" "succeeded" 360; then
 else no "360s 没收口（组 $AT_LAST）"; at_orch "$OID_B"; echo "$AT_ORCH" | jq -c '.tasks[] | {key,status,error}'; ml_summary; fi
 eq "D 的 Task 恰好一场执行 run" "1" \
   "$(ml_sql "SELECT count(*) FROM runs WHERE session_id=(SELECT execution_session_id FROM agent_tasks WHERE id='$TID_D')")"
-FINAL_B="$WS_ROOT/tenants/$TEN/workspaces/$WID/rev-b.txt"
+FINAL_B="$WS_ROOT/tenants/$TEN/workspaces/$WID/content/rev-b.txt"
 if [ -f "$FINAL_B" ] && grep -q "A-$STAMP" "$FINAL_B" && grep -q "D-$STAMP" "$FINAL_B"; then
   ok "rev-b.txt 由 a 与 D 的证据合成（D 真的跑过）"
 else no "rev-b.txt 缺证据字节（$FINAL_B）"; fi

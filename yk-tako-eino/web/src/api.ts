@@ -114,8 +114,9 @@ export type SubagentItem = {
 
 export type SubagentListResponse = { subagents: SubagentItem[] }
 
-// DELETE 两个端点成功后都回 {status:"deleted"}。
-export type DeleteStatus = { status: string }
+// DELETE 成功后回 {status:"deleted"}；删除项目多一个 cleanup（doc/76 §4.4）：
+// done = 容器已清，pending = 业务删除已完成、磁盘清理待补偿（前端不能说「磁盘已清完」）。
+export type DeleteStatus = { status: string; cleanup?: 'done' | 'pending' }
 
 export type SessionStatus = {
   liveRunId: RunID
@@ -435,6 +436,34 @@ export function postResume(runId: RunID): Promise<ResumeResult> {
   return request<ResumeResult>(`/api/runs/${encodeURIComponent(runId)}/resume`, { method: 'POST' })
 }
 
+// —— 对话页右侧工作区（doc/78 §4）——
+// 改动文件由服务端从 runlog 的工具调用行派生（与压缩折叠的 file-ops 同源），读模型文字不作数：
+// path 相对项目 content/、分隔符 `/` 无前导 `./`；op 只有 write（新建/覆盖）与 edit（改）。
+export type RunChangedFile = { path: string; op: 'write' | 'edit' }
+export type RunChangedFilesResponse = { runId: RunID; files: RunChangedFile[] }
+
+export function getRunChangedFiles(runId: RunID): Promise<RunChangedFilesResponse> {
+  return request<RunChangedFilesResponse>(
+    `/api/runs/${encodeURIComponent(runId)}/changed-files`,
+  )
+}
+
+// 本场看板行（run_tasks 读口）：deleted 不列、task_no 升序；total = rows 长度，done = completed 行数。
+export type RunTaskRow = {
+  no: number
+  subject: string
+  status: string
+  description: string
+  result: string
+  skillName: string
+  updatedAt: string
+}
+export type RunTasksResponse = { runId: RunID; rows: RunTaskRow[]; total: number; done: number }
+
+export function getRunTasks(runId: RunID): Promise<RunTasksResponse> {
+  return request<RunTasksResponse>(`/api/runs/${encodeURIComponent(runId)}/tasks`)
+}
+
 // —— 技能（doc/52 §6.1）——
 // 字段序是契约（name→description→source→path→enabled→bytes→requires→missing→updatedAt→valid）。
 // enabled 是服务端从 skill_disables 派生的；missing 是**本副本此刻**按过滤后的 PATH 现算的
@@ -681,13 +710,32 @@ export type OrchestrationBody = {
   updatedAt: string
   // doc/74 §4.3：与 Task 同一形状，追加在组半末尾；shared 不出现。
   workspace?: TaskWorkspaceView
+  // doc/75 §4.1/§4.4：继任组在 workspace 之后追加来源组与重规划深度；非继任组不出现这两个键。
+  replanOf?: string
+  replanDepth?: number
 }
 
 export type TaskLink = { parentTaskId: string; childTaskId: string }
 export type OrchestrationView = { orchestration: OrchestrationBody; tasks: AgentTask[]; links: TaskLink[] }
 
-export function listWorkspaceTasks(workspaceId: string): Promise<TaskListResponse> {
-  return request<TaskListResponse>(`/api/workspaces/${encodeURIComponent(workspaceId)}/tasks`)
+// GET /api/orchestrations/:id/handoff（doc/75 §4.3）：机器字段 + 正文原文。
+// reuse 是结果复用清单（taskId + resultRevision）；body 由页面按 Markdown 安全渲染。
+export type OrchestrationHandoff = {
+  orchestrationId: string
+  replanOf: string
+  replanDepth: number
+  reuse: { taskId: string; resultRevision: number }[]
+  body: string
+}
+
+export function getOrchestrationHandoff(orchestrationId: string): Promise<OrchestrationHandoff> {
+  return request<OrchestrationHandoff>(`/api/orchestrations/${encodeURIComponent(orchestrationId)}/handoff`)
+}
+
+// sessionId 可选（doc/80）：非空时只看「本会话派发的」Task；空串/省略字节与今天一致。
+export function listWorkspaceTasks(workspaceId: string, sessionId?: string): Promise<TaskListResponse> {
+  const q = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ''
+  return request<TaskListResponse>(`/api/workspaces/${encodeURIComponent(workspaceId)}/tasks${q}`)
 }
 
 export function getAgentTask(taskId: string): Promise<AgentTask> {

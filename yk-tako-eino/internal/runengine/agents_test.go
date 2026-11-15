@@ -292,7 +292,8 @@ func TestShippedAgentSpecToolGuards(t *testing.T) {
 	}
 
 	// 金样 = 每条出厂规格今天应有的**有效名单**（逐名逐序；researcher 走排除路 = 池序，
-	// coder 走白名单路 = 它 frontmatter 里写的顺序，两序今天只差 memory/bash 的先后）。
+	// coder 走白名单路 = 它 frontmatter 里写的顺序）。子代理结构性没有 memory／search_memory
+	// （doc/65 §4.5/§5.2 的 drop helper），规格里也不该再列它们。
 	// researcher 的金样 = 父池去掉 bash，逐名写死；不写总数——数字会随父池变化而腐化。
 	// 给 researcher read_pdf_text，是因为它本来就能读 workspace 里的文件，PDF 文本属于同一类读。
 	golden := map[string][]string{
@@ -301,7 +302,7 @@ func TestShippedAgentSpecToolGuards(t *testing.T) {
 			"read_media_file", "read_pdf_text", "memory", "search_history", "web_search", "web_fetch",
 			"ask_user",
 			"enter_plan_mode", "submit_plan"},
-		"coder": {"write_file", "read_text_file", "edit_file", "list_directory", "search_files", "memory", "bash"},
+		"coder": {"write_file", "read_text_file", "edit_file", "list_directory", "search_files", "bash"},
 	}
 	// inheritOK：出厂规格默认必须写 tools: 或 exclude_tools: 之一——两行都不写 = 整份继承，
 	// 继承正是 doc/26 §2 那条「新工具自动到达」的通道。哪条规格有意整份继承，在这里显式表态，

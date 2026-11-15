@@ -227,7 +227,8 @@ SRC="$SID"
 ok "隔离引擎、项目 $WID 与来源会话 $SRC 就位"
 
 STAMP="$(date +%s)-$$"
-WS_DIR="$WS/tenants/$TEN/workspaces/$WID"
+# doc/76：产物路径相对用户内容根 content/（容器根另有 layout.json 与 runtime/）。
+WS_DIR="$WS/tenants/$TEN/workspaces/$WID/content"
 mkdir -p "$WS_DIR"
 
 # ═══ 场景 1：pending 双副本认领 ═══════════════════════════════════════════════
@@ -251,8 +252,19 @@ echo "── 场景 5：占住来源会话让交付认领推迟，换不可用�
 create_one err "只回复 ok，然后调用 submit_task_result，summary 写 ok。" || ml_summary
 # 来源会话里先挂一场等人回答的聊天 run：组收口后通知保持 pending（认领被会话忙挡住），
 # 这是产品里真实存在的推迟路径，也让「换密钥 → 放行 → 交付 run 用坏密钥」有确定窗口。
-ml_run "调用 ask_user，问题固定为「73-BLOCK-$STAMP」，拿到回答后只回复 ok。" "$WID" "$SRC"
+# 忙线 run 必须挂在另一个项目（doc/76 §4 起发布准入排除同项目的其它活 run）：它若占着 WID，
+# 最终 Task 的发布一直等不到静默，连 succeeded 都到不了，通知更不会产生。
+WID_BUSY=$(curl -sS -X POST "$B/api/workspaces" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -d '{"name":"73-delivery-busy-ws"}' | jq -r .data.workspace.id)
+[ -n "$WID_BUSY" ] && [ "$WID_BUSY" != "null" ] || { no "建忙线项目失败"; ml_summary; }
+PATCH=$(curl -sS -X PATCH "$B/api/sessions/$SRC" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -d "{\"workspaceId\":\"$WID_BUSY\"}")
+eq "来源会话挪到忙线项目" "0" "$(echo "$PATCH" | jq -r .code)"
+ml_run "调用 ask_user，问题固定为「73-BLOCK-$STAMP」，拿到回答后只回复 ok。" "$WID_BUSY" "$SRC"
 BLOCK_RID=$RID
+PATCH=$(curl -sS -X PATCH "$B/api/sessions/$SRC" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -d "{\"workspaceId\":\"$WID\"}")
+eq "来源会话挪回任务项目" "0" "$(echo "$PATCH" | jq -r .code)"
 if at_wait_task "$TID" "succeeded" 300; then
   ok "最终 Task 已 succeeded（结果已保存）"
 else no "300s 没跑到 succeeded（$AT_LAST）"; fi
@@ -325,8 +337,9 @@ eq "来源会话多两场 run（停止 + 重试）" "$((PRE_RUNS + 2))" "$(sessi
 echo
 echo "── 场景 8：产物文件打开 / 删除后重试 117110 / 补回后可恢复"
 ART_MARK="ART-73-$STAMP"
-printf '%s\n' "$ART_MARK" > "$WS_DIR/delivery-artifact.txt"
-create_one art "项目根已经有文件 delivery-artifact.txt。读它，把原文写进 summary，然后调用 submit_task_result，artifacts 传 [{path:\"delivery-artifact.txt\",kind:\"report\"}]。" || ml_summary
+# 产物必须由任务在本次执行里新建（共享工作区的提交校验按基线 diff 判定「新增或修改」；
+# 提前放进 content 的文件属于基线，声明成 artifact 会被 117110 前的校验拒绝）。
+create_one art "在项目根创建文件 delivery-artifact.txt，内容写一行「$ART_MARK」。然后调用 submit_task_result，summary 写文件路径，artifacts 传 [{path:\"delivery-artifact.txt\",kind:\"report\"}]。" || ml_summary
 if wait_claimed "$OID" 300; then ok "交付 run 已认领（$CRID）"; else no "300s 没认领"; ml_summary; fi
 http_as POST "/api/runs/$CRID/stop" "" "$TOK"
 N8=$NID
@@ -513,7 +526,7 @@ if [ -n "${VTOKEN:-}" ] && [ "$VTOKEN" != "null" ]; then
   curl -sS -o /dev/null -X POST "$B/api/auth/register-by-invite" -H 'Content-Type: application/json' \
     -d '{"token":"'"$VTOKEN"'","email":"'"$VEM"'","password":"changeme123"}'
   VLOGIN=$(curl -sS -X POST "$B/api/auth/login" -H 'Content-Type: application/json' \
-    -d '{"email":"'"$VEM"'","password":"changeme123"}')
+    -d '{"identifier":"'"$VEM"'","password":"changeme123"}')
   VACCESS=$(echo "$VLOGIN" | jq -r .data.accessToken)
   VREFRESH=$(echo "$VLOGIN" | jq -r .data.refreshToken)
   VSW=$(curl -sS -X POST "$B/api/auth/switch-tenant" -H "Authorization: Bearer $VACCESS" -H 'Content-Type: application/json' \

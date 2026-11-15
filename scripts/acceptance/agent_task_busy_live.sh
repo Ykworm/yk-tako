@@ -5,6 +5,8 @@
 #
 # 忙源是确定性的：ask_user 挂起的 run 保持 running + 活租约（waittools 的约定），
 # 挂多久由脚本控制——不赌模型输出时长。
+# 忙源不挂项目（doc/76 §4）：组结果现在要发布进 content/，发布准入排除同项目其它活 run；
+# 若忙源挂在该项目上，组要等它收尾才可能发布，就测不到「组已收口而会话仍忙」的门。
 # 起法同 agent_task_single_live.sh 头注（开着调度循环的隔离引擎 + TAKO_PG_DSN）。
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/agent_task_live_lib.sh"
@@ -13,12 +15,35 @@ ml_need_dsn
 echo "引擎 $B · 打「来源会话正忙 → 通知 pending → 空闲后恰好一场交付」的链"
 ml_signup taskbusy
 
-# ── 1. 先建项目，再起一场挂着项目的 ask_user 挂起 run——它就是「会话正忙」本身 ────
-# （来源会话必须挂着项目：创建 Task 要求两者一致。）
+# ── 1. 建项目，并让来源会话挂上它（创建 Task 要求两者一致）─────────────────────
 WID=$(curl -sS -X POST "$B/api/workspaces" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
   -d '{"name":"task-busy-ws"}' | jq -r .data.workspace.id)
 [ -n "$WID" ] && [ "$WID" != "null" ] || { no "建项目失败"; ml_summary; }
-ml_run '请调用 ask_user 工具问我「选 A 还是 B？」，问完就停在那里等我的答案，不要自己替我选。' "$WID"
+at_probe_run "$WID"
+
+# ── 2. 建单件 Task（来源会话此刻挂着项目，创建校验通过）────────────────────────
+STAMP="$(date +%s)-$$"
+RESP=$(at_create_task "acc-busy-$STAMP" "$WID" "$SID" \
+  "在项目根创建文件 busy.txt，内容写一行「busy-probe-$STAMP」。然后调用 submit_task_result，summary 写文件路径。" \
+  "researcher")
+TID=$(echo "$RESP" | jq -r '.data.taskId // ""')
+OID=$(echo "$RESP" | jq -r '.data.orchestrationId // ""')
+[ -n "$TID" ] && [ "$TID" != "null" ] || { echo "创建失败：$RESP" >&2; exit 2; }
+echo "  taskId=$TID orchId=$OID"
+
+# ── 3. 立刻在来源会话起 ask_user 挂起 run——它就是「会话正忙」本身 ────────────────
+# 必须长在来源会话里（不另起会话，否则交付判据看不到它），但不能占着任务所在的项目：
+# doc/76 §4 起 shared 组的结果也要发布进 content/，发布准入会排除同项目的其它活 run
+# （发布窗口内不允许第二个写者）——忙源留在原项目会让组一直等它，根本闭不上。
+# 已有会话的 run 沿用会话列上的项目（请求里的 workspaceId 不改列），所以先 PATCH 把会话
+# 挪到另一个项目，再起挂起 run；任务已经建好，不再依赖会话挂哪个项目。
+WID2=$(curl -sS -X POST "$B/api/workspaces" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -d '{"name":"task-busy-other-ws"}' | jq -r .data.workspace.id)
+[ -n "$WID2" ] && [ "$WID2" != "null" ] || { no "建第二个项目失败"; ml_summary; }
+PATCH=$(curl -sS -X PATCH "$B/api/sessions/$SID" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -d "{\"workspaceId\":\"$WID2\"}")
+eq "会话挪到第二个项目" "0" "$(echo "$PATCH" | jq -r .code)"
+ml_run '请调用 ask_user 工具问我「选 A 还是 B？」，问完就停在那里等我的答案，不要自己替我选。' "$WID2" "$SID"
 BUSY_RUN="$RID"
 # 等挂起真的发生：run_questions 出 pending 行（挂起中 watchdog 照续租约）。
 QID=""
@@ -31,16 +56,6 @@ done
 ok "来源会话已挂起在 ask_user（question $QID，run $BUSY_RUN）"
 eq "挂起中 run 仍是 running + 活租约" "1" \
   "$(ml_sql "SELECT count(*) FROM runs WHERE id='$BUSY_RUN' AND status='running' AND lease_until > now()")"
-
-# ── 2. 正忙的来源会话上建单件 Task，等它跑完收口 ─────────────────────────────────
-STAMP="$(date +%s)-$$"
-RESP=$(at_create_task "acc-busy-$STAMP" "$WID" "$SID" \
-  "在项目根创建文件 busy.txt，内容写一行「busy-probe-$STAMP」。然后调用 submit_task_result，summary 写文件路径。" \
-  "researcher")
-TID=$(echo "$RESP" | jq -r '.data.taskId // ""')
-OID=$(echo "$RESP" | jq -r '.data.orchestrationId // ""')
-[ -n "$TID" ] && [ "$TID" != "null" ] || { echo "创建失败：$RESP" >&2; exit 2; }
-echo "  taskId=$TID orchId=$OID"
 
 if at_wait_orch "$OID" "succeeded" 300; then
   ok "Task 跑完、整组收口 succeeded（来源会话仍挂着）"
@@ -55,7 +70,7 @@ eq "通知保持 pending（消费循环看过多轮仍不认领）" "pending" \
   "$(ml_sql "SELECT status FROM agent_notifications WHERE id='$NOTIF'")"
 eq "组交付状态还是 pending" "pending" "$(at_orch_field "$OID" "deliveryStatus")"
 eq "deliveryRunId 还是空" "" "$(at_orch_field "$OID" "deliveryRunId")"
-eq "来源会话仍只有挂起那一场 run" "1" "$(at_session_runs "$SID")"
+eq "来源会话仍只有探针 + 挂起两场 run" "2" "$(at_session_runs "$SID")"
 
 # ── 4. 答题收尾 → 会话空闲 → 消费 → 恰好一场交付 run ─────────────────────────────
 ANS=$(curl -sS -X POST "$B/api/questions/$QID/answer" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
@@ -67,7 +82,7 @@ if at_wait_delivered "$OID" 180; then
 else no "180s 没等到交付（deliveryStatus=$(at_orch_field "$OID" deliveryStatus)）"; ml_summary; fi
 DRV=$(at_orch_field "$OID" "deliveryRunId")
 [ -n "$DRV" ] && ok "交付 run 铸了（$DRV）" || no "deliveryRunId 是空"
-eq "来源会话恰好两场 run（挂起 + 交付）" "2" "$(at_session_runs "$SID")"
+eq "来源会话恰好三场 run（探针 + 挂起 + 交付）" "3" "$(at_session_runs "$SID")"
 eq "交付 run 终态 complete" "complete" "$(ml_sql "SELECT status FROM runs WHERE id='$DRV'")"
 eq "orchestration_finished 通知恰好 1 条" "1" "$(at_notif_count "$OID" "orchestration_finished")"
 eq "且已消费" "1" "$(at_notif_count "$OID" "orchestration_finished" "consumed")"

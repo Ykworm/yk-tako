@@ -67,7 +67,7 @@ func TestDeleteWorkspaceCascade(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("AcquireRun = (ok %v, err %v)", ok, err)
 	}
-	if _, err := s.DeleteWorkspaceCascade(ctx, testOwner.TenantID, testOwner.UserID, ws.ID); !errors.Is(err, ErrWorkspaceBusy) {
+	if err := s.DeleteWorkspaceCascade(ctx, testOwner.TenantID, testOwner.UserID, ws.ID); !errors.Is(err, ErrWorkspaceBusy) {
 		t.Fatalf("活 run 删除 = %v, want busy", err)
 	}
 	if s.count(t, &Workspace{}, "id = ?", ws.ID) != 1 {
@@ -95,30 +95,23 @@ func TestDeleteWorkspaceCascade(t *testing.T) {
 	}
 	runsBefore := s.count(t, &Run{}, "")
 
-	if _, err := s.DeleteWorkspaceCascade(ctx, bob.TenantID, bob.UserID, ws.ID); !errors.Is(err, ErrWorkspaceNotFound) {
+	if err := s.DeleteWorkspaceCascade(ctx, bob.TenantID, bob.UserID, ws.ID); !errors.Is(err, ErrWorkspaceNotFound) {
 		t.Fatalf("成员删除 = %v, want not found", err)
 	}
 	def, err := s.EnsureDefaultWorkspace(ctx, testOwner.TenantID, testOwner.UserID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.DeleteWorkspaceCascade(ctx, testOwner.TenantID, testOwner.UserID, def.ID); !errors.Is(err, ErrWorkspaceDefault) {
+	if err := s.DeleteWorkspaceCascade(ctx, testOwner.TenantID, testOwner.UserID, def.ID); !errors.Is(err, ErrWorkspaceDefault) {
 		t.Fatalf("默认工作区 = %v, want default", err)
 	}
 	if s.count(t, &Workspace{}, "id = ?", def.ID) != 1 {
 		t.Fatal("默认工作区被删掉了")
 	}
 
-	ids, err := s.DeleteWorkspaceCascade(ctx, testOwner.TenantID, testOwner.UserID, ws.ID)
+	err = s.DeleteWorkspaceCascade(ctx, testOwner.TenantID, testOwner.UserID, ws.ID)
 	if err != nil {
 		t.Fatal(err)
-	}
-	got := map[SessionID]bool{}
-	for _, id := range ids {
-		got[id] = true
-	}
-	if len(ids) != 2 || !got[sid] || !got["s_cas_bob"] {
-		t.Fatalf("连带会话 = %v, want s_cas 与 s_cas_bob", ids)
 	}
 	if s.count(t, &Workspace{}, "id = ?", ws.ID) != 0 {
 		t.Fatal("项目行还在")

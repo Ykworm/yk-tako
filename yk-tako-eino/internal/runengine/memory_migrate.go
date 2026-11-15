@@ -655,7 +655,7 @@ func (s *Store) exportResidentsToMarkdown(ctx context.Context, root string) erro
 			f.path = filepath.Join(dir, memoryUserFileName)
 		} else {
 			f.workspaceID, f.lockKey = k.subject, "workspace:"+k.subject
-			dir, err = workspaceDir(root, k.tenant, k.subject)
+			dir, err = projectMemoryDir(root, k.tenant, k.subject)
 			f.path = filepath.Join(dir, memoryWorkspaceFileName)
 		}
 		if err != nil {
@@ -755,7 +755,9 @@ func (s *Store) importMarkdownToResidents(ctx context.Context, root string) erro
 	if err != nil {
 		return err
 	}
-	wsPaths, err := filepath.Glob(filepath.Join(root, "tenants", "*", "workspaces", "*", memoryWorkspaceFileName))
+	// 项目记忆在 runtime/memory（doc/76 §6.1）；旧容器根上的 MEMORY.md 不在本命令的读取面，
+	// 先跑项目布局迁移再导入。
+	wsPaths, err := filepath.Glob(filepath.Join(root, "tenants", "*", "workspaces", "*", projectRuntimeDirName, "memory", memoryWorkspaceFileName))
 	if err != nil {
 		return err
 	}
@@ -769,20 +771,23 @@ func (s *Store) importMarkdownToResidents(ctx context.Context, root string) erro
 	for _, p := range paths {
 		rel, _ := filepath.Rel(root, p)
 		parts := strings.Split(filepath.ToSlash(rel), "/")
-		if len(parts) != 5 || parts[0] != "tenants" {
+		if parts[0] != "tenants" {
 			return fmt.Errorf("记忆文件路径形状不对：%s", rel)
 		}
 		f := memoryMigrationFile{relPath: filepath.ToSlash(rel), path: p, tenantID: parts[1], cap: memoryWorkspaceCap}
-		if parts[2] == "users" {
+		switch {
+		case len(parts) == 5 && parts[2] == "users":
 			f.userID, f.lockKey, f.cap = parts[3], "user:"+parts[3], memoryUserCap
 			if _, err := userDir(root, f.tenantID, f.userID); err != nil {
 				return fmt.Errorf("%s：用户 id 不合法：%w", rel, err)
 			}
-		} else {
+		case len(parts) == 7 && parts[2] == "workspaces" && parts[4] == projectRuntimeDirName && parts[5] == "memory":
 			f.workspaceID, f.lockKey = parts[3], "workspace:"+parts[3]
 			if _, err := workspaceDir(root, f.tenantID, f.workspaceID); err != nil {
 				return fmt.Errorf("%s：项目 id 不合法：%w", rel, err)
 			}
+		default:
+			return fmt.Errorf("记忆文件路径形状不对：%s", rel)
 		}
 		raw, err := os.ReadFile(p)
 		if err != nil {

@@ -1,0 +1,103 @@
+/* markdown 排版（共享一份，doc/48 A1）。
+ *
+ * 为什么要单独一份全局样式：Vue 的 **scoped 样式只作用于本组件的元素**。
+ * 聊天气泡那套排版原先写在 `App.vue` 里、选择器是 `.bubble-text :deep(h1)`——
+ * 直接复制到 `WorkspaceFileView.vue` / `ProjectsView.vue` 里，**一条都不会生效**
+ * （scoped 的 data-v 属性不在别人组件的元素上）。所以排版规则必须抽到全局，
+ * 由一个中性类名承载，三个入口挂同一个类。
+ *
+ * `.md-body` 承载的是**与容器无关的那部分**：标题、段落、列表、行内代码、代码块、
+ * 引用、表格（含滚动壳）、链接、分隔线、图片。
+ * **气泡专属的不在这里**：用户气泡是深色底，那套「浅底深字」的反色覆盖留在 `App.vue`
+ * （`.bubble.user .bubble-text :deep(code)` 等），搬过来会把用户气泡的代码块变浅色。
+ *
+ * 用法：`<div class="… md-body" v-html="renderSafe(text)" />`。
+ */
+
+.md-body {
+  margin: 0;
+  min-width: 0;
+  /* markdown 自带块结构；继承容器的 pre-wrap 会把 </p> 后面的换行也画成一行。 */
+  white-space: normal;
+}
+
+.md-body h1,
+.md-body h2,
+.md-body h3,
+.md-body h4 {
+  margin: 0.65rem 0 0.3rem;
+  line-height: 1.35;
+  font-weight: 650;
+}
+.md-body h1 { font-size: 1.22rem; }
+.md-body h2 { font-size: 1.1rem; }
+.md-body h3 { font-size: 1rem; }
+.md-body h4 { font-size: 0.93rem; }
+.md-body p { margin: 0.32rem 0; }
+.md-body ul,
+.md-body ol {
+  margin: 0.32rem 0;
+  padding-left: 1.35rem;
+}
+.md-body li { margin: 0.12rem 0; }
+.md-body code {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0.05rem 0.28rem;
+  font-size: 0.86em;
+}
+.md-body pre {
+  margin: 0.45rem 0;
+  padding: 0.55rem 0.65rem;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow-x: auto;
+}
+.md-body pre code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font-size: 0.82rem;
+}
+.md-body blockquote {
+  margin: 0.4rem 0;
+  padding: 0.05rem 0 0.05rem 0.7rem;
+  border-left: 3px solid var(--line-strong);
+  color: var(--ink-soft);
+}
+/* 表格滚动壳（markdown.ts 里生成）：窄屏列多时只滚表格，不把整条正文变成滚动区。 */
+.md-body .table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+  -webkit-overflow-scrolling: touch;
+}
+.md-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.45rem 0;
+  font-size: 0.86rem;
+}
+.md-body .table-scroll table {
+  width: max-content;
+  min-width: 100%;
+  margin: 0.15rem 0;
+}
+.md-body th,
+.md-body td {
+  border: 1px solid var(--line);
+  padding: 0.28rem 0.45rem;
+  text-align: left;
+}
+.md-body th {
+  background: var(--bg);
+  font-weight: 650;
+}
+.md-body a { color: var(--accent-ink); }
+.md-body hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 0.55rem 0;
+}
+.md-body img { max-width: 100%; }

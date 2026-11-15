@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/tool"
@@ -88,6 +89,46 @@ func TestJournalWrapHandlerCoversRunPool(t *testing.T) {
 	}
 	if rows, err = s.JournalRows(ctx, rid); err != nil || len(rows) != 2 {
 		t.Fatalf("无 target 调用后账本 = %d 行 (err=%v), want 仍 2 行", len(rows), err)
+	}
+}
+
+// TestJournalToolResultInvalidUTF8Sanitized 钉工具出口的编码防线（2026-11-12 活体实测：
+// 交付 run 读 .git 对象（二进制）→ INSERT run_journal 报 SQLSTATE 22021，整场 run 失败）。
+// 账本、mh 与 runlog 都是 PG text 列，只收 UTF-8；非法字节在记账前统一换成 U+FFFD，
+// 返回值与账本同源，后续帧／收尾写入不会再撞同一个错。
+func TestJournalToolResultInvalidUTF8Sanitized(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t, testLease, testTTL)
+	sid, rid := SessionID("s_utf8"), RunID("r_utf8")
+	s.mustAcquire(t, sid, rid, "m_utf8", "hi")
+	raw := "git blob \x8d\x00\xff tail"
+	inner := &fakeInvokableTool{info: &schema.ToolInfo{Name: "read_text_file"}, out: raw}
+	h := &journalWrapHandler{BaseChatModelAgentMiddleware: &adk.BaseChatModelAgentMiddleware{}, store: s}
+	runCtx := &adk.ChatModelAgentContext{Tools: []tool.BaseTool{inner}}
+	_, got, err := h.BeforeAgent(ctx, runCtx)
+	if err != nil {
+		t.Fatalf("BeforeAgent: %v", err)
+	}
+	rootCtx := withJournalTarget(ctx, journalTarget{runID: rid, epoch: 1})
+	out, err := got.Tools[0].(tool.InvokableTool).InvokableRun(rootCtx, `{}`)
+	if err != nil {
+		t.Fatalf("InvokableRun: %v", err)
+	}
+	if !utf8.ValidString(out) || strings.ContainsRune(out, 0) {
+		t.Fatalf("工具出口仍含非法 UTF-8：%q", out)
+	}
+	if !strings.HasPrefix(out, "git blob ") || !strings.HasSuffix(out, " tail") {
+		t.Fatalf("无效字节之外的可读内容被改了：%q", out)
+	}
+	rows, err := s.JournalRows(ctx, rid)
+	if err != nil {
+		t.Fatalf("JournalRows: %v", err)
+	}
+	if len(rows) != 2 || rows[1].Role != "tool_result" {
+		t.Fatalf("账本行 = %+v", rows)
+	}
+	if !utf8.ValidString(rows[1].Text) || rows[1].Text != out {
+		t.Fatalf("账本结果与工具出口不同源或仍非 UTF-8：%q", rows[1].Text)
 	}
 }
 

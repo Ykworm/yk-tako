@@ -257,7 +257,7 @@ func TestDevMemoryFileReadonly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wdir := filepath.Join(root, "tenants/t1/workspaces", ws.ID)
+	wdir := filepath.Join(root, "tenants/t1/workspaces", ws.ID, "runtime", "memory")
 	if err := os.MkdirAll(wdir, 0o755); err != nil {
 		t.Fatal(err)
 	}

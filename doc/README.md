@@ -1,7 +1,7 @@
 # doc/ 文档索引
 
 > 性质：**索引**，不是方案。本文只回答「这篇文档是什么、能不能照着施工、代码在哪、被谁取代」。
-> 最后核对：2026-11-11。
+> 最后核对：2026-11-14。
 > 状态口径：✅ 已落地 · 🔶 部分落地／待收口 · ⬜ 未做 · 存档 = 历史材料，不作施工面。
 > 代码路径均相对 `yk-tako-eino/`。
 
@@ -27,7 +27,7 @@
 - 改响应信封／业务码表：`doc/40`（规则在根 `AGENTS.md`，码表在 doc/40 §4）。
 - 改契约字节、要重跑验收：`doc/19-v6/19v6-04`（人读版）、`scripts/acceptance/`（机器真源与断言器）、`yk-tako-eino/internal/runengine/contract_test.go`（快闸）。
 - 改团队前端（切换器／成员管理／邀请落地页）：`doc/36`。
-- 改界面可用性（markdown 渲染／会话历史入口／停止按钮／文件可达／破坏性操作与文案）：`doc/48`。
+- 改界面可用性（markdown 渲染／会话历史入口／停止按钮／文件可达／破坏性操作与文案／**md 文件按 markdown 渲染显示**，doc/48 §10）：`doc/48`。
 - 改侧栏项目树（项目 → 对话二级、10 条上限、展示全部）：`doc/50`。
 - 改视觉（配色／字阶／间距／圆角／侧栏三段／手机抽屉／气泡）：`doc/51`。
 - 加技能、改技能目录／加载／依赖／管理面：`doc/52`。
@@ -46,7 +46,10 @@
 - 改对话页的工具卡（哪些工具进气泡、摘要／失败／截断口径）：`doc/59`。
 - 改多会话并发（切走保留／实例上限／空对话项目落点／侧栏运行中）：`doc/60`。
 - 改持久 Task／多 Agent 编排：`doc/70`、`doc/72`、`doc/73`；并行任务的工作区隔离、结果交接与发布恢复：`doc/74`（已落地）。
-- 改目标可行性判断、继任编排组与 handoff：`doc/75`（方案已点头、与 76 合并施工包待审）；改项目内容根、运行资源容器与整容器删除：`doc/76`（方案已点头、与 75 合并施工包待审）。
+- 改目标可行性判断、继任编排组与 handoff：`doc/75`；改项目内容根、运行资源容器与整容器删除：`doc/76`（两篇 2026-11-13 已落地）。
+- 改对话页右侧任务面板（项目 Task 常驻、处理项就地打开）：`doc/77`（已落地）。
+- 改对话页右侧工作区（项目目录树、任务、Todo、文件标签与「改动的文件」回执）：`doc/78`（已落地；取代 doc/77 §3「Todo 不进面板」）。
+- 改任务列表的会话过滤（任务面板／任务页默认「本会话」、可切「本项目全部」）：`doc/80`（已落地；取代 doc/77 §3「不按会话过滤」与 doc/78 §3 同名条款）。
 - 想知道某个设计当时为什么这么裁、代价是什么：`doc/problems/`（问题档案，按模块分组）。
 
 **不要先读：** `doc/archive/`（旧线 01–15、18 与引擎 v3／v4／v5）与 `doc/log/`（历史交接与文章）。这些是历史材料，不是现行施工面。
@@ -219,9 +222,10 @@
   - 2026-10-23 立项并落地。**Q（ask_user）**：`run_questions` 表 + `kind=question` 帧（词表 8→9）+ 三拍（落行/发帧/轮询）+ CAS 一答终答 + resume 重放第三分支 + options 快捷选项；**P（plan gate，A 形态=kimi 式运行时守卫）**：模型自主调 `enter_plan_mode`，`planGuardHandler` 黑名单硬 deny 写/执行，`submit_plan` 复用等人机器过人审（可编辑方案卡），批准注回并放行。P/Q 共用一张表（kind 列）一种帧一套 resume 分支；新增 `15` 人审与问答段（115002/115101）。`question_crash.sh` 16 条断言验「挂起中 kill -9 → resume → 答 → complete」；`seed-question` 脚手架已转只读 `question-check`。翻 doc/41 §7「不做 Plan 层人审 gate」之案（用户 2026-10-23 拍）
   - **2026-11-03 补记（§5.5）**：一场 run 的正文按等人工具分段——仍是一条 Σ assistant 行，payload 加 `segments:[{end,toolCallId}]`（rune 偏移）；历史/收口/实时同套切法，问题卡挂切点前那段，已答自由文本问题紧跟右对齐答案气泡。`questionView` 补 `toolCallId`，`answer` 对 question/plan/install 全量返回。无提问 run 的 payload 字节不变
 
-- **48** [前端可用性欠账（方案）](48-前端可用性欠账.md) ✅（2026-10-23 全部 17 拍落地）
-  - 落点：`yk-tako-eino/web/{playwright.config.ts,e2e/,test/,src/{App.vue,ProjectsView.vue,Configure.vue,MembersView.vue,api.ts,chat.ts,markdown.ts}}`、`yk-tako-eino/internal/runengine/{product_api.go,server.go,contract_test.go}`、`scripts/acceptance/{expected.json,harness.py,assert_contract.py}`（**新增**：文件清单端点 `GET /api/workspaces/:id/files`、项目对象的 `isDefault` 字段；markdown 渲染走 `marked` + `dompurify`）
+- **48** [前端可用性欠账（方案）](48-前端可用性欠账.md) ✅（2026-10-23 全部 17 拍落地；**2026-11-14 补充 §10**：md 文件按 markdown 渲染显示、默认预览态可切「原文」，doc/79）
+  - 落点：`yk-tako-eino/web/{playwright.config.ts,e2e/,test/,src/{App.vue,ProjectsView.vue,WorkspaceFileView.vue,Configure.vue,MembersView.vue,api.ts,chat.ts,markdown.ts,markdown.css}}`、`yk-tako-eino/internal/runengine/{product_api.go,server.go,contract_test.go}`、`scripts/acceptance/{expected.json,harness.py,assert_contract.py}`（**新增**：文件清单端点 `GET /api/workspaces/:id/files`、项目对象的 `isDefault` 字段；markdown 渲染走 `marked` + `dompurify`）
   - 2026-10-23 立项。2026-10-23 浏览器走查（四个页面 × 两种视口宽度 + 只读 API 交叉核对）逐条验出 **17 条界面现象（归并为 14 项修复）**：**markdown 渲染是 v6 契约违背**（19v6-03:118 写明「客户端按 markdown 渲染」，代码是纯文本插值）；**后端早有的能力前端没入口**（停止端点 `POST /api/runs/:id/stop` 一次没调 / 跨项目会话列表 `GET /api/sessions` 前端从不裸调 / 文件字节出口 `GET /api/media` 只有图片在用）；**agent 产出的文件用户拿不走**（项目页不列文件、文件片不可点）。分 4 个 loop 17 个 action，**只有 2 条动后端**（B1 新增 `GET /api/workspaces/:id/files`、C1 响应体加 `isDefault` 字段）。台账 `tmp/48-前端可用性欠账/`（不入库）
+  - **2026-11-14 补充（doc/79）**：项目里的 `.md` / `.markdown` 在**两个入口**（对话页右侧文件标签、项目页文件列表）按 markdown 渲染显示、**默认预览态**、可切「原文」；排版样式抽成**全局** `.md-body` 三处共用（Vue 的 scoped 样式不跨组件，抄不进第二个组件）；渲染复用 `markdown.ts` 既有管线（marked + DOMPurify），md 用 `breaks: false`、气泡仍 `breaks: true`；**先截断后渲染**、不把 token 拼进 URL。纯前端、**契约字节零变化**；单测 8 条 + playwright 2 条新断言全绿。详见 §10
 
 - **49** [走查缺陷修复](49-走查缺陷修复.md) ✅（已落地，2026-10-23）
   - 落点：`internal/runengine/{agents.go,product_api.go,server.go,accesslog_test.go,agents_test.go}`、`web/src/{chat.ts,App.vue,Configure.vue,ProjectsView.vue,InviteLanding.vue,markdown.ts,auth.ts}`、`web/test/markdown.test.ts`
@@ -327,15 +331,41 @@
   - Git 只在已有仓库、需要持久修改并合回项目时启用；非 Git 由 DirectoryProvider 完成目录副本、文件变更清单、冲突与发布恢复。PG 不保存 branch／commit／repo path／worktree path／文件哈希；Provider 状态与不可变结果在共享持久卷
   - 验收：活体四场 git 51／directory 42／publication 34／crash 57 全绿；契约用例 57–59 逐字节、用例 60 登记 declared_not_asserted（模型与真实现场场景由活体判红）；既有 70–73 回归（single 24、busy 14、dag 22、crash 20、two_replicas 13、revision 68、attention 39、hitl 48、wakeup 14、delivery_recovery 109）与 `spotcheck.sh` 37/37 全绿；浏览器走查隔离标识／发布面板／验证失败／受阻后重新发布闭环
 
-- **75** [目标重规划与继任编排组](75-目标重规划与继任编排组.md) ⬜（方案已点头、与 76 合并施工包待审，未施工）
-  - 落点：—（设计阶段；预计为继任创建服务、handoff、结果引用复用、任务页与活体）
-  - 2026-11-12 立项。先判断目标可行性，再决定 doc/72 同组修订或创建继任编排组；不可行／不确定时告知或问用户，不盲目新建。继任组写 `handoff.md`（frontmatter 机器读、正文给人读），按 `(taskId,resultRevision)` 复用旧组不可变结果；原组先收口、预算不重置、外部副作用不自动重放
-  - 明确不做跨组调度依赖边、无限重规划、多继任组竞争与 Git 字段入 PG；验收含同组修订、继任复用、不可行、不确定、并发、预算、副作用与崩溃
+- **75** [目标重规划与继任编排组](75-目标重规划与继任编排组.md) ✅（**2026-11-12 立项／施工，2026-11-13 活体验收与文档收口**）
+  - 落点：`internal/runengine/agent_task_{successor,handoff,tools,api,store,scheduler,types,delivery,runner}.go` + `project_layout.go`（继任组目录）+ `auth.go`（117004／117114／117115／117116）+ `server.go`（`POST /api/orchestrations/:id/successors`、`GET /api/orchestrations/:id/handoff`）；前端 `web/src/{TasksView.vue,api.ts}`；活体 `scripts/acceptance/goal_replan_live.sh`（124 条）、`goal_replan_crash_live.sh`（46 条）+ `expected.json` 用例 61–63（人读版 [19v6-04](19-v6/19v6-04-验收-curl.md)）
+  - 2026-11-12 立项、2026-11-13 与 doc/76 合并一个施工包落地。先判断目标可行性（`goalAssessment.outcome == feasible` 才建组），再决定 doc/72 同组修订或创建继任编排组；不可行／不确定时告知或问用户，不盲目新建。继任组写 `successor.json` + `handoff.md`（frontmatter 机器读、正文给人读，记 replanOf／原因／复用引用／深度），按 `(taskId,resultRevision)` 复用旧组不可变结果；深度上限 8、原组先收口、预算不重置、外部副作用不自动重放
+  - 明确不做跨组调度依赖边、无限重规划、多继任组竞争与 Git 字段入 PG；验收含同组修订、继任复用、不可行、不确定、并发（两副本一条继任行，202／409 117114）、预算、副作用与 `kill -9` 崩溃（`preparing` 不调度、重启后继续）
 
-- **76** [项目内容目录与运行资源容器](76-项目内容目录与运行资源容器.md) ⬜（方案已点头、与 75 合并施工包待审，未施工）
-  - 落点：—（设计阶段；预计为项目路径函数、WorkspaceRef、Provider 路径、媒体／记忆／输出、迁移与整容器删除）
-  - 2026-11-12 立项。把 `workspaces/<wid>` 改为项目资源容器，用户只看 `content/`，异步工作区、不可变结果、临时文件、媒体与项目记忆归 `runtime/`；shared 是同组共享工作现场，isolated 是每 Task 独立现场，两者中间结果都不直接写 content，最终才发布
-  - 存量迁移采用复制 → 校验 → 原子切换；删除时清整个项目容器但不误删租户技能／工具、系统技能与用户记忆。用户级 skill／plugin 本期不做；验收含迁移、可见性、shared／isolated、Git／Directory、崩溃与删除
+- **76** [项目内容目录与运行资源容器](76-项目内容目录与运行资源容器.md) ✅（**2026-11-12 立项／施工，2026-11-13 活体验收与文档收口**）
+  - 落点：`internal/runengine/project_layout.go`（容器路径与 `layout.json`）+ `scope.go`／`worker.go`（工作现场落 runtime）+ `media*.go`／`bashspill.go`／`webfetch.go`／`websearch.go`（运行资源根）+ `memory_markdown.go`／`memory_migrate.go`（项目记忆在 `runtime/memory/`）+ `workspace_{provider,engine,git,directory,result,publish,view}.go`（最终结果发布进 `content/`）+ `filetools.go`／`product_api.go`（删除回 `cleanup=done|pending`）+ `pgstore.go`／`store.go`（`project_cleanups`）+ `archive_sweep.go`／`tempsweep.go` + `cmd/yktako/main.go`（`-migrate-project-layout`）；前端 `web/src/{ProjectsView.vue,api.ts}`；活体 `scripts/acceptance/project_layout_live.sh`（36 条）、`project_layout_migration_live.sh`（51 条）、`memory_project_delete_live.sh`（10 条）+ `expected.json` 用例 58／60
+  - 2026-11-12 立项、2026-11-13 与 doc/75 合并一个施工包落地。`workspaces/<wid>` 成为项目资源容器：用户只看 `content/`，异步工作区、不可变结果、临时文件、媒体与项目记忆归 `runtime/{orchestrations,tmp,media,memory}`；shared 是同组共享工作现场，isolated 是每 Task 独立现场，两者中间结果都不直接写 content，最终才发布（共享组同样发布，doc/76 §10.5）
+  - 存量迁移走离线命令的复制 → 校验 → 原子切换，旧布局项目在 HTTP 层直接 409 `117116`；删除清整个项目容器但不误删租户技能／工具、系统技能与用户记忆，容器删除失败回 `cleanup=pending` 由 `project_cleanups` 补偿；没有临时实现或过渡开关。用户级 skill／plugin 本期不做
+
+- **77** [对话页右侧任务面板](77-对话页任务面板.md) ✅（**2026-11-13 落地**：`web/src/App.vue`、`web/src/TasksView.vue`，无后端改动）
+  - 落点（预计）：`web/src/App.vue`（对话页布局与面板壳）、`web/src/TasksView.vue`（`embedded` 嵌入模式）；无后端改动、无契约字节变化
+  - 病灶：Task 在后台异步执行，而可观察面只在「任务」页；用户看状态、答 Task 提问、做计划决策都要离开对话再回来。面板把当前项目的 Task 列表与「需要我处理」放到对话页右侧，点行复用任务页同一个详情抽屉；范围是**当前项目**而非当前会话
+  - 不改 Task 的存储、状态机、调度与 API；移动端（≤860px）不出现面板，仍走左侧「任务」入口。**§3 第 4 条（Todo 不进面板）已被 [doc/78](78-对话页右侧工作区与改动文件.md) 取代**；**§3 第 1 条（不按会话过滤）与 §4.2 已被 [doc/80](80-任务列表按会话过滤.md) 取代**
+
+- **78** [对话页右侧工作区与改动文件](78-对话页右侧工作区与改动文件.md) ✅（**2026-11-13 落地**：`internal/runengine/runviews.go`、`web/src/ChatDock.vue` 等，契约用例 65）
+  - 落点：`internal/runengine/{runviews.go,runviews_test.go,server.go,contract_test.go}`、`web/src/{App.vue,api.ts,ChatDock.vue,WorkspaceTree.vue,WorkspaceFileView.vue,RunTodoPanel.vue,RunChangedFiles.vue}`、`scripts/acceptance/expected.json`（用例 65）、`doc/19-v6/19v6-04`、`doc/40`（端点表）
+  - 把 doc/77 的单面板扩成多标签工作区（项目目录 / 任务 / Todo / 文件），并新增两个只读端点：`GET /api/runs/:id/changed-files`（从 runlog 工具调用行派生本轮写入/编辑过的文件）与 `GET /api/runs/:id/tasks`（`run_tasks` 的第一个 HTTP 读口）；助手回复结尾列出改动文件，点开在右侧打开文件标签
+  - 不改 run 执行、Task 状态机、文件工具行为与帧格式；不做右侧编辑、不做 diff、不做拖拽调宽；≤860px 工作区不渲染，Todo 留在输入框上方
+  - **2026-11-14 补充（doc/79）**：文件标签里的 `.md` / `.markdown` **按 markdown 渲染显示，默认预览态、可切「原文」**（§2 第 6 条已改口径；样式与判定见 [doc/48](48-前端可用性欠账.md) §10）。取字节的路径、端点与响应字节**一个字没变**
+
+- **80** [任务列表按会话过滤](80-任务列表按会话过滤.md) ✅（**2026-11-14 落地**：`internal/runengine/{agent_task_store.go,agent_task_api.go}`、`web/src/{api.ts,TasksView.vue,ChatDock.vue,App.vue}`，契约用例 80）
+  - 落点：`internal/runengine/{agent_task_store.go,agent_task_api.go}`（`ListWorkspaceTasks` 加 `sessionID` 参数 + 子查询）、`web/src/{api.ts,TasksView.vue,ChatDock.vue,App.vue}`、`scripts/acceptance/expected.json`（用例 80）、`doc/19-v6/19v6-04`
+  - 病灶：Task 由对话派发、结果回到对话，但任务面板与任务页只按**项目**列出，同一项目里多个会话派发的任务混在一起。`GET /api/workspaces/:id/tasks` 新增可选参数 `sessionId`（不传=全部、非空=按来源会话过滤、未知会话=200 空列表）；面板／任务页默认「本会话」、可一键切「本项目全部」；处理条仍项目级聚合
+  - 纯过滤，不校验会话存在性；`sessionId=` 空串等于不传；不动 Task 的存储、状态机、调度与其它 API 字节。**取代 [doc/77](77-对话页任务面板.md) §3「不按会话过滤」与 [doc/78](78-对话页右侧工作区与改动文件.md) §3 同名条款**
+
+- **81** [刷新失败不误判登出](81-刷新失败不误判登出.md) ✅（**2026-11-14 落地**：`web/src/auth.ts`、`web/test/authrefresh.test.ts`，无后端改动）
+  - 落点：`web/src/auth.ts`（`RefreshOutcome` / `readRefreshOutcome` / `isEnvelope` 三态判定，`doRefresh` 按三态分支）、`web/test/authrefresh.test.ts`（新增回归网 8 条）；纯前端、契约字节零变化
+  - 病灶：`doRefresh` 把「`/api/auth/refresh` 拿到任何非 2xx」都当登录失效并 `clearAuth('expired')`；dev 重启引擎时 Vite 代理回 500（`text/plain`），开着的标签页被无端登出。改为只有「HTTP 401 且响应是引擎信封且 `code≠0`」才登出，5xx／代理 500／非信封 401 都是暂时性故障、静默保留 token 等下一拍
+
+- **82** [可组合执行原语与后台任务](82-可组合执行原语与后台任务.md) ⬜（**方案待点头，未施工**）
+  - 落点（预计）：`internal/runengine/{bash,bashspill,sandbox,bash_job_*,agent_task_tools,agent_task_delivery,agent_task_scheduler,agent_task_runner,server,auth}.go`、`internal/config/model.go`、`web/src/`、机器验收 `scripts/acceptance/`
+  - 2026-11-15 立项。bash 的 30 秒改为前台等待窗口，超时保留进程并返回 `bj_…`，补输出读取／有限等待／停止／持久通知与失联处理；Task 新增 `wait_task`，当前 run 已读结果时认领通知，避免重复交付；创建编排补 `finalTaskId`
+  - 不增加用户可见 DAG 模式或 JS 引擎：同步子代理、持久 Task、等待和依赖保持可组合；新工作继续走 doc/72 同组修订，已交付后走 doc/75 继任组；shared 组改为串行，需并行修改时使用 doc/74 isolated 现场。方案含多副本、崩溃、Task／项目生命周期与完整验收线
+  - 页面不只给最终结果：新增路径账本（`GET /api/orchestrations/:id/journey` 提案），从计划修订、Task 终态与失败原因、结果复用、通知尝试与继任 handoff 派生；计划版本、失败／取消节点、替代路径、交付次数都可见，刷新与换副本一致
 
 ## 2. 历史存档（`doc/archive/`，不作施工面）
 
@@ -361,6 +391,7 @@
 | `doc/` | [68-记忆检索的故事演示](68-记忆检索的故事演示.md) | 非方案，演示读物 | 2026-11-08：doc/65 §4.4 `search_memory` 语义的故事版演示——一场搬家 + 六个问题，覆盖 as_of 现实回放、include_history 改口链、removed 删除边界、过期退场；认知回放只作对比说明，现行工具不开放；参考脉络 Zep/Graphiti（借查询语义、不抄图谱存储）；不作施工真源 |
 | `doc/` | [69-参照实现对照：rakazo 与 octop](69-参照实现对照-rakazo与octop.md) | 非方案，对照记录 | 2026-11-08：读 rakazo（`ref-agent/rakazo/`）与 Octop（`ref-agent/Octop/`）源码的对照——agent 管理（rakazo 的 Bot+Subagent 双形态、octop 的 Expert→Agent→Team 三层）、plugin（rakazo「静态声明不执行代码」vs octop「plugin.yaml+main.py 可执行包」）、skill（三家同构的 SKILL.md）；结论：rakazo 无 expert、octop 有、tako 无 plugin/expert/协作；只作对照阅读，不作施工真源 |
 | `doc/problems/` | [问题与方案库](problems/README.md)（43 条） | 非方案 | 决策档案：每条一个设计选择题——当时遇到什么、桌上有哪些候选、为什么这么裁、代价是什么、今天还成不成立；按模块分组，并在 `doc/53` 各小模块后反链 |
+| `doc/assets/` | [tako 架构与数据流（可交互）](assets/tako-architecture.html) | 非方案，交互图 | 2026-11-13：五层架构图（前端 → 接入层 → 运行引擎 → 模型层 → 存储层）+ 九条数据流（请求／帧／工具／定稿／记忆／编排／恢复／文件／事件）。点节点看它是什么、代码落在哪、在链路里的位置与真源文档；点连线看这条流什么时候发生、带的是什么、落到哪；可按「播放数据流」逐步走完一场 run 的 23 步生命周期。静态版 `tako-architecture.png`（3840×2822）由 `scripts/export-architecture-poster.sh` 从本页派生、可重跑——矢量渲染导出，图中文字是真文本而非图像模型生成，不会有乱码。品牌头用定稿 Logo（Tako Grid 图形 + 轮廓字标，燕麦／焦糖／可可）。内容取自 doc/19-v6、doc/53、doc/16、doc/70；与文档冲突以文档为准 |
 
 ## 4. `doc/log/` 记录
 

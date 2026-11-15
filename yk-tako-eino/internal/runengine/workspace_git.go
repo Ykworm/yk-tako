@@ -89,7 +89,7 @@ type gitPublication struct {
 
 // ── 路径与分支命名 ──────────────────────────────────────────────────────────
 
-func (g *GroupHandle) gitRepoDir() string  { return filepath.Join(g.providerDir(), "repo.git") }
+func (g *GroupHandle) gitRepoDir() string   { return filepath.Join(g.providerDir(), "repo.git") }
 func (g *GroupHandle) gitStatePath() string { return filepath.Join(g.providerDir(), "git.json") }
 func (g *GroupHandle) gitParentsPath(taskID string) string {
 	return filepath.Join(g.providerDir(), "parents", taskID+".json")
@@ -114,6 +114,14 @@ func gitBranchName(orchID, taskKey string) string {
 		safe = "task"
 	}
 	return "tako/" + orchID + "/" + safe
+}
+
+// gitWorkBranch 是工作现场对应的内部分支：isolated 每 Task 一条，shared 整组一条。
+func (g *GroupHandle) gitWorkBranch(taskKey string) string {
+	if g.sharedMode() {
+		return "tako/" + g.OrchestrationID + "/shared"
+	}
+	return gitBranchName(g.OrchestrationID, taskKey)
 }
 
 // ── git 命令执行口 ──────────────────────────────────────────────────────────
@@ -344,7 +352,12 @@ func (p *gitProvider) PrepareGroup(ctx context.Context, g *GroupHandle) error {
 // ── PrepareTask / RecoverTaskWork：linked worktree ──────────────────────────
 
 func (p *gitProvider) PrepareTask(ctx context.Context, g *GroupHandle, task AgentTask, parents []ResultRef) (TaskWork, error) {
-	rel, err := g.Locker.Lock(ctx, []string{g.taskLockKey(task.ID)})
+	// shared 的 worktree 整组只有一个：建它必须走组锁（不同 Task 的 Task 锁互不挡）。
+	lockKey := g.taskLockKey(task.ID)
+	if g.sharedMode() {
+		lockKey = g.groupLockKey()
+	}
+	rel, err := g.Locker.Lock(ctx, []string{lockKey})
 	if err != nil {
 		return TaskWork{}, err
 	}
@@ -362,16 +375,19 @@ func (p *gitProvider) PrepareTask(ctx context.Context, g *GroupHandle, task Agen
 		return TaskWork{}, fmt.Errorf("Git 组尚未准备，无法领取 Task %s", task.ID)
 	}
 	// 解析父结果提交（按 taskKey 排序由调用方保证）。无父从 baseCommit，有父从第一个父提交起。
+	// shared：整组同一条内部支线，父任务的提交本来就在支线上，不再按结果 merge。
 	resolved := make([]gitParentRef, 0, len(parents))
-	for _, ref := range parents {
-		commit, err := gitOut(ctx, "", g.gitDirArg(), "rev-parse", "--verify", gitResultRefName(ref.TaskID, ref.ResultRevision))
-		if err != nil || commit == "" {
-			return TaskWork{}, fmt.Errorf("父结果 %s/%d 的提交不存在（尚未接受？）", ref.TaskID, ref.ResultRevision)
+	if !g.sharedMode() {
+		for _, ref := range parents {
+			commit, err := gitOut(ctx, "", g.gitDirArg(), "rev-parse", "--verify", gitResultRefName(ref.TaskID, ref.ResultRevision))
+			if err != nil || commit == "" {
+				return TaskWork{}, fmt.Errorf("父结果 %s/%d 的提交不存在（尚未接受？）", ref.TaskID, ref.ResultRevision)
+			}
+			resolved = append(resolved, gitParentRef{TaskID: ref.TaskID, ResultRevision: ref.ResultRevision, Commit: commit})
 		}
-		resolved = append(resolved, gitParentRef{TaskID: ref.TaskID, ResultRevision: ref.ResultRevision, Commit: commit})
 	}
 	startCommit := st.BaseCommit
-	if len(resolved) > 0 {
+	if !g.sharedMode() && len(resolved) > 0 {
 		startCommit = resolved[0].Commit
 	}
 	if p.reserve != nil {
@@ -384,7 +400,7 @@ func (p *gitProvider) PrepareTask(ctx context.Context, g *GroupHandle, task Agen
 	if err := os.MkdirAll(filepath.Dir(workRoot), 0o755); err != nil {
 		return TaskWork{}, err
 	}
-	branch := gitBranchName(g.OrchestrationID, task.TaskKey)
+	branch := g.gitWorkBranch(task.TaskKey)
 	// 清理崩溃残留的 worktree 注册（只 prune 已失效的，不删未知目录）。
 	if _, err := runGit(ctx, "", g.gitDirArg(), "worktree", "prune"); err != nil {
 		return TaskWork{}, err
@@ -403,21 +419,47 @@ func (p *gitProvider) PrepareTask(ctx context.Context, g *GroupHandle, task Agen
 	if err := p.verifyBinding(ctx, g, task, workRoot); err != nil {
 		return TaskWork{}, err
 	}
-	if err := p.saveParents(g, task.ID, resolved); err != nil {
-		return TaskWork{}, err
+	var conflicts []gitConflict
+	if !g.sharedMode() {
+		if err := p.saveParents(g, task.ID, resolved); err != nil {
+			return TaskWork{}, err
+		}
+		if conflicts, err = p.mergeParents(ctx, g, workRoot, resolved); err != nil {
+			return TaskWork{}, err
+		}
+		if err := p.saveConflicts(g, task.ID, conflicts); err != nil {
+			return TaskWork{}, err
+		}
 	}
-	conflicts, err := p.mergeParents(ctx, g, workRoot, resolved)
-	if err != nil {
-		return TaskWork{}, err
+	// 无父 Task 从继任组固化的复用快照带入前代结果（doc/75 §7.4）。
+	// Git 组必须先提交：AcceptResult 的 requireCleanWorktree 拒绝未跟踪文件。
+	reuseNote := ""
+	reuseConflicts := 0
+	if len(parents) == 0 {
+		app, err := applyGroupReuse(g, workRoot)
+		if err != nil {
+			return TaskWork{}, err
+		}
+		if len(app.Applied) > 0 {
+			if _, err := runGit(ctx, workRoot, "add", "-A"); err != nil {
+				return TaskWork{}, fmt.Errorf("暂存复用结果失败：%w", err)
+			}
+			if _, err := runGit(ctx, workRoot, "commit", "-m", "tako: 带入前代任务仍有效的结果"); err != nil {
+				return TaskWork{}, fmt.Errorf("提交复用结果失败：%w", err)
+			}
+		}
+		reuseNote = app.Note
+		reuseConflicts = len(app.Conflicts)
 	}
-	if err := p.saveConflicts(g, task.ID, conflicts); err != nil {
-		return TaskWork{}, err
-	}
-	return TaskWork{Root: workRoot, PromptOverlay: gitOverlay(conflicts), ExtraWriteRoots: []string{g.gitRepoDir()}, Conflicts: len(conflicts)}, nil
+	return TaskWork{Root: workRoot, RuntimeRoot: g.Dir, PromptOverlay: gitOverlay(g.sharedMode(), conflicts) + reuseNote, ExtraWriteRoots: []string{g.gitRepoDir()}, Conflicts: len(conflicts) + reuseConflicts}, nil
 }
 
 func (p *gitProvider) RecoverTaskWork(ctx context.Context, g *GroupHandle, task AgentTask, revision int) (TaskWork, error) {
-	rel, err := g.Locker.Lock(ctx, []string{g.taskLockKey(task.ID)})
+	lockKey := g.taskLockKey(task.ID)
+	if g.sharedMode() {
+		lockKey = g.groupLockKey()
+	}
+	rel, err := g.Locker.Lock(ctx, []string{lockKey})
 	if err != nil {
 		return TaskWork{}, err
 	}
@@ -437,7 +479,7 @@ func (p *gitProvider) taskWorkFromExisting(ctx context.Context, g *GroupHandle, 
 	if err != nil {
 		return TaskWork{}, err
 	}
-	return TaskWork{Root: g.workDir(task.ID), PromptOverlay: gitOverlay(conflicts), ExtraWriteRoots: []string{g.gitRepoDir()}, Conflicts: len(conflicts)}, nil
+	return TaskWork{Root: g.workDir(task.ID), RuntimeRoot: g.Dir, PromptOverlay: gitOverlay(g.sharedMode(), conflicts), ExtraWriteRoots: []string{g.gitRepoDir()}, Conflicts: len(conflicts)}, nil
 }
 
 // verifyBinding 核 worktree top、common dir 与分支都和 Task 绑定一致（doc/74 §7.1）。
@@ -460,7 +502,7 @@ func (p *gitProvider) verifyBinding(ctx context.Context, g *GroupHandle, task Ag
 	if err != nil {
 		return fmt.Errorf("worktree HEAD 不在分支上：%w", err)
 	}
-	if branch != gitBranchName(g.OrchestrationID, task.TaskKey) {
+	if branch != g.gitWorkBranch(task.TaskKey) {
 		return fmt.Errorf("worktree 分支与 Task 绑定不符：%s", branch)
 	}
 	return nil
@@ -514,11 +556,20 @@ func splitNonEmptyLines(s string) []string {
 }
 
 // gitOverlay 是 worktree 的 prompt 补充（只指导模型，程序判定不依赖它）。
-func gitOverlay(conflicts []gitConflict) string {
+func gitOverlay(shared bool, conflicts []gitConflict) string {
 	var b strings.Builder
-	b.WriteString("你在一个隔离的 Git worktree 中工作，原项目不会被直接改动。完成工作后请 git commit 你的修改，")
+	if shared {
+		b.WriteString("你在本编排组共用的 Git worktree 中工作，其他任务也会读写同一分支；原项目不会被直接改动。")
+	} else {
+		b.WriteString("你在一个隔离的 Git worktree 中工作，原项目不会被直接改动。")
+	}
+	b.WriteString("完成工作后请 git commit 你的修改，")
 	b.WriteString("再用 submit_task_result 提交结果，artifacts 声明本次交付的文件（相对路径，必须已提交进 HEAD）。")
-	b.WriteString("程序会校验工作区干净、产物在 HEAD、所有父结果提交都已合并。")
+	if shared {
+		b.WriteString("程序会校验工作区干净、产物在 HEAD。")
+	} else {
+		b.WriteString("程序会校验工作区干净、产物在 HEAD、所有父结果提交都已合并。")
+	}
 	if len(conflicts) > 0 {
 		b.WriteString("\n\n合并父任务结果时出现冲突，需要你裁决（程序不会自动合并）：")
 		seen := map[string]bool{}
@@ -562,18 +613,21 @@ func (p *gitProvider) AcceptResult(ctx context.Context, g *GroupHandle, task Age
 			return ImmutableResult{}, fmt.Errorf("%w: artifact 不是普通文件：%s", errSubmitBad, clean)
 		}
 	}
-	// 所有父结果提交都是 HEAD 祖先。
-	parents, err := p.loadParents(g, task.ID)
-	if err != nil {
-		return ImmutableResult{}, err
-	}
+	// 所有父结果提交都是 HEAD 祖先（shared 组没有按父 merge 的步骤：同一分支上
+	// 父任务的提交已被支线纳入，由 DAG 领取顺序保证；不再逐父校验）。
 	head, err := gitOut(ctx, workRoot, "rev-parse", "HEAD")
 	if err != nil {
 		return ImmutableResult{}, err
 	}
-	for _, par := range parents {
-		if _, err := runGit(ctx, workRoot, "merge-base", "--is-ancestor", par.Commit, head); err != nil {
-			return ImmutableResult{}, fmt.Errorf("%w: 父结果 %s/%d 尚未合并进 HEAD", errSubmitBad, par.TaskID, par.ResultRevision)
+	if !g.sharedMode() {
+		parents, err := p.loadParents(g, task.ID)
+		if err != nil {
+			return ImmutableResult{}, err
+		}
+		for _, par := range parents {
+			if _, err := runGit(ctx, workRoot, "merge-base", "--is-ancestor", par.Commit, head); err != nil {
+				return ImmutableResult{}, fmt.Errorf("%w: 父结果 %s/%d 尚未合并进 HEAD", errSubmitBad, par.TaskID, par.ResultRevision)
+			}
 		}
 	}
 	if g.VerifyCommand != "" {

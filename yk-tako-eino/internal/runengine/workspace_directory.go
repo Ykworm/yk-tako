@@ -1,7 +1,8 @@
-// 本文件是 DirectoryWorkspaceProvider（方案真源 = doc/74 §8）：非 Git 项目的隔离工作区。
+// 本文件是 DirectoryWorkspaceProvider（方案真源 = doc/74 §8；doc/76 §4）：非 Git 项目的工作区。
 //
-// 它做什么：第一次准备时把原项目普通文件冻结成组基线（物理副本 + 清单）；每件 Task 从基线
-// 复制独立工作目录，按父 taskKey 顺序应用父结果；接受结果时与基线 diff 出变更集、验证、
+// 它做什么：第一次准备时把原项目普通文件冻结成组基线（物理副本 + 清单）；isolated 每件 Task
+// 从基线复制独立工作目录，按父 taskKey 顺序应用父结果；shared 整组共用一棵从基线复制的
+// work/shared（父结果本来就在同一棵树上，不重放）。接受结果时与基线 diff 出变更集、验证、
 // 固化成不可变结果；发布时逐路径比对原项目与基线，仍等于基线才原子写入，全程记录进度，
 // 崩溃后按记录与现场对账。**不执行任何 Git 命令，不创建 .git。**
 //
@@ -277,7 +278,12 @@ func (p *directoryProvider) PrepareGroup(ctx context.Context, g *GroupHandle) er
 // ── PrepareTask / RecoverTaskWork：工作现场 ──────────────────────────────────
 
 func (p *directoryProvider) PrepareTask(ctx context.Context, g *GroupHandle, task AgentTask, parents []ResultRef) (TaskWork, error) {
-	rel, err := g.Locker.Lock(ctx, []string{g.taskLockKey(task.ID)})
+	// shared 的现场是整组共用的一棵目录树：建它必须走组锁（不同 Task 的 Task 锁互不挡）。
+	lockKey := g.taskLockKey(task.ID)
+	if g.sharedMode() {
+		lockKey = g.groupLockKey()
+	}
+	rel, err := g.Locker.Lock(ctx, []string{lockKey})
 	if err != nil {
 		return TaskWork{}, err
 	}
@@ -325,22 +331,41 @@ func (p *directoryProvider) PrepareTask(ctx context.Context, g *GroupHandle, tas
 	if err := os.Rename(staging, workRoot); err != nil {
 		return TaskWork{}, fmt.Errorf("准备工作目录失败：%w", err)
 	}
+	// shared：父任务与当前任务在同一棵目录树上，父的修改本来就在现场里，不再按结果重放。
 	var conflicts []directoryConflict
-	for _, ref := range parents {
-		cs, err := p.applyParentResult(g, workRoot, bl, ref)
+	if !g.sharedMode() {
+		for _, ref := range parents {
+			cs, err := p.applyParentResult(g, workRoot, bl, ref)
+			if err != nil {
+				return TaskWork{}, err
+			}
+			conflicts = append(conflicts, cs...)
+		}
+		if err := p.saveConflicts(g, task.ID, conflicts); err != nil {
+			return TaskWork{}, err
+		}
+	}
+	// 继任组的无父任务：把创建时固化的复用结果带进现场（doc/75 §7.4）。
+	// 只做一次——工作现场已存在时上面的幂等分支已经返回，不会重放。
+	reuseNote := ""
+	reuseConflicts := 0
+	if len(parents) == 0 {
+		app, err := applyGroupReuse(g, workRoot)
 		if err != nil {
 			return TaskWork{}, err
 		}
-		conflicts = append(conflicts, cs...)
+		reuseNote = app.Note
+		reuseConflicts = len(app.Conflicts)
 	}
-	if err := p.saveConflicts(g, task.ID, conflicts); err != nil {
-		return TaskWork{}, err
-	}
-	return TaskWork{Root: workRoot, PromptOverlay: directoryOverlay(conflicts), Conflicts: len(conflicts)}, nil
+	return TaskWork{Root: workRoot, RuntimeRoot: g.Dir, PromptOverlay: directoryOverlay(g.sharedMode(), conflicts) + reuseNote, Conflicts: len(conflicts) + reuseConflicts}, nil
 }
 
 func (p *directoryProvider) RecoverTaskWork(ctx context.Context, g *GroupHandle, task AgentTask, revision int) (TaskWork, error) {
-	rel, err := g.Locker.Lock(ctx, []string{g.taskLockKey(task.ID)})
+	lockKey := g.taskLockKey(task.ID)
+	if g.sharedMode() {
+		lockKey = g.groupLockKey()
+	}
+	rel, err := g.Locker.Lock(ctx, []string{lockKey})
 	if err != nil {
 		return TaskWork{}, err
 	}
@@ -357,7 +382,7 @@ func (p *directoryProvider) taskWorkFromExisting(g *GroupHandle, task AgentTask)
 	if err != nil {
 		return TaskWork{}, err
 	}
-	return TaskWork{Root: g.workDir(task.ID), PromptOverlay: directoryOverlay(conflicts), Conflicts: len(conflicts)}, nil
+	return TaskWork{Root: g.workDir(task.ID), RuntimeRoot: g.Dir, PromptOverlay: directoryOverlay(g.sharedMode(), conflicts), Conflicts: len(conflicts)}, nil
 }
 
 // applyParentResult 把一份父结果按路径应用进子工作目录（doc/74 §8.2）：
@@ -502,9 +527,14 @@ func (p *directoryProvider) loadConflicts(g *GroupHandle, taskID string) ([]dire
 }
 
 // directoryOverlay 是工作现场的 prompt 补充（只指导模型，程序判定不依赖它）。
-func directoryOverlay(conflicts []directoryConflict) string {
+func directoryOverlay(shared bool, conflicts []directoryConflict) string {
 	var b strings.Builder
-	b.WriteString("你在一个隔离工作目录中工作，原项目不会被直接改动。完成后用 submit_task_result 提交结果，")
+	if shared {
+		b.WriteString("你在本编排组共用的工作目录中工作，其他任务也会读写同一目录；原项目不会被直接改动。")
+	} else {
+		b.WriteString("你在一个隔离工作目录中工作，原项目不会被直接改动。")
+	}
+	b.WriteString("完成后用 submit_task_result 提交结果，")
 	b.WriteString("artifacts 声明本次新增或修改的交付文件（相对路径）。")
 	if len(conflicts) > 0 {
 		b.WriteString("\n\n父任务结果与本目录存在冲突，需要你裁决（程序不会自动合并）：")

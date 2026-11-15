@@ -1,0 +1,1099 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tako · 架构与数据流</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#fafafa; --panel:#fff; --line:#e7e5e4; --line-soft:#f1f0ee;
+  --ink:#18181b; --ink2:#52525b; --muted:#a1a1aa;
+  --accent:#0f9d76;
+  --c-fe:#3b82f6; --c-api:#0ea5e9; --c-eng:#f59e0b; --c-md:#8b5cf6; --c-st:#10b981;
+  --f-request:#2563eb; --f-frame:#d97706; --f-tool:#0891b2; --f-finalize:#059669;
+  --f-memory:#7c3aed; --f-orch:#db2777; --f-recover:#dc2626; --f-fs:#64748b; --f-event:#0d9488;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--ink);
+  font-family:'Outfit','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;
+  font-size:14.5px; line-height:1.62; -webkit-font-smoothing:antialiased;
+}
+.mono{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+
+/* ---------- header ---------- */
+.hd{
+  position:sticky; top:0; z-index:40;
+  background:rgba(250,250,250,.92); backdrop-filter:blur(10px);
+  border-bottom:1px solid var(--line);
+  padding:16px 24px; display:flex; gap:28px; align-items:flex-start; flex-wrap:wrap;
+}
+.brandbar{display:flex; align-items:center; gap:14px}
+.brandmark{display:block; flex:none}
+.kicker{font-size:11.5px; letter-spacing:.14em; text-transform:uppercase; color:#BB7738; font-weight:600; font-family:'JetBrains Mono',monospace}
+.hd h1{font-size:27px; line-height:1.25; margin:4px 0 0; font-weight:600; letter-spacing:-.01em}
+.lede{margin:6px 0 0; color:var(--ink2); max-width:70ch; font-size:14px}
+.hd-r{margin-left:auto; display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding-top:6px}
+.btn{
+  font:inherit; font-size:13px; font-weight:500; color:var(--ink2);
+  background:var(--panel); border:1px solid var(--line); border-radius:9px;
+  padding:7px 13px; cursor:pointer; transition:all .18s ease; white-space:nowrap;
+}
+.btn:hover{border-color:#d6d3d1; color:var(--ink); transform:translateY(-1px); box-shadow:0 4px 14px -4px rgba(0,0,0,.1)}
+.btn-primary{background:var(--accent); border-color:var(--accent); color:#fff}
+.btn-primary:hover{background:#0b8a66; border-color:#0b8a66; color:#fff}
+.btn:disabled{opacity:.45; cursor:not-allowed; transform:none}
+
+/* ---------- shell ---------- */
+.shell{display:grid; grid-template-columns:216px minmax(0,1fr) 348px; gap:0; align-items:stretch}
+.rail{border-right:1px solid var(--line); padding:18px 16px 40px; background:var(--panel)}
+.rail-sec{margin-bottom:22px}
+.rail-sec h3{font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted); margin:0 0 9px; font-family:'JetBrains Mono',monospace}
+.ck{display:flex; align-items:center; gap:8px; padding:3.5px 0; cursor:pointer; font-size:13.5px; color:var(--ink2); user-select:none}
+.ck:hover{color:var(--ink)}
+.ck input{accent-color:var(--accent); width:14px; height:14px; cursor:pointer}
+.sw{width:9px; height:9px; border-radius:2.5px; background:var(--c); flex:none}
+.rail input[type=text]{
+  width:100%; font:inherit; font-size:13px; padding:7px 10px; border:1px solid var(--line);
+  border-radius:8px; background:var(--bg); color:var(--ink);
+}
+.rail input[type=text]:focus{outline:none; border-color:var(--accent); background:#fff}
+.kv{display:grid; grid-template-columns:auto 1fr; gap:3px 12px; margin:0; font-size:12.5px}
+.kv dt{color:var(--muted)}
+.kv dd{margin:0; color:var(--ink2); font-family:'JetBrains Mono',monospace; font-size:11.5px; text-align:right}
+
+/* ---------- stage ---------- */
+.stage{position:relative; overflow:hidden; background:
+  radial-gradient(circle at 1px 1px, #e7e5e4 1px, transparent 0) 0 0/22px 22px, var(--bg);}
+.stage-top{position:absolute; top:10px; left:14px; right:14px; z-index:5; display:flex; justify-content:space-between; pointer-events:none}
+.hint{font-size:11.5px; color:var(--muted); font-family:'JetBrains Mono',monospace; background:rgba(255,255,255,.75); padding:3px 8px; border-radius:6px}
+.zoomctl{pointer-events:auto; display:flex; gap:4px; align-items:center; background:rgba(255,255,255,.88); border:1px solid var(--line); border-radius:8px; padding:3px}
+.zoomctl button{border:0; background:transparent; cursor:pointer; font:inherit; font-size:14px; color:var(--ink2); width:24px; height:22px; border-radius:5px}
+.zoomctl button:hover{background:var(--line-soft); color:var(--ink)}
+.zoomctl span{font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--muted); min-width:38px; text-align:center}
+#cv{width:100%; height:calc(100vh - 118px); min-height:560px; display:block; cursor:grab}
+#cv.drag{cursor:grabbing}
+.legend{position:absolute; bottom:12px; left:14px; z-index:5; display:flex; gap:14px; flex-wrap:wrap;
+  background:rgba(255,255,255,.9); border:1px solid var(--line); border-radius:9px; padding:7px 12px; font-size:11.5px; color:var(--ink2)}
+.legend span{display:flex; align-items:center; gap:5px}
+.legend i{width:16px; height:2.5px; border-radius:2px; background:var(--c); display:inline-block}
+
+/* ---------- svg ---------- */
+.band{fill:#fff; stroke:var(--line); stroke-width:1; rx:14}
+.band-title{font-size:14px; font-weight:600; fill:var(--ink)}
+.band-sub{font-size:10.5px; fill:var(--muted); font-family:'JetBrains Mono',monospace}
+.lane-label{font-size:10.5px; fill:var(--muted); font-family:'JetBrains Mono',monospace; letter-spacing:.06em}
+.node rect{stroke-width:1.25; transition:opacity .2s ease}
+.node text{pointer-events:none}
+.n-name{font-size:13.5px; font-weight:600; fill:var(--ink)}
+.n-sub{font-size:10.5px; fill:var(--muted); font-family:'JetBrains Mono',monospace}
+.n-line{font-size:11.5px; fill:var(--ink2); font-family:'JetBrains Mono',monospace}
+.node{cursor:pointer}
+.node:hover .n-name{fill:var(--accent)}
+.edge{fill:none; stroke-width:1.6; transition:opacity .2s ease, stroke-width .2s ease}
+.edge-label{
+  font-size:10px; font-family:'JetBrains Mono',monospace; fill:var(--ink2);
+  pointer-events:none; opacity:0; transition:opacity .2s ease;
+  paint-order:stroke; stroke:#fafafa; stroke-width:3.5px; stroke-linejoin:round;
+}
+.edge-label.show{opacity:.92}
+.edge.dim{opacity:.10}
+.node.dim{opacity:.22}
+.edge.hot{stroke-width:2.6; opacity:1}
+.edge-label.hot{opacity:1; font-weight:500}
+.edge.live{stroke-width:3.2; opacity:1}
+.node.live rect{stroke-width:2.4}
+.dimmed{opacity:.18}
+.pulse{opacity:0}
+
+/* ---------- detail ---------- */
+.detail{border-left:1px solid var(--line); background:var(--panel); padding:18px 18px 44px; overflow-y:auto; max-height:calc(100vh - 118px)}
+.detail h2{font-size:17px; margin:0 0 2px; font-weight:600; line-height:1.3}
+.detail .dsub{font-size:12px; color:var(--muted); font-family:'JetBrains Mono',monospace; margin-bottom:12px}
+.detail h4{font-size:11px; letter-spacing:.11em; text-transform:uppercase; color:var(--muted); margin:16px 0 6px; font-family:'JetBrains Mono',monospace}
+.detail p{margin:0 0 8px; color:var(--ink2); font-size:13.5px}
+.code{display:flex; flex-direction:column; gap:3px}
+.code a{display:block; font-family:'JetBrains Mono',monospace; font-size:11.5px; color:var(--ink2);
+  background:var(--bg); border:1px solid var(--line-soft); border-radius:6px; padding:4px 8px; text-decoration:none}
+.code a:hover{border-color:var(--accent); color:var(--accent)}
+.facts{margin:0; display:grid; grid-template-columns:auto 1fr; gap:5px 12px; font-size:12.5px}
+.facts dt{color:var(--muted)}
+.facts dd{margin:0; color:var(--ink2)}
+.flowlist{margin:0; padding:0; list-style:none; font-size:12.5px}
+.flowlist li{padding:4px 0; border-bottom:1px dashed var(--line); color:var(--ink2); display:flex; gap:7px}
+.flowlist li:last-child{border-bottom:0}
+.flowlist .dot{width:7px; height:7px; border-radius:2px; background:var(--c); flex:none; margin-top:7px}
+.docs{margin:0; padding:0; list-style:none; font-size:12.5px}
+.docs li{padding:3px 0}
+.docs span{color:var(--ink2)}
+.docs i{color:var(--muted); font-style:normal; font-family:'JetBrains Mono',monospace; font-size:11px; display:block}
+.tag{display:inline-block; font-size:10.5px; font-family:'JetBrains Mono',monospace; padding:2px 7px; border-radius:20px;
+  background:color-mix(in srgb, var(--c) 12%, transparent); color:var(--c); border:1px solid color-mix(in srgb, var(--c) 28%, transparent)}
+.empty{color:var(--muted); font-size:13px}
+.empty ul{margin:8px 0 0; padding-left:18px}
+.empty li{margin-bottom:4px}
+
+/* ---------- step list ---------- */
+.steps{margin:0; padding:0; list-style:none; counter-reset:s}
+.steps li{
+  counter-increment:s; font-size:12.5px; color:var(--ink2); padding:5px 0 5px 26px; position:relative;
+  border-bottom:1px solid var(--line-soft); cursor:pointer;
+}
+.steps li::before{content:counter(s); position:absolute; left:0; top:5px; width:17px; height:17px; border-radius:50%;
+  border:1.5px solid var(--line); font-size:9.5px; display:flex; align-items:center; justify-content:center; color:var(--muted); font-family:'JetBrains Mono',monospace}
+.steps li.on::before{background:var(--accent); border-color:var(--accent); color:#fff}
+.steps li.on{color:var(--ink); font-weight:500}
+.steps li.done::before{background:#e6f5ef; border-color:var(--accent); color:var(--accent)}
+.steps li:hover{color:var(--ink)}
+
+/* ---------- notes ---------- */
+.notes{max-width:1180px; margin:0 auto; padding:44px 24px 80px}
+.notes h2{font-size:23px; font-weight:600; margin:44px 0 6px; letter-spacing:-.01em}
+.notes h2:first-child{margin-top:0}
+.notes .sub{color:var(--ink2); margin:0 0 18px; max-width:74ch}
+.cardgrid{display:grid; grid-template-columns:repeat(auto-fit,minmax(268px,1fr)); gap:14px}
+.card{background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px 18px; box-shadow:0 2px 8px rgba(0,0,0,.035)}
+.card h3{font-size:14.5px; margin:0 0 6px; font-weight:600; display:flex; align-items:center; gap:7px}
+.card p{margin:0; font-size:13px; color:var(--ink2)}
+.card code{font-family:'JetBrains Mono',monospace; font-size:11.5px; background:var(--line-soft); padding:1px 5px; border-radius:4px; color:var(--ink)}
+table{width:100%; border-collapse:collapse; font-size:13px; background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden}
+th,td{text-align:left; padding:9px 13px; border-bottom:1px solid var(--line-soft); vertical-align:top}
+th{font-size:11px; letter-spacing:.09em; text-transform:uppercase; color:var(--muted); font-family:'JetBrains Mono',monospace; font-weight:500; background:var(--bg)}
+tr:last-child td{border-bottom:0}
+td code{font-family:'JetBrains Mono',monospace; font-size:11.5px; color:var(--ink2)}
+.foot{margin-top:36px; padding-top:16px; border-top:1px solid var(--line); font-size:12.5px; color:var(--muted)}
+.foot code{font-family:'JetBrains Mono',monospace; font-size:11.5px}
+/* ---------- poster 模式：只留画布，给无头 Chrome 导出 4K 海报 ---------- */
+body.poster{background:#FCFAF6}
+body.poster .hd,body.poster .rail,body.poster .detail,body.poster .notes,
+body.poster .stage-top,body.poster .legend{display:none!important}
+body.poster .shell{display:block}
+body.poster .stage{overflow:hidden;background:#FCFAF6}
+body.poster #cv{width:100vw;height:100vh;min-height:0}
+body.poster .n-name,body.poster .n-sub,body.poster .n-line,body.poster .lane-label,
+body.poster .band-title,body.poster .band-sub{ /* 海报里字要清楚 */ }
+@media(max-width:1180px){ .shell{grid-template-columns:186px minmax(0,1fr) 300px} }
+@media(max-width:900px){
+  .shell{grid-template-columns:1fr}
+  .rail{border-right:0; border-bottom:1px solid var(--line); display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:18px}
+  .detail{border-left:0; border-top:1px solid var(--line); max-height:none}
+  #cv{height:70vh}
+}
+</style>
+</head>
+<body>
+
+<header class="hd">
+  <div class="hd-l">
+    <div class="brandbar"><svg class="brandmark" viewBox="0 0 180 64" height="34" width="96" aria-label="tako"><g fill="#BB7738">
+    <rect x="28" y="8" width="9" height="9" rx="2"/>
+    <rect x="28" y="42" width="9" height="9" rx="2"/>
+    <rect x="39" y="42" width="9" height="9" rx="2"/>
+  </g>
+  <g fill="#543A29">
+    <rect x="6" y="25" width="9" height="9" rx="2"/>
+    <rect x="17" y="25" width="9" height="9" rx="2"/>
+    <rect x="28" y="25" width="9" height="9" rx="2"/>
+    <rect x="39" y="25" width="9" height="9" rx="2"/>
+    <rect x="50" y="25" width="9" height="9" rx="2"/>
+  </g>
+  <g transform="translate(75 46) scale(1 -1)">
+    <path d="M14.82 30.89 L14.82 24.06 L23.05 24.06 L23.05 19.23 L14.82 19.23 L14.82 7.84 Q14.82 6.23 15.61 5.53 Q16.39 4.83 18.22 4.83 L23.05 4.83 L23.05 0.00 L17.77 0.00 Q12.35 0.00 10.44 1.73 Q8.53 3.46 8.53 8.14 L8.53 19.23 L2.38 19.23 L2.38 24.06 L8.53 24.06 L8.53 30.89 Z M38.53 11.30 Q35.01 11.30 33.61 10.40 Q32.21 9.50 32.21 7.30 Q32.21 5.67 33.18 4.71 Q34.15 3.74 35.80 3.74 Q38.29 3.74 39.67 5.62 Q41.04 7.50 41.04 10.87 L41.04 11.30 Z M47.29 13.73 L47.29 0.00 L41.04 0.00 L41.04 2.69 Q39.90 1.10 38.12 0.24 Q36.34 -0.62 34.19 -0.62 Q30.09 -0.62 27.80 1.55 Q25.51 3.72 25.51 7.61 Q25.51 11.82 28.24 13.83 Q30.97 15.83 36.68 15.83 L41.04 15.83 L41.04 16.89 Q41.04 18.41 39.94 19.20 Q38.83 19.98 36.68 19.98 Q34.43 19.98 32.31 19.41 Q30.19 18.84 27.89 17.60 L27.89 22.97 Q29.98 23.83 32.13 24.23 Q34.28 24.64 36.68 24.64 Q42.55 24.64 44.92 22.26 Q47.29 19.87 47.29 13.73 Z M50.72 33.43 L57.01 33.43 L57.01 15.88 L64.58 24.06 L72.20 24.06 L63.09 15.08 L72.72 0.00 L65.76 0.00 L59.16 11.26 L57.01 9.20 L57.01 0.00 L50.72 0.00 Z M83.71 19.53 Q81.45 19.53 80.16 17.54 Q78.87 15.55 78.87 12.01 Q78.87 8.46 80.16 6.48 Q81.45 4.49 83.71 4.49 Q85.98 4.49 87.27 6.48 Q88.56 8.46 88.56 12.01 Q88.56 15.55 87.27 17.54 Q85.98 19.53 83.71 19.53 Z M72.58 12.01 Q72.58 17.83 75.59 21.24 Q78.61 24.64 83.71 24.64 Q88.82 24.64 91.84 21.24 Q94.86 17.83 94.86 12.01 Q94.86 6.19 91.84 2.78 Q88.82 -0.62 83.71 -0.62 Q78.61 -0.62 75.59 2.78 Q72.58 6.19 72.58 12.01 Z" fill="#543A29"/>
+  </g>
+</svg><span class="kicker">运行引擎架构与数据流</span></div>
+    <h1>一场 run 从用户指尖到历史落库的完整链路</h1>
+    <p class="lede">点节点看它是什么、代码落在哪；点连线看这条数据流什么时候发生、带了什么、落到哪。或按「播放数据流」看一场真实 run 的生命周期怎么一步步走完。</p>
+  </div>
+  <div class="hd-r">
+    <button class="btn btn-primary" id="play">▶ 播放数据流</button>
+    <button class="btn" id="prev">‹ 上一步</button>
+    <button class="btn" id="next">下一步 ›</button>
+    <button class="btn" id="reset">重置</button>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="rail">
+    <section class="rail-sec">
+      <h3>图层</h3>
+      <div id="layerCks"></div>
+    </section>
+    <section class="rail-sec">
+      <h3>数据流类型</h3>
+      <div id="flowCks"></div>
+    </section>
+    <section class="rail-sec">
+      <h3>查找</h3>
+      <input type="text" id="q" placeholder="节点 / 代码 / 关键词">
+    </section>
+    <section class="rail-sec">
+      <h3>规模</h3>
+      <dl class="kv">
+        <dt>Go 源文件</dt><dd>219</dd>
+        <dt>非测试代码</dt><dd>~3.2 万行</dd>
+        <dt>PG 表</dt><dd>25+</dd>
+        <dt>Redis 临时键</dt><dd>2 类</dd>
+        <dt>前端</dt><dd>Vue 3 + Vite</dd>
+        <dt>引擎底座</dt><dd>Eino ADK</dd>
+      </dl>
+    </section>
+    <section class="rail-sec">
+      <h3>怎么读</h3>
+      <p style="font-size:12.5px;color:var(--ink2);margin:0">实线=请求／帧／定稿等主链路。<br>虚线=恢复链路。<br>双向箭头=一次往返（调用与结果）。<br>悬停任一节点会隔离它的上下游。</p>
+    </section>
+  </aside>
+
+  <main class="stage">
+    <div class="stage-top">
+      <span class="hint">滚轮缩放 · 拖拽平移 · 点击节点／连线</span>
+      <div class="zoomctl">
+        <button id="zout" title="缩小">−</button>
+        <span id="zval">100%</span>
+        <button id="zin" title="放大">+</button>
+        <button id="zfit" title="适应画布">⤢</button>
+      </div>
+    </div>
+    <svg id="cv" viewBox="0 0 1470 1080" preserveAspectRatio="xMidYMid meet">
+      <defs>
+        <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,1 L9,5 L0,9 z" fill="context-stroke"/>
+        </marker>
+      </defs>
+      <rect x="0" y="0" width="1470" height="1080" fill="#FCFAF6"/>
+      <g id="gBrand"><rect x="0" y="0" width="1470" height="100" fill="#F5E9D2"/><rect x="0" y="100" width="1470" height="1" fill="#E2CDA6"/><svg x="40" y="18" width="180" height="64" viewBox="0 0 180 64"><g fill="#BB7738">
+    <rect x="28" y="8" width="9" height="9" rx="2"/>
+    <rect x="28" y="42" width="9" height="9" rx="2"/>
+    <rect x="39" y="42" width="9" height="9" rx="2"/>
+  </g>
+  <g fill="#543A29">
+    <rect x="6" y="25" width="9" height="9" rx="2"/>
+    <rect x="17" y="25" width="9" height="9" rx="2"/>
+    <rect x="28" y="25" width="9" height="9" rx="2"/>
+    <rect x="39" y="25" width="9" height="9" rx="2"/>
+    <rect x="50" y="25" width="9" height="9" rx="2"/>
+  </g>
+  <g transform="translate(75 46) scale(1 -1)">
+    <path d="M14.82 30.89 L14.82 24.06 L23.05 24.06 L23.05 19.23 L14.82 19.23 L14.82 7.84 Q14.82 6.23 15.61 5.53 Q16.39 4.83 18.22 4.83 L23.05 4.83 L23.05 0.00 L17.77 0.00 Q12.35 0.00 10.44 1.73 Q8.53 3.46 8.53 8.14 L8.53 19.23 L2.38 19.23 L2.38 24.06 L8.53 24.06 L8.53 30.89 Z M38.53 11.30 Q35.01 11.30 33.61 10.40 Q32.21 9.50 32.21 7.30 Q32.21 5.67 33.18 4.71 Q34.15 3.74 35.80 3.74 Q38.29 3.74 39.67 5.62 Q41.04 7.50 41.04 10.87 L41.04 11.30 Z M47.29 13.73 L47.29 0.00 L41.04 0.00 L41.04 2.69 Q39.90 1.10 38.12 0.24 Q36.34 -0.62 34.19 -0.62 Q30.09 -0.62 27.80 1.55 Q25.51 3.72 25.51 7.61 Q25.51 11.82 28.24 13.83 Q30.97 15.83 36.68 15.83 L41.04 15.83 L41.04 16.89 Q41.04 18.41 39.94 19.20 Q38.83 19.98 36.68 19.98 Q34.43 19.98 32.31 19.41 Q30.19 18.84 27.89 17.60 L27.89 22.97 Q29.98 23.83 32.13 24.23 Q34.28 24.64 36.68 24.64 Q42.55 24.64 44.92 22.26 Q47.29 19.87 47.29 13.73 Z M50.72 33.43 L57.01 33.43 L57.01 15.88 L64.58 24.06 L72.20 24.06 L63.09 15.08 L72.72 0.00 L65.76 0.00 L59.16 11.26 L57.01 9.20 L57.01 0.00 L50.72 0.00 Z M83.71 19.53 Q81.45 19.53 80.16 17.54 Q78.87 15.55 78.87 12.01 Q78.87 8.46 80.16 6.48 Q81.45 4.49 83.71 4.49 Q85.98 4.49 87.27 6.48 Q88.56 8.46 88.56 12.01 Q88.56 15.55 87.27 17.54 Q85.98 19.53 83.71 19.53 Z M72.58 12.01 Q72.58 17.83 75.59 21.24 Q78.61 24.64 83.71 24.64 Q88.82 24.64 91.84 21.24 Q94.86 17.83 94.86 12.01 Q94.86 6.19 91.84 2.78 Q88.82 -0.62 83.71 -0.62 Q78.61 -0.62 75.59 2.78 Q72.58 6.19 72.58 12.01 Z" fill="#543A29"/>
+  </g>
+</svg><text x="248" y="45" font-size="29" font-weight="600" fill="#543A29" font-family="'Outfit','PingFang SC',sans-serif">架构与数据流</text><text x="248" y="73" font-size="13" fill="#8A684C" font-family="'Outfit','PingFang SC',sans-serif">多租户 Agent 运行时 · 一场 run 从投递到定稿的完整链路</text><text x="742" y="40" font-size="11.5" fill="#A08D7A" font-family="'JetBrains Mono',monospace">Go + Gin + Eino ADK</text><text x="742" y="58" font-size="11.5" fill="#A08D7A" font-family="'JetBrains Mono',monospace">PostgreSQL + Redis + Redpanda</text><text x="742" y="76" font-size="11.5" fill="#A08D7A" font-family="'JetBrains Mono',monospace">Vue 3 · 2026-11-13</text><line x1="1032" y1="26" x2="1047" y2="26" stroke="#2563eb" stroke-width="2.5" stroke-linecap="round"/><text x="1053" y="30" font-size="11" fill="#6B5647" font-family="'JetBrains Mono',monospace">请求流</text><line x1="1166" y1="26" x2="1181" y2="26" stroke="#d97706" stroke-width="2.5" stroke-linecap="round"/><text x="1187" y="30" font-size="11" fill="#6B5647" font-family="'JetBrains Mono',monospace">帧流</text><line x1="1300" y1="26" x2="1315" y2="26" stroke="#0891b2" stroke-width="2.5" stroke-linecap="round"/><text x="1321" y="30" font-size="11" fill="#6B5647" font-family="'JetBrains Mono',monospace">工具往返</text><line x1="1032" y1="48" x2="1047" y2="48" stroke="#059669" stroke-width="2.5" stroke-linecap="round"/><text x="1053" y="52" font-size="11" fill="#6B5647" font-family="'JetBrains Mono',monospace">定稿流</text><line x1="1166" y1="48" x2="1181" y2="48" stroke="#7c3aed" stroke-width="2.5" stroke-linecap="round"/><text x="1187" y="52" font-size="11" fill="#6B5647" font-family="'JetBrains Mono',monospace">记忆流</text><line x1="1300" y1="48" x2="1315" y2="48" stroke="#db2777" stroke-width="2.5" stroke-linecap="round"/><text x="1321" y="52" font-size="11" fill="#6B5647" font-family="'JetBrains Mono',monospace">编排流</text><line x1="1032" y1="70" x2="1047" y2="70" stroke="#dc2626" stroke-width="2.5" stroke-linecap="round"/><text x="1053" y="74" font-size="11" fill="#6B5647" font-family="'JetBrains Mono',monospace">恢复流</text><line x1="1166" y1="70" x2="1181" y2="70" stroke="#64748b" stroke-width="2.5" stroke-linecap="round"/><text x="1187" y="74" font-size="11" fill="#6B5647" font-family="'JetBrains Mono',monospace">文件流</text><line x1="1300" y1="70" x2="1315" y2="70" stroke="#0d9488" stroke-width="2.5" stroke-linecap="round"/><text x="1321" y="74" font-size="11" fill="#6B5647" font-family="'JetBrains Mono',monospace">事件流</text></g>
+      <g id="shift" transform="translate(0,110)">
+      <g id="root">
+        <g id="gBands"></g>
+        <g id="gEdges"></g>
+        <g id="gLabels"></g>
+        <g id="gNodes"></g>
+        <circle id="pulse" r="5.5" fill="#0f9d76" stroke="#fff" stroke-width="2" class="pulse"/>
+      </g>
+      </g>
+    </svg>
+    <div class="legend" id="legend"></div>
+  </main>
+
+  <aside class="detail" id="detail"></aside>
+</div>
+
+<section class="notes" id="notes"></section>
+
+<script>
+/* 海报模式：?poster —— 只留画布，给无头 Chrome 导出 4K PNG。
+   交互模式不画画布内的品牌带（页头已有真 Logo，避免两套标识）；海报模式才画。 */
+const POSTER=/[?&]poster/.test(location.search);
+if(POSTER){
+  document.body.classList.add('poster');
+  document.title='tako · 架构与数据流（海报）';
+} else {
+  const gb=document.getElementById('gBrand'); if(gb) gb.setAttribute('display','none');
+  const sh=document.getElementById('shift');  if(sh) sh.setAttribute('transform','translate(0,0)');
+  document.getElementById('cv').setAttribute('viewBox','0 0 1470 970');
+}
+/* =========================================================================
+   数据：节点 / 连线 / 步骤。所有内容取自 doc/19-v6、doc/53、doc/16、doc/70
+   ========================================================================= */
+const LAYERS=[
+ {id:'fe', name:'前端', sub:'Vue 3 SPA', color:'var(--c-fe)', y:24, h:118},
+ {id:'api',name:'接入层', sub:'Go + Gin', color:'var(--c-api)', y:160, h:118},
+ {id:'eng',name:'运行引擎', sub:'Worker · Eino', color:'var(--c-eng)', y:296, h:310},
+ {id:'md', name:'模型层', sub:'厂商 API', color:'var(--c-md)', y:626, h:112},
+ {id:'st', name:'存储层', sub:'PG · Redis · MQ', color:'var(--c-st)', y:758, h:176}
+];
+const FLOWS={
+ request:{n:'请求流', c:'var(--f-request)'},
+ frame:{n:'帧流', c:'var(--f-frame)'},
+ tool:{n:'工具往返', c:'var(--f-tool)'},
+ finalize:{n:'定稿流', c:'var(--f-finalize)'},
+ memory:{n:'记忆流', c:'var(--f-memory)'},
+ orch:{n:'编排流', c:'var(--f-orch)'},
+ recover:{n:'恢复流', c:'var(--f-recover)'},
+ fs:{n:'文件流', c:'var(--f-fs)'},
+ event:{n:'事件流', c:'var(--f-event)'}
+};
+const LANES=[
+ {t:'一次 run 的生命周期', y:348, layer:'eng'},
+ {t:'工具与子代理', y:452, layer:'eng'},
+ {t:'多 Agent 编排', y:544, layer:'eng'}
+];
+
+const NODES=[
+/* ---------------- 前端 ---------------- */
+{id:'fe-chat',layer:'fe',x:230,y:56,w:150,h:56,name:'对话页',sub:'多会话实例池',
+ what:'Vue 单页应用的主视图。一个用户可以同时开着多场会话，每场是一个独立的实例；切走不打断运行中的那场，回来时按游标续拉。每个会话右侧挂着工作区与任务面板。',
+ code:['web/src/App.vue','web/src/chat.ts','web/src/chatpool.ts'],
+ role:'整条链路的起点与终点。发消息走 POST /api/runs，收帧走 GET /api/runs/:id/frames（或 SSE），收口走 GET /api/sessions/:id/log。',
+ facts:[['发消息','POST /api/runs {content, workspaceId?}'],['看生成中','GET /api/runs/:id/frames?eventOffset=N'],['看定稿','GET /api/sessions/:id/log?runlogOffset=N'],['等答案','GET /api/sessions/:id → liveRunId']],
+ docs:[['doc/19-v6/19v6-01-契约-四个API.md','四个端点的请求／响应字节'],['doc/19-v6/19v6-02-reconcile与双游标.md','双游标 reconcile 流程'],['doc/60-多会话并发.md','切走保留与实例上限']]},
+{id:'fe-proj',layer:'fe',x:404,y:56,w:150,h:56,name:'项目目录',sub:'一员工=一项目',
+ what:'tako 的产品形态：一个员工对应一个项目，项目里的文件由他的多场会话共享。团队共享账号、额度与审计，但不共享文件。',
+ code:['web/src/ProjectsView.vue','internal/runengine/product_store.go'],
+ role:'为会话提供工作区落点。新会话默认挂在当前项目下，项目目录决定这一场 run 能读写哪些文件。',
+ facts:[['文件归属','项目 content 根（用户内容）'],['运行产物','独立 runtime 运行资源根'],['共享粒度','账号 / 额度 / 审计，不共享文件']],
+ docs:[['doc/42-产品形态收窄与共享项目退役.md','形态定稿'],['doc/35-项目目录.md','工作区目录'],['doc/76-项目内容目录与运行资源容器.md','content 根 + runtime 根']]},
+{id:'fe-skill',layer:'fe',x:578,y:56,w:150,h:56,name:'技能',sub:'Skill 目录',
+ what:'技能（Skill）的目录、详情、启用禁用与安装提案。技能正文在折叠时被换成标记，靠 read_skill 按需重读，不占常驻上下文。',
+ code:['web/src/SkillsView.vue','web/src/SkillInstallCard.vue','internal/runengine/skilltools.go'],
+ role:'管理面，不在主链路上；技能正文会作为工具结果进入 run 的模型输入。',
+ facts:[['工具','read_skill / use_skill / read_skill_file / skill_install'],['瘦身','折叠时换标记，按需重读'],['安装','提案落成等人行，点头才落盘']],
+ docs:[['doc/52-技能.md','技能方案']]},
+{id:'fe-tool',layer:'fe',x:752,y:56,w:150,h:56,name:'工具',sub:'租户工具根',
+ what:'租户级工具根的扫盘列表、上传与删除。可以把自带的脚本／工具挂给本租户的 agent 使用。',
+ code:['web/src/ToolsView.vue','internal/runengine/toolroots.go'],
+ role:'管理面；工具根里的东西在装配阶段进入本场 run 的工具池。',
+ facts:[['装配点','profile.go 装配 RunProfile 时裁剪'],['隔离','按租户命名空间隔离']],
+ docs:[['doc/19-v6/19v6-06-deferred-tools与缓存机制.md','工具分级与 deferred 机制']]},
+{id:'fe-team',layer:'fe',x:926,y:56,w:150,h:56,name:'团队 / 任务页',sub:'成员 · Task',
+ what:'两个视图合一：团队侧是成员、邀请、租户切换；任务侧是持久 Task 与编排组的全量列表，可停止、可恢复、可看详情。',
+ code:['web/src/MembersView.vue','web/src/TasksView.vue','internal/runengine/agent_task_api.go'],
+ role:'消费事件流（Redis Pub/Sub → /api/events）来感知任务与编排的状态变化。',
+ facts:[['成员','增删改 / 角色 / 转让所有者'],['邀请','建、列、撤销、接受、拒绝'],['任务','全量可见：停止 / 恢复 / 详情']],
+ docs:[['doc/36-团队前端.md','团队前端'],['doc/70-多Agent编排与Task/03-第一版方案.md','持久 Task 与固定 DAG 编排'],['doc/46-变更同步与事件通道.md','事件通道']]},
+/* ---------------- 接入层 ---------------- */
+{id:'api-auth',layer:'api',x:230,y:192,w:250,h:56,name:'认证中间件 · 统一信封',sub:'{code,message,data}',
+ what:'access / refresh 双令牌签发与校验，中间件 RequireAuth / RequireSystemAdmin / RequireTenantRole / PathTenantMatch。成功和失败都回统一信封：code（数字业务码）→ message（弹窗文案）→ data（业务体）。',
+ code:['internal/runengine/auth.go','internal/runengine/scope.go'],
+ role:'所有请求的第一道门。校验通过后把 tenantID / userID 塞进 scope，后续每一层按这个范围取数、算配额、判可见性。',
+ facts:[['信封顺序','code → message → data'],['code','0 成功；非 0 为业务码，页面靠它分支'],['message','成功为空串；失败是给人看的一句话'],['不变量','机器码、堆栈、SQL 不进 message']],
+ docs:[['doc/40-响应信封统一.md','信封规则与码表'],['doc/28-多租户.md','多租户运行时']]},
+{id:'api-product',layer:'api',x:504,y:192,w:250,h:56,name:'产品 API',sub:'工作区 / 租户 / 技能 / 工具',
+ what:'业务面的大杂烩：工作区（项目目录）增删改查、租户 CRUD、租户级笔记、主 agent 与子代理的租户级配置、邀请、用量视图、租户级 MCP 配置、模型解析预览。dev 探针也在这里，且只在 -dev 模式注册。',
+ code:['internal/runengine/product_api.go','internal/runengine/tenant_api.go'],
+ role:'管理面。跑一场 run 之前，前端先从这里把项目、模型配置、MCP 配置准备好。',
+ facts:[['工作区','建/列/改/删 + 文件清单'],['Agent 配置','模型 ref / 工具策略 / 技能作用域'],['运行时配置','租户级 MCP 配置']],
+ docs:[['doc/35-项目目录.md','项目目录'],['doc/34-租户运行时装配.md','租户运行时装配'],['doc/36-团队前端.md','团队前端']]},
+{id:'api-4api',layer:'api',x:778,y:192,w:250,h:56,name:'四个产品 API',sub:'runs / sessions / frames / stream',
+ what:'运行面的全部契约面。POST /api/runs 创建 run（等于投递消息，含首条消息懒建会话）；GET /api/sessions/{id} 查状态（活 run + runlog 高水位），是 reconcile 的唯一入口；GET /api/runs/{id}/frames 拉生成中的帧；GET /api/runs/{id}/stream 是同一帧面的 SSE 运输。',
+ code:['internal/runengine/server.go'],
+ role:'主链路的中枢。投递在这里发生，生成中的观察在这里发生，收口也在从这里出发。',
+ facts:[['创建','POST /api/runs → 202 + runId'],['观察','GET /api/runs/:id/frames?eventOffset=N'],['收口','GET /api/sessions/:id/log?runlogOffset=N'],['活 run','GET /api/sessions/:id → liveRunId（空=闲着）'],['控制','POST /api/runs/:id/stop · /resume']],
+ docs:[['doc/19-v6/19v6-01-契约-四个API.md','端点字节真源'],['doc/31-sse流式端点.md','SSE 端点'],['doc/30-崩溃续跑.md','resume']]},
+{id:'api-events',layer:'api',x:1052,y:192,w:250,h:56,name:'事件通道 /api/events',sub:'Redis Pub/Sub → SSE',
+ what:'把 Redis 发布订阅里的租户级事件流以 SSE 吐给前端。用于变更同步：任务状态、编排进展这类「服务端发生了变化」由它推，而不是让前端狂轮询。',
+ code:['internal/runengine/events.go'],
+ role:'主链路之外的第二条实时通道。拉取（frames）保证正确性，事件流是优化。',
+ facts:[['运输','SSE'],['来源','Redis 发布订阅'],['用途','变更同步（任务 / 编排状态）']],
+ docs:[['doc/46-变更同步与事件通道.md','事件通道方案']]},
+/* ---------------- 运行引擎 ---------------- */
+{id:'eng-gate',layer:'eng',x:230,y:360,w:210,h:56,name:'运行闸 AcquireRun',sub:'两把闸都在 DB',
+ what:'抢 run 位的那一步。两把闸：一把管一场会话（runs 表上 one_live_run_per_session 部分唯一索引，WHERE status=running，插入失败本身就是 409）；一把管一个租户（事务内先拿 pg_advisory_xact_lock，再数该租户的活 run，超 max_concurrent_runs 就 429 113001）。数与放行收在同一笔事务里，中间持一把所有副本共享的顾问锁。',
+ code:['internal/runengine/store.go','internal/runengine/scope.go'],
+ role:'主链路第一站。闸在这里，所以多副本下不可能超发、也不可能同一会话并发两场。',
+ facts:[['会话闸','UNIQUE(session_id) WHERE status=running'],['租户闸','pg_advisory_xact_lock + 数活 run'],['冲突','会话忙 409；租户满 429 113001'],['出生即带租约','INSERT 同笔写 lease_until'],['无 DDL','计数口径不变，契约字节不变']],
+ docs:[['doc/43-租户并发闸入DB.md','租户并发闸进数据库'],['doc/19-v6/19v6-03-存储形态与生命周期.md','闸的落库形态'],['doc/42-产品形态收窄与共享项目退役.md','项目闸退役']]},
+{id:'eng-profile',layer:'eng',x:462,y:360,w:210,h:56,name:'RunProfile 装配',sub:'模型 · 工具池 · MCP',
+ what:'一场 run 起来前把零件拼成 RunProfile：把「模型 ref」解析成可用的 ModelInstance（对接 internal/config 的厂商目录）、连上 MCP、裁好工具池（deferred 工具靠 tool_search 的 BM25 命中才进激活集）、划清子代理的工具边界。装配失败返回带业务码的 assembleError。',
+ code:['internal/runengine/profile.go','internal/runengine/tenantmodel.go','internal/runengine/agents.go'],
+ role:'模型请求的必经之路，也是召回块进入模型输入的地方。',
+ facts:[['模型','租户模型表 → 生效 ref → 已构建的 chat model'],['工具','direct 直给 + deferred 命中才激活'],['MCP','stdio 连接，工具名 mcp__短名__工具名'],['失败','返回带业务码的 assembleError']],
+ docs:[['doc/34-租户运行时装配.md','租户运行时装配'],['doc/19-v6/19v6-05-tool-loop.md','tool loop 与工具双投影'],['doc/19-v6/19v6-06-deferred-tools与缓存机制.md','deferred 机制']]},
+{id:'eng-loop',layer:'eng',x:694,y:360,w:210,h:56,name:'模型—工具循环',sub:'Eino ADK Agent',
+ what:'run 的心脏。prepareInput 从 run_model_messages 读 compacted=false 的行（模型现在该看到什么），拼上召回块与笔记快照，交给 Eino 的 ChatModelAgent；模型流回来的每个 delta 都压成帧；模型要调工具就调，工具结果回灌继续下一轮，直到模型不再要工具。',
+ code:['internal/runengine/worker.go','internal/runengine/tools.go','internal/runengine/agentlog.go'],
+ role:'数据流上最忙的一个节点：向上要模型、向下要工具、往左压帧、往右定稿。',
+ facts:[['输入源','run_model_messages（compacted=false）'],['输出','每个 delta 一帧（kind=delta）'],['工具','tool_call → tool_result 回灌'],['收尾','defer 里 EndRun：放闸 + 定稿同一笔事务']],
+ docs:[['doc/19-v6/19v6-05-tool-loop.md','tool loop 机制'],['doc/19-v6/19v6-04-验收-curl.md','期望字节'],['doc/24-用量计数.md','用量计数与滤思考']]},
+{id:'eng-fold',layer:'eng',x:926,y:360,w:210,h:56,name:'压缩 / 折叠 / 溢出救援',sub:'compact · midfold · guard',
+ what:'上下文超了怎么办，三层机制接力：compact 在发送前自测超限就压缩（原文行保留作审计，seq=0 的摘要行替代可见内容）；midfold 在 run 中途折叠，把长工具结果折掉；guard/overflow 识别供应商的溢出报错并强制压缩后只重试一次。折叠后从工具调用记录重建「文件操作清单」钉在摘要末尾——路径靠程序重抄，不靠模型记性。',
+ code:['internal/runengine/compact.go','internal/runengine/midfold.go','internal/runengine/guard.go','internal/runengine/overflow.go','internal/runengine/fileops.go'],
+ role:'保证一场长 run 不会因为窗口爆掉而中断；也是模型输入侧唯一会改写历史形状的地方。',
+ facts:[['触发','worker 发送前自测，无定时器'],['落点','压 run_model_messages，不动 runlog'],['摘要行','seq=0，role=user'],['溢出救援','强制压缩只重试一次'],['账本继承','文件清单从调用记录重建，钉在摘要末尾']],
+ docs:[['doc/19-v6/19v6-07-compact.md','compact 机制'],['doc/19-v6/19v6-10-mid-run-fold.md','mid-run fold'],['doc/19-v6/19v6-09-溢出修复层.md','溢出救援']]},
+{id:'eng-sub',layer:'eng',x:1158,y:360,w:210,h:56,name:'子代理委派',sub:'coder / researcher',
+ what:'把一件活交给另一个 agent：工具名就是子代理规格名，父 agent 调它就是派发。子代理有独立上下文、自己的工具白名单（coder 能改文件跑命令，researcher 只能调研不能跑命令）、以及一份追加式的持久档案。每个实例一份 wire 档案（.tako/subagents/ 下的 JSONL），resume_subagent 只认完整档案，不做半截重接。',
+ code:['internal/runengine/agents.go','internal/runengine/subagent_wire.go','internal/runengine/resume_subagent.go','agents/coder.md','agents/researcher.md'],
+ role:'一次 run 内部的纵向拆分；和「多 Agent 编排」不同——委派是同步工具调用，编排是脱离工具调用的独立工作。',
+ facts:[['规格','YAML frontmatter + 正文指令，每场 run 扫盘加载'],['工具边界','tools: / exclude_tools: 裁剪'],['档案','.tako/subagents/ 追加式 JSONL'],['恢复','只认完整档案']],
+ docs:[['doc/23-coder规格.md','coder 规格'],['doc/26-researcher工具护栏.md','护栏'],['doc/39-子代理持久化与resume.md','持久档案与 resume']]},
+{id:'eng-tool-bash',layer:'eng',x:230,y:462,w:160,h:48,name:'bash',sub:'沙箱围栏',
+ what:'跑 shell 命令。围栏是硬边界：macOS 用 sandbox-exec profile，Linux 用 bwrap 逐个卸命名空间（不卸 net），出站开、入站关；探测失败就 fail closed，不放行。输出有上限，超了截断并给提示，大输出落盘到 runtime 运行资源根。',
+ code:['internal/runengine/bash.go','internal/runengine/sandbox.go','internal/runengine/bashspill.go'],
+ role:'工具往返的一端。调用与结果是一对，模型拿到 tool_result 继续下一轮。',
+ facts:[['macOS','sandbox-exec profile'],['Linux','bwrap（不卸 net）'],['网络','出站开 / 入站关'],['失败策略','探测失败 fail closed'],['子进程 PATH','按工具根过滤']],
+ docs:[['doc/28-多租户.md','沙箱口径'],['doc/58-读分页与输出留存.md','bash 大输出留尾 / 全文落盘']]},
+{id:'eng-tool-files',layer:'eng',x:406,y:462,w:160,h:48,name:'文件工具族',sub:'11 个工具',
+ what:'读写文件的十一件套：write_file / read_text_file / read_file / edit_file / move_file / create_directory / list_directory / directory_tree / get_file_info / search_files / read_media_file。路径不出工作区圈；同一个文件并发写用文件锁与 SHA 指纹互斥。',
+ code:['internal/runengine/filetools.go','internal/runengine/filelock.go','internal/runengine/filefp.go'],
+ role:'工具往返的一端；也是折叠后「文件操作清单」的重建来源。',
+ facts:[['围栏','路径不出工作区圈'],['并发','同文件并发写用锁（多进程互斥）'],['媒体','对话只存 path，不存 base64'],['清单','折叠后从调用记录重建']],
+ docs:[['doc/19-v6/19v6-08-file-tools.md','文件工具族契约'],['doc/32-media-offload.md','media 只存 path'],['doc/71-文件写入竞争.md','文件写入竞争']]},
+{id:'eng-tool-mcp',layer:'eng',x:582,y:462,w:160,h:48,name:'MCP 工具',sub:'stdio 连接',
+ what:'接外部 MCP server（stdio 本地进程）。server 的工具直接进工具池，名字是 mcp__短名__工具名。MCP 进程也进围栏。',
+ code:['internal/runengine/mcp.go','internal/runengine/mcpconf.go'],
+ role:'工具往返的一端；也是工具池里唯一「不是我们自己写的」那一类。',
+ facts:[['传输','stdio（本地进程）'],['工具名','mcp__短名__工具名'],['围栏','MCP 进程也进沙箱']],
+ docs:[['doc/33-mcp-client.md','MCP client']]},
+{id:'eng-tool-web',layer:'eng',x:758,y:462,w:160,h:48,name:'web_search',sub:'DeepSeek / 兜底',
+ what:'联网搜索。主通道是 DeepSeek 的 /v1/tools/search，兜底是 searchfree；结果先落盘到 .tako/search/ 再把描述段给模型，避免一大坨正文占窗口。',
+ code:['internal/runengine/websearch.go'],
+ role:'工具往返的一端；结果落盘是纪律，不是可选。',
+ facts:[['主通道','DeepSeek /v1/tools/search'],['兜底','searchfree'],['纪律','结果始终落盘再给描述段']],
+ docs:[['doc/22-网络搜索.md','网络搜索'],['doc/57-网络抓取.md','网络抓取']]},
+{id:'eng-tool-search',layer:'eng',x:934,y:462,w:160,h:48,name:'tool_search',sub:'BM25 检索工具',
+ what:'延迟工具发现。工具池里的工具分成 direct（直接声明）和 deferred（只在目录里）。模型想用某个 deferred 工具时调 tool_search，用 BM25 在目录里检索，命中之后才进激活集，下一轮就能直接调。',
+ code:['internal/runengine/toolsearch.go'],
+ role:'工具往返的一端；让工具池不必全量塞进每一轮上下文。',
+ facts:[['算法','BM25'],['两态','direct / deferred'],['激活','命中后才进激活集'],['重建','每轮用 run 内完整目录重建声明面']],
+ docs:[['doc/19-v6/19v6-06-deferred-tools与缓存机制.md','deferred 工具'],['doc/19-v6/19v6-05-tool-loop.md','工具目录']]},
+{id:'eng-tool-coder',layer:'eng',x:1110,y:462,w:160,h:48,name:'coder / researcher',sub:'出厂规格',
+ what:'两个出厂子代理的规格文件。coder 是整包执行者：能改文件、写脚本、跑命令；researcher 只做调研与资料整理，不能跑命令。规格里的 tools 白名单会挡掉 search_history / web_search。',
+ code:['agents/coder.md','agents/researcher.md'],
+ role:'被 eng-sub 按名派发；每场 run 起来时扫盘加载。',
+ facts:[['coder','可改文件 / 写脚本 / 跑命令'],['researcher','只调研，不能跑命令'],['护栏','exclude_tools 四态']],
+ docs:[['doc/23-coder规格.md','coder 规格逐字'],['doc/26-researcher工具护栏.md','四态排除']]},
+{id:'eng-task',layer:'eng',x:230,y:552,w:250,h:48,name:'持久 Task',sub:'一件独立的活',
+ what:'让一件工作脱离一次同步工具调用：它有自己的身份、输入、执行 run、状态、结果与通知。模型用 delegate_task / create_orchestration 派发，服务端一次原子创建整组。',
+ code:['internal/runengine/agent_task_store.go','internal/runengine/agent_task_tools.go','internal/runengine/agent_task_types.go'],
+ role:'和「子代理委派」的区别就在这里：委派是父 agent 等着，Task 不等。',
+ facts:[['表','agent_tasks / agent_task_links'],['创建','整组原子创建，幂等'],['执行','独立 session + 独立 run']],
+ docs:[['doc/70-多Agent编排与Task/03-第一版方案.md','V1 方案'],['doc/72-多Agent编排下一阶段.md','下一阶段']]},
+{id:'eng-orch',layer:'eng',x:504,y:552,w:250,h:48,name:'DAG 依赖调度',sub:'ready 才放行',
+ what:'一组 Task 按创建时声明的依赖推进。调度循环按秒扫，原子领取 ready 的任务起独立 session + run；上游没成功，下游就停在 pending；上游失败，阻断沿依赖边传播。',
+ code:['internal/runengine/agent_task_scheduler.go','internal/runengine/agent_task_graph.go','internal/runengine/agent_task_runner.go','internal/runengine/agent_task_recovery.go'],
+ role:'多 Agent 编排的推进器；崩溃后靠显式恢复接管（同 run epoch+1）。',
+ facts:[['调度','每秒一轮，原子领取'],['依赖','A、B 成功才放 C ready'],['失败','沿依赖边阻断传播'],['恢复','显式接管，epoch+1'],['工作区','并行任务各自隔离工作现场']],
+ docs:[['doc/74-并行任务工作区隔离.md','并行隔离与交接'],['doc/73-协调通知与交付恢复.md','协调与恢复'],['doc/75-目标重规划与继任编排组.md','继任组']]},
+{id:'eng-deliver',layer:'eng',x:778,y:552,w:250,h:48,name:'协调交付',sub:'整组单次交付',
+ what:'一组任务全部结束后，协调职责把结果整组单次交付回来源会话（orchestration_finished 事件 + 通知，失败有重试与尝试计数）。如果目标被判为不可行，会建继任编排组并复用上一组的结果。',
+ code:['internal/runengine/agent_task_delivery.go','internal/runengine/agent_task_notification.go','internal/runengine/agent_task_successor.go','internal/runengine/agent_task_handoff.go'],
+ role:'编排链路的最后一跳：把分散在多个 run 里的结果收成一份，回给发话的那场会话。',
+ facts:[['表','agent_notifications / agent_notification_attempts'],['交付','整组一次，不零散回'],['不可行','判可行性 → 建继任组，复用上一组结果']],
+ docs:[['doc/73-协调通知与交付恢复.md','交付与通知'],['doc/75-目标重规划与继任编排组.md','继任编排组']]},
+/* ---------------- 模型层 ---------------- */
+{id:'md-tenant',layer:'md',x:230,y:668,w:250,h:56,name:'租户模型装配',sub:'tenant model → 生效 ref',
+ what:'把租户配置的模型 ref 变成真正能调用的模型实例：按平台默认与租户覆盖的优先级取生效 ref，再去 internal/config 的注册表里解析并缓存已构建的模型。API Key 落库前加密（密封值标记）。',
+ code:['internal/runengine/tenantmodel.go','internal/runengine/secretseal.go','internal/config/modelregistry.go'],
+ role:'模型请求的落地步骤。租户没装 *_API_KEY 就起不了 run（回 111408，是设计不是故障）。',
+ facts:[['优先级','平台默认 vs 租户覆盖'],['密钥','落库前加密，读出解密'],['缓存','按 ref 解析并缓存，缓存键是指纹'],['失败','租户没 API Key → 111408']],
+ docs:[['doc/28-多租户.md','租户与密钥'],['doc/34-租户运行时装配.md','装配口径']]},
+{id:'md-vendor',layer:'md',x:504,y:668,w:250,h:56,name:'厂商 API',sub:'DeepSeek · OpenAI · Anthropic · Ollama',
+ what:'真正的外部模型。internal/config 里有厂商目录（provider-catalog.json：协议、base URL、模型清单、视觉能力）和环境变量发现（ResolvedProvider → ResolvedModel，Ollama 特例），按协议构建 ToolCallingChatModel。',
+ code:['internal/config/catalog.go','internal/config/resolve.go','internal/config/model.go','internal/config/provider-catalog.json'],
+ role:'整条链路上唯一的外部依赖，也是唯一会把流式 token 送回来的地方。',
+ facts:[['目录','provider-catalog.json：协议 / base URL / 视觉能力'],['发现','从环境变量发现可用厂商'],['构建','按协议构建 ToolCallingChatModel'],['特殊','Ollama 特例'],['media','图片按厂商规则折 token 后再发']],
+ docs:[['doc/32-media-offload.md','图片 token 计价'],['doc/24-用量计数.md','用量计数']]},
+/* ---------------- 存储层 ---------------- */
+{id:'db-pg',layer:'st',x:230,y:794,w:540,h:124,type:'store',name:'PostgreSQL',sub:'永久真源',
+ lines:['sessions · runs · run_model_messages','runlog_entries · run_journal · run_questions','workspaces · agent_tasks · agent_orchestrations · agent_task_links','memory_items · dialogue_chunks · notes · users · tenants'],
+ what:'所有要长期成立的状态都在这里。runlog_entries 记「产出了什么」（历史展示只读它）；run_model_messages 记「模型现在该看到什么」（worker 组装输入的唯一来源，compact 压它、不动 runlog）；runs 表一行活 run 就是一把闸。',
+ code:['internal/runengine/pgstore.go'],
+ role:'数据流的最终落点：闸、定稿、编排、记忆都落在这里。',
+ facts:[['会话','sessions / runs / run_model_messages / runlog_entries'],['恢复','run_journal（一枪一记：intent + 结果）'],['编排','agent_tasks / agent_orchestrations / agent_task_links'],['记忆','memory_items（resident / recall 两层）/ dialogue_chunks / notes'],['身份','users / tenants / tenant_members / tenant_usage_daily'],['项目','workspaces / project_cleanups / tenant_storage'],['不变量','runlog 只增不删；零 JSONB、零外键、全表代理主键']],
+ docs:[['doc/19-v6/19v6-03-存储形态与生命周期.md','四表 + 两键、真源划分'],['doc/30-崩溃续跑.md','崩溃账本与续跑'],['doc/65-记忆两层方案.md','记忆两层']]},
+{id:'st-redis',layer:'st',x:790,y:794,w:250,h:124,type:'store',name:'Redis',sub:'临时态 · TTL 到即清',
+ lines:['tk:runlive:{runId}  帧流','tk:runepoch:{runId}  纪元','tk:  事件通道 Pub/Sub'],
+ what:'只留两类临时键：tk:runlive:{runId}（一场 run 的生成过程帧序列，LIST）与 tk:runepoch:{runId}（纪元，STRING）。两键出生即带租约 TTL，PG 说活才刷。帧的写口先比对 epoch，续跑后旧执行者的帧会被拒收。',
+ code:['internal/runengine/redisstore.go','internal/runengine/events.go'],
+ role:'生成中状态的临时舞台。清掉不影响历史正确性——那条回复的权威在 runlog。',
+ facts:[['键','tk:runlive:{runId} / tk:runepoch:{runId}'],['前缀','tk:，reset 时 SCAN MATCH tk:* 天然免疫'],['写口','AppendFrame 先比对 epoch'],['到期','TTL 到即清，客户端看到 gone']],
+ docs:[['doc/19-v6/19v6-03-存储形态与生命周期.md','三搬两留一消失'],['doc/38-删除draft键.md','draft 键已移除']]},
+{id:'st-redpanda',layer:'st',x:1060,y:794,w:220,h:56,name:'Redpanda',sub:'记忆抽取派工',
+ what:'记忆 pipeline 模式的派工队列。run 结束后把这一轮派给抽取代理（分 inrun / postrun 两类），抽取事实、偏好与决策，退避重试。',
+ code:['internal/runengine/memory_redpanda.go','internal/runengine/memory_queue.go','internal/runengine/memory_dispatch.go'],
+ role:'记忆链路的异步段：run 的成功不等抽取，抽取失败不影响当轮交付。',
+ facts:[['模式','pipeline 模式才用 MQ'],['另一模式','markdown 模式：USER.md / MEMORY.md 同步直写，不起 MQ'],['抽取','事实 / 偏好 / 决策，退避重试']],
+ docs:[['doc/65-记忆两层方案.md','两种记忆模式'],['doc/29-长期记忆.md','长期记忆（线二仍现行）']]},
+{id:'st-fs',layer:'st',x:1060,y:862,w:220,h:56,name:'文件系统',sub:'content 根 · runtime 根',
+ what:'两个根：项目 content 根放用户内容（文件、产出），runtime 运行资源根放运行期产物（bash 输出、fetch 全文、搜索落盘），两者不互相污染。子代理的 wire 档案在 .tako/subagents/。',
+ code:['internal/runengine/product_store.go','internal/runengine/archive_sweep.go'],
+ role:'工具真正落笔的地方；也是归档清扫器清理的对象（过窗文件）。',
+ facts:[['content 根','用户内容与产出'],['runtime 根','运行期产物，不污染 content'],['子代理档案','.tako/subagents/ 追加式 JSONL'],['清扫','过窗文件由清扫器清理']],
+ docs:[['doc/76-项目内容目录与运行资源容器.md','双根容器'],['doc/37-删除与档案清理.md','保留窗口与清扫器']]}
+];
+
+const NOTES=[
+ {id:'note-fe',layer:'fe',x:1100,y:48,w:300,h:78,type:'note',name:'双游标 reconcile',
+  lines:['eventOffset：run 内序号，看「正在生成」','runlogOffset：session 内全局序号，看「已定稿」','两个游标别混：一个只前进，一个可来回']},
+ {id:'note-orch',layer:'eng',x:1052,y:550,w:316,h:50,type:'note',name:'并行任务的现场',
+  lines:['每个 Task 领一份独立工作区，互不踩脚','结果与产出路径交接给下游']},
+ {id:'note-md',layer:'md',x:960,y:660,w:440,h:64,type:'note',name:'厂商目录 provider-catalog.json',
+  lines:['协议 · base URL · 模型清单 · 视觉能力','环境发现 → ResolvedProvider → ResolvedModel']}
+];
+
+const EDGES=[
+ {id:'R1',f:'fe-chat',t:'api-auth',flow:'request',short:'POST /api/runs',label:'POST /api/runs · Bearer（前端带 access token 投递消息）',primary:1,fx:.5,tx:.5,labXY:[362,180]},
+ {id:'R2',f:'api-auth',t:'api-4api',flow:'request',short:'认证通过',label:'认证通过 → 路由：中间件校验 token，解析出 tenantID / userID 塞进 scope'},
+ {id:'R3',f:'api-4api',t:'eng-gate',flow:'request',short:'起 run → 202',label:'起 run（后台执行，202 + runId，响应不等模型）',primary:1,fx:.35,tx:.5},
+ {id:'R4',f:'eng-gate',t:'db-pg',flow:'request',short:'AcquireRun 事务',label:'AcquireRun 事务：INSERT runs(status=running, 出生带 lease_until)。会话闸=部分唯一索引，租户闸=pg_advisory_xact_lock + 数活 run',primary:1,fx:.28,tx:.08,labXY:[284,528]},
+ {id:'R5',f:'eng-gate',t:'st-redis',flow:'request',short:'建帧流',label:'同事务写 Redis：建 tk:runlive 压入 start 帧，建 tk:runepoch=1，两键都带租约 TTL',fx:.78,tx:.35},
+ {id:'R6',f:'eng-gate',t:'eng-profile',flow:'request',short:'装配',label:'后台 worker 起手：配额检查、工作区寻址、装配 RunProfile（模型 ref / 工具池 / MCP / 子代理边界）'},
+ {id:'R7',f:'eng-profile',t:'md-tenant',flow:'request',short:'模型 ref → 实例',label:'模型 ref → ModelInstance：租户模型表 → 生效 ref → 已构建的 chat model',primary:1,fx:.5,tx:.4},
+ {id:'R8',f:'md-tenant',t:'md-vendor',flow:'request',short:'模型请求',label:'模型请求：prepareInput 读 run_model_messages(compacted=false) + 召回块 + 笔记快照',primary:1,fx:.5,tx:.5,labXY:[629,660]},
+ {id:'R9',f:'md-vendor',t:'eng-loop',flow:'request',short:'delta 流',label:'delta 流：模型流式吐 token，worker 每收到一段就压一帧（kind=delta）',primary:1,fx:.5,tx:.5},
+
+ {id:'F1',f:'eng-loop',t:'st-redis',flow:'frame',short:'每 delta 压一帧',label:'每 delta 压一帧：帧追加进 tk:runlive。写口先比对 tk:runepoch，不等就拒收（续跑后旧执行者的脏帧进不来）',primary:1,fx:.15,tx:.62},
+ {id:'F2',f:'st-redis',t:'fe-chat',flow:'frame',short:'帧流 → 气泡',label:'帧流回页面：轮询 GET /api/runs/:id/frames?eventOffset=N（正确性）或 GET /api/runs/:id/stream（SSE，优化）。客户端按 eventOffset 顺序把 delta 追加进气泡',primary:1,fx:.25,tx:.5,labXY:[300,130]},
+ {id:'F3',f:'eng-loop',t:'eng-fold',flow:'frame',short:'折叠 / 压缩',label:'上下文超限 → compact 压 run_model_messages（seq=0 摘要行）/ midfold 途中折 / 溢出救援强制压缩只重试一次'},
+
+ {id:'T1',f:'eng-loop',t:'eng-tool-files',flow:'tool',short:'文件工具',label:'tool_call / tool_result：读写文件的十一件套，路径不出工作区圈，同文件并发写用锁互斥',bidir:1,fx:.3,tx:.5},
+ {id:'T2',f:'eng-loop',t:'eng-tool-bash',flow:'tool',short:'bash',label:'bash（沙箱围栏）：macOS seatbelt / Linux bwrap，出站开入站关，探测失败 fail closed，输出超限截断并落盘',bidir:1,fx:.15,tx:.5},
+ {id:'T3',f:'eng-loop',t:'eng-tool-mcp',flow:'tool',short:'MCP',label:'stdio 连接：MCP server 的工具直接进工具池，名字是 mcp__短名__工具名，进程也进围栏',bidir:1,fx:.6,tx:.5},
+ {id:'T4',f:'eng-loop',t:'eng-tool-web',flow:'tool',short:'搜索 / BM25',label:'web_search（DeepSeek /v1/tools/search，结果落盘再给描述段）与 tool_search（BM25 检索 deferred 工具，命中才进激活集）',bidir:1,fx:.85,tx:.5},
+ {id:'T5',f:'eng-loop',t:'eng-sub',flow:'tool',short:'委派子代理',label:'委派子代理：工具名就是子代理规格名，父 agent 调它就是派发',bidir:1,side:'lat'},
+ {id:'T6',f:'eng-sub',t:'eng-tool-coder',flow:'tool',short:'按规格派发',label:'按规格派发：按 tools: / exclude_tools: 裁工具池，coder 可改文件跑命令，researcher 只调研',fx:.5,tx:.5},
+
+ {id:'G1',f:'eng-loop',t:'db-pg',flow:'finalize',short:'放闸 + 定稿',label:'EndRun 同一笔 PG 事务：UPDATE runs 落终态（放闸）+ INSERT runlog_entries(assistant 全文)。不存在「闸已放、历史还没那行」的窗口',primary:1,fx:.5,tx:.26,labXY:[570,618]},
+ {id:'G2',f:'db-pg',t:'fe-chat',flow:'finalize',short:'拉 log → 替换气泡',label:'GET /api/sessions/:id/log?runlogOffset=N 拿 assistant 全文 → 按 runId 替换掉用 delta 拼的半截气泡。此后这条回复的权威内容以 runlog 为准',primary:1,route:'left',ch:52,sy:.72,ty:.5,labXY:[72,480]},
+ {id:'G3',f:'eng-fold',t:'db-pg',flow:'finalize',short:'compact 压 mh',label:'compact 压 run_model_messages：原文行保留作审计，seq=0 摘要行替代可见内容，不动 runlog',fx:.5,tx:.62},
+
+ {id:'M1',f:'eng-loop',t:'st-redpanda',flow:'memory',short:'抽取派工',label:'run 结束 → 异步派抽取工（分 inrun / postrun），抽取不等当轮交付，失败有退避重试',fx:.65,tx:.5},
+ {id:'M2',f:'st-redpanda',t:'db-pg',flow:'memory',short:'记忆两层',label:'memory_items 两层（resident 常驻 + recall 可召回）+ dialogue_chunks 按 run 增量建对话块',fx:.5,tx:.85},
+ {id:'M3',f:'db-pg',t:'eng-profile',flow:'memory',short:'召回 → 下一轮',label:'召回块注入下一轮输入，并写回 run_model_messages 的 seq=1——所以 mid-run 折叠也抹不掉它',route:'left',ch:76,sy:.9,ty:.5,labXY:[58,690]},
+
+ {id:'O1',f:'eng-loop',t:'db-pg',flow:'orch',short:'派发 Task / 建编排组',label:'delegate_task · create_orchestration：服务端一次原子创建编排组、若干 Task 与依赖边（agent_tasks + agent_task_links）',fx:.82,tx:.44},
+ {id:'O2',f:'eng-orch',t:'db-pg',flow:'orch',short:'领取 ready → 独立 run',label:'调度循环按秒扫，原子领取 ready 的任务，各起独立 session + run（各自隔离工作现场）；上游没成功下游就 pending，失败沿依赖边阻断传播',fx:.5,tx:.72},
+ {id:'O3',f:'eng-deliver',t:'db-pg',flow:'orch',short:'整组结果落库',label:'整组结果 + 产出路径落库 → 协调职责整组单次交付回来源会话（orchestration_finished 事件 + 通知重试）；目标不可行时判可行性后建继任组',fx:.5,tx:.93},
+
+ {id:'C1',f:'fe-chat',t:'api-4api',flow:'recover',short:'POST /resume',label:'POST /api/runs/:id/resume：客户端触发续跑（引擎不做自动巡检）；租约到点后读侧即判死，liveRunId 不再报活',fx:.5,tx:.35,dash:1},
+ {id:'C2',f:'api-4api',t:'db-pg',flow:'recover',short:'账本重放 epoch+1',label:'认领同一场 run + run_journal 账本（一枪一记：intent + 结果）重放已发生的轮次，同 run epoch+1 接管',fx:.7,tx:.78,dash:1},
+
+ {id:'S1',f:'eng-tool-files',t:'st-fs',flow:'fs',short:'读写文件',label:'读写文件：落在项目 content 根，路径不出工作区圈',fx:.5,tx:.35},
+ {id:'S2',f:'eng-tool-bash',t:'st-fs',flow:'fs',short:'落 runtime 根',label:'bash 大输出、fetch 全文、搜索结果落 runtime 运行资源根，不污染 content 根',fx:.5,tx:.6},
+ {id:'S3',f:'eng-sub',t:'st-fs',flow:'fs',short:'subagent 档案',label:'子代理 wire 档案：.tako/subagents/ 下的追加式 JSONL，每实例一份',fx:.5,tx:.82},
+
+ {id:'V1',f:'st-redis',t:'api-events',flow:'event',short:'发布事件',label:'Redis 发布订阅里的租户级事件流',route:'right',ch:1440},
+ {id:'V2',f:'api-events',t:'fe-team',flow:'event',short:'变更同步',label:'变更同步：任务与编排状态由事件流推给前端，不靠狂轮询',fx:.5,tx:.5}
+];
+
+/* 演示步骤：一场真实 run 的生命周期 */
+const STEPS=[
+ {e:'R1',title:'投递',text:'用户在对话页发一句话。前端带 access token 调 POST /api/runs，内容是第一段用户消息。'},
+ {e:'R2',title:'认证',text:'中间件校验 token，解析出 tenantID / userID 塞进 scope。失败回 401，走信封。'},
+ {e:'R3',title:'起 run',text:'端点开后台执行，立刻回 202 与 runId；响应不等模型。'},
+ {e:'R4',title:'抢闸 + 落库',text:'同一笔 PG 事务：INSERT runs(status=running, 出生带 lease_until)。会话闸是部分唯一索引，租户闸在同一笔事务里拿顾问锁再数活 run——数与放行不分开。冲突即 409，租户满即 429 113001。'},
+ {e:'R5',title:'建帧流',text:'同事务写 Redis：建 tk:runlive 压入 start 帧，建 tk:runepoch=1，两键都带租约 TTL。Redis 写失败整笔回滚，零痕迹。'},
+ {e:'R6',title:'装配',text:'后台 worker 起手：跑配额检查、寻址工作区、装配 RunProfile（模型 ref → ModelInstance、MCP 连接、工具池裁剪、子代理边界）。'},
+ {e:'R7',title:'解析模型',text:'租户模型表 → 生效模型 ref → 已构建的 chat model。租户没装 API Key 就 111408，是设计不是故障。'},
+ {e:'R8',title:'调模型',text:'prepareInput 读 run_model_messages（compacted=false）+ 召回块 + 笔记快照，拼成这一枪的模型输入。'},
+ {e:'R9',title:'delta 回来',text:'模型流式吐 token，worker 每收到一段就压一帧（kind=delta，带 agent 与 model 字段）。'},
+ {e:'F1',title:'压帧',text:'帧追加进 tk:runlive。写口先比对 tk:runepoch：不等就拒收——续跑后旧执行者的脏帧进不来。'},
+ {e:'F2',title:'回页面',text:'两种运输：轮询 GET /api/runs/:id/frames?eventOffset=N（正确性），或 GET /api/runs/:id/stream（SSE，优化）。客户端按 eventOffset 顺序把 delta 追加进气泡。'},
+ {e:'T2',title:'调工具',text:'模型要跑命令就调 bash：沙箱围栏（macOS seatbelt / Linux bwrap）里执行，出站开入站关，输出超限就截断并落盘。工具结果以 tool_result 回灌，继续下一轮。'},
+ {e:'F3',title:'折叠',text:'上下文超限：compact 压 run_model_messages（原文留作审计，seq=0 摘要行替代可见内容），midfold 在 run 中途折，溢出救援强制压缩只重试一次。文件清单从调用记录重建、钉在摘要末尾——路径靠程序重抄，不靠模型记性。'},
+ {e:'G1',title:'定稿 + 放闸',text:'EndRun 在同一笔 PG 事务里做两件事：UPDATE runs 落终态（放闸）+ INSERT runlog_entries(assistant 全文)。不存在「闸已放、历史还没那行」的窗口。commit 后 Redis 压 terminal 帧、设 TTL、删 epoch。'},
+ {e:'G2',title:'收口',text:'客户端见 terminal（或 liveRunId 变空）→ GET /api/sessions/:id/log?runlogOffset=N 拿 assistant 全文 → 按 runId 替换掉用 delta 拼的半截气泡。此后这条回复的权威内容以 runlog 为准。'},
+ {e:'M1',title:'记忆派工',text:'run 结束，异步派抽取工（分 inrun / postrun）。抽取不等当轮交付，失败有退避重试。'},
+ {e:'M2',title:'记忆落库',text:'抽取出的事实 / 偏好 / 决策落 PG 两层（resident 常驻 + recall 可召回），同时 dialogue_chunks 按 run 增量建对话块。'},
+ {e:'M3',title:'召回',text:'下一场 run 前把召回块拼进本轮输入，并写回 run_model_messages 的 seq=1——所以 mid-run 折叠也抹不掉它。'},
+ {e:'C1',title:'崩溃续跑（客户端触发）',text:'进程被 kill -9：无人续约 → lease_until 到点，读侧按租约即判死（liveRunId 不再报活），两键 TTL 到期蒸发，客户端看到 gone。'},
+ {e:'C2',title:'账本重放',text:'客户端 POST /api/runs/:id/resume：服务端认领同一场 run，按 run_journal 账本（一枪一记：intent + 结果）重放已发生的轮次，同 run epoch+1 接管。引擎不做自动巡检，恢复是客户端触发的。'},
+ {e:'O1',title:'派发编排',text:'要并行干活时，模型调 delegate_task / create_orchestration：服务端一次原子创建编排组、若干 Task 与依赖边（agent_tasks + agent_task_links）。'},
+ {e:'O2',title:'依赖推进',text:'调度循环按秒扫，原子领取 ready 的任务，各起独立 session + run（各自隔离工作现场）。上游没成功下游就 pending，失败沿依赖边阻断传播。'},
+ {e:'O3',title:'整组交付',text:'全部完成后协调职责把结果整组单次交付回来源会话（orchestration_finished 事件 + 通知重试）。目标不可行时判可行性后建继任组，复用上一组结果。'}
+];
+
+/* =========================================================================
+   渲染
+   ========================================================================= */
+const SVGNS='http://www.w3.org/2000/svg';
+const el=(t,a={})=>{const n=document.createElementNS(SVGNS,t);for(const k in a)n.setAttribute(k,a[k]);return n;};
+const N={}, E={};
+const gBands=document.getElementById('gBands'), gEdges=document.getElementById('gEdges'),
+      gLabels=document.getElementById('gLabels'), gNodes=document.getElementById('gNodes'),
+      pulse=document.getElementById('pulse'), root=document.getElementById('root');
+
+LAYERS.forEach(L=>{
+  const g=el('g',{class:'bandg','data-layer':L.id});
+  g.appendChild(el('rect',{class:'band',x:40,y:L.y,width:1380,height:L.h,style:'fill:'+L.color+';fill-opacity:.06'}));
+  g.appendChild(el('rect',{x:40,y:L.y,width:3,height:L.h,fill:L.color,'fill-opacity':'.85'}));
+  const t=el('text',{class:'band-title',x:124,y:L.y+26,fill:L.color}); t.textContent=L.name;
+  g.appendChild(t);
+  const s=el('text',{class:'band-sub',x:124,y:L.y+42}); s.textContent=L.sub;
+  g.appendChild(s);
+  gBands.appendChild(g);
+});
+LANES.forEach(l=>{
+  const t=el('text',{class:'lane-label',x:124,y:l.y}); t.textContent=l.t;
+  gBands.appendChild(t);
+});
+
+function drawCard(g,n){
+  const accent={fe:'var(--c-fe)',api:'var(--c-api)',eng:'var(--c-eng)',md:'var(--c-md)',st:'var(--c-st)'}[n.layer];
+  g.appendChild(el('rect',{x:n.x,y:n.y,width:n.w,height:n.h,rx:10,fill:'#fff',stroke:accent,'stroke-opacity':'.42'}));
+  g.appendChild(el('rect',{x:n.x,y:n.y+9,width:3,height:n.h-18,rx:1.5,fill:accent,'fill-opacity':'.9'}));
+  const nameY=n.h>=56? n.y+23 : n.y+19;
+  const t1=el('text',{class:'n-name',x:n.x+13,y:nameY}); t1.textContent=n.name; g.appendChild(t1);
+  if(n.sub){
+    const t2=el('text',{class:'n-sub',x:n.x+13,y:n.h>=56? n.y+40 : n.y+35}); t2.textContent=n.sub; g.appendChild(t2);
+  }
+}
+function drawStore(g,n){
+  const accent='var(--c-st)';
+  g.appendChild(el('rect',{x:n.x,y:n.y,width:n.w,height:n.h,rx:11,fill:'#fff',stroke:accent,'stroke-opacity':'.55'}));
+  g.appendChild(el('rect',{x:n.x,y:n.y+10,width:3,height:n.h-20,rx:1.5,fill:accent,'fill-opacity':'.95'}));
+  const t1=el('text',{class:'n-name',x:n.x+15,y:n.y+23}); t1.textContent=n.name; g.appendChild(t1);
+  const t2=el('text',{class:'n-sub',x:n.x+15,y:n.y+39}); t2.textContent=n.sub; g.appendChild(t2);
+  (n.lines||[]).forEach((L,i)=>{
+    const t=el('text',{class:'n-line',x:n.x+15,y:n.y+62+i*17}); t.textContent=L; g.appendChild(t);
+  });
+}
+function drawNote(g,n){
+  g.appendChild(el('rect',{x:n.x,y:n.y,width:n.w,height:n.h,rx:10,fill:'#fff','fill-opacity':'.9',stroke:'#d6d3d1','stroke-dasharray':'4 3'}));
+  const t1=el('text',{class:'n-sub',x:n.x+12,y:n.y+16,fill:'#78716c'}); t1.textContent=n.name; g.appendChild(t1);
+  (n.lines||[]).forEach((L,i)=>{
+    const t=el('text',{class:'n-line',x:n.x+12,y:n.y+32+i*13,fill:'#78716c','font-size':'10.5'}); t.textContent=L; g.appendChild(t);
+  });
+}
+
+NODES.forEach(n=>{
+  const g=el('g',{class:'node','data-id':n.id,'data-layer':n.layer});
+  if(n.type==='store') drawStore(g,n); else drawCard(g,n);
+  g.addEventListener('click',ev=>{ev.stopPropagation(); selectNode(n.id);});
+  g.addEventListener('mouseenter',()=>hoverNode(n.id));
+  g.addEventListener('mouseleave',()=>hoverNode(null));
+  gNodes.appendChild(g); N[n.id]={g,n};
+});
+NOTES.forEach(n=>{
+  const g=el('g',{class:'node note','data-layer':n.layer});
+  drawNote(g,n); gNodes.appendChild(g); N[n.id]={g,n};
+});
+
+function anchorOf(n,side,frac){
+  frac = frac==null? .5 : frac;
+  if(side==='bottom') return {x:n.x+n.w*frac, y:n.y+n.h};
+  if(side==='top')    return {x:n.x+n.w*frac, y:n.y};
+  if(side==='right')  return {x:n.x+n.w, y:n.y+n.h*.5};
+  return {x:n.x, y:n.y+n.h*.5};
+}
+function pathFor(e){
+  const A=N[e.f].n, B=N[e.t].n;
+  let side='down';
+  if(e.side==='lat') side='lat';
+  else if(B.y + B.h <= A.y) side='up';
+  else if(B.y >= A.y + A.h) side='down';
+  else side='lat';
+
+  let f, t, d;
+  if(e.route==='left'){
+    f={x:A.x, y:A.y+A.h*(e.sy==null?.5:e.sy)};
+    t={x:B.x, y:B.y+B.h*(e.ty==null?.5:e.ty)};
+    d=`M${f.x},${f.y} C${e.ch},${f.y} ${e.ch},${t.y} ${t.x},${t.y}`;
+    return {d,f,t};
+  }
+  if(e.route==='right'){
+    f={x:A.x+A.w, y:A.y+A.h*.5};
+    t={x:B.x+B.w, y:B.y+B.h*.5};
+    d=`M${f.x},${f.y} C${e.ch},${f.y} ${e.ch},${t.y} ${t.x},${t.y}`;
+    return {d,f,t};
+  }
+  if(side==='down'){
+    f=anchorOf(A,'bottom',e.fx); t=anchorOf(B,'top',e.tx);
+    const dy=t.y-f.y;
+    d=`M${f.x},${f.y} C${f.x},${f.y+dy*.45} ${t.x},${t.y-dy*.45} ${t.x},${t.y}`;
+  } else if(side==='up'){
+    f=anchorOf(A,'top',e.fx); t=anchorOf(B,'bottom',e.tx);
+    const dy=t.y-f.y;
+    d=`M${f.x},${f.y} C${f.x},${f.y+dy*.45} ${t.x},${t.y-dy*.45} ${t.x},${t.y}`;
+  } else {
+    const rightward = (B.x+B.w/2) > (A.x+A.w/2);
+    f=anchorOf(A, rightward?'right':'left', .5); t=anchorOf(B, rightward?'left':'right', .5);
+    const dx=t.x-f.x;
+    d=`M${f.x},${f.y} C${f.x+dx*.45},${f.y} ${t.x-dx*.45},${t.y} ${t.x},${t.y}`;
+  }
+  return {d,f,t};
+}
+
+EDGES.forEach(e=>{
+  const g=el('g',{'data-flow':e.flow,'data-edge':e.id});
+  const geo=pathFor(e);
+  const col=FLOWS[e.flow].c;
+  const p=el('path',{class:'edge',d:geo.d,stroke:col,'stroke-opacity':'.42',
+    'stroke-dasharray':e.dash?'6 4':'', 'marker-end':'url(#ah)'});
+  if(e.bidir) p.setAttribute('marker-start','url(#ah)');
+  g.appendChild(p);
+  const mid=el('path',{class:'edge',d:geo.d,stroke:'transparent','stroke-width':14,fill:'none'});
+  g.appendChild(mid);
+  gEdges.appendChild(g);
+  const lab=el('text',{class:'edge-label','data-edge':e.id,x:0,y:0,fill:col,'text-anchor':'middle'});
+  lab.textContent=e.short||e.label;
+  if(e.primary) lab.classList.add('show');
+  gLabels.appendChild(lab);
+  E[e.id]={g,p,lab,geo,e};
+  // 标签落点：默认取曲线真实中点；密集处用 labXY / labAt 手动挪开
+  try{
+    const L=p.getTotalLength();
+    const pt=p.getPointAtLength(L*(e.labAt==null?0.5:e.labAt));
+    if(e.labXY){lab.setAttribute('x',e.labXY[0]); lab.setAttribute('y',e.labXY[1]);}
+    else {lab.setAttribute('x',pt.x); lab.setAttribute('y',pt.y-3);}
+  }catch(err){
+    lab.setAttribute('x',(geo.f.x+geo.t.x)/2); lab.setAttribute('y',(geo.f.y+geo.t.y)/2-3);
+  }
+  mid.addEventListener('click',ev=>{ev.stopPropagation(); selectEdge(e.id);});
+  mid.addEventListener('mouseenter',()=>hoverEdge(e.id));
+  mid.addEventListener('mouseleave',()=>hoverEdge(null));
+});
+
+/* 图例 */
+const leg=document.getElementById('legend');
+Object.keys(FLOWS).forEach(k=>{
+  const s=document.createElement('span');
+  s.innerHTML='<i style="--c:'+FLOWS[k].c+'"></i>'+FLOWS[k].n;
+  leg.appendChild(s);
+});
+
+/* 左侧图层 / 数据流开关 */
+const layerCks=document.getElementById('layerCks'), flowCks=document.getElementById('flowCks');
+const layerOn={}, flowOn={};
+LAYERS.forEach(L=>{
+  layerOn[L.id]=true;
+  const lb=document.createElement('label'); lb.className='ck';
+  lb.innerHTML='<input type="checkbox" checked><span class="sw" style="--c:'+L.color+'"></span>'+L.name;
+  lb.querySelector('input').addEventListener('change',ev=>{layerOn[L.id]=ev.target.checked; applyFilters();});
+  layerCks.appendChild(lb);
+});
+Object.keys(FLOWS).forEach(k=>{
+  flowOn[k]=true;
+  const lb=document.createElement('label'); lb.className='ck';
+  lb.innerHTML='<input type="checkbox" checked><span class="sw" style="--c:'+FLOWS[k].c+'"></span>'+FLOWS[k].n;
+  lb.querySelector('input').addEventListener('change',ev=>{flowOn[k]=ev.target.checked; applyFilters();});
+  flowCks.appendChild(lb);
+});
+
+function applyFilters(){
+  Object.keys(N).forEach(id=>{
+    const n=N[id].n;
+    N[id].g.style.display = (n.layer && layerOn[n.layer]===false)? 'none':'';
+  });
+  Object.keys(E).forEach(id=>{
+    const e=E[id].e;
+    const fl = flowOn[e.flow];
+    const ly = layerOn[N[e.f].n.layer] && layerOn[N[e.t].n.layer];
+    E[id].g.style.display = (fl&&ly)?'':'none';
+    E[id].lab.style.display = (fl&&ly)?'':'none';
+  });
+}
+
+/* =========================================================================
+   交互：选中 / 悬停隔离 / 搜索
+   ========================================================================= */
+const detail=document.getElementById('detail');
+let sel=null;
+
+function upstreamOf(id){return EDGES.filter(e=>e.t===id).map(e=>e.f);}
+function downstreamOf(id){return EDGES.filter(e=>e.f===id).map(e=>e.t);}
+function nodeById(id){return N[id]?N[id].n:null;}
+
+function escapeHTML(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+
+function selectNode(id){
+  sel={type:'node',id};
+  const n=nodeById(id); if(!n) return;
+  const up=upstreamOf(id), dn=downstreamOf(id);
+  const upS=[...new Set(up)].map(u=>nodeById(u)).filter(Boolean);
+  const dnS=[...new Set(dn)].map(u=>nodeById(u)).filter(Boolean);
+  const layer=LAYERS.find(L=>L.id===n.layer);
+  let h='<h2>'+escapeHTML(n.name)+'</h2><div class="dsub">'+escapeHTML(layer?layer.name+' · '+layer.sub:'')+(n.sub?' · '+escapeHTML(n.sub):'')+'</div>';
+  h+='<p>'+escapeHTML(n.what)+'</p>';
+  h+='<h4>在数据流里</h4><p>'+escapeHTML(n.role)+'</p>';
+  if(n.facts&&n.facts.length){
+    h+='<h4>关键事实</h4><dl class="facts">';
+    n.facts.forEach(f=>{h+='<dt>'+escapeHTML(f[0])+'</dt><dd>'+escapeHTML(f[1])+'</dd>';});
+    h+='</dl>';
+  }
+  if(n.code&&n.code.length){
+    h+='<h4>代码落点</h4><div class="code">';
+    n.code.forEach(c=>{h+='<a>'+escapeHTML(c)+'</a>';});
+    h+='</div>';
+  }
+  h+='<h4>上游</h4>'+ (upS.length? '<ul class="flowlist">'+upS.map(u=>'<li><span class="dot" style="--c:'+(layer?layer.color:'#999')+'"></span>'+escapeHTML(u.name)+'</li>').join('')+'</ul>' : '<div class="empty">无（入口节点）</div>');
+  h+='<h4>下游</h4>'+ (dnS.length? '<ul class="flowlist">'+dnS.map(u=>'<li><span class="dot" style="--c:'+(layer?layer.color:'#999')+'"></span>'+escapeHTML(u.name)+'</li>').join('')+'</ul>' : '<div class="empty">无（终点节点）</div>');
+  if(n.docs&&n.docs.length){
+    h+='<h4>真源文档</h4><ul class="docs">';
+    n.docs.forEach(d=>{h+='<li><span>'+escapeHTML(d[0])+'</span><i>'+escapeHTML(d[1])+'</i></li>';});
+    h+='</ul>';
+  }
+  detail.innerHTML=h;
+  Object.keys(E).forEach(k=>setLabel(k,'short'));
+  highlightSel();
+}
+
+function selectEdge(id){
+  sel={type:'edge',id};
+  const e=E[id].e;
+  const F=FLOWS[e.flow];
+  const A=nodeById(e.f), B=nodeById(e.t);
+  let h='<h2>'+escapeHTML(A.name)+' → '+escapeHTML(B.name)+'</h2>';
+  h+='<div class="dsub"><span class="tag" style="--c:'+F.c+'">'+F.n+'</span></div>';
+  h+='<h4>这条流带的是什么</h4><p>'+escapeHTML(e.label)+'</p>';
+  h+='<h4>从哪到哪</h4><dl class="facts"><dt>起点</dt><dd>'+escapeHTML(A.name)+'</dd><dt>终点</dt><dd>'+escapeHTML(B.name)+'</dd><dt>方向</dt><dd>'+(e.bidir?'双向（一次往返：调用与结果）':'单向')+'</dd></dl>';
+  const rel=STEPS.filter(s=>s.e===id);
+  if(rel.length){
+    h+='<h4>在生命周期里的位置</h4>';
+    rel.forEach(s=>{h+='<p><strong>'+escapeHTML(s.title)+'</strong>：'+escapeHTML(s.text)+'</p>';});
+  }
+  detail.innerHTML=h;
+  setLabel(id,'full');
+  highlightSel();
+}
+
+function highlightSel(){
+  Object.keys(E).forEach(id=>{E[id].p.classList.remove('live');E[id].lab.classList.remove('hot');});
+  Object.keys(N).forEach(id=>{N[id].g.classList.remove('live');});
+  if(!sel) return;
+  if(sel.type==='node'){
+    N[sel.id].g.classList.add('live');
+    EDGES.filter(e=>e.f===sel.id||e.t===sel.id).forEach(e=>{E[e.id].p.classList.add('live');E[e.id].lab.classList.add('hot');});
+  } else {
+    E[sel.id].p.classList.add('live'); E[sel.id].lab.classList.add('hot');
+    N[E[sel.id].e.f].g.classList.add('live'); N[E[sel.id].e.t].g.classList.add('live');
+  }
+}
+
+function hoverNode(id){
+  if(id){
+    const keep=new Set([id]);
+    EDGES.forEach(e=>{ if(e.f===id||e.t===id){keep.add(e.f);keep.add(e.t);} });
+    Object.keys(N).forEach(k=>N[k].g.classList.toggle('dim',!keep.has(k)));
+    Object.keys(E).forEach(k=>{
+      const e=E[k].e, on=(e.f===id||e.t===id);
+      E[k].p.classList.toggle('hot',on);
+      E[k].lab.classList.toggle('hot',on);
+      E[k].p.classList.toggle('dim',!on);
+    });
+  } else if(!sel){
+    Object.keys(N).forEach(k=>N[k].g.classList.remove('dim'));
+    Object.keys(E).forEach(k=>{E[k].p.classList.remove('dim');E[k].p.classList.remove('hot');E[k].lab.classList.remove('hot');});
+  }
+}
+function hoverEdge(id){
+  if(id){
+    const e=E[id].e;
+    E[id].p.classList.add('hot'); E[id].lab.classList.add('hot');
+    setLabel(id,'full');
+    [e.f,e.t].forEach(k=>N[k].g.classList.remove('dim'));
+  } else {
+    Object.keys(E).forEach(k=>{E[k].p.classList.remove('hot');E[k].lab.classList.remove('hot');});
+    Object.keys(E).forEach(k=>setLabel(k,'short'));
+    if(sel && sel.type==='edge') setLabel(sel.id,'full');
+  }
+}
+/* 静默态只显示短标签；悬停 / 选中 / 演示到这一步时展开成完整描述（画布上截断，全文在右侧面板） */
+function setLabel(id,mode){
+  const e=E[id], s=e.e;
+  let txt;
+  if(mode==='full'){
+    txt = s.label.length>46 ? s.label.slice(0,45)+'…' : s.label;
+  } else {
+    txt = s.short||s.label;
+  }
+  if(e.lab.textContent!==txt) e.lab.textContent=txt;
+}
+
+/* 搜索 */
+document.getElementById('q').addEventListener('input',ev=>{
+  const q=ev.target.value.trim().toLowerCase();
+  if(!q){
+    Object.keys(N).forEach(k=>N[k].g.classList.remove('dim'));
+    Object.keys(E).forEach(k=>{E[k].p.classList.remove('dim');E[k].lab.classList.remove('hot');});
+    return;
+  }
+  const hits=new Set();
+  Object.keys(N).forEach(id=>{
+    const n=N[id].n;
+    const hay=[n.name,n.sub,n.what,n.role,(n.code||[]).join(' ')].join(' ').toLowerCase();
+    if(hay.indexOf(q)>=0) hits.add(id);
+  });
+  Object.keys(N).forEach(k=>N[k].g.classList.toggle('dim',!hits.has(k)));
+  Object.keys(E).forEach(k=>{
+    const e=E[k].e, on=hits.has(e.f)||hits.has(e.t);
+    E[k].p.classList.toggle('dim',!on);
+    E[k].lab.classList.toggle('hot',on);
+  });
+});
+
+/* =========================================================================
+   缩放 / 平移
+   ========================================================================= */
+let scale=1, tx=0, ty=0;
+const cv=document.getElementById('cv');
+function applyTransform(){ root.setAttribute('transform',`translate(${tx},${ty}) scale(${scale})`); document.getElementById('zval').textContent=Math.round(scale*100)+'%'; }
+function zoomAt(cx,cy,factor){
+  const ns=Math.min(3,Math.max(.35,scale*factor));
+  const k=ns/scale;
+  tx=cx-(cx-tx)*k; ty=cy-(cy-ty)*k; scale=ns; applyTransform();
+}
+cv.addEventListener('wheel',ev=>{
+  ev.preventDefault();
+  const r=cv.getBoundingClientRect();
+  const px=(ev.clientX-r.left)/r.width*1470, py=(ev.clientY-r.top)/r.height*970;
+  zoomAt(px,py, ev.deltaY<0?1.12:0.89);
+},{passive:false});
+let dragging=false,sx=0,sy=0,stx=0,sty=0;
+cv.addEventListener('mousedown',ev=>{dragging=true;sx=ev.clientX;sy=ev.clientY;stx=tx;sty=ty;cv.classList.add('drag');});
+window.addEventListener('mouseup',()=>{dragging=false;cv.classList.remove('drag');});
+window.addEventListener('mousemove',ev=>{
+  if(!dragging)return;
+  const r=cv.getBoundingClientRect();
+  tx=stx+(ev.clientX-sx)/r.width*1470; ty=sty+(ev.clientY-sy)/r.height*970; applyTransform();
+});
+document.getElementById('zin').addEventListener('click',()=>zoomAt(735,485,1.2));
+document.getElementById('zout').addEventListener('click',()=>zoomAt(735,485,1/1.2));
+document.getElementById('zfit').addEventListener('click',()=>{scale=1;tx=0;ty=0;applyTransform();});
+
+/* =========================================================================
+   演示播放
+   ========================================================================= */
+let step=0, playing=false, timer=null, raf=null;
+const btnPlay=document.getElementById('play');
+function renderStep(){
+  const s=STEPS[step], e=E[s.e];
+  sel={type:'edge',id:s.e};
+  Object.keys(E).forEach(k=>{E[k].p.classList.remove('live');E[k].lab.classList.remove('hot');setLabel(k,'short');});
+  Object.keys(N).forEach(k=>N[k].g.classList.remove('live'));
+  e.p.classList.add('live'); e.lab.classList.add('hot'); setLabel(s.e,'full');
+  N[e.e.f].g.classList.add('live'); N[e.e.t].g.classList.add('live');
+  const A=nodeById(e.e.f), B=nodeById(e.e.t), F=FLOWS[e.e.flow];
+  let h='<div class="dsub">第 '+(step+1)+' / '+STEPS.length+' 步 · <span class="tag" style="--c:'+F.c+'">'+F.n+'</span></div>';
+  h+='<h2>'+escapeHTML(s.title)+'</h2><p>'+escapeHTML(s.text)+'</p>';
+  h+='<h4>这一跳</h4><dl class="facts"><dt>从</dt><dd>'+escapeHTML(A.name)+'</dd><dt>到</dt><dd>'+escapeHTML(B.name)+'</dd><dt>带的东西</dt><dd>'+escapeHTML(e.e.label)+'</dd></dl>';
+  h+='<h4>全部步骤</h4><ol class="steps">';
+  STEPS.forEach((x,i)=>{
+    h+='<li class="'+(i===step?'on':(i<step?'done':''))+'" data-i="'+i+'">'+escapeHTML(x.title)+'</li>';
+  });
+  h+='</ol>';
+  detail.innerHTML=h;
+  detail.querySelectorAll('.steps li').forEach(li=>{
+    li.addEventListener('click',()=>{goStep(parseInt(li.dataset.i,10));});
+  });
+  document.getElementById('prev').disabled = step===0;
+  document.getElementById('next').disabled = step===STEPS.length-1;
+  animatePulse(e);
+}
+function animatePulse(e){
+  if(raf) cancelAnimationFrame(raf);
+  const path=e.p; const len=path.getTotalLength();
+  const t0=performance.now(), dur=900;
+  function frame(t){
+    const k=Math.min(1,(t-t0)/dur);
+    const pt=path.getPointAtLength(len*k);
+    pulse.setAttribute('cx',pt.x); pulse.setAttribute('cy',pt.y);
+    pulse.classList.remove('pulse');
+    if(k<1) raf=requestAnimationFrame(frame);
+  }
+  raf=requestAnimationFrame(frame);
+}
+function goStep(i){
+  step=Math.max(0,Math.min(STEPS.length-1,i));
+  renderStep();
+}
+function play(){
+  if(playing) return;
+  playing=true; btnPlay.textContent='⏸ 暂停';
+  if(step>=STEPS.length-1) step=0;
+  renderStep();
+  timer=setInterval(()=>{
+    if(step>=STEPS.length-1){ stopPlay(); return; }
+    goStep(step+1);
+  },2600);
+}
+function stopPlay(){playing=false;btnPlay.textContent='▶ 播放数据流';if(timer){clearInterval(timer);timer=null;}}
+btnPlay.addEventListener('click',()=>{playing?stopPlay():play();});
+document.getElementById('next').addEventListener('click',()=>{stopPlay();goStep(step+1);});
+document.getElementById('prev').addEventListener('click',()=>{stopPlay();goStep(step-1);});
+document.getElementById('reset').addEventListener('click',()=>{
+  stopPlay(); sel=null; step=0;
+  Object.keys(E).forEach(k=>{E[k].p.classList.remove('live');E[k].lab.classList.remove('hot');E[k].p.classList.remove('dim');setLabel(k,'short');});
+  Object.keys(N).forEach(k=>N[k].g.classList.remove('dim','live'));
+  pulse.classList.add('pulse');
+  detail.innerHTML=defaultDetail();
+});
+
+function defaultDetail(){
+  return '<div class="dsub">导读</div><h2>怎么读这张图</h2>'+
+   '<p>五条横带自上而下是<b>一次请求穿过系统的顺序</b>：前端 → 接入层 → 运行引擎 → 模型层 → 存储层。带箭头的线是<b>数据流</b>，线上的字写的是「这一跳带的是什么」。</p>'+
+   '<p>有两种线特别值得注意：<br>· 往回拐的<b>长弯线</b>（左边缘那两条）是<b>回流</b>——定稿与召回从存储层回到引擎／页面；<br>· <b>虚线</b>是恢复链路（崩溃后续跑）。</p>'+
+   '<p>点任意<b>节点</b>：看它是什么、代码落在哪、在链路里的位置、真源文档。<br>点任意<b>连线</b>：看这条流什么时候发生、带了什么。</p>'+
+   '<h4>三个最容易记错的点</h4><ul style="font-size:13px;color:var(--ink2);padding-left:18px;margin:0">'+
+   '<li><b>闸在数据库不在进程</b>：会话闸是部分唯一索引，租户闸是数据库顾问锁。多副本下靠它不靠进程内互斥。</li>'+
+   '<li><b>两张表两个投影</b>：runlog 记「产出了什么」，run_model_messages 记「模型现在该看到什么」。compact 只压后者。</li>'+
+   '<li><b>失败也留痕</b>：这一轮已经说出的半截回答照常落库；只是「还没说话就失败」那一档一行不写。</li>'+
+   '</ul>';
+}
+
+/* =========================================================================
+   页脚说明
+   ========================================================================= */
+document.getElementById('detail').innerHTML=defaultDetail();
+
+document.getElementById('notes').innerHTML = `
+<h2>tako 是什么</h2>
+<p class="sub">多租户的 agent 运行时（Go + Gin + Eino + PostgreSQL + Redis + Redpanda + Vue）。用户发一句话，引擎起一个 run，模型可以在里面调 bash、读写文件、搜历史、搜网络、委派子代理；帧流式回给页面；崩了能续跑；隔天的对话能召回。<b>不是知识库／RAG 产品</b>——记忆与召回只作支撑 agent 干活的横切能力。</p>
+<div class="cardgrid">
+  <div class="card"><h3>闸在数据库</h3><p>会话闸 = <code>one_live_run_per_session</code> 部分唯一索引；租户闸 = <code>pg_advisory_xact_lock</code> + 数活 run，数与放行同一笔事务。多副本下不可能超发。</p></div>
+  <div class="card"><h3>两张表两个投影</h3><p><code>runlog_entries</code> 记「产出了什么」（历史展示只读它）；<code>run_model_messages</code> 记「模型现在该看到什么」（compact 只压它，不动 runlog）。</p></div>
+  <div class="card"><h3>临时态在 Redis</h3><p>只剩 <code>tk:runlive</code>（帧流）与 <code>tk:runepoch</code>（纪元）两类键，TTL 到即清。清掉不影响历史正确性——权威在 runlog。</p></div>
+  <div class="card"><h3>失败也留痕</h3><p>这一轮已经产出的内容照常落库（runlog 与 mh 同样落）；缺 tool 结果的调用补一条合成行，否则下一枪 provider 会 400。</p></div>
+</div>
+
+<h2>一条 run 的时间线</h2>
+<p class="sub">下面这条链是本页演示的骨架，从投递到收口再到记忆回流。点「播放数据流」会沿着它一步步走。</p>
+<table>
+<thead><tr><th style="width:74px">阶段</th><th>发生什么</th><th style="width:230px">数据落点</th></tr></thead>
+<tbody>
+<tr><td>投递</td><td>POST /api/runs → 认证 → 抢闸 → 起后台 run</td><td><code>runs</code>（running，出生带租约）</td></tr>
+<tr><td>落帧</td><td>建 tk:runlive 压 start 帧、建 tk:runepoch=1</td><td><code>tk:runlive</code> / <code>tk:runepoch</code></td></tr>
+<tr><td>装配</td><td>配额检查 → 工作区寻址 → RunProfile（模型 / 工具池 / MCP / 子代理边界）</td><td>内存态 + 租户配置表</td></tr>
+<tr><td>生成</td><td>模型 delta → 每个 delta 压一帧；工具调用与结果回灌</td><td><code>tk:runlive</code>（追加帧）</td></tr>
+<tr><td>折叠</td><td>超限 → compact 压 mh、midfold 途中折、溢出救援重试一次</td><td><code>run_model_messages</code>（seq=0 摘要行）</td></tr>
+<tr><td>定稿</td><td>EndRun 同事务：放闸 + 写 assistant 全文</td><td><code>runs</code> 终态 + <code>runlog_entries</code></td></tr>
+<tr><td>收口</td><td>拉 log 拿全文，按 runId 替换半截气泡</td><td>客户端气泡（权威在 runlog）</td></tr>
+<tr><td>记忆</td><td>异步抽取 → 两层记忆 → 下轮召回注入</td><td><code>memory_items</code> / <code>dialogue_chunks</code></td></tr>
+<tr><td>崩溃</td><td>租约到点判死 → 客户端 resume → 账本重放，epoch+1</td><td><code>run_journal</code></td></tr>
+</tbody>
+</table>
+
+<h2>术语</h2>
+<div class="cardgrid">
+  <div class="card"><h3>run</h3><p>一次执行：消费一条 user message、产出一条 assistant message。<code>id</code> 形如 <code>r_&lt;ULID&gt;</code>。</p></div>
+  <div class="card"><h3>session</h3><p>服务端登记的会话资源，首条消息投递时懒建。<code>id</code> 形如 <code>s_&lt;ULID&gt;</code>。</p></div>
+  <div class="card"><h3>帧（frame）</h3><p>一场 run 的一个事件。<code>kind</code> 有 start / delta / tool_call / tool_result / usage / resume / terminal / task；每帧带 <code>agent</code>（空=root）与 <code>model</code>（空=非模型产物）。</p></div>
+  <div class="card"><h3>eventOffset</h3><p>run 内序号，start=1、每 delta +1、terminal 占末。只前进，定稿后失效，不是历史地址。</p></div>
+  <div class="card"><h3>runlogOffset</h3><p>session 内全局序号，跨 run 单调，每条定稿记录占一个。永久有效，可前后拨。</p></div>
+  <div class="card"><h3>liveRunId</h3><p>会话当前活 run 的 id，空串=闲着。判活看 <code>status='running' AND lease_until &gt; now()</code>。</p></div>
+  <div class="card"><h3>reconcile</h3><p>纯轮询的收口流程：查 session → 拉 log 补历史 → 有活 run 就轮询 frames → 见 terminal 收口。无长连接、无推送。</p></div>
+  <div class="card"><h3>epoch</h3><p>一次执行者的纪元令牌。续跑时 epoch+1，旧执行者的帧写口比对不上就被拒收。</p></div>
+</div>
+
+<h2>真源</h2>
+<p class="sub">本页所有内容取自以下现行真源（<code>doc/</code>，2026-11-13 核对）。图是索引的补充，不取代文档。</p>
+<table>
+<thead><tr><th style="width:280px">文档</th><th>回答什么</th></tr></thead>
+<tbody>
+<tr><td><code>doc/19-v6/19-运行引擎架构-v6.md</code></td><td>v6 文档集入口、概念表、跨切面不变量</td></tr>
+<tr><td><code>doc/19-v6/19v6-01-契约-四个API.md</code></td><td>四个端点的请求／响应／错误字节（帧 kind 词表）</td></tr>
+<tr><td><code>doc/19-v6/19v6-02-reconcile与双游标.md</code></td><td>客户端纯轮询总流程、双游标语义</td></tr>
+<tr><td><code>doc/19-v6/19v6-03-存储形态与生命周期.md</code></td><td>四表 + 两键、真源划分、闸的落库形态、多副本</td></tr>
+<tr><td><code>doc/19-v6/19v6-05-tool-loop.md</code></td><td>tool loop 机制、工具双投影、子代理派发</td></tr>
+<tr><td><code>doc/53-模块地图.md</code></td><td>模块与文件的对应关系（每层代码落在哪）</td></tr>
+<tr><td><code>doc/16-能力复刻总规划.md</code></td><td>产品定位、能力总表、现状快照</td></tr>
+<tr><td><code>doc/70-多Agent编排与Task/03-第一版方案.md</code></td><td>持久 Task 与固定 DAG 编排的完整链路</td></tr>
+<tr><td><code>doc/43-租户并发闸入DB.md</code></td><td>租户并发闸为什么必须进数据库</td></tr>
+<tr><td><code>doc/65-记忆两层方案.md</code></td><td>记忆双模式（pipeline / markdown）</td></tr>
+</tbody>
+</table>
+
+<div class="foot">
+本页为交互式架构图，静态版本见 <code>doc/assets/tako-architecture.png</code>；同源文档见仓库 <code>doc/</code> 目录（<code>doc/README.md</code> 是索引页）。图与文档冲突时以文档为准。
+</div>
+`;
+</script>
+</body>
+</html>

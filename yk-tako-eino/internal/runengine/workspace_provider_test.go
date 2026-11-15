@@ -57,12 +57,15 @@ func TestDetectWorkspaceProvider(t *testing.T) {
 func TestNewGroupHandleAssembly(t *testing.T) {
 	root := t.TempDir()
 	locker := newFlockFileLocker(root)
-	o := AgentOrchestration{ID: "or_1", TenantID: "t1"}
+	o := AgentOrchestration{ID: "or_1", TenantID: "t1", WorkspaceID: "ws_1"}
 	if _, err := newGroupHandle("", o, "/p", locker); err == nil {
 		t.Fatal("缺 root 应报错")
 	}
-	if _, err := newGroupHandle(root, AgentOrchestration{ID: "or_1"}, "/p", locker); err == nil {
+	if _, err := newGroupHandle(root, AgentOrchestration{ID: "or_1", WorkspaceID: "ws_1"}, "/p", locker); err == nil {
 		t.Fatal("缺 tenant 应报错")
+	}
+	if _, err := newGroupHandle(root, AgentOrchestration{ID: "or_1", TenantID: "t1"}, "/p", locker); err == nil {
+		t.Fatal("缺 workspace id 应报错")
 	}
 	if _, err := newGroupHandle(root, o, "", locker); err == nil {
 		t.Fatal("缺 projectRoot 应报错")
@@ -74,7 +77,7 @@ func TestNewGroupHandleAssembly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantDir := filepath.Join(root, "tenants", "t1", ".tako", "orchestrations", "or_1", "workspace")
+	wantDir := filepath.Join(root, "tenants", "t1", "workspaces", "ws_1", "runtime", "orchestrations", "or_1", "workspace")
 	if g.Dir != wantDir {
 		t.Fatalf("Dir = %q, want %q", g.Dir, wantDir)
 	}
@@ -366,7 +369,7 @@ func TestWorkspaceSummaryVerificationEvidence(t *testing.T) {
 	ctx := context.Background()
 	g, root := wsTestGroup(t)
 	s := &Store{workspaceRoot: root}
-	o := AgentOrchestration{ID: "or_1", TenantID: "t1", WorkspaceMode: workspaceModeIsolated, VerifyCommand: "exit 1"}
+	o := AgentOrchestration{ID: "or_1", TenantID: "t1", WorkspaceID: "ws_1", WorkspaceMode: workspaceModeIsolated, VerifyCommand: "exit 1"}
 
 	shared := o
 	shared.WorkspaceMode = workspaceModeShared

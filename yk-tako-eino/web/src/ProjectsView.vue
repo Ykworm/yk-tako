@@ -17,6 +17,7 @@ import {
 import { authFetch } from './auth'
 import ConfirmDialog from './ConfirmDialog.vue'
 import { broadcastMutation, onMutation } from './mutation'
+import { MD_BODY_CLASS, renderSafe } from './markdown'
 
 const props = defineProps<{ activeWorkspaceId: string | null }>()
 
@@ -42,7 +43,8 @@ type ProjectRow = {
 }
 
 // FileRow 是「当前所在目录」的一份清单。path 相对项目根（"." = 根）。
-// preview 记「文件名 → 图片 blob URL」；text 记「文件名 → 文本内容」。
+// preview 记「文件名 → 图片 blob URL」；text 记「文件名 → 文本内容」；
+// raw 记「文件名 → 是否看原始字节」（只有 md 有两种看法，doc/79）。
 type FileRow = {
   path: string
   entries: WorkspaceFileEntry[]
@@ -50,6 +52,7 @@ type FileRow = {
   error: string
   preview: Record<string, string>
   text: Record<string, string>
+  raw: Record<string, boolean>
 }
 
 // 能不能「预览」：服务端条目**不带 mime**（mime 是字节出口的事），所以按扩展名近似。
@@ -61,6 +64,9 @@ const TEXT_EXT = new Set([
   'txt', 'md', 'markdown', 'csv', 'json', 'log', 'yml', 'yaml', 'toml',
   'html', 'css', 'js', 'ts', 'go', 'py', 'sh', 'xml', 'ini', 'conf',
 ])
+// 按 markdown 渲染的扩展名（doc/79 §3.1）：**只有这两个**。
+// 把 json/yaml 也当 markdown 渲染是倒退——散文排版套在数据文件上，读不懂。
+const MD_EXT = new Set(['md', 'markdown'])
 
 function extOf(name: string): string {
   return name.split('.').pop()?.toLowerCase() ?? ''
@@ -71,9 +77,22 @@ function canPreview(name: string): boolean {
   return IMAGE_EXT.has(ext) || TEXT_EXT.has(ext)
 }
 
+/** 这份文件是不是按 markdown 渲染（doc/79）。 */
+function isMarkdown(name: string): boolean {
+  return MD_EXT.has(extOf(name))
+}
+
+/** 是不是在看原文（md 默认看渲染后的预览态）。 */
+function rawView(p: ProjectRow, name: string): boolean {
+  return !!p.files?.raw[name]
+}
+
 const projects = ref<ProjectRow[]>([])
 const loading = ref(true)
 const error = ref('')
+// 删除回执（doc/76 §4.4）：cleanup=pending 表示业务删除已完成、磁盘清理待补偿，
+// 不能显示成「磁盘已清完」；等补偿或刷新后再消失。
+const cleanupNote = ref('')
 
 function rowOf(workspace: Workspace): ProjectRow {
   return { workspace, sessions: null, open: false, loading: false, error: '', files: null, filesOpen: false }
@@ -220,7 +239,7 @@ async function loadFiles(p: ProjectRow, path = '.') {
   // 不是 reactive proxy——后面 `row.entries = …` 就绕过了响应式 set 拦截器，
   // 数据到了、DOM 不更新（列表永远是空的）。分开写，row 才是 proxy。
   if (!p.files) {
-    p.files = { path, entries: [], loading: false, error: '', preview: {}, text: {} }
+    p.files = { path, entries: [], loading: false, error: '', preview: {}, text: {}, raw: {} }
   }
   const row = p.files
   row.loading = true
@@ -286,7 +305,7 @@ async function fetchBlob(p: ProjectRow, entry: WorkspaceFileEntry): Promise<Blob
 // 预览：图片出缩略图，文本出内容，其他类型告诉用户去下载。
 const TEXT_PREVIEW_MAX = 2000
 
-async function previewFile(p: ProjectRow, entry: WorkspaceFileEntry) {
+async function previewFile(p: ProjectRow, entry: WorkspaceFileEntry, raw = false) {
   const row = p.files
   if (!row) return
   const blob = await fetchBlob(p, entry)
@@ -301,13 +320,34 @@ async function previewFile(p: ProjectRow, entry: WorkspaceFileEntry) {
   }
   if (TEXT_EXT.has(ext)) {
     const text = await blob.text()
+    // **先截断、后渲染**：截断拿到的是纯文本，渲染的是截断后的结果。
+    // 反过来（渲染后截 HTML）会拦腰砍断表格与代码块——半张表比显示原文更糟。
     row.text[entry.name] =
       text.length > TEXT_PREVIEW_MAX
         ? `${text.slice(0, TEXT_PREVIEW_MAX)}\n…（还有 ${text.length - TEXT_PREVIEW_MAX} 个字，用「下载」拿全文）`
         : text
+    // md 有两种看法（原文 / 预览），非 md 只有一种——后者这行不写。
+    if (isMarkdown(entry.name)) row.raw[entry.name] = raw
     return
   }
   row.error = `${entry.name} 不能直接看，用「下载」拿走。`
+}
+
+// md 的「预览/原文」切换：内容还没取过就先取，取过就只切看法（不重复拉字节）。
+async function showMd(p: ProjectRow, entry: WorkspaceFileEntry, raw: boolean) {
+  const row = p.files
+  if (!row) return
+  if (row.text[entry.name] === undefined) {
+    await previewFile(p, entry, raw)
+    return
+  }
+  row.raw[entry.name] = raw
+}
+
+/** md 预览态的 HTML。复用 markdown.ts 那条管线（marked + DOMPurify），排版走全局 .md-body。
+ *  breaks: false——文件里的换行是作者排版的结果，单个换行不等于换行。 */
+function mdHtml(text: string): string {
+  return renderSafe(text, { breaks: false })
 }
 
 async function downloadFile(p: ProjectRow, entry: WorkspaceFileEntry) {
@@ -381,7 +421,11 @@ async function confirmDelete() {
   confirmError.value = ''
   try {
     if (t.kind === 'workspace') {
-      await deleteWorkspace(t.project.workspace.id)
+      const res = await deleteWorkspace(t.project.workspace.id)
+      cleanupNote.value =
+        res.cleanup === 'pending'
+          ? `“${t.project.workspace.name}”已删除；磁盘上的项目文件稍后清理完成。`
+          : ''
       broadcastMutation({ type: 'workspace_deleted', id: t.project.workspace.id })
       projects.value = projects.value.filter((x) => x !== t.project)
       emit('workspace-deleted', {
@@ -453,6 +497,10 @@ function closeDialog() {
     <p v-if="error" class="banner error" role="alert">
       {{ error }}
       <button type="button" class="text" @click="load">重试</button>
+    </p>
+    <p v-if="cleanupNote" class="banner ok" role="status" data-testid="project-delete-cleanup">
+      {{ cleanupNote }}
+      <button type="button" class="text" @click="cleanupNote = ''">知道了</button>
     </p>
     <p v-if="loading" class="placeholder">正在加载项目…</p>
     <p v-else-if="!projects.length && !error" class="placeholder">
@@ -555,7 +603,25 @@ function closeDialog() {
                 <span v-if="e.modifiedAt" class="meta">{{ fmtTime(e.modifiedAt) }}</span>
               </div>
               <div v-if="e.kind === 'file'" class="actions">
-                <button v-if="canPreview(e.name)" type="button" @click="previewFile(p, e)">预览</button>
+                <!-- md 有两种看法：预览（渲染）与原文（原始字节）。这一组按钮同时是「打开这个文件」
+                     的入口——没取过内容就先取，取过就只切看法。非 md 只有一种看法，不出现这组。 -->
+                <template v-if="isMarkdown(e.name)">
+                  <button
+                    type="button"
+                    class="view-btn"
+                    :class="{ on: !rawView(p, e.name) }"
+                    :aria-pressed="!rawView(p, e.name)"
+                    @click="showMd(p, e, false)"
+                  >预览</button>
+                  <button
+                    type="button"
+                    class="view-btn"
+                    :class="{ on: rawView(p, e.name) }"
+                    :aria-pressed="rawView(p, e.name)"
+                    @click="showMd(p, e, true)"
+                  >原文</button>
+                </template>
+                <button v-else-if="canPreview(e.name)" type="button" @click="previewFile(p, e)">预览</button>
                 <button type="button" @click="downloadFile(p, e)">下载</button>
               </div>
               <img
@@ -564,7 +630,17 @@ function closeDialog() {
                 :src="p.files.preview[e.name]"
                 :alt="e.name"
               />
-              <pre v-if="p.files?.text[e.name]" class="file-text">{{ p.files.text[e.name] }}</pre>
+              <pre v-if="p.files?.text[e.name] && !isMarkdown(e.name)" class="file-text">{{ p.files.text[e.name] }}</pre>
+              <!-- md 预览态：排版规则在全局 .md-body（scoped 样式不跨组件，抄不进这里）。
+                   v-memo：正文没变就别重算（marked 解析 + 消毒不便宜）。 -->
+              <div
+                v-else-if="p.files?.text[e.name] && isMarkdown(e.name) && !rawView(p, e.name)"
+                class="file-md"
+                :class="MD_BODY_CLASS"
+                v-html="mdHtml(p.files.text[e.name])"
+                v-memo="[p.files?.text[e.name]]"
+              />
+              <pre v-else-if="p.files?.text[e.name]" class="file-text">{{ p.files.text[e.name] }}</pre>
             </li>
           </ul>
         </div>
@@ -903,6 +979,27 @@ button.file-name:hover {
   white-space: pre-wrap;
   word-break: break-word;
 }
+/* md 预览态的容器：排版规则在全局 .md-body（scoped 样式不跨组件，抄不进这里）。
+   这里只管这个容器自己的东西：占位、留白、字号、长字符串换行。 */
+.file-md {
+  flex-basis: 100%;
+  max-height: 22rem;
+  overflow: auto;
+  margin: 0.2rem 0 0;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  font-size: 0.78rem;
+  line-height: 1.6;
+  word-break: break-word;
+}
+/* 「预览/原文」切换：当前态高亮。 */
+.view-btn.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
 .session-main strong {
   font-size: 0.86rem;
   overflow: hidden;
@@ -924,6 +1021,10 @@ button.file-name:hover {
 .banner.error {
   color: var(--danger);
   background: var(--danger-soft);
+}
+.banner.ok {
+  color: #15803d;
+  background: #dcfce7;
 }
 @media (max-width: 860px) {
   .projects {

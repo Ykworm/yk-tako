@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"yk-tako-eino/internal/observability"
 
@@ -35,6 +36,12 @@ var errJournalGateLost = errors.New("账本写入时闸已不属于本 run")
 // 文本逐字节固定）：账本只知道「intent 存在、result 不存在」，不知道工具到底执行没执行——
 // 自动重跑会让副作用重复，如实说「结果未知」是唯一安全的默认（at-most-once）。
 const interruptedResultText = "错误：工具调用在执行中被进程中断，没有拿到结果；引擎不会自动重跑这次调用。需要的话请重新发起。"
+
+// sanitizeToolText 把工具输出变成 PG text 列能安全接收的字符串：非法 UTF-8 与 NUL 字节
+// 都换成 U+FFFD（PG 的 text 两样都不收），合法内容原样保留。
+func sanitizeToolText(s string) string {
+	return strings.ReplaceAll(strings.ToValidUTF8(s, "\uFFFD"), "\x00", "\uFFFD")
+}
 
 // journalTarget 是账本的写入坐标：哪一场 run、哪个接管令牌。由 Worker.Run 塞进 ctx
 // （epoch 来自 Run 参数：POST 路径 1，A4a 的 resume 路径传 claim 返回值）。工具与 assistant 行都从这里取。
@@ -142,6 +149,11 @@ func (t *journalInvokableTool) InvokableRun(ctx context.Context, argumentsInJSON
 		// 不写 result，run 照常走 error 出口；账本留下 intent = 「可能执行过、结果不可知」。
 		return "", err
 	}
+	// 工具输出可以是任意字节（read_text_file 读到 .git 对象、bash 回二进制）。账本、mh 与 runlog
+	// 都是 PG text 列：无效 UTF-8 与 NUL 字节都会让整场 run 在记账或收尾时失败（实测：交付 run
+	// 读 git 对象 → INSERT run_journal 报 SQLSTATE 22021）。在工具出口统一换成 U+FFFD，
+	// 下游（帧／runlog／resume 输入）看到的也是同一个字符串。
+	out = sanitizeToolText(out)
 	observability.SetTextJSON(span, "gen_ai.tool.call.result", out)
 	if err := t.store.InsertJournal(ctx, RunJournal{
 		RunID: target.runID, Epoch: target.epoch, Role: "tool_result",

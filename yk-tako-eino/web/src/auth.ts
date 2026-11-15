@@ -90,13 +90,13 @@ type LoginData = {
 
 export type LoginResult = { ok: true } | { ok: false; status: number; message: string }
 
-export async function loginWithPassword(email: string, password: string): Promise<LoginResult> {
+export async function loginWithPassword(identifier: string, password: string): Promise<LoginResult> {
   let res: Response
   try {
     res = await fetch('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({ identifier, password }),
     })
   } catch {
     return { ok: false, status: 0, message: '连不上引擎' }
@@ -185,6 +185,31 @@ export function refreshAccessToken(): Promise<boolean> {
   return refreshing
 }
 
+export type RefreshOutcome = 'ok' | 'expired' | 'transient'
+
+// 引擎信封的形状（doc/40 的 {code,message,data}，顺序固定）：非 null 对象、code 是数字、message 是字符串。
+function isEnvelope(body: unknown): body is { code: number; message: string; data?: unknown } {
+  if (typeof body !== 'object' || body === null) return false
+  const e = body as { code?: unknown; message?: unknown }
+  return typeof e.code === 'number' && typeof e.message === 'string'
+}
+
+// /api/auth/refresh 拿到响应之后的三态判定（纯函数、可机器测）：
+//   ok        = 2xx 且是引擎信封、code=0、data.accessToken 是字符串 —— 续期成功，换 token 对；
+//   expired   = HTTP 401 且是引擎信封且 code≠0 —— 引擎明确拒绝续期，这是唯一会清登录态的一态；
+//   transient = 其余全部 —— 5xx、dev 下 Vite 代理在引擎重启窗口回的 500（text/plain，解析不出 JSON 得 null）、
+//               400、非 JSON 的 HTML、401 但非信封、401 却自称 code=0 的矛盾体 —— 都是暂时性故障或无法确证，
+//               保留登录态等下一拍，不清 token。
+// 只按 HTTP 状态分（「401 就登出」）会把判断绑在「引擎恰好用 401 表达失效」这个巧合上；信封与业务码才是真源。
+export function readRefreshOutcome(status: number, body: unknown): RefreshOutcome {
+  if (status >= 200 && status < 300 && isEnvelope(body) && body.code === 0) {
+    const data = body.data as { accessToken?: unknown } | undefined
+    if (data && typeof data.accessToken === 'string') return 'ok'
+  }
+  if (status === 401 && isEnvelope(body) && body.code !== 0) return 'expired'
+  return 'transient'
+}
+
 async function doRefresh(): Promise<boolean> {
   const rt = readRefreshToken()
   if (!rt) return false
@@ -199,16 +224,20 @@ async function doRefresh(): Promise<boolean> {
     // 网络错误不代表登录失效；保留 token，下一拍还能再试。
     return false
   }
-  const body = (await res.json().catch(() => null)) as {
-    code?: number
-    data?: { accessToken?: string; refreshToken?: string }
-  } | null
-  if (!res.ok || !body || body.code !== 0 || !body.data?.accessToken) {
+  const body = await res.json().catch(() => null) // 代理 500 是 text/plain，这里解析失败 → null
+  const outcome = readRefreshOutcome(res.status, body)
+  if (outcome === 'expired') {
     clearAuth('expired')
     return false
   }
-  updateTokens(body.data.accessToken, body.data.refreshToken || rt)
-  return true
+  if (outcome === 'ok') {
+    const data = (body as { data: { accessToken: string; refreshToken?: string } }).data
+    updateTokens(data.accessToken, data.refreshToken || rt)
+    return true
+  }
+  // transient：引擎/中间层暂时不可用（重启窗口、5xx、代理 500），保留登录态等下一拍。
+  // 只有引擎明确拒绝续期（401 + 引擎信封）才算失效，暂时性故障不许把合法登录清掉。
+  return false
 }
 
 async function rawFetch(url: string, init?: RequestInit): Promise<Response> {

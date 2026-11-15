@@ -12,6 +12,7 @@ import {
   continueOrchestration,
   getAgentTask,
   getOrchestration,
+  getOrchestrationHandoff,
   listPlanRevisions,
   listTaskQuestions,
   listWorkspaceTasks,
@@ -24,6 +25,7 @@ import {
   taskArtifactUrl,
   workspaceFileUrl,
   type AgentTask,
+  type OrchestrationHandoff,
   type OrchestrationView,
   type PlanRevisionRow,
   type TaskQuestion,
@@ -32,12 +34,20 @@ import {
   type Workspace,
 } from './api'
 import { authFetch } from './auth'
+import { renderSafe } from './markdown'
 import ConfirmDialog from './ConfirmDialog.vue'
 import NotificationRecovery from './NotificationRecovery.vue'
 import { onMutation } from './mutation'
 
 const props = defineProps<{
   activeWorkspaceId?: string | null
+  // doc/80：当前活动会话 id。非空时「本会话」档可用且默认落本会话；换会话按新会话重来。
+  activeSessionId?: string | null
+  // doc/77：对话页右侧面板的嵌入模式——隐藏页头与项目选择器，作用域由 App 传死；
+  // 列表、详情抽屉与全部操作与任务页共用同一份实现。
+  embedded?: boolean
+  // 事件流重连／窗口聚焦时由 App 递增，嵌入实例据此重拉（任务页不传）。
+  reloadNonce?: number
   // 左侧「任务」处理项定位（doc/72 §8.2）：App 用显式 id 传过来，不引入新路由。
   focusWorkspaceId?: string
   focusTaskId?: string
@@ -48,7 +58,11 @@ const props = defineProps<{
   focusNonce?: number
 }>()
 
-const emit = defineEmits<{ openSession: [sessionId: string] }>()
+const emit = defineEmits<{
+  openSession: [sessionId: string]
+  // doc/80 §4.5：档位变化上报给宿主（对话页右栏据此给项目级处理条加限定词标题）。
+  scopeChange: [scope: 'session' | 'project']
+}>()
 
 const phase = ref<'loading' | 'ready' | 'error'>('loading')
 const banner = ref('')
@@ -60,6 +74,9 @@ const workspaceId = ref('')
 
 const tasks = ref<AgentTask[]>([])
 const query = ref('')
+// 列表档位（doc/80 §4.3）：本会话 / 本项目全部。默认能拿到当前会话就本会话，否则本项目全部；
+// 不落 localStorage——默认表达「我现在在看哪一场」，不是长期偏好，记住会让「新会话默认本会话」当场失效。
+const scope = ref<'session' | 'project'>(props.activeSessionId ? 'session' : 'project')
 
 // 详情抽屉：任务详情与编排组视图共用一个抽屉，组视图由详情里的「查看编排组」进入。
 const detail = ref<AgentTask | null>(null)
@@ -70,6 +87,12 @@ const revisionsLoading = ref(false)
 const planBusy = ref(false)
 // 恢复面板内联在列表上方（doc/73 §7.2）：不把完整问题或 DAG 塞进左侧处理项。
 const activeNotificationId = ref('')
+// 继任组的重规划交接（doc/75 §9.2）：机器字段与正文都来自 GET handoff，按需拉取；
+// 交接写一次就不再变，打开详情时清空，避免把上一组的交接显示给下一组。
+const handoff = ref<OrchestrationHandoff | null>(null)
+const handoffOpen = ref(false)
+const handoffLoading = ref(false)
+const handoffError = ref('')
 
 // Task 问题区（doc/72 §5）：pending 按 createdAt,id 的 FIFO 排，第一张可答；
 // answered／stale 只读展示。问题正文行是 Task 当前 run 的 run_questions 行。
@@ -160,13 +183,22 @@ async function loadTasks() {
     return
   }
   try {
-    const res = await listWorkspaceTasks(workspaceId.value)
+    // 本会话档：把当前会话 id 交给服务端缩小范围（doc/80 §4.1）；本项目全部档不传。
+    const sid = scope.value === 'session' ? (props.activeSessionId ?? '') : ''
+    const res = await listWorkspaceTasks(workspaceId.value, sid)
     tasks.value = res.tasks
     phase.value = 'ready'
   } catch (err) {
     phase.value = 'error'
     banner.value = err instanceof ApiError ? err.message : '任务列表没拉到'
   }
+}
+
+// 手动换项目（doc/80 §4.3）：当前会话不属于那个项目，档位落「本项目全部」。
+function onWorkspacePick(e: Event) {
+  const v = (e.target as HTMLSelectElement).value
+  if (v !== workspaceId.value) workspaceId.value = v
+  scope.value = 'project'
 }
 
 function fail(err: unknown, fallback: string) {
@@ -177,7 +209,24 @@ function fail(err: unknown, fallback: string) {
   banner.value = fallback
 }
 
-watch(workspaceId, () => void loadTasks())
+// 档位或项目变了就重拉；两者同一次 flush 一起变时只拉一次。
+watch([workspaceId, scope], () => void loadTasks())
+
+// 换会话（doc/80 §4.3）：档位回到默认（能拿到会话就本会话）。任务页不换 key，靠这条重拉；
+// 嵌入实例换会话时由 ChatDock 换 key 整体重挂载，这条只在任务页内生效。
+watch(
+  () => props.activeSessionId,
+  (v) => {
+    const next = v ? 'session' : 'project'
+    // 档位变了由上面的 watch 重拉；档位没变（会话 A→B 仍是「本会话」）时这里必须自己重拉，
+    // 否则列表停在上一场会话的结果上。
+    if (scope.value === next) void loadTasks()
+    else scope.value = next
+  },
+)
+
+// 档位变化上报给宿主（doc/80 §4.5）：对话页右栏据此给项目级处理条加「· 本项目」限定词。
+watch(scope, (v) => emit('scopeChange', v))
 
 async function loadQuestions(task: AgentTask) {
   if (!task.currentRunId) {
@@ -199,6 +248,7 @@ async function openDetail(row: AgentTask, questionId = '') {
   banner.value = ''
   orch.value = null
   revisions.value = []
+  resetHandoff()
   detail.value = row
   focusedQuestionId.value = questionId
   answerDraft.value = ''
@@ -255,6 +305,38 @@ async function reloadOrch(id: string) {
   await loadRevisions(id)
 }
 
+function resetHandoff() {
+  handoff.value = null
+  handoffOpen.value = false
+  handoffLoading.value = false
+  handoffError.value = ''
+}
+
+function openReplanOrigin() {
+  const id = orch.value?.orchestration.replanOf
+  if (id) void openOrch(id)
+}
+
+async function toggleHandoff() {
+  const id = orch.value?.orchestration.orchestrationId
+  if (!id || handoffLoading.value) return
+  if (handoffOpen.value) {
+    handoffOpen.value = false
+    return
+  }
+  handoffOpen.value = true
+  if (handoff.value) return
+  handoffLoading.value = true
+  handoffError.value = ''
+  try {
+    handoff.value = await getOrchestrationHandoff(id)
+  } catch (err) {
+    handoffError.value = err instanceof ApiError ? err.message : '交接文件没拉到'
+  } finally {
+    handoffLoading.value = false
+  }
+}
+
 function closeDetail() {
   detail.value = null
   orch.value = null
@@ -263,12 +345,14 @@ function closeDetail() {
   focusedQuestionId.value = ''
   answerDraft.value = ''
   answerPick.value = -1
+  resetHandoff()
 }
 
 async function openOrch(id: string) {
   banner.value = ''
   detail.value = null
   questions.value = []
+  resetHandoff()
   detailLoading.value = true
   try {
     orch.value = await getOrchestration(id)
@@ -407,15 +491,11 @@ async function submitTaskAnswer(q: TaskQuestion) {
   }
 }
 
-// 产物下载：隔离结果走新 artifact 出口——按当前结果版本读不可变结果（doc/74 §11.1），
-// 不读主项目里的同路径文件；shared 保持原项目文件出口。两个出口都要 Bearer 头，
-// 先 fetch 成 blob 再触发下载（不能直接 <a href>，会 401）。
+// 产物下载：shared 与 isolated 都有不可变结果（doc/76 §4/§5），统一走 artifact 出口——
+// 按当前结果版本读结果字节，不读项目里的同路径文件（中间结果不进 content）。
+// 出口要 Bearer 头，先 fetch 成 blob 再触发下载（不能直接 <a href>，会 401）。
 async function downloadArtifact(task: AgentTask, artifactPath: string) {
-  const url =
-    task.workspace?.mode === 'isolated'
-      ? taskArtifactUrl(task.taskId, artifactPath)
-      : workspaceFileUrl(task.workspaceId, artifactPath)
-  await downloadUrl(url, artifactPath)
+  await downloadUrl(taskArtifactUrl(task.taskId, artifactPath), artifactPath)
 }
 
 // 「查看项目当前文件」恒走项目文件出口：隔离任务看的也是原项目现状，
@@ -467,6 +547,9 @@ const ORCH_STATUS_LABEL: Record<string, string> = {
   failed: '失败',
   cancelling: '停止中',
   cancelled: '已取消',
+  // doc/75 §4.2：继任组的两个未收口状态，都不可调度、不可发布、阻止项目删除。
+  preparing: '正在准备继任方案',
+  waiting_previous: '等待原组结束',
 }
 const DELIVERY_LABEL: Record<string, string> = {
   pending: '待交付',
@@ -547,6 +630,8 @@ async function applyFocus() {
   if (wid && wid !== workspaceId.value && workspaces.value.some((w) => w.id === wid)) {
     workspaceId.value = wid
   }
+  // 定位到某条任务/编排组时落「本项目全部」（doc/80 §4.3）：否则本会话档会把这个抽屉里的任务过滤掉。
+  if (props.focusOrchestrationId || props.focusTaskId) scope.value = 'project'
   // 通知恢复面板与自动打开的组详情可以同时存在：失败通知既要在组里看交付状态，
   // 也要在面板里看结果定位与重试。新的定位没有通知 id 时顺手关掉旧面板。
   activeNotificationId.value = props.focusNotificationId ?? ''
@@ -578,9 +663,27 @@ watch(
   () => void applyFocus(),
 )
 
+// 事件流重连／窗口聚焦（doc/77）：嵌入实例由 App 递增 reloadNonce，列表与已打开详情重拉。
+watch(
+  () => props.reloadNonce,
+  () => {
+    void loadTasks()
+    if (detail.value) void reloadDetail(detail.value.taskId)
+    if (orch.value) void reloadOrch(orch.value.orchestration.orchestrationId)
+  },
+)
+
 onMounted(() => {
   window.addEventListener('keydown', onKeydown)
   void (async () => {
+    // 嵌入实例（doc/77）不消费挂载前就存在的定位：左栏处理项写的是任务页那份 nonce，
+    // 面板重挂载（切项目／回到对话页）时不能把旧定位再弹一次。
+    if (props.embedded) {
+      workspaceId.value = props.activeWorkspaceId ?? ''
+      lastFocusNonce = props.focusNonce ?? 0
+      await loadTasks()
+      return
+    }
     try {
       await loadWorkspaces()
     } catch (err) {
@@ -601,8 +704,8 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="tasks">
-    <header class="page-head">
+  <div class="tasks" :class="{ embedded }">
+    <header v-if="!embedded" class="page-head">
       <div>
         <p class="kicker">任务</p>
         <h2>交给助手的长活</h2>
@@ -612,7 +715,7 @@ onBeforeUnmount(() => {
         </p>
       </div>
       <div class="head-actions">
-        <select v-model="workspaceId" aria-label="选择项目" data-testid="tasks-workspace">
+        <select :value="workspaceId" aria-label="选择项目" data-testid="tasks-workspace" @change="onWorkspacePick">
           <option v-if="!workspaces.length" value="">（还没有项目）</option>
           <option v-for="w in workspaces" :key="w.id" :value="w.id">{{ w.name }}</option>
         </select>
@@ -633,14 +736,31 @@ onBeforeUnmount(() => {
     <section class="card">
       <div class="list-head">
         <h3>任务 <span class="count">{{ tasks.length }}</span></h3>
+        <div class="scope-switch" role="group" aria-label="任务范围">
+          <button
+            type="button"
+            :class="{ on: scope === 'session' }"
+            :disabled="!activeSessionId"
+            :title="activeSessionId ? '只看本会话派发的任务' : '当前没有活动会话'"
+            data-testid="tasks-scope-session"
+            @click="scope = 'session'"
+          >本会话</button>
+          <button
+            type="button"
+            :class="{ on: scope === 'project' }"
+            data-testid="tasks-scope-project"
+            @click="scope = 'project'"
+          >本项目全部</button>
+        </div>
         <input v-model="query" type="search" placeholder="按 key 或内容筛选" aria-label="筛选任务" />
       </div>
 
       <p v-if="phase === 'loading'" class="muted">正在加载…</p>
       <p v-else-if="phase === 'error'" class="muted">列表没拉到，稍后重试。</p>
-      <p v-else-if="!workspaceId" class="muted">先在上面选一个项目。</p>
-      <p v-else-if="!filtered.length" class="muted">
-        {{ tasks.length ? '没有匹配的任务。' : '这个项目还没有任务。在对话里让助手用任务功能派发。' }}
+      <p v-else-if="!workspaceId" class="muted">{{ embedded ? '先在左侧选一个项目。' : '先在上面选一个项目。' }}</p>
+      <p v-else-if="!filtered.length && (tasks.length || scope !== 'session')" class="muted">
+        <template v-if="tasks.length">没有匹配的任务。</template>
+        <template v-else>这个项目还没有任务。在对话里让助手用任务功能派发。</template>
       </p>
 
       <ul v-else class="task-list" data-testid="tasks-list">
@@ -690,6 +810,13 @@ onBeforeUnmount(() => {
                       · 发布：<span class="tag" :class="`p-${orch.orchestration.workspace.publication.status}`" data-testid="orch-pub-status">{{ PUB_LABEL[orch.orchestration.workspace.publication.status] ?? orch.orchestration.workspace.publication.status }}</span>
                     </template>
                   </template>
+                  <template v-if="orch.orchestration.replanOf">
+                    · 由
+                    <button type="button" class="orch-link" data-testid="orch-replan-origin" @click="openReplanOrigin">
+                      {{ orch.orchestration.replanOf }}
+                    </button>
+                    重规划而来（第 {{ orch.orchestration.replanDepth }} 层）
+                  </template>
                 </p>
               </div>
               <div class="sheet-actions">
@@ -727,6 +854,31 @@ onBeforeUnmount(() => {
                 · 检查点已暂停领取新工作；查看修订历史后显式继续，或回到来源对话让协调者复核。
               </template>
             </p>
+            <!-- 重规划交接（doc/75 §9.2）：关联与复用走机器字段，正文按安全 Markdown 渲染。 -->
+            <section v-if="orch.orchestration.replanOf" class="sec handoff-panel" data-testid="orch-handoff">
+              <h4>重规划交接</h4>
+              <p class="muted">
+                这一组由前代编排组创建；计划版本从 v0 开始，复用条目只取自交接链上已成功的结果。
+              </p>
+              <button
+                type="button"
+                class="orch-link"
+                data-testid="orch-handoff-toggle"
+                @click="toggleHandoff"
+              >{{ handoffOpen ? '收起交接文件' : '查看交接文件' }}</button>
+              <p v-if="handoffLoading" class="muted">正在读取…</p>
+              <p v-else-if="handoffError" class="banner error" role="alert">{{ handoffError }}</p>
+              <template v-else-if="handoffOpen && handoff">
+                <p class="muted handoff-reuse" data-testid="orch-handoff-reuse">
+                  复用前代结果：
+                  <template v-if="handoff.reuse.length">
+                    <code v-for="r in handoff.reuse" :key="r.taskId" class="handoff-reuse-item">{{ r.taskId }}（resultRevision {{ r.resultRevision }}）</code>
+                  </template>
+                  <template v-else>无</template>
+                </p>
+                <div class="handoff-body" data-testid="orch-handoff-body" v-html="renderSafe(handoff.body)" />
+              </template>
+            </section>
             <div class="dep-map" data-testid="orch-deps">
               <p class="muted">依赖（parent → child）：</p>
               <ul v-if="orch.links.length">
@@ -1021,6 +1173,28 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: var(--space-3);
 }
+/* 嵌入对话页右栏（doc/77 / doc/78）：外层 .dock-pane 负责滚动，这里不再自己滚。 */
+.tasks.embedded {
+  flex: none;
+  width: auto;
+  max-width: none;
+  margin: 0;
+  padding: 0 0.6rem 1rem;
+  overflow: visible;
+  gap: var(--space-2);
+}
+/* 列表头一行（doc/80）：标题 + 两档切换 + 筛选框，同 ToolsView/SkillsView 的写法。 */
+.list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+.list-head input { width: min(100%, 16rem); }
+.tasks.embedded .list-head {
+  padding: 0 0.15rem;
+}
 .page-head {
   display: flex;
   align-items: flex-end;
@@ -1054,6 +1228,37 @@ h4 { margin: 0 0 0.35rem; font-size: var(--text-sm); font-weight: 600; }
   padding: 0.4rem 0.6rem;
 }
 .count { color: var(--muted); font-weight: 400; font-size: var(--text-sm); }
+/* 两档切换（doc/80 §4.3）：本会话 / 本项目全部，放在列表头那一行。 */
+.scope-switch {
+  display: inline-flex;
+  border: 1px solid var(--line, #e5e7eb);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.scope-switch button {
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: var(--text-xs);
+  padding: 0.25rem 0.7rem;
+  cursor: pointer;
+}
+.scope-switch button:hover:not(:disabled) { color: var(--ink); }
+.scope-switch button.on {
+  background: var(--accent-soft, #eef2ff);
+  color: var(--accent-ink, #3730a3);
+}
+.scope-switch button:disabled { opacity: 0.45; cursor: default; }
+.linkish {
+  border: 0;
+  background: none;
+  color: var(--accent-ink, #3730a3);
+  font: inherit;
+  padding: 0 0.15rem;
+  cursor: pointer;
+  text-decoration: underline;
+}
 
 .task-list {
   list-style: none;
@@ -1116,6 +1321,9 @@ h4 { margin: 0 0 0.35rem; font-size: var(--text-sm); font-weight: 600; }
 .tag.cancelled { background: var(--bg-soft, #f3f4f6); color: var(--muted); }
 .tag.active { background: #e0f2fe; color: #0369a1; }
 .tag.cancelling { background: #fef3c7; color: #92400e; }
+/* doc/75 §4.2：继任组出生与等待原组两个未收口状态（都不可调度）。 */
+.tag.preparing { background: #fef3c7; color: #92400e; }
+.tag.waiting_previous { background: #eef2ff; color: #4338ca; }
 .tag.d-delivered { background: #dcfce7; color: #15803d; }
 .tag.d-delivering { background: #e0f2fe; color: #0369a1; }
 .tag.d-pending { background: #fef3c7; color: #92400e; }
@@ -1248,6 +1456,50 @@ h4 { margin: 0 0 0.35rem; font-size: var(--text-sm); font-weight: 600; }
   color: var(--accent, #4f46e5);
   text-decoration: underline;
   cursor: pointer;
+}
+
+/* 重规划交接（doc/75 §9.2）：正文是程序渲染的 Markdown，样式与聊天气泡同族。 */
+.handoff-panel {
+  border: 1px solid var(--line, #e5e7eb);
+  border-radius: 10px;
+  padding: 0.7rem 0.9rem;
+}
+.handoff-panel p { margin: 0.25rem 0; }
+.handoff-reuse-item { margin-right: 0.6rem; }
+.handoff-body {
+  margin-top: 0.45rem;
+  padding: 0.65rem 0.8rem;
+  border-radius: 10px;
+  background: var(--bg-soft, #f6f7f9);
+  font-size: var(--text-sm);
+  word-break: break-word;
+  max-height: 22rem;
+  overflow: auto;
+}
+.handoff-body :deep(h1),
+.handoff-body :deep(h2),
+.handoff-body :deep(h3) {
+  margin: 0.6rem 0 0.3rem;
+  line-height: 1.35;
+}
+.handoff-body :deep(h1) { font-size: 1.1rem; }
+.handoff-body :deep(h2) { font-size: 1rem; }
+.handoff-body :deep(h3) { font-size: 0.95rem; }
+.handoff-body :deep(p) { margin: 0.3rem 0; }
+.handoff-body :deep(ul),
+.handoff-body :deep(ol) { margin: 0.3rem 0; padding-left: 1.3rem; }
+.handoff-body :deep(li) { margin: 0.1rem 0; }
+.handoff-body :deep(code) {
+  background: rgba(0, 0, 0, 0.05);
+  border-radius: 4px;
+  padding: 0.05rem 0.25rem;
+  font-size: 0.92em;
+}
+.handoff-body :deep(pre) {
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 8px;
+  padding: 0.5rem 0.6rem;
+  overflow: auto;
 }
 
 /* 修订时间线：一条版本一行块，命令原样展示（doc/72 §8.2）。 */

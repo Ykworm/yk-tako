@@ -37,7 +37,11 @@ func TestTaskToolSurfaces(t *testing.T) {
 
 	s := newTestStore(t, testLease, testTTL)
 	w := &Worker{store: s, tools: all}
-	exec := gotNames(w.agentTaskExecutorBase(ctx, nil))
+	execTools := w.agentTaskExecutorBase(ctx, nil)
+	if st := w.agentTaskSubmitTool(); st != nil {
+		execTools = append(execTools, st)
+	}
+	exec := gotNames(execTools)
 	for _, want := range []string{"ask_user", "bash", "read_text_file", "submit_task_result"} {
 		if !exec[want] {
 			t.Fatalf("Task 执行者缺工具 %q：%v", want, exec)
@@ -50,6 +54,21 @@ func TestTaskToolSurfaces(t *testing.T) {
 		if exec[denied] {
 			t.Fatalf("Task 执行者拿到了 %q：%v", denied, exec)
 		}
+	}
+
+	// 白名单档不裁交付口：coder 就是 tools: 白名单，submit_task_result 若留在基座里会被
+	// resolveToolPool 裁掉，执行者永远交不出结果（result_not_submitted）。保留名跳过 + 装配后补。
+	listed := []string{"read_text_file", taskSubmitToolName}
+	pool, err := resolveToolPool(ctx, AgentSpec{Tools: &listed}, w.agentTaskExecutorBase(ctx, nil))
+	if err != nil {
+		t.Fatalf("白名单写了保留名 submit_task_result 不该报未知名: %v", err)
+	}
+	if len(pool) != 1 {
+		t.Fatalf("白名单过滤后只该剩 read_text_file（submit 由装配追加），got %d", len(pool))
+	}
+	pool = append(pool, w.agentTaskSubmitTool())
+	if !gotNames(pool)["submit_task_result"] {
+		t.Fatal("白名单规格的最终池里没有 submit_task_result")
 	}
 
 	review := gotNames(keepPlanReviewTools(ctx, all))
@@ -79,18 +98,19 @@ func TestTaskToolSurfaces(t *testing.T) {
 // TestSubmitTaskResultErrorAsResult 钉住 submit_task_result 进执行者池时包了 wrapToolErrors：
 // 提交被拒（验证未过／没有 run 身份等业务错误）必须回注「错误：…」结果让执行者返工，
 // 而不是裸抛 error 被 ToolsNode 当 NodeRunError 打挂整场 run（doc/74 §8.2 验证返工的前提）。
+// 工具本身由 agentTaskSubmitTool 单独造——它装配在规格过滤之后，不在执行者基座里。
 func TestSubmitTaskResultErrorAsResult(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t, testLease, testTTL)
 	w := &Worker{store: s}
 	var submit tool.InvokableTool
-	for _, x := range w.agentTaskExecutorBase(ctx, nil) {
-		info, err := x.Info(ctx)
+	if st := w.agentTaskSubmitTool(); st != nil {
+		info, err := st.Info(ctx)
 		if err != nil {
 			t.Fatalf("Info: %v", err)
 		}
 		if info.Name == "submit_task_result" {
-			submit, _ = x.(tool.InvokableTool)
+			submit, _ = st.(tool.InvokableTool)
 		}
 	}
 	if submit == nil {

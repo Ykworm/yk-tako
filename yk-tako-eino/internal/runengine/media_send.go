@@ -160,7 +160,7 @@ func (m *mediaSendModel) restore(ctx context.Context, input []*schema.Message) [
 		return input
 	}
 	resolve := func(ctx context.Context, path string) (string, error) {
-		return resolveReadMediaPath(ctx, m.store, m.workspace, path)
+		return resolveReadMediaPath(ctx, m.store, m.workspace, m.workspace, path)
 	}
 	box := foldBoxFrom(ctx)
 	out, stats := restoreUserMedia(ctx, input, resolve, box)

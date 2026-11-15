@@ -42,13 +42,22 @@ func (s *Server) taskPlanEnv(ctx context.Context, p principal) (planEnv, error) 
 func taskStoreErr(c *gin.Context, err error) bool {
 	var pe *planError
 	var wce *workspaceConfigError
+	var se *successorError
 	switch {
 	case errors.As(err, &pe):
 		writeEnvelope(c, http.StatusBadRequest, codePlanInvalid, "任务计划不合法", gin.H{"reason": pe.reason})
 	case errors.As(err, &wce):
 		writeEnvelope(c, http.StatusBadRequest, codeWorkspaceConfigInvalid, "工作区配置不合法", gin.H{"reason": wce.reason})
+	case errors.As(err, &se):
+		writeEnvelope(c, http.StatusBadRequest, codeSuccessorInvalid, "继任方案不合法", gin.H{"reason": se.reason})
 	case errors.Is(err, errPlanConflict):
 		writeEnvelope(c, http.StatusConflict, codePlanConflict, "这个创建键已经用于另一份计划", nil)
+	case errors.Is(err, errSuccessorRefused):
+		writeEnvelope(c, http.StatusConflict, codeSuccessorNotAllowed, "这个编排组现在不能创建继任组", nil)
+	case errors.Is(err, errHandoffMissing):
+		writeEnvelope(c, http.StatusNotFound, codeHandoffMissing, "找不到这次重规划交接", nil)
+	case errors.Is(err, errProjectLayoutUnmigrated):
+		writeEnvelope(c, http.StatusConflict, codeLayoutUnmigrated, "这个项目还需要迁移目录后才能使用", nil)
 	case errors.Is(err, errCreateSource):
 		writeEnvelope(c, http.StatusNotFound, codeSessionMissing, "找不到这场会话", nil)
 	case errors.Is(err, errCreateWorkspace), errors.Is(err, ErrWorkspaceNotFound):
@@ -65,8 +74,6 @@ func taskStoreErr(c *gin.Context, err error) bool {
 		writeEnvelope(c, http.StatusConflict, codeTaskFinished, "这件任务已经结束，不能停止", nil)
 	case errors.Is(err, errOrchNotStoppable):
 		writeEnvelope(c, http.StatusConflict, codeOrchFinished, "这个编排组已经结束，不能停止", nil)
-	case errors.Is(err, errArtifactShared):
-		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "这件任务的结果产物请从项目文件读取", nil)
 	case errors.Is(err, errArtifactUnreadable):
 		writeEnvelope(c, http.StatusConflict, codeArtifactInvalid, "结果产物已不可读取", nil)
 	case errors.Is(err, errTaskNotRepublishable):
@@ -110,6 +117,9 @@ func (s *Server) postAgentTask(c *gin.Context) {
 	if req.IdempotencyKey == "" || req.WorkspaceID == "" || req.SourceSessionID == "" ||
 		req.Content == "" || req.Agent == "" {
 		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "idempotencyKey、workspaceId、sourceSessionId、content、agent 都是必填", nil)
+		return
+	}
+	if s.rejectUnmigratedWorkspace(c, p, req.WorkspaceID) {
 		return
 	}
 	env, err := s.taskPlanEnv(c.Request.Context(), p)
@@ -167,6 +177,9 @@ func (s *Server) postAgentOrchestration(c *gin.Context) {
 		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "idempotencyKey、workspaceId、sourceSessionId、goal 都是必填", nil)
 		return
 	}
+	if s.rejectUnmigratedWorkspace(c, p, req.WorkspaceID) {
+		return
+	}
 	env, err := s.taskPlanEnv(c.Request.Context(), p)
 	if err != nil {
 		if taskStoreErr(c, err) {
@@ -220,7 +233,8 @@ func (s *Server) listWorkspaceAgentTasks(c *gin.Context) {
 		writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
 		return
 	}
-	views, err := s.store.ListWorkspaceTasks(c.Request.Context(), p, c.Param("id"))
+	// sessionId 可选：非空时只看「本会话派发的」Task（doc/80）；空串 = 不限定。
+	views, err := s.store.ListWorkspaceTasks(c.Request.Context(), p, c.Param("id"), c.Query("sessionId"))
 	if err != nil {
 		if taskStoreErr(c, err) {
 			return
@@ -318,4 +332,100 @@ func (s *Server) stopAgentOrchestration(c *gin.Context) {
 		s.stopTaskRun(c.Request.Context(), runID)
 	}
 	writeEnvelope(c, http.StatusAccepted, codeOK, "", gin.H{"orchestrationId": c.Param("id"), "status": status})
+}
+
+// postOrchestrationSuccessor 为一个原组创建继任编排组（doc/75 §4.1；施工包 §4.1/§7.2）。
+//
+//	202 {"code":0,"message":"","data":{"orchestrationId":"or_…","status":"preparing|waiting_previous|active","replanOf":"or_原组","replanDepth":1}}
+//	400 117115 继任方案不合法（reason 进 data.reason）；409 117102 同键不同方案
+//	404 117002 原组不存在/不可见；409 117114 不能创建继任组（已有继任者/状态不允许）
+//	409 117116 项目还是旧目录布局
+//
+// 校验只有一份：形状、可行性、复用、预算与 DAG 全在 store 的创建服务里；handler 只判必填。
+// 原组未终态时 store 已持久化停止请求，running 节点的 run 在这里收尾（与停整组同一条链路）。
+func (s *Server) postOrchestrationSuccessor(c *gin.Context) {
+	p, ok := principalFrom(c)
+	if !ok {
+		writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
+		return
+	}
+	var req struct {
+		IdempotencyKey  string         `json:"idempotencyKey"`
+		GoalAssessment  GoalAssessment `json:"goalAssessment"`
+		Reason          string         `json:"reason"`
+		SuccessorReason string         `json:"successorReason"`
+		NoReplay        []string       `json:"noReplay"`
+		Reuse           []struct {
+			TaskID         string `json:"taskId"`
+			ResultRevision int    `json:"resultRevision"`
+		} `json:"reuse"`
+		WorkspaceID   string     `json:"workspaceId"`
+		Goal          string     `json:"goal"`
+		WorkspaceMode string     `json:"workspaceMode"`
+		VerifyCommand string     `json:"verifyCommand"`
+		Tasks         []planTask `json:"tasks"`
+		Links         []planLink `json:"links"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeEnvelope(c, http.StatusBadRequest, codeBadJSON, "请求格式不对", nil)
+		return
+	}
+	if req.IdempotencyKey == "" || req.Goal == "" || len(req.Tasks) == 0 {
+		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "idempotencyKey、goal、tasks 都是必填", nil)
+		return
+	}
+	env, err := s.taskPlanEnv(c.Request.Context(), p)
+	if err != nil {
+		if taskStoreErr(c, err) {
+			return
+		}
+		internal(c, err)
+		return
+	}
+	cmd := SuccessorCommand{
+		IdempotencyKey:  req.IdempotencyKey,
+		GoalAssessment:  req.GoalAssessment,
+		Reason:          req.Reason,
+		SuccessorReason: req.SuccessorReason,
+		NoReplay:        req.NoReplay,
+		WorkspaceID:     req.WorkspaceID,
+		Goal:            req.Goal,
+		WorkspaceMode:   req.WorkspaceMode,
+		VerifyCommand:   req.VerifyCommand,
+		Tasks:           req.Tasks,
+		Links:           req.Links,
+	}
+	for _, r := range req.Reuse {
+		cmd.Reuse = append(cmd.Reuse, SuccessorReuseRef{TaskID: r.TaskID, ResultRevision: r.ResultRevision})
+	}
+	resp, err := s.store.CreateSuccessorOrchestration(c.Request.Context(), p, c.Param("id"), cmd, env)
+	if err != nil {
+		if taskStoreErr(c, err) {
+			return
+		}
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusAccepted, codeOK, "", resp)
+}
+
+// getOrchestrationHandoff 读继任组的交接文件（施工包 §4.3）。
+//
+//	200 {"code":0,"message":"","data":{"orchestrationId":"or_…","replanOf":"or_原组","replanDepth":1,"reuse":[…],"body":"…"}}
+//	404 117002 组不存在/不可见；404 117004 组在但没有重规划交接
+func (s *Server) getOrchestrationHandoff(c *gin.Context) {
+	p, ok := principalFrom(c)
+	if !ok {
+		writeEnvelope(c, http.StatusUnauthorized, codeMissingToken, "请先登录", nil)
+		return
+	}
+	view, err := s.store.GetOrchestrationHandoff(c.Request.Context(), p, c.Param("id"))
+	if err != nil {
+		if taskStoreErr(c, err) {
+			return
+		}
+		internal(c, err)
+		return
+	}
+	writeEnvelope(c, http.StatusOK, codeOK, "", view)
 }

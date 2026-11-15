@@ -730,9 +730,12 @@ func resolveToolPool(ctx context.Context, spec AgentSpec, base []tool.BaseTool) 
 		if name == toolSearchToolName {
 			continue // 保留名：不在 base，由子代理自己的 toolSearchHandler 装入
 		}
+		if name == taskSubmitToolName {
+			continue // 保留名：Task 执行者装配在规格过滤之后追加，不在 base
+		}
 		t, ok := byName[name]
 		if !ok {
-			options := append(append([]string(nil), names...), toolSearchToolName)
+			options := append(append([]string(nil), names...), toolSearchToolName, taskSubmitToolName)
 			return nil, fmt.Errorf("tools 列了未知名 %q（可选: %s）", name, strings.Join(options, ", "))
 		}
 		pool = append(pool, t)

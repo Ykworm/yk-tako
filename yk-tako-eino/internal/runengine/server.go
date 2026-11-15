@@ -140,6 +140,9 @@ func (s *Server) RouterFor() *gin.Engine {
 	r.GET("/api/runs/:runId/stream", authn, s.getRunStream)
 	// 技能加载记录（doc/52 B1）：本拍只证端点通（loads 恒空），B4 从 runlog 派生。
 	r.GET("/api/runs/:runId/skills", authn, s.getRunSkills)
+	// 对话页右侧工作区的两个只读读口（doc/78 §4）：改动文件从 runlog 派生，Todo 读 run_tasks。
+	r.GET("/api/runs/:runId/changed-files", authn, s.getRunChangedFiles)
+	r.GET("/api/runs/:runId/tasks", authn, s.getRunTasks)
 	r.GET("/api/sessions/:id/log", authn, s.getSessionLog)
 	r.GET("/api/mcp/servers", authn, sys, s.getMcpServers)
 	r.GET("/api/media", authn, s.getMedia)
@@ -196,6 +199,9 @@ func (s *Server) RouterFor() *gin.Engine {
 	r.GET("/api/orchestrations/:id/revisions", authn, s.getOrchestrationRevisions)
 	r.POST("/api/tasks/:id/stop", authn, s.auth.RequireTenantRole("member"), s.stopAgentTask)
 	r.POST("/api/orchestrations/:id/stop", authn, s.auth.RequireTenantRole("member"), s.stopAgentOrchestration)
+	// 目标重规划与继任组（doc/75 §4）：写面 member，读面 authn + 属主链。
+	r.POST("/api/orchestrations/:id/successors", traceIngress(), authn, s.auth.RequireTenantRole("member"), s.postOrchestrationSuccessor)
+	r.GET("/api/orchestrations/:id/handoff", authn, s.getOrchestrationHandoff)
 	// 任务级恢复（doc/70 §10.1）：复用 ClaimResume / 账本重放 / Redis seed，装配口换执行者。
 	r.POST("/api/tasks/:id/resume", traceIngress(), authn, s.resumeAgentTask)
 	// 隔离结果产物与人工重新发布（doc/74 §4.4/§4.5）：产物读面 authn + 属主链，写面 member。
@@ -460,6 +466,18 @@ func (s *Server) postRuns(c *gin.Context) {
 			return
 		}
 	}
+	// doc/76 §6.3：存量未迁移项目在任何新 run 之前就拒绝，不等到 worker 里才报 workspace 错。
+	checkWid := workspaceID
+	if sessionExists {
+		var err error
+		if checkWid, err = s.store.SessionWorkspaceID(ctx, sessionID); err != nil {
+			internal(c, err)
+			return
+		}
+	}
+	if s.rejectUnmigratedWorkspace(c, p, checkWid) {
+		return
+	}
 	// 入口媒体（doc/32 A1）：先校验+落盘（400 同形 bad_media 带原因），再准入（A2 把 base64
 	// 体折进 413 预算）——落盘在闸前，因为占位要进 user 行 text，而 user 行在 AcquireRun
 	// 的原子写里定稿。409/500 时工作区目录里的 .media/ 可能多出文件：内容寻址幂等、无对话痕迹，
@@ -478,9 +496,13 @@ func (s *Server) postRuns(c *gin.Context) {
 			}
 			seqStart = n + 1
 		}
-		dir, prefix, err := s.imageRoot(ctx, p, sessionID, workspaceID, sessionExists)
+		mediaDir, prefix, err := s.imageRoot(ctx, p, sessionID, workspaceID, sessionExists)
 		if errors.Is(err, ErrWorkspaceNotFound) {
 			writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
+			return
+		}
+		if errors.Is(err, errProjectLayoutUnmigrated) {
+			writeLayoutUnmigrated(c)
 			return
 		}
 		if err != nil {
@@ -500,7 +522,7 @@ func (s *Server) postRuns(c *gin.Context) {
 				})
 			}
 		}
-		ph, err := ingestImagesAt(dir, req.Images, seqStart, prefix, quota)
+		ph, err := ingestImagesAt(mediaDir, req.Images, seqStart, prefix, quota)
 		if errors.Is(err, errStorageQuota) {
 			writeEnvelope(c, http.StatusTooManyRequests, codeQuota, "这个工作区的额度用完了", nil)
 			return
@@ -577,9 +599,11 @@ func (s *Server) postRuns(c *gin.Context) {
 	writeEnvelope(c, http.StatusAccepted, codeOK, "", postRunsResponse{SessionID: sessionID, RunID: runID, MessageID: req.MessageID})
 }
 
-// imageRoot 决定这批入口图写到哪，并给出占位 path 的前缀 workspaces/<wid>/。
+// imageRoot 决定这批入口图在项目容器里写到哪，并给出占位 path 的前缀 workspaces/<wid>/。
+// 物理落点是项目运行资源区的 runtime/media（doc/76 §6.1），占位里仍是 .media/，逐字不变。
 // 已有会话只看会话行上的项目；新会话看这次请求的 workspaceId。两边都空就用默认工作区，没有这行就建。
 // 解析出来的项目当前用户看不见时，返回 ErrWorkspaceNotFound，调用方回 114001，字节不落盘。
+// 存量未迁移项目返回 errProjectLayoutUnmigrated（409 117116），也不落盘。
 func (s *Server) imageRoot(ctx context.Context, p principal, sessionID SessionID, requestWorkspaceID string, sessionExists bool) (string, string, error) {
 	wid := ""
 	if sessionExists {
@@ -600,11 +624,35 @@ func (s *Server) imageRoot(ctx context.Context, p principal, sessionID SessionID
 	} else if _, err := s.store.VisibleWorkspace(ctx, wid, p.TenantID, p.UserID); err != nil {
 		return "", "", err
 	}
-	dir, err := workspaceDir(s.mediaRoot, p.TenantID, wid)
+	_, runtimeDir, err := ensureProjectLayout(s.mediaRoot, p.TenantID, wid)
 	if err != nil {
 		return "", "", err
 	}
-	return dir, "workspaces/" + wid + "/", nil
+	return filepath.Join(runtimeDir, projectMediaDirName), "workspaces/" + wid + "/", nil
+}
+
+// writeLayoutUnmigrated 是旧目录布局的统一拒绝（doc/76 §6.3）：项目所有读写入口在显式迁移
+// 之前都回这一句，不提供任何「看起来能读」的旁路。
+func writeLayoutUnmigrated(c *gin.Context) {
+	writeEnvelope(c, http.StatusConflict, codeLayoutUnmigrated, "这个项目还需要迁移目录后才能使用", nil)
+}
+
+// rejectUnmigratedWorkspace 在写入口前挡存量布局；返回 true = 已写出响应。
+// 空 wid / 未配置作业根 = 没有项目容器，不拦（纯会话与单测）。
+func (s *Server) rejectUnmigratedWorkspace(c *gin.Context, p principal, wid string) bool {
+	if wid == "" || s.mediaRoot == "" {
+		return false
+	}
+	needs, err := projectLayoutNeedsMigration(s.mediaRoot, p.TenantID, wid)
+	if err != nil {
+		internal(c, err)
+		return true
+	}
+	if needs {
+		writeLayoutUnmigrated(c)
+		return true
+	}
+	return false
 }
 
 // runView 是 run 端点的归属结果。written=true 表示 401/500 已经写出，调用方直接 return。
@@ -1570,13 +1618,29 @@ func (s *Server) getMedia(c *gin.Context) {
 			internal(c, err)
 			return
 		}
-		dir, err := workspaceDir(s.mediaRoot, who.TenantID, wid)
+		needs, err := projectLayoutNeedsMigration(s.mediaRoot, who.TenantID, wid)
 		if err != nil {
-			writeEnvelope(c, http.StatusNotFound, codeMediaMissing, "找不到这个文件", nil)
+			internal(c, err)
 			return
 		}
-		root = dir
-		rel = inside
+		if needs {
+			writeLayoutUnmigrated(c)
+			return
+		}
+		contentDir, runtimeDir, err := ensureProjectLayout(s.mediaRoot, who.TenantID, wid)
+		if err != nil {
+			internal(c, err)
+			return
+		}
+		// 媒体占位路径逐字不变（workspaces/<wid>/.media/…），物理字节在 runtime/media；
+		// 其余项目内路径按 content 读。
+		if relPath, ok := strings.CutPrefix(inside, mediaDirName+"/"); ok {
+			root = filepath.Join(runtimeDir, projectMediaDirName)
+			rel = relPath
+		} else {
+			root = contentDir
+			rel = inside
+		}
 	}
 	full, err := resolveInWorkspace(root, rel)
 	if err != nil {

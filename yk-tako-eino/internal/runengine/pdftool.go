@@ -29,7 +29,7 @@ func newReadPDFTextTool(store *Store, root string) (tool.BaseTool, error) {
 			"page_from 与 page_to 可省略，默认第 1-3 页；单次最多 10 页、16KB。"+
 			"没有文本层的扫描件会说明读不到。不要用它读图片或音视频。",
 		func(ctx context.Context, in readPDFTextInput) (string, error) {
-			full, err := resolveReadMediaPath(ctx, store, root, in.Path)
+			full, err := resolveReadMediaPath(ctx, store, root, root, in.Path)
 			if err != nil {
 				return "", err
 			}

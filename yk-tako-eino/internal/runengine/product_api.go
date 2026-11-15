@@ -198,9 +198,22 @@ func (s *Server) listWorkspaceFiles(c *gin.Context) {
 		internal(c, err)
 		return
 	}
-	root, err := workspaceDir(s.mediaRoot, p.TenantID, wid)
+	root, err := projectContentDir(s.mediaRoot, p.TenantID, wid)
 	if err != nil {
 		writeEnvelope(c, http.StatusNotFound, codeMediaMissing, "找不到这个文件", nil)
+		return
+	}
+	needs, err := projectLayoutNeedsMigration(s.mediaRoot, p.TenantID, wid)
+	if err != nil {
+		internal(c, err)
+		return
+	}
+	if needs {
+		writeLayoutUnmigrated(c)
+		return
+	}
+	if _, _, err := ensureProjectLayout(s.mediaRoot, p.TenantID, wid); err != nil {
+		internal(c, err)
 		return
 	}
 	rel := strings.TrimSpace(c.Query("path"))
@@ -292,15 +305,16 @@ func (s *Server) patchWorkspaceVisibility(c *gin.Context) {
 }
 
 // deleteWorkspace 删创建者自己的项目，并软删挂在上面的会话。
-// 有活 run 则 409，项目行、会话行和目录都留着。默认工作区仍不能删。
-// 成功是先提交事务，再删项目目录和各会话目录。目录删失败只记日志，响应仍是 deleted。
+// 有活 run／未收口组或发布则 409，项目行、会话行和目录都留着。默认工作区仍不能删。
+// 成功是先提交事务，再删整个项目容器与各会话私有目录（doc/76 §6.4）：
+// 全删掉回 cleanup=done；有目录删失败只记日志，回 cleanup=pending 并由调度器补偿。
 func (s *Server) deleteWorkspace(c *gin.Context) {
 	p, ok := s.requirePrincipal(c)
 	if !ok {
 		return
 	}
 	id := c.Param("id")
-	sessionIDs, err := s.store.DeleteWorkspaceCascade(c.Request.Context(), p.TenantID, p.UserID, id)
+	err := s.store.DeleteWorkspaceCascade(c.Request.Context(), p.TenantID, p.UserID, id)
 	switch {
 	case errors.Is(err, ErrWorkspaceNotFound):
 		writeEnvelope(c, http.StatusNotFound, codeWorkspaceMissing, "找不到这个项目", nil)
@@ -312,25 +326,16 @@ func (s *Server) deleteWorkspace(c *gin.Context) {
 		log.Printf("DELETE /api/workspaces/%s: %v", id, err)
 		writeEnvelope(c, http.StatusInternalServerError, codeInternal, "服务暂时不可用，请再试一次", nil)
 	default:
-		if dir, dirErr := workspaceDir(s.mediaRoot, p.TenantID, id); dirErr != nil {
-			log.Printf("DELETE /api/workspaces/%s: %v", id, dirErr)
-		} else if rmErr := os.RemoveAll(dir); rmErr != nil {
-			log.Printf("DELETE /api/workspaces/%s: %v", id, rmErr)
-		}
-		for _, sid := range sessionIDs {
-			sdir, serr := sessionDir(s.mediaRoot, p.TenantID, sid)
-			if serr != nil {
-				log.Printf("DELETE /api/workspaces/%s session %s: %v", id, sid, serr)
-				continue
-			}
-			if rmErr := os.RemoveAll(sdir); rmErr != nil {
-				log.Printf("DELETE /api/workspaces/%s session %s: %v", id, sid, rmErr)
-			}
+		cleanup := "done"
+		if err := s.store.CleanupProjectStorage(c.Request.Context(), p.TenantID, id); err != nil {
+			log.Printf("DELETE /api/workspaces/%s cleanup: %v", id, err)
+			cleanup = "pending"
 		}
 		s.publishEvent(c.Request.Context(), p.TenantID, eventWorkspaceDeleted, id)
 		writeEnvelope(c, http.StatusOK, codeOK, "", struct {
-			Status string `json:"status"`
-		}{Status: "deleted"})
+			Status  string `json:"status"`
+			Cleanup string `json:"cleanup"`
+		}{Status: "deleted", Cleanup: cleanup})
 	}
 }
 
@@ -644,7 +649,7 @@ func (s *Server) getDevMemoryFile(c *gin.Context) {
 			internal(c, verr)
 			return
 		}
-		dir, err = workspaceDir(s.mediaRoot, p.TenantID, wid)
+		dir, err = projectMemoryDir(s.mediaRoot, p.TenantID, wid)
 		fileName, capacity = memoryWorkspaceFileName, memoryWorkspaceCap
 	default:
 		writeEnvelope(c, http.StatusBadRequest, codeBadInput, "target 只能是 user 或 workspace", nil)

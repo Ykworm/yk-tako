@@ -28,11 +28,25 @@ test('项目页能列出项目目录里的文件，并能把它下载走', async
   }).then((r) => r.json())
   const wid = created.data.workspace.id
 
-  // 2) 往项目目录里造文件（正文 + 一个子目录）
+  // 2) 让容器转正，再往项目目录里造文件（正文 + 一个子目录）
+  //
+  // **顺序有讲究**（doc/79 施工包 §3.7，curl 实跑确认）：
+  // POST /api/workspaces 只写库、不建磁盘目录；容器是第一次被**读**时才建的
+  // （ensureProjectLayout）。先写盘再列目录，容器就不是空的了 → 服务端判成
+  // 「存量未迁移」→ 409 117116，页面显示「这个项目还需要迁移目录后才能使用」。
+  // 所以先打一次 GET /files 让服务端把容器转正（写 layout.json、建 content/ 与 runtime/），
+  // **再**写盘。
+  //
+  // **写盘路径带 content/**（doc/76）：服务端只扫 content/，写容器根的文件它看不见。
   const dir = resolve(WS_ROOT, 'tenants', tenantId, 'workspaces', wid)
-  await mkdir(resolve(dir, 'sub'), { recursive: true })
-  await writeFile(resolve(dir, 'hello.txt'), 'Hello, world!\n')
-  await writeFile(resolve(dir, 'sub', 'nested.txt'), 'nested\n')
+  const listed = await fetch(`${BASE}/api/workspaces/${wid}/files?path=.`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!listed.ok) throw new Error(`项目容器转正失败：HTTP ${listed.status}`)
+  const content = resolve(dir, 'content')
+  await mkdir(resolve(content, 'sub'), { recursive: true })
+  await writeFile(resolve(content, 'hello.txt'), 'Hello, world!\n')
+  await writeFile(resolve(content, 'sub', 'nested.txt'), 'nested\n')
 
   try {
     // 3) 打开项目页 → 展开这个项目的「文件」

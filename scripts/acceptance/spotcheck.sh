@@ -60,7 +60,7 @@ has "alice 有个人 tenant" "$ATEN" "^t_"
 TEAM=$(curl -sS -X POST $B/api/tenants -H "Authorization: Bearer $ATOK" -H "$J" -d '{"name":"TeamA"}')
 TTEN=$(echo "$TEAM" | jq -r .data.tenant.id)
 eq "alice 建团队 → code" "0" "$(echo "$TEAM" | jq -r .code)"
-TOK=$ATOK; REFRESH=$(curl -sS -X POST $B/api/auth/login -H "$J" -d '{"email":"alice_'"$STAMP"'@tako.test","password":"changeme123"}' | jq -r .data.refreshToken)
+TOK=$ATOK; REFRESH=$(curl -sS -X POST $B/api/auth/login -H "$J" -d '{"identifier":"alice_'"$STAMP"'@tako.test","password":"changeme123"}' | jq -r .data.refreshToken)
 switch_to "$TTEN"
 ATOK=$TOK; ATEN=$TEN; AROLE=$ROLE
 eq "alice 切到团队后 activeTenant" "$TTEN" "$ATEN"
@@ -77,7 +77,7 @@ eq "bob 用邀请注册 → code" "0" "$(echo "$REG" | jq -r .code)"
 reg bob_$STAMP@tako.test
 BTOK=$TOK; BTEN=$TEN
 if [ "$ATEN" != "$BTEN" ]; then ok "alice 与 bob 是不同 tenant"; else no "alice 与 bob 同 tenant"; fi
-BL=$(curl -sS -X POST $B/api/auth/login -H "$J" -d '{"email":"bob_'"$STAMP"'@tako.test","password":"changeme123"}')
+BL=$(curl -sS -X POST $B/api/auth/login -H "$J" -d '{"identifier":"bob_'"$STAMP"'@tako.test","password":"changeme123"}')
 BTOK=$(echo "$BL" | jq -r .data.accessToken); BREFRESH=$(echo "$BL" | jq -r .data.refreshToken)
 SW=$(curl -sS -X POST $B/api/auth/switch-tenant -H "Authorization: Bearer $BTOK" -H "$J" -d '{"tenantId":"'"$TTEN"'","refreshToken":"'"$BREFRESH"'"}')
 eq "bob 切到团队 → code" "0" "$(echo "$SW" | jq -r .code)"

@@ -63,13 +63,13 @@ func (s *Store) ReconcileRun(ctx context.Context, runID RunID) error {
 		Result          string `gorm:"column:result"`
 		ResultRevision  int    `gorm:"column:result_revision"`
 		PlanCheckpoint  bool   `gorm:"column:plan_checkpoint"`
-		WorkspaceMode   string `gorm:"column:workspace_mode"`
+		WorkspaceID     string `gorm:"column:workspace_id"`
 		FinalTaskID     string `gorm:"column:final_task_id"`
 	}
 	res := s.db.WithContext(ctx).Raw(`
 SELECT r.status AS run_status, r.lease_epoch, t.id AS task_id, t.tenant_id, t.orchestration_id,
        o.source_session_id, t.status, t.result_run_id, t.result, t.result_revision, t.plan_checkpoint,
-       o.workspace_mode, o.final_task_id
+       o.workspace_id, o.final_task_id
   FROM runs r
   JOIN agent_tasks t ON t.current_run_id = r.id
   JOIN agent_orchestrations o ON o.id = t.orchestration_id
@@ -88,8 +88,9 @@ SELECT r.status AS run_status, r.lease_epoch, t.id AS task_id, t.tenant_id, t.or
 	case "complete":
 		if row.ResultRunID == string(runID) && row.Result != "" {
 			status = agentTaskStatusSucceeded
-			if row.WorkspaceMode == workspaceModeIsolated && row.TaskID == row.FinalTaskID {
-				if s.isolatedResultPresent(row.TenantID, row.OrchestrationID, row.TaskID, row.ResultRevision) {
+			// 最终 Task 的结果必须完整固化后才进入发布准入；shared／isolated 同一判据（doc/76 §4）。
+			if row.TaskID == row.FinalTaskID {
+				if s.immutableResultPresent(row.TenantID, row.WorkspaceID, row.OrchestrationID, row.TaskID, row.ResultRevision) {
 					publishing = true
 				} else {
 					status = agentTaskStatusFailed
@@ -189,14 +190,14 @@ SELECT r.status AS run_status, r.lease_epoch, t.id AS task_id, t.tenant_id, t.or
 	return nil
 }
 
-// isolatedResultPresent 核验不可变结果确实完整（doc/74 §9.2：PG 已保存必须以 Provider final
+// immutableResultPresent 核验不可变结果确实完整（doc/74 §9.2：PG 已保存必须以 Provider final
 // 完整为前提）。作业根未配置、结果缺失或 result.json 损坏都算缺失——ReconcileRun 不得只凭
-// resultRunID 把这样的 Task 标 succeeded。
-func (s *Store) isolatedResultPresent(tenantID, orchID, taskID string, revision int) bool {
+// resultRunID 把这样的 Task 标 succeeded。shared／isolated 共用（doc/76 §4）。
+func (s *Store) immutableResultPresent(tenantID, workspaceID, orchID, taskID string, revision int) bool {
 	if s.workspaceRoot == "" {
 		return false
 	}
-	g := &GroupHandle{Dir: orchWorkspaceDir(s.workspaceRoot, tenantID, orchID)}
+	g := &GroupHandle{Dir: orchWorkspaceDir(s.workspaceRoot, tenantID, workspaceID, orchID)}
 	_, err := readImmutableResult(g, ResultRef{TaskID: taskID, ResultRevision: revision})
 	return err == nil
 }
@@ -760,6 +761,9 @@ func (ts *TaskScheduler) RunOnce(ctx context.Context) {
 	ts.reconcileFinishedRuns(ctx)
 	ts.detectInterruptedTasks(ctx)
 	ts.expireTaskInputs(ctx)
+	// 继任组对账排在提升之前：上一轮崩溃留下的 preparing/waiting_previous 先补齐标记与快照、
+	// 再推进状态；激活后才可能出现 ready 节点（施工包 §7.2 恢复路径）。
+	ts.reconcileSuccessors(ctx)
 	if n, err := ts.store.PropagateBlockedTasks(ctx); err != nil {
 		log.Printf("task scheduler propagate: %v", err)
 	} else if n > 0 {
@@ -779,6 +783,7 @@ func (ts *TaskScheduler) RunOnce(ctx context.Context) {
 	ts.claimReady(ctx)
 	ts.consumeNotifications(ctx)
 	ts.cleanupWorkspaces(ctx)
+	ts.compensateProjectCleanups(ctx)
 }
 
 // claimReady 找有 ready 节点的 active 组逐组领取；领取成功后装配并启动（提交后启动，§6.2 第 5 步）。

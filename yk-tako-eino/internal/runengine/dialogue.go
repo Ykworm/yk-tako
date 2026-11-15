@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"gorm.io/gorm"
 )
 
 // DialogueChunk = `dialogue_chunks`（doc/29 §5.4）：一场 run 的原文块（passage ≤4000 rune）。
@@ -41,28 +43,30 @@ func (s *Store) EnsureDialogueIndex(ctx context.Context) error {
 	if !s.memoryCfg.RAG {
 		return nil
 	}
-	var preload string
-	if err := s.db.WithContext(ctx).Raw(`SELECT current_setting('shared_preload_libraries')`).Scan(&preload).Error; err != nil {
-		return err
-	}
-	loaded := false
-	for _, p := range strings.Split(preload, ",") {
-		if strings.TrimSpace(p) == "pg_search" {
-			loaded = true
-			break
+	return withStartupDDLLock(s.db.WithContext(ctx), func(db *gorm.DB) error {
+		var preload string
+		if err := db.Raw(`SELECT current_setting('shared_preload_libraries')`).Scan(&preload).Error; err != nil {
+			return err
 		}
-	}
-	if !loaded {
-		return fmt.Errorf("pg_search 未预加载（shared_preload_libraries=%q）：给 PG 加 shared_preload_libraries='pg_search' 并重启，或设 TAKO_RAG=off 关闭线二", preload)
-	}
-	var ext int
-	if err := s.db.WithContext(ctx).Raw(`SELECT COUNT(*) FROM pg_extension WHERE extname = 'pg_search'`).Scan(&ext).Error; err != nil {
-		return err
-	}
-	if ext == 0 {
-		return fmt.Errorf("pg_search 扩展未安装：psql -p <port> -d <db> -c 'CREATE EXTENSION pg_search CASCADE'（依赖 vector）")
-	}
-	return s.db.WithContext(ctx).Exec(dialogueSearchIndexDDL).Error
+		loaded := false
+		for _, p := range strings.Split(preload, ",") {
+			if strings.TrimSpace(p) == "pg_search" {
+				loaded = true
+				break
+			}
+		}
+		if !loaded {
+			return fmt.Errorf("pg_search 未预加载（shared_preload_libraries=%q）：给 PG 加 shared_preload_libraries='pg_search' 并重启，或设 TAKO_RAG=off 关闭线二", preload)
+		}
+		var ext int
+		if err := db.Raw(`SELECT COUNT(*) FROM pg_extension WHERE extname = 'pg_search'`).Scan(&ext).Error; err != nil {
+			return err
+		}
+		if ext == 0 {
+			return fmt.Errorf("pg_search 扩展未安装：psql -p <port> -d <db> -c 'CREATE EXTENSION pg_search CASCADE'（依赖 vector）")
+		}
+		return db.Exec(dialogueSearchIndexDDL).Error
+	})
 }
 
 // ListDialogueChunks 是 GET /api/memory/dialogue 的读侧（doc/29 §7.2③）：runId 精确查，空参 = 最近 20 条。

@@ -182,7 +182,7 @@ def run_case(case, key, tally, only_print, seed):
                 tally.no(label, f"注册 viewer 失败：HTTP {code} {body!r}")
                 return False
             code, body = harness.call("POST", "/api/auth/login",
-                                      {"email": email, "password": "changeme123"})
+                                      {"identifier": email, "password": "changeme123"})
             if code != 200 or not isinstance(body, dict) or body.get("code") != 0:
                 tally.no(label, f"登录 viewer 失败：HTTP {code} {body!r}")
                 return False
@@ -253,19 +253,43 @@ def run_case(case, key, tally, only_print, seed):
             continue
 
         if op == "seed_ws":
-            # 往项目目录里造文件/目录/符号链接：产出文件在**文件系统**上，SQL 造不出来。
-            # 项目目录布局 = <workspace根>/tenants/<tid>/workspaces/<wid>/（scope.go）。
+            # 往项目容器里造文件/目录/符号链接：产出文件在**文件系统**上，SQL 造不出来。
+            # 容器布局见 doc/76：<WS_ROOT>/tenants/<tid>/workspaces/<wid>/{layout.json,
+            # content/, runtime/{media,tmp,memory,orchestrations}}。seed 里的路径按**逻辑路径**
+            # 写（与工具回执一致），落到物理位置：
+            #   .media/...            → runtime/media/...
+            #   .tako/{bash,fetch,search}/... → runtime/tmp/{kind}/...
+            #   其余                   → content/...
+            # 写之前先打一次 GET /api/workspaces/<wid>/files：它是真实入口，会经
+            # ensureProjectLayout 建好 layout.json 与两棵树。顺序不能反——先往空容器里
+            # 写文件就成了「没有 layout.json 却有旧字节」的未迁移项目，入口全 409 117116。
             wid = resolve_path(step["workspace"], vars)
-            root = Path(harness.WS_ROOT) / "tenants" / vars["ten"] / "workspaces" / wid
+            container = Path(harness.WS_ROOT) / "tenants" / vars["ten"] / "workspaces" / wid
+            code, body = harness.call("GET", f"/api/workspaces/{wid}/files", token=vars.get("tok"))
+            if code != 200:
+                tally.no(label, f"初始化项目布局失败：HTTP {code} {body!r}")
+                return False
+
+            def seed_dest(rel):
+                rel = rel.strip("/")
+                if rel == ".media" or rel.startswith(".media/"):
+                    return container / "runtime" / "media" / rel[len(".media/"):] if rel.startswith(".media/") else container / "runtime" / "media"
+                for kind in ("bash", "fetch", "search"):
+                    prefix = f".tako/{kind}"
+                    if rel == prefix or rel.startswith(prefix + "/"):
+                        rest = rel[len(prefix):].lstrip("/")
+                        return container / "runtime" / "tmp" / kind / rest
+                return container / "content" / rel
+
             try:
                 for rel, content in (step.get("files") or {}).items():
-                    f = root / rel
+                    f = seed_dest(rel)
                     f.parent.mkdir(parents=True, exist_ok=True)
                     f.write_text(content)
                 for rel in (step.get("dirs") or []):
-                    (root / rel).mkdir(parents=True, exist_ok=True)
+                    seed_dest(rel).mkdir(parents=True, exist_ok=True)
                 for rel in (step.get("symlinks") or []):
-                    link = root / rel
+                    link = seed_dest(rel)
                     if link.is_symlink() or link.exists():
                         link.unlink()
                     os.symlink("/etc", link)
@@ -275,15 +299,54 @@ def run_case(case, key, tally, only_print, seed):
             tally.ok("%s 造文件 %s" % (label, wid))
             continue
 
+        if op == "seed_unmigrated":
+            # 造「非空但没有 layout.json」的旧项目容器（doc/76 §6.1）：旧字节已在盘上、
+            # 从未走过新布局初始化。入口必须先拒绝并要求迁移（409 117116），不能自动
+            # 把旧字节当 content。**故意不先打 files 接口**——那一步就会建布局，造不出这个态。
+            # files 里的键是**容器内相对路径**（如 content/old.txt）。
+            wid = resolve_path(step["workspace"], vars)
+            container = Path(harness.WS_ROOT) / "tenants" / vars["ten"] / "workspaces" / wid
+            try:
+                container.mkdir(parents=True, exist_ok=True)
+                for rel, content in (step.get("files") or {}).items():
+                    f = container / resolve_path(rel, vars).lstrip("/")
+                    f.parent.mkdir(parents=True, exist_ok=True)
+                    f.write_text(content)
+            except OSError as e:
+                tally.no(label, "造旧容器失败：%s" % e)
+                return False
+            tally.ok("%s 造旧容器 %s" % (label, wid))
+            continue
+
+        if op == "chmod":
+            # 给容器内某个路径改权限（如把容器设成只读，让删除的物理清理失败 → cleanup=pending）。
+            # 只作用于本用例自己造的项目容器。
+            wid = resolve_path(step["workspace"], vars)
+            container = Path(harness.WS_ROOT) / "tenants" / vars["ten"] / "workspaces" / wid
+            target = container if step.get("path", ".") == "." else container / resolve_path(step["path"], vars).lstrip("/")
+            try:
+                os.chmod(target, int(step["mode"], 8))
+            except OSError as e:
+                tally.no(label, "改权限失败：%s" % e)
+                return False
+            tally.ok("%s chmod %s %s" % (label, target.name, step["mode"]))
+            continue
+
         if op == "seed_group":
             # 往**组工作区目录**里造隔离组的现场（doc/74 §5.2）：state.json + 不可变结果
-            # （result.json 清单 + artifacts/ 字节）+ 验证证据。布局 =
-            # <WS_ROOT>/tenants/<tid>/.tako/orchestrations/<orchID>/workspace/。
+            # （result.json 清单 + artifacts/ 字节）+ 验证证据。布局（doc/76 §5.1）=
+            # <WS_ROOT>/tenants/<tid>/workspaces/<wid>/runtime/orchestrations/<orchID>/workspace/。
             # 这些是文件系统上的产物，SQL 造不出来；artifact / retry-publication 的 core 用例
             # 靠它把「已固化结果」摆到位，不必真跑模型。
             # artifacts 条目带 content = 写文件；不带 content = 只进清单不写文件（造「产物缺失」117110）。
             orid = resolve_path(step["orchestration"], vars)
-            gdir = Path(harness.WS_ROOT) / "tenants" / vars["ten"] / ".tako" / "orchestrations" / orid / "workspace"
+            wid = resolve_path(step["workspace"], vars)
+            code, body = harness.call("GET", f"/api/workspaces/{wid}/files", token=vars.get("tok"))
+            if code != 200:
+                tally.no(label, f"初始化项目布局失败：HTTP {code} {body!r}")
+                return False
+            gdir = (Path(harness.WS_ROOT) / "tenants" / vars["ten"] / "workspaces" / wid
+                    / "runtime" / "orchestrations" / orid / "workspace")
             provider = step.get("provider", "directory")
             try:
                 gdir.mkdir(parents=True, exist_ok=True)
@@ -421,7 +484,9 @@ def run_case(case, key, tally, only_print, seed):
                 vars[name] = val
 
         if only_print:
-            shown = repr(body[:200]) if isinstance(body, (bytes, bytearray)) else json.dumps(body, ensure_ascii=False)[:300]
+            # --print 是「对齐用」：JSON 详情要整段打出来才好抄期望字节；
+            # 只有原始字节（artifact／media）才截断——它可能很大。
+            shown = repr(body[:200]) if isinstance(body, (bytes, bytearray)) else json.dumps(body, ensure_ascii=False)
             print(f"  {label} {step['method']} {path} → HTTP {http} {shown}")
             continue
 

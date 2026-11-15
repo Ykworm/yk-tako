@@ -48,7 +48,8 @@ if [ -z "$WID" ] || [ "$WID" = "null" ]; then no "建项目失败"; ml_summary; 
 ml_run '请用 memory 工具记住：这个项目的部署端口是 8943。target 用 workspace。做完只回复 ok。' "$WID"
 ml_wait_terminal 120 || no "run2 没到 terminal"
 ml_wait_settled || no "run2 会话没落定"
-MF="$WS_ROOT/tenants/$TEN/workspaces/$WID/MEMORY.md"
+# doc/76：项目记忆物理落在 runtime/memory/MEMORY.md（逻辑路径仍是 <项目>/MEMORY.md）。
+MF="$WS_ROOT/tenants/$TEN/workspaces/$WID/runtime/memory/MEMORY.md"
 if [ -f "$MF" ] && grep -q '8943' "$MF"; then ok "MEMORY.md 落盘且含「8943」：$(cat "$MF")"; else no "MEMORY.md 没写出来"; fi
 body=$(curl -sS "$B/api/dev/memory-file?target=workspace&workspaceId=$WID" -H "Authorization: Bearer $TOK")
 eq "workspace 观测口 cap=2200" "2200" "$(echo "$body" | jq -r .data.cap)"

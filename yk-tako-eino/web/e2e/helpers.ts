@@ -31,7 +31,7 @@ export function devAccount(): { email: string; password: string } {
 export async function login(page: Page): Promise<void> {
   const { email, password } = devAccount()
   await page.goto('/')
-  await page.locator('input[type=email]').fill(email)
+  await page.locator('input[name=identifier]').fill(email)
   await page.locator('input[type=password]').fill(password)
   await page.getByRole('button', { name: '登录', exact: true }).click()
   await expect(page.getByRole('button', { name: '新对话' })).toBeVisible({ timeout: 15_000 })

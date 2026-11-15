@@ -304,6 +304,65 @@ func TestContractStreamEventBytes(t *testing.T) {
 	}
 }
 
+// TestContractRunViewsBytes 钉住对话页右侧工作区两个读口（doc/78 §4）的 data 字段序：
+//
+//	changed-files：runId → files →（每项）path → op
+//	run tasks：runId → rows →（每行）no → subject → status → description → result → skillName → updatedAt → total → done
+//
+// 下面的字节不是手写的，是 2026-11-13 从隔离引擎（8943 / tako_acc78）实跑抄下来的；
+// 时间在实跑里带 +08:00 偏移，这里固定成 UTC 只为让字节可复现（时间自带时区，不是契约）。
+func TestContractRunViewsBytes(t *testing.T) {
+	got := mustJSON(t, envelope{Code: 0, Message: "", Data: runChangedFilesData{
+		RunID: "r_acc65",
+		Files: []runChangedFile{
+			{Path: "quote.py", Op: "write"},
+			{Path: "test_quote.py", Op: "edit"},
+		},
+	}})
+	const wantChanged = `{"code":0,"message":"","data":{"runId":"r_acc65","files":[{"path":"quote.py","op":"write"},{"path":"test_quote.py","op":"edit"}]}}`
+	if got != wantChanged {
+		t.Fatalf("改动文件字节序漂移：\n得到 %s\n期望 %s", got, wantChanged)
+	}
+
+	at := time.Date(2026, 11, 13, 6, 32, 26, 503178000, time.UTC)
+	got = mustJSON(t, envelope{Code: 0, Message: "", Data: runTasksData{
+		RunID: "r_acc65",
+		Rows: []runTaskRow{
+			{No: 1, Subject: "实现报价计算", Status: "completed", Description: "", Result: "读取两份文件并生成 quote.py", SkillName: "", UpdatedAt: at},
+			{No: 2, Subject: "跑单测", Status: "in_progress", Description: "", Result: "", SkillName: "", UpdatedAt: at},
+		},
+		Total: 2, Done: 1,
+	}})
+	const wantTasks = `{"code":0,"message":"","data":{"runId":"r_acc65","rows":[{"no":1,"subject":"实现报价计算","status":"completed","description":"","result":"读取两份文件并生成 quote.py","skillName":"","updatedAt":"2026-11-13T06:32:26.503178Z"},{"no":2,"subject":"跑单测","status":"in_progress","description":"","result":"","skillName":"","updatedAt":"2026-11-13T06:32:26.503178Z"}],"total":2,"done":1}}`
+	if got != wantTasks {
+		t.Fatalf("看板字节序漂移：\n得到 %s\n期望 %s", got, wantTasks)
+	}
+
+	// 空清单/空看板：数组恒在（不是 null），前端 .map 才不炸。
+	got = mustJSON(t, envelope{Code: 0, Message: "", Data: runChangedFilesData{RunID: "r_e", Files: []runChangedFile{}}})
+	const wantEmptyFiles = `{"code":0,"message":"","data":{"runId":"r_e","files":[]}}`
+	if got != wantEmptyFiles {
+		t.Fatalf("空改动清单字节 = %s\n期望 %s", got, wantEmptyFiles)
+	}
+	got = mustJSON(t, envelope{Code: 0, Message: "", Data: runTasksData{RunID: "r_e", Rows: []runTaskRow{}, Total: 0, Done: 0}})
+	const wantEmptyRows = `{"code":0,"message":"","data":{"runId":"r_e","rows":[],"total":0,"done":0}}`
+	if got != wantEmptyRows {
+		t.Fatalf("空看板字节 = %s\n期望 %s", got, wantEmptyRows)
+	}
+
+	// 两个失败体与 /skills 同字节：看不见与不存在不区分。
+	got = mustJSON(t, envelope{Code: codeRunMissing, Message: "找不到这次运行", Data: nil})
+	const wantMissing = `{"code":112002,"message":"找不到这次运行","data":null}`
+	if got != wantMissing {
+		t.Fatalf("404 字节 = %s\n期望 %s", got, wantMissing)
+	}
+	got = mustJSON(t, envelope{Code: codeMissingToken, Message: "请先登录", Data: nil})
+	const want401 = `{"code":111102,"message":"请先登录","data":null}`
+	if got != want401 {
+		t.Fatalf("401 字节 = %s\n期望 %s", got, want401)
+	}
+}
+
 // TestContractWorkspaceFilesBytes 钉住 GET /api/workspaces/{id}/files 的 data 字段序
 // （doc/48 B1）：path → entries；entry = name → kind →（**只有文件**才有）size → modifiedAt。
 //
@@ -724,7 +783,6 @@ func TestContractPublicationRetryBytes(t *testing.T) {
 		{codeArtifactInvalid, "结果产物已不可读取", `{"code":117110,"message":"结果产物已不可读取","data":null}`},
 		{codeTaskMissing, "找不到这件任务", `{"code":117001,"message":"找不到这件任务","data":null}`},
 		{codeMissingToken, "请先登录", `{"code":111102,"message":"请先登录","data":null}`},
-		{codeBadInput, "这件任务的结果产物请从项目文件读取", `{"code":111002,"message":"这件任务的结果产物请从项目文件读取","data":null}`},
 		{codeTaskNotRepublishable, "这件任务现在不能重新发布", `{"code":117112,"message":"这件任务现在不能重新发布","data":null}`},
 		{codeForbidden, "没有权限做这件事", `{"code":111203,"message":"没有权限做这件事","data":null}`},
 	}
@@ -756,5 +814,86 @@ func TestContractWorkspaceConfigErrBytes(t *testing.T) {
 	const wantPublishing = `{"code":117113,"message":"项目正在发布结果，请稍后再试","data":null}`
 	if got != wantPublishing {
 		t.Fatalf("发布准入失败信封字节 = %s\nwant %s", got, wantPublishing)
+	}
+}
+
+// TestContractSuccessorBytes 钉住继任组创建／交接／组详情尾字段与项目删除成功体
+// （doc/75 §4.1/§4.3/§4.4；doc/76 §4/§6.4）。真实字节来自 2026-11-12 隔离引擎 curl
+// （expected.json 的 61-goal-replan / 62-project-layout / 63-project-delete-cleanup）：
+// 创建 202 四键序；handoff 200 五键序；组详情只在继任组末尾追加 replanOf/replanDepth；
+// 删除成功体在 status 后加 cleanup；旧布局入口统一 409 117116。
+func TestContractSuccessorBytes(t *testing.T) {
+	got := mustJSON(t, successorResp{
+		OrchestrationID: "or_s", Status: "active", ReplanOf: "or_o", ReplanDepth: 1,
+	})
+	const wantCreate = `{"orchestrationId":"or_s","status":"active","replanOf":"or_o","replanDepth":1}`
+	if got != wantCreate {
+		t.Fatalf("继任创建字节 = %s\nwant %s", got, wantCreate)
+	}
+
+	got = mustJSON(t, handoffView{
+		OrchestrationID: "or_s", ReplanOf: "or_o", ReplanDepth: 1,
+		Reuse: []handoffReuseEntry{{TaskID: "at_a", ResultRevision: 1}},
+		Body:  "\n# 为什么重规划\n\n局部换路\n",
+	})
+	const wantHandoff = `{"orchestrationId":"or_s","replanOf":"or_o","replanDepth":1,"reuse":[{"taskId":"at_a","resultRevision":1}],"body":"\n# 为什么重规划\n\n局部换路\n"}`
+	if got != wantHandoff {
+		t.Fatalf("交接读取字节 = %s\nwant %s", got, wantHandoff)
+	}
+
+	t0 := time.Date(2026, 11, 12, 0, 0, 0, 0, time.UTC)
+	base := orchestrationBody{
+		OrchestrationID: "or_o", Goal: "g", Status: "active", CreatedAt: t0, UpdatedAt: t0,
+	}
+	const wantBase = `{"orchestrationId":"or_o","goal":"g","workspaceId":"","sourceSessionId":"","status":"active","finalTaskId":"","planRevision":0,"planHold":false,"deliveryStatus":"","deliveryRunId":"","deliveryErrorCode":"","createdAt":"2026-11-12T00:00:00Z","finishedAt":null,"deliveredAt":null,"updatedAt":"2026-11-12T00:00:00Z"}`
+	got = mustJSON(t, base)
+	if got != wantBase {
+		t.Fatalf("非继任组详情字节 = %s\nwant %s", got, wantBase)
+	}
+	succ := base
+	succ.ReplanOf, succ.ReplanDepth = "or_g", 1
+	const wantSuccTail = `,"updatedAt":"2026-11-12T00:00:00Z","replanOf":"or_g","replanDepth":1}`
+	got = mustJSON(t, succ)
+	if !strings.HasSuffix(got, wantSuccTail) {
+		t.Fatalf("继任组详情尾字节 = %s\nwant 尾 %s", got, wantSuccTail)
+	}
+
+	// 删除成功体是 handler 内的匿名结构（字段序 status → cleanup）。
+	type deleteResult struct {
+		Status  string `json:"status"`
+		Cleanup string `json:"cleanup"`
+	}
+	got = mustJSON(t, deleteResult{Status: "deleted", Cleanup: "done"})
+	const wantDone = `{"status":"deleted","cleanup":"done"}`
+	if got != wantDone {
+		t.Fatalf("删除成功体字节 = %s\nwant %s", got, wantDone)
+	}
+	got = mustJSON(t, deleteResult{Status: "deleted", Cleanup: "pending"})
+	const wantPending = `{"status":"deleted","cleanup":"pending"}`
+	if got != wantPending {
+		t.Fatalf("删除待补偿体字节 = %s\nwant %s", got, wantPending)
+	}
+
+	cases := []struct {
+		code    int
+		message string
+		want    string
+	}{
+		{codeLayoutUnmigrated, "这个项目还需要迁移目录后才能使用", `{"code":117116,"message":"这个项目还需要迁移目录后才能使用","data":null}`},
+		{codeHandoffMissing, "找不到这次重规划交接", `{"code":117004,"message":"找不到这次重规划交接","data":null}`},
+		{codeSuccessorNotAllowed, "这个编排组现在不能创建继任组", `{"code":117114,"message":"这个编排组现在不能创建继任组","data":null}`},
+	}
+	for _, c := range cases {
+		got = mustJSON(t, envelope{Code: c.code, Message: c.message, Data: nil})
+		if got != c.want {
+			t.Fatalf("继任/布局失败信封字节 = %s\nwant %s", got, c.want)
+		}
+	}
+	// 117115 的 data 是 gin.H{"reason":…}（map 按键序）；真实原因来自 store 的纯校验。
+	reason := `目标可行性判定必须是 feasible 才能创建继任组（当前 "不确定"）`
+	got = mustJSON(t, envelope{Code: codeSuccessorInvalid, Message: "继任方案不合法", Data: gin.H{"reason": reason}})
+	want := `{"code":117115,"message":"继任方案不合法","data":{"reason":"` + `目标可行性判定必须是 feasible 才能创建继任组（当前 \"不确定\"）` + `"}}`
+	if got != want {
+		t.Fatalf("117115 失败信封字节 = %s\nwant %s", got, want)
 	}
 }
