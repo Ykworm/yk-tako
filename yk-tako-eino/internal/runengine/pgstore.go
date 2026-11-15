@@ -798,7 +798,7 @@ func autoMigrateLocked(db *gorm.DB) error {
 		&Workspace{}, &CleanerState{}, &RunTask{}, &RunQuestion{},
 		&SkillRow{}, &SkillDisable{},
 		&AgentOrchestration{}, &AgentTask{}, &AgentTaskLink{}, &AgentNotification{}, &AgentPlanRevision{},
-		&AgentNotificationAttempt{}, &ProjectCleanup{}); err != nil {
+		&AgentNotificationAttempt{}, &ProjectCleanup{}, &BackgroundJob{}); err != nil {
 		return err
 	}
 	// AutoMigrate 只补「新增列」的结构、只管「同名索引在不在」；存量列后加的默认值/可空性
@@ -899,15 +899,22 @@ WHERE publication_status <> ''`).Error; err != nil {
 	//    读面会把空串当成「不知道」，回填后与当时唯一可能的失败路径一致；
 	// ② 已经认领过的通知补一行 attempt=1，让「这次通知被处理过几次」从第一天起就是真值。
 	//    id 用 gen_random_uuid（PG13+ 内建），attempt 表只需行存在，主键格式不对外。
+	// doc/82 §6.4：agent_notifications.orchestration_id 从 not null 放开——bash 通知没有编排组。
+	// AutoMigrate 对已存在列不保证收回 NOT NULL，这里显式幂等地对齐（新库上已是可空，无害）。
+	if err := db.Exec(`ALTER TABLE agent_notifications ALTER COLUMN orchestration_id DROP NOT NULL`).Error; err != nil {
+		return err
+	}
 	if err := db.Exec(`UPDATE agent_orchestrations SET delivery_error_code = 'delivery_run_error'
 WHERE delivery_status = 'failed' AND delivery_error_code = ''`).Error; err != nil {
 		return err
 	}
+	// 回填排除 claimed_in_place=true（doc/82 §5）：就地认领不写 attempt 行，也绝不能被回填补成
+	// 交付身份——否则普通聊天 run 一 resume 就被当成交付 run、工具面被裁成只读。
 	if err := db.Exec(`INSERT INTO agent_notification_attempts (id, tenant_id, notification_id, attempt, run_id, created_at)
 SELECT 'ana_' || replace(gen_random_uuid()::text, '-', ''), tenant_id, id, 1, claim_run_id,
        COALESCE(claimed_at, created_at)
   FROM agent_notifications
- WHERE claim_run_id <> ''
+ WHERE claim_run_id <> '' AND claimed_in_place = false
 ON CONFLICT DO NOTHING`).Error; err != nil {
 		return err
 	}

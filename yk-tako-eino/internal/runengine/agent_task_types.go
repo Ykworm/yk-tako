@@ -95,14 +95,36 @@ const (
 	deliveryStatusFailed     = "failed"
 )
 
-// 协调通知词表（doc/70 §9.1；doc/72 §6.1）：进模型的事件；普通工具进度只进 run 账本。
+// 协调通知词表（doc/70 §9.1；doc/72 §6.1；doc/82 §6.5）：进模型的事件；普通工具进度只进 run 账本。
 // plan_review_required 是检查点——Task 成功把组推进 plan_hold，等一次计划决策。
+// bash_job_finished 是后台命令到终态（doc/82）：orchestration 为空、job 必填、task_id 维持空串。
 const (
 	notifKindTaskFailed         = "task_failed"
 	notifKindTaskInterrupted    = "task_interrupted"
 	notifKindOrchFinished       = "orchestration_finished"
 	notifKindPlanReviewRequired = "plan_review_required"
+	notifKindBashJobFinished    = "bash_job_finished"
 )
+
+// 后台命令状态词表（doc/82 §6.1；施工包 §4-1/§4-2）。stopping 是中间态：停止请求已持久化、
+// 执行者尚未确认进程组退出，仍算未收口；已终态重复停止回当前终态，仍 stopping 时重复停止 409 117118。
+const (
+	jobStatusRunning     = "running"
+	jobStatusStopping    = "stopping"
+	jobStatusSucceeded   = "succeeded"
+	jobStatusFailed      = "failed"
+	jobStatusStopped     = "stopped"
+	jobStatusInterrupted = "interrupted"
+)
+
+// jobTerminal 报告一个 job 状态是否终态（stopping 不是终态）。
+func jobTerminal(status string) bool {
+	switch status {
+	case jobStatusSucceeded, jobStatusFailed, jobStatusStopped, jobStatusInterrupted:
+		return true
+	}
+	return false
+}
 
 // 通知状态（doc/73 §5.1）：pending（待消费）→ claimed（已认领、协调 run 在跑）→
 // consumed（已消费完）；claimed 的 run 明确 error／stopped 后进 failed，只能由用户显式
@@ -245,16 +267,24 @@ func (AgentTaskLink) TableName() string { return "agent_task_links" }
 // AgentNotification = `agent_notifications` 表。dedup_key 唯一：
 // 失败 / 中断 = task:run:epoch，整组完成 = 组:final revision——恢复同一代不重复写。
 type AgentNotification struct {
-	ID                string    `gorm:"primaryKey"` // an_<ULID>
-	TenantID          string    `gorm:"not null;index"`
-	OrchestrationID   string    `gorm:"not null;index"`
-	TaskID            string    `gorm:"not null;default:''"`
+	ID       string `gorm:"primaryKey"` // an_<ULID>
+	TenantID string `gorm:"not null;index"`
+	// OrchestrationID 可空（doc/82 §6.4）：bash_job_finished 通知没有编排组，job 必填。
+	// 空串 = 这条通知不来自编排组（bash 行）；属主链与跳转目标按 kind 二选一取。
+	OrchestrationID string `gorm:"index"`
+	TaskID          string `gorm:"not null;default:''"`
+	// BackgroundJobID 指向后台命令（doc/82 §6.5）：bash_job_finished 通知按它找本 job 的 pending 行。
+	// 其他 kind 为 NULL；唯一索引允许多个 NULL。
+	BackgroundJobID   *string   `gorm:"uniqueIndex"`
 	ReceiverSessionID SessionID `gorm:"not null"`
 	Kind              string    `gorm:"not null"`
 	DedupKey          string    `gorm:"not null;uniqueIndex"`
 	Status            string    `gorm:"not null;default:pending"`
 	ClaimRunID        string    `gorm:"not null;default:'';index"`
-	ErrorCode         string    `gorm:"not null;default:''"`
+	// ClaimedInPlace=true：由来源 run 就地认领（ClaimNotificationInline，不铸 run、不写 attempt），
+	// 与协调 run 的认领区分——CoordinationClaimForRun 与启动回填 attempt 的 SQL 都要排除它。
+	ClaimedInPlace    bool   `gorm:"not null;default:false"`
+	ErrorCode         string `gorm:"not null;default:''"`
 	// ConsumeErrorCode 是最近一次协调 run 没完成消费的机器原因（doc/73 §4.5），
 	// 只在 status=failed 时有值；它与被通知 Task 的 ErrorCode 分开。
 	ConsumeErrorCode string `gorm:"not null;default:''"`
@@ -298,6 +328,46 @@ type AgentPlanRevision struct {
 }
 
 func (AgentPlanRevision) TableName() string { return "agent_plan_revisions" }
+
+// BackgroundJob = `background_jobs` 表（doc/82 §6.4）：一条离开前台窗口或显式转入后台的
+// bash 命令的持久身份。前台窗口内完成的短命令也登记（Backgrounded=false）——按命令号回查
+// 与停止请求都要求有行；默认列表靠 Backgrounded 过滤，所以短命令不刷满列表。
+//
+// 单 owner 语义：job 由启动它的副本监管（ExecutorID 指向该副本），Epoch+LeaseUntil 双保险。
+// 幂等键 (SourceRunID, ToolCallID) 的唯一索引就是「一次工具调用一行」的闸。
+type BackgroundJob struct {
+	ID              string `gorm:"primaryKey"` // bj_ + newRowID 同款
+	TenantID        string `gorm:"not null;index"`
+	WorkspaceID     string `gorm:"not null;index"` // 没有项目的会话为空串
+	SourceSessionID string `gorm:"not null;index"`
+	SourceRunID     string `gorm:"not null;uniqueIndex:background_jobs_idem,priority:1"`
+	ToolCallID      string `gorm:"not null;uniqueIndex:background_jobs_idem,priority:2"`
+	SourceTaskID    string `gorm:"not null;default:''"`
+	// SourceOrchestrationID 是来源 Task 所属编排组（聊天来源为空串）。
+	SourceOrchestrationID string `gorm:"not null;default:''"`
+	Command               string `gorm:"not null"`
+	// Status：running/stopping/succeeded/failed/stopped/interrupted。
+	Status        string `gorm:"not null;index"`
+	ExitCode      *int
+	StopRequested bool `gorm:"not null;default:false"`
+	// Backgrounded：命令以「返回命令号继续跑」的形态回过调用方（前台超时转后台或显式后台）。
+	// 只有它才写 bash_job_finished 通知，也才进默认命令列表。
+	Backgrounded bool   `gorm:"not null;default:false"`
+	ExecutorID   string `gorm:"not null;default:''"`
+	// Epoch 从 1 起；对账收 interrupted 时 +1，旧 owner 的条件写不再命中。
+	Epoch          int       `gorm:"not null"`
+	ProcessGroupID *int64
+	LeaseUntil     time.Time `gorm:"not null"`
+	// 相对运行资源根的逻辑路径（无项目时以 .tako/bash/jobs/<bj>/ 开头）；不存绝对路径。
+	StdoutRelPath string `gorm:"not null;default:''"`
+	StderrRelPath string `gorm:"not null;default:''"`
+	CreatedAt     time.Time
+	StartedAt     *time.Time // 启动确认前为 null
+	EndedAt       *time.Time
+	UpdatedAt     time.Time `gorm:"not null;default:now()"`
+}
+
+func (BackgroundJob) TableName() string { return "background_jobs" }
 
 // TaskArtifact 是结果里的一个产物引用：项目根的相对路径 + 种类标签。
 type TaskArtifact struct {

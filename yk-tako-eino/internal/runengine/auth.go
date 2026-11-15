@@ -242,7 +242,11 @@ const (
 	codeSuccessorNotAllowed = 117114 // 409 这个编排组现在不能创建继任组（已有继任者／状态不允许）
 	codeSuccessorInvalid    = 117115 // 400 继任方案不合法（可行性判定、原因、复用或画布；原因进 data.reason）
 	codeLayoutUnmigrated    = 117116 // 409 这个项目还是旧目录布局，需要先跑显式迁移
-	codeInternal            = 111901
+	// 117117–117118：后台命令（doc/82 §6.3）。117119（Task 尚有未收口后台命令）只在 doc/40 词表登记，
+	// 没有 HTTP 提交面——实际拒绝走工具错误句子（submitErrText 的 errSubmitJobsRunning）。
+	codeJobMissing       = 117117 // 404 找不到这条命令（不存在、不可见或跨租户）
+	codeJobNotStoppable  = 117118 // 409 这条命令正在停止中，不能重复请求
+	codeInternal         = 111901
 )
 
 var (

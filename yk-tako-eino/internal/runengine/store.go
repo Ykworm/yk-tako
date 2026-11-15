@@ -1004,12 +1004,12 @@ func (s *Store) AbandonClaim(ctx context.Context, runID RunID, epoch int64) erro
 // （清扫只在新 POST 时按 session_id 触发，旧 session 已 404，再没人替它扫）；
 // 记忆层（memory_items / memory_jobs）是引擎自己的状态，同属「引擎自己的东西」，全局归零一并清；
 // 持久 Task 五表（agent_orchestrations / agent_tasks / agent_task_links / agent_notifications /
-// agent_notification_attempts）同批。
+// agent_notification_attempts）与后台命令表 background_jobs（doc/82 §6.4）同批。
 // 旧的 `notes` 表已随存量迁移退役（doc/65 §6.1），不再出现在 TRUNCATE 列表里——
 // 表都不在了，还 TRUNCATE 它会直接报错。
 func (s *Store) Reset(ctx context.Context) (deleted int, err error) {
 	if err := s.db.WithContext(ctx).Exec(
-		`TRUNCATE TABLE tenant_invitations, tenant_agents, tenant_settings, tenant_usage_daily, audit_log, refresh_tokens, tenant_members, tenants, users, sessions, runs, run_model_messages, runlog_entries, memory_items, memory_jobs, run_journal, agent_orchestrations, agent_tasks, agent_task_links, agent_notifications, agent_notification_attempts`).Error; err != nil {
+		`TRUNCATE TABLE tenant_invitations, tenant_agents, tenant_settings, tenant_usage_daily, audit_log, refresh_tokens, tenant_members, tenants, users, sessions, runs, run_model_messages, runlog_entries, memory_items, memory_jobs, run_journal, agent_orchestrations, agent_tasks, agent_task_links, agent_notifications, agent_notification_attempts, background_jobs`).Error; err != nil {
 		return 0, err
 	}
 	var cursor uint64

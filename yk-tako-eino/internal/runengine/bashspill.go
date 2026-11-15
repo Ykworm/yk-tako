@@ -41,6 +41,16 @@ type bashSpill struct {
 	name   string // 非空时文件名用它（如验证证据的 <taskId>），空 = 默认 <seq>
 }
 
+// jobStdoutFileName / jobStderrFileName 是后台任务（job）两路输出的固定文件名。
+//
+// 与 run 级落盘（序号命名）不同，job 的输出路径要能被 API 与工具回执**预测**——
+// jobView 的 stdoutPath/stderrPath 必须是「登记那一刻就知道」的稳定字节，前端与模型
+// 不靠等文件出现才拿到路径。所以按 job 固定目录 + 固定名，见 newJobSpill。
+const (
+	jobStdoutFileName = "stdout.out"
+	jobStderrFileName = "stderr.out"
+)
+
 // newBashSpill 算本次调用的落盘位置。
 //
 // 目录段用 run id（noteBox 里那份，与搜索/抓取的落盘同一个 run 口径）：
@@ -68,6 +78,27 @@ func newBashSpill(ctx context.Context, workspace string) *bashSpill {
 		dirAbs: filepath.Join(physDir, runID),
 		seq:    seq,
 	}
+}
+
+// newJobSpill 算一个后台任务（job）的落盘位置：<kind 根>/jobs/<jobId>/。
+//
+// 与 run 级落盘的差别只在目录与文件名：目录按 job 固定（不再按 run + 序号），
+// 文件名固定 stdout.out/stderr.out（由 tailCollector.fileName 给出）——这样 jobView 的
+// stdoutPath/stderrPath 在登记那一刻就能算出来，前端与模型不必等文件出现。
+// kind 根仍走 runtimeOutputDir 的既有分支：有项目 → runtime/tmp/bash，无项目 → .tako/bash。
+func newJobSpill(ctx context.Context, workspace, jobID string) *bashSpill {
+	physDir, relDir := runtimeOutputDir(ctx, workspace, "bash")
+	seg := sanitizePathSegment(jobID)
+	return &bashSpill{
+		dirRel: relDir + "/jobs/" + seg,
+		dirAbs: filepath.Join(physDir, "jobs", seg),
+	}
+}
+
+// jobOutputRelPaths 给出一个 job 两路输出的逻辑相对路径（与 newJobSpill 同源，供登记时落库）。
+func jobOutputRelPaths(ctx context.Context, workspace, jobID string) (stdout, stderr string) {
+	sp := newJobSpill(ctx, workspace, jobID)
+	return sp.dirRel + "/" + jobStdoutFileName, sp.dirRel + "/" + jobStderrFileName
 }
 
 // bashLocalSeq 是没有 noteBox 时的进程内序号（旁路调用专用）。
@@ -101,6 +132,9 @@ type tailCollector struct {
 
 	spill    *bashSpill
 	ext      string // 文件扩展名：out / err
+	// fileName 非空时落盘文件就用它（job 的 stdout.out/stderr.out）；
+	// 空 = 按 spill.seq 或 spill.name 拼 <基础名>.<ext>（run 级落盘）。
+	fileName string
 	file     *os.File
 	relPath  string // 相对作业根的路径（落盘成功后才有）
 	spillOff bool   // 落盘关掉了（写失败或装不下全文）
@@ -165,6 +199,9 @@ func (c *tailCollector) openSpill() (*os.File, string, error) {
 	name := fmt.Sprintf("%d.%s", c.spill.seq, c.ext)
 	if c.spill.name != "" {
 		name = c.spill.name + "." + c.ext
+	}
+	if c.fileName != "" {
+		name = c.fileName
 	}
 	full := filepath.Join(c.spill.dirAbs, name)
 	f, err := os.OpenFile(full, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
