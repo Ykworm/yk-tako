@@ -32,7 +32,7 @@
 <li><a href="19-v6/19v6-04-验收-curl.html"><code>19v6-04-验收-curl.md</code></a>：用例 → curl → 期望字节。</li>
 </ul></li>
 </ol>
-<p><strong>想在浏览器里读：</strong> <code>doc/html/</code> 下每个 md 都有一页网页版（站点首页 · 本索引的网页版），由 <code>scripts/build-doc-html.py</code> 从 md 自动生成。<strong>内容以 md 为准</strong>——网页版是同批生成的读物，改了 md 要重跑脚本，别直接改 html。</p>
+<p><strong>想在浏览器里读：</strong> 在线 <a href="https://ykworm.github.io/yk-tako/">https://ykworm.github.io/yk-tako/</a>；本地 <code>doc/html/</code> 下每个 md 都有一页网页版（<a href="../index.html">站点首页</a> · <a href="index.html">本索引的网页版</a>），由 <code>scripts/build-doc-html.py</code> 从 md 自动生成。<strong>内容以 md 为准</strong>——网页版是同批生成的读物，改了 md 要重跑脚本，别直接改 html。</p>
 <p><strong>按任务查：</strong></p>
 <ul>
 <li>改运行引擎、API、存储：先读 19-v6 四篇，再查本表第 1 节。</li>
@@ -564,9 +564,9 @@
 </tr>
 <tr>
 <td><code>doc/html/</code></td>
-<td>文档站首页 · 全部文档索引</td>
+<td><a href="../index.html">文档站首页</a> · <a href="index.html">全部文档索引</a> · <a href="https://ykworm.github.io/yk-tako/">在线站点</a></td>
 <td>非方案，网页版</td>
-<td>2026-11-16：每个已入库 md 对应一页网页版，由 <code>scripts/build-doc-html.py</code>（pandoc gfm→html5）生成并重写链接——doc 之间的链接转成 html、代码与脚本链接转成 GitHub blob、仓库里没有的（tmp/ 施工包、ref-agent 参考实现）去掉链接保留文字。<strong>只转已被 git 跟踪的 md</strong>（<code>doc/interview/</code> 等被 .gitignore 挡住的私有材料不入站）；内容以 md 为准，改了 md 要重跑脚本。<code>--check</code> 只比对不写盘，可进机器验收</td>
+<td>2026-11-16：每个已入库 md 对应一页网页版，由 <code>scripts/build-doc-html.py</code>（pandoc gfm→html5）生成并重写链接——doc 之间的链接转成 html、代码与脚本链接转成 GitHub blob、仓库里没有的（tmp/ 施工包、ref-agent 参考实现）去掉链接保留文字。<strong>只转已被 git 跟踪的 md</strong>（<code>doc/interview/</code> 等被 .gitignore 挡住的私有材料不入站）；内容以 md 为准，改了 md 要重跑脚本。<code>--check</code> 只比对不写盘、<code>--audit-only</code> 只查断链，都可进机器验收；<code>.github/workflows/pages.yml</code> 负责发布</td>
 </tr>
 </tbody>
 </table></div>

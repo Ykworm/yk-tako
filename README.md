@@ -10,6 +10,8 @@ tako **不是知识库产品**：记忆与检索只支撑 Agent 工作。它也*
 
 ## 架构导览
 
+**在线文档站**：<https://ykworm.github.io/yk-tako/> —— 四张可交互说明页，加上全部文档的网页版（每个 md 一页）。改 `doc/` 里的东西推 main 就自动重新发布。
+
 [![tako 系统架构总览](doc/assets/tako-architecture.png)](doc/assets/tako-architecture.html)
 
 克隆仓库后，用浏览器打开下面的 HTML 即可查看交互说明，无需构建或联网：
@@ -21,7 +23,7 @@ tako **不是知识库产品**：记忆与检索只支撑 Agent 工作。它也*
 
 这些页面是现行文档的导读，不是另一份施工契约；实现与专项文档冲突时，以代码和专项文档为准。
 
-全部文档另有网页版：`doc/html/` 下每个 md 对应一页，由 `scripts/build-doc-html.py` 从 md 自动生成（内容以 md 为准）。入口是[文档站首页](doc/index.html)与[全部文档索引](doc/html/index.html)。
+全部文档另有网页版：`doc/html/` 下每个 md 对应一页，由 `scripts/build-doc-html.py` 从 md 自动生成（内容以 md 为准）。本地入口是[文档站首页](doc/index.html)与[全部文档索引](doc/html/index.html)；线上入口是 <https://ykworm.github.io/yk-tako/>。
 
 ## 快速开始
 
@@ -230,6 +232,7 @@ doc/
   19-v6/                       第六代运行引擎文档集
   70-多Agent编排与Task/        持久 Task 与编排方案集
   assets/                      四张系统说明页与总览海报
+  html/                        文档网页版（由 build-doc-html.py 从 md 生成）
   problems/                    设计决策档案
   log/                         交接、施工记录与文章，不作施工真源
   archive/                     被整代取代的旧线与旧引擎
@@ -237,14 +240,16 @@ scripts/
   dev.sh                       一键开发环境
   acceptance/                  可机器重跑的契约与活体验收
   bench/                       公开基准对照
+  build-doc-html.py            doc/ 树转网页站（pandoc + 链接改道）
   export-architecture-poster.sh 从总览 HTML 导出 PNG
   check-architecture-pages.mjs  检查页面数据、导航与本地链接
+.github/workflows/pages.yml    把 doc/ 发布成 GitHub Pages
 ```
 
 ## 文档与协作
 
 - [doc/README.md](doc/README.md)：文档索引，区分现行真源、历史记录与归档。
-- [doc/index.html](doc/index.html)：文档站首页（可离线打开）；[全部文档索引（网页版）](doc/html/index.html)。
+- [在线文档站](https://ykworm.github.io/yk-tako/)：四张系统说明页 + 全部文档的网页版；[doc/index.html](doc/index.html) 是它的本地入口（可离线打开），[全部文档索引（网页版）](doc/html/index.html)。
 - [doc/16-能力复刻总规划.md](doc/16-能力复刻总规划.md)：产品能力、当前状态与下一步。
 - [doc/19-v6/19-运行引擎架构-v6.md](doc/19-v6/19-运行引擎架构-v6.md)：第六代运行引擎架构入口；v6 是代际编号，不是服务版本。
 - [doc/53-模块地图.md](doc/53-模块地图.md)：模块职责与真实代码落点。
