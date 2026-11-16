@@ -29,6 +29,7 @@
 - 改登录、租户、会话归属：`doc/28`、`doc/34`、`doc/35`。
 - 改响应信封／业务码表：`doc/40`（规则在根 `AGENTS.md`，码表在 doc/40 §4）。
 - 改契约字节、要重跑验收：`doc/19-v6/19v6-04`（人读版）、`scripts/acceptance/`（机器真源与断言器）、`yk-tako-eino/internal/runengine/contract_test.go`（快闸）。
+- 改 Eval／验收口径：`doc/45`（场景化 Eval 框架，口径 2026-11-01 已拍板、未施工）、`doc/56`（公开基准与配对协议，已部分落地）、`doc/83`（Anthropic 思路稿，待点头；与 doc/45 并存，取代关系待裁定）。
 - 改团队前端（切换器／成员管理／邀请落地页）：`doc/36`。
 - 改界面可用性（markdown 渲染／会话历史入口／停止按钮／文件可达／破坏性操作与文案／**md 文件按 markdown 渲染显示**，doc/48 §10）：`doc/48`。
 - 改侧栏项目树（项目 → 对话二级、10 条上限、展示全部）：`doc/50`。
@@ -369,6 +370,12 @@
   - 落点：`internal/runengine/{bash_job.go,bash_job_sweeper.go,bashspill.go,agent_task_tools.go,agent_task_delivery.go,agent_task_scheduler.go,agent_task_store.go,agent_task_runner.go,agent_task_recovery.go,agent_task_attention.go,agent_task_api.go,orchestration_journey.go,sandbox.go}`、`internal/config/model.go`、`cmd/yktako/main.go`（5 旗标）、`agents/{coder,researcher}.md`、`web/src/{api.ts,TasksView.vue,NotificationRecovery.vue}`、`scripts/acceptance/`（expected.json 用例 82–83 + bash_job_live.sh 等）、[19v6-04](19-v6/19v6-04-验收-curl.md)、[doc/40](40-响应信封统一.md) §4.2e（117117/117118/117119）
   - 2026-11-15 立项并落地。bash 的 30 秒改为前台等待窗口（默认 8s，超时保留进程并返回 `bj_…`），补输出读取／有限等待／停止（SIGKILL 整进程组）／持久通知与失联处理（owner watcher 续租写终态、sweeper 对账 interrupted）；`wait_task` 让当前 run 已读结果时就地认领通知（`claimed_in_place=true`，不建 run、不写 attempt 行），避免重复交付；编排组内并发按 `workspace_mode` 取值（shared=1、isolated=2）；创建编排补 `finalTaskId`；新增路径账本 `GET /api/orchestrations/:id/journey`（只读投影，从计划修订、Task 终态、结果复用、通知尝试与继任 handoff 派生，刷新与换副本一致）
   - 不增加用户可见 DAG 模式或 JS 引擎：同步子代理、持久 Task、等待和依赖保持可组合；新工作继续走 doc/72 同组修订，已交付后走 doc/75 继任组；shared 组改为串行，需并行修改时使用 doc/74 isolated 现场。验收：单测/契约 506/0、活体四脚本（bash job 62/0、编排 49/49、journey 22/0、orchestration 回归）+ `spotcheck.sh` 37/0 + 浏览器走查（桌面/移动端 390 断言）；doc/58 的 bash 落盘落点与清扫触发点被本篇改定
+
+- **83** [场景化 Eval 方案（Anthropic 思路）](83-场景化Eval方案.md) ⬜（方案待点头）
+  - 落点：—（未施工；文中提到的 `scripts/eval/` 是 [doc/45](45-场景化Eval框架.md) 的计划落点，尚未存在）
+  - 病灶：doc/45 的口径在 2026-11-01 已拍板但一直没开工；本篇是另一条思路——把评测定成「给真实任务、重复跑多次、查任务结束后的真实世界状态、留完整轨迹」，与 Anthropic 的 Agent Eval 工程实践同调
+  - 2026-11-16 从仓库根 `eval/README.md`（讨论稿、无编号）迁入 doc 树，补 NN 编号与状态头注。**与 doc/45／doc/56 并存，取代关系尚未裁定**；裁定前不动 doc/45 的已拍板口径、不开工
+  - 验收：无（未施工）。裁定口径后按仓库流程出 `tmp/83-场景化Eval/施工包.md` 交审
 
 ## 2. 历史存档（`doc/archive/`，不作施工面）
 
