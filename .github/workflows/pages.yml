@@ -1,0 +1,65 @@
+# 把 doc/ 发布成 GitHub Pages 站点。
+#
+# 为什么走 Actions 而不是「Deploy from a branch」：
+# branch 方式的发布源路径只允许 / 或 /docs 两种。/docs 已被仓库纪律禁用
+# （scripts/check-doc-layout.sh：docs/ 目录不许复活），而本仓的文档在 doc/。
+# 所以用 Actions 把 doc/ 整个目录作为 Pages 产物上传，站点根就是 doc/ 的内容。
+#
+# 产物里不含 .md：页面之间的链接已由 scripts/build-doc-html.py 改道到 .html，
+# 剩下的 .md 链接都是指向 GitHub 的绝对地址。md 真源仍在仓库里，GitHub 上照常渲染。
+name: Deploy docs to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "doc/**"
+      - "scripts/build-doc-html.py"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: 校验生成站链接
+        run: python3 scripts/build-doc-html.py --audit-only
+
+      - name: 暂存站点目录
+        run: |
+          mkdir -p _site
+          cp -R doc/. _site/
+          find _site -name '*.md' -delete
+          find _site -name '.DS_Store' -delete
+          ls -l _site/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

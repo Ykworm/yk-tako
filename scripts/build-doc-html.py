@@ -471,7 +471,19 @@ def rewrite_asset_pages(write=True):
 def main():
     parser = argparse.ArgumentParser(description="生成 doc/html 静态站")
     parser.add_argument("--check", action="store_true", help="只比对不写盘：有差异或断链就非零退出")
+    parser.add_argument(
+        "--audit-only",
+        action="store_true",
+        help="只查已生成站的链接（不需要 pandoc，可在 CI 里跑）",
+    )
     args = parser.parse_args()
+
+    if args.audit_only:
+        total, broken = audit_links()
+        print(f"生成站本地链接：{total} 条，断链 {len(broken)} 条")
+        for item in broken[:20]:
+            print(f"  断链：{item}")
+        return 1 if broken else 0
 
     global TRACKED, TRACKED_DIRS
     TRACKED = git_tracked()
