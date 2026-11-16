@@ -10,7 +10,7 @@
 **第一次进仓库，按这个顺序：**
 
 1. 根 `README.md`：项目是什么、怎么把引擎和前端跑起来。
-2. 系统说明页（可离线打开）：[总览](assets/tako-architecture.html) → [单场 run](assets/tako-run-lifecycle.html) → [长任务与编排](assets/tako-orchestration.html) → [数据与存储](assets/tako-data-model.html)。先建立结构，再读契约。
+2. 系统说明页：[总览](https://ykworm.github.io/yk-tako/assets/tako-architecture.html) → [单场 run](https://ykworm.github.io/yk-tako/assets/tako-run-lifecycle.html) → [长任务与编排](https://ykworm.github.io/yk-tako/assets/tako-orchestration.html) → [数据与存储](https://ykworm.github.io/yk-tako/assets/tako-data-model.html)。先建立结构，再读契约。（上面是线上版；离线看就克隆仓库后打开 `doc/assets/` 下的同名 HTML——GitHub 上点 HTML 文件只会显示源码。）
 3. 本索引：分清哪些文档能施工、哪些只是历史。
 4. [`19-v6/19-运行引擎架构-v6.md`](19-v6/19-运行引擎架构-v6.md)：v6（第六代引擎，非服务版本）文档集总入口。
 5. 契约与存储四篇，按这个顺序读：
@@ -19,7 +19,7 @@
    - [`19v6-02-reconcile与双游标.md`](19-v6/19v6-02-reconcile与双游标.md)：客户端轮询与游标。
    - [`19v6-04-验收-curl.md`](19-v6/19v6-04-验收-curl.md)：用例 → curl → 期望字节。
 
-**想在浏览器里读：** 在线 <https://ykworm.github.io/yk-tako/>；本地 `doc/html/` 下每个 md 都有一页网页版（[站点首页](index.html) · [本索引的网页版](html/index.html)），由 `scripts/build-doc-html.py` 从 md 自动生成。**内容以 md 为准**——网页版是同批生成的读物，改了 md 要重跑脚本，别直接改 html。
+**想在浏览器里读：** 在线 <https://ykworm.github.io/yk-tako/>；本地 `doc/html/` 下每个 md 都有一页网页版（站点首页 `doc/index.html` · 本索引的网页版 `doc/html/index.html`），由 `scripts/build-doc-html.py` 从 md 自动生成。**内容以 md 为准**——网页版是同批生成的读物，改了 md 要重跑脚本，别直接改 html。
 
 **按任务查：**
 
@@ -401,11 +401,11 @@
 | `doc/` | [68-记忆检索的故事演示](68-记忆检索的故事演示.md) | 非方案，演示读物 | 2026-11-08：doc/65 §4.4 `search_memory` 语义的故事版演示——一场搬家 + 六个问题，覆盖 as_of 现实回放、include_history 改口链、removed 删除边界、过期退场；认知回放只作对比说明，现行工具不开放；参考脉络 Zep/Graphiti（借查询语义、不抄图谱存储）；不作施工真源 |
 | `doc/` | [69-参照实现对照：rakazo 与 octop](69-参照实现对照-rakazo与octop.md) | 非方案，对照记录 | 2026-11-08：读 rakazo（`ref-agent/rakazo/`）与 Octop（`ref-agent/Octop/`）源码的对照——agent 管理（rakazo 的 Bot+Subagent 双形态、octop 的 Expert→Agent→Team 三层）、plugin（rakazo「静态声明不执行代码」vs octop「plugin.yaml+main.py 可执行包」）、skill（三家同构的 SKILL.md）；结论：rakazo 无 expert、octop 有、tako 无 plugin/expert/协作；只作对照阅读，不作施工真源 |
 | `doc/problems/` | [问题与方案库](problems/README.md)（43 条） | 非方案 | 决策档案：每条一个设计选择题——当时遇到什么、桌上有哪些候选、为什么这么裁、代价是什么、今天还成不成立；按模块分组，并在 `doc/53` 各小模块后反链 |
-| `doc/assets/` | [系统架构总览](assets/tako-architecture.html) | 非方案，交互图 | 2026-11-16 重基线：约 20 个责任节点讲清前端、接入、run worker、长任务、结果发布、模型、扩展与存储；点节点/连线看输入输出、代码与真源。静态版 `tako-architecture.png`（3840×2822）由 `scripts/export-architecture-poster.sh` 派生。四页共享 `tako-architecture.css/js`，`scripts/check-architecture-pages.mjs` 检查数据与链接 |
-| `doc/assets/` | [单场 run 生命周期](assets/tako-run-lifecycle.html) | 非方案，交互图 | 从 POST /api/runs 到定稿、记忆与显式续跑；含九种帧、runlog/模型输入/journal 分工、问答与 compact |
-| `doc/assets/` | [长任务与多 Agent 编排](assets/tako-orchestration.html) | 非方案，交互图 | 持久 Task、依赖调度、wait_task、shared/isolated、结果发布、后台 bash、通知恢复、同组修订与继任组 |
-| `doc/assets/` | [数据、状态与存储](assets/tako-data-model.html) | 非方案，交互图 | PostgreSQL 当前模型、四类 Redis 临时状态、项目 content/runtime、会话 wire、记忆双模式与多副本共享卷边界 |
-| `doc/html/` | [文档站首页](index.html) · [全部文档索引](html/index.html) · [在线站点](https://ykworm.github.io/yk-tako/) | 非方案，网页版 | 2026-11-16：每个已入库 md 对应一页网页版，由 `scripts/build-doc-html.py`（pandoc gfm→html5）生成并重写链接——doc 之间的链接转成 html、代码与脚本链接转成 GitHub blob、仓库里没有的（tmp/ 施工包、ref-agent 参考实现）去掉链接保留文字。**只转已被 git 跟踪的 md**（`doc/interview/` 等被 .gitignore 挡住的私有材料不入站）；内容以 md 为准，改了 md 要重跑脚本。`--check` 只比对不写盘、`--audit-only` 只查断链，都可进机器验收；`.github/workflows/pages.yml` 负责发布 |
+| `doc/assets/` | [系统架构总览](https://ykworm.github.io/yk-tako/assets/tako-architecture.html) | 非方案，交互图 | 2026-11-16 重基线：约 20 个责任节点讲清前端、接入、run worker、长任务、结果发布、模型、扩展与存储；点节点/连线看输入输出、代码与真源。静态版 `tako-architecture.png`（3840×2822）由 `scripts/export-architecture-poster.sh` 派生。四页共享 `tako-architecture.css/js`，`scripts/check-architecture-pages.mjs` 检查数据与链接 |
+| `doc/assets/` | [单场 run 生命周期](https://ykworm.github.io/yk-tako/assets/tako-run-lifecycle.html) | 非方案，交互图 | 从 POST /api/runs 到定稿、记忆与显式续跑；含九种帧、runlog/模型输入/journal 分工、问答与 compact |
+| `doc/assets/` | [长任务与多 Agent 编排](https://ykworm.github.io/yk-tako/assets/tako-orchestration.html) | 非方案，交互图 | 持久 Task、依赖调度、wait_task、shared/isolated、结果发布、后台 bash、通知恢复、同组修订与继任组 |
+| `doc/assets/` | [数据、状态与存储](https://ykworm.github.io/yk-tako/assets/tako-data-model.html) | 非方案，交互图 | PostgreSQL 当前模型、四类 Redis 临时状态、项目 content/runtime、会话 wire、记忆双模式与多副本共享卷边界 |
+| `doc/html/` | [在线站点](https://ykworm.github.io/yk-tako/) · 本地入口 `doc/index.html`、`doc/html/index.html` | 非方案，网页版 | 2026-11-16：每个已入库 md 对应一页网页版，由 `scripts/build-doc-html.py`（pandoc gfm→html5）生成并重写链接——doc 之间的链接转成 html、代码与脚本链接转成 GitHub blob、仓库里没有的（tmp/ 施工包、ref-agent 参考实现）去掉链接保留文字。**只转已被 git 跟踪的 md**（`doc/interview/` 等被 .gitignore 挡住的私有材料不入站）；内容以 md 为准，改了 md 要重跑脚本。`--check` 只比对不写盘、`--audit-only` 只查断链，都可进机器验收；`.github/workflows/pages.yml` 负责发布 |
 
 ## 4. `doc/log/` 记录
 

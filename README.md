@@ -12,18 +12,20 @@ tako **不是知识库产品**：记忆与检索只支撑 Agent 工作。它也*
 
 **在线文档站**：<https://ykworm.github.io/yk-tako/> —— 四张可交互说明页，加上全部文档的网页版（每个 md 一页）。改 `doc/` 里的东西推 main 就自动重新发布。
 
-[![tako 系统架构总览](doc/assets/tako-architecture.png)](doc/assets/tako-architecture.html)
+[![tako 系统架构总览](doc/assets/tako-architecture.png)](https://ykworm.github.io/yk-tako/assets/tako-architecture.html)
 
-克隆仓库后，用浏览器打开下面的 HTML 即可查看交互说明，无需构建或联网：
+四张说明页，点开即用：
 
-- [系统架构总览](doc/assets/tako-architecture.html)：谁把什么交给谁，同步执行与异步任务怎样接成一条交付链。
-- [单场 run 生命周期](doc/assets/tako-run-lifecycle.html)：创建、模型工具循环、九种帧、定稿、等人、压缩与显式续跑。
-- [长任务与多 Agent 编排](doc/assets/tako-orchestration.html)：持久 Task、依赖、shared/isolated、后台 bash、发布、通知与重规划。
-- [数据、状态与存储](doc/assets/tako-data-model.html)：PostgreSQL 表、四类 Redis 临时状态、项目 content/runtime、会话 wire 与记忆双模式。
+- [系统架构总览](https://ykworm.github.io/yk-tako/assets/tako-architecture.html)：谁把什么交给谁，同步执行与异步任务怎样接成一条交付链。
+- [单场 run 生命周期](https://ykworm.github.io/yk-tako/assets/tako-run-lifecycle.html)：创建、模型工具循环、九种帧、定稿、等人、压缩与显式续跑。
+- [长任务与多 Agent 编排](https://ykworm.github.io/yk-tako/assets/tako-orchestration.html)：持久 Task、依赖、shared/isolated、后台 bash、发布、通知与重规划。
+- [数据、状态与存储](https://ykworm.github.io/yk-tako/assets/tako-data-model.html)：PostgreSQL 表、四类 Redis 临时状态、项目 content/runtime、会话 wire 与记忆双模式。
+
+离线看：克隆仓库后用浏览器打开 `doc/assets/` 下的同名 HTML，无需构建或联网（GitHub 上点 HTML 文件只会显示源码，所以上面的链接指向线上站）。
 
 这些页面是现行文档的导读，不是另一份施工契约；实现与专项文档冲突时，以代码和专项文档为准。
 
-全部文档另有网页版：`doc/html/` 下每个 md 对应一页，由 `scripts/build-doc-html.py` 从 md 自动生成（内容以 md 为准）。本地入口是[文档站首页](doc/index.html)与[全部文档索引](doc/html/index.html)；线上入口是 <https://ykworm.github.io/yk-tako/>。
+全部文档另有网页版：`doc/html/` 下每个 md 对应一页，由 `scripts/build-doc-html.py` 从 md 自动生成（内容以 md 为准）。线上入口是 <https://ykworm.github.io/yk-tako/>；本地入口是 `doc/index.html`（站点首页）与 `doc/html/index.html`（全部文档索引）。
 
 ## 快速开始
 
@@ -249,7 +251,7 @@ scripts/
 ## 文档与协作
 
 - [doc/README.md](doc/README.md)：文档索引，区分现行真源、历史记录与归档。
-- [在线文档站](https://ykworm.github.io/yk-tako/)：四张系统说明页 + 全部文档的网页版；[doc/index.html](doc/index.html) 是它的本地入口（可离线打开），[全部文档索引（网页版）](doc/html/index.html)。
+- [在线文档站](https://ykworm.github.io/yk-tako/)：四张系统说明页 + 全部文档的网页版。本地入口：`doc/index.html`（站点首页，可离线打开）、`doc/html/index.html`（全部文档索引）。
 - [doc/16-能力复刻总规划.md](doc/16-能力复刻总规划.md)：产品能力、当前状态与下一步。
 - [doc/19-v6/19-运行引擎架构-v6.md](doc/19-v6/19-运行引擎架构-v6.md)：第六代运行引擎架构入口；v6 是代际编号，不是服务版本。
 - [doc/53-模块地图.md](doc/53-模块地图.md)：模块职责与真实代码落点。

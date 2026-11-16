@@ -21,7 +21,7 @@
 <p><strong>第一次进仓库，按这个顺序：</strong></p>
 <ol type="1">
 <li>根 <code>README.md</code>：项目是什么、怎么把引擎和前端跑起来。</li>
-<li>系统说明页（可离线打开）：<a href="../assets/tako-architecture.html">总览</a> → <a href="../assets/tako-run-lifecycle.html">单场 run</a> → <a href="../assets/tako-orchestration.html">长任务与编排</a> → <a href="../assets/tako-data-model.html">数据与存储</a>。先建立结构，再读契约。</li>
+<li>系统说明页：<a href="https://ykworm.github.io/yk-tako/assets/tako-architecture.html">总览</a> → <a href="https://ykworm.github.io/yk-tako/assets/tako-run-lifecycle.html">单场 run</a> → <a href="https://ykworm.github.io/yk-tako/assets/tako-orchestration.html">长任务与编排</a> → <a href="https://ykworm.github.io/yk-tako/assets/tako-data-model.html">数据与存储</a>。先建立结构，再读契约。（上面是线上版；离线看就克隆仓库后打开 <code>doc/assets/</code> 下的同名 HTML——GitHub 上点 HTML 文件只会显示源码。）</li>
 <li>本索引：分清哪些文档能施工、哪些只是历史。</li>
 <li><a href="19-v6/19-运行引擎架构-v6.html"><code>19-v6/19-运行引擎架构-v6.md</code></a>：v6（第六代引擎，非服务版本）文档集总入口。</li>
 <li>契约与存储四篇，按这个顺序读：
@@ -32,7 +32,7 @@
 <li><a href="19-v6/19v6-04-验收-curl.html"><code>19v6-04-验收-curl.md</code></a>：用例 → curl → 期望字节。</li>
 </ul></li>
 </ol>
-<p><strong>想在浏览器里读：</strong> 在线 <a href="https://ykworm.github.io/yk-tako/">https://ykworm.github.io/yk-tako/</a>；本地 <code>doc/html/</code> 下每个 md 都有一页网页版（<a href="../index.html">站点首页</a> · <a href="index.html">本索引的网页版</a>），由 <code>scripts/build-doc-html.py</code> 从 md 自动生成。<strong>内容以 md 为准</strong>——网页版是同批生成的读物，改了 md 要重跑脚本，别直接改 html。</p>
+<p><strong>想在浏览器里读：</strong> 在线 <a href="https://ykworm.github.io/yk-tako/">https://ykworm.github.io/yk-tako/</a>；本地 <code>doc/html/</code> 下每个 md 都有一页网页版（站点首页 <code>doc/index.html</code> · 本索引的网页版 <code>doc/html/index.html</code>），由 <code>scripts/build-doc-html.py</code> 从 md 自动生成。<strong>内容以 md 为准</strong>——网页版是同批生成的读物，改了 md 要重跑脚本，别直接改 html。</p>
 <p><strong>按任务查：</strong></p>
 <ul>
 <li>改运行引擎、API、存储：先读 19-v6 四篇，再查本表第 1 节。</li>
@@ -548,31 +548,31 @@
 </tr>
 <tr>
 <td><code>doc/assets/</code></td>
-<td><a href="../assets/tako-architecture.html">系统架构总览</a></td>
+<td><a href="https://ykworm.github.io/yk-tako/assets/tako-architecture.html">系统架构总览</a></td>
 <td>非方案，交互图</td>
 <td>2026-11-16 重基线：约 20 个责任节点讲清前端、接入、run worker、长任务、结果发布、模型、扩展与存储；点节点/连线看输入输出、代码与真源。静态版 <code>tako-architecture.png</code>（3840×2822）由 <code>scripts/export-architecture-poster.sh</code> 派生。四页共享 <code>tako-architecture.css/js</code>，<code>scripts/check-architecture-pages.mjs</code> 检查数据与链接</td>
 </tr>
 <tr>
 <td><code>doc/assets/</code></td>
-<td><a href="../assets/tako-run-lifecycle.html">单场 run 生命周期</a></td>
+<td><a href="https://ykworm.github.io/yk-tako/assets/tako-run-lifecycle.html">单场 run 生命周期</a></td>
 <td>非方案，交互图</td>
 <td>从 POST /api/runs 到定稿、记忆与显式续跑；含九种帧、runlog/模型输入/journal 分工、问答与 compact</td>
 </tr>
 <tr>
 <td><code>doc/assets/</code></td>
-<td><a href="../assets/tako-orchestration.html">长任务与多 Agent 编排</a></td>
+<td><a href="https://ykworm.github.io/yk-tako/assets/tako-orchestration.html">长任务与多 Agent 编排</a></td>
 <td>非方案，交互图</td>
 <td>持久 Task、依赖调度、wait_task、shared/isolated、结果发布、后台 bash、通知恢复、同组修订与继任组</td>
 </tr>
 <tr>
 <td><code>doc/assets/</code></td>
-<td><a href="../assets/tako-data-model.html">数据、状态与存储</a></td>
+<td><a href="https://ykworm.github.io/yk-tako/assets/tako-data-model.html">数据、状态与存储</a></td>
 <td>非方案，交互图</td>
 <td>PostgreSQL 当前模型、四类 Redis 临时状态、项目 content/runtime、会话 wire、记忆双模式与多副本共享卷边界</td>
 </tr>
 <tr>
 <td><code>doc/html/</code></td>
-<td><a href="../index.html">文档站首页</a> · <a href="index.html">全部文档索引</a> · <a href="https://ykworm.github.io/yk-tako/">在线站点</a></td>
+<td><a href="https://ykworm.github.io/yk-tako/">在线站点</a> · 本地入口 <code>doc/index.html</code>、<code>doc/html/index.html</code></td>
 <td>非方案，网页版</td>
 <td>2026-11-16：每个已入库 md 对应一页网页版，由 <code>scripts/build-doc-html.py</code>（pandoc gfm→html5）生成并重写链接——doc 之间的链接转成 html、代码与脚本链接转成 GitHub blob、仓库里没有的（tmp/ 施工包、ref-agent 参考实现）去掉链接保留文字。<strong>只转已被 git 跟踪的 md</strong>（<code>doc/interview/</code> 等被 .gitignore 挡住的私有材料不入站）；内容以 md 为准，改了 md 要重跑脚本。<code>--check</code> 只比对不写盘、<code>--audit-only</code> 只查断链，都可进机器验收；<code>.github/workflows/pages.yml</code> 负责发布</td>
 </tr>
