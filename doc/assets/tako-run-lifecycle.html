@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="tako 单场 run 的完整生命周期：创建、模型工具循环、帧与日志、等人、压缩、记忆和显式续跑。">
+<title>tako · 单场 run 生命周期</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='8' y='26' width='12' height='12' rx='2' fill='%23543A29'/%3E%3Crect x='26' y='8' width='12' height='12' rx='2' fill='%23BB7738'/%3E%3Crect x='26' y='26' width='12' height='12' rx='2' fill='%23543A29'/%3E%3Crect x='26' y='44' width='12' height='12' rx='2' fill='%23BB7738'/%3E%3Crect x='44' y='26' width='12' height='12' rx='2' fill='%23543A29'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="tako-architecture.css">
+</head>
+<body data-page="run" data-view="diagram">
+<a class="skip-link" href="#main">跳到正文</a>
+<header class="site-header">
+  <a class="brand" href="tako-architecture.html" aria-label="tako 系统架构总览"><svg class="brand-grid" viewBox="0 0 62 56" aria-hidden="true"><g fill="#BB7738"><rect x="28" y="8" width="9" height="9" rx="2"/><rect x="28" y="42" width="9" height="9" rx="2"/><rect x="39" y="42" width="9" height="9" rx="2"/></g><g fill="#543A29"><rect x="6" y="25" width="9" height="9" rx="2"/><rect x="17" y="25" width="9" height="9" rx="2"/><rect x="28" y="25" width="9" height="9" rx="2"/><rect x="39" y="25" width="9" height="9" rx="2"/><rect x="50" y="25" width="9" height="9" rx="2"/></g></svg><span class="brand-word">tako</span></a>
+  <nav class="page-nav" aria-label="系统说明页面"><a data-page="overview" href="tako-architecture.html">系统总览</a><a data-page="run" href="tako-run-lifecycle.html">单场 run</a><a data-page="orchestration" href="tako-orchestration.html">长任务与编排</a><a data-page="data" href="tako-data-model.html">数据与存储</a></nav>
+  <div class="baseline">核对至 2026-11-16<br>代码基线 a3ee354</div>
+</header>
+<main class="page-main" id="main">
+  <section class="hero">
+    <div><p class="kicker">RUN LIFECYCLE · ONE USER TURN</p><h1>一句话怎样成为可恢复的执行</h1><p class="hero-lede">run 是用户一条消息触发的一次执行。页面看到的是过程帧与定稿历史，模型看到的是另一份可压缩输入，恢复使用的是第三份逐枪记录。沿时间线读，分清这三份数据就不会再互相替代。</p><div class="hero-actions"><a class="button button-primary" href="tako-orchestration.html">继续看持久 Task</a><a class="button" href="tako-data-model.html">查每条记录存在哪</a><a class="button" href="../19-v6/19-运行引擎架构-v6.md">阅读 v6 架构</a></div></div>
+    <aside class="hero-aside"><p>播放链路会走创建、模型、工具、定稿、记忆与恢复的关键跳。页面下半部分给出九种帧和失败分支的完整对照。</p><dl><dt>过程读取</dt><dd>frames · eventOffset</dd><dt>定稿读取</dt><dd>session log · runlogOffset</dd><dt>实时优化</dt><dd>run SSE / 账号 SSE</dd><dt>崩溃恢复</dt><dd>显式 resume · epoch+1</dd></dl></aside>
+  </section>
+  <div class="workspace">
+    <aside class="controls" aria-label="图解控制">
+      <section class="control-section"><p class="control-title">阅读方式</p><div class="view-switch"><button class="button" data-view-choice="diagram" aria-pressed="true">图解</button><button class="button" data-view-choice="list" aria-pressed="false">列表</button></div></section>
+      <section class="control-section"><label class="search-label" for="search">查找阶段或代码</label><input class="search-input" id="search" type="search" placeholder="例如 question / compact"><p class="search-status" id="search-status" aria-live="polite"></p></section>
+      <section class="control-section filters"><p class="control-title">数据流类型</p><div class="filter-list" id="filters"></div></section>
+      <section class="control-section control-help"><p class="control-title">怎么读</p><p class="control-note">同步主链路是实线，异步记忆是长虚线，恢复是短虚线。帧告诉页面“正在发生什么”，runlog 告诉页面“最终发生了什么”。</p></section>
+    </aside>
+    <section class="diagram-stage" aria-label="run 生命周期交互图"><div class="diagram-toolbar"><div class="toolbar-group"><button class="button playback-control" id="play" type="button" aria-pressed="false">播放链路</button><button class="button playback-control" id="previous-step" type="button">上一步</button><button class="button playback-control" id="next-step" type="button">下一步</button><button class="button" id="reset" type="button">重置</button></div><div class="toolbar-group"><button class="button" id="zoom-out" type="button" aria-label="缩小">−</button><span class="zoom-value" id="zoom-value">100%</span><button class="button" id="zoom-in" type="button" aria-label="放大">+</button><button class="button" id="zoom-fit" type="button">适应</button></div></div><svg class="diagram" id="diagram" role="group"></svg><p class="diagram-hint">滚轮缩放 · 空白拖拽 · Tab 聚焦 · Enter 选中</p></section>
+    <aside class="detail-panel" id="detail" aria-live="polite"><p>正在读取本地页面数据…</p></aside>
+    <section class="mobile-view" id="mobile-view" aria-label="run 生命周期列表"></section>
+  </div>
+  <div class="content-sections" id="content-sections"></div>
+  <noscript><div class="noscript-note">交互图需要 JavaScript。可直接阅读 <a href="../19-v6/19v6-01-契约-四个API.md">四个 API 契约</a>、<a href="../19-v6/19v6-02-reconcile与双游标.md">双游标</a> 和 <a href="../30-崩溃续跑.md">崩溃续跑</a>。</div></noscript>
+</main>
+<footer class="page-footer"><p>本页描述单场 run；持久 Task、后台命令和整组交付见“长任务与编排”。</p><p><code>doc/assets/tako-run-lifecycle.html · 2026-11-16</code></p></footer>
+<script type="application/json" id="page-data">
+{
+  "title":"单场 run 生命周期",
+  "diagramLabel":"从用户投递到 run 定稿、记忆和显式恢复",
+  "viewBox":[0,0,1470,1120],
+  "flows":{"primary":"同步主链路","support":"支撑与读取","async":"异步记忆","recovery":"显式恢复","observe":"观测"},
+  "bands":[
+    {"title":"浏览器","subtitle":"投递 · 过程帧 · 定稿历史 · 中断后续跑","x":40,"y":30,"w":1390,"h":155},
+    {"title":"HTTP 接入","subtitle":"run API 与账号事件是两条不同通道","x":40,"y":205,"w":1390,"h":140},
+    {"title":"run worker","subtitle":"取得执行权 → 装配 → 模型/工具循环 → 定稿","x":40,"y":365,"w":1390,"h":345},
+    {"title":"模型与同步委派","subtitle":"外部模型和独立上下文都不是持久状态所有者","x":40,"y":730,"w":1390,"h":135},
+    {"title":"持久记录与临时设施","subtitle":"每份数据只承担自己的读取契约","x":40,"y":885,"w":1390,"h":205}
+  ],
+  "nodes":[
+    {"id":"ui-submit","title":"用户投递","subtitle":"POST /api/runs","band":"浏览器","x":70,"y":85,"w":300,"h":76,"summary":"首条消息可懒建会话；后续消息挂到既有 session。响应返回 runId 后，浏览器开始观察，而不是在一个 HTTP 请求里等完整答案。","input":"用户文本、附件与可选 workspaceId。","output":"带 access token 的创建 run 请求。","code":["web/src/chat.ts","web/src/api.ts"],"docs":[{"path":"19-v6/19v6-01-契约-四个API.md","label":"19v6-01 · 创建 run"}]},
+    {"id":"ui-stream","title":"过程帧与工具卡","subtitle":"eventOffset 只向前","band":"浏览器","x":400,"y":85,"w":300,"h":76,"summary":"轮询 frames 是正确性来源，run SSE 是同一帧面的优化运输。文本增量、工具调用、用量、Todo 与问题卡按 eventOffset 合并。","input":"GET frames 或 GET run stream。","output":"生成中的气泡、工具卡、问题卡、用量和状态。","code":["web/src/chat.ts","web/src/App.vue"],"docs":[{"path":"31-sse流式端点.md","label":"doc/31 · run SSE"},{"path":"59-工具调用可见性.md","label":"doc/59 · 工具卡"}]},
+    {"id":"ui-final","title":"定稿历史","subtitle":"runlogOffset 跨 run 单调","band":"浏览器","x":730,"y":85,"w":300,"h":76,"summary":"见 terminal 或会话不再有活 run 后，页面拉 session log，用 runlog 的完整记录替换生成中的临时气泡。历史可分页回查，不依赖 Redis 帧还存在。","input":"GET /api/sessions/:id 与 /log。","output":"最终回复、工具行、问题与答案的历史视图。","code":["web/src/chat.ts","internal/runengine/server.go"],"docs":[{"path":"19-v6/19v6-02-reconcile与双游标.md","label":"19v6-02 · reconcile"}]},
+    {"id":"ui-resume","title":"中断与显式续跑","subtitle":"用户确认后继续这一轮","band":"浏览器","x":1060,"y":85,"w":320,"h":76,"summary":"租约过期后页面把 run 显示为 interrupted，由用户点击继续。普通 run 没有服务端自动巡检接管，也不把旧进程谎称仍在工作。","input":"会话状态中的中断标志与用户动作。","output":"POST /api/runs/:id/resume。","code":["web/src/App.vue","web/src/chat.ts","internal/runengine/server.go"],"docs":[{"path":"30-崩溃续跑.md","label":"doc/30 · 客户端触发恢复"}]},
+    {"id":"api-runs","title":"run 与 session API","subtitle":"创建 · 拉帧 · 拉日志 · 停止/续跑","band":"HTTP 接入","x":240,"y":260,"w":460,"h":64,"summary":"认证与可见性检查后，路由调用存储和 worker。创建、过程帧、会话状态和定稿日志各有不同读取契约。","input":"浏览器请求与身份范围。","output":"统一 JSON 响应或 run SSE 帧面。","code":["internal/runengine/server.go","internal/runengine/auth.go"],"docs":[{"path":"19-v6/19v6-01-契约-四个API.md","label":"19v6-01 · 端点字节"}]},
+    {"id":"api-events","title":"账号事件 API","subtitle":"Redis Stream → SSE","band":"HTTP 接入","x":800,"y":260,"w":430,"h":64,"summary":"这是项目、Task、后台命令等变更的账号级通知通道，不是某一场 run 的 delta 流。事件只让本地副本失效，随后必须重拉。","input":"tk:events:<tid> 的 XREAD 与续读游标。","output":"seq/type/id/at；空闲时发送 SSE 注释心跳。","code":["internal/runengine/events.go","web/src/mutation.ts"],"docs":[{"path":"46-变更同步与事件通道.md","label":"doc/46 · 账号事件"}]},
+    {"id":"acquire","title":"取得运行权","subtitle":"PG 唯一索引 + 容量事务","band":"run worker","x":70,"y":440,"w":300,"h":82,"summary":"runs 的部分唯一索引保证同会话只有一个 running；租户容量在同一 PG 事务里计数与放行。租约和执行代次从创建起就属于这场 run。","need":"如果先数再放行分成两个独立操作，多副本会同时看到“还没满”，实际运行数就会超过上限。","input":"已认证的租户、会话和用户消息。","output":"running 行、租约、epoch=1；冲突返回明确业务错误。","code":["internal/runengine/store.go","internal/runengine/pgstore.go"],"docs":[{"path":"43-租户并发闸入DB.md","label":"doc/43 · 容量事务"},{"path":"19-v6/19v6-03-存储形态与生命周期.md","label":"19v6-03 · 核心表"}]},
+    {"id":"profile","title":"装配当前输入","subtitle":"模型 · 工具 · 项目 · 记忆","band":"run worker","x":400,"y":440,"w":300,"h":82,"summary":"worker 解析项目 content/runtime、租户模型、工具、MCP、技能和记忆，读取 run_model_messages 中当前可见的消息。","input":"运行记录、租户配置、项目路径、历史模型输入。","output":"RunProfile 与第一枪模型输入。","code":["internal/runengine/profile.go","internal/runengine/worker.go","internal/runengine/project_layout.go"],"docs":[{"path":"34-租户运行时装配.md","label":"doc/34 · 运行时装配"},{"path":"76-项目内容目录与运行资源容器.md","label":"doc/76 · 项目路径"}]},
+    {"id":"loop","title":"模型—工具循环","subtitle":"Generate → call → result → Generate","band":"run worker","x":730,"y":440,"w":300,"h":82,"summary":"每次模型返回后，文本写帧，工具调用先记 journal 再执行，结果回灌模型；没有更多工具调用时进入定稿。OTel span 同步记录，但不参与业务裁决。","input":"当前模型输入与后续工具结果。","output":"delta/tool/usage/task/question 帧、journal 与最终 assistant 内容。","code":["internal/runengine/worker.go","internal/runengine/tools.go","internal/runengine/journal.go","internal/runengine/trace_run.go"],"docs":[{"path":"19-v6/19v6-05-tool-loop.md","label":"19v6-05 · tool loop"},{"path":"54-运行级OTel追踪.md","label":"doc/54 · 观测"}]},
+    {"id":"tools","title":"工具与真实动作","subtitle":"bash · 文件 · 网络 · MCP","band":"run worker","x":400,"y":580,"w":300,"h":82,"summary":"工具在沙箱和路径范围内执行。长文件分页读取，长输出保留尾部并写全文；超过前台等待窗口的 bash 转到后台命令链。","input":"模型工具参数与当前项目/租户范围。","output":"工具结果、文件修改、输出路径或后台 jobId。","code":["internal/runengine/bash.go","internal/runengine/bash_job.go","internal/runengine/filetools.go","internal/runengine/webfetch.go"],"docs":[{"path":"58-读分页与输出留存.md","label":"doc/58 · 输出留存"},{"path":"82-可组合执行原语与后台任务.md","label":"doc/82 · 后台命令"}]},
+    {"id":"wait","title":"等人记录","subtitle":"ask · plan · install","band":"run worker","x":70,"y":580,"w":300,"h":82,"summary":"ask_user、submit_plan 与技能安装提案先写 run_questions，再发 question 帧。worker 等的是数据库里的答案，不是只存在当前进程内的回调。","input":"模型决定需要人提供答案、批准方案或确认安装。","output":"pending/answered 行、question 帧；resume 后接回同一工具结果。","code":["internal/runengine/questions.go","internal/runengine/waittools.go","internal/runengine/skillask.go"],"docs":[{"path":"47-Plan审核与追问澄清.md","label":"doc/47 · 等人现场"},{"path":"52-技能.md","label":"doc/52 · 安装确认"}]},
+    {"id":"compact","title":"压缩与溢出处理","subtitle":"只改模型可见输入","band":"run worker","x":730,"y":580,"w":300,"h":82,"summary":"compact、mid-run fold 和 overflow 在窗口不足时重写 run_model_messages 的可见部分；runlog 原文仍用于页面历史和回查。文件与技能清单由程序从记录继承。","input":"当前模型消息、工具结果与窗口预算。","output":"摘要行、折叠标记与可继续生成的输入。","code":["internal/runengine/compact.go","internal/runengine/midfold.go","internal/runengine/overflow.go","internal/runengine/fileops.go"],"docs":[{"path":"19-v6/19v6-07-compact.md","label":"19v6-07 · compact"},{"path":"19-v6/19v6-09-溢出修复层.md","label":"19v6-09 · 溢出处理"}]},
+    {"id":"finalize","title":"定稿与结束","subtitle":"终态 + 全文历史","band":"run worker","x":1060,"y":580,"w":320,"h":82,"summary":"模型不再调用工具后，worker 保存 run 终态和 assistant 定稿记录，再让客户端通过 terminal 或会话状态进入收口。失败但已有产出的内容也保留。","input":"最终文本、工具记录、用量与执行结果。","output":"runs 终态、runlog_entries、terminal 帧与后续记忆工作。","code":["internal/runengine/store.go","internal/runengine/worker.go"],"docs":[{"path":"19-v6/19v6-03-存储形态与生命周期.md","label":"19v6-03 · 定稿与失败留痕"}]},
+    {"id":"model","title":"外部模型","subtitle":"流式文本与工具决策","band":"模型与同步委派","x":400,"y":785,"w":300,"h":60,"summary":"根据当前输入生成内容，不直接持有 run、Task 或文件权威状态。","input":"模型可见消息和工具声明。","output":"delta、工具调用、用量。","code":["internal/config/model.go","internal/config/provider-catalog.json"],"docs":[{"path":"34-租户运行时装配.md","label":"doc/34 · 模型装配"}]},
+    {"id":"subagent","title":"同步子代理","subtitle":"独立上下文，父 run 等待","band":"模型与同步委派","x":740,"y":785,"w":300,"h":60,"summary":"需要隔离中间过程时同步委派，结果回父 run；wire 档案落会话目录。","input":"父 Agent 委派输入。","output":"折叠结果与可 resume 的完整档案。","code":["internal/runengine/agents.go","internal/runengine/subagent_wire.go"],"docs":[{"path":"39-子代理持久化与resume.md","label":"doc/39 · wire 档案"}]},
+    {"id":"extensions","title":"技能与 MCP","subtitle":"按需装配，不保存执行事实","band":"模型与同步委派","x":1070,"y":785,"w":310,"h":60,"summary":"技能正文经工具进入上下文；MCP 工具经本地进程执行。二者都遵循当前 run 的范围与权限。","input":"技能目录、MCP 配置与工具策略。","output":"技能内容、外部工具声明与结果。","code":["internal/runengine/skilltools.go","internal/runengine/mcp.go"],"docs":[{"path":"52-技能.md","label":"doc/52 · 技能"},{"path":"33-mcp-client.md","label":"doc/33 · MCP"}]},
+    {"id":"pg","title":"PostgreSQL","subtitle":"run / runlog / 模型输入 / journal / 问答","band":"持久记录与临时设施","x":70,"y":950,"w":300,"h":112,"lines":["runs · runlog_entries","run_model_messages · run_journal","run_questions · run_tasks"],"summary":"run 的业务状态与永久历史在这里。runlog、模型输入、journal 和问答各自服务不同读取者，不能合并成“聊天记录”一个词。","code":["internal/runengine/pgstore.go","internal/runengine/store.go","internal/runengine/questions.go"],"docs":[{"path":"19-v6/19v6-03-存储形态与生命周期.md","label":"19v6-03 · 存储分工"}]},
+    {"id":"redis","title":"Redis run 状态","subtitle":"runlive / runepoch","band":"持久记录与临时设施","x":400,"y":950,"w":300,"h":112,"lines":["生成中的帧序列","当前执行代次","账号事件与 Task 唤醒另见数据页"],"summary":"runlive 供过程帧读取，runepoch 拒绝旧执行者写帧。它们是临时面，不是定稿历史。runliveStart 在 AcquireRun 的 PG 事务内调用，失败会使 PG 回滚；EndRun 则在 PG 提交后再收敛 Redis，两种存储不是一个数据库，但调用顺序与补偿明确。","code":["internal/runengine/redisstore.go","internal/runengine/store.go"],"docs":[{"path":"19-v6/19v6-03-存储形态与生命周期.md","label":"19v6-03 · 临时状态"}]},
+    {"id":"files","title":"共享文件系统","subtitle":"content / runtime / 会话 wire","band":"持久记录与临时设施","x":730,"y":950,"w":300,"h":112,"lines":["用户文件在 content","输出与运行资源在 runtime","子代理档案在会话目录"],"summary":"真实文件、长输出和子代理 wire 都在文件系统。多副本要共享持久卷，不能用进程所在机器的临时目录代替。","code":["internal/runengine/project_layout.go","internal/runengine/subagent_wire.go"],"docs":[{"path":"76-项目内容目录与运行资源容器.md","label":"doc/76 · 项目容器"}]},
+    {"id":"memory","title":"记忆读写","subtitle":"inrun / postrun","band":"持久记录与临时设施","x":1060,"y":950,"w":150,"h":112,"summary":"记忆并非全部等 run 结束：inrun 可在当前对话中登记或同步写入，postrun 再做场后处理；模式决定具体路径。","input":"用户原话、run 日志与历史记忆。","output":"后续回合的常驻与召回内容。","code":["internal/runengine/memory_pipeline.go","internal/runengine/memory_markdown.go"],"docs":[{"path":"65-记忆两层方案.md","label":"doc/65 · 双模式"}]},
+    {"id":"redpanda","title":"Redpanda","subtitle":"仅 pipeline","band":"持久记录与临时设施","x":1230,"y":950,"w":150,"h":112,"summary":"pipeline 的异步抽取派送。PG memory_jobs 与对账器保留故障语义；markdown 不走这里。","code":["internal/runengine/memory_redpanda.go","internal/runengine/memory_queue.go"],"docs":[{"path":"65-记忆两层方案.md","label":"doc/65 · 抽取派送"}]}
+  ],
+  "edges":[
+    {"id":"R01","from":"ui-submit","to":"api-runs","kind":"primary","label":"创建 run","short":"01 · 用户消息","description":"浏览器提交消息，HTTP 只确认 run 已受理。","fromSide":"bottom","toSide":"top","labelAt":[310,220]},
+    {"id":"R02","from":"api-runs","to":"acquire","kind":"primary","label":"身份与容量检查","short":"02 · 取得运行权","description":"接入层把身份范围交给存储，运行记录创建成功后 worker 才能推进。","fromSide":"bottom","toSide":"top","labelAt":[240,395]},
+    {"id":"R03","from":"acquire","to":"pg","kind":"primary","label":"写 running 与租约","short":"03 · PG 运行记录","description":"部分唯一索引与容量事务保证执行权；这是 PG 操作。","fromSide":"bottom","toSide":"top","channel":875,"labelAt":[190,885]},
+    {"id":"R04","from":"acquire","to":"redis","kind":"support","label":"建立过程帧与 epoch","short":"runlive / runepoch","description":"AcquireRun 的 PG 事务内调用一条 Redis Lua 同时建立 runlive 与 runepoch；Lua 失败会回滚 PG。PG 提交后的 Redis 收尾失败则不回滚 PG，定稿以 PG 为准。","fromSide":"right","toSide":"top","channel":900,"labelAt":[510,890]},
+    {"id":"R05","from":"acquire","to":"profile","kind":"primary","label":"装配运行环境","short":"04 · RunProfile","description":"worker 解析项目、模型、工具与记忆，准备当前输入。","fromSide":"right","toSide":"left","labelAt":[390,420]},
+    {"id":"R06","from":"profile","to":"loop","kind":"primary","label":"进入模型循环","short":"05 · 当前模型输入","description":"装配结果交给模型—工具循环，后续每枪都从确定的输入与工具结果继续。","fromSide":"right","toSide":"left","labelAt":[720,420]},
+    {"id":"R07","from":"loop","to":"model","kind":"primary","label":"请求模型","short":"06 · Generate","description":"向模型发送当前消息与工具声明。","fromSide":"bottom","toSide":"top","labelAt":[900,745]},
+    {"id":"R08","from":"model","to":"loop","kind":"primary","label":"返回文本与调用","short":"07 · delta / tool calls","description":"模型流式返回，worker 分别处理文本、工具调用与用量。","fromSide":"left","toSide":"bottom","channel":765,"labelAt":[645,760],"bidirectional":true},
+    {"id":"R09","from":"loop","to":"redis","kind":"support","label":"追加过程帧","short":"delta / tool / usage / task / question","description":"每类过程事件按帧契约追加，写口检查当前 epoch。","fromSide":"bottom","toSide":"top","channel":865,"labelAt":[690,885]},
+    {"id":"R10","from":"redis","to":"ui-stream","kind":"support","label":"frames 轮询或 run SSE","short":"08 · 过程上屏","description":"浏览器按 eventOffset 读取同一帧面；SSE 断开仍可由轮询补齐。","fromSide":"left","toSide":"bottom","channel":175,"labelAt":[250,560]},
+    {"id":"R11","from":"loop","to":"tools","kind":"primary","label":"调用工具并回灌结果","short":"09 · 真实动作","description":"工具先记 intent，再执行并保存结果；模型根据结果继续。","fromSide":"left","toSide":"right","labelAt":[650,555],"bidirectional":true},
+    {"id":"R12","from":"loop","to":"wait","kind":"primary","label":"需要人时落问题行","short":"10 · ask / plan / install","description":"问题与方案不是进程内等待者：先写 run_questions，再发 question 帧。","fromSide":"left","toSide":"right","labelAt":[320,555],"bidirectional":true},
+    {"id":"R13","from":"wait","to":"pg","kind":"support","label":"读取答案状态","short":"pending / answered","description":"worker 轮询问题行；恢复时 pending 接着等，answered 将答案作为工具结果注回。","fromSide":"bottom","toSide":"top","channel":890,"labelAt":[200,895]},
+    {"id":"R14","from":"loop","to":"compact","kind":"primary","label":"窗口不足时压缩","short":"11 · compact / fold / overflow","description":"只调整模型可见输入，保留页面历史与恢复所需记录。","fromSide":"bottom","toSide":"top","labelAt":[900,555],"bidirectional":true},
+    {"id":"R15","from":"compact","to":"pg","kind":"support","label":"写模型输入摘要","short":"run_model_messages","description":"摘要替代模型可见内容，runlog 原文不被改写。","fromSide":"bottom","toSide":"top","channel":890,"labelAt":[660,890]},
+    {"id":"R16","from":"loop","to":"finalize","kind":"primary","label":"不再调工具则定稿","short":"12 · 完成或明确失败","description":"最终文本和执行结果进入结束路径；已有产出的失败轮也保留。","fromSide":"right","toSide":"top","labelAt":[1150,555]},
+    {"id":"R17","from":"finalize","to":"pg","kind":"primary","label":"保存终态与全文","short":"13 · runs + runlog_entries","description":"终态与定稿历史落 PG，之后客户端才能用权威全文完成收口。","fromSide":"bottom","toSide":"top","channel":890,"labelAt":[1050,890]},
+    {"id":"R18","from":"pg","to":"ui-final","kind":"support","label":"拉取定稿日志","short":"14 · runlogOffset","description":"页面按 session 全局游标拉 log，以 runId 对齐并替换临时气泡。","fromSide":"top","toSide":"bottom","channel":20,"labelAt":[85,535]},
+    {"id":"R19","from":"ui-resume","to":"api-runs","kind":"recovery","label":"显式续跑","short":"15 · POST resume","description":"用户确认后调用 resume；普通 run 不靠服务端巡检自动接管。","fromSide":"bottom","toSide":"right","labelAt":[1080,225]},
+    {"id":"R20","from":"api-runs","to":"pg","kind":"recovery","label":"认领同一 run","short":"16 · lease_epoch+1","description":"服务端认领过期的 running 行，执行代次递增，旧 worker 后续写入会因代次不符失败。","fromSide":"bottom","toSide":"top","channel":330,"labelAt":[480,350],"dash":true},
+    {"id":"R21","from":"pg","to":"loop","kind":"recovery","label":"回放 journal","short":"恢复已完成步骤","description":"已完成的模型与工具结果原样恢复；只有 intent 没有结果的调用标记中断，不盲目重放副作用。","fromSide":"right","toSide":"bottom","channel":915,"labelAt":[980,915]},
+    {"id":"R22","from":"finalize","to":"memory","kind":"async","label":"场后记忆工作","short":"17 · postrun","description":"定稿后登记场后记忆工作；当轮回复不等异步抽取完成。","fromSide":"right","toSide":"top","channel":900,"labelAt":[1370,830]},
+    {"id":"R23","from":"loop","to":"memory","kind":"async","label":"场中记忆入口","short":"inrun / 同步直写","description":"pipeline 可登记 inrun 作业；markdown 主 Agent 可在当前回合同步维护文件，不经过 Redpanda。","fromSide":"right","toSide":"top","channel":920,"labelAt":[1330,690]},
+    {"id":"R24","from":"memory","to":"redpanda","kind":"async","label":"pipeline 异步派送","short":"抽取作业","description":"Redpanda 仅承担 pipeline 正常派送，持久作业与对账负责故障恢复。","fromSide":"right","toSide":"left","labelAt":[1220,930],"bidirectional":true},
+    {"id":"R25","from":"memory","to":"pg","kind":"async","label":"写记忆与对话块","short":"后续回合读取","description":"pipeline 条目、作业和对话块保存后，后续回合按常驻或召回契约读取。","fromSide":"left","toSide":"right","channel":920,"labelAt":[800,925]},
+    {"id":"R26","from":"tools","to":"files","kind":"support","label":"写文件与输出","short":"content / runtime","description":"用户文件、长输出和运行资源按项目布局写盘，工具结果只带回需要的文本与路径。","fromSide":"bottom","toSide":"top","channel":875,"labelAt":[550,880]},
+    {"id":"R27","from":"loop","to":"subagent","kind":"support","label":"同步委派","short":"独立上下文","description":"同步子代理结果回父 run；它不是独立推进的持久 Task。","fromSide":"bottom","toSide":"top","labelAt":[880,745],"bidirectional":true},
+    {"id":"R28","from":"subagent","to":"files","kind":"support","label":"写 wire 档案","short":"会话 .tako/subagents/","description":"每个子代理实例的模型进出写追加式 JSONL，完整档案可供 resume。","fromSide":"bottom","toSide":"top","labelAt":[880,900]},
+    {"id":"R29","from":"redis","to":"api-events","kind":"support","label":"XREAD 账号事件","short":"变更通知，不是 run delta","description":"账号事件 API 从独立 Stream 读取变更通知，与 runlive 的模型过程帧分开。","fromSide":"top","toSide":"bottom","channel":610,"labelAt":[850,620]},
+    {"id":"R30","from":"api-events","to":"ui-stream","kind":"support","label":"账号 SSE 后重拉","short":"只通知，不带业务状态","description":"页面收到任务或项目变化通知后重新拉取对应 API，不把通知正文当完整状态。","fromSide":"top","toSide":"bottom","channel":210,"labelAt":[960,220]}
+  ],
+  "steps":[
+    {"edge":"R01","title":"投递","text":"用户消息变成创建 run 的请求，浏览器拿到 runId 后开始观察。"},
+    {"edge":"R02","title":"取得执行权","text":"身份与容量先裁决，避免同会话或同租户超出允许的执行数量。"},
+    {"edge":"R03","title":"保存运行记录","text":"PG 保存 running、租约与执行代次；AcquireRun 在同一受理流程内调用 Redis Lua 建立临时帧面，Redis 失败会回滚 PG。"},
+    {"edge":"R05","title":"装配","text":"worker 找到项目目录、租户模型、工具与当前记忆，准备输入。"},
+    {"edge":"R06","title":"进入循环","text":"模型看到 run_model_messages 的当前内容，而不是直接读取页面历史。"},
+    {"edge":"R07","title":"请求模型","text":"当前输入与工具声明发给租户选择的模型。"},
+    {"edge":"R08","title":"接收流式结果","text":"文本成为 delta，工具调用进入执行链，用量单独记帧。"},
+    {"edge":"R11","title":"执行工具","text":"工具产生真实文件或输出，结果回灌模型；长命令可转后台。"},
+    {"edge":"R12","title":"需要人时等待","text":"问题、方案和安装确认先落库，进程崩溃后仍能接回答案。"},
+    {"edge":"R14","title":"控制上下文","text":"窗口不足只改模型可见输入，页面仍保留真实历史。"},
+    {"edge":"R16","title":"进入定稿","text":"模型不再调用工具后，worker 汇总最终内容与终态。"},
+    {"edge":"R17","title":"保存全文","text":"run 终态与 runlog 定稿记录成为后续读取的权威。"},
+    {"edge":"R18","title":"页面收口","text":"客户端按 runlogOffset 拉全文，替换生成中的临时内容。"},
+    {"edge":"R22","title":"处理记忆","text":"inrun 与 postrun 按模式进入各自路径，不让异步抽取阻塞回复。"},
+    {"edge":"R19","title":"崩溃后由人续跑","text":"普通 run 显示中断后由用户显式 resume，不假装原进程还活着。"},
+    {"edge":"R21","title":"回放而不盲目重做","text":"journal 恢复已有结果，未取得结果的工具调用标中断并交模型决定。"}
+  ],
+  "guide":{"title":"先分清“页面历史、模型输入、恢复记录”","paragraphs":["runlog_entries 回答“实际产出了什么”；run_model_messages 回答“下一枪模型该看到什么”；run_journal 回答“每个意图和结果走到哪一步”。","eventOffset 是 run 内过程帧游标，runlogOffset 是 session 内定稿历史游标。两者不能混用，也不能用 Redis 帧代替永久日志。"],"bullets":["run SSE 与 frames 轮询承载同一帧面；账号 SSE 是另一种变更通知。","compact 只改模型输入，不把用户历史替换成摘要。","resume 递增 lease_epoch，旧执行者不能继续写。","没有工具结果的那次调用不自动重放，避免重复外部副作用。"]},
+  "sections":[
+    {"title":"九种帧分别告诉页面什么","intro":"帧是 run 的过程视图，不是永久历史。kind 词表必须完整；question 已经是独立类型，不能再按旧八种理解。","type":"table","columns":["kind","出现的时机","页面的用途"],"rows":[["start","run 创建，关联首条用户消息","初始化生成中的本轮视图"],["delta","模型文本增量到达","追加生成中的正文"],["tool_call","模型决定调用工具","显示工具名与参数"],["tool_result","工具完成并产生回执","与 toolCallId 配对，显示结果或失败"],["usage","模型返回本轮用量","更新 token 与窗口提示"],["task","run 内 Todo 发生变化","显示当前工作清单；不是持久 Task"],["question","追问、方案或安装提案落行后","渲染问题卡、方案卡或安装确认"],["resume","续跑接管并生成恢复种子","标识这是恢复后的执行"],["terminal","run 到 complete/error/stopped 等终态","触发客户端拉定稿历史收口"]]},
+    {"title":"五份记录，五个读取者","intro":"同样来自一场 run，也不代表可以合并。每份记录都有明确消费者，合并后必然有一方读到错误语义。","type":"table","columns":["记录","谁写","谁读、为什么读"],"rows":[["runlog_entries","worker 定稿与工具/问答记录","页面历史、search_history、改动文件视图；读真实产出"],["run_model_messages","run 装配与 compact/fold","下一枪模型；读当前应该看见的输入"],["run_journal","工具与模型步骤执行前后","resume；恢复已完成结果并识别未完成 intent"],["run_questions","ask/plan/install 工具与用户答案端点","worker 等人、前端问题卡、resume；读 pending/answered"],["run_tasks","TaskCreate/TaskUpdate 等看板工具","当前与后续 run 的 Todo 面板；读步骤和结果，不参与 DAG 调度"]]},
+    {"title":"失败与恢复不能一刀切","intro":"故障发生在哪一步，决定哪些结果可以信任、哪些动作不能重做。下面四种分支比“系统支持断点续传”更能说明真实行为。","type":"rows","items":[{"title":"模型已经返回部分内容","text":"已有文本与工具记录可以保留并用于恢复；失败轮不是整轮从数据库消失。客户端之后仍能看到实际产出。"},{"title":"工具已登记 intent，还没有结果","meta":"SIDE EFFECTS","text":"恢复时保留这次调用并标注中断，不自动再执行。命令到底有没有写文件或调用外部服务无法由引擎证明，交给模型根据现状决定。"},{"title":"正在等人回答","meta":"PERSISTED WAIT","text":"pending 行重发问题帧并继续等，answered 行把答案注回工具结果；不需要原进程里的等待回调还存在。"},{"title":"客户端断线，而不是引擎崩溃","meta":"RECONCILE","text":"先查 session 和 runlog 高水位，再按 liveRunId 决定是否继续拉 frames。账号事件流断线只影响通知效率，重拉仍能追回真相。"},{"title":"执行者已经换代","meta":"LEASE EPOCH","text":"resume 后 lease_epoch 递增，旧 worker 的帧写入和状态更新因代次不匹配失败，防止两个进程同时改写同一场 run。"}]},
+    {"title":"对应专项文档","intro":"本页只帮助串线。具体请求字节、状态转换与算法限制以这些文档和代码为准。","type":"rows","items":[{"title":"契约与客户端收口","text":"四个 API、双游标、核心存储和 SSE 运输。","links":[{"label":"四个 API","href":"../19-v6/19v6-01-契约-四个API.md"},{"label":"双游标","href":"../19-v6/19v6-02-reconcile与双游标.md"},{"label":"核心存储","href":"../19-v6/19v6-03-存储形态与生命周期.md"}]},{"title":"模型循环与长上下文","text":"tool loop、compact、mid-run fold、溢出处理与文件工具。","links":[{"label":"tool loop","href":"../19-v6/19v6-05-tool-loop.md"},{"label":"compact","href":"../19-v6/19v6-07-compact.md"},{"label":"mid-run fold","href":"../19-v6/19v6-10-mid-run-fold.md"}]},{"title":"等人、恢复与记忆","text":"问答与方案、journal 续跑、记忆两种独立运行模式。","links":[{"label":"Plan 与追问","href":"../47-Plan审核与追问澄清.md"},{"label":"崩溃续跑","href":"../30-崩溃续跑.md"},{"label":"记忆双模式","href":"../65-记忆两层方案.md"}]}]}
+  ]
+}
+</script>
+<script src="tako-architecture.js" defer></script>
+</body>
+</html>

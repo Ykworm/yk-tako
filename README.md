@@ -1,205 +1,55 @@
 # tako
 
-一个能自己干活的 AI 工作伙伴。你发一句话，它在沙箱里调 bash、读写文件、搜网络、委派子代理，把任务拆成看板一步步推进；崩了能续跑，隔天的对话能召回。多租户，团队共享账号与额度，不共享文件。
+tako 是一个多租户 Agent 运行时与 AI 工作台。你给它一个目标，它不仅能对话，还能读写项目、执行命令、搜索资料、委派子代理，把长工作拆成可恢复的 Task，最后交付一份可以打开检查的文件。
 
-技术栈：**Go 1.27 + [Eino](https://github.com/cloudwego/eino)**（CloudWeGo）+ Gin + PostgreSQL/pgvector + Redis，前端 Vue 3 + Vite。代码在 `yk-tako-eino/`，唯一入口 `cmd/yktako`。
+例如你说：「调研两个方案，修改这个项目，跑完构建，最后给我一份报告；构建期间我还要问别的问题。」主 Agent 可以直接修改文件，让两件调研 Task 按依赖推进，把长构建留在后台；需要结果时主动等待，完成后验证并发布报告。页面能看到工具调用、任务进展和改动文件，而不是只看到一句“正在处理”。
 
-## 能力清单
+tako **不是知识库产品**：记忆与检索只支撑 Agent 工作。它也**不是多人协同编辑产品**：一个员工一个项目，项目文件由本人的多场会话共享；团队共享账号、额度与审计，不共享文件。
 
-| 类别 | 功能 | 状态 |
-|---|---|---|
-| **主循环** | 工具调用（bash / 文件 / 网络搜索与抓取 / 记忆 / MCP） | ✅ |
-| | Plan 审核与追问澄清（写/执行前挂起等人批） | ✅ |
-| | 任务看板（数据在 PostgreSQL，活得过 `kill -9`） | ✅ |
-| | 每一次工具调用都上屏 | ✅ |
-| | 工具分级与延迟加载（`tool_search` 按 BM25 检索挂载；工具定义不占提示词前缀） | ✅ |
-| **上下文** | 压缩 + 中途折叠 + 溢出救援 | ✅ |
-| | 图片落盘换占位符，模型按需读取 | ✅ |
-| | token 用量可见 | ✅ |
-| | `read_file` 分页读 / `bash` 留尾 + 全文落盘 | ✅ |
-| **子代理** | 委派 + 上下文隔离 + 折叠回传 | ✅ |
-| | 持久档案与 resume（跑完还能接着问） | ✅ |
-| | 工具权限分档（白名单 / 排除清单；普通子代理拿不到技能工具，也读不到技能目录） | ✅ |
-| **记忆** | 长期记忆抽取与自动召回（`pipeline` / `markdown` 双模式，`TAKO_MEMORY_MODE` 切换） | ✅ |
-| | 跨会话对话召回 + 主动历史查询（`search_memory`：时点回放 / 改口链） | ✅ |
-| **安全** | bash 沙箱（macOS seatbelt / Linux bwrap） | ✅ |
-| | 文件围栏 + 同文件并发写防护 | ✅ |
-| | PII 脱敏（工具出口 / 模型输入 / 记忆入库） | ✅ |
-| | MCP 进程围栏 | ✅ |
-| **运输** | 四个产品 API 拉取帧 | ✅ |
-| | SSE 流式端点 | ✅ |
-| | 崩溃续跑（客户端触发） | 🔶 |
-| **多租户** | 注册登录 + 租户 + 成员邀请 | ✅ |
-| | 团队协作前端 | ✅ |
-| | 租户配额与并发准入（日 token 预算 / 并发上限，裁决在数据库事务里） | ✅ |
-| | 多 Agent 协作 | ⬜ |
-| **多入口** | Web | ✅ |
-| | IM / cron | ⬜ |
-| **前端** | 多会话并发（切走不打断，草稿与游标随会话保留） | ✅ |
-| **治理** | 项目目录 + 文件清单 | ✅ |
-| | 删除与档案清理 | ✅ |
-| | 变更事件通道 | ✅ |
-| **可观测** | 运行级 OTel trace（CozeLoop / Langfuse，可双发） | ✅ |
-| **质量** | 三层验收：接口契约有机器断言 / 验收场景一键重跑 / 公开基准双臂对照 | ✅ |
-| **技能** | 技能包安装 / 使用 / 禁用 | ✅ |
-| | 对话内安装需管理员确认 + 依赖检查 | ✅ |
-| | 自定义工具上传 | ✅ |
+技术栈：**Go 1.27 + [Eino](https://github.com/cloudwego/eino) + Gin + PostgreSQL/pgvector + Redis**，前端 **Vue 3 + Vite**。`pipeline` 记忆模式另用 Redpanda 派送抽取作业。唯一服务入口是 `yk-tako-eino/cmd/yktako`。
 
-> ✅ 已落地 · 🔶 部分落地 · ⬜ 未做。完整状态与设计见 [doc/16](doc/16-能力复刻总规划.md)。
+## 架构导览
 
-## 架构
+[![tako 系统架构总览](doc/assets/tako-architecture.png)](doc/assets/tako-architecture.html)
 
-```mermaid
-flowchart TB
-    U[用户浏览器] -->|POST /api/runs · SSE · frames 轮询| API
+克隆仓库后，用浏览器打开下面的 HTML 即可查看交互说明，无需构建或联网：
 
-    subgraph SRV["tako 引擎 · cmd/yktako · 无状态多副本"]
-        API["Gin API 层<br/>认证 / 租户 / 响应信封"]
-        WRK["worker · asynq 消费"]
-        LOOP["Eino Agent 循环<br/>Generate → 工具调用 → 结果回填"]
-        TOOL["工具池<br/>bash / 文件 / 搜索抓取 / 记忆 / 技能 / MCP"]
-        SUB["子代理 coder / researcher<br/>委派折叠 · 独立上下文 · wire 档案"]
-        WAIT["等人现场落库<br/>ask_user / plan 审核"]
-        SBX["沙箱与围栏<br/>seatbelt / bwrap · 租户目录 · PII 脱敏"]
-    end
+- [系统架构总览](doc/assets/tako-architecture.html)：谁把什么交给谁，同步执行与异步任务怎样接成一条交付链。
+- [单场 run 生命周期](doc/assets/tako-run-lifecycle.html)：创建、模型工具循环、九种帧、定稿、等人、压缩与显式续跑。
+- [长任务与多 Agent 编排](doc/assets/tako-orchestration.html)：持久 Task、依赖、shared/isolated、后台 bash、发布、通知与重规划。
+- [数据、状态与存储](doc/assets/tako-data-model.html)：PostgreSQL 表、四类 Redis 临时状态、项目 content/runtime、会话 wire 与记忆双模式。
 
-    PG[("PostgreSQL<br/>runs / runlog / run_tasks / 技能表")]
-    RD[("Redis<br/>runlive / runepoch / 事件流")]
-    OT["OTel GenAI trace<br/>CozeLoop / Langfuse 双发"]
-
-    API -->|同事务取执行权，裁决在数据库| PG
-    API -->|临时帧与事件| RD
-    WRK --> LOOP
-    LOOP --> TOOL
-    LOOP -->|委派| SUB
-    LOOP -->|挂起等人| WAIT
-    WAIT --> PG
-    SBX -. 约束 .-> TOOL
-    LOOP --> OT
-```
-
-引擎无状态：互斥与租约全落在 PostgreSQL，临时帧与事件放 Redis——任一进程崩了，租约过期即解锁，另一副本接管。
-
-## 并发控制：为什么不用分布式锁
-
-tako 不使用应用层分布式锁（Redis `SETNX` 那类），互斥下沉到存储层原语：
-
-- **会话级单 run 准入**：`runs` 表的部分唯一索引（`UNIQUE session_id WHERE status='running'`），INSERT 冲突即 409——锁就是数据本身。
-- **租约 + 接管令牌**：`lease_until` 列当 TTL（进程死了自动过期），`lease_epoch` 列当 fencing token（被接管后旧写自然失败）。
-- **文件并发写**：`flock` 排它锁 + sha256 指纹比对，比对在锁内做，防旧版覆盖新版。
-- **配额 / 并发上限**：短事务内 `FOR UPDATE` / `pg_advisory_lock`，事务结束自动释放。
-
-核心运行路径通过设计消除了竞态：单 run 单 worker 串行、历史表只增不删、状态机单向终态不可逆。锁只处理并发发起和崩溃接管两个边界。多副本部署时，数据库是唯一裁判。
-
-当前所有互斥都能下沉到 PG / 磁盘，因为被保护的数据就在这些存储层。若将来需要协调存储层之外的资源（第三方 API 全局限流、跨服务复合操作），才需要引入分布式锁。
-
-完整设计与对比见 [doc/61](doc/61-并发控制设计.md)。
-
-## 请求怎么流转
-
-```
-用户 → POST /api/runs → 数据库互斥（同一会话只跑一个 run）→ worker
-  → 装配租户运行时（模型 / 工具 / 子代理 / MCP / 记忆）
-  → 模型循环：Generate → 工具调用 → 写运行日志 → 推帧
-  → 帧持久化到 PostgreSQL，临时面放 Redis → SSE / 轮询双路给客户端
-  → run 结束：异步记忆抽取 + 对话建索引
-```
-
-互斥与租约在 PostgreSQL，临时态在 Redis，天然支持多副本部署——进程崩溃后租约过期，会话自动解锁。
-
-## 记忆：一层常驻，一层召回
-
-tako 的两套记忆，写入时机不同，进模型的方式也不同。
-
-**常驻层（`notes`）** 管「以后每一场都要遵守的事」。你说「deck 放 output/deck.html，以后改这个文件，不要重建」，模型当场调 `memory` 工具记下来，必须带上你的原句。下一场 run 一开始，所有条目按团队、个人两段渲染进系统提示，整场冻结——本场里新写的，要下一场才看得到。上限是 agent 2200 字、user 1375 字；写满了工具直接报错，让模型自己合并或删一条再写。
-
-**召回层（`memory_items` + `dialogue_chunks`）** 管「以前聊过的事」。一场 run 结束之后，后台把这一场的账本（用户消息、工具调用与回执、助手回复）交给另一个模型，抽成事实、偏好、决定和一段本场摘要，存进 `memory_items`。下一场 run 起手时，拿用户这句话切词（英文串 + 中文二字组），去表里做子串匹配，命中的几条拼进当轮消息。另一条线把每场对话存成一段原文块，用 BM25 检索，补「当时具体怎么说的」。
-
-```mermaid
-flowchart LR
-    A[用户说一句规矩] --> B[模型当场调 memory 工具] --> C[(notes)]
-    C --> D[下一场 run · 系统提示 · 冻结]
-    E[一场 run 结束] --> F[后台抽取 job] --> G[(memory_items)]
-    G --> H[下一场 run 起手 · 召回 · 拼当轮消息]
-```
-
-一句话：常驻层是「记下来就一定看得到」，召回层是「存下来，命中才看得到」。前者由对话里的模型当场判断，所以带你的原话；后者由另一个模型事后推断，所以没有原话，只有它的总结。
-
-两层不并表：常驻层的读者是系统提示，召回层的读者是按需检索，读取契约不同。目前 `memory` 工具不写 `memory_items`，抽取器也不写 `notes`，同一件事可能两边各存一份——这一档由「写侧不重复、读侧笔记优先、删除留痕」处理。两层各自怎么补删改、定位、去重与过期，见 [doc/65](doc/65-记忆两层方案.md)。
-
-上面描述的是 `pipeline` 模式（默认）。运行时由 `TAKO_MEMORY_MODE` 选模式，实例级、重启切换：`pipeline` = PG 两层 + 后台抽取，抽取任务经 Redpanda（Kafka 协议）按会话分区派工，凭据走 `TAKO_REDPANDA_BROKERS / USER / PASSWORD / MECH`（只从环境变量读）；不配 broker 时消费者不起，抽取任务留在队列里等。`markdown` = 不要 PG 记忆表、不要 MQ：master 用同步 `memory` 工具直接写 `USER.md`（全项目通用）与项目 `MEMORY.md`，跨进程文件锁 + 原子替换保证多副本不写坏文件。
-
-记忆检索的时点回放与历史链——`pipeline` 模式的 `search_memory` 工具：`as_of` 按「事实现实中何时为真」回放、`include_history` 沿改口链双向展开——参考了 [Zep](https://www.getzep.com/) 的 memory 产品 [Graphiti](https://github.com/getzep/graphiti)（时序知识图谱：双时间轴 + as-of 查询）。tako 借它的查询语义，没有照抄图谱存储。故事版演示（一场搬家 + 六个问题）见 [doc/68](doc/68-记忆检索的故事演示.md)。
-
-## 基准测试
-
-在 GAIA L1 的 25 道纯文本题上，用同一模型（deepseek-flash）、每题跑 5 次，分别量天花板（Pass@5：至少做对一次）和可靠性（pass^5：次次做对）：
-
-| 指标 | tako | 同类 harness |
-|---|---|---|
-| Pass@5 | 24 / 25 | 23 / 25 |
-| pass^5 | 20 / 25 | 14 / 25 |
-| 平均模型轮次 / 题 | 4.8 | 11.8 |
-| token 总量 | 10.8M | 34.5M |
-
-结论：「能做对一次」两者几乎一样；「次次做对」差出来的部分主要是预算与超时（对比臂的 22 个未完成轮次集中在 8 道题上），不是能力差。tako 用约 1/3 的 token 和不到一半的轮次达到了相近的天花板。
-
-完整口径、归因方法与过程见 [doc/56](doc/56-Agent测试与基准选型.md)。
-
-## 四个关键取舍
-
-每条 = 当时的问题 / 怎么裁 / 代价。完整决策档案（43 条）在 [doc/problems](doc/problems/README.md)。
-
-1. **准入裁决在数据库，不在进程** — 「最多同时跑几个」若在应用层「数一遍 → 比上限 → 放行」，并发下必超发（实测上限 2 放进 4 场）。裁：数与放行收进同一笔 PG 事务 + `pg_advisory_xact_lock`。代价：每次放行多一次锁等待。（[doc/43](doc/43-租户并发闸入DB.md)）
-2. **非典型 HITL** — 模型觉得需要人拍板时调 `ask_user`，页面出一张问题卡；人答完，这句答案就当这次工具调用的结果回给模型，它接着往下跑。不走 eino 的 `compose.Interrupt`（底层 `core.Interrupt`）：那套把执行图停在某个组件的地址上、存一份 checkpoint 快照，恢复时再从那个地址重入；tako 这边图从不停，挂起只是一次调用在等答案，现场落在 PG 的 `run_questions` 行上，进程死了也能由 resume 重建。代价：模型该问的时候没问，人就没有插手的机会；问起来不设上限，人几天不回，这个会话就一直占着。（[doc/47](doc/47-Plan审核与追问澄清.md) §3.4）
-3. **崩溃后接着往下跑，不整轮重来** — 崩之前模型说过的话、已经跑出结果的工具调用，都从 `run_journal` 账本里捞回来原样喂给模型，模型看着这些自己往下走；只有那一次「工具已经叫起来、结果还没拿到」的调用不重跑，只回一句「这次中断了、没拿到结果，要不要重来你定」。代价是那次调用到底有没有留下副作用说不准，所以宁可把重不重来的决定交给模型，也不自动替它跑一遍。（[doc/30](doc/30-崩溃续跑.md)、[doc/39](doc/39-子代理持久化与resume.md)）
-4. **把技能转成任务** — 每场 run 起手，在系统提示词末尾拼一行目录：名字、一句话描述、文件路径。模型要用哪个，就调 `use_skill` 把说明书整篇读进上下文，照着它把步骤一条条建到看板上；任务一建好，说明书就折成一行占位，看板上那几条才是要干的活，它不会被 Compact 折掉，每条任务自带标题和说明，细节不丢。（[doc/52](doc/52-技能.md)）
-
-## 与 kimi / DSH（参照 agent）的差异（归纳中）
-
-kimi 指参照实现 kimi-code，DSH 指 deepseek-harness，两者都是 tako 设计与验收时对照的对象。差异清单边对照边归纳，便于参考与学习；目前已记录下来的：
-
-1. **图片只发一次**（对比如下）：
-
-   - **kimi / DSH 每轮都带图**：用户上传的图片会重新编码、跟着每一轮的消息一起送进模型上下文。
-   - **tako 只发一次**：图片只在第一轮进上下文，随后落到租户目录，后续轮次里只留一行「图片已存档在档案室，路径 `<tenant>/media/xxx.png`，要看自己按路径取」。
-   - **重读基本靠人提醒**：模型不会主动想起去看图，除非人在对话里提一句「看看那张截图」，它才按路径重新读取。
-
-2. **挂起等人时现场放哪**（[doc/47](doc/47-Plan审核与追问澄清.md)）：
-
-   - **kimi**：用 `waitUntil` 在进程内等。
-   - **dsh**：让调用以 `pending` 完成，答案作为下一轮消息。
-   - **tako**：不暂停整个执行流程，也不存快照。问人的那个工具调用当场卡住，每隔一秒半去数据库查一眼那行有没有答案；run 保持运行中，租约照续，不烧 token。人答完，答案原文就当这次工具调用的结果返回，模型在同一轮接着干活。进程中途死了，这行还在库里，resume 按它把这次调用重建出来继续等。
-
-3. **折掉的原文怎么查回来**（[doc/63](doc/63-参照实现对照-子代理与折叠回查.md#2-折叠回查)）：上下文折叠之后，模型想知道摘要里某句话的原文，两家给的通道不一样。
-
-   - **kimi**：没有专门工具。入口是摘要末尾由程序机械贴上的日志路径和行号窗口，模型自己跳区间读行或 grep——方向由程序给，读不读、怎么读靠模型。
-   - **tako**：有 `search_history`，查的是数据库里本会话已提交的行。词由模型自己猜，程序只按空格切词做 ILIKE 全命中，猜成同义词就返回零条。
-
-4. **换任务时的旧上下文：软隔离 vs 程序压缩**
-
-   - **kimi / DSH：软隔离** — 识别到用户换了个全新任务时，旧上下文不删不压，原样留在上下文列表里。只在旧任务最后一条消息和新任务之间插一条系统提示，大意：「上方历史为已完成的旧任务，仅作背景资料和环境信息（如 IP、路径）保留备用，请勿继续执行其操作步骤；从下方消息开始专注新任务」。模型读到这句后把旧任务当背景资料：不再顺着旧任务的排障逻辑往下跑，需要服务器 IP、路径这类环境信息时自己往上检索。换任务 = 保留全部历史 + 插一条提示，隔离靠模型读提示后自觉不执行。
-   - **tako：程序压缩** — 不指望模型自觉。新 run 装配输入时，旧 run 超窗由程序折叠/压缩成摘要行（compact / fold，摘要独立成行），新 run 的上下文里没有旧任务的逐字记录；同会话「上一场」只通过任务看板给一行概要（做完的步骤带结果，没做完的列主题）。旧任务的排障逻辑和报错信息不在新 run 上下文里，模型没有继续执行旧任务的原料，不需要提示词提醒。
+这些页面是现行文档的导读，不是另一份施工契约；实现与专项文档冲突时，以代码和专项文档为准。
 
 ## 快速开始
 
-### 一键开发环境
+### 1. 启动开发环境
+
+前置条件：
+
+- Go 1.27；脚本会把 `$HOME/sdk/go1.27.0/bin` 加进 PATH。
+- Node.js >= 20.19。
+- 本机可用的 Redis 与 PostgreSQL 工具；端口已有实例就复用，否则脚本会在本地创建开发实例。
+- 至少一个可用模型。可以在启动前配置平台默认模型，也可以注册后在配置页给当前租户安装模型密钥。租户没有可用密钥时，run 会按设计拒绝，而不是悄悄换用别人的 Key。
+
+在仓库根目录执行：
 
 ```bash
 ./scripts/dev.sh
 ```
 
-前置条件：
+默认地址：
 
-- Go 1.27（脚本会把 `$HOME/sdk/go1.27.0/bin` 加进 PATH）
-- Node.js >= 20.19（Vite 7 要求）
-- Redis 与 Postgres：端口上已有实例就复用；空闲时脚本用本机 `redis-server` 和 `initdb/pg_ctl` 起本地实例（数据在 `tmp/pg-5433/`）
-- `yk-tako-eino/.env` 里配好模型密钥（如 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`、`TAKO_MODEL`）
-- 可选：`pipeline` 模式的后台抽取要一个 Redpanda（Kafka 协议）broker 与四个 `TAKO_REDPANDA_*` 变量；不配也能起引擎，只是抽取任务不消费。`markdown` 模式零额外依赖
+- 前端：<http://127.0.0.1:5173>
+- 引擎：`127.0.0.1:8901`
+- Redis：`127.0.0.1:6390`
+- PostgreSQL：`127.0.0.1:5433/tako`
 
-默认前端 <http://127.0.0.1:5173>、引擎 `127.0.0.1:8901`、Redis `127.0.0.1:6390`、Postgres `127.0.0.1:5433/tako`。
+`dev.sh` 会自动生成开发用的 `TAKO_JWT_SECRET` 和 `TAKO_DATA_KEY`。手动启动引擎时，需要自行提供至少 32 字节的这两个值。
 
-第一次用先注册账号（注册即建个人租户，密码至少 8 位）：
+### 2. 注册并配置租户
+
+第一次使用可以先用 API 注册；注册会创建个人租户，密码至少 8 位：
 
 ```bash
 curl -s -X POST http://127.0.0.1:8901/api/auth/signup \
@@ -207,71 +57,195 @@ curl -s -X POST http://127.0.0.1:8901/api/auth/signup \
   -d '{"email":"you@example.com","password":"changeme123"}'
 ```
 
-`Ctrl-C` 一起停。常用子命令：
+然后打开前端，在配置页为当前租户安装模型密钥，再登录并发送第一条消息。完整业务链是：**注册 → 配置当前租户模型 → 登录 → 发消息**。
+
+### 3. 选择记忆模式
+
+默认 `pipeline` 模式使用 PostgreSQL 两层记忆、Redpanda 异步抽取和 BM25 召回。若启用后台抽取，需要配置 `TAKO_REDPANDA_BROKERS / USER / PASSWORD / MECH`；不配 broker 也能启动引擎，但抽取作业会留在队列里等待，不能当作已经完成。
+
+如果希望少一套 MQ 依赖，可在启动前设置：
 
 ```bash
-./scripts/dev.sh status      # 有没有在跑（读 pidfile）
-./scripts/dev.sh stop        # 发 TERM，走和 Ctrl-C 同一条收尾
-./scripts/dev.sh restart     # 停掉再前台起
+export TAKO_MEMORY_MODE=markdown
+```
+
+此模式同步维护用户 `USER.md` 与项目 `runtime/memory/MEMORY.md`，不启动 Redpanda 和 BM25。两种模式共用对话块召回。
+
+### 常用开发命令
+
+```bash
+./scripts/dev.sh status
+./scripts/dev.sh stop
+./scripts/dev.sh restart
 
 ENGINE_PORT=8905 WEB_PORT=5180 REDIS_ADDR=127.0.0.1:6392 PG_PORT=5434 ./scripts/dev.sh
 ```
 
-脚本会自动生成开发用的 `TAKO_JWT_SECRET` / `TAKO_DATA_KEY`（至少 32 字节）；不走 dev.sh 时必须自己 export。
-
-### 测试
+### 测试与构建
 
 ```bash
 cd yk-tako-eino
 PATH="$HOME/sdk/go1.27.0/bin:$PATH" go test ./internal/runengine
+PATH="$HOME/sdk/go1.27.0/bin:$PATH" go vet ./internal/runengine
+PATH="$HOME/sdk/go1.27.0/bin:$PATH" go build ./cmd/yktako
 
 cd web
 npm run typecheck
+npm run build
 ```
 
-单元测试不打模型，不需要 API Key。
+单元测试不调用模型，不需要 API Key。契约与活体验收见 [scripts/acceptance/README.md](scripts/acceptance/README.md)；请使用隔离引擎，不要拿开发库做全量重置。
+
+## 现在能做什么
+
+| 领域 | 已落地的能力 | 边界与验证口径 |
+|---|---|---|
+| 对话与工具 | bash、文件、搜索与抓取、历史查询、MCP；工具定义按需检索；每次工具调用上屏 | macOS seatbelt 与 Linux bwrap 代码均已落地；Linux 活体脚本已入库，但当前开发机未实跑 |
+| 长命令 | bash 前台等待超时后保留进程并返回 `bj_…`；读取输出、有限等待、停止进程组、持久通知与失联处理 | 默认前台等待窗口为 30 秒，可配置；引擎重启不自动重放命令，`interrupted` 不表示仍在运行 |
+| 多 Agent 编排 | 持久 Task、初始依赖图、有界计划修订、Task 内提问、依赖推进、失败阻断、整组交付与执行历程 | 不是 Agent 自由群聊；shared 当前同组串行，isolated 当前同组最多两件并行 |
+| 工作区与发布 | Git worktree 或普通目录副本、不可变结果、结果验证、项目级发布协调与受阻重试 | 中间结果不直接写 `content/`；不承诺外部副作用 exactly-once |
+| 重规划 | 最终节点未开始时同组修订；原组已交付后判断继任组；复用旧结果并记录 handoff | 只有 `goalAssessment.outcome == feasible` 才能创建继任组；不可行或不确定不会自动新建 |
+| 同步子代理 | 独立上下文、委派折叠、coder/researcher 权限边界、完整 wire 档案与 resume | 父 Agent 等待结果；它不是另一种后台 Task |
+| 项目与文件 | 项目目录树、文件预览与下载、Markdown 预览、改动文件回执、删除与过期清理 | `content/` 是用户内容，`runtime/` 是工作现场、结果、输出、媒体与项目记忆 |
+| 上下文 | compact、mid-run fold、溢出处理、图片落盘与按需重读、分页读取、长输出留尾和全文落盘 | 页面历史与模型输入分开；压缩不会把用户历史替换成摘要 |
+| 记忆 | `pipeline` / `markdown` 两种模式；常驻与按需召回；`search_memory` 时点与历史链；对话块召回 | 旧 `notes` 路径已迁移退役；`markdown` 不启动 MQ 与 BM25 |
+| 人工参与 | `ask_user` 追问、Plan 审核、技能安装确认；问答现场落库，崩溃后可接回 | 越界命令由沙箱拒绝，不另做框架替模型拦截的审批回路 |
+| 多租户与团队 | 注册登录、租户、成员邀请、模型配置、日 token 与并发容量、存储额度 | 一个员工一个项目；不做团队共享文件、计费、SSO 与 API Key 自服务 |
+| 前端 | 多会话并行、项目会话树、任务处理提醒、右侧工作区、后台命令视图、账号事件同步 | 事件只通知失效，页面仍须重拉权威状态 |
+| 可靠性 | run 租约与执行代次、journal、显式 resume、Task 通知恢复、后台命令失联对账 | 普通 run 由客户端显式续跑，不做服务端自动巡检接管 |
+| 可观测 | OTel GenAI span，CozeLoop / Langfuse 单发或双发 | 观测出口不是恢复或业务历史的权威来源，导出失败不影响 run |
+| 技能与扩展 | 技能安装、更新、禁用、依赖检查、对话内确认；租户上传可执行文件 | 工具根进入子进程 PATH，不等于自动新增模型工具 schema；不做技能市场 |
+| 质量 | 单元契约检查、机器可重跑活体验收、公开基准双臂对照 | 场景化 Eval 仍待点头；公开基准不替代确定性回归 |
+
+## 先分清这些对象
+
+| 对象 | 调用方是否等待 | 身份与记录在哪里 | 主要用途 |
+|---|---|---|---|
+| `session` | 不是执行单元 | PostgreSQL `sessions`；另有会话目录 | 一串对话或一件 Task 的执行归属 |
+| `run` | HTTP 创建后立即返回，页面随后观察 | `runs`、runlog、journal、Redis 临时帧 | 一条用户消息或一次 Task/交付处理触发的一场执行 |
+| 直接工具 | 等本次工具结果 | 调用与结果进入 run 帧和历史 | 当前上下文能完成的动作 |
+| 同步子代理 | 父 Agent 等独立上下文的结果 | 独立模型上下文；会话 `.tako/subagents/` wire | 隔离中间过程，并立即拿结果继续 |
+| run 内 Todo | 不是独立执行单元 | PostgreSQL `run_tasks` | 展示当前 run 的步骤与结果，不参与 DAG 调度 |
+| 持久 Task | 可离开，也可 `wait_task` | PG Task/依赖/通知 + 独立 session/run | 后台推进、依赖、独立恢复与整组交付 |
+| 后台 bash | 等待窗口后可离开，也可 `bash_output` | PG `background_jobs` + runtime 输出 + owner 进程 | 长构建、长测试与持续输出 |
+
+## 系统结构
+
+```mermaid
+flowchart LR
+    U[用户] --> WEB[Vue 工作台]
+    WEB --> API[Gin 接入与身份]
+    API --> WORKER[run worker]
+    WORKER --> LOOP[Eino 模型—工具循环]
+    LOOP --> MODEL[模型厂商]
+    LOOP --> TOOLS[工具与同步子代理]
+    LOOP -->|创建持久工作| SCHED[Task 调度与通知]
+    SCHED --> TRUN[独立 Task session/run]
+    TRUN --> LOOP
+    SCHED --> PROVIDER[工作现场与结果发布]
+    PROVIDER --> FS[(共享持久卷<br/>content / runtime / sessions / users)]
+    WORKER --> PG[(PostgreSQL<br/>权威业务记录)]
+    WORKER --> REDIS[(Redis<br/>过程帧 / epoch / Streams)]
+    SCHED --> PG
+    SCHED --> FS
+    LOOP --> MEMORY[记忆双模式]
+    MEMORY --> PG
+    MEMORY --> RP[Redpanda<br/>仅 pipeline 派送]
+    MEMORY --> FS
+    WORKER --> OTEL[OTel<br/>CozeLoop / Langfuse]
+    REDIS -->|过程帧与变更通知| WEB
+    PG -->|重拉权威状态| WEB
+    FS -->|最终文件与输出| WEB
+```
+
+进程内不保存权威运行状态。PostgreSQL 负责业务事实与事务协调，Redis 负责临时过程帧、执行代次和变更通知，共享持久卷负责真实文件，Redpanda 只负责 `pipeline` 记忆派送。普通 run 崩溃后由用户显式 resume；Task、后台命令和记忆作业各有自己的恢复规则，不能统称“另一副本自动重放”。
+
+## 四个关键工程取舍
+
+1. **执行权与容量由数据库裁决，而不是先数后放。** 同一会话的唯一运行由 `runs` 部分唯一索引保证；租户容量在同一笔 PG 事务里计数与放行，并使用 advisory lock 串起竞争请求。代价是放行时可能多一次锁等待，但不会出现两个副本同时看到“尚未满员”而一起超发。详见 [doc/43](doc/43-租户并发闸入DB.md) 与 [doc/61](doc/61-并发控制设计.md)。
+
+2. **页面历史、模型输入和恢复记录分开。** `runlog_entries` 保存实际产出，`run_model_messages` 保存下一枪模型该看到什么，`run_journal` 保存每一步意图与结果。compact 只改第二份，resume 使用第三份。代价是多份数据与明确写入纪律，换来的是用户历史不被摘要覆盖、恢复不依赖被压缩的聊天记录。
+
+3. **等人与恢复都落库，外部副作用不盲目重做。** 追问、方案和安装确认写 `run_questions`；续跑时 `lease_epoch+1`，旧执行者无法继续写。已经取得结果的工具可以回放，只有 intent 没有结果的调用标记中断，由模型结合现状决定下一步。代价是那次调用的副作用可能需要人工判断，但避免了自动重复写文件或调用外部服务。
+
+4. **中间结果与最终内容分开。** 项目 `content/` 只放用户内容与最终发布结果，`runtime/` 放工作现场、不可变结果、输出、媒体与项目记忆。短写入使用锁内版本校验、同目录临时文件和原子替换；Task 最终结果还要验证与发布。代价是多一次结果固化与发布，但用户不会把并行任务的半成品当成最终交付。详见 [doc/71](doc/71-文件写入竞争.md)、[doc/74](doc/74-并行任务工作区隔离.md) 与 [doc/76](doc/76-项目内容目录与运行资源容器.md)。
+
+## 记忆：两种独立运行模式
+
+| 维度 | `pipeline` | `markdown` |
+|---|---|---|
+| 长期记忆位置 | PG `memory_items` 的 resident / recall 两层 | 用户 `USER.md` + 项目 `runtime/memory/MEMORY.md` |
+| 写入 | inrun / postrun 作业，统一抽取代理处理 | 主 Agent 调 memory 工具，同步 add / replace / remove / batch |
+| 派送与故障 | Redpanda 正常派送，PG jobs、前置条件与对账器处理补投和崩溃 | 无 MQ；锁内重读、跨副本 advisory lock 与原子替换 |
+| 读取 | 常驻读取、BM25 召回、`search_memory` 时点与历史链 | 后续回合直接读取文件，不启动 BM25 |
+| 项目删除 | 清当前项目 workspace 范围记忆与相关 jobs，保留 user 行 | 项目 MEMORY.md 随容器清理，用户 USER.md 保留 |
+| 对话块 | 两种模式共用 `dialogue_chunks` | 两种模式共用 `dialogue_chunks` |
+
+完整设计见 [doc/65](doc/65-记忆两层方案.md)，时点查询的故事版说明见 [doc/68](doc/68-记忆检索的故事演示.md)。
+
+## 基准与验证边界
+
+在 GAIA L1 的 25 道纯文本题上，使用同一模型 deepseek-flash、每题跑 5 次，比较 tako 与参照 harness 的天花板（Pass@5）和重复可靠性（pass^5）：
+
+| 指标 | tako | 参照 harness |
+|---|---:|---:|
+| Pass@5 | 24 / 25 | 23 / 25 |
+| pass^5 | 20 / 25 | 14 / 25 |
+| 平均模型轮次 / 题 | 4.8 | 11.8 |
+| token 总量 | 10.8M | 34.5M |
+
+这是**特定模型、题目切片、harness 与时间点的对照**，不是通用产品排名，也不替代确定性回归。完整口径、同臂重跑分歧与归因方法见 [doc/56](doc/56-Agent测试与基准选型.md)。
+
+当前验证分三层：单元契约检查、真实引擎活体验收、公开基准对照。场景化 Eval 用来进一步回答“活有没有真正干完”，目前仍是待点头方案。Linux 沙箱实现与活体脚本虽已入库，但尚未在本开发机外的 Linux 环境实跑，不能用 macOS 结果代替。
+
+## 下一步
+
+当前已确定的待做与候选：
+
+- **IM / cron 入口**：成为 Web 之外的第二个产品入口。
+- **场景化 Eval**：把“接口按约返回”推进到“任务结果真正完成”；方案见 [doc/45](doc/45-场景化Eval框架.md)，尚待点头。
+- **待评估候选**：浏览器操作、跨子代理结构化产物黑板、run 级预算中断、Prompt 缓存边界优化、受限自修改实验。
+
+多 Agent 编排、持久 Task、并行工作区和后台命令已经落地，不再列为未做。完整能力状态与排序以 [doc/16](doc/16-能力复刻总规划.md) 为准。
 
 ## 项目结构
 
 ```text
-yk-tako-eino/             Go 引擎 + Vue 前端（主代码目录）
-  cmd/yktako/             唯一入口
-  internal/runengine/     运行引擎：API、worker、存储、工具、子代理、记忆、MCP
-  internal/config/        模型厂商目录、模型客户端与系统提示词
-  internal/observability/ OTel trace 装配与内容序列化
-  agents/                 内置子代理规格（coder.md / researcher.md）
-  web/                    Vue 3 + Vite 前端
-doc/                      设计文档（现行）；索引见 doc/README.md
-  log/                    按日期的记录：交接、执行台账、文章（不施工）
-  archive/                旧线与旧代归档（不施工）
-scripts/dev.sh            一键开发环境
-scripts/acceptance/       可机器重跑的验收：期望响应 + 断言器 + 活体抽验
-scripts/bench/            公开基准（GAIA 等）测试脚本
-tmp/                      临时文件（已忽略，不入库）
+yk-tako-eino/                  Go 引擎 + Vue 前端
+  cmd/yktako/                  唯一服务入口与工程参数
+  internal/runengine/          API、worker、存储与工具
+    agent_task_*.go            持久 Task、DAG、修订、通知、恢复与执行历程
+    workspace_*.go             Git/Directory Provider、结果验证与发布
+    bash_job*.go               后台命令、owner 租约与失联对账
+    project_*.go               content/runtime 布局、迁移与删除补偿
+    memory_*.go                pipeline / markdown、召回与抽取
+    ...                        run、compact、技能、MCP、媒体、问答等
+  internal/config/             模型厂商目录、模型客户端与系统提示词
+  internal/observability/      OTel 装配与内容序列化
+  agents/                      coder / researcher 出厂规格
+  web/src/                     Vue 工作台、任务页与右侧工作区
+doc/
+  19-v6/                       第六代运行引擎文档集
+  70-多Agent编排与Task/        持久 Task 与编排方案集
+  assets/                      四张系统说明页与总览海报
+  problems/                    设计决策档案
+  log/                         交接、施工记录与文章，不作施工真源
+  archive/                     被整代取代的旧线与旧引擎
+scripts/
+  dev.sh                       一键开发环境
+  acceptance/                  可机器重跑的契约与活体验收
+  bench/                       公开基准对照
+  export-architecture-poster.sh 从总览 HTML 导出 PNG
+  check-architecture-pages.mjs  检查页面数据、导航与本地链接
 ```
-
-## 下一步做什么
-
-**待完成（已定方向）**——排序与依据见 [doc/16 §5.1](doc/16-能力复刻总规划.md)：
-
-- **IM / cron 入口**：多入口统一路由的第二个入口（推送替代拉取、消息即 run 触发源）。
-- **多 Agent 编排**：在子代理原语（委派 / 上下文隔离 / 持久档案 / 权限分档）之上做任务拆分与动态调度。
-- **场景化 Eval**：验收从「接口有没有按约回」推到「活有没有干完」（方案 [doc/45](doc/45-场景化Eval框架.md)，待点头）。
-
-**待评估（候选，未拍板）**——完整候选池与借鉴来源在 [doc/16 §2b](doc/16-能力复刻总规划.md)：
-
-- 浏览器操作（Work Agent 方向：DOM / 截图理解页面，每步重新观察）
-- 跨子代理的结构化产物黑板（blackboard）
-- run 级预算中断（现有配额是租户日 token；run 级超限自动停）
-- Prompt 缓存边界的进一步压榨（静态前缀声明、逐轮微压缩）
-- 受限自修改（RSI）实验：固定评测集 + 候选版本晋级 / 回滚
 
 ## 文档与协作
 
-- [doc/README.md](doc/README.md)：文档索引——分清哪些是现行文档、哪些是记录与归档，以及 `doc/log/` 里的历史文章怎么读。
-- [doc/16-能力复刻总规划.md](doc/16-能力复刻总规划.md)：产品能力总览——tako 做什么、做到哪了、下一步做什么。
-- [doc/19-v6/19-运行引擎架构-v6.md](doc/19-v6/19-运行引擎架构-v6.md)：第六代运行引擎架构入口（v6 是代际编号，不是服务版本）。
-- [doc/53-模块地图.md](doc/53-模块地图.md)：代码结构索引——每个模块落在哪些文件、对应哪篇方案。
-- [doc/problems/README.md](doc/problems/README.md)：设计决策档案库——当时遇到什么问题、桌上有哪些候选、为什么这么裁。
-- [AGENTS.md](AGENTS.md)：协作规范。
+- [doc/README.md](doc/README.md)：文档索引，区分现行真源、历史记录与归档。
+- [doc/16-能力复刻总规划.md](doc/16-能力复刻总规划.md)：产品能力、当前状态与下一步。
+- [doc/19-v6/19-运行引擎架构-v6.md](doc/19-v6/19-运行引擎架构-v6.md)：第六代运行引擎架构入口；v6 是代际编号，不是服务版本。
+- [doc/53-模块地图.md](doc/53-模块地图.md)：模块职责与真实代码落点。
+- [doc/problems/README.md](doc/problems/README.md)：设计问题、候选与取舍档案。
+- [doc/63-参照实现对照-子代理与折叠回查.md](doc/63-参照实现对照-子代理与折叠回查.md)：与 kimi / DSH 的专项对照，不再占用首页篇幅。
+- [AGENTS.md](AGENTS.md)：施工、验收与文档协作规范。
 - [LICENSE](LICENSE)：MIT 协议。

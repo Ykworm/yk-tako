@@ -1,7 +1,7 @@
 # 70 · 多 Agent 编排与持久 Task
 
 > 性质：**方案集入口**。调研篇保存参考证据；[第一版方案](03-第一版方案.md) 是 V1 的唯一方案真源。
-> 状态：✅ 已落地（2026-11-10 施工+活体验收，头注见方案篇；commit 待用户定）。
+> 状态：✅ 已落地（2026-11-10 施工+活体验收，commit `9b31baa`）。
 > 日期：2026-11-09。
 > 代码落点：`yk-tako-eino/internal/runengine/agent_task_*.go`、`cmd/yktako/main.go`、`web/src/TasksView.vue`；活体 `scripts/acceptance/agent_task_*.sh`。
 > 与总纲关系：承接 doc/16 #9“多 Agent 协作”的缺口。

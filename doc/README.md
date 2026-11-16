@@ -1,7 +1,7 @@
 # doc/ 文档索引
 
 > 性质：**索引**，不是方案。本文只回答「这篇文档是什么、能不能照着施工、代码在哪、被谁取代」。
-> 最后核对：2026-11-15。
+> 最后核对：2026-11-16。
 > 状态口径：✅ 已落地 · 🔶 部分落地／待收口 · ⬜ 未做 · 存档 = 历史材料，不作施工面。
 > 代码路径均相对 `yk-tako-eino/`。
 
@@ -9,10 +9,11 @@
 
 **第一次进仓库，按这个顺序：**
 
-1. 根 `README.md`：怎么把引擎和前端跑起来。
-2. 本索引：分清哪些文档能施工、哪些只是历史。
-3. [`19-v6/19-运行引擎架构-v6.md`](19-v6/19-运行引擎架构-v6.md)：v6（第六代引擎，非服务版本）文档集总入口。
-4. 契约与存储四篇，按这个顺序读：
+1. 根 `README.md`：项目是什么、怎么把引擎和前端跑起来。
+2. 系统说明页（可离线打开）：[总览](assets/tako-architecture.html) → [单场 run](assets/tako-run-lifecycle.html) → [长任务与编排](assets/tako-orchestration.html) → [数据与存储](assets/tako-data-model.html)。先建立结构，再读契约。
+3. 本索引：分清哪些文档能施工、哪些只是历史。
+4. [`19-v6/19-运行引擎架构-v6.md`](19-v6/19-运行引擎架构-v6.md)：v6（第六代引擎，非服务版本）文档集总入口。
+5. 契约与存储四篇，按这个顺序读：
    - [`19v6-01-契约-四个API.md`](19-v6/19v6-01-契约-四个API.md)：四个端点的请求／响应／错误字节。
    - [`19v6-03-存储形态与生命周期.md`](19-v6/19v6-03-存储形态与生命周期.md)：四表 + 两键（runlive / runepoch）、真源划分、多副本。
    - [`19v6-02-reconcile与双游标.md`](19-v6/19v6-02-reconcile与双游标.md)：客户端轮询与游标。
@@ -32,7 +33,7 @@
 - 改视觉（配色／字阶／间距／圆角／侧栏三段／手机抽屉／气泡）：`doc/51`。
 - 加技能、改技能目录／加载／依赖／管理面：`doc/52`。
 - 改删除与档案清理（连带删会话、单场删除、保留窗口）：`doc/37`。
-- 改记忆、召回：现行实现 `doc/29`；两种独立模式（`pipeline` = PG 两层 + 抽取代理 + Redpanda；`markdown` = `USER.md` / `MEMORY.md` 同步直写）的**方案（待点头）**：`doc/65`；想借鉴别家记忆设计（nanoMuse：防重／整理／变更账）：`doc/62`。
+- 改记忆、召回：`doc/65`（已落地：`pipeline` = PG 两层 + 抽取代理 + Redpanda；`markdown` = `USER.md` / 项目 `runtime/memory/MEMORY.md` 同步直写）；`doc/29` 的线一已被 doc/65 取代，线二 `dialogue_chunks` 仍现行；想借鉴别家记忆设计（nanoMuse：防重／整理／变更账）：`doc/62`。
 - 改崩溃续跑：`doc/30`。
 - 改 Redis 临时键（移除 draft）：`doc/38`。
 - 改流式端点：`doc/31`。
@@ -59,7 +60,7 @@
 
 - **16** [能力复刻总规划](16-能力复刻总规划.md) 🔶
   - 落点：全仓；分篇见本表
-  - 产品能力总纲。**2026-10-23 已按 doc/35–49 重基线**：§0.1 现状快照、§2 表补 5b（子代理持久档案与 resume）/ 9b（团队协作前端）/ 12（项目目录）/ 13（删除与档案清理）、§2c 横切契约（响应信封 doc/40、临时键 doc/38）、§5.1 当前待做、§6 索引补齐 doc/23、24、35–49 与 v6 文档集；doc/48 与 doc/49 已落地并从欠账里划掉；**2026-10-27 增补 doc/52 技能方案（已点头；A1–A4、B1–B8、C1–C5、D1、E1、E2、F1–F3、G1 已落地 2026-10-28，24 拍收口）**。🔶＝总纲自身仍列着 ⬜ 未做能力（IM/cron、多 agent 协作、场景化 Eval）
+  - 产品能力总纲。**2026-10-23 已按 doc/35–49 重基线**：§0.1 现状快照、§2 表补 5b（子代理持久档案与 resume）/ 9b（团队协作前端）/ 12（项目目录）/ 13（删除与档案清理）、§2c 横切契约（响应信封 doc/40、临时键 doc/38）、§5.1 当前待做、§6 索引补齐 doc/23、24、35–49 与 v6 文档集；doc/48 与 doc/49 已落地并从欠账里划掉；**2026-10-27 增补 doc/52 技能方案（已点头；A1–A4、B1–B8、C1–C5、D1、E1、E2、F1–F3、G1 已落地 2026-10-28，24 拍收口）**。🔶＝总纲自身仍列着 ⬜ 未做能力（IM/cron、场景化 Eval；多 Agent 协作已落地）
 
 - **17** [后续计划：代码子代理与记忆](17-后续计划-代码子代理与记忆.md) 🔶
   - 落点：`internal/runengine/notes.go`、`bash.go`、`agents/`、`web/`
@@ -304,7 +305,7 @@
   - Markdown 写入只给 master，锁内重读 + 操作式修改 + 同目录临时文件原子 rename（`atomicfile.go`）；多副本用 PG advisory lock 协调。Rakazo 的真实内置存储已核为 PG document + revision，Hermes 才是纯文件参照
   - 验收：观测口与守卫字节在 `expected.json` 用例 35–38 + 快闸 `TestContractMemoryObserveBytes`；活体六件——pipeline_live 20/20、markdown_live 26/26、migrate_live 42/42、file_race 11/11、project_delete 9/9、redpanda_crash（真 broker kill -9 补投与 A→B→A 不被吞）；[doc/29](29-长期记忆.md) 线一被本篇取代、线二仍现行
 
-- **70** [多 Agent 编排与持久 Task：第一版方案](70-多Agent编排与Task/03-第一版方案.md) ✅（**2026-11-10 施工+活体验收，commit 待用户定**）
+- **70** [多 Agent 编排与持久 Task：第一版方案](70-多Agent编排与Task/03-第一版方案.md) ✅（**2026-11-10 施工+活体验收，commit `9b31baa`**）
   - 落点：`internal/runengine/agent_task_{api,delivery,graph,runner,scheduler,store,tools,types}.go` + `auth.go`（117xxx 码，[doc/40](40-响应信封统一.md) §4.2c）+ `events.go`（`agent_tasks_changed`／`agent_orchestrations_changed`，[doc/46](46-变更同步与事件通道.md) §7.7）+ `cmd/yktako/main.go`（`-task-interval`）；`web/src/TasksView.vue`（任务页）；活体 `scripts/acceptance/agent_task_{single,busy,dag,crash,two_replicas}_live.sh` + `agent_task_live_lib.sh`；方案集与调研入口见 [doc/70 README](70-多Agent编排与Task/README.md)
   - 2026-11-09 立项收束 V1，2026-11-10 一次施工完成：一件可持久、执行、通知、停止与显式恢复的 Task（独立执行 session，恢复复用 doc/30 的同 run epoch+1 接管），加「初始 DAG 整组原子创建 → 并行推进 → 依赖满足后 C 汇总 → 失败阻断传播 → 整组单次交付」。四张表（`agent_orchestrations`/`agent_tasks`/`agent_task_links`/`agent_notifications`）+ 模型工具 `delegate_task`/`create_orchestration`/`submit_task_result` + 八端点；V1 固定节点内容、执行者与依赖边，Goal 驱动的动态改图留作下一版
   - 验收：单测全绿（图校验/事件/产出归一/依赖失败传播钉子）；活体五场 single 24/24、busy 14/14、dag 22/22、crash 20/20、two_replicas 13/13；浏览器走查停止链与恢复链、交付一次审计（来源会话 17 组各恰一条 `orchestration_finished`）；施工期契约缺口修复已回填 doc/40 §4.2c 与 doc/46 §7.7
@@ -343,7 +344,7 @@
   - 存量迁移走离线命令的复制 → 校验 → 原子切换，旧布局项目在 HTTP 层直接 409 `117116`；删除清整个项目容器但不误删租户技能／工具、系统技能与用户记忆，容器删除失败回 `cleanup=pending` 由 `project_cleanups` 补偿；没有临时实现或过渡开关。用户级 skill／plugin 本期不做
 
 - **77** [对话页右侧任务面板](77-对话页任务面板.md) ✅（**2026-11-13 落地**：`web/src/App.vue`、`web/src/TasksView.vue`，无后端改动）
-  - 落点（预计）：`web/src/App.vue`（对话页布局与面板壳）、`web/src/TasksView.vue`（`embedded` 嵌入模式）；无后端改动、无契约字节变化
+  - 落点：`web/src/App.vue`（对话页布局与面板壳）、`web/src/TasksView.vue`（`embedded` 嵌入模式）；无后端改动、无契约字节变化
   - 病灶：Task 在后台异步执行，而可观察面只在「任务」页；用户看状态、答 Task 提问、做计划决策都要离开对话再回来。面板把当前项目的 Task 列表与「需要我处理」放到对话页右侧，点行复用任务页同一个详情抽屉；范围是**当前项目**而非当前会话
   - 不改 Task 的存储、状态机、调度与 API；移动端（≤860px）不出现面板，仍走左侧「任务」入口。**§3 第 4 条（Todo 不进面板）已被 [doc/78](78-对话页右侧工作区与改动文件.md) 取代**；**§3 第 1 条（不按会话过滤）与 §4.2 已被 [doc/80](80-任务列表按会话过滤.md) 取代**
 
@@ -391,7 +392,10 @@
 | `doc/` | [68-记忆检索的故事演示](68-记忆检索的故事演示.md) | 非方案，演示读物 | 2026-11-08：doc/65 §4.4 `search_memory` 语义的故事版演示——一场搬家 + 六个问题，覆盖 as_of 现实回放、include_history 改口链、removed 删除边界、过期退场；认知回放只作对比说明，现行工具不开放；参考脉络 Zep/Graphiti（借查询语义、不抄图谱存储）；不作施工真源 |
 | `doc/` | [69-参照实现对照：rakazo 与 octop](69-参照实现对照-rakazo与octop.md) | 非方案，对照记录 | 2026-11-08：读 rakazo（`ref-agent/rakazo/`）与 Octop（`ref-agent/Octop/`）源码的对照——agent 管理（rakazo 的 Bot+Subagent 双形态、octop 的 Expert→Agent→Team 三层）、plugin（rakazo「静态声明不执行代码」vs octop「plugin.yaml+main.py 可执行包」）、skill（三家同构的 SKILL.md）；结论：rakazo 无 expert、octop 有、tako 无 plugin/expert/协作；只作对照阅读，不作施工真源 |
 | `doc/problems/` | [问题与方案库](problems/README.md)（43 条） | 非方案 | 决策档案：每条一个设计选择题——当时遇到什么、桌上有哪些候选、为什么这么裁、代价是什么、今天还成不成立；按模块分组，并在 `doc/53` 各小模块后反链 |
-| `doc/assets/` | [tako 架构与数据流（可交互）](assets/tako-architecture.html) | 非方案，交互图 | 2026-11-13：五层架构图（前端 → 接入层 → 运行引擎 → 模型层 → 存储层）+ 九条数据流（请求／帧／工具／定稿／记忆／编排／恢复／文件／事件）。点节点看它是什么、代码落在哪、在链路里的位置与真源文档；点连线看这条流什么时候发生、带的是什么、落到哪；可按「播放数据流」逐步走完一场 run 的 23 步生命周期。静态版 `tako-architecture.png`（3840×2822）由 `scripts/export-architecture-poster.sh` 从本页派生、可重跑——矢量渲染导出，图中文字是真文本而非图像模型生成，不会有乱码。品牌头用定稿 Logo（Tako Grid 图形 + 轮廓字标，燕麦／焦糖／可可）。内容取自 doc/19-v6、doc/53、doc/16、doc/70；与文档冲突以文档为准 |
+| `doc/assets/` | [系统架构总览](assets/tako-architecture.html) | 非方案，交互图 | 2026-11-16 重基线：约 20 个责任节点讲清前端、接入、run worker、长任务、结果发布、模型、扩展与存储；点节点/连线看输入输出、代码与真源。静态版 `tako-architecture.png`（3840×2822）由 `scripts/export-architecture-poster.sh` 派生。四页共享 `tako-architecture.css/js`，`scripts/check-architecture-pages.mjs` 检查数据与链接 |
+| `doc/assets/` | [单场 run 生命周期](assets/tako-run-lifecycle.html) | 非方案，交互图 | 从 POST /api/runs 到定稿、记忆与显式续跑；含九种帧、runlog/模型输入/journal 分工、问答与 compact |
+| `doc/assets/` | [长任务与多 Agent 编排](assets/tako-orchestration.html) | 非方案，交互图 | 持久 Task、依赖调度、wait_task、shared/isolated、结果发布、后台 bash、通知恢复、同组修订与继任组 |
+| `doc/assets/` | [数据、状态与存储](assets/tako-data-model.html) | 非方案，交互图 | PostgreSQL 当前模型、四类 Redis 临时状态、项目 content/runtime、会话 wire、记忆双模式与多副本共享卷边界 |
 
 ## 4. `doc/log/` 记录
 
