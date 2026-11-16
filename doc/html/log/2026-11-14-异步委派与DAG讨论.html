@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>异步委派、子代理与 DAG 讨论笔记 · tako 文档</title>
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="异步委派子代理与-dag-讨论笔记">异步委派、子代理与 DAG 讨论笔记</h1>
+<blockquote>
+<p>性质：<strong>讨论记录</strong>，不是方案，不作施工真源。 日期：2026-11-14。 状态：概念澄清；没有形成改造拍板，没有修改代码、提示词或工具描述。 取信口径：tako 结论以当日代码为准；Claude 结论以当日官方文档为准；DeepSeek Super-agent 与 Kimi 结论来自此前对本地源码的核对。</p>
+</blockquote>
+<h2 id="0-一句话结论">0. 一句话结论</h2>
+<p><strong>DAG 不是「让 Todo 异步并行」的开关，而是「多个独立执行单元及其依赖关系」；异步委派也不由 Bash、写文件、description、goroutine 或超时中的任何一项单独决定。</strong> Claude 有依赖图式的 Agent teams 和代码式 Workflow，但本轮核到的官方资料没有显示它有 tako 这种默认统一的「持久 DAG 对象 + 独立 Task run + 依赖调度 + 结果通知」产品形态。</p>
+<h2 id="1-讨论从哪里开始">1. 讨论从哪里开始</h2>
+<p>最初想要一个看得懂的自然语言测试：用户只布置环境并说出目标，agent 自己建计划、执行，发现环境变化后重规划。用户台词不能点工具名，也不能提示「先核对」「失败就换方案」「分派给执行者」等行为。</p>
+<p>早期演示脚本改为直接调 API、手写 <code>tasks</code> 和 <code>links</code> 来创建两节点 DAG。它只能证明「计划已经存在以后，系统能否复核」，不能证明「模型自己决定拆计划」，因此被判定为作弊，不再作为自主重规划的成功证据。</p>
+<p>讨论随后从演示回到两个原始动机：</p>
+<ol type="1">
+<li>长工作可以异步执行，不占住来源会话；</li>
+<li>用户知道目标很繁琐时，可以进入一种持续探索、动态规划、追踪目标的模式。</li>
+</ol>
+<p>用户进一步结合自己的实际开发习惯修正了第二个动机：平时并不使用 goal 模式，而是让模型写带验收的文档，自己也不常看验收文档。因此本轮先把问题收窄为：<strong>DAG、Todo、异步委派和普通子代理究竟分别是什么，Claude 又如何划分这些概念。</strong></p>
+<h2 id="2-tako-当前的四种对象">2. tako 当前的四种对象</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>对象</th>
+<th>谁在执行</th>
+<th>调用方是否等最终结果</th>
+<th>生命周期与用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>run_tasks</code> 任务看板</td>
+<td>当前 run 的同一个执行者</td>
+<td>不涉及委派</td>
+<td>一场 run 一块看板；记录「我自己接下来分几步做」</td>
+</tr>
+<tr>
+<td>普通子代理</td>
+<td>一次委派的独立子代理实例</td>
+<td><strong>等</strong></td>
+<td>独立上下文与档案不等于异步；父调用拿到最终字符串后才继续</td>
+</tr>
+<tr>
+<td><code>delegate_task</code> 创建的持久 Task</td>
+<td>独立执行者、独立 execution session/run</td>
+<td><strong>不等</strong></td>
+<td>立即返回任务号；结果以持久通知回来源会话，并有调度与恢复链</td>
+</tr>
+<tr>
+<td><code>create_orchestration</code> 创建的 DAG</td>
+<td>多个独立执行者</td>
+<td><strong>不等整组现场完成</strong></td>
+<td>一次原子提交节点和依赖；无依赖节点可并行，上游成功后下游才开放</td>
+</tr>
+</tbody>
+</table></div>
+<p>代码证据：</p>
+<ul>
+<li>看板与持久 Task 的边界写在 <code>internal/runengine/agent_task_tools.go:122</code>：前者记本 run 的待办步骤，后者创建独立执行的持久 Task，且执行者看不到来源会话。</li>
+<li><code>delegate_task</code> 的描述在 <code>internal/runengine/agent_task_tools.go:141</code>：立即返回任务号、不等结果，完成或失败以持久通知回来。</li>
+<li><code>create_orchestration</code> 的描述在 <code>internal/runengine/agent_task_tools.go:215</code>：一次提交整张任务依赖图，各节点按依赖自动推进。</li>
+<li>普通子代理的调用在 <code>internal/runengine/agents.go:355</code>：<code>subagentShell.InvokableRun</code> 返回内层 <code>InvokableRun</code> 的最终字符串，调用语义仍是同步。</li>
+<li>持久 Task 最终由 <code>internal/runengine/agent_task_runner.go:329</code> 的 <code>go ts.worker.Run(...)</code> 启动；在此前后还有 Task 领取、独立 session/run、工作现场、失败收尾、通知与恢复，不能只看见 <code>go</code> 这一行。</li>
+</ul>
+<p>所以「复杂任务拆成 Task，每个 Task 内部再有自己的 Todo」在产品概念上可以成立，但这是两个层次：<strong>外层是独立工作及其依赖，内层是某个执行者自己的步骤清单。</strong> 外层 DAG 不来自内层 Todo 自动升级。</p>
+<h2 id="3-本轮澄清的四个问题">3. 本轮澄清的四个问题</h2>
+<h3 id="31-dag-是不是让-todo-可以异步并行">3.1 DAG 是不是让 Todo 可以异步并行</h3>
+<p>不是。Todo 并行只描述「几件事同时做」，DAG 还描述「谁必须等谁」。</p>
+<p>例如：</p>
+<ol type="1">
+<li>A 调研 API，B 调研 UI，两件工作互不等结果，可以并行；</li>
+<li>C 写综合报告，必须同时拿到 A 和 B 的结果；</li>
+<li>程序只在 A、B 都成功后开放 C。</li>
+</ol>
+<p>这里真正需要 DAG 的是第 3 条。如果只有一件长工作，<code>delegate_task</code> 就够了，不必制造一张单节点以外的图；如果三步都由同一个执行者顺序完成，任务看板就够了。</p>
+<p><strong>没有依赖声明会怎样：</strong> C 可能在 A、B 尚未完成时开始，执行者只能猜上游结果，或者重复做一遍。<strong>没有异步会怎样：</strong> 来源会话必须等整组结束才继续，但依赖关系本身仍然成立。异步与依赖是两个不同的轴。</p>
+<h3 id="32-异步是不是-bash写文件或-goroutine-决定的">3.2 异步是不是 Bash、写文件或 goroutine 决定的</h3>
+<p>不是。<strong>同步／异步说的是调用方是否等待结果；goroutine 是 Go 用来并发执行代码的手段。</strong></p>
+<ul>
+<li>tako 的 Bash 在 <code>internal/runengine/bash.go:82</code> 使用 <code>cmd.Run()</code> 等待命令结束；超时分支在 <code>bash.go:86</code>，返回「bash 超时，死前输出」。它不会把命令自动转成后台任务。</li>
+<li><code>write_file</code> 从 <code>internal/runengine/filetools.go:115</code> 开始，是同步整文件覆盖写，没有后台语义。</li>
+<li>普通子代理即使底层存在并发执行，父调用仍等最终字符串，所以语义仍同步。</li>
+<li>持久 Task 使用 goroutine 启动，但其产品语义来自独立持久生命周期：来源会话可以先做别的，Task 之后由调度、通知和恢复链接管。</li>
+</ul>
+<p>因此，「一个异步子代理内部有 Bash、读文件、写文件等多种操作」完全正常。异步边界包住的是<strong>整件工作</strong>，工作内部仍然一步一步同步执行。</p>
+<h3 id="33-启动前怎么知道该不该异步">3.3 启动前怎么知道该不该异步</h3>
+<p>不需要先预测它会调用多少工具，也不需要准确预测耗时。判断顺序是：</p>
+<ol type="1">
+<li><strong>下一步是否马上需要这个结果。</strong> 马上要，就倾向同步；不马上要，才考虑异步。</li>
+<li><strong>这件工作能否自包含独立执行。</strong> 执行者看不到来源会话，目标、路径、验收标准必须写全；做不到就先补齐输入，而不是直接派发。</li>
+<li><strong>是否较长，且用户希望当前会话继续响应。</strong> 两者同时成立时，异步才有明显收益。</li>
+</ol>
+<p><code>description</code> 不负责回答这套问题。它主要回答「这件工作是否适合委派，以及委派给哪种专家」；前后台边界是另一个维度。让 description 同时承担耗时预测和异步开关，会把两个判断揉在一起。</p>
+<h3 id="34-是否统一靠超时把长操作转异步">3.4 是否统一靠超时把长操作转异步</h3>
+<p>不是通用原则。超时转后台是特定工具的补救机制，不是任务规划方法。</p>
+<p>Claude 的 Bash 支持显式 <code>run_in_background</code>，前台命令超过两分钟也会自动转后台；但这不是 Write 等所有工具的统一行为。tako 当前 Bash 的 30 秒超时则是终止并交回死前输出，不转后台。</p>
+<p><strong>如果把超时当成统一异步入口会怎样：</strong> 调用方一开始仍按同步语义组织后续步骤，只有超时后才突然发现结果尚未产生；任务边界、输入自包含和结果通知都没有提前建立。是否异步应在委派整件工作时决定，而不是等某个内部工具超时后补救。</p>
+<h2 id="4-delegate_task-目前确实只是可选能力">4. <code>delegate_task</code> 目前确实只是可选能力</h2>
+<p>这是本轮确认的机制缺口，不是模型一定「不会拆任务」的证据。</p>
+<p>当前工具描述说明了它能做什么：异步、立即返回、持久通知、输入自包含；但没有告诉模型<strong>什么时候该用、什么时候不该用</strong>。系统提示也没有补这层策略。因此，用户只说一个目标时，模型可以合理地选择自己直接做完；「工具可用」不等于「模型有理由使用」。</p>
+<p>后续是否给 <code>delegate_task</code> 增加「何时用／何时不用」的策略，是候选改造方向，<strong>本轮未拍板，也未修改工具描述。</strong></p>
+<h2 id="5-claude-的准确对照">5. Claude 的准确对照</h2>
+<h3 id="51-任务清单与后台任务是两件事">5.1 任务清单与后台任务是两件事</h3>
+<p>Claude 的 <code>TaskCreate / TaskGet / TaskUpdate / TaskList</code> 是单个 agent 的多步工作清单；<code>/tasks</code> 查看的是后台 shell 和子代理，不是同一份 Todo 的另一种展示。</p>
+<p>较新模型默认不提供这些任务工具。官方理由是：这些模型不依赖书面清单也能跟踪多步工作，而工具定义和提醒会占用上下文；多步骤或用户明确要求时仍可启用。</p>
+<p>这与 tako 当前「任务看板默认可用」的选择不同，是产品策略差异，不是哪一方缺少任务概念。</p>
+<h3 id="52-子代理的-description-管委派不单独管异步">5.2 子代理的 description 管委派，不单独管异步</h3>
+<p>Claude 官方把 description 定义为自动委派的主要依据：主 agent 读取请求和各子代理描述，选择匹配者；用户也可以显式点名。</p>
+<p>交互式主会话中的子代理默认后台启动，结果以后以通知送达；SDK／程序化调用则可用 <code>await</code> 等待，也可用 <code>Promise.all</code> 并发等待多个子代理。这里的 <code>await Promise.all(...)</code> 表示内部并发、外部仍等这一组结果，不能把它理解成「所有子代理永远同步」或「永远异步」。</p>
+<h3 id="53-claude-不是没有-dag-式能力">5.3 Claude 不是没有 DAG 式能力</h3>
+<p>Claude 有两种不同形态：</p>
+<ul>
+<li><strong>Agent teams</strong>：实验性、默认关闭。共享任务列表支持依赖，上游完成后自动解除下游阻塞，队友认领未阻塞任务。这是依赖图式协调。</li>
+<li><strong>Dynamic workflows</strong>：Claude 编写 JavaScript，用 <code>await</code>、<code>parallel()</code>、<code>pipeline()</code> 表达依赖和并发，中间结果保存在脚本变量中。Workflow 会保存结果并支持恢复，但退出 Claude Code 后不会自行继续；恢复时需要回原会话并重启 Workflow。</li>
+</ul>
+<p>因此准确结论是：<strong>Claude 有 DAG 式协调能力，但不是 tako 当前这种默认统一的持久 DAG 编排组。</strong> 不能把 Agent teams、Workflow、普通后台子代理和任务清单合并成同一种「任务」。</p>
+<h2 id="6-deepseek-super-agent-与-kimi-带来的校准">6. DeepSeek Super-agent 与 Kimi 带来的校准</h2>
+<p>此前对本地源码的核对给本轮讨论提供了两条边界：</p>
+<ul>
+<li>DeepSeek Super-agent 的 Router 不写实施计划；短请求不得改写成 work plan。worker 内部才使用 <code>todo_write</code>、<code>subagent</code> 等工具。出处：<code>ref-agent/dsh-superagent-prototype/prompts/orchestrator.md:4</code>、<code>prompts/dispatch.md:38</code>、<code>src/app/sessions.ts:61</code>。</li>
+<li>Kimi 的委派原则是琐碎工作不委派，只有收益抵偿上下文交接成本时才委派；Tower／Goal 属于显式开启的形态，不是模型从任意自然语言请求自行进入的重型模式。出处：<code>ref-agent/kimi-code/packages/agent-core-v2/src/agent/tools/agent/agent.md:13</code>。</li>
+</ul>
+<p><strong>本轮由此形成的讨论判断：</strong> 不能拿「成熟产品都会从一句自然语言自动建多 agent DAG」当前提。轻量委派和单 agent 清单可以由模型自决，重型编排是否默认自动进入，需要单独拍板；目前没有这个拍板。</p>
+<h2 id="7-已确认与未拍板">7. 已确认与未拍板</h2>
+<h3 id="已确认的事实">已确认的事实</h3>
+<ol type="1">
+<li>Todo、普通子代理、持久 Task、DAG 是四种不同对象。</li>
+<li>单个异步 Task 不需要 DAG；DAG 的独有价值是多个独立执行单元及其依赖。</li>
+<li>普通子代理的独立上下文不等于异步；tako 当前普通委派是同步调用语义。</li>
+<li>异步与工具类型无关；异步执行者内部可以有任意多种同步工具操作。</li>
+<li>goroutine 是启动手段，不是持久 Task 的全部语义。</li>
+<li>description 主要管委派选择，不是可靠的耗时预测器或异步开关。</li>
+<li>Claude 的 Bash 超时转后台不能推广成所有工具的通用规则；tako 当前 Bash 超时也不转后台。</li>
+<li><code>delegate_task</code> 当前缺少「何时使用」的策略，确实只是模型可选用的能力。</li>
+</ol>
+<h3 id="尚未拍板的问题">尚未拍板的问题</h3>
+<ol type="1">
+<li>是否以及如何给 <code>delegate_task</code> 补「何时用／何时不用」的策略。</li>
+<li>DAG 是保持显式重型编排，还是允许模型在默认对话中自行创建；触发边界是什么。</li>
+<li>普通子代理是否需要像 Claude 一样区分交互式前后台与程序化等待；本轮没有改造决定。</li>
+<li>是否存在需要「超时转后台」的具体工具场景；不能从一个 Bash 例子推广成统一机制。</li>
+<li>原动态重规划演示停在 <code>planHold</code>、复核 run 没有调用决策工具的问题仍未定位；<code>tmp/replan-demo/case.sh</code> 仍不能作为模型自主建计划的证据。</li>
+</ol>
+<p>下一步若进入改造，先针对上述某一个产品语义形成方案与施工包，再由用户点头；本笔记本身不授权修改代码或提示词。</p>
+<h2 id="8-claude-官方资料">8. Claude 官方资料</h2>
+<p>本轮核对于 2026-11-14：</p>
+<ul>
+<li>工具参考（Task 工具、后台 Bash）：<a href="https://code.claude.com/docs/zh-CN/tools-reference">https://code.claude.com/docs/zh-CN/tools-reference</a></li>
+<li>交互模式（后台 Bash、子代理、<code>/tasks</code>）：<a href="https://code.claude.com/docs/zh-CN/interactive-mode">https://code.claude.com/docs/zh-CN/interactive-mode</a></li>
+<li>子代理（description、前后台、SDK <code>await</code>）：<a href="https://code.claude.com/docs/zh-CN/sub-agents">https://code.claude.com/docs/zh-CN/sub-agents</a></li>
+<li>Agent teams（实验开关、共享任务依赖与认领）：<a href="https://code.claude.com/docs/zh-CN/agent-teams">https://code.claude.com/docs/zh-CN/agent-teams</a></li>
+<li>Dynamic workflows（代码式编排、保存与恢复边界）：<a href="https://code.claude.com/docs/zh-CN/workflows">https://code.claude.com/docs/zh-CN/workflows</a></li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/log/2026-11-14-%E5%BC%82%E6%AD%A5%E5%A7%94%E6%B4%BE%E4%B8%8EDAG%E8%AE%A8%E8%AE%BA.md"><code>doc/log/2026-11-14-异步委派与DAG讨论.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

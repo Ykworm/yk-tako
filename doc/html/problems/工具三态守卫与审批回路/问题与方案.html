@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>工具三态守卫与审批回路 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="工具三态守卫与审批回路">工具三态守卫与审批回路</h1>
+<blockquote>
+<p>模块：工具安全（旧线 <code>internal/guard</code>，现 <code>internal/runengine/pii.go</code> + 沙箱）｜ 状态：三态闸 + <code>run_approvals</code> + 挂起等人 <strong>整条不做</strong>（2026-10-22）；危险面改由沙箱围栏硬挡；PII 已落地｜ 证据：<code>doc/06-工具安全层.md</code>、<code>doc/41-任务看板与人工审批.md</code> §3.1/§6 Loop A/§8、<code>tmp/审批回路/决策记录.md</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>agent 有了手（bash、文件读写）之后，怎么防止它闯祸？最早的设计是三态闸：<code>allow</code> 放行、<code>deny</code> 把解释文本当结果挡回模型（不抛 error）、<code>ask</code> 暂停整张图等人裁决。旧线（doc/06）把它实现成命令规则引擎 + 文件路径三态 + PII 打码，<code>ask</code> 用 eino 的 <code>StatefulInterrupt</code> + gob checkpoint。</p>
+<p>搬进 v6 时先看到的病灶是：run 只有 complete / error / stopped 三种终态，<strong>没有「暂停等人」的生命周期</strong>；<code>interrupted</code> 是崩溃后的读侧派生视图，语义是「执行者死了」，不是「挂起等人」。于是 doc/41 设计了一套队列式审批：拦截 → <code>run_approvals</code> 落行 → approval 帧 → 阻塞轮询 → 人裁决 → 继续；<code>awaiting_approval</code> 要算会话占用，否则能跳过审批直接投新消息。</p>
+<p>但同一天实测改变了前提：bash 的越界由 <code>sandbox-exec</code> 围栏硬挡（越界读/写全部 <code>Operation not permitted</code>），MCP 也进了同款围栏（围栏根 = 租户目录）。<strong>没有需要「挂起问人」的场景了</strong>——越界是「禁止 + 模型自己改路」，不是「问人」。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>候选</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>危险面怎么收</td>
+<td>A 提示词劝告</td>
+<td>零机制</td>
+<td>外部文本一来就失效（doc/26 那场 `curl</td>
+</tr>
+<tr>
+<td></td>
+<td>B 三态闸 + 审批队列（doc/41 Loop A 原设计）</td>
+<td>人保留最终裁决；等待态持久、多副本安全</td>
+<td>多一个状态值 → 帧 terminal、前端渲染、runlog 语义、两个会话闸唯一索引全要改；模型要「重新热身」；<code>awaiting_approval</code> 必须算占用，否则审批成孤儿</td>
+</tr>
+<tr>
+<td></td>
+<td>C 沙箱围栏硬挡 + 规则表只做 deny（定案方向）</td>
+<td>越界是确定性的「不能」，不产生噪音；模型拿到明确失败原因后改路</td>
+<td>只能挡「围栏外」；围栏内仍是宽权限（项目根可读写、出站网络开）；规则表挡的是「围栏内也不该做」的命令</td>
+</tr>
+<tr>
+<td></td>
+<td>D 逐工具守卫</td>
+<td>不需要沙箱</td>
+<td><strong>逐工具的守卫 ≠ 沙箱</strong>：bash 能读任意路径，文件守卫只管文件工具；Codex 用系统调用层兜底，工具边界只是软约束</td>
+</tr>
+<tr>
+<td>审批用哪套持久化</td>
+<td>A eino gob checkpoint + StatefulInterrupt</td>
+<td>旧线已验证</td>
+<td>进程内字节，多副本下裁决端点在别的副本够不着；v6 的 run 循环是 worker 直驱动，没有可重入执行图</td>
+</tr>
+<tr>
+<td></td>
+<td>B PG 审批行 + 阻塞轮询</td>
+<td>共享阵地；人与 worker 不必同进程</td>
+<td>需要新表、新帧、新端点、会话闸改条件</td>
+</tr>
+<tr>
+<td>PII 要不要一起做</td>
+<td>A 等审批回路</td>
+<td>一次挂齐</td>
+<td>PII 的落点在「所有工具结果的唯一出口」与「模型输入的唯一转换口」，与审批无关，可独立先做（事实也正是 B/C 两线落地、A 取消）</td>
+</tr>
+<tr>
+<td></td>
+<td>B 独立落三处（定案）</td>
+<td>覆盖面完整</td>
+<td>挂载点选错会漏（贴真工具内侧漏 MCP；只挂 <code>prepareInput</code> 折叠后 PII 复活）</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>裁定：C（危险面靠沙箱 + deny 规则）；B 的审批队列整条不做，设计留档备查；PII 独立落地。</strong></p>
+<h2 id="3-同族小裁定">3. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>硬拒返回 error 还是 string？</td>
+<td>返回解释性 string 当 tool_result，不抛 error</td>
+<td>抛 error 模型只看到「tool execution failed」，容易傻重试；带理由的拒绝能让它改道或收手</td>
+</tr>
+<tr>
+<td>三态里的 ask 还需要吗？</td>
+<td>当前无场景；将来出现不可逆动作（如删项目）可从 Loop A 留档直接取</td>
+<td><code>run_approvals</code> 表、挂起三拍、裁决 CAS、resume 第三分支都还在文档里，代码零落点</td>
+</tr>
+<tr>
+<td>「能问的不拒，该拒的不问」？</td>
+<td>保留为原则</td>
+<td>全 ask 会把审批弹窗变成噪音，人就会无脑点 y；全 deny 会逼 agent 绕道（自己 bash <code>cat</code>），反而丧失可观测性</td>
+</tr>
+<tr>
+<td>审批挂起时 run 算什么状态？</td>
+<td>原设计：不新增存储状态，running + 存在 pending 审批行（读侧派生「等审批」）</td>
+<td>与 <code>interrupted</code> 的派生哲学一致；若真做，会话闸要改成 <code>status IN ('running','awaiting_approval')</code>，那是单独一拍</td>
+</tr>
+<tr>
+<td>挂起时进程死了怎么办？</td>
+<td>原设计：journal 重放第三分支——无行回注 <code>interruptedResultText</code>；pending 重新挂起；approved 补执行；rejected 补拒绝文本</td>
+<td>「结果未知」与「人白批了」是两种不同的语义，不能混</td>
+</tr>
+<tr>
+<td>规则从哪来？</td>
+<td>旧线 10 条代表性规则（rm/mv、mkfs/dd、fork 炸弹、`curl</td>
+<td>bash<code>、反弹 shell、Unicode 空白、</code>/proc/environ<code>、jq </code>system()`、sudo），规则即代码、可单测</td>
+</tr>
+<tr>
+<td>PII 打码挂在哪些点？</td>
+<td>① 工具统一出口 <code>wrapToolErrors</code>（含 MCP）；② 模型输入唯一转换口 <code>toSchemaMessages</code>（首轮/折叠/救援全覆盖）；③ 记忆抽取入库前</td>
+<td>贴真工具内侧会漏 MCP；只挂 <code>prepareInput</code> 会在折叠后让 PII 复活</td>
+</tr>
+<tr>
+<td>三处策略一样吗？</td>
+<td>工具输出：打码即焚（原文不进任何持久层）；模型输入：mh/runlog 留原文、模型侧见掩码；记忆：密钥类拒收、证件类打码入库</td>
+<td>用户消息原文要留在 runlog 给页面回放；密钥没有「用户想看原文」的需求</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-证据">4. 证据</h2>
+<ul>
+<li>方案：<code>doc/06-工具安全层.md</code> §1（三件套）、§3（实现）、§4（三态注解 + 两态实现的教训）、§8（未做系统调用层沙箱）；<code>doc/41</code> §3.1（人审回路全设计）、§6 Loop A（七拍全部划掉）、§8 开放问题 1/6/7（两处拍板：bash 不问人、MCP 进围栏、Loop A 不做）。</li>
+<li>台账：<code>tmp/审批回路/决策记录.md</code>（2026-10-22 02:52 三拍：YAML 规则 / 队列审批 / 先审批后沙箱；后被同日实测推翻）。</li>
+<li>代码（现状）：<code>pii.go</code>（<code>piiRules</code>、<code>maskSpan</code>、<code>piiToolWrapper</code>）；没有任何 <code>run_approvals</code> 表或审批端点（<code>grep -rn "run_approvals" internal/runengine/*.go</code> 无匹配）；旧线 <code>internal/guard</code> 已不在本仓。</li>
+<li>复核命令：<code>grep -rn "run_approvals\|awaiting_approval" yk-tako-eino/internal/runengine</code>。</li>
+</ul>
+<h2 id="5-现状">5. 现状</h2>
+<p><strong>审批回路未落地，且按 2026-10-22 拍板不做</strong>；PII 脱敏已落地（doc/41 B 线）。危险面的实际防线是：bash 与租户 MCP 的沙箱围栏（macOS seatbelt；Linux 待补 bwrap，见 <a href="../没有沙箱的系统怎么办/问题与方案.html">没有沙箱的系统怎么办</a>）+ 旧线规则表的结论（未迁入 v6 代码）。若将来出现真需要人拍板的不可逆动作，<code>doc/41</code> §3.1 与 §6 是可直接取用的设计。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E5%B7%A5%E5%85%B7%E4%B8%89%E6%80%81%E5%AE%88%E5%8D%AB%E4%B8%8E%E5%AE%A1%E6%89%B9%E5%9B%9E%E8%B7%AF/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/工具三态守卫与审批回路/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PII 打码挂哪层：贴工具、贴装配口，还是贴统一出口 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="pii-打码挂哪层贴工具贴装配口还是贴统一出口">PII 打码挂哪层：贴工具、贴装配口，还是贴统一出口</h1>
+<blockquote>
+<p>模块：运行引擎 · 数据安全（doc/41 §3.2 B 线，规则口径继承 doc/06 §3.3）｜状态：<strong>已落地</strong>（2026-10-23，<code>fd6a489</code>）｜证据：<code>doc/41-任务看板与人工审批.md</code> §3.2、<code>doc/06-工具安全层.md</code> §3.3、<code>internal/runengine/pii.go</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>租户 A 的 agent 跑 <code>cat .env</code>。<code>bash</code> 工具今天零守卫（<code>bash.go</code> 明文写着「不做危险命令表」），<code>.env</code> 里的厂商 API Key 原样进 tool_result 帧、进 mh（模型消息表）、进 runlog（历史真源），再被记忆抽取带进 <code>memory_items</code> 长期保存。</p>
+<p>多租户已经能区分人和组织，但数据在 agent 工具链里是裸奔的。密钥之外，用户在消息里贴的身份证号、手机号也一路原样喂给模型、抽进记忆——下周一条召回就把它们带回来一次。</p>
+<p>旧线 doc/06 做过这件事（7 条密钥正则 + 两个挂载点），但代码随仓体翻篇出仓。本篇要回答的不是「要不要打码」，而是<strong>打在哪一层才能不漏</strong>——这正是旧方案踩过坑的地方。</p>
+<h2 id="2-三个挂载点与它们的策略">2. 三个挂载点与它们的策略</h2>
+<p>PII 分两类：<strong>密钥类</strong>（API Key、token、密码——继承 doc/06 的 7 条正则并扩到 <code>AKIA</code>/<code>AIza</code>/<code>hf_</code>/<code>sk-</code> 家族与赋值形式）与<strong>证件类</strong>（身份证号、手机号、邮箱、银行卡）。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>挂载点</th>
+<th>位置</th>
+<th>策略</th>
+<th>没它会怎样</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>① 工具返回</td>
+<td><strong>工具统一出口</strong> <code>wrapToolErrors</code>（<code>tools.go:49</code>）——自家工具 / media / pdf / tool_search / <strong>MCP</strong> 都走它，成功与错误两路都打码</td>
+<td><strong>打码后返回</strong>（原文不留）：模型、mh、runlog、tool_result 帧全部只见过干净文本</td>
+<td><code>cat .env</code> 的密钥落帧落库，被记忆抽走</td>
+</tr>
+<tr>
+<td>② 模型输入装配</td>
+<td><strong>模型输入的唯一转换口</strong> <code>toSchemaMessages</code>（<code>midfold.go:373</code>）——首轮 / 折叠 / 救援三条路一次覆盖</td>
+<td><strong>喂模型前打码</strong>：mh/runlog 保留原文（页面要显示用户原话），模型侧只见掩码</td>
+<td>用户消息里的身份证号被模型复述进终稿、带进记忆</td>
+</tr>
+<tr>
+<td>③ 记忆抽取入库</td>
+<td><code>memory.go</code> 抽取管线 parseExtraction 之后、入库之前</td>
+<td><strong>密钥类拒收</strong>（整条丢弃）；<strong>证件类打码后入库</strong></td>
+<td><code>memory_items</code> 慢慢攒成 PII 库，召回一次带一次</td>
+</tr>
+</tbody>
+</table></div>
+<p>①与②策略不同是刻意的：工具输出夹带的密钥没有「用户想在页面上看到原文」的需求，焚掉最干净；用户消息原文要留在 runlog 里给页面回放，所以只在模型出口打码。</p>
+<h2 id="3-候选对比原方案的两个挂载点为什么不能用">3. 候选对比：原方案的两个挂载点为什么不能用</h2>
+<p>这是本拍唯一真正值得记录的设计翻转——<strong>2026-10-23 落地时改的，别照原方案抄</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>原方案</th>
+<th>为什么不能用</th>
+<th>改成的</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>① 贴真工具内侧（每把工具各包一层）</td>
+<td>只覆盖第一方工具，<strong>MCP 工具的结果会漏</strong>——MCP 恰是最不可信的一路</td>
+<td>挂 <code>wrapToolErrors</code>：所有工具结果的唯一必经之路</td>
+</tr>
+<tr>
+<td>② 挂 <code>prepareInput</code></td>
+<td>只管<strong>首轮</strong>；折叠的原料是 <strong>mh 原文</strong>（user 行按设计存原文给页面显示）→ <strong>折叠一次 PII 就复活</strong>（短对话安全、长对话漏，越重要的对话越漏）</td>
+<td>挂 <code>toSchemaMessages</code>：模型输入的唯一转换口，三条路一次覆盖</td>
+</tr>
+</tbody>
+</table></div>
+<p>候选总表：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 提示词劝阻</td>
+<td>只在抽取提示词里写「不要抽密钥」</td>
+<td>零代码</td>
+<td>模型不听话就漏；输出侧根本没管</td>
+</tr>
+<tr>
+<td>B 贴真工具内侧</td>
+<td>每把工具各包一层</td>
+<td>位置直观</td>
+<td>漏 MCP；新增工具忘记包就漏</td>
+</tr>
+<tr>
+<td>C 挂 prepareInput</td>
+<td>只在装配首轮时打码</td>
+<td>一个点覆盖所有工具</td>
+<td>折叠后复活；救援路径也漏</td>
+</tr>
+<tr>
+<td>D 三处统一出口（选定）</td>
+<td><code>wrapToolErrors</code> + <code>toSchemaMessages</code> + 记忆写入前</td>
+<td>每一处都是唯一必经之路，新工具/新折叠路径自动覆盖</td>
+<td>三处策略不同，要分别讲清「为什么这里这样打」</td>
+</tr>
+</tbody>
+</table></div>
+<p>选 D。判断标准只有一条：<strong>这个点是不是所有流量都必经</strong>。是，就挂这里；不是，就要问「哪条路会绕过去」。</p>
+<h2 id="4-同族小裁定">4. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>掩码规则</td>
+<td>密钥类头尾各 4 位（doc/06 口径）；证件类保留可人工核对的头尾、掩掉中段</td>
+<td>逐条金样钉死；<code>maskSpan</code> / <code>maskKeep</code> 两个函数</td>
+</tr>
+<tr>
+<td>幂等性</td>
+<td>打码可重复跑，结果不变</td>
+<td>doc/06 就要求；<code>MaskSecrets</code> 去重区间后从后往前替换</td>
+</tr>
+<tr>
+<td>工具输出要不要留原文</td>
+<td><strong>不留</strong>（打码即焚）</td>
+<td>没有「用户想在页面上看到密钥」的需求</td>
+</tr>
+<tr>
+<td>用户消息要不要留原文</td>
+<td><strong>留</strong>（runlog/mh 存原文给页面回放），只在模型出口打码</td>
+<td>两条代价并存：库里仍有 PII（at-rest 加密不做，见下）</td>
+</tr>
+<tr>
+<td>记忆里密钥类怎么办</td>
+<td><strong>整条拒收</strong>，<code>extractStats.Rejected</code> 计数</td>
+<td>提示词劝阻变成程序拦截</td>
+</tr>
+<tr>
+<td>记忆里证件类怎么办</td>
+<td><strong>打码后入库</strong></td>
+<td>记忆要复用；拒收会把可用信息一起扔掉</td>
+</tr>
+<tr>
+<td>用户消息里已经带掩码的怎么办</td>
+<td><code>MaskPIIKeepUserMasked</code> 保留用户自己打的掩码，不二次打码</td>
+<td>避免把 <code>***</code> 再打一遍</td>
+</tr>
+<tr>
+<td>挂载顺序（handler 链）</td>
+<td><code>gate</code>（外）→ <code>journal</code>（中）→ <code>pii</code>（内，贴真工具）</td>
+<td>PII 在 journal 内：打码发生在结果返程上，意图与结果的分工不被打乱</td>
+</tr>
+<tr>
+<td>旧线「就地改 state 写穿回历史」怎么处理</td>
+<td>v6 不用 <code>BeforeModelRewriteState</code></td>
+<td>旧线那套会写穿回 REPL 历史——当前语义下当时想要，但 v6 的页面历史真源是 runlog，不能跟着模型出口一起改</td>
+</tr>
+<tr>
+<td>dev 探针</td>
+<td><code>POST /api/dev/pii-check</code> body <code>{text}</code> → <code>{masked, hits:[{kind,span}]}</code></td>
+<td>只读诊断口，长期保留</td>
+</tr>
+<tr>
+<td>at-rest 加密</td>
+<td><strong>不做</strong>（数据安全另案）</td>
+<td>库里的原文仍是明文，这是已知边界</td>
+</tr>
+<tr>
+<td>向量库侧 PII</td>
+<td><strong>不做</strong></td>
+<td>记忆端点本来就是 dev 观测口</td>
+</tr>
+<tr>
+<td>对外 API 返回体的 PII 审查</td>
+<td><strong>不做</strong></td>
+<td>同上</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="5-证据">5. 证据</h2>
+<p><strong>方案</strong>：<code>doc/41-任务看板与人工审批.md</code> §3.2（三处挂载点 + 策略 + 踩坑修复表 + 本期不做）、§6 Loop B（B1–B3 三拍）。<strong>规则口径来源</strong>：<code>doc/06-工具安全层.md</code> §3.3（7 条正则、头尾各 4 位、幂等、两个旧挂载点）。</p>
+<p><strong>台账</strong>：<code>tmp/41-任务看板与人工审批/</code>（本地，不入库）。</p>
+<p><strong>代码符号</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>是什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>internal/runengine/pii.go:30</code></td>
+<td><code>PIIKind</code>：密钥类 / 证件类词表</td>
+</tr>
+<tr>
+<td><code>internal/runengine/pii.go:66</code></td>
+<td><code>piiRules</code>：正则规则表</td>
+</tr>
+<tr>
+<td><code>internal/runengine/pii.go:88</code></td>
+<td><code>MaskPII(text) (string, []PIIHit)</code>：唯一扫描函数</td>
+</tr>
+<tr>
+<td><code>internal/runengine/pii.go:152</code></td>
+<td><code>maskSpan</code>：按规则打码</td>
+</tr>
+<tr>
+<td><code>internal/runengine/pii.go:164</code></td>
+<td><code>maskKeep</code>：保留头尾</td>
+</tr>
+<tr>
+<td><code>internal/runengine/pii.go:180</code></td>
+<td><code>piiToolWrapper</code>：工具出口包装</td>
+</tr>
+<tr>
+<td><code>internal/runengine/pii.go:200</code></td>
+<td><code>hasSecretPII</code>：记忆拒收判据</td>
+</tr>
+<tr>
+<td><code>internal/runengine/pii.go:213</code></td>
+<td><code>devPiiCheck</code>：<code>POST /api/dev/pii-check</code></td>
+</tr>
+<tr>
+<td><code>internal/runengine/pii.go:236</code></td>
+<td><code>MaskPIIKeepUserMasked</code>：不二次打码</td>
+</tr>
+<tr>
+<td><code>internal/runengine/tools.go:49</code></td>
+<td><code>wrapToolErrors</code>：挂载点①（所有工具结果唯一必经）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/midfold.go:373</code></td>
+<td><code>toSchemaMessages</code>：挂载点②（模型输入唯一转换口）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/memory.go:553</code>、<code>:578</code></td>
+<td>挂载点③（episode 与 item 两处）</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>复核命令</strong>：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;piiRules\|MaskPII\|hasSecretPII&quot;</span> internal/runengine/pii.go</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;piiToolWrapper&quot;</span> internal/runengine/tools.go internal/runengine/pii.go</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-rn</span> <span class="st">&quot;MaskPII&quot;</span> internal/runengine/midfold.go internal/runengine/memory.go</span></code></pre></div>
+<p><strong>活体验收（2026-10-23）</strong>：<code>pii_test.go</code> 金样钉住掩码串与 span；<code>pii_mount_test.go</code> 钉住三个挂载点。活体：发含假证件号的消息 run 正常 complete（「模型不复述」类断言登记 <code>declared_not_asserted</code>）；发「我的身份证号是 110101…，请记住」→ 抽取后记忆 dev 观测口读到打码后条目；构造夹带 <code>sk-</code> 的原文 → 该条不入库。</p>
+<h2 id="6-现状">6. 现状</h2>
+<ul>
+<li><strong>仍有效</strong>：三处挂载点；两类 PII 两类策略；工具输出打码即焚、用户原文留存；记忆拒收/打码分档；幂等掩码。</li>
+<li><strong>已翻转</strong>：原方案的「贴真工具内侧」「挂 prepareInput」两处都被落地时推翻（理由见 §3）。</li>
+<li><strong>明确不做</strong>：at-rest 加密、向量库侧 PII、对外 API 返回体 PII 审查。</li>
+<li><strong>同族问题</strong>：审批闸整条不做 → <a href="../工具三态守卫与审批回路/问题与方案.html">工具三态守卫与审批回路</a>；记忆入库管线 → <a href="../记忆要不要上向量/问题与方案.html">记忆要不要上向量</a>；旧线规则表来源 → <a href="../工具三态守卫与审批回路/问题与方案.html">工具三态守卫与审批回路</a>。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/PII%E6%89%93%E7%A0%81%E6%8C%82%E5%93%AA%E5%B1%82/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/PII打码挂哪层/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

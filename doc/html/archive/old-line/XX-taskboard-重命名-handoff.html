@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Handoff · 包重命名：taskboard → tasktracker · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="handoff--包重命名taskboard--tasktracker">Handoff · 包重命名：<code>taskboard</code> → <code>tasktracker</code></h1>
+<blockquote>
+<p>性质：<strong>纯 handoff 文档</strong>。不改动任何代码；记录本次命名对话的决策背景、 被否决的候选、影响面清单、以及逐文件的操作步骤，留给后续执行重命名时对照。</p>
+<p>触发对话（2026-09-30）：用户先问 <code>taskboard.go:L1</code> 有什么用 → 引申到「包名不合理」 → 排查与 eino <code>plantask</code>/<code>Claude Tasks</code> 的概念冲突 → 否决 <code>tasks</code>（概念歧义）、 <code>planning</code>（反三层分离、且与已删除旧包同名）、<code>ledger</code>（联想财务）、 <code>board</code>（联想前端 dashboard）→ <strong>终定 <code>tasktracker</code></strong>。</p>
+</blockquote>
+<hr />
+<h2 id="1-决策为什么是-tasktracker">1. 决策：为什么是 <code>tasktracker</code></h2>
+<h3 id="11-三层分离约束硬边界">1.1 三层分离约束（硬边界）</h3>
+<p>三层分离写死在 internal/taskboard/taskboard.go#L5-L6 及 doc/07 §4.1：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>层</th>
+<th>含义</th>
+<th>命名禁区</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Plan</td>
+<td>给人审的方案（动手前拆步骤）</td>
+<td>❌ 不能沾 <strong>plan/planning</strong></td>
+</tr>
+<tr>
+<td>Tasks</td>
+<td>施工期勾选看板（开干后跟踪状态）</td>
+<td>✅ 包名必须落在这一层</td>
+</tr>
+<tr>
+<td>Actions</td>
+<td><code>bash</code>/文件读写等干活工具</td>
+<td>❌ 不能沾 action/exec</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="12-被否决的候选每次否决都是心智雷区">1.2 被否决的候选（每次否决都是心智雷区）</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>否决原因</th>
+<th>谁的直觉</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>taskboard</code></td>
+<td><code>board</code> 会联想到「前端 dashboard / UI 面板」，掩盖「跟踪施工状态」的核心职责</td>
+<td>用户（核心否决）</td>
+</tr>
+<tr>
+<td><code>planning</code></td>
+<td>指 Plan 层，直接违背三层分离；且与 2026-09-26 删除的旧 <code>internal/planning</code> 同名，历史混淆</td>
+<td>用户+文档</td>
+</tr>
+<tr>
+<td><code>tasks</code></td>
+<td>与 eino <code>plantask</code>、Claude Tasks 概念撞脸，每次读代码要做「哦是第三种 task」的消歧</td>
+<td>用户+我们在 §2 一起确认</td>
+</tr>
+<tr>
+<td><code>ledger</code> / <code>account</code></td>
+<td>强联想「财务、钱」，虽然工程界有「事件流水账=ledger」的泛义，但压不过用户的先验语义</td>
+<td>用户（核心否决）</td>
+</tr>
+<tr>
+<td><code>dashboard</code> / <code>panel</code></td>
+<td>纯 UI 概念，比 <code>board</code> 更坏</td>
+<td>直接排除</td>
+</tr>
+<tr>
+<td><code>kanban</code></td>
+<td>比 <code>board</code> 好（是方法学不是 UI），但中文心智里仍是「看板=墙上那块板」，且用户没提这个词</td>
+<td>保留但不推荐</td>
+</tr>
+<tr>
+<td><code>worktrack</code></td>
+<td>弱化了 <code>task</code> 前缀，但对外工具名是 <code>TaskCreate/TaskUpdate</code>（给模型看的），包名 vs 工具前缀拧巴</td>
+<td>保留但不推荐</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="13-tasktracker-终定理由">1.3 <code>tasktracker</code> 终定理由</h3>
+<ul>
+<li><strong>无语义冲突</strong>：软件工程界 <code>bugtracker</code> / <code>issuetracker</code> / <code>tasktracker</code> 用法现成， <strong>没有人会把 tracker 联想到前端 UI 或财务账</strong>。</li>
+<li><strong>过程语义精准</strong>：<code>track</code> 直接对应 <code>pending → in_progress → completed</code> 的<strong>状态跟踪</strong>动作； 既不是「规划前」（planning）、也不是「展示」（board）、更不是「账」（ledger）。</li>
+<li><strong>与工具名自洽</strong>：对外工具名 <code>TaskCreate/TaskUpdate/...</code> 前缀是 <code>Task</code>，包名 <code>tasktracker</code> 前缀一致， Go 代码里看到 <code>tasktracker.NewStore()</code> 和模型看到 <code>TaskCreate</code> 不会产生两套心智。</li>
+<li><strong>不撞历史</strong>：仓库里从未出现过 <code>tasktracker</code>，git 考古不串台。</li>
+</ul>
+<hr />
+<h2 id="2-影响面37-处引用--9-文件--1-readme">2. 影响面（37 处引用 × 9 文件 × 1 README）</h2>
+<p>2026-09-30 全仓 <code>grep "taskboard\."</code> 结果（已排除包内注释中「见 taskboard.go」之类的文字性提及， 这些需跟着内部重命名再改）。数字只是参考，<strong>以改名时的实际 grep 为准</strong>。</p>
+<h3 id="21-需改-import-路径--包名引用">2.1 需改 import 路径 + 包名引用</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文件</th>
+<th>引用形态（示意）</th>
+<th>处数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/cmd/yktako/main.go">cmd/yktako/main.go</a></td>
+<td><code>import "yk-tako-eino/internal/taskboard"</code>、<code>taskboard.New/NewStore</code>、<code>taskboard.Instruction</code></td>
+<td>4</td>
+</tr>
+<tr>
+<td>cmd/yktako/sink_test.go</td>
+<td><code>taskboard.ToolList</code></td>
+<td>2</td>
+</tr>
+<tr>
+<td>internal/adkrun/event.go</td>
+<td><code>import "…/taskboard"</code>、<code>taskboard.IsBoardTool</code></td>
+<td>1+1=2</td>
+</tr>
+<tr>
+<td>internal/adkrun/event_test.go</td>
+<td><code>taskboard.ToolList</code>（断言 Kind=EventBoard 的用例）</td>
+<td>9</td>
+</tr>
+<tr>
+<td>internal/adkrun/turn_test.go</td>
+<td>注释：「taskboard.IsBoardTool 判定」</td>
+<td>1（文字）</td>
+</tr>
+<tr>
+<td>internal/webui/server_test.go</td>
+<td><code>import</code>、<code>taskboard.New/NewStore/ToolCreate</code></td>
+<td>4</td>
+</tr>
+<tr>
+<td>README.md</td>
+<td><code>internal/taskboard</code> 路径 + 文字说明</td>
+<td>1+（多处文字）</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="22-包内部目录移动后import-路径变了但包内自引用是-包名符号">2.2 包内部（目录移动后，import 路径变了，<strong>但包内自引用是 <code>包名.符号</code></strong>，</h3>
+<p>因此把 <code>package taskboard</code> 改成 <code>package tasktracker</code> 后，所有 <code>taskboard.</code> 自引用都要同步改成 <code>tasktracker.</code>）</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文件</th>
+<th>需改</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>taskboard.go</td>
+<td><code>package taskboard</code> → <code>package tasktracker</code>；文件本身也建议改名成 <code>store.go</code>（见 §3.1）</td>
+</tr>
+<tr>
+<td>tools.go</td>
+<td><code>package taskboard</code>；第 72 行注释「机制见 taskboard.go 的 SessionKey 注释」→「机制见 store.go」（如果文件也改名了）</td>
+</tr>
+<tr>
+<td>middleware.go</td>
+<td><code>package taskboard</code>；第 2、44 行注释提「eino plantask 同款」不必改，但提 <code>taskboard.go</code> 文件名的要同步</td>
+</tr>
+<tr>
+<td>taskboard_test.go</td>
+<td><code>package taskboard</code> → <code>package tasktracker</code></td>
+</tr>
+<tr>
+<td>tools_test.go</td>
+<td><code>package taskboard</code> → <code>package tasktracker</code></td>
+</tr>
+<tr>
+<td>middleware_test.go</td>
+<td><code>package taskboard</code> → <code>package tasktracker</code></td>
+</tr>
+<tr>
+<td>integration_test.go</td>
+<td>外部测试包 <code>package taskboard_test</code> → <code>package tasktracker_test</code>；所有 <code>taskboard.</code> 导出符号引用全部改成 <code>tasktracker.</code>；import 路径改成 <code>…/internal/tasktracker</code></td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="23-可能的连锁常量-isboardtool--eventboard--sessionkey-值">2.3 可能的连锁：常量 <code>IsBoardTool</code> / <code>EventBoard</code> / <code>SessionKey</code> 值</h3>
+<p>这些<strong>不在本次必须改名范围内</strong>，但逻辑上已轻微错位，留待后续决策：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>东西</th>
+<th>错位点</th>
+<th>是否本次改</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>IsBoardTool(name) bool</code>（tools.go#L29-L36）</td>
+<td>判断的是不是「账本/跟踪工具」，但名字还叫 Board</td>
+<td>⚠️ 可选，建议改 <code>IsTrackerTool</code>，但要同步 adkrun 的引用</td>
+</tr>
+<tr>
+<td><code>EventBoard EventKind</code>（event.go#L28）</td>
+<td>呈现事件四类之一叫 board，其实是「账本投影」</td>
+<td>❌ 本次不改（是呈现层的标签，不是包概念）</td>
+</tr>
+<tr>
+<td><code>SessionKey = "taskboard_session_key_tasks"</code>（taskboard.go#L25）</td>
+<td>字符串里还嵌着 <code>taskboard</code></td>
+<td>⚠️ <strong>强建议一起改</strong>，否则 grep 代码时永远能搜到 <code>taskboard</code>，且这个 key 是 checkpoint 内部用的（目前 checkpoint 也是内存的，无向后兼容负担）。现在不改以后就成死债</td>
+</tr>
+<tr>
+<td>工具名 <code>TaskCreate/TaskUpdate/...</code></td>
+<td>给模型看的外部协议，和 Claude Tasks 对齐</td>
+<td>❌ <strong>绝对不能改</strong> — 这是模型协议层</td>
+</tr>
+<tr>
+<td><code>Instruction</code> 常量（middleware.go#L57-L61）</td>
+<td>首行「任务看板约定」文字还是看板说法</td>
+<td>⚠️ 可选，改成「任务跟踪约定」比较顺手</td>
+</tr>
+</tbody>
+</table></div>
+<hr />
+<h2 id="3-操作步骤清单留给下次执行时逐条-tick">3. 操作步骤清单（留给下次执行时逐条 tick）</h2>
+<h3 id="31-改目录--内部文件最小变更顺序">3.1 改目录 + 内部文件（最小变更顺序）</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />1. <code>mv yk-tako-eino/internal/taskboard yk-tako-eino/internal/tasktracker</code></label></li>
+<li><label><input type="checkbox" />2. 目录内 7 个文件的 <code>package taskboard</code> → <code>package tasktracker</code>； 外部测试包 <code>package taskboard_test</code> → <code>package tasktracker_test</code></label></li>
+<li><label><input type="checkbox" />3. （顺手）把 <code>taskboard.go</code> 重命名为 <code>store.go</code> —— 因为包名不再叫 taskboard， 文件名还用旧包名会误导人；它的内容本来就是「数据模型 + Store 正本」，叫 <code>store.go</code> 刚好和 adkrun、mediaoffload、compact 等包的命名风格一致（它们都有 <code>store.go</code>）。</label></li>
+<li><label><input type="checkbox" />4. （如果改了文件名）同步所有注释里的「见 taskboard.go」→「见 store.go」： 目前至少 tools.go#L72</label></li>
+<li><label><input type="checkbox" />5. 包内自引用 <code>taskboard.Task</code> / <code>taskboard.StatusCompleted</code> / <code>taskboard.NewStore</code> 等 全部改成 <code>tasktracker.</code>；集成测试（外部包）里的 <code>taskboard.ToolCreate</code> 等量替换</label></li>
+<li><label><input type="checkbox" />6. （建议）<code>SessionKey</code> 常量字符串值改为 <code>tasktracker_session_key_tasks</code> （或更短 <code>tasktracker_tasks</code>，唯一即可）</label></li>
+<li><label><input type="checkbox" />7. （可选）<code>IsBoardTool</code> → <code>IsTrackerTool</code></label></li>
+<li><label><input type="checkbox" />8. （可选）<code>Instruction</code> 首行「任务看板约定」→「任务跟踪约定」</label></li>
+</ul>
+<h3 id="32-改外部引用按-21-列表逐文件扫">3.2 改外部引用（按 §2.1 列表逐文件扫）</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />9. <a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/cmd/yktako/main.go">cmd/yktako/main.go</a>： import 路径 + <code>taskboard.X</code> 全部替换</label></li>
+<li><label><input type="checkbox" />10. cmd/yktako/sink_test.go：同上</label></li>
+<li><label><input type="checkbox" />11. internal/adkrun/event.go： import 路径 + <code>taskboard.IsBoardTool</code>（如果改了函数名就改新名）</label></li>
+<li><label><input type="checkbox" />12. internal/adkrun/event_test.go： import + 全部 <code>taskboard.ToolList</code></label></li>
+<li><label><input type="checkbox" />13. internal/adkrun/turn_test.go： 文字注释 <code>taskboard.IsBoardTool</code> → <code>tasktracker.IsTrackerTool</code>（如果函数改名了）</label></li>
+<li><label><input type="checkbox" />14. internal/webui/server_test.go： import + 全部 <code>taskboard.X</code></label></li>
+</ul>
+<h3 id="33-验证必须全绿才能收尾">3.3 验证（必须全绿才能收尾）</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />15. <code>cd yk-tako-eino &amp;&amp; go build ./...</code></label></li>
+<li><label><input type="checkbox" />16. <code>go vet ./...</code></label></li>
+<li><label><input type="checkbox" />17. <code>go test -race ./...</code>（确保集成测试的 gob checkpoint 也过——<code>SessionKey</code> 字符串值改了后要重跑 integration_test.go 的 TestInterruptCheckpointCarriesBoard， 它目前断言 checkpoint 字节里含 <code>"查时间"</code>，和 SessionKey 无关，应该不受影响）</label></li>
+<li><label><input type="checkbox" />18. README：yk-tako-eino/README.md 里所有 <code>internal/taskboard</code> 路径 + 「任务看板」文字说明按需更新（看板是 UX 呈现名词， 不是包名，所以文字层保留「看板」没问题；只是代码路径要改对）</label></li>
+<li><label><input type="checkbox" />19. （顺手）确认 doc/ 目录里其他 md 是否引用 <code>internal/taskboard</code> 路径—— 目前 doc/02 和 doc/07 有大量引用。<strong>策略：这些是历史文档（「实现计划」「决策记录」）， 引用的是当时写就时的旧路径，不必改</strong>，保持记录原样更真实； <strong>只改「当前生效」的 README</strong>——除非你想要所有历史文档都一致，那另计。</label></li>
+</ul>
+<h3 id="34-本-handoff-文档的处理">3.4 本 handoff 文档的处理</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" />20. 改名做完后，把本文件的编号 <code>XX-</code> 改成正式编号（按 doc/ 目录现有最大编号 +1）。 目前最大编号是 <code>18-</code>，新的就是 <code>19-</code>。 文件从 <code>XX-taskboard-重命名-handoff.md</code> 改成 <code>19-taskboard-重命名-handoff.md</code>（保留原名里的 <code>taskboard</code> 关键词， 方便未来考古——这是 handoff 不是新文档）。</label></li>
+<li><label><input type="checkbox" />21. 在 §0 顶部追加一行「执行记录」：日期、执行人、对应 commit hash（以后 git 有 commit 之后）。</label></li>
+</ul>
+<hr />
+<h2 id="4-风险点清单">4. 风险点清单</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>风险</th>
+<th>概率</th>
+<th>应对</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SessionKey</code> 改字符串后，<strong>如果</strong>有任何外部 checkpoint 持久化到磁盘（目前 adkrun.Store 是内存的，但将来接磁盘就有），会出现续跑找不到 key</td>
+<td>目前极低</td>
+<td>现在不改，将来接入磁盘 checkpoint 时就必须带迁移脚本；现在改是最佳时机，0 兼容成本</td>
+</tr>
+<tr>
+<td>集成测试 gob 反序列化受影响</td>
+<td>极低</td>
+<td>gob key 是 <code>SessionKey</code> 字符串，改了后 <strong>新 run 用新 key</strong>，老 run（内存的进程都结束了）不存在</td>
+</tr>
+<tr>
+<td><code>IsBoardTool</code> 改 <code>IsTrackerTool</code> 时漏改 adkrun 引用</td>
+<td>中</td>
+<td>用 <code>grep -rn "IsBoardTool"</code> 全仓搜，改完 <code>go build</code> 会报错兜底，不会沉默</td>
+</tr>
+<tr>
+<td>注释里「taskboard」文字性残留</td>
+<td>高</td>
+<td>残留不影响构建，纯美观；允许分批清理，但 <code>SessionKey</code> / <code>import</code> / <code>package</code> 声明必须一次改完</td>
+</tr>
+<tr>
+<td>IDE / 其他构建缓存把旧路径留在 <code>.vscode/</code>、<code>.idea/</code> 等</td>
+<td>低</td>
+<td>「手动移目录后重新跑 <code>go build ./...</code>」会重建 Go 索引</td>
+</tr>
+</tbody>
+</table></div>
+<hr />
+<h2 id="5-本次对话的决策摘要防止将来又绕一圈">5. 本次对话的决策摘要（防止将来又绕一圈）</h2>
+<blockquote>
+<p><strong>核心分歧</strong>：<code>board</code> → 你联想「前端 dashboard」；<code>ledger</code> → 你联想「财务账」； <code>planning</code> → 违背三层分离且踩历史包名；<code>tasks</code> → 与 eino/Claude Task 概念消歧成本高。</p>
+<p><strong>收敛标准</strong>：命名必须是「软件工程有现成先例」「不占用你的已有语义雷区」「落在 Tasks 层（施工跟踪）」。 满足全部三条的只有 <code>tasktracker</code>（参考 <code>bugtracker/issuetracker</code> 用法）。</p>
+<p><strong>对外协议不动</strong>：<code>TaskCreate/TaskUpdate/TaskList/TaskGet</code> 四个工具名（给模型的）、 <code>pending/in_progress/completed/deleted</code> 状态值、<code>EventBoard</code> 呈现类别标签—— 这些都不是 Go 包名层面的事，本次不碰。</p>
+</blockquote>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/archive/old-line/XX-taskboard-%E9%87%8D%E5%91%BD%E5%90%8D-handoff.md"><code>doc/archive/old-line/XX-taskboard-重命名-handoff.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

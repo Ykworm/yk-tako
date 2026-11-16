@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>失败轮要不要留痕：区分「没产出」与「做了一半」 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="失败轮要不要留痕区分没产出与做了一半">失败轮要不要留痕：区分「没产出」与「做了一半」</h1>
+<blockquote>
+<p>模块：运行引擎 · run 终态与历史（<code>tmp/失败留痕</code> 台账，commit <code>d74bf91</code>）｜状态：<strong>已落地</strong>（2026-10-22）｜证据：<code>tmp/失败留痕/planning.md</code>、<code>internal/runengine/store.go</code>、<code>worker.go</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>一场 run 失败时，它已经说过的话、已经做过的工具调用，现在<strong>什么都不留</strong>。三个会真实发生的戏：</p>
+<p><strong>戏一：用户刷新页面，半截回答消失。</strong> 模型说了三段话，正说到一半，provider 报 500，run 走 error 出口。页面上半截回答还在（浏览器内存里），用户一刷新 → 页面从 runlog 重建历史 → <strong>runlog 里没有这场 run 的 assistant 行</strong> → 半截回答消失，只剩用户那条提问。五分钟后帧也过期（<code>tk:runlive</code> 终态 <code>EXPIRE 300s</code>）→ 连现场都没了。</p>
+<p><strong>戏二：模型下一枪看到一条没人回答的用户消息。</strong> <code>AcquireRun</code> 在同一笔事务里把本轮 user 行写进 mh 和 runlog；<code>EndRun</code> 的 complete 分支才写 assistant / tool 行，error / stopped 走 <code>else</code> 分支<strong>一行不写</strong>。于是下一场 run 的 <code>prepareInput</code> 读到的是 <code>[…历史…, user: 帮我把 X 改一下]</code>——这条 user 消息永远没有配对的 assistant 行。用户重发「刚才改到哪了？」，模型看到两条没有回答的 user 消息，既不知道上一轮说了什么，也不知道上一轮已经动过手。</p>
+<p><strong>戏三：工具的副作用没人记得。</strong> 崩溃账本 <code>run_journal</code> 是这一轮最完整的记录（每次工具调用的 intent 与 result、每次 assistant 轮）。但终态时账本被无条件删掉——于是「这一轮改过哪些文件、跑过什么命令、结果是什么」只剩 Redis 里 300 秒的帧，之后归零。</p>
+<p><strong>病根</strong>：<code>error</code> / <code>stopped</code> 这一档同时意味着「这一轮没发生」和「这一轮做了一半」，而现在的实现只认前一种。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 全不留（现状）</td>
+<td>error/stopped 一行不写</td>
+<td>语义简单：有 assistant 行 ≈ 成功</td>
+<td>戏一、戏二、戏三全部发生</td>
+</tr>
+<tr>
+<td>B 全留</td>
+<td>失败轮一律写 mh + runlog</td>
+<td>不丢任何东西</td>
+<td>「失败且无产出」也写 → 库里多出一堆空 assistant 行；页面刷新后每个失败都显示一个空气泡</td>
+</tr>
+<tr>
+<td>C 区分「失败无产出」与「失败有产出」（选定）</td>
+<td>判据：<code>len(turn) &gt; 0</code> 即算有产出</td>
+<td>该留的留、该干净的干净；一行代码就能判</td>
+<td>mh 里会出现半截 assistant 行，Provider 协议要求 tool_calls 有配对结果，需要配平</td>
+</tr>
+</tbody>
+</table></div>
+<p>选 C。「这一轮说没说话」是现成、无歧义、不依赖模型的判据——<code>turn</code> 里有没有条目，机械可判。</p>
+<p>改后落什么：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>终态</th>
+<th>turn</th>
+<th>改后落什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>complete</td>
+<td>有</td>
+<td>mh + runlog（现状不动）</td>
+</tr>
+<tr>
+<td>error</td>
+<td>空</td>
+<td>只有 user 行（与改造前一致）</td>
+</tr>
+<tr>
+<td>error</td>
+<td>非空</td>
+<td>mh + runlog（<strong>新增</strong>）</td>
+</tr>
+<tr>
+<td>stopped</td>
+<td>空</td>
+<td>只有 user 行</td>
+</tr>
+<tr>
+<td>stopped</td>
+<td>非空</td>
+<td>mh + runlog（<strong>新增</strong>）</td>
+</tr>
+<tr>
+<td>闸失（已被接管）</td>
+<td>任意</td>
+<td>零写入（接管者负责）</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="3-同族小裁定">3. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>stopped 与 error 是否同待遇</td>
+<td><strong>同待遇</strong></td>
+<td>两者同构（用户主动停 = 这一轮做了一半）；分开处理只多一个特例。stopped 天然多是无产出——流被掐断时 turn 里没有 assistant 条目，规则自动落成「一行不写」</td>
+</tr>
+<tr>
+<td>失败轮的半截 assistant 行要不要进 mh</td>
+<td><strong>要</strong></td>
+<td>不落 → 模型下一枪看到一条没人回答的 user 消息，接不上</td>
+</tr>
+<tr>
+<td>mh 里 tool_calls 没有配对结果怎么办</td>
+<td><code>balanceToolResults</code> 补一条合成结果行（「没拿到结果」），<strong>不编造结果</strong></td>
+<td>OpenAI 协议要求 tool_calls 后紧跟对应结果，否则下一枪被拒。配平规则复用 <code>replayJournal</code> 已在做的事</td>
+</tr>
+<tr>
+<td>记忆抽取线要不要放开到失败轮</td>
+<td><strong>不放开</strong></td>
+<td>记忆要可信的完整事实；失败轮虽落 runlog，但<strong>不登记抽取任务</strong>（outbox 仍只在 complete 分支）。<code>failtrace_test.go</code> 有断言钉住</td>
+</tr>
+<tr>
+<td>闸失分支</td>
+<td><strong>仍零写入</strong></td>
+<td>接管者负责；旧进程的每次写都自然失败（doc/30 §7）</td>
+</tr>
+<tr>
+<td>账本删除时机</td>
+<td><strong>不变</strong>（终态照旧删）</td>
+<td>账本的职责是续跑；续跑完了就没用了，内容已转进 mh / runlog</td>
+</tr>
+<tr>
+<td>complete 分支</td>
+<td><strong>一行不改</strong></td>
+<td>用既有回归 + 契约矩阵重放兜底</td>
+</tr>
+<tr>
+<td>用量记账</td>
+<td>三个终态都记</td>
+<td>2026-10-22 从「只在 complete 记」改成三终态都记——失败那轮也花了 token</td>
+</tr>
+<tr>
+<td>前端收口</td>
+<td><code>error</code> / <code>stopped</code> 也拉 log 渲染</td>
+<td>气泡以 log 为准，状态保留 error/stopped</td>
+</tr>
+<tr>
+<td>runlog 语义变化</td>
+<td>「有 assistant 行」不再 ≈「run 成功」</td>
+<td>凡是拿它当成功判据的地方都要复查：前端已改；记忆线靠「不放开」这条不变量挡住</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-证据">4. 证据</h2>
+<p><strong>方案</strong>：<code>tmp/失败留痕/planning.md</code>（§2 背景、§3 三个病灶故事、§4 方案选定、§5 契约面改了什么没改什么、§9 不变量与风险、§10 三拍全部落地）、<code>tmp/失败留痕/todos.md</code>（E1–E4 四要素）。</p>
+<p><strong>入库</strong>：commit <code>d74bf91</code>「runengine+web+docs：失败留痕——失败那一轮「已产出的内容」照常落库」。</p>
+<p><strong>代码符号</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>是什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>internal/runengine/store.go:397</code></td>
+<td><code>Store.EndRun</code>：三个终态共用一笔事务</td>
+</tr>
+<tr>
+<td><code>internal/runengine/store.go:453</code></td>
+<td><code>writeMHRows</code>：mh 写入的唯一闭包（complete / error / stopped 共用）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/store.go:492</code></td>
+<td><code>writeTurnRows(rootAlways bool)</code>：runlog 写入的唯一闭包</td>
+</tr>
+<tr>
+<td><code>internal/runengine/store.go:631</code></td>
+<td>stopped 分支：写 mh + runlog（<code>turn</code> 为空则自然零行）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/store.go:755</code></td>
+<td>error 分支：同上</td>
+</tr>
+<tr>
+<td><code>internal/runengine/store.go:717</code></td>
+<td>线一 outbox 登记（只在 complete 分支 → 失败轮不进记忆）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/worker.go:550</code></td>
+<td>失败终态的 mhRows 由 turn 派生</td>
+</tr>
+<tr>
+<td><code>internal/runengine/worker.go:944</code></td>
+<td><code>balanceToolResults</code>：给缺结果的调用补合成行</td>
+</tr>
+<tr>
+<td><code>internal/runengine/failtrace_test.go</code></td>
+<td>失败留痕的四条断言</td>
+</tr>
+<tr>
+<td><code>web/src/chat.ts:682</code></td>
+<td><code>closeOut</code>：error/stopped 也 <code>drainLog</code></td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>复核命令</strong>：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;writeMHRows\|writeTurnRows&quot;</span> internal/runengine/store.go</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sed</span> <span class="at">-n</span> <span class="st">&#39;625,640p&#39;</span> internal/runengine/store.go      <span class="co"># stopped 分支</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">sed</span> <span class="at">-n</span> <span class="st">&#39;750,765p&#39;</span> internal/runengine/store.go      <span class="co"># error 分支</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;balanceToolResults&quot;</span> internal/runengine/worker.go</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="va">PATH</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$HOME</span><span class="st">/sdk/go1.27.0/bin:</span><span class="va">$PATH</span><span class="st">&quot;</span> <span class="ex">go</span> test ./internal/runengine <span class="at">-run</span> <span class="st">&#39;EndRun|BalanceToolResults&#39;</span> <span class="at">-v</span></span></code></pre></div>
+<p><strong>活体验收（台账 §10 记录，2026-10-22 全部落地）</strong>：</p>
+<ul>
+<li>停止场景（B）：投一条会让 agent 先调 bash、说几句的消息 → 8 秒后 <code>POST /api/runs/{id}/stop</code> → 拉会话历史 → 至少两行（user + assistant 非空）。改前只有 user 一行。</li>
+<li>反向用例（A）：模型一个字没说就报错 → log 里仍只有 user 一行，不该凭空多出 assistant 行。</li>
+<li>模型接得上（C）：承 B 再发一条消息 → 新一轮模型输入里带着上一轮的半截回答与工具结果。</li>
+<li>记忆不进（E）：承 B 等抽取线跑完 → <code>memory_items</code> 里没有这场 run 的产物。</li>
+</ul>
+<h2 id="5-现状">5. 现状</h2>
+<ul>
+<li><strong>仍有效</strong>：<code>turn</code> 非空即留痕；stopped 与 error 同待遇；配平规则；记忆线只在 complete；闸失零写入；账本终态删除。</li>
+<li><strong>已知小瑕疵</strong>：<code>web/src/chat.ts:838</code> 的注释仍写着「停止/失败在 log 里都不留 assistant 行」——这句话在 <code>d74bf91</code> 之后已过期（closeOut 已改为拉 log）。行为正确（reconcile 先查气泡是否已存在），注释待顺手清。</li>
+<li><strong>风险登记</strong>：mh 里会出现半截 assistant 行，下一枪模型看到「自己上次说到一半被中断」——这是真相，但要观察模型不会因此反复道歉。</li>
+<li><strong>同族问题</strong>：崩溃与续跑的状态语义 → <a href="../崩溃后这场run算什么状态/问题与方案.html">崩溃后这场 run 算什么状态</a>；崩溃前那半句怎么进账本 → <a href="../崩溃前那半句要不要存/问题与方案.html">崩溃前那半句要不要存</a>；记忆线的输入边界 → <a href="../记忆要不要上向量/问题与方案.html">记忆要不要上向量</a>。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E5%A4%B1%E8%B4%A5%E8%BD%AE%E8%A6%81%E4%B8%8D%E8%A6%81%E7%95%99%E7%97%95/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/失败轮要不要留痕/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

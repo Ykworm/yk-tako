@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>记忆要不要上向量 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="记忆要不要上向量">记忆要不要上向量</h1>
+<blockquote>
+<p>模块：长期记忆与召回（<code>internal/runengine/memory.go</code>、<code>recall.go</code>）｜ 状态：已落地（<code>doc/29</code> A1–B4，<code>29f9d18</code>，2026-10-18）；线二检索栈由自研 tsvector+BM25 改为 pg_search｜ 证据：<code>doc/29-长期记忆.md</code> §2、§10.1–§10.3、<code>tmp/pgsearch-verify/</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>三周前，用户在会话 A 里和 agent 排查构建失败，顺口说「这个项目的 Go 不在 PATH，得用 <code>PATH=$HOME/sdk/go1.27.0/bin:$PATH</code>」。三周后会话 B，用户说「加个 handler，跑一下测试」，agent 直接 <code>go test</code>，报了一屏 <code>package requires go &gt;= 1.27</code>。它不知道这句话：notes 里没有（用户没说「记下来」），<code>search_history</code> 只能搜会话 B 自己。同一件事，用户第二次付了时间。</p>
+<p>更麻烦的是决策与原文：会话 A 里比较半小时后拍板「Go + Gin，理由单二进制部署」，会话 B 里 agent 又推荐 FastAPI；会话 A 里定下「dev 库 5433、迁移窗口周六凌晨」，会话 B 问「5433 那件事，旧实例读到几号」——原料都在 <code>runlog_entries</code> 里，断的是「把上一场 run 变成下一场可用的结论 / 可搜的原文」这两段。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>候选</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>召回用什么检索</td>
+<td>A pgvector 语义召回</td>
+<td>换说法也能命中（「周末」→「周六」）</td>
+<td>embedding provider、外部调用故障面、RRF 融合、HNSW 调参；tako 是工作伙伴不是知识库，语义噪声会挤掉精确事实</td>
+</tr>
+<tr>
+<td></td>
+<td>B ILIKE 词法（线一，定案）</td>
+<td>零扩展、零外部依赖、可预测</td>
+<td>只认字面；短句记忆量小，词法够用</td>
+</tr>
+<tr>
+<td></td>
+<td>C PG 内核 <code>tsvector</code> + Go 侧 BM25（第三稿）</td>
+<td>不装扩展</td>
+<td>要自研 bigram 预处理、生成列 + GIN、重排；中文分词与 BM25 都要自己维护</td>
+</tr>
+<tr>
+<td></td>
+<td>D pg_search 扩展（线二，定案）</td>
+<td>Lindera 分词 + 扩展内 BM25，一条 <code>@@@</code> 查询</td>
+<td>部署矩阵多一个扩展；dev 实例要 preload + 重启</td>
+</tr>
+<tr>
+<td>一份还是两份索引</td>
+<td>A 一张表一个召回函数</td>
+<td>实现少</td>
+<td>蒸馏记忆与原文的形态、预算、召回路完全不同，混在一起必互相拖累</td>
+</tr>
+<tr>
+<td></td>
+<td>B 一份原料两条加工线（定案）</td>
+<td>各用各的检索栈：记忆 ILIKE、原文 pg_search</td>
+<td>两条写链、两个召回口，但只在一个注入点汇合</td>
+</tr>
+<tr>
+<td>要不要 <code>search_memory</code> 工具</td>
+<td>A 给模型一把工具</td>
+<td>模型可按需查</td>
+<td>自动召回已覆盖主场景；工具要模型自觉调用，弱模型不可靠</td>
+</tr>
+<tr>
+<td></td>
+<td>B 只做自动召回（定案）</td>
+<td>不依赖模型自觉</td>
+<td>召回块不够用时没有第二条路（二期再加，它只是召回函数的一层壳）</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>裁定：A 不做；线一 B、线二 D；两条线分开建；<code>search_memory</code> 不做。</strong></p>
+<h2 id="3-同族小裁定">3. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>原文怎么切块？</td>
+<td>一个 run 一块 passage（≤4000 rune），不切</td>
+<td>WeKnora 同款；切块会切碎上下文，排名也更难解释</td>
+</tr>
+<tr>
+<td>工具行进不进索引？</td>
+<td>两条线都不进</td>
+<td>工具输出大、噪、多是网页/文件原文；需要精确找时本会话有 <code>search_history</code></td>
+</tr>
+<tr>
+<td>子代理终稿进不进？</td>
+<td>两条线都进（各截 1000 rune）</td>
+<td>tako 的大活常整体委派，root 终稿可能只有一句；不收，委派型 run 的记忆是空壳</td>
+</tr>
+<tr>
+<td>抽取什么时候触发？</td>
+<td>run complete，<code>EndRun</code> 同事务写 <code>memory_jobs</code>（outbox）</td>
+<td>同事务保证「run 定稿 ⇒ 待抽任务一定存在」；不塞进 EndRun 同步做，主流程不欠记忆任何东西</td>
+</tr>
+<tr>
+<td>索引什么时候触发？</td>
+<td>常驻循环每 2s 反查未索引 run</td>
+<td>本地毫秒级写入，幂等重扫比 outbox 更少件达到同等可靠性</td>
+</tr>
+<tr>
+<td>失败怎么办？</td>
+<td>抽取 job 重试三次后 failed；索引重扫覆盖同一行</td>
+<td>run 早已 complete，记忆失败不拖垮主流程</td>
+</tr>
+<tr>
+<td>语义召回的「换说法」怎么办？</td>
+<td>明确放弃，写进契约并验收固化</td>
+<td>「库里有『周六』、问『周末』命中 0」是接受的限制，不是 bug；将来若要捡回，pg_search 自带混合检索，门比当初宽</td>
+</tr>
+<tr>
+<td>记忆合并/淘汰？</td>
+<td>一期不做；写入只增不改，召回同 topic 取最新</td>
+<td>二期加 <code>status</code>/<code>superseded_by</code> 再议</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-证据">4. 证据</h2>
+<ul>
+<li>方案：<code>doc/29-长期记忆.md</code> §1（三场戏）、§2（两条线对照与四条判据）、§3（写链/读链/重建链）、§4–§5（两线实现）、§6.3（接受的限制）、§10.1（WeKnora 抄/不抄）、§10.2（两次路线裁决）、§10.3（远期备选）。</li>
+<li>台账：<code>tmp/pgsearch-verify/</code>（PG 17.4 临时实例四项实证；5433/5432 全程未动）。</li>
+<li>代码：<code>memory.go</code>（抽取管线）、<code>recall.go</code>（<code>renderMemoryBlock</code>、<code>memoryCandidate.CreatedAt</code>）、<code>internal/runengine</code> 的 <code>dialogue_chunks</code> 手写迁移与 pg_search 索引。</li>
+<li>复核命令：<code>grep -rn "pg_search\|dialogue_chunks\|ILIKE" yk-tako-eino/internal/runengine/*.go | head</code>。</li>
+</ul>
+<h2 id="5-现状">5. 现状</h2>
+<p>仍有效。线一是 ILIKE 词法 + 命中数；线二落 pg_search（<code>@@@</code>）。pgvector 未 <code>CREATE EXTENSION</code>——它只是 pg_search 的捆绑依赖文件，不是启用状态。与 <a href="../召回块放哪一层/问题与方案.html">召回块放哪一层</a> 的交界：检索栈决定「召回什么」，注入位置决定「召回块怎么进模型输入」，两件事分开裁定。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E8%AE%B0%E5%BF%86%E8%A6%81%E4%B8%8D%E8%A6%81%E4%B8%8A%E5%90%91%E9%87%8F/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/记忆要不要上向量/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

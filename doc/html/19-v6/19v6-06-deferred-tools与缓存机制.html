@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>19v6-06 · 工具分级与 deferred tools（机制篇） · tako 文档</title>
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="19v6-06--工具分级与-deferred-tools机制篇">19v6-06 · 工具分级与 deferred tools（机制篇）</h1>
+<blockquote>
+<p>本篇是 doc/19-v6 文档集的 <strong>deferred tools 机制篇</strong>：工具分级为什么存在、前缀缓存的失效力学、 client mode 与 hosted mode 的完整链路、各厂商支持矩阵（2026-10-08 实证）、provider 原生通道的接法。 分级的 v6 落点（启用工具全注册 + <code>BeforeModelRewriteState</code> 声明过滤、两档定义）见 <code>19v6-05</code> §5——本篇不重复裁定， 只给机制背景与 provider 原生通道的对照。<strong>本篇不做契约承诺</strong>，所有 provider 原生内容均为「背景素材」。 <strong>2026-10-20 校正</strong>：§1 的 hidden 原文「代码内部/子代理用」先校正为 pi 的操作定义（注册但不可达）， 随后裁定 <strong>tako 不设 hidden 档</strong>——只留 direct / deferred，禁用工具 = 装配时不 append。见 <code>19v6-90</code> 十九修。 <strong>2026-10-21 裁定（终态）</strong>：用户裁 <strong>client mode 即终态底座，hosted mode（provider 原生 deferred）不接</strong>—— 理由三条见 §6。<strong>本篇降为纯背景篇：§4–5 的链路与矩阵保留作将来复用的参考，不作施工面、不进待办</strong>。</p>
+</blockquote>
+<h2 id="0-一句话">0. 一句话</h2>
+<p>工具分级解决「工具一多，声明成本（token / 注意力 / 缓存）爆炸」；<strong>deferred tools 是各厂商对同一问题的 协议级回答——目前无标准名、无标准协议，形态碎片化</strong>，这正是 v6 把客户端过滤定为默认底座的原因。</p>
+<h2 id="1-为什么需要分级">1. 为什么需要分级</h2>
+<ul>
+<li>模型在协议上只能调用<strong>当前请求 <code>tools</code> 数组里声明了</strong>的工具；声明 = 占用前缀 token。</li>
+<li>上百个工具的全量 schema 既烧 token 又稀释注意力 → 只常声明一小撮（direct）， 其余进目录（deferred：模型经检索按需激活）；不想要就在装配时不放进池（tako 不设 hidden 档）。</li>
+<li><strong>pi 的 hidden（仅作对照，tako 不采纳）</strong>：原文是 <em>registered but unreachable</em>—— 工具仍在注册表里，但模型与 <code>ctx.executeTool()</code> 两条路都够不着，激活也不生效 （<code>packages/coding-agent/docs/extensions.md</code>「Tool exposure」）。pi 需要它是因为注册表没有 unregister，只能重注册成 hidden 来「撤回」；MCP 配置里它也是 server 级默认值与工具级覆盖的 一个取值（<code>"delete_*": "hidden"</code> 做黑名单，server 默认 hidden + 逐工具覆盖做白名单）。 但 tako 的池每 run 重建，禁用 = 装配时不 append，不需要这一档；只撤声明、不撤执行的 hidden 在 Eino 下也关不住执行面（tools node 按全量工具表按名分发，见 <code>19v6-05</code> §5）。</li>
+<li>v6 两档 = pi <code>ToolExposure</code> 五档（direct / model-only / codemode / deferred / hidden）中取 <strong>direct / deferred</strong>；model-only / codemode 不在 v6 范围，hidden 按上条不采纳。</li>
+</ul>
+<h2 id="2-缓存力学一切的根源">2. 缓存力学（一切的根源）</h2>
+<ul>
+<li><strong>无状态协议</strong>：服务端不记会话，每轮客户端全量重发 history → provider 按「前缀哈希」做 prompt caching （Anthropic 实证：写缓存 = 断点处前缀的哈希；命中要求逐字节相同）。</li>
+<li><strong>前缀层级固定</strong>：<code>tools → system → messages</code>。改 tools 段 = 三层缓存全灭 （Anthropic 失效表原话：<em>"Modifying tool definitions invalidates the entire cache"</em>）。</li>
+<li>KV 按位置缓存：前缀任何位置变更，<strong>其后所有位置</strong>的 K/V 作废；tools 排最前，所以一改全灭。</li>
+<li><strong>追加不破坏缓存</strong>：tool result 作为新消息追加在尾部，是缓存友好动作——多轮对话本身就是 「恒定前缀 + 尾部追加」结构，agent loop 天然适配。<strong>破坏缓存的是「改写已存在的前缀内容」， 不是「出现 tool result」</strong>（ tool_use / tool result 块在 Anthropic 均可被缓存）。</li>
+<li>缓存价值：读 ≈ 0.1x 价、TTFT 大降；一 run 多轮的 tool loop 是最依赖缓存的负载——声明集稳不稳是真金白银。</li>
+</ul>
+<h2 id="3-client-mode--v6-现在手写声明过滤">3. client mode = v6 现在（手写声明过滤）</h2>
+<ul>
+<li>全工具注册进 tools node（永远可执行，注册 ≠ 声明）；deferred 的<strong>整条 ToolInfo（名字、描述、 参数 schema）都不进声明面</strong>，模型不知道目录里有哪些非必要工具，只知道 <code>tool_search</code> 这个入口存在。 <code>BeforeModelRewriteState</code> 每轮用本 run 保存的完整目录<strong>重建</strong> <code>state.ToolInfos</code>，决定本轮发给模型的 <code>tools</code> 数组（eino 钩子，provider 零感知）。不能对当前 <code>state.ToolInfos</code> 做减法：首轮过滤后 deferred 项已不在其中，目录必须另存。</li>
+<li><code>tool_search</code> 是<strong>普通工具</strong>：模型调用 → 客户端 BM25 检索 → 命中名单写进本 run 的激活集 （tool_search 的 handler 持有；不扫消息文本）→ 钩子每轮按「direct + 激活集」从完整目录重建 <code>state.ToolInfos</code> → 下一轮模型才「看见」。结果文本同时落消息历史，供模型读「加载了什么」——<strong>它只是回执，不是激活真源</strong>。</li>
+<li><strong>代价</strong>：激活那轮 tools 数组在中段变更 → 前缀哈希作废 → 缓存失效（本 run 内单调收敛：搜出即常驻， 之后稳定，仅「发现期」几次 miss；跨 run 不保留——激活集只活一场 run，2026-10-20 已拍，见 <code>19v6-05</code> §5）。</li>
+<li><strong>优点</strong>：对 provider 零要求——任何模型、任何兼容端点都能跑。T4/T5（分级 + BM25 目录）复刻的就是检索层。</li>
+</ul>
+<h2 id="4-hosted-mode--provider-原生-deferred-tools">4. hosted mode = provider 原生 deferred tools</h2>
+<h3 id="41-名字无标准">4.1 名字（无标准）</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>出处</th>
+<th>叫法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Anthropic</td>
+<td>deferred tool loading + Tool Search（<code>tool_search_tool_bm25_20251119</code> / regex 变体）</td>
+</tr>
+<tr>
+<td>OpenAI</td>
+<td>tool search（Responses API，<code>{"type":"tool_search"}</code> + <code>defer_loading</code>）</td>
+</tr>
+<tr>
+<td>eino 抽象</td>
+<td><code>WithDeferredTools</code> / <code>WithToolSearchTool</code></td>
+</tr>
+<tr>
+<td>pi</td>
+<td>ToolExposure 的 deferred 档 + tool_search 扩展</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="42-完整链路请求携带式-hostedopenai-文档--eino-ext-源码实证">4.2 完整链路（请求携带式 hosted，OpenAI 文档 + eino-ext 源码实证）</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>步骤</th>
+<th>执行者</th>
+<th>输入</th>
+<th>输出</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>目录组装</td>
+<td>客户端（eino wrapper 每轮附加 <code>WithDeferredTools</code>）</td>
+<td>应用的工具注册表</td>
+<td>请求 tools 数组：全量 schema + <code>defer_loading</code> 标记 + <code>{type:"tool_search"}</code></td>
+<td>provider 本轮知道库存</td>
+</tr>
+<tr>
+<td>1</td>
+<td>扣留暂存</td>
+<td>provider 网关</td>
+<td>tools 数组</td>
+<td>暂存区（deferred schema 隔离，<strong>不进 KV key</strong>）</td>
+<td>目录保管在上下文外</td>
+</tr>
+<tr>
+<td>2</td>
+<td>前缀预填充</td>
+<td>provider</td>
+<td>摘要层 + 常声明工具 + system + messages</td>
+<td>前缀 KV；模型开局视野</td>
+<td>建立恒定可缓存前缀</td>
+</tr>
+<tr>
+<td>3</td>
+<td>检索词生成</td>
+<td>模型</td>
+<td>任务上下文 + 摘要层</td>
+<td>query / paths（hosted 下为内部信号）</td>
+<td>模型唯一发言点：搜什么</td>
+</tr>
+<tr>
+<td>4</td>
+<td>索引检索</td>
+<td>provider 检索索引</td>
+<td>query + 暂存区</td>
+<td>命中的工具 schema</td>
+<td>BM25/regex 机械匹配（无任何智能成分）</td>
+</tr>
+<tr>
+<td>5</td>
+<td>末尾注入</td>
+<td>provider 基础设施</td>
+<td>命中 schema</td>
+<td>追加在<strong>上下文末尾</strong>（只增区）</td>
+<td>模型看见 schema 且前缀不动</td>
+</tr>
+<tr>
+<td>6</td>
+<td>工具调用生成</td>
+<td>模型</td>
+<td>注入的 schema</td>
+<td>普通 function_call / tool_use</td>
+<td>与常声明工具同构</td>
+</tr>
+<tr>
+<td>7</td>
+<td>工具执行</td>
+<td>客户端</td>
+<td>function_call</td>
+<td>tool result（下轮 messages 追加）</td>
+<td>客户端常规职责，零特殊逻辑</td>
+</tr>
+<tr>
+<td>8</td>
+<td>事件记录</td>
+<td>provider → 客户端</td>
+<td>步骤 3–5 过程</td>
+<td>响应里的 <code>tool_search_call</code> / <code>tool_search_output</code> item</td>
+<td>可观测；多轮回放保持状态</td>
+</tr>
+</tbody>
+</table></div>
+<p>循环规则：同轮可 3→6 多遍（需要第二个工具就再搜）；跨轮重复 0–2 时前缀字节相同 → 缓存命中，注入区累积在尾部。</p>
+<h3 id="43-关键机制点">4.3 关键机制点</h3>
+<ul>
+<li><strong><code>defer_loading</code> 的实质</strong>：全量 schema 仍随每轮请求上行（占带宽、不占上下文），但被剥出模型工作 上下文、不进 KV key——「provider 本轮替你保管目录」。</li>
+<li><strong>摘要/细节二分</strong>：模型开局只见摘要层（名+描述，常驻前缀、供生成检索词）；被扣的是参数 schema。 加载粒度 = 检索路径命中的子树（如搜 <code>paths:["crm"]</code> → 整个 namespace 进来），模型不能逐工具勾选， 不满意只能再搜。</li>
+<li><strong>注入位置是护城河</strong>：<em>"All tools are loaded at the end of the model's context window"</em>（OpenAI 原文）—— 变更永远落在只增不改的尾部，所以缓存保活。client mode 永远做不到这点（只能改 tools 段中段）。</li>
+<li><strong><code>tool_search</code> 用 <code>type</code> 不用 <code>name</code></strong>：tools 数组是联合类型（function / namespace / tool_search / web_search…），<code>type</code> 是判别字段；<code>name</code> 只属于模型按名调用的用户函数。</li>
+<li><strong>变体</strong>：
+<ul>
+<li><em>client-executed</em>（OpenAI）：模型发 <code>tool_search_call</code>（execution:"client"），客户端执行检索、 下轮把 <code>tool_search_output</code> 塞进 input——检索位置灵活，但加载仍走尾部注入（协议化的 client mode）。</li>
+<li><em>MCP 自动发现</em>（OpenAI Agents API）：provider 自己连远程 MCP server 做 tools/list，目录不进请求。</li>
+</ul></li>
+<li><strong>铁律不变</strong>：工具定义的控制权在应用/MCP server 侧，模型不能给自己造工具（所有模式一致）。</li>
+</ul>
+<h3 id="44-缓存友好的三条路线同一原则的实现谱系">4.4 缓存友好的三条路线（同一原则的实现谱系）</h3>
+<p>原则：<strong>变更只能落在「只增不改」的尾部，或干脆不落在模型上下文里。</strong></p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>路线</th>
+<th>工具变更落在哪</th>
+<th>前缀旧段</th>
+<th>代表</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>前缀外通道</td>
+<td>provider 暂存区（不进 KV key）</td>
+<td>原样</td>
+<td><code>defer_loading</code>（Anthropic / OpenAI / DeepSeek）</td>
+</tr>
+<tr>
+<td>尾部追加</td>
+<td>messages 尾部</td>
+<td>原样</td>
+<td>Anthropic <code>tool_addition</code>（inline-tools beta）；OpenAI <code>additional_tools</code>；Kimi <code>messages[].tools</code></td>
+</tr>
+<tr>
+<td>认损</td>
+<td>tools 段中段</td>
+<td><strong>被破坏</strong>（发现期）</td>
+<td>client 过滤 = v6 现在</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="5-厂商支持矩阵2026-10-08-实证">5. 厂商支持矩阵（2026-10-08 实证）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>厂商</th>
+<th>支持</th>
+<th>形态</th>
+<th>eino-ext 组件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Anthropic</td>
+<td>✅</td>
+<td><code>defer_loading</code> + 内置 BM25/Regex tool search + inline-tools beta</td>
+<td>✅ 已接（claude.go 翻译 defer_loading 与 tool search 工具）</td>
+</tr>
+<tr>
+<td>OpenAI</td>
+<td>✅（Responses API，gpt-5.4+）</td>
+<td>hosted + client-executed 两式 + namespaces + <code>additional_tools</code></td>
+<td>❌ <strong>组件未翻译</strong>（API 有、组件没有）</td>
+</tr>
+<tr>
+<td>DeepSeek</td>
+<td>✅</td>
+<td>Messages API 认 <code>defer_loading</code>（服务端 400 校验："at least one tool must have defer_loading=false"）</td>
+<td>—</td>
+</tr>
+<tr>
+<td>Kimi</td>
+<td>✅（私有变体）</td>
+<td>消息级工具声明 <code>messages[].tools</code>：已加载工具从顶层 tools[] 剥离、schema 走消息通道</td>
+<td>—</td>
+</tr>
+<tr>
+<td>Gemini</td>
+<td>❌</td>
+<td>仅标准 function calling（feature request 仍开）</td>
+<td>—</td>
+</tr>
+<tr>
+<td>Qwen / 豆包 / GLM</td>
+<td>❌ 未见</td>
+<td>仅标准 function calling（托管 web_search 是厂商自带工具，与用户工具 deferred 无关）</td>
+<td>—</td>
+</tr>
+</tbody>
+</table></div>
+<p>要点：</p>
+<ul>
+<li>「支持」本身也分裂：DeepSeek 认 Anthropic 式标记、Kimi 用自家消息通道、Anthropic 带服务端 BM25—— <strong>没有两家同协议</strong>，升级路只能按家适配。</li>
+<li>eino 核心只定义 option，<strong>翻译靠组件、可用性靠 provider 运行时校验</strong>（eino 不做任何能力探测； eino-ext openai 组件静默忽略 option 即是例证）。</li>
+<li>顺手的推论：deferred schema 不进 KV key → 原生模式下<strong>改目录本身可能缓存中性</strong> （与 client mode 的中段变更形成对照），待接入时以厂商文档最终确认。</li>
+</ul>
+<h2 id="6-v6-的裁定与升级路">6. v6 的裁定与升级路</h2>
+<ul>
+<li><strong>默认底座 = client 过滤</strong>（<code>19v6-05</code> §5）：碎片化格局下的最大公约数，不挑 provider。</li>
+<li><strong>2026-10-21 用户裁定（终态）：client mode 即终态底座，hosted mode 不接。</strong> 理由三条：
+<ol type="1">
+<li><strong>覆盖面对不上</strong>——本仓 provider 目录 39 条里 36 条是 openai 协议、3 条 anthropic 协议； eino-ext 只有 claude 组件翻 <code>defer_loading</code>（openai 组件 v0.1.13 无翻译层）， 接了 hosted 只覆盖那 3 条，主力那 36 条吃不到。</li>
+<li><strong>代价与收益不对账</strong>——hosted 唯一的增量是「发现期不毁缓存」，而 client 模式的缓存损失<strong>有界</strong>： 激活集同 run 内常驻（搜出即常驻、之后单调收敛），只有最初「找工具」那几轮 miss；跨 run 不保留激活集， 本来就是每场重新发现。</li>
+<li><strong>client 模式对 provider 零要求</strong>——任何模型、任何兼容端点都能跑，不挑厂商、不吃私有协议、 不等 eino-ext 上游。</li>
+</ol></li>
+<li><strong>§4–5 的链路与厂商矩阵保留作背景</strong>（将来若换厂商组合、或某家把 client-executed 变体做成标准， 可直接取用），但<strong>不作施工面、不进待办</strong>。§4.2 步骤 0–8 与 §5 矩阵在本仓均无对应代码。</li>
+<li>T4/T5（分级 + BM25 目录）复刻的是检索层——client mode 即终态，这套客户端目录与匹配逻辑就是执行体。</li>
+<li><strong>第一个真实负载已经到场</strong>（2026-10-18 补；2026-10-20 开工）：MCP client（doc/33）落地后，MCP 工具以 <code>mcp__短名__工具名</code> 直接进池；用户 2026-10-20 裁「一步到位把 T5 也做了」——T4/T5 合批开工， MCP 工具是 deferred 目录的第一批真实负载（<code>19v6-05</code> §5，施工台账 <code>tmp/19-v6/</code>）。</li>
+</ul>
+<h2 id="附--证据清单全部-2026-10-08-实读">附 · 证据清单（全部 2026-10-08 实读）</h2>
+<ul>
+<li>Anthropic prompt caching 文档：缓存层级（tools→system→messages）、失效表、tool result 可缓存、逐字节命中。</li>
+<li>OpenAI Tool search 文档：hosted / client-executed 全流程、<code>additional_tools</code>、尾注入缓存语义、gpt-5.4+ 限制。</li>
+<li>eino v0.9.21 源码：<code>components/model/option.go</code>（两 option）、<code>adk/handler.go</code>（<code>BeforeModelRewriteState</code> / <code>state.ToolInfos</code> 为 source of truth）、<code>adk/middlewares/dynamictool/toolsearch/toolsearch.go</code>（client 过滤 参考实现 + <code>UseModelToolSearch</code> 开关）、<code>adk/wrappers.go</code>（每轮附加 option）。</li>
+<li>eino-ext 主干：<code>components/model/claude/claude.go</code>（defer_loading / BM25 工具翻译）、 <code>components/model/openai</code>（无对应实现）、<code>examples/hosted_tool_search</code>（官方用法）。</li>
+<li>厂商生态佐证：deepseek-ai/deepseek-harness#8683（defer_loading 400 校验原文）、 MoonshotAI/kimi-code#3295（messages[].tools 私有通道）、googleapis/python-genai#2185（Gemini 未支持）。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/19-v6/19v6-06-deferred-tools%E4%B8%8E%E7%BC%93%E5%AD%98%E6%9C%BA%E5%88%B6.md"><code>doc/19-v6/19v6-06-deferred-tools与缓存机制.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

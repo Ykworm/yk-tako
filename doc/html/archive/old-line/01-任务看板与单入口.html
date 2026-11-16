@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>01 · 任务看板与单入口（2026-09-26） · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="01--任务看板与单入口2026-09-26">01 · 任务看板与单入口（2026-09-26）</h1>
+<blockquote>
+<p>性质：<strong>定案文档</strong>。本文是 doc/ 新系列的第一篇（旧 01–06 与《设计了解》已随本次定案删除， 随后按新方向重写为新系列 03–09，见篇末 §9 索引）。 定案两件事：</p>
+<ol type="1">
+<li>仓库从「分层学习对照」收敛为<strong>单入口产品形态</strong>：<code>cmd/yktako</code> 是唯一入口， 其余 cmd（l0raw / l0react / l0deep / l1guard / l2planexec）与 <code>internal/planexec</code> 删除；</li>
+<li>任务管理按 <strong>Plan / Tasks / Actions 三层分离</strong>落地，Tasks 层自研记账工具 （<code>internal/taskboard</code>），替代 DeepAgent 的整表 <code>write_todos</code>。</li>
+</ol>
+</blockquote>
+<h2 id="0-问题">0. 问题</h2>
+<p>产品要有 Planning，执行前/执行中要有 todos。Eino DeepAgent 把规划做成 ReAct 工具 <code>write_todos</code>，<strong>不保证</strong>每一轮工具跑完或中断时账本都是最新，也不保证 status 与具体 调用对齐。目标不是「推断这次调用对应哪条 todo」，而是把蓝图 / 看板 / 动作分开： 账本有稳定主键、更新可投影、落盘不依赖模型自觉。</p>
+<h2 id="1-三层不并成一层">1. 三层，不并成一层</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>层</th>
+<th>是什么</th>
+<th>谁写</th>
+<th>主键</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Plan</strong></td>
+<td>给人审的方案（背景、步骤、文件、风险）</td>
+<td>模型 + 用户改</td>
+<td>文档结构</td>
+</tr>
+<tr>
+<td><strong>Tasks</strong></td>
+<td>执行期勾选看板</td>
+<td>模型用记账 tool</td>
+<td><strong><code>taskId</code></strong>（自增数字）</td>
+</tr>
+<tr>
+<td><strong>Actions</strong></td>
+<td><code>Edit</code> / <code>Bash</code> 等干活工具</td>
+<td>模型按 ReAct 选</td>
+<td>tool_call id，与 task <strong>无外键</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p>关系定案为<strong>分离</strong>（对标 Claude 默认）：Plan 是给人审的文档；开干后模型用 TaskCreate 建看板，文案不必逐行等于 plan。一条 Task 下许多 Action，taskId 只寻址看板行， 不是 plan 第 N 条，也也不是某次工具调用。</p>
+<p>本轮 Plan 层不新增机制：没有人审 gate，没有 ExitPlanMode 式 interrupt，Plan 仅以 提示词约定的口述方案形态存在。Tasks 账本是本轮唯一新建机制。</p>
+<h2 id="2-记账协议替代整表-write_todos">2. 记账协议（替代整表 <code>write_todos</code>）</h2>
+<p>四个工具（<code>utils.InferTool</code> 生成，最终实现 <code>tool.InvokableTool</code>）：</p>
+<ul>
+<li><code>TaskCreate(subject, description?, activeForm?)</code> → 返回 <code>taskId</code></li>
+<li><code>TaskUpdate(taskId, status?, subject?, description?, activeForm?)</code> → 按 id patch</li>
+<li><code>TaskList()</code> → 全部未删除任务</li>
+<li><code>TaskGet(taskId)</code> → 单条</li>
+</ul>
+<p>Status：<code>pending → in_progress → completed</code>，不再需要时用 <code>deleted</code>（TaskList 不列出）。</p>
+<p>约束写在 <strong>tool description</strong>（不是状态机）：</p>
+<ul>
+<li>≥3 步或用户列了多件事才建表；一步任务不建</li>
+<li>动手前标 <code>in_progress</code>，同时尽量一条</li>
+<li>做完立刻 <code>completed</code>，不要攒着勾</li>
+<li>测试红 / 做了一半 / 未解报错 → 不准 completed</li>
+<li>卡住就 Create 一条 blocker</li>
+</ul>
+<p>全局约定（什么时候该建表）进 agent 的 <code>Instruction</code>。模型仍自评「做没做完」—— 协议解决的是<strong>改哪一行</strong>，不是客观验收。</p>
+<p><strong>每个工具输出 = 操作回执 + 当前看板紧凑视图 + 催更块</strong>（存在未完成项时提醒 「先更新状态再干活」「做完立刻标 completed」，参照 WeKnora <code>todo_write</code> 的 Important Reminder 注入）。</p>
+<h2 id="3-存储正本--镜像落盘不依赖模型自觉的具体机制">3. 存储：正本 + 镜像（「落盘不依赖模型自觉」的具体机制）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>层</th>
+<th>角色</th>
+<th>生命周期</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>middleware 自持 <code>*Store</code>（mutex + map + 自增计数器）</td>
+<td><strong>正本</strong>：四工具直接读写</td>
+<td>agent 建一次 → 跨 REPL 轮次存活</td>
+</tr>
+<tr>
+<td><code>adk.AddSessionValue</code> 写快照</td>
+<td><strong>镜像</strong>：每次变更后全量写入</td>
+<td>interrupt 时随 runContext gob 进 checkpoint</td>
+</tr>
+</tbody>
+</table></div>
+<p>机制依据（eino v0.9.21 源码核实）：</p>
+<ul>
+<li><code>adk/runctx.go</code> 的 <code>runSession.Values</code> 标注 <code>CheckpointSchema: persisted via serialization.RunCtx (gob)</code>——session 值在 interrupt 时随整个 runContext 经 gob 序列化进入 <code>CheckPointStore</code>，<strong>账本镜像随图状态 一起落盘是免费得到的</strong>。快照类型必须经过 <code>gob.Register</code>（session.Values 是 <code>map[string]any</code>，具体类型不注册无法序列化）。</li>
+<li>但 session 每轮 <code>runner.Run</code> 新建（<code>ctxWithNewTypedRunCtx</code>）；能把父 session 带进 子 run 的 option（<code>withSharedParentSession</code>）<strong>未导出</strong>，外部用不了——所以跨轮 正本不能放 session，只能 middleware 自持。</li>
+<li>resume 后：同进程 middleware 正本不变，checkpoint 恢复的镜像与之一致。</li>
+<li>进程重启全丢：<code>adkrun.Store</code> 本来就是内存实现（「进程退出即清空，足够演示 interrupt」）， 磁盘持久化留作后续层级。</li>
+</ul>
+<p>同一 middleware 实例内用 mutex 把四个工具串行化（参照 eino plantask），防同轮并行 调用写坏账本。</p>
+<h2 id="4-runtime-接线">4. Runtime 接线</h2>
+<ul>
+<li><strong>流式投影</strong>：<code>adkrun</code> 按账本工具名把回执分类成 board 事件，📋 看板投影由消费方 sink 打印（REPL sink 在 <code>cmd/yktako/sink.go</code>；替换原 <code>formatTodoReceipt</code> 的 write_todos 投影，随 l0deep 一起退役）。</li>
+<li><strong>Checkpoint</strong>：interrupt 时账本镜像随图状态落盘（§3 机制）；Run 正常结束 eino <strong>不写</strong> checkpoint，跨轮靠 middleware 正本——如实记录，不假装有「Run 结束落盘」。</li>
+<li><strong><code>ExecuteSequentially: true</code></strong>：<code>ChatModelAgentConfig</code> 内嵌 <code>compose.ToolsNodeConfig</code> 直接可用；同批工具调用串行，「同批里先 Update 再干活」降低打架。这是秩序偏好， 不是正确性保证。</li>
+<li>每轮新 checkpointID（沿用 <code>turn-%d</code> 模式）。</li>
+</ul>
+<h2 id="5-单入口结构">5. 单入口结构</h2>
+<pre><code>cmd/yktako（唯一入口）
+  └─ ChatModelAgent（裸 ReAct，MaxIterations 20）
+       ├─ Instruction = config.SystemPrompt() + taskboard 记账约定
+       ├─ Handlers = [taskboard middleware] + guard.Handlers(...)（L1 三件套）
+       ├─ Tools = internal/tools 现有工具（Actions 层）
+       └─ Runner(CheckPointStore = adkrun.NewStore()) + REPL 审批回路</code></pre>
+<p>taskboard middleware 实现 <code>adk.ChatModelAgentMiddleware</code>，<code>BeforeAgent</code> 里往 <code>runCtx.Tools</code> 追加四个工具（eino plantask 同款机制）。</p>
+<p>删除：<code>cmd/{l0raw,l0react,l0deep,l1guard,l2planexec}</code>、<code>internal/planexec</code>、 adkrun 的 write_todos 投影。 保留：<code>internal/{adkrun,config,fsbackend,guard,repl,tools}</code>。</p>
+<h2 id="6-明确不解决什么">6. 明确不解决什么</h2>
+<ul>
+<li>Action ↔︎ Task 双射</li>
+<li>模型漏 Update 时自动勾选正确的行</li>
+<li>用 Graph 拓扑强制执行顺序</li>
+</ul>
+<p>要硬进度：收窄执行模型（一次只推进一条 / 子 Agent 交卷才算完 / 测试或 goal 作为验收标准）， 不要在开放 ReAct 上做语义对齐。</p>
+<h2 id="7-测试计划">7. 测试计划</h2>
+<ul>
+<li>taskboard 单测：CRUD、非法 id、deleted 不出现在 List、status 校验、session 镜像 写入、看板/催更输出、并行调用串行化；</li>
+<li>middleware <code>BeforeAgent</code> 注入测试；adkrun 投影测试；</li>
+<li>集成：假模型走真实图（turn_test 风格）——建表 → 干活 → 更新 → 完成全链路， 以及 interrupt 后从 checkpoint 字节里能 gob 解出账本快照。</li>
+</ul>
+<h2 id="8-参考来源">8. 参考来源</h2>
+<ul>
+<li><strong>WeKnora</strong>（<code>ref-agent/WeKnora</code>）：<code>todo_write</code> 无状态 echo 设计 + tool_result 尾部 催更注入 + 随消息 jsonb 落库。它的状态寄生在对话历史里；本设计改为 middleware 正本 + session 镜像，不依赖历史回放。</li>
+<li><strong>eino plantask</strong>（<code>adk/middlewares/plantask</code>）：四工具名字/状态值/数字 id/mutex 串行化对齐它；但它的存储是文件 Backend（file-per-task + highwatermark）、带 Blocks/BlockedBy 依赖图，与本设计的 Session 镜像路线不同，故自研。</li>
+<li><strong>Claude Tasks</strong>：记账协议原型（TaskCreate/TaskUpdate/TaskList/TaskGet、 pending→in_progress→completed/deleted、约束写在 tool description）。</li>
+</ul>
+<h2 id="9-doc-系列索引2026-09-26-起">9. doc/ 系列索引（2026-09-26 起）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>篇</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>01 任务看板与单入口</td>
+<td>定案：单入口收敛、Plan/Tasks/Actions 三层分离、正本 + 镜像</td>
+</tr>
+<tr>
+<td>02 任务看板实现计划</td>
+<td>Task 1–8 逐任务实现计划（含每步验收命令）</td>
+</tr>
+<tr>
+<td>03 立项与命名</td>
+<td>背景、技术选型终版、命名、参考资产位置</td>
+</tr>
+<tr>
+<td>04 技术路线</td>
+<td>T-Mem 取舍、LangGraph.js vs Eino、反转记、LangGraph→Eino 映射表</td>
+</tr>
+<tr>
+<td>05 Octop 架构剖析与生长式复刻</td>
+<td>壳/芯分层、组件清单、产品能力路线、翻译原则</td>
+</tr>
+<tr>
+<td>06 工具安全层</td>
+<td>命令/文件/PII 三件套、三态裁决、审批回路、溯源纠错与踩坑</td>
+</tr>
+<tr>
+<td>07 任务规划与看板</td>
+<td>三层分离与记账协议、与官方 <code>write_todos</code> 的对照、旧线退场</td>
+</tr>
+<tr>
+<td>08 Eino 规划机制调研</td>
+<td><code>write_todos</code> / <code>PlanTask</code> / Workflow + Plan-Execute 三套机制与定案依据</td>
+</tr>
+<tr>
+<td>09 设计了解</td>
+<td>Eino 机制笔记：钩子时机、<code>endpoint</code>、session 落盘、<code>adkrun.Run</code> 的两个标识</td>
+</tr>
+<tr>
+<td>10 最小 Web UI</td>
+<td>定案：方案 A 先行——事件 sink 重构 → HTTP + SSE 单页 → 回 #4；范围冻结与事件契约</td>
+</tr>
+<tr>
+<td>11 最小 Web-UI 实施计划</td>
+<td>方案 A 执行台账：T0–T3 状态、P1/P2、进度日志</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote>
+<p>注：maf 冻结线的对照篇在 <code>maf/doc/10-MAF审批回路与Eino对照.md</code>（2026-09-26 移入）， 不占本索引编号；它是冻结存档，行号锚点不随主库代码刷新。</p>
+</blockquote>
+<p>写作约定：</p>
+<ul>
+<li><strong>定案与决策</strong>篇记"为什么这么定"（01 的取舍、02 的逐任务计划、04 的反转记、08 的调研）；</li>
+<li><strong>能力</strong>篇记"现在是什么 + 落点在哪 + 和参考实现的差距"（05、06、07）；</li>
+<li><strong>机制</strong>篇记"框架怎么运作"（09），行号锚点跟当前代码刷新；</li>
+<li>被删掉的实现不抹掉记录：注明退场原因与替代者（<code>cmd/l2planning</code>、<code>cmd/l2builtin</code>、 <code>cmd/l2planexec</code> 与 <code>internal/{planning,planexec}</code> 都按这个规矩留在 07、08 里），避免同一个坑踩第二次。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/archive/old-line/01-%E4%BB%BB%E5%8A%A1%E7%9C%8B%E6%9D%BF%E4%B8%8E%E5%8D%95%E5%85%A5%E5%8F%A3.md"><code>doc/archive/old-line/01-任务看板与单入口.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

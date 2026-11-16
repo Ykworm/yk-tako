@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>19v6-08 · 文件工具族（F 系列） · tako 文档</title>
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="19v6-08--文件工具族f-系列">19v6-08 · 文件工具族（F 系列）</h1>
+<blockquote>
+<p><strong>立项（2026-10-11 交审）</strong>：T 系列（19v6-05）延拍。把 fileOps 目录名单（19v6-07 §5） 从「lint 对照表上的纸面名字」落成第一方真工具。本文是 F 系列的机制与契约真源； 施工台账在 <code>tmp/19-v6/filetools/</code>；冲突以本文为准、回头改台账。</p>
+<p><strong>2026-10-20</strong>：文件工具新增 <code>read_pdf_text</code>（doc/32 A8-1）。 <code>fileEffectToolNames</code> 那份目录名单不变。<code>read_pdf_text</code> 只登记 <code>firstPartyFileEffects</code>，不进那份名单。 <strong>2026-10-20 A8-2</strong>：页码超出、无文本层、加密或损坏、非 PDF，都降级成正常结果或「错误：…」，run 继续。<code>TAKO_MEDIA_SEND=off</code> 时这把工具仍可读。PDF 正文里印着的回执行不附图。 <strong>2026-10-22</strong>：同文件并发写底座落地（<code>filefp.go</code>）——<code>write_file</code> 的「先读后写」纪律、 <code>edit_file</code> 的现读带过、<code>write_file</code>/<code>edit_file</code>/<code>move_file</code> 的 flock 写锁。成功体与既有错误 分支<strong>不变</strong>；新增的拒绝是<strong>工具结果文本</strong>（走既有 <code>wrapToolErrors</code> 通道），不是 HTTP 业务码。 机制与边界见 <a href="../42-产品形态收窄与共享项目退役.html">doc/42</a> §2.4，施工台账 <code>tmp/文件写入并发/</code>。 <strong>2026-11-01（doc/58）</strong>：读工具改成分页——入参换成 <code>offset?</code>/<code>limit?</code>（<strong><code>head</code>/<code>tail</code> 删掉</strong>）， 一次一页（2000 行 / 50KB / 单行 2000 字符），每次追加一行页脚；「&gt;200KB 且无 head/tail」 那条错误分支<strong>撤掉</strong>（大文件照样分页读）。bash 侧同期改成<strong>留尾 + 全文落盘 + 回路径</strong> （<code>.tako/bash/&lt;runId&gt;/&lt;seq&gt;.out</code>，每流 64,000 字节尾窗 / 64MB 落盘上限、保留 30 天）， 机制与出处见 <a href="../58-读分页与输出留存.html">doc/58</a>。</p>
+</blockquote>
+<h2 id="0-立项由来两个空转等这拍转正">§0 立项由来：两个「空转」等这拍转正</h2>
+<p>背景故事（病灶）：C5-A4 落成了 fileOps 提取器 + 启动 lint（19v6-07 §5），但今天它们都在 对空气工作——<code>firstPartyFileEffects</code> 是张空表，lint 拿空表跑恒过；提取器的「注册表声明位」 分支（判定 ①）从没吃到过真声明，因为池内唯一的工具 <code>get_time</code> 不碰文件。同时模型手里 没有一只能读写工作区的手：想让它存个文件，它只能把内容喷在回复正文里。</p>
+<p>「把这些工具落地」同时解开三件事：</p>
+<ol type="1">
+<li><strong>lint 转正</strong>：注册表第一次非空、且每个文件工具都带 <code>file_effect</code> 声明 → lint 从 空转变成真检查（漏声明 = 启动失败）。</li>
+<li><strong>提取器转正</strong>：真 tool_calls 带真声明进来 → 折叠时「改过/读过」清单第一次出现真路径， C5-A5 的 file-ops 块有东西可钉。</li>
+<li><strong>模型长手</strong>：工作区内读写文件成为模型可用的动作，防重建保险丝（19v6-07 §5 的 WeKnora 战例）有了真实用武之地。</li>
+</ol>
+<h2 id="1-范围与非目标">§1 范围与非目标</h2>
+<p><strong>范围内</strong>：目录名单里的名字全部落地为第一方工具（<code>read_text_file</code>、<code>read_media_file</code>、 <code>write_file</code>、<code>edit_file</code>、<code>move_file</code>、<code>create_directory</code>、<code>list_directory</code>、 <code>directory_tree</code>、<code>get_file_info</code>、<code>search_files</code>、<code>read_file</code>），逐个带 <code>file_effect</code> 声明进注册表，受启动 lint 管辖。2026-10-20 起文件工具另增加 <code>read_pdf_text</code>。 它不在目录名单里，启动 lint 不拿它做「名单内必须声明」的对照；<code>firstPartyFileEffects</code> 给它登记 read，父池在 <code>read_media_file</code> 之后装配。</p>
+<p><strong>明确不做</strong>（本节登记，未来用例逼出再立项）：</p>
+<ul>
+<li><strong><code>read_multiple_files</code> 不发明</strong>——MCP filesystem 服务器的后增工具，不在目录名单内 （C5-A4 裁：按字面清单实现，不凑数）。</li>
+<li><strong>内容正则搜索</strong>——<code>search_files</code> v1 只做固定子串；正则的 ReDoS 面不自找。</li>
+<li><strong>符号链接逃逸防护</strong>——v1 只防 <code>..</code> 路径逃逸；symlink 指向 workspace 外是已登记盲区 （dev 单机可接受，生产前随沙箱 loop 一并裁）。</li>
+<li><del><strong>真沙箱</strong></del> → <strong>2026-11-03 已落地</strong>：bash 与租户 MCP 的围栏见 <code>sandbox.go</code> （macOS seatbelt / Linux bwrap）。本节的路径约束仍然不是安全边界：文件工具本身不做 沙箱，symlink 逃逸仍是 §6 的挂账。</li>
+<li><strong>四端点契约零变化</strong>——不加帧 kind（复用 T2 的 <code>tool_call</code>/<code>tool_result</code>），不动 19v6-01 任何字节；F 系列全部是「池内容」变化，不是「契约面」变化（同 T2 判据）。</li>
+</ul>
+<h2 id="2-workspace-与路径约束">§2 workspace 与路径约束</h2>
+<p>所有文件工具只在 <strong>workspace 根</strong>内作业。这不是体验决定，是事故防线：</p>
+<ul>
+<li><strong>没它会怎样（具体事故）</strong>：模型被诱导执行「把配置写到 <code>../../../../.env</code>」—— 无约束 = 引擎进程的密钥文件被覆写或读取，run 还照常 complete（工具成功了）； 有约束 = 工具返回错误文本、模型换路子或放弃，<strong>run 不失败</strong>（工具错误是结果不是 run 的死因——机制 = 装配点的 <code>wrapToolErrors</code>（eino <code>WrapToolWithErrorHandler</code>）把工具 错误转成字符串结果回注模型，全部第一方工具统一包（tools.go）。<strong>2026-10-11 F1 实读 源码勘误</strong>：eino v0.9.21 的 ToolsNode 对未包装的工具错误直接上抛、run 随之 error， 回注并非「内建自动」——原文「ADK 工具环内建语义」表述作废）。</li>
+<li><strong>形态</strong>：<code>-workspace &lt;dir&gt;</code> 旗标（默认 <code>./workspace</code>）；启动时 <code>MkdirAll</code> + 绝对化 记录，log 一行打印根路径。工具入参 <code>path</code> <strong>一律相对根</strong>（POSIX 风格）；工具内部 <code>join(根, path)</code> 后 <code>Clean</code>，结果必须仍以前缀「根 + 分隔符」开头（或等于根，目录工具）， 否则返回错误「路径越出 workspace」。</li>
+<li><strong>多副本挂账</strong>（与 19v6-03 同列）：文件真身在磁盘 = 跨副本共享状态，多副本部署时 workspace 必须挂共享盘；dev 单副本无感。</li>
+</ul>
+<h2 id="3-工具契约表v1">§3 工具契约表（v1）</h2>
+<p>通用约定：</p>
+<ul>
+<li><strong>入参 <code>path</code></strong>：相对 workspace 根；越界 → 错误返回（见 §2）。</li>
+<li><strong>返回</strong>：纯文本直出（同 <code>get_time</code> 约定：字符串输出不套 JSON 引号），可被 curl 一眼验证。</li>
+<li><strong>错误形态</strong>：返回 error → 装配点的错误回注包装（<code>wrapToolErrors</code>，见 §2）转成工具结果 回注模型，模型自行处理，run 继续（terminal 仍 <code>complete</code>）。错误文本一律「错误：…」开头； 实现面剥掉 eino InferTool 的外壳前缀（<code>[LocalFunc] failed to invoke tool, …, err=</code>）再加锚， 回注文本首句即原因（F1 活体引入，tools.go <code>toolErrorText</code>）。</li>
+<li><strong>上限</strong>：各工具的体积/条数上限是<strong>减灾档</strong>（防一次工具调用灌爆上下文），初值 dev 校准、 写死在契约里（不另开旗标）。<strong>读工具分页后每页 2000 行 / 50KB / 单行 2000 字符</strong> （doc/58 §3.2）——它不再是「无界读 + 超了报错」，而是<strong>一次只给一页</strong>。</li>
+</ul>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>工具</th>
+<th>声明</th>
+<th>入参（JSON）</th>
+<th>返回文本（成功）</th>
+<th>错误分支</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>write_file</code></td>
+<td>write</td>
+<td><code>path</code>,<code>content</code></td>
+<td><code>已写入 &lt;path&gt;（&lt;n&gt; 字节）</code></td>
+<td>越界；<strong>没读过就写</strong>（覆盖已存在文件前必须先 <code>read_file</code>）；<strong>内容与读到的不一致</strong>（被 bash 或另一个 agent 改过）；<strong>读过但文件已没了</strong>（被删/被移走）；拿不到写锁（30s 内被占）</td>
+</tr>
+<tr>
+<td><code>read_text_file</code></td>
+<td>read</td>
+<td><code>path</code>,<code>offset?</code>(起始行，1-based，默认 1),<code>limit?</code>(本次最多读多少行，默认 2000、上限 2000)</td>
+<td>文件文本原文（纯文本直出）+ 空行 + 一行页脚（doc/58 §3.2 三态：还有更多 / 被 50KB 截断 / 读完了）</td>
+<td>不存在；是目录；<code>offset</code> 非正整数；<code>limit</code> 非正整数或 &gt;2000；<code>offset</code> 超出文件末尾</td>
+</tr>
+<tr>
+<td><code>edit_file</code></td>
+<td>edit</td>
+<td><code>path</code>,<code>old_text</code>,<code>new_text</code>,<code>replace_all?</code>(默认 false)</td>
+<td><code>已编辑 &lt;path&gt;（替换 n 处）</code></td>
+<td>越界；<code>old_text</code> 找不到；多处出现且未置 <code>replace_all</code>；拿不到写锁</td>
+</tr>
+<tr>
+<td><code>read_file</code></td>
+<td>read</td>
+<td>同 <code>read_text_file</code></td>
+<td>同 <code>read_text_file</code></td>
+<td>同</td>
+</tr>
+<tr>
+<td><code>move_file</code></td>
+<td>edit</td>
+<td><code>path</code>(源),<code>destination</code></td>
+<td><code>已移动 &lt;path&gt; → &lt;destination&gt;</code></td>
+<td>越界（任一端）；目标已存在（不覆盖）</td>
+</tr>
+<tr>
+<td><code>create_directory</code></td>
+<td>write</td>
+<td><code>path</code></td>
+<td><code>已建目录 &lt;path&gt;</code>（已存在 = 幂等成功，返回「已存在」）</td>
+<td>越界</td>
+</tr>
+<tr>
+<td><code>list_directory</code></td>
+<td>read</td>
+<td><code>path</code></td>
+<td>每行一个条目，目录以 <code>/</code> 结尾，按名排序，不含 <code>.</code>/<code>..</code>；空目录返回 <code>（空目录）</code></td>
+<td>越界；不是目录</td>
+</tr>
+<tr>
+<td><code>directory_tree</code></td>
+<td>read</td>
+<td><code>path</code>,<code>depth?</code>(默认 3，上限 5)</td>
+<td>缩进树（两空格一级），目录以 <code>/</code> 结尾；超深处标 <code>…</code>；节点上限 500、超出标 <code>（已截断）</code></td>
+<td>越界；不是目录</td>
+</tr>
+<tr>
+<td><code>get_file_info</code></td>
+<td>read</td>
+<td><code>path</code></td>
+<td>四行：<code>size: &lt;n&gt; 字节</code> / <code>modified: &lt;RFC3339&gt;</code> / <code>mode: &lt;-rw-r--r--&gt;</code> / <code>type: 文件|目录</code></td>
+<td>越界；不存在</td>
+</tr>
+<tr>
+<td><code>search_files</code></td>
+<td>read</td>
+<td><code>path</code>(起始目录),<code>query</code>(固定子串),<code>file_glob?</code>(如 <code>*.go</code>)</td>
+<td>命中行 <code>relpath:行号:行内容</code>，上限 50 条、超出标 <code>（更多命中已省略）</code>；单文件 &gt;1MB 跳过</td>
+<td>越界；不是目录</td>
+</tr>
+<tr>
+<td><code>read_media_file</code></td>
+<td>read</td>
+<td><code>path</code></td>
+<td>单行 <code>[media path=… mime=… size=…B sha=…；已按路径读取。媒体字节不会写入对话记录，请勿重复调用]</code>（doc/32 A2/A3-2）</td>
+<td>越界；不存在；&gt;5MB（提示太大）</td>
+</tr>
+<tr>
+<td><code>read_pdf_text</code></td>
+<td>read</td>
+<td><code>path</code>,<code>page_from?</code>,<code>page_to?</code></td>
+<td>页眉 <code>[pdf path=… pages=N；第 a-b 页；文本层抽取]</code>，随后 <code>--- page N ---</code> 与该页文本。默认第 1-3 页，单次最多 10 页、16KB。扫描件与页码超出是正常结果</td>
+<td>越界；不存在；不是 <code>.pdf</code>；不是普通文件；&gt;5MB；加密或损坏</td>
+</tr>
+</tbody>
+</table></div>
+<p>语义裁定：</p>
+<ul>
+<li><strong><code>write_file</code> 覆盖语义</strong>：文件已存在 → 照写覆盖（返回行带「（覆盖）」标记）。MCP 原版 靠提示词劝谨慎，v1 用标记代替劝告——模型在工具结果里看得见自己覆盖了什么。</li>
+<li><strong><code>write_file</code> 的「先读后写」纪律（2026-10-22 落地）</strong>：覆盖<strong>已存在</strong>的文件前必须先 <code>read_file</code> 读它。<strong>没读过 → 拒</strong>；读过但文件在此期间被改过（bash、另一个 agent）→ <strong>拒</strong>， 并在错误文案里引导「先 read_file 重读；要做局部修改请用 edit_file」；读过但文件被删/被移走 → 拒（别重建）。理由：<code>write_file</code> 是<strong>整份覆盖</strong>语义，凭记忆整份回写会把读之后的改动<strong>静默</strong> 抹回旧版（两道 run 都报「成功」，没有一方收到错误）。这与 Kimi 的 "Read before overwriting an existing file" 同款，但 Kimi 那条只是<strong>工具描述里的一句话</strong>（prompt 级），tako 做成<strong>程序级</strong>。 判据 = 从磁盘现算的 <code>sha256</code>（内容级；&gt;64MB 降级为 mtime+size 并显式标注弱判据）。 底座见 <a href="../42-产品形态收窄与共享项目退役.html">doc/42</a> §2.4 与 <code>tmp/文件写入并发/</code>。</li>
+<li><strong><code>edit_file</code> = 精确串替换</strong>（不做 MCP 的 pattern-matching 多编辑阵）：<code>replace_all=false</code> 时原文必须<strong>恰好一处</strong>命中（0 处或 &gt;1 处都报错，&gt;1 处错误文本带出现次数）——把 「编辑哪一处」的决定权留在模型手里，程序不做模糊匹配。</li>
+<li><strong><code>edit_file</code> 是局部修改的首选</strong>：它在<strong>编辑那一刻现读</strong>磁盘、写回时用的也是它 → 别的写者 在你读之后落盘的改动会被<strong>原样带过去</strong>（不会丢）。所以「改一处」用 <code>edit_file</code>、「整份替换」 用 <code>write_file</code>，两者语义不同、判据不同（前者看锚点、后者看整份指纹）。</li>
+<li><strong>部署前提（2026-10-22 落地时写死）</strong>：这套文件级防护的地基是<strong>多副本 + 同一块共享盘</strong>， 且<strong>那块盘要支持跨机 POSIX 锁</strong>（CephFS ✅／NFSv4 ✅／NFSv3 ⚠️／块存储多机挂载 ❌）。 ① 多副本的 <code>-workspace</code> 必须指向同一块盘（引擎启动时会警告，<code>main.go</code>），否则文件根本不在一处； ② 锁跨机是否成立取决于存储——本地盘与单副本下 flock 只在本机有效（跨机那几毫秒窗口靠写前比对兜）； ③ <strong>NFS 的崩溃恢复有 lease 延迟</strong>（默认 ~30 秒）：持锁进程死后，别的副本要等 lease 过期才拿得到锁。 ④ <strong>锁文件用桶锁（256 桶）、不清理</strong>（结论，2026-10-22）：锁键 = <code>sha256(路径)</code> 首字节 % 256 → 锁文件数<strong>恒 ≤ 256</strong>，锁目录永远不大。<strong>为什么不用「一路径一锁文件」</strong>：一个项目写几千个文件就会在锁目录 堆几千个空文件（ext4 的大目录会退化、e2fsck 会告警），而<strong>清理又不能随便做</strong>——unlink 一个正被持有的锁文件， 后来者会 open 到<strong>新 inode</strong> → 两边同时以为自己独占了 → 互斥失效；要清只能在<strong>租户删除</strong>时连目录清，那又太迟。 桶锁把两个问题一起消失。代价：不同路径可能撞同一桶（1/256）→ 假串行，无正确性问题。</li>
+<li><strong>同文件写锁（2026-10-22 落地）</strong>：<code>write_file</code>／<code>edit_file</code>／<code>move_file</code> 的写路径取 <strong>flock 排它锁</strong>（粒度=文件，锁文件在 <code>tenants/&lt;tid&gt;/.tako/locks/&lt;sha16(绝对路径)&gt;.lock</code>）。 同机跨进程、跨副本都串；跨机看共享盘是否支持 POSIX 锁（CephFS / NFSv4 支持，NFS 崩溃后要等 lease 过期 ~30s）。<strong>比对在锁内做</strong>——锁让「检查—写」成为原子的一段，否则检查与写之间有缝。 flock 是 <strong>advisory</strong> 的：bash（<code>rm</code>／<code>sed -i</code>／<code>&gt;</code> 重定向）绕过它 → 不守规矩的写者由 人工审批闸兜（<a href="../41-任务看板与人工审批.html">doc/41</a>）。</li>
+<li><strong><code>read_file</code> 与 <code>read_text_file</code> 同体</strong>：OpenHands / Open Interpreter 系的惯用名 （19v6-07 §5 出处），同参同行为，仅名字与描述不同。两个都落地的原因：目录名单照单 全收，别名让两系生态的 prompt/习惯在 tako 上直接可跑。</li>
+<li><strong>读工具改成「分页 + 页脚」（doc/58 §3 落地，2026-11-01）</strong>：
+<ul>
+<li><strong>入参只剩 <code>path</code>/<code>offset?</code>/<code>limit?</code></strong>——<code>head</code>/<code>tail</code> <strong>删掉</strong>（dsh 与 pi 各自独立同形： read 只有这三个参数）。一套截读方言比两套好：模型不必在「前 N 行／后 N 行／第几行起」 之间做选择题，也没有「两个参数打架」的组合要判。<strong>代价</strong>：读尾部要两跳（先拿总行数再 <code>offset</code> 跳过去）；<strong>缓解</strong>：页脚恒带总行数。</li>
+<li><strong>一次一页</strong>：2000 行 / 50KB / 单行 2000 字符，先到先算。<strong>超长单行不切半行</strong>——按字符 截到上限内、行尾标 <code>…（本行超长已截断）</code>。</li>
+<li><strong>页脚恒在</strong>（三态，字节定死）：<code>（已显示第 A-B 行，共 N 行；继续读用 offset=C）</code>／ <code>（已显示第 A-B 行，共 N 行；本次被 50KB 上限截断，继续读用 offset=C）</code>／ <code>（已读到文件末尾，共 N 行）</code>。<strong>为什么「读完了」也要带总行数</strong>：截读方言只剩一套之后， 总行数是模型唯一的定位坐标。</li>
+<li><strong>大文件不再报错</strong>：改前「&gt;200KB 且无 head/tail」那条错误分支<strong>已撤</strong>——超 200KB 的文件 照样分页读，读得到中间。</li>
+<li><strong>指纹不变</strong>：<code>write_file</code> 的「先读后写」判据仍是<strong>整文件</strong> sha256（流式算的），只读一页 不影响冲突检测。</li>
+</ul></li>
+<li><strong><code>read_media_file</code> 的回执与发送份是两件事</strong>：回执（落库、payload、帧）永远是上面的 占位行；A3-2 在下一枪的模型输入副本里把回执换成 tool 角色的 image part，模型因此能看见图。 工具描述与回执里的「媒体字节不会写入对话记录」说的是落库纪律，不是说模型看不到图。 同一 run 里，用户随消息带来的图只附在第一次成功回复之前的那一枪；模型要再看，调 <code>read_media_file</code>，下一枪的回执发送份会把图附上。这道闸记在 <code>foldBox</code> 上，续跑新建容器会再发一次。 发送份只在两把闸都开时才换成图：目录里这条模型标了 <code>vision</code>，并且进程的 <code>TAKO_MEDIA_SEND</code> 不是 <code>off</code>。 关闸或模型不收图时，模型看到的仍是占位。细节见 doc/32 A3。</li>
+<li><strong><code>read_pdf_text</code> 读的是文本层，不是图片回执</strong>。工具结果写入 runlog 和 <code>run_model_messages</code>，按页和 16KB 封顶。它不产生「已按路径读取」回执，发送侧也不会因为它被调用就把图附上。PDF 正文里即使印着一行完整的媒体回执，也不附图：还原 tool 消息要同时满足两件事，ToolCallID 在最后一条 user 之后的 assistant 消息里对应 <code>read_media_file</code>，并且该行带「已按路径读取」。映射缺失按不还原处理。</li>
+<li><strong><code>head</code>/<code>tail</code> 已删</strong>（doc/58 §3，2026-11-01）：读工具的截读方言只剩 <code>offset</code>/<code>limit</code> 一套， 「同时给出 head 与 tail → 错误」那条分支随它们一起消失。</li>
+<li><strong><code>move_file</code> 的 <code>destination</code> 不进 fileOps 清单</strong>：提取器 <code>pathsFromArgs</code> 只收 <code>path</code> 字段（C5-A4 形状），destination 是登记盲区（§6 挂账）——防重建保险丝关心「内容写过 哪些路径」，移动的目的地暂不入账。</li>
+</ul>
+<h2 id="4-装配与登记">§4 装配与登记</h2>
+<ul>
+<li><strong>每拍两个登记点</strong>：工具进 <code>NewWorker</code> 的 <code>ToolsConfig.Tools</code> 池（ADK 声明面 + 执行面）， <code>firstPartyFileEffects</code>（19v6-07 §5 声明位 v1 载体）同步加 <code>名字 → 声明值</code> 行。</li>
+<li><strong>lint 转正叙事</strong>：F1 起注册表非空且全部带声明 → <code>lintFileEffects</code> 第一次「真的检查」； 此后任何文件工具漏声明 = 启动失败。名单（<code>fileEffectToolNames</code>）与第一方名单 1:1 重合 是预期态——lint 同时罩住未来的外来 MCP filesystem 服务器（挂进来不声明即拦）。</li>
+<li><strong>工具描述面</strong>：<code>description</code> 写给模型看——说清 workspace 相对路径约定、覆盖语义、 体积上限。系统 prompt 不动（同 T2：描述自足，不污染 Instruction）。</li>
+<li><strong>子代理继承</strong>：池内工具对子代理规格的白名单/继承机制天然可见（19v6-05 §4 的工具面四态）， F 系列零额外工作。<strong>2026-10-16 起多一步</strong>（<code>doc/26</code> §7 登记的长期维护点）：新工具进父池会让 researcher 的有效名单变长（它走 <code>exclude_tools</code> 排除路，父池加什么就默认到达什么）⇒ <code>agents_test.go</code> 的 <code>TestShippedAgentSpecToolGuards</code> 红一次，红的时候当场决定这把给不给 researcher （给 ⇒ 改金样；不给 ⇒ 往 <code>exclude_tools</code> 加一行、金样不动），并在 <code>agent tools researcher:</code> 日志行里复核。 这也是「新工具必须登记 <code>file_effect</code>（显式 <code>none</code> 也算）」的第二个理由：金样的名字宇宙派生自 <code>firstPartyFileEffects</code> 的键 ∪ <code>{get_time}</code>，不进注册表的新工具不在它的视野里。</li>
+</ul>
+<h2 id="5-与-fileops--c5-的咬合">§5 与 fileOps / C5 的咬合</h2>
+<ul>
+<li><strong>提取器 ① 分支转正</strong>：真 <code>write_file</code>/<code>edit_file</code>/… 调用进来，声明位分支第一次吃到 真声明 → 折叠时「改过/读过」清单出现真路径。</li>
+<li><strong>e2e 活体</strong>：C5-A5（钉块）落地后，含文件操作的会话压出 seq0 摘要、其中出现 <code>tako:file-ops v1</code> 块 = 全链活体。F12 收口时 C5-A5 未落地 → 抽验挂账到 A5 之后 （2026-10-11 台账注明；A5 转正拍跑此 e2e 时窗口取 ≥3000——600 窗是 A3 实测 + F12 复现的退化窗：budget 上限下拒收耗尽走干净 A，无 seq0 可查）。</li>
+<li><strong>序列裁定建议（交审拍板）</strong>：<strong>C5-A5/A6 先收口、F1 随后</strong>——A5 的活体验收前提是「池内 无文件工具 → 无块」，先收口验收面干净，F1 随即成为 fileOps 的正式转正拍（一块验）。 若用户要求 F1 先行：A5 的活体验收仍成立（C2 话本不调文件工具 → 无块），只是 「转正拍」叙事稀释，两序不冲突。</li>
+</ul>
+<h2 id="6-挂账">§6 挂账</h2>
+<ul>
+<li><code>move_file.destination</code> 进提取清单（随「提取器收参数面扩展」用例）。</li>
+<li>symlink 逃逸（沙箱 loop 已收口 bash/MCP；文件工具这条仍挂账）。</li>
+<li><code>search_files</code> 正则/大小写开关（用例逼出）。</li>
+<li>19v6-07 §5 数字与出处勘误 <strong>已于 2026-10-11（F12）全部落定</strong>：两处「12 个名字」→ 11 （F 系列立项当日提前清账）；出处注记按升级证据整段重写（11 名 = npm @modelcontextprotocol/ <a href="mailto:server-filesystem@1.0.0">server-filesystem@1.0.0</a> 的 dist/server.js 里 14 个 registerTool 中的 11 个；README 列 13 系文档滞后、不作依据；read_file = 该服务器 read_text_file 的 deprecated 前身，非 OpenHands / Open Interpreter 惯用名——旧论断「OpenHands 有 read_file 惯例」已被升级证据 推翻）。依据 = 2026-10-11 实读 dist/server.js（14 名单）、package.json、README（13 名单） 与 hermes-agent tool_dispatch_helpers.py:51-52。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/19-v6/19v6-08-file-tools.md"><code>doc/19-v6/19v6-08-file-tools.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

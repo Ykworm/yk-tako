@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>交接：doc/24 两件事实现（滤思考 + Usage mid-run 触发） · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="交接doc24-两件事实现滤思考--usage-mid-run-触发">交接：doc/24 两件事实现（滤思考 + Usage mid-run 触发）</h1>
+<blockquote>
+<p>写给实现方（人或 agent）。项目：<code>/Users/yuweikang/dev/ykcode/learn/yk-tako</code>，代码主仓在 <code>yk-tako-eino/</code>。</p>
+<p><strong>性质说明</strong>：<code>doc/24-用量计数.md</code> 已改为<strong>实现真源</strong>，与本交接对齐。实现以两文公式与裁决为准，着手本篇对齐的 <strong>2 个需求</strong>（滤思考 + Usage mid-run 触发）。仍<strong>不写</strong> <code>tmp/</code> 台账；存储面（思考进 runlog / 改 <code>19v6-03</code>）仍<strong>不要做</strong>。</p>
+<p>指针已更新：<code>doc/19-v6/19v6-07-compact.md</code> §1、<code>doc/19-v6/19v6-10-mid-run-fold.md</code> §6。<code>19v6-03</code> / 架构总览 / API <strong>未动</strong>（runlog-for-reasoning 未定）。</p>
+</blockquote>
+<hr />
+<h2 id="1-目标--非目标">1. 目标 / 非目标</h2>
+<h3 id="目标只做这两件">目标（只做这两件）</h3>
+<ol type="1">
+<li><strong>同一场 run 内、下一 Turn 发给模型之前</strong>：清空历史 assistant 消息上的 <code>ReasoningContent</code>，使真实请求不再重发上一枪思考；从而 <code>countInput</code> 与真实请求在「思考」这一维对齐。</li>
+<li><strong>可选的 Usage 基线 mid-run 触发</strong>：有上一笔账单时，用<br />
+<code>PromptTokens + (CompletionTokens − reasoning_est) + 锚点后新行</code><br />
+代替全量 BPE；无账单时仍走今天的全量 <code>countInput</code>。工具 schema <strong>仍不进</strong>触发。</li>
+</ol>
+<h3 id="非目标明确不做">非目标（明确不做）</h3>
+<ul>
+<li>不写 <code>tmp/</code> 台账（<strong>仍不造临时台账</strong>；两文已对齐为可实现，本拍仍不写台账）。</li>
+<li><strong>不改</strong> <code>countInput</code> 的三块基数（system / text / tool_calls）。</li>
+<li><strong>不改</strong> limit 公式（<code>window − min(window/5, 16384)</code>）。</li>
+<li><strong>不把</strong> Usage 或思考默认写入四个 API / 帧 / <code>run_model_messages</code> / <code>runlog_entries</code>。</li>
+<li><strong>不做</strong>「思考进 runlog」展示列（另裁存储面时再开；见 §6）。</li>
+<li><strong>不改</strong> <code>19v6-03</code>、架构总览、API 契约。</li>
+<li>不做挂在引擎上的全局 <code>lastUsage</code>；账单粘在产生它的 assistant 消息上。</li>
+<li>不给子代理新挂折叠；不替换溢出层。</li>
+<li>滤思考后若厂商 400：<strong>不补假思考、不单独重试</strong>，走现有 <code>error</code>。</li>
+</ul>
+<hr />
+<h2 id="2-已对齐裁决实现时当不变量">2. 已对齐裁决（实现时当不变量）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>项</th>
+<th>裁决</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>滤思考</td>
+<td>场内下一 Turn 发出前清空 <code>ReasoningContent</code>（默认要做）</td>
+</tr>
+<tr>
+<td>schema</td>
+<td><strong>不计入</strong>触发（WeKnora 战例仍有效；不翻案）</td>
+</tr>
+<tr>
+<td>Usage</td>
+<td><strong>可选</strong>：有则用基线+delta；无则全量 <code>countInput</code></td>
+</tr>
+<tr>
+<td>上下文长度看哪</td>
+<td>看 <strong><code>PromptTokens</code>（输入侧）</strong>，<strong>不要</strong>把 <code>CompletionTokens</code> 当「当前上下文」</td>
+</tr>
+<tr>
+<td>思考落库</td>
+<td>默认 <strong>不进</strong> <code>run_model_messages</code>；展示若将来要做，只进 <code>runlog_entries</code>，另开存储面</td>
+</tr>
+<tr>
+<td>账单落库</td>
+<td>本拍 <strong>不写 Usage 列</strong>；跨场从 mh 读回没有 <code>ResponseMeta</code></td>
+</tr>
+</tbody>
+</table></div>
+<hr />
+<h2 id="3-病灶为何要做">3. 病灶（为何要做）</h2>
+<ul>
+<li>DeepSeek 等思考模型把长思考放在 <code>schema.Message.ReasoningContent</code>，正文在 <code>Content</code>。</li>
+<li>eino openai 兼容组件发下一轮时会把 <code>ReasoningContent</code> <strong>原样</strong>放进 assistant → 思考进入真实请求。</li>
+<li>mid-run 计数走 <code>convertState</code> → <code>ModelMessage</code> 只有 <code>Text</code> + <code>ToolCalls</code>，<strong>丢掉</strong> <code>ReasoningContent</code> → <code>countInput</code> 把思考数成 0 → 自测偏小被放行，厂商按真实长度拒收或吃窗。</li>
+<li>今天思考本来就不落库：<code>drain</code> 合并后只把 <code>merged.Content</code> + <code>ToolCalls</code> 写入 <code>TurnEntry</code>；EndRun 进 mh/runlog 也只有正文侧。思考只活在本场 ADK <code>state.Messages</code>。跨场读回没有它。</li>
+</ul>
+<hr />
+<h2 id="4-精确公式与回退">4. 精确公式与回退</h2>
+<h3 id="41-锚点必须在原始-statemessages-上找">4.1 锚点（必须在原始 <code>state.Messages</code> 上找）</h3>
+<p>从队尾往前，找最后一条 <code>role == assistant</code> 且 <code>ResponseMeta.Usage</code> 非空（三个整数不全为 0）的消息。</p>
+<p><strong>关键</strong>：<code>convertState</code> / <code>toSchemaMessages</code> 之后账单已丢，<strong>禁止</strong>在转换后再找锚点。</p>
+<h3 id="42-有账单时">4.2 有账单时</h3>
+<pre class="text"><code>reasoning_est =
+  若 Usage.CompletionTokensDetails.ReasoningTokens &gt; 0 → 用它
+  否则 → cl100k(锚点.ReasoningContent)   // 滤之前估；无则 0
+
+visible_completion = CompletionTokens − reasoning_est
+若 visible_completion &lt; 0 → 置 0
+
+next_input = PromptTokens
+           + visible_completion
+           + countInput(&quot;&quot; /* system 空 */, 锚点之后的新行)</code></pre>
+<p>说明：</p>
+<ul>
+<li>锚点之后的新行主要是尚未发给厂商的 tool result（以及若有的新 user）。</li>
+<li>锚点自己的正文 / tool_calls 已由 <code>visible_completion</code> 代表，<strong>不要</strong>再进 delta。</li>
+<li>system 与上一枪 schema 已在 <code>PromptTokens</code> 里，delta <strong>不再加</strong>。</li>
+<li><strong>等价验收写法</strong>（不用 Completion 减思考）：<br />
+<code>PromptTokens + countInput(上一枪可见输出行) + countInput(新行)</code><br />
+两条应对齐到同一量级，允许分词器偏差。</li>
+</ul>
+<p>与 <code>limit</code> 比：超了走现有 <code>foldInput</code>；没超则放行。<strong>无论超不超，放行前都要执行滤思考</strong>。</p>
+<p><strong>不要用</strong>：<code>TotalTokens + 新行</code>（含思考，滤后会偏保守早折）；也不要用「只有 Completion − 思考 + 新行、没有 Prompt」（缺整份输入历史）。</p>
+<h3 id="43-无账单时回退">4.3 无账单时（回退）</h3>
+<p>下列情况用今天的全量自测：</p>
+<ul>
+<li>每场第一次模型调用前（<code>prepareInput</code> / Run fold）——本来就没有本场 Usage</li>
+<li>刚折完、厂商还没对折后那一份回执（<code>toSchemaMessages</code> 重写 state <strong>不拷贝</strong> <code>ResponseMeta</code>，锚点自然消失）</li>
+<li>Usage 缺失或不完整</li>
+</ul>
+<pre class="text"><code>total = countInput(system, 全部可见历史)</code></pre>
+<p><strong>禁止</strong>拿上一场末尾账单当本场第一呼长度。</p>
+<h3 id="44-滤思考时机与-reasoning_est-顺序">4.4 滤思考时机与 <code>reasoning_est</code> 顺序</h3>
+<ol type="1">
+<li>（可选）在原始 state 上找锚点、读 Usage、在<strong>清空前</strong>算 <code>reasoning_est</code></li>
+<li>用公式或全量 <code>countInput</code> 做触发判断；超限则 <code>foldInput</code></li>
+<li><strong>发出前</strong>：清空 state 里相关 assistant 的 <code>ReasoningContent</code>（至少清空会被重发的那些；实现上可对整份 <code>state.Messages</code> 里所有 assistant 清空）</li>
+</ol>
+<p>滤完字段空了，减项必须事先算好，不能事后从空字段估。</p>
+<hr />
+<h2 id="5-改哪里已在-mac-代码核实">5. 改哪里（已在 Mac 代码核实）</h2>
+<p>根目录：<code>yk-tako-eino/internal/runengine/</code>。eino = <code>v0.9.21</code>。</p>
+<h3 id="51-计数与转换现状核实">5.1 计数与转换（现状核实）</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>符号</th>
+<th>文件:约行</th>
+<th>现状</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>countInput</code></td>
+<td><code>compact.go:249</code></td>
+<td><code>system + Text + json.Marshal(ToolCalls)</code>；<strong>不数</strong> ReasoningContent / schema</td>
+</tr>
+<tr>
+<td><code>foldInput</code></td>
+<td><code>compact.go:388</code></td>
+<td>超限折叠主循环；本拍签名可不动</td>
+</tr>
+<tr>
+<td><code>convertState</code></td>
+<td><code>midfold.go:141</code></td>
+<td>state → mh；首条必须 system</td>
+</tr>
+<tr>
+<td><code>newRowFromMessage</code></td>
+<td><code>midfold.go:174</code></td>
+<td>只取 <code>m.Content</code> + Role/ToolCalls；<strong>丢</strong> ReasoningContent / ResponseMeta</td>
+</tr>
+<tr>
+<td><code>toSchemaMessages</code></td>
+<td><code>midfold.go:191</code></td>
+<td><code>AssistantMessage(Text, ToolCalls)</code> 等；<strong>不带回</strong> ReasoningContent / Usage</td>
+</tr>
+<tr>
+<td><code>midfoldHandler.BeforeModelRewriteState</code></td>
+<td><code>midfold.go:275</code></td>
+<td>现：<code>convertState</code> → <strong>全量</strong> <code>countInput</code> → 超限 <code>foldInput</code> → 重写 state</td>
+</tr>
+<tr>
+<td><code>midfoldHandler.AfterAgent</code></td>
+<td><code>midfold.go:313</code></td>
+<td>折后 state → mh 投影进 foldBox</td>
+</tr>
+<tr>
+<td><code>prepareInput</code></td>
+<td><code>worker.go:612</code></td>
+<td>Run fold：全量 <code>countInput</code>；产物 <code>toSchemaMessages</code></td>
+</tr>
+<tr>
+<td><code>drain</code></td>
+<td><code>worker.go:523</code></td>
+<td>流排干 <code>ConcatMessages</code>；思考在 chunk 的 ReasoningContent，<strong>不进 delta 帧</strong></td>
+</tr>
+<tr>
+<td>turn 写入</td>
+<td><code>worker.go:413</code></td>
+<td><code>TurnEntry{Text: merged.Content, ToolCalls: ...}</code>——<strong>无</strong> ReasoningContent</td>
+</tr>
+<tr>
+<td>EndRun</td>
+<td><code>worker.go</code> defer → <code>store.EndRun</code></td>
+<td>mh/runlog 只有正文侧</td>
+</tr>
+<tr>
+<td>Handlers 顺序</td>
+<td><code>worker.go:197-211</code></td>
+<td>agentSpec → noteSnapshot → <strong>midfold</strong> → agentLog → overflowGuard</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="52-eino-字段依赖">5.2 eino 字段（依赖）</h3>
+<ul>
+<li><code>schema.Message.ReasoningContent</code>（<code>string</code>，json <code>reasoning_content</code>）</li>
+<li><code>schema.ResponseMeta.Usage</code> → <code>TokenUsage</code>：<code>PromptTokens</code> / <code>CompletionTokens</code> / <code>TotalTokens</code></li>
+<li><code>Usage.CompletionTokensDetails.ReasoningTokens</code>（有则优先于 cl100k 估思考）</li>
+</ul>
+<h3 id="53-建议落点实现面">5.3 建议落点（实现面）</h3>
+<p><strong>主战场 = <code>midfold.go</code> 的 <code>BeforeModelRewriteState</code></strong>（每轮模型调用前唯一能在「发出前」动 state 的位点）：</p>
+<ol type="1">
+<li><strong>在 <code>convertState</code> 之前</strong>（原始 <code>state.Messages</code>）：
+<ul>
+<li>找 Usage 锚点</li>
+<li>若有锚点：算 <code>reasoning_est</code>（优先 <code>ReasoningTokens</code>，否则对 <code>ReasoningContent</code> 做与 <code>countInput</code> 同词表的 <code>counter.Count</code>）</li>
+<li>算 <code>next_input</code>；无锚点则走现有 <code>countInput(sys, history)</code>（仍可先 convert 再全量数，与今天同形）</li>
+</ul></li>
+<li>超限 → 现有 <code>foldInput</code> 路径不变</li>
+<li><strong>放行前滤思考</strong>：清空 <code>state.Messages</code> 里 assistant 的 <code>ReasoningContent</code>（折后重写路径：<code>toSchemaMessages</code> 本就不带思考，折后自然干净；未折的直通路径必须显式清空）</li>
+</ol>
+<p>可选辅助：</p>
+<ul>
+<li>抽纯函数如 <code>usageBasedInput(counter, msgs) (n int, ok bool)</code> / <code>stripReasoning(msgs)</code>，便于单测钉公式，不必起整条 ADK。</li>
+<li><code>prepareInput</code> / Run fold：<strong>不必</strong>接 Usage 公式（首呼无本场账单；跨场也无 ResponseMeta）。滤思考对首呼基本无操作对象（库回放本来无 ReasoningContent）。</li>
+</ul>
+<p><strong>不要改</strong>：<code>countInput</code> 基数、<code>foldInput</code> 算法本体、<code>19v6-03</code>、EndRun 落库列、四个 API。</p>
+<hr />
+<h2 id="6-尚未裁本拍不要做">6. 尚未裁、本拍不要做</h2>
+<ul>
+<li><strong>思考进 <code>runlog_entries</code> 展示</strong>（新列或 payload）：点头另开存储面，并改 <code>19v6-03</code> / 架构总览 / 必要时 <code>19v6-01</code>。未裁前思考只存在于本枪响应内存，滤掉即丢。</li>
+<li>Usage 落库 / 全局 lastUsage</li>
+<li>改 limit、改 schema 是否计入</li>
+<li>子代理折叠</li>
+</ul>
+<hr />
+<h2 id="7-风险">7. 风险</h2>
+<ol type="1">
+<li><strong>厂商要求下一轮带回 <code>reasoning_content</code></strong>（部分思考模型）：滤掉后可能 <strong>400</strong>。裁定：走现有 <code>error</code>，不补假思考、不单独重试。验收时用目录常用思考模型（如 DeepSeek）打一枪确认行为。</li>
+<li><strong><code>reasoning_est</code> 与厂商 <code>ReasoningTokens</code> 不一致</strong>：优先厂商字段；无则 cl100k 估；<code>visible_completion &lt; 0</code> 置 0。</li>
+<li><strong>PromptTokens 含 schema，自测不含</strong>：有意为之；溢出层继续兜底（doc/24 §8）。</li>
+<li><strong>折后 state</strong>：<code>toSchemaMessages</code> 不拷贝 Usage → 自然退回全量 <code>countInput</code>，不要另做「清锚点」开关。</li>
+<li><strong>锚点找错位置</strong>：若在 <code>convertState</code> 之后找，Usage 已丢，会永远回退全量——功能「看起来能跑」但优化永不生效。单测必须钉「在原始 schema.Message 上找」。</li>
+</ol>
+<hr />
+<h2 id="8-建议实现顺序">8. 建议实现顺序</h2>
+<ol type="1">
+<li><p><strong>探活（可先做、改动小）</strong><br />
+同一场先 <code>get_time</code>（或任意工具）再回答，迫使第二次模型调用。第二次调用前日志打印上一条 assistant 的 <code>PromptTokens</code> / <code>CompletionTokens</code>（至少一个 &gt; 0）。对目录常用模型记一笔「Usage 是否稳定 / 是否有 ReasoningTokens」。确认字段再接线。</p></li>
+<li><p><strong>滤思考（需求 1，独立可验）</strong><br />
+在 <code>BeforeModelRewriteState</code> 放行前清空 ReasoningContent。单测/断言：发出前锚点 assistant 字段为空。活体：思考模型二次调用不带上一枪思考（组件或抓包）。</p></li>
+<li><p><strong>Usage 公式（需求 2）</strong><br />
+锚点查找 + <code>next_input</code> + 无账单回退。超限仍进现有 <code>foldInput</code>。日志建议：<code>compact usage</code> 打 baseline / delta / total；旁注全量自测<strong>不每轮算</strong>（2026-10-15 用户裁，理由与替代见 <code>doc/24</code> §9）；<code>window = 0</code> 时不出现。</p></li>
+<li><p><strong>单测钉死（见下节）</strong></p></li>
+<li><p><strong>活体 + 四端点同形</strong>（未裁思考进 runlog 之前，字段面与改前同形）</p></li>
+</ol>
+<hr />
+<h2 id="9-验收摘自-doc24-9实现完成标准">9. 验收（摘自 doc/24 §9，实现完成标准）</h2>
+<h3 id="探活">探活</h3>
+<ul>
+<li>第二次模型调用前能读到上一条 assistant 的 Usage（至少一个 token 字段 &gt; 0）。</li>
+</ul>
+<h3 id="单测">单测</h3>
+<ol type="1">
+<li>有 Usage + 其后一条 tool 文本：<code>next_input</code> 等于公式；把思考再加进 delta 的变体更大（钉「可见输出只算一次」）。</li>
+<li>无 Usage：结果等于全量 <code>countInput</code>；函数无「传入 schema」参数。</li>
+<li>经 <code>toSchemaMessages</code> 重写后：退回全量 <code>countInput</code>。</li>
+<li>滤思考：发出前 state 上锚点 assistant 的 <code>ReasoningContent</code> 为空；请求侧不带该字段。</li>
+</ol>
+<h3 id="活体">活体</h3>
+<ul>
+<li>第二次调用前可打 <code>compact usage</code>（baseline / delta / total）。旁注全量自测不每轮算（2026-10-15 用户裁：每轮重算等于把要省的整份重数跑回去；同量级对照由单测 <code>TestUsageBasedInputFormula</code> 钉，厂商报数失真由溢出层兜底）。</li>
+<li><code>window = 0</code> 时不出现折叠/usage 触发日志。</li>
+<li>四端点路径与字段面与改前同形。</li>
+</ul>
+<hr />
+<h2 id="10-参考文档">10. 参考文档</h2>
+<ul>
+<li>实现真源：<code>doc/24-用量计数.md</code>（全文；与本交接对齐）</li>
+<li>指针：<code>doc/19-v6/19v6-07-compact.md</code> §1（复审项段落）</li>
+<li>指针：<code>doc/19-v6/19v6-10-mid-run-fold.md</code> §6（schema 不计 + 指向 doc/24）</li>
+<li>溢出层 usage 缺失 = 沉默盲区：<code>overflow.go</code> <code>detectTruncation</code>（已有先例，可对照）</li>
+</ul>
+<hr />
+<h2 id="11-一句话收束">11. 一句话收束</h2>
+<p>场内滤掉思考重发，治自测漏数；有账单时 mid-run 用 <code>PromptTokens + 可见 completion + 新行</code>，无账单仍全量 <code>countInput</code>；schema 不进触发；思考/Usage 默认不落库。主改 <code>midfold.BeforeModelRewriteState</code>，不动 <code>countInput</code> 基数与存储面。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/archive/old-line/handoff-doc24-%E6%BB%A4%E6%80%9D%E8%80%83%E4%B8%8EUsage%E8%A7%A6%E5%8F%91.md"><code>doc/archive/old-line/handoff-doc24-滤思考与Usage触发.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

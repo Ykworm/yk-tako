@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>42 · 产品形态收窄与共享项目退役 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="42--产品形态收窄与共享项目退役">42 · 产品形态收窄与共享项目退役</h1>
+<blockquote>
+<p>性质：<strong>已落地</strong>（2026-10-22）。三件拍板项全部施工并验收：① 跨成员共享项目退役 ② 项目闸退役 ③ 不再有游离会话（每场会话都挂项目）。 状态：✅ 已施工。<strong>验收结论（2026-10-22）</strong>：可见性判定只剩属主（<code>pgstore.go</code> 三处 SQL + <code>ListWorkspaces</code> 的 scope 分支）；<code>PATCH /api/workspaces/:id/visibility</code> 端点<strong>留着路由恒回 404 <code>114001</code></strong>（摘掉路由会让 gin 的默认 404 接管，前端接不住 doc/40 的信封），<code>SetWorkspaceVisibility</code> 存储方法退役留档；业务码 <code>114004</code> 退役（doc/40 §4.1 登记）；<code>runs.one_live_run_per_workspace</code> 索引在迁移处 DROP（幂等）——同项目并发不再被 409 挡；每场 run 自动挂该成员的默认项目，存量游离会话下一场 run 归位。 <strong>随 <code>44cf7ca</code> 入库</strong>（2026-10-22）：形态收窄的代码与文档都在那一笔。 日期：2026-10-22。 代码落点：<code>yk-tako-eino/internal/runengine/{pgstore.go,store.go,product_store.go,product_api.go,server.go,auth.go,filetools.go}</code>；前端 0 处（§3.1 S7）；契约文档 <code>doc/19-v6-04</code> 与 <code>doc/40 §4.1</code>（<code>114004</code> 退役登记）；台账 <code>tmp/42-形态收窄/</code>（本地，不入库）。 与 doc/16 的关系：给总纲补一节「产品形态与资源模型」，并改 §2 能力表 #9／#12／#13 三行、§5.1 排序与 §0.1 的判断句。 与其他文档的关系：改写 <a href="35-项目目录.html">doc/35</a> 的「共享」语义；改 <a href="28-多租户.html">doc/28</a> §15 与 <a href="36-团队前端.html">doc/36</a> 的项目切换面；给 <a href="41-任务看板与人工审批.html">doc/41</a> §7 补一句前提条件（<strong>闸退役依赖它</strong>）。 决定来源：用户 2026-10-22 拍板——① 不做跨成员共享项目 ② <strong>项目</strong>是资源管理单位、项目文件多 session 共享 ③ 项目闸退役 ④ 游离会话强制挂默认项目 ⑤ <code>visibility</code> 列留 ⑥ 开放问题 1 走 Kimi 的内容锚定路线 ⑦ doc/16 §0.1 判断句要改。</p>
+</blockquote>
+<hr />
+<h2 id="0-背景与动机">0. 背景与动机</h2>
+<h3 id="01-起因">0.1 起因</h3>
+<p>2026-10-22 复核运行时机制时，把「共享项目」这件事从机制层一路追到了产品层，追出来的不是某个 bug，而是<strong>产品形态没定</strong>：</p>
+<ul>
+<li>代码里有一道「项目闸」：同一项目同时只允许一场 run 在跑（<code>pgstore.go:512-515</code> 的部分唯一索引 <code>one_live_run_per_workspace</code>），撞了就回 409「项目正在另一场会话里运行」（<code>server.go:418</code>）。</li>
+<li>当年定这道闸的理由写得很清楚（<code>tmp/35-项目目录/planning.md</code> 规则 8）：共享目录让两场 run 第一次写同一块可变状态，失败是<strong>无声的</strong>——A 的 agent 正在重写 <code>output/report.json</code>，B 的 agent 同时读它，读到写了一半的字节；更糟的是 bash：B 的 agent 起手 <code>rm -rf output/</code>，A 十分钟的产物消失，<strong>两道 run 都报「成功」，没有一方收到错误</strong>。</li>
+<li>同一份台账里也写了正解：「哪天真要同时改，正确解是乐观并发（write_file 写前校验读时版本、变了让模型重读重做），<strong>不是放宽闸</strong>——留为远期缝，v1 不做」。</li>
+</ul>
+<p><strong>也就是说：闸不是最终解，是在"改不动写协议"的前提下选的替代方案。</strong> 而「共享项目」这个产品能力本身，从来没有被当成一个产品决定拍过——它是一路从「多租户隔离」长出来的副产品。</p>
+<h3 id="02-为什么现在要收窄三个理由只有一条致命">0.2 为什么现在要收窄：三个理由，只有一条致命</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>理由</th>
+<th>成立吗</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>共享文件的多人在线同时修改</strong></td>
+<td><strong>成立，且致命</strong></td>
+<td>这是<strong>另一个产品</strong>：协同编辑要 CRDT/OT、在线状态、冲突合并、版本历史、撤销重做。tako 现在的形态是「agent 写文件 + 帧流回页面」，<strong>没有这个地基</strong>。</td>
+</tr>
+<tr>
+<td>权限是问题</td>
+<td>可解，不致命</td>
+<td>可见性模型已经在（<code>workspaces.visibility</code> 两值 + 三处判定），真要做不难。</td>
+</tr>
+<tr>
+<td>共享目录的存储是问题</td>
+<td>可解，不致命</td>
+<td>配额与计量都已有（租户级整树统计），要做只是加粒度。</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>准确的表述</strong>（比"难做"硬得多，也好讲得多）：</p>
+<blockquote>
+<p>「共享文件」真正要做的是<strong>协同编辑</strong>。tako 不做协同编辑 → 于是共享项目这条线整条不立。</p>
+</blockquote>
+<p>这条护栏与 doc/16 §4「不做 RAG／知识库产品」同款：<strong>它是一条边界，不是一个待补的功能。</strong></p>
+<h3 id="03-砍掉之后tako-是什么">0.3 砍掉之后，tako 是什么</h3>
+<blockquote>
+<p><strong>tako 是多租户的 AI 工作台：一个员工 = 一个项目，项目里有多场对话。</strong> 团队共享的是<strong>账号、额度、审计</strong>；<strong>不共享文件</strong>。不做协同编辑（共享文件的多人同时修改）。</p>
+</blockquote>
+<p><strong>不是什么</strong>（新增一条，与 §4 RAG 护栏并列）：</p>
+<blockquote>
+<p><strong>不做协同编辑 / 共享文件的多人同时修改。</strong> 项目是<strong>个人</strong>的：别人看不见你的项目、读不到你的文件、进不去你的 run。</p>
+</blockquote>
+<hr />
+<h2 id="1-名词准入操作定义后文只用这几个词">1. 名词准入（操作定义，后文只用这几个词）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>名词</th>
+<th>真身（长什么样）</th>
+<th>谁能碰</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>租户</strong></td>
+<td><code>tenants</code> 表的一行 = 一个组织；<code>users</code> 表里 <code>tenant_id</code> 指向它</td>
+<td>管理员 + 成员</td>
+</tr>
+<tr>
+<td><strong>成员</strong></td>
+<td><code>users</code> 表一行 = 一个员工账号；<code>tenant_members</code> 记谁在租户里</td>
+<td>本人</td>
+</tr>
+<tr>
+<td><strong>项目</strong></td>
+<td><code>workspaces</code> 表一行 = 成员自己的一个工作项目；物理目录 <code>tenants/&lt;tid&gt;/workspaces/&lt;wid&gt;/</code>；<strong>只有属主可见</strong>（<code>visibility</code> 恒为 <code>private</code>）。<strong>一个项目里有多场会话，项目的文件由这些会话共享。</strong></td>
+<td>只有属主</td>
+</tr>
+<tr>
+<td><strong>会话</strong></td>
+<td><code>sessions</code> 表一行 = 项目里的一场对话；物理目录 <code>tenants/&lt;tid&gt;/sessions/&lt;sid&gt;/</code>，<strong>只放会话自己的档案</strong>（<code>.tako/</code> 子代理 wire、<code>.media/</code>）</td>
+<td>只有属主</td>
+</tr>
+<tr>
+<td><strong>产出</strong></td>
+<td>agent 写出的文件（报告、代码、中间件）</td>
+<td>落在<strong>项目</strong>目录里，不在会话目录里</td>
+</tr>
+<tr>
+<td><strong>闸</strong></td>
+<td>一条 PG 部分唯一索引，插不进去就是撞了</td>
+<td>闸在库里，不在进程里</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>产品叫法 ↔︎ 代码叫法</strong>（本文统一用产品叫法，代码里仍叫 workspace／工作区）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>本文说</th>
+<th>代码/表里叫</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>项目</td>
+<td><code>workspaces</code> 表 / <code>workspace_id</code> 列 / <code>workspaceDir()</code></td>
+<td><strong>不打算改代码命名</strong>——改名的收益是零，代价是全仓字符串替换与迁移风险</td>
+</tr>
+<tr>
+<td>项目目录</td>
+<td><code>tenants/&lt;tid&gt;/workspaces/&lt;wid&gt;/</code></td>
+<td>物理路径不变</td>
+</tr>
+<tr>
+<td>默认项目</td>
+<td><code>workspaces.is_default = true</code> 的那一行</td>
+<td>今天叫「默认工作区」（doc/35 §0 第 6 条），它本来就是 <code>private</code>，退役后正好接上</td>
+</tr>
+<tr>
+<td>跨成员共享项目</td>
+<td><code>visibility = 'tenant'</code> 的项目</td>
+<td><strong>本次退役的那个</strong>（本文 §3.1）。它与上面的「项目」不是一回事：上面的是个人的，这个是多人可见的</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote>
+<p>⚠️ 消歧提醒：本文之后「项目」一律指<strong>个人项目</strong>（多 session 共享文件）；被退役的那个一律写全称**「跨成员共享项目」**。</p>
+</blockquote>
+<hr />
+<h2 id="2-资源模型本文的主轴">2. 资源模型（本文的主轴）</h2>
+<h3 id="21-三层三个单位">2.1 三层三个单位</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>层</th>
+<th>单位</th>
+<th>文件归属</th>
+<th>用量计量</th>
+<th>生命周期</th>
+<th>闸</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>租户</td>
+<td>租户</td>
+<td>全树</td>
+<td>额度总上限 + 日 token</td>
+<td>租户删除</td>
+<td>租户并发闸（<strong>待修</strong>，见 §4.3）</td>
+</tr>
+<tr>
+<td>项目</td>
+<td><strong>项目（= 资源管理单位）</strong></td>
+<td>项目目录</td>
+<td><strong>算到项目</strong></td>
+<td>删项目 = 递归删目录 + 连带删它下面的会话目录</td>
+<td><strong>本次退役</strong></td>
+</tr>
+<tr>
+<td>会话</td>
+<td>会话</td>
+<td>会话目录（只有档案）</td>
+<td>并入项目</td>
+<td>删会话 = 删会话目录（<strong>含产出落点调整后不再有孤儿</strong>）</td>
+<td>会话闸（一场会话一场 run）<strong>保留</strong></td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="22-产出落点要跟着改这是本次改动里最实的一处">2.2 产出落点要跟着改（这是本次改动里最实的一处）</h3>
+<p><strong>现状</strong>（今天）：产出和会话档案<strong>混在同一个会话目录</strong>里——<code>sessions/&lt;sid&gt;/</code> 下既有 <code>.tako/</code>、<code>.media/</code>，也有 agent 写的 <code>report.md</code>。挂了项目的会话，产出落项目目录；没挂的，落会话目录。</p>
+<p><strong>改后</strong>：拆成两层，各归各的。</p>
+<pre><code>tenants/&lt;tid&gt;/
+├── workspaces/&lt;wid&gt;/          ← 项目：产出落这里（报告、代码、中间件）
+│   └── .media/                ← 附件（内容寻址 sha16，并发写是 no-op）
+└── sessions/&lt;sid&gt;/            ← 会话：只放会话自己的档案
+    ├── .tako/subagents/*.jsonl  ← 子代理 wire
+    └── .media/                 ← 旧媒体兜底</code></pre>
+<p><strong>这么改顺带解掉一个真缺口</strong>：今天删会话只清 <code>.tako</code> 与 <code>.media</code>，<strong>产出文件原地留下</strong>（<code>product_api.go:269-282</code> 的注释写明「产出留在会话目录里」），于是软删会话的产出成了<strong>没人认领的孤儿</strong>，还继续吃租户配额（配额按 <code>tenants/&lt;tid&gt;</code> 整棵树算，<code>worker.go:479</code>）。产出挪到项目层之后，<strong>删会话不再产生孤儿</strong>——垃圾只有一种（会话档案），而垃圾的清理路径已经存在。</p>
+<p><strong>项目要成为默认落点</strong>（用户 2026-10-22 拍板：游离会话<strong>强制挂默认项目</strong>）：既然项目是资源管理单位，它就该是默认的作业根——每个成员有一个默认项目（今天叫「默认工作区」，<code>workspaces.is_default</code>），会话默认挂在它下面。<strong>不再保留"不挂项目"的游离会话</strong>（那类会话的产出落会话目录 → 删会话后成孤儿 → 与 §2.2 的解法直接冲突）。挂载点在建会话时定死，不再提供"游离"这个选项。</p>
+<h3 id="23-闸退役后项目里两场会话同时跑会怎样">2.3 闸退役后，项目里两场会话同时跑会怎样</h3>
+<p><strong>先说清楚退役后剩下什么</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>原闸挡的场景</th>
+<th>退役后</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>两个<strong>员工</strong>同时改同一目录（A 的产物被 B 的 <code>rm -rf</code> 删掉）</td>
+<td><strong>不存在了</strong>——项目是个人的，别人进不来</td>
+</tr>
+<tr>
+<td>同一个<strong>人</strong>的两场会话同时写同一个文件</td>
+<td>仍在。后果：自己覆盖自己，或一场会话的 <code>rm -rf</code> 删掉另一场的产物</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>所以闸退役不是白退，它把"防人"换成了"防 agent 互相踩"</strong>。这一档怎么处理，取决于两件事：</p>
+<ol type="1">
+<li><strong>危险 bash 由 doc/41 的人审闸收掉</strong>（doc/41 §3.1：v1 <code>bash 一律 ask</code>，deny 表优先）——<code>rm -rf output/</code> 这种要人点头。<strong>这是闸退役的前提条件</strong>，§6 的 Loop 顺序因此把 doc/41 排在前面。</li>
+<li><strong>同名文件覆盖</strong>：靠<strong>内容锚定</strong>（下节 Kimi 的做法）——冲突要<strong>显式失败</strong>让模型重读，不能静默覆盖。</li>
+</ol>
+<h3 id="24-同文件冲突抄-kimi-的做法2026-10-22-核对-ref-agentkimi-code">2.4 同文件冲突：抄 Kimi 的做法（2026-10-22 核对 <code>ref-agent/kimi-code</code>）</h3>
+<p><strong>Kimi 的三层</strong>（<code>packages/agent-core-v2/</code>）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>层</th>
+<th>实现</th>
+<th>干什么</th>
+<th>粒度</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>① 同文件写串行</td>
+<td><code>src/agent/toolExecutor/toolScheduler.ts:17-70</code> + <code>src/tool/toolContract.ts:184-206</code>（<code>ToolAccesses.conflict</code>）</td>
+<td>每个工具声明它对文件的访问集（读/写/搜 + 路径）；两个调用<strong>有一个是写且路径重叠</strong> → 后来的排队等前面的跑完</td>
+<td><strong>文件</strong>（不是项目/工作区）</td>
+</tr>
+<tr>
+<td>② 未声明访问集 = 访问一切</td>
+<td><code>src/agent/toolExecutor/toolExecutorService.ts:438</code>：<code>execution.accesses ?? ToolAccesses.all()</code></td>
+<td><strong>bash 没声明访问集 → 按「访问一切」算 → 与所有文件操作串行</strong>（bash 能动一切，所以它必须独占）</td>
+<td>工具级</td>
+</tr>
+<tr>
+<td>③ 内容锚定的乐观并发</td>
+<td><code>src/app/edit/fileEditService.ts</code>（read → apply <code>old_string</code> → write）+ <code>src/agent/tools/edit/edit.md</code></td>
+<td>Edit 锚定<strong>精确 old_string</strong>；文件被改过 → 报 <code>old_string not found</code> → 模型必须重读。契约里还明写：「<strong>写锁只保证同文件编辑按响应顺序串行，串行化不能让陈旧的 old_string 变有效</strong>」</td>
+<td>字段级</td>
+</tr>
+<tr>
+<td>④ Write 禁增量覆盖</td>
+<td><code>src/agent/tools/os/write/write.md</code></td>
+<td>「<strong>Write is NOT ALLOWED for incremental changes to existing files</strong> … Use Edit instead」+「Read before overwriting an existing file」→ 增量修改必须走 Edit</td>
+<td>工具契约级</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>抄哪几层，抄不了哪一层</strong>（这是关键，不能照抄）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Kimi 的层</th>
+<th>tako 现状</th>
+<th>结论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>① 同文件写串行（<strong>进程内</strong>）</td>
+<td>Eino ToolsNode 默认并行；跨 run 更是<strong>跨进程/跨副本</strong></td>
+<td><strong>抄，但换手段</strong>：进程内 mutex 只管一个进程 → 改用 <strong>flock</strong>（OS 级，同机跨进程跨副本都串），比 Kimi 强一档</td>
+</tr>
+<tr>
+<td>② bash = 访问一切 → 独占</td>
+<td>tako 无「访问集」概念</td>
+<td><strong>不抄</strong>——被下面的 ④ 覆盖；且 bash 超时 30 秒（<code>bash.go:16</code>），让它持全局锁会<strong>30 秒内阻塞整个项目的文件写</strong>（Kimi 是单进程桌面应用，才敢这么干）</td>
+</tr>
+<tr>
+<td>③ Edit 内容锚定</td>
+<td><strong>tako 的 <code>edit_file</code> 已经是同款</strong>（<code>filetools.go:255-270</code>：<code>OldText</code> 精确匹配，不匹配就报错让模型重读）</td>
+<td><strong>已有 ✓</strong></td>
+</tr>
+<tr>
+<td>④ Write 禁增量覆盖</td>
+<td><strong>Kimi 那条其实是 prompt 级</strong>（<code>writeTool.ts:88-92</code> 的实现是 <code>fs.writeText(path, content)</code>——整份覆盖、零检查）；tako 的 <code>write_file</code> 同样无约束（<code>filetools.go:120-140</code>）</td>
+<td><strong>抄，但要做成程序级</strong>（tako 的 ③ 比 Kimi 的 ④ 还硬）</td>
+</tr>
+<tr>
+<td>⑤ 真 CAS（版本号 + 原子递增）</td>
+<td>无</td>
+<td><strong>抄，但版本号用文件系统指纹</strong>（<code>(mtime, size, sha256)</code>）：零状态、跨机天然成立、不碰 PG</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>⚠️ 本节 2026-10-22 16:53 修正两处</strong>（前一条消息里的分析有错，已按代码复核改正）：</p>
+<ol type="1">
+<li><strong>「内容锚定不保证写回的整体是最新的」——错。</strong> <code>edit_file</code> 的第一步是<strong>编辑时刻现读磁盘</strong>（<code>filetools.go:257</code>），写回时用的也是它 → <strong>别的写者在你读之后落盘的改动，会被原样带过去</strong>。所以内容锚定 + 现读 = <strong>只在"锚点那一段"被并发改动时才失败</strong>，别的段落不失败、也不会被抹掉。丢更新的真实窗口因此从「模型读→模型写」（几秒到几分钟）压到「<strong>程序读→程序写</strong>」（微秒到几十毫秒）。</li>
+<li><strong>「不需要任何跨 run 的锁」——要限定。</strong> 跨<strong>机</strong>没有共享锁可依（flock 只在同机有效），但可以做<strong>显式失败</strong>：写前比对指纹，变了就拒（跨机成立，因为判据是文件本身）。同机则用 flock 真串行。</li>
+</ol>
+<p><strong>落到 tako's 结论</strong>：</p>
+<blockquote>
+<p><strong>乐观并发 = 四件事</strong>（2026-10-22 已落地，见 <code>tmp/文件写入并发/</code>）： ① <strong>flock 写锁</strong>（粒度=文件；锁文件 <code>tenants/&lt;tid&gt;/.tako/locks/&lt;桶号&gt;.lock</code>（<strong>256 桶</strong>：锁键 = <code>sha256(路径)</code> 首字节 % 256 → 锁文件数恒 ≤ 256，锁目录永远不大）；接进 <code>write_file</code>/<code>edit_file</code>/<code>move_file</code>）——同机全串，跨机看共享盘是否支持 POSIX 锁（CephFS/NFSv4 ✓；NFS 崩溃后要等 lease ~30s）→ <strong>部署前提要钉</strong>； ② <strong>Edit 内容锚定</strong>（tako 已有）：<code>old_text</code> 精确匹配，且<strong>编辑时刻现读</strong> → 别的写者的改动被<strong>带过去</strong>； ③ <strong>write_file 写前比对指纹</strong>（新落地）：没读过 → 拒；读过但内容变了 → 拒（引导改用 <code>edit_file</code>）；读过但文件被删/移走 → 拒。判据 = 从磁盘现算的 <code>sha256</code>（内容级；&gt;64MB 降级 mtime+size 且显式标注弱判据）； ④ <strong>run 级基准表</strong>（新落地，内存，键 = agent 名 + 绝对路径）：「我读到的是哪一版」。不落库、不跨 run 共享、零清理。</p>
+<p><strong>关键</strong>：<strong>比对必须在锁内做</strong>——锁让「检查—写」成为原子的一段（否则两者之间有缝）；快照让「拒」成为可能。只有锁 → 照样用旧版覆盖；只有快照 → 检查与写不原子。</p>
+<p><strong>诚实边界</strong>：跨机的极窄窗口（指纹比完到写之间）<strong>关不掉</strong>——共享文件 + 无协调的写者这个模型下没有免费的原子 CAS（<code>rename</code> 是 last-writer-wins；<code>O_EXCL</code> 只对新建有效），而 bash 绕过工具层会让任何外部协调状态与磁盘脱节。<strong>要 100% 就得禁止并发，那等于把闸请回来，与本文直接矛盾。</strong> 本篇的选择是：<strong>允许并发，冲突显式失败</strong>。</p>
+<p><strong>不做</strong>：Redis 锁 / PG advisory lock（flock 够；Redis 也是 advisory 的、对 bash 一点帮助没有，还要 TTL + 新依赖 + 破坏 doc/38 的「Redis 只留两键」收敛）；版本号表（版本信息只取自目标文件自身，避免「文件写了 version 没跟上」的裂缝）；rename 日志（「B 把文件移哪去了」查不到，机制补不了）。</p>
+</blockquote>
+<p><strong>当时的展开施工</strong>：<code>tmp/文件写入并发/</code>（planning.md + todos.md，七拍：W1 指纹+基准表 → W4a 锁封装 → W2 write 判据 → W4b edit/move 接入 → W3 edit 基准+单测 → W5 文案 → W6 收口；现已落地，临时目录不保留）。当时的拍序理由是：比对必须在锁内 → 先把锁封装好再写判据，否则返工。当前代码仍是 flock + SHA256 指纹（&gt;64MB 降级为 mtime+size，且显式标注弱判据）；多副本 PG 锁与原子替换的后续方向见 <a href="71-文件写入竞争.html">doc/71</a>（方案待点头），不把该方案写成本篇已经落地。</p>
+<p><strong>所以开放问题 1 落定</strong>：闸退役后，同文件冲突靠** flock + 内容锚定 + 写前指纹比对**处理；bash 的写由 doc/41 的人审兜底。<strong>乐观并发从"远期缝"提上来，与闸退役同批。</strong></p>
+<hr />
+<h2 id="3-退役清单代码">3. 退役清单（代码）</h2>
+<blockquote>
+<p>逐处可点名。每处都标了「退役后变成什么」与「验收怎么看」。</p>
+</blockquote>
+<h3 id="31-跨成员共享项目退役">3.1 跨成员共享项目退役</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>位置</th>
+<th>现状</th>
+<th>退役后</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>S1</td>
+<td><code>pgstore.go:146</code> <code>Workspace.Visibility</code></td>
+<td><code>default:'private'</code>，两值</td>
+<td><strong>列保留，不写 <code>tenant</code></strong>（用户 2026-10-22 拍板）。删列要迁存量行，收益只有"少一列"</td>
+</tr>
+<tr>
+<td>S2</td>
+<td><code>pgstore.go:185-186</code>（<code>scope=tenant</code> 列举）</td>
+<td><code>GET /api/workspaces?scope=tenant</code> 列全租户可见项目</td>
+<td><strong>scope 参数退役</strong>：只列属主的（<code>scope</code> 参数本身可以留着当 no-op，或直接删参数 → 字节要定）</td>
+</tr>
+<tr>
+<td>S3</td>
+<td><code>pgstore.go:262 / 294 / 411</code>（可见性判定）</td>
+<td><code>(user_id = ? OR visibility = 'tenant')</code></td>
+<td>简化为 <code>user_id = ?</code>（三处）</td>
+</tr>
+<tr>
+<td>S4</td>
+<td><code>product_api.go:120</code>（<code>scope=tenant</code> 注释与分支）</td>
+<td>同 S2</td>
+<td>同 S2</td>
+</tr>
+<tr>
+<td>S5</td>
+<td><code>product_api.go:176</code>（创建时的 visibility 校验）</td>
+<td>允许 <code>private</code>／<code>tenant</code></td>
+<td>只允许 <code>private</code>；传 <code>tenant</code> → <strong>回什么字节要定</strong>（建议 400 <code>111001</code> 理由「不再支持团队可见」）</td>
+</tr>
+<tr>
+<td>S6</td>
+<td><code>server.go:97</code> <code>PATCH /api/workspaces/:id/visibility</code></td>
+<td>改可见性的端点</td>
+<td><strong>端点退役</strong>：回什么字节要定（建议 404 <code>114001</code>「找不到这个项目」——端点不存在与目标不存在同形）</td>
+</tr>
+<tr>
+<td>S7</td>
+<td><code>web/src/</code></td>
+<td><strong>前端一行都没调过 workspaces 端点</strong>（项目目录页本来就没做，doc/35 头注写明「项目目录的前端页面明确不在本篇」）</td>
+<td><strong>前端零改动</strong>；反而<strong>省掉</strong>「项目目录页」这个前端欠账（doc/16 §5.1 第 4 项要改；<strong>2026-10-23 已由 <a href="44-前端三处欠账.html">doc/44</a> 落地</strong>）</td>
+</tr>
+<tr>
+<td>S8</td>
+<td><code>web/src/Configure.vue:445</code></td>
+<td>有 <code>visibility</code> 下拉（private/tenant）</td>
+<td><strong>不动</strong>——那是 <strong>agent 的可见性</strong>（doc/34 租户 agent 配置），与项目可见性<strong>是两码事</strong>。⚠️ 极易误伤，代码评审时盯住这一处</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>默认工作区（<code>is_default</code>）不受影响</strong>：它本来就是 <code>private</code>（doc/35 §0 第 6 条），退役后它就是"每个成员的默认项目"——正好接上 §2.2。</p>
+<h3 id="32-项目闸退役">3.2 项目闸退役</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>位置</th>
+<th>现状</th>
+<th>退役后</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>G1</td>
+<td><code>pgstore.go:512-515</code> <code>one_live_run_per_workspace</code></td>
+<td>部分唯一索引（<code>workspace_id</code> WHERE <code>status='running'</code>）</td>
+<td><strong>索引删除</strong>，但<strong>必须两拍</strong>（顺序有讲究，见下）</td>
+</tr>
+<tr>
+<td>G2</td>
+<td><code>store.go:233-256</code>（<code>AcquireRun</code> 抢闸段）</td>
+<td><code>SAVEPOINT project_gate</code> + 唯一冲突 → 判 <code>errGateBusy</code> / <code>errProjectBusy</code></td>
+<td><strong>冲突兜底保留</strong>（不再区分"项目忙"），等 G1 的索引删掉后它自然永不触发</td>
+</tr>
+<tr>
+<td>G3</td>
+<td><code>server.go:417-419</code></td>
+<td>409 <code>114004</code>「项目正在另一场会话里运行」</td>
+<td><strong>分支退役</strong>（统一并到会话忙的码）。该码未进 <code>19v6-01</code>／<code>19v6-04</code>，也未进 <code>scripts/acceptance/expected.json</code> → <strong>契约字节影响面小</strong>（核过）</td>
+</tr>
+<tr>
+<td>G4</td>
+<td><code>auth.go:167</code> <code>codeWorkspaceBusy = 114004</code></td>
+<td>常量</td>
+<td><strong>退役</strong>（码表 doc/40 §4 同步标退役或留空）</td>
+</tr>
+<tr>
+<td>G5</td>
+<td><code>product_api.go:215</code> <code>codeWorkspaceBusyLive = 114006</code></td>
+<td>删项目时有活 run → 409</td>
+<td><strong>保留</strong>——那是删除闸（doc/37），与项目闸无关</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>G1 的两拍顺序（为什么不能一把梭）</strong>：</p>
+<p>唯一索引是<strong>数据库层面强制</strong>的——代码不做任何检查，INSERT 撞了照样报错。所以两件事的顺序会决定"中间那段时间用户看到什么"：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>顺序</th>
+<th>中间窗口里发生什么</th>
+<th>后果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>先删索引，再发新代码</strong></td>
+<td>索引没了 → 老代码的"冲突分支"永远不触发 → 老副本<strong>静默放行</strong>两场并发</td>
+<td>闸的保护提前消失（窗口 = 从 DDL 到滚动完成）。<strong>不报错，但保护没了</strong></td>
+</tr>
+<tr>
+<td><strong>先发新代码（且不留兜底），再删索引</strong></td>
+<td>索引还在 → 新代码的 INSERT 撞唯一约束 → <strong>没人翻译这个错误 → 500</strong></td>
+<td>用户看到"服务暂时不可用"（随机：老副本 409、新副本 500）。<strong>报错，但是错的那种</strong></td>
+</tr>
+<tr>
+<td><strong>先发新代码（保留 409 兜底），再删索引</strong> ✅</td>
+<td>索引还在 → 新旧代码都把冲突翻译成 409 → <strong>用户看到的与今天一模一样</strong>；索引删掉后两边都不再冲突 → 并发真的放开</td>
+<td><strong>没有坏行为的窗口</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>所以两拍是</strong>：<strong>R2a = 代码侧把"唯一约束冲突"统一成 409（不再有"项目忙"的专属语义），索引不动 → 行为零变化</strong>；<strong>R2b = 执行 <code>DROP INDEX IF EXISTS one_live_run_per_workspace</code>（纯 DDL）→ 并发真的放开</strong>。多副本下 DDL 在所有副本升级完之后执行；此时老副本的行为也已经是"新行为"（它不再期待冲突），所以没有不一致窗口。</p>
+<h3 id="33-闸退役带来的新问题项目内并发">3.3 闸退役带来的新问题：项目内并发</h3>
+<p><strong>同一项目两场会话同时跑</strong>，<code>runs</code> 表上不再有约束拦着 → 两场 run 都进 <code>worker.Run</code> → 都往项目目录写。处置：</p>
+<ul>
+<li>帧面不冲突（<code>runlive</code> 按 runId 分键）✓</li>
+<li>mh / runlog 不冲突（按 session 分）✓</li>
+<li><strong>文件层会撞</strong>（见 §2.3）→ 前置条件是 doc/41 的 bash 审批闸 + 后续的乐观并发</li>
+</ul>
+<hr />
+<h2 id="4-影响面清单">4. 影响面清单</h2>
+<h3 id="41-文档">4.1 文档</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文件</th>
+<th>改什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>doc/16</code></td>
+<td>① §0 加护栏「不做协同编辑」；② 新增 §0.2「产品形态与资源模型」（四句话 + 三层表）；③ §2 能力表 #9 备注里的「组织共享」移出、#12 语义改成「个人项目」、#13 跟着调；④ §5.1 第 3 项去掉「组织共享」、第 4 项去掉「项目目录页」、<strong>撤销「乐观并发 v1 不做」</strong>（若 §8 开放问题 1 通过）；⑤ §0.1 那句「剩下的是产品外围」要改（另见 §4.4）</td>
+</tr>
+<tr>
+<td><code>doc/28</code></td>
+<td>§15 同步：并行会话 2026-10-22 已把「团队计费 / API key / SSO / 组织共享 / 审计导出」整组移出路线图；<strong>本文落地的是「组织共享」那一半的技术侧退役</strong>（代码与契约），商业化那几项不归本文</td>
+</tr>
+<tr>
+<td><code>doc/35</code></td>
+<td>整篇的「共享」语义降级为「个人项目」；A7d 那一条（项目闸）标退役；补「产出落项目层、会话目录只放档案」的新形状</td>
+</tr>
+<tr>
+<td><code>doc/36</code></td>
+<td>团队前端的「工作区切换」面重新界定：切的是<strong>我自己的项目</strong>，不是同事的项目（前端本来就没做项目页，实际影响小）</td>
+</tr>
+<tr>
+<td><code>doc/41</code></td>
+<td>§7「不做沙箱」补一句前提：<strong>闸退役依赖本文的 bash 审批闸</strong>；§3.1 的 gate 规则里「写类文件工具目标在工作区外 → ask」的口径要跟新的项目语义对齐</td>
+</tr>
+<tr>
+<td><code>doc/README</code></td>
+<td>新增 42 行；同批同步 16／28／35／36／41 五行</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="42-代码">4.2 代码</h3>
+<p>见 §3 逐处。<strong>总量估计</strong>：后端 8～10 处（含 3 处可见性判定简化 + 抢闸段整段删），前端 0 处（项目页本来没做）。</p>
+<h3 id="43-顺带修的两处本次形态收窄的副产品量小">4.3 顺带修的两处（本次形态收窄的副产品，量小）</h3>
+<blockquote>
+<p><strong>先澄清「租户闸」是什么</strong>（容易误会）：它<strong>不是"租户之间"的闸</strong>。不同租户的数据互相隔离、互不可见，本来就没有共享资源要争。它是<strong>同一个租户内</strong>同时最多跑几场 run 的上限（<code>max_concurrent_runs</code>，默认 8），保护的是<strong>共享资源</strong>：模型供应商的 API 配额与成本、同一台机器的 CPU/内存。 所以它与本文退役的「项目闸」<strong>是两码事</strong>：项目闸管"一个项目内能跑几场"（管的是共享文件），租户闸管"一个租户总共能跑几场"（管的是算力与成本）。前者随本文退役，后者留下但要修。</p>
+</blockquote>
+<ol type="1">
+<li><strong>租户并发闸改成 DB 约束</strong> → <strong>已落地（2026-10-23，<a href="43-租户并发闸入DB.html">doc/43</a>）</strong>。原状：<code>overQuota</code>（<code>product_api.go:26-57</code>）用 <code>CountLiveRuns</code> 读-判-写 → 并发下可超发（两个请求都读到 7 &lt; 8 就都放行，实际 9 场在跑；2026-10-23 活体实测：上限 2，并发四打进来 <strong>4 场</strong>）。<strong>落地形态</strong>：数活 run 与插 run 行收进<strong>同一笔 PG 事务</strong>，中间持一把所有副本共享的顾问锁（<code>pg_advisory_xact_lock</code>）→ 并发下不可能超发。<strong>无 DDL、无存量迁移</strong>、计数口径逐字不变（僵尸行不算活 → 不误拒）、<strong>契约字节不变</strong>（满租户仍回 429 <code>113001</code>）。槽位唯一索引那种「插入冲突=满」的形态<strong>没选</strong>（要 DDL + 存量回填 + 全租户僵尸清扫），取舍见 doc/43 §3。</li>
+<li><strong>并发额度分成员</strong>：现在并发额度是租户共享池（一个成员占满 8 场，其他人全被挡），且它与日 token 配额<strong>共用同一个业务码 <code>codeQuota</code> 与同一句文案</strong>（<code>product_api.go:41-56</code>）→ 用户分不清是 token 没了还是并发满了。形态定成"租户=员工的集合"后，并发额度该能分到成员。</li>
+</ol>
+<blockquote>
+<p>这两条<strong>不在本文的必做范围</strong>（用户 2026-10-22 拍板：不同批做）。它们是"租户=员工集合"这句话的直接推论。 注意区分：<strong>额度分档（计费）<strong>已随「团队计费」整组移出路线图（2026-10-22 用户裁）；但</strong>并发闸是运行时闸、不是商业化项</strong>——它现在有竞态、且被单个成员占满就挡住全租户，这一条仍建议修（与本文的闸退役同属"闸要真"这一族）。</p>
+</blockquote>
+<h3 id="44-不在本文但同源的两处提醒别混进来">4.4 不在本文、但同源的两处（提醒，别混进来）</h3>
+<ul>
+<li><strong>MCP 进程无围栏 → 跨租户泄漏</strong> → <strong>已修（2026-10-22）</strong>：租户自己配的 MCP 进 seatbelt 围栏，围栏根 = 该租户的存储根；平台的系统 MCP 不围栏；没有沙箱 → fail closed；command 必须在租户目录内（依赖要预装到租户目录里）；连接缓存的键含围栏根。详见 <a href="33-mcp-client.html">doc/33</a>。</li>
+<li><strong>失败不留痕</strong> → <strong>已落地（2026-10-22）</strong>：失败轮「已产出的内容」照落库（runlog + mh），前端收口也拉 log。</li>
+<li><strong>召回块在 mid-run 折叠时被抹掉</strong> → <strong>已由另一方案解决（2026-10-22，<code>f4df5ef</code>）</strong>：召回块进「本轮输入」并写回 mh 的 seq=1，折叠重建时从 mh 取 → 块活过折叠。<strong>属召回块那条方案的事，不在本篇范围。</strong></li>
+</ul>
+<p>这两条<strong>已还</strong>（2026-10-22）：失败留痕已落地（doc/19-v6-03 + doc/30 + doc/16 §0.1 判断句同批改）；召回块活过折叠由另一方案解决（<code>f4df5ef</code>）。<strong>归属说明</strong>：召回块那条属召回块方案的事，不在本篇范围。**</p>
+<hr />
+<h2 id="5-数据与迁移">5. 数据与迁移</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>数据</th>
+<th>现状</th>
+<th>处置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>workspaces.visibility = 'tenant'</code> 的行</td>
+<td>开发库可能有，线上待查</td>
+<td><strong>迁成 <code>private</code></strong>（一行 UPDATE），或保留列但不再读（两者都安全，因为判定改成只看 <code>user_id</code>）</td>
+</tr>
+<tr>
+<td><code>workspaces.is_default</code> 行</td>
+<td>每（租户，用户）一行，<code>private</code></td>
+<td><strong>不动</strong>，它就是新的"默认项目"</td>
+</tr>
+<tr>
+<td><code>sessions.workspace_id</code> 指向的项目</td>
+<td>会话挂载点</td>
+<td><strong>保留</strong>（项目仍在，只是变成个人的）</td>
+</tr>
+<tr>
+<td>项目目录里的文件</td>
+<td>已有产出</td>
+<td><strong>不动</strong>（形状本来就对，只是语义从"共享"变"个人"）</td>
+</tr>
+<tr>
+<td><code>runs.workspace_id</code> 列</td>
+<td>闸的载体 + 删除闸要用</td>
+<td><strong>保留列</strong>（<code>114006</code> 删除闸还在用），<strong>只删索引</strong></td>
+</tr>
+</tbody>
+</table></div>
+<hr />
+<h2 id="6-loop-拆分点头后逐拍施工每拍先交-todosmd">6. Loop 拆分（点头后逐拍施工；每拍先交 todos.md）</h2>
+<blockquote>
+<p>顺序：<strong>P（前置：doc/41 的人审闸）→ R1（跨成员共享项目退役）→ R2a（闸退役·代码侧）→ R2b（闸退役·DDL 侧）→ R2c（内容锚定）→ R3（形态落文档）</strong>。 为什么 doc/41 在前：闸退役后，危险的 bash 就没有第二道防线（§2.3）。<strong>人可以先不点头 doc/41，但那时 R2 不许开工。</strong></p>
+</blockquote>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>拍</th>
+<th>改什么</th>
+<th>怎么验收（curl 第一）</th>
+<th>回答什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R0</td>
+<td>（前置）doc/41 Loop A 的 A1–A4 落地</td>
+<td><code>POST /api/dev/seed-approval</code> 造行 → <code>POST /api/approvals/:id/decide</code> 批 → bash 调用真的执行了</td>
+<td>危险 bash 已经有人点头这道闸</td>
+</tr>
+<tr>
+<td>R1a</td>
+<td>✅ <strong>已落地（2026-10-22）</strong>：可见性判定三处简化（<code>pgstore.go</code> 的 <code>seeVisibleWorkspace</code> / <code>lockWorkspace</code> / <code>VisibleWorkspace</code>）+ <code>scope=tenant</code> 列举退役（<code>ListWorkspaces</code> 只列属主，scope 参数保留但已退役）</td>
+<td><code>GET /api/workspaces</code> → 只列属主的</td>
+<td>跨成员可见性真的断了</td>
+</tr>
+<tr>
+<td>R1b</td>
+<td>✅ <strong>已落地（2026-10-22）</strong>：<code>PATCH /api/workspaces/:id/visibility</code> 端点退役（<strong>留着路由恒回 404 <code>114001</code></strong>——摘掉路由会让 gin 的默认 404 接管，前端的信封拆包器接不住）；<code>SetWorkspaceVisibility</code> 存储方法退役（留档在注释里）；<strong>游离会话强制挂默认项目</strong>（新会话在 <code>postRuns</code> 里挂默认项目；存量游离会话在下一场 run 时归位）</td>
+<td><code>PATCH /api/workspaces/&lt;id&gt;/visibility</code> → 404 <code>114001</code>；新会话 <code>workspaceId</code> 非空</td>
+<td>对外契约：不再有"团队可见"，也不再有"游离会话"</td>
+</tr>
+<tr>
+<td>R2a</td>
+<td>✅ <strong>已落地（2026-10-22）</strong>：唯一约束冲突统一回 <code>errGateBusy</code>（不再有"项目忙"的专属语义），索引暂不动的过渡拍</td>
+<td>同一项目连投两条 → 409</td>
+<td>行为零变化的过渡拍（为 R2b 铺路）</td>
+</tr>
+<tr>
+<td>R2b</td>
+<td>✅ <strong>已落地（2026-10-22）</strong>：迁移处 <code>DROP INDEX IF EXISTS one_live_run_per_workspace</code>（幂等，每次启动跑一遍）；业务码 <code>114004</code> 与它的 409 分支退役（doc/40 §4.1 已登记）</td>
+<td>同一项目连投两条 → <strong>两条都 202</strong></td>
+<td>项目内不再整层排队</td>
+</tr>
+<tr>
+<td>R2c</td>
+<td><strong>同文件冲突防护</strong>（展开在 <code>tmp/文件写入并发/</code>，七拍：W1 指纹+基准表 → W4a 锁封装 → W2 write 判据 → W4b edit/move 接入 → W3 edit 基准+单测 → W5 文案 → W6 收口）：<strong>flock 写锁</strong>（粒度=文件；同机全串，跨机看存储——CephFS/NFSv4 ✓）+ <strong>写前指纹比对</strong>（判据 = 从磁盘现算的 sha256，&gt;64MB 降级为 mtime+size 且显式标注弱判据；<strong>比对必须在锁内</strong>）+ run 级基准表（键 = agent 名 + 绝对路径）</td>
+<td>两场会话同时改同一文件 → 后者收到「它跟你读到的不一样了，先 read_file 或改用 edit_file」而不是静默覆盖；同机两场并发写 → flock 串行</td>
+<td>闸退役后不留下静默覆盖</td>
+</tr>
+<tr>
+<td>R3</td>
+<td>文档同批：doc/16（§0 护栏 + §0.2 形态 + §2 表 + §5.1 + <strong>§0.1 判断句改写</strong>）、doc/28、doc/35、doc/36、doc/41、doc/README</td>
+<td><code>./scripts/check-master-plan.sh</code> 通过；<code>doc/16</code> §0.1 的判断句已改</td>
+<td>总纲的"现状"是真的</td>
+</tr>
+<tr>
+<td>R4</td>
+<td>全量回归 + 活体验收</td>
+<td><code>go test ./internal/runengine</code> + <code>go vet</code> + <code>npm run typecheck</code> + <code>npm run build</code> + <code>assert_contract.py</code> + <code>check-expected.sh</code> 全绿</td>
+<td>两台机器都钉住新契约</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>脚手架与转正</strong>：本文不新增 dev 探针端点。R1/R2 的验收口用现有的（<code>GET /api/workspaces</code>、<code>POST /api/runs</code>、跨账号 token）。</p>
+<hr />
+<h2 id="7-明确不做本期">7. 明确不做（本期）</h2>
+<ul>
+<li><strong>协同编辑 / 共享文件的多人同时修改</strong>——本文的护栏本身（§0.3）。</li>
+<li><strong>跨成员可见的项目、跨成员可见的 agent 之外的一切共享</strong>（agent 的团队可见性<strong>不受影响</strong>，那是 doc/34 的另一码事）。</li>
+<li><strong>沙箱读围栏</strong>（<code>sandbox.go:50</code> 的 <code>allow read "/"</code>）：本期靠工作区围栏 + 审批，不靠目录隔离。这条 doc/41 §7 已写「不做沙箱」，本文只补一句"读侧围栏同样不做"。</li>
+<li><strong>MQ 同步写入、hosted mode、扫描件 OCR 与音视频</strong>：沿用 doc/16 §5 的既有裁断，不在本轮重开。</li>
+<li><strong>版本号式的乐观并发</strong>（加列维护版本）：不做。改用<strong>内容锚定</strong>——<code>edit_file</code> 的 <code>old_text</code> 匹配（已有）+ <code>write_file</code> 写前比对内容（新增），见 §2.4。无状态、无迁移、跨副本天然成立。</li>
+</ul>
+<hr />
+<h2 id="8-开放问题2026-10-22-已全部拍完">8. 开放问题（2026-10-22 已全部拍完）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>问题</th>
+<th>结论</th>
+<th>落在哪</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>闸退役后，项目内同文件冲突怎么收？</td>
+<td><strong>四件事</strong>：flock 同机写锁（粒度=文件）+ Edit 内容锚定（已有）+ <code>write_file</code> 写前比对指纹 + <strong>版本号用文件系统指纹</strong>（<code>mtime</code>+<code>size</code>+<code>sha256</code>，不用 PG 版本号列）。<strong>bash 独占不做</strong>（被写前比对覆盖，且 30s 持锁会阻塞全项目）。<strong>不追求 100% 原子</strong>——跨机极窄窗口靠"显式失败"兜，要 100% 就得把闸请回来。展开施工见 <code>tmp/文件写入并发/</code>（W1–W6，待点头）</td>
+<td>§2.4 / <code>tmp/文件写入并发/</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td>游离会话（不挂项目）保留还是退役？</td>
+<td><strong>强制挂默认项目</strong>——不再提供"游离"这个选项（否则它就是孤儿制造机）</td>
+<td>§2.2 / R1b</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>workspaces.visibility</code> 列留还是删？</td>
+<td><strong>留</strong>（不写 <code>tenant</code>）——删列要迁存量行，收益只有"少一列"</td>
+<td>§3.1 S1</td>
+</tr>
+<tr>
+<td>4</td>
+<td>索引删除的顺序？</td>
+<td><strong>两拍</strong>：R2a 代码侧统一回 409（索引不动，行为零变化）→ R2b 执行 <code>DROP INDEX</code>（并发才真的放开）。理由与三种顺序的后果对比见 §3.2 的表</td>
+<td>§3.2 / R2a、R2b</td>
+</tr>
+<tr>
+<td>5</td>
+<td>租户并发闸那条（§4.3）同批做吗？</td>
+<td><strong>不同批</strong>。它是<strong>租户内总并发</strong>的闸（保护算力与 API 成本），不是"租户之间"的闸，与本文退役的项目闸是两码事。<strong>它现在是读-判-写有竞态、且被单个成员占满就挡住全租户</strong>——仍建议修，但另开一笔</td>
+<td>§4.3</td>
+</tr>
+<tr>
+<td>6</td>
+<td>doc/16 §0.1 那句"剩下的是产品外围"怎么改？</td>
+<td><strong>已改（2026-10-22）</strong>：两条地基欠账（失败留痕、召回块活过折叠）都已还 → 判断句改为「核心循环已经跑通——成功路径、失败路径、长对话路径三条都验过；剩下的是产品外围；地基还欠审批闸与任务看板」</td>
+<td>§4.4 / R3</td>
+</tr>
+</tbody>
+</table></div>
+<hr />
+<h2 id="9-所以这解决了什么">9. 所以这解决了什么</h2>
+<p>产品形态从"没定"变成"一句话"：<strong>tako 是多租户的 AI 工作台，一个员工一个项目，团队共享账号与额度、不共享文件。</strong> 这条形态一旦写死，三件一直悬着的事当场落地：① 跨成员共享项目退役（连同它的权限分支与存储分支）；② 项目闸退役——它当年挡的"两个员工互相删产物"场景，因为项目变个人的而不复存在；③ 产出与会话档案分层，<strong>删会话不再产生孤儿文件</strong>，项目的配额与清理归口明确。</p>
+<p>同时把当年那条"乐观并发是远期缝"的搁置理由掀了：它当初被搁置是因为"闸先顶着"，而闸现在要退役——<strong>但落法变了</strong>：不是加版本号列，而是抄 Kimi 的<strong>内容锚定</strong>（§2.4）——<code>edit_file</code> 的 <code>old_text</code> 匹配 tako 已经有了，只差 <code>write_file</code> 写前比对内容。<strong>这是无状态、无迁移、跨副本天然成立的版本</strong>，比当年设想的版本号方案便宜一个量级。</p>
+<p><strong>代价也要说清楚</strong>：团队叙事从"共享一个项目"收窄为"各自的项目 + 共享额度与审计"，对外可讲的故事少了一条（doc/16 §2 的 #9b 团队协作前端仍在，但它讲的不再是"一起改同一个项目"）；跨成员共享文件这条需求从"待做"变成"明确不做"（doc/16 §5.1 第 3 项与 doc/28 §15 要同步改口）。这是<strong>定位收窄</strong>，不是工程量收窄——换来的是不用去做协同编辑这个级别的地基。</p>
+<hr />
+<h2 id="10-演进记录">10. 演进记录</h2>
+<ul>
+<li><p><strong>2026-10-22 22:20</strong>：<strong>R1 / R2a / R2b 全部施工并活体验收通过</strong>。落地形态：① 可见性判定只剩属主 （<code>pgstore.go</code> 的 <code>seeVisibleWorkspace</code> / <code>lockWorkspace</code> / <code>VisibleWorkspace</code> 三处 SQL + <code>ListWorkspaces</code> 的 scope 分支删除；scope 参数保留但已退役）；② <code>PATCH /api/workspaces/:id/visibility</code> 端点<strong>留着路由恒回 404 <code>114001</code></strong>（摘掉路由会让 gin 的默认 404 接管 → 前端信封拆包器接不住）； ③ <code>SetWorkspaceVisibility</code> 存储方法退役（留档在注释里）；④ <strong>不再有游离会话</strong>——<code>postRuns</code> 里没指定 项目就用该成员的默认项目（没有就当场建），存量游离会话在下一场 run 时归位；⑤ <code>one_live_run_per_workspace</code> 索引在迁移处 DROP；⑥ 业务码 <code>114004</code> 与它的 409 分支退役（doc/40 §4.1 登记）。 <strong>活体四问</strong>：同项目连投两条 → 两条都 202 ✓；<code>PATCH .../visibility</code> → 404 <code>114001</code> ✓； 新会话 <code>workspaceId</code> 非空（挂默认项目）✓；跨成员可见性只认属主 ✓。 <strong>前端零改动</strong>（项目页本来没做；<code>Configure.vue</code> 的 visibility 是 <strong>agent</strong> 的、不是项目的）。</p></li>
+<li><p><strong>2026-10-22 16:16</strong>：建方案。事实核对基于当日实读代码：<code>pgstore.go:141-152</code>（Workspace 表）、<code>pgstore.go:185-186/262/294/411</code>（可见性判定四处）、<code>pgstore.go:512-515</code>（项目闸索引）、<code>store.go:129-285</code>（AcquireRun 抢闸段）、<code>server.go:94-98</code>（工作区端点五个）、<code>server.go:417-419</code>（409 <code>114004</code>）、<code>auth.go:167/169</code>（<code>114004</code>/<code>114006</code>）、<code>product_api.go:120/176/215</code>（列举、visibility 校验、删除闸）、<code>product_api.go:26-57</code>（租户闸与配额文案）、<code>product_api.go:200-282</code>（删项目 / 删会话清理）、<code>scope.go:81-135</code>（目录布局）、<code>worker.go:479</code>（配额统计口径）、<code>web/src/</code>（零调用 workspaces 端点；<code>Configure.vue</code> 的 visibility 是 agent 的）、<code>doc/16</code> §0.1/§2/§5.1、<code>doc/35</code> §0/§A7d、<code>tmp/35-项目目录/planning.md</code> 规则 8（闸的原始理由）。用户拍板：共享项目立即退役、闸退役、项目为资源管理单位、先出文档交审。</p></li>
+<li><p><strong>2026-10-23</strong>：§4.3 第 1 条（租户并发闸改成 DB 约束）<strong>已落地</strong>——方案、形态取舍与验收见 <a href="43-租户并发闸入DB.html">doc/43</a>。用户 2026-10-23 拍「DB 互斥 + 计数」（顾问锁 + 活 run 计数，收在 <code>AcquireRun</code> 同一笔事务里），未选槽位唯一索引。活体实测：修前上限 2 并发四打 = 4 个 <code>202</code>；修后 = 2 个 <code>202</code> + 2 个 <code>429</code>（<code>113001</code>，字节不变）。回归网入库（存储层用例摘掉闸即红 + 活体 <code>scripts/acceptance/tenant_gate.sh</code>）。<strong>本篇 §4.3 第 2 条（并发额度分成员 / 拆 <code>codeQuota</code>）仍未做。</strong></p></li>
+<li><p><strong>2026-10-22 16:30</strong>：按用户第二轮拍板修订全文——① 命名「空间」→「<strong>项目</strong>」，并加「产品叫法 ↔︎ 代码叫法」对照表与消歧（被退役的叫「跨成员共享项目」）；② 游离会话<strong>强制挂默认项目</strong>（不再提供"游离"选项）；③ <code>workspaces.visibility</code> 列<strong>留</strong>；④ 新增 §2.4「同文件冲突：抄 Kimi 的做法」——实读 <code>ref-agent/kimi-code/packages/agent-core-v2</code>：<code>toolScheduler.ts:17-70</code>（同文件写串行，粒度=文件）、<code>toolContract.ts:184-206</code>（冲突判据）、<code>toolExecutorService.ts:438</code>（未声明访问集 = <code>ToolAccesses.all()</code> → bash 独占）、<code>fileEditService.ts</code> + <code>src/agent/tools/edit/edit.md</code>（<code>old_string</code> 内容锚定；契约明写"串行化不能让陈旧的 old_string 变有效"）、<code>src/agent/tools/os/write/write.md</code>（Write 禁增量覆盖）。<strong>结论：tako 的 <code>edit_file</code> 已是同款，缺的是 <code>write_file</code> 写前校验</strong>（R2c）；⑥ 闸退役索引删除的顺序讲清（§3.2 三种顺序的后果对比 → 定为 R2a 代码侧留 409 兜底、R2b 再 DROP INDEX）；⑦ 澄清「租户闸」不是"租户之间"的闸，是租户内总并发（§4.3）；⑧ doc/16 §0.1 判断句的改法写进 §8 第 6 条（用户已拍"改"）。<strong>六个开放问题全部拍完，本文可点头开工。</strong></p></li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/42-%E4%BA%A7%E5%93%81%E5%BD%A2%E6%80%81%E6%94%B6%E7%AA%84%E4%B8%8E%E5%85%B1%E4%BA%AB%E9%A1%B9%E7%9B%AE%E9%80%80%E5%BD%B9.md"><code>doc/42-产品形态收窄与共享项目退役.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

@@ -2,6 +2,9 @@
   "use strict";
 
   const NS = "http://www.w3.org/2000/svg";
+  // 代码落点的链接用 GitHub 绝对地址，不用 "../../yk-tako-eino/" 这种相对路径——
+  // 相对路径在 Pages 以 doc/ 为根时会指到站点外面去，绝对地址在任何部署位置都成立。
+  const CODE_BASE = "https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/";
   const poster = new URLSearchParams(location.search).has("poster");
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
   const body = document.body;
@@ -321,7 +324,7 @@
       ${node.facts?.length ? `<h3>关键事实</h3><dl class="detail-facts">${node.facts.map(fact => `<dt>${escapeHTML(fact[0])}</dt><dd>${inline(fact[1])}</dd>`).join("")}</dl>` : ""}
       <h3>上游</h3><p>${upstream.length ? upstream.map(escapeHTML).join("、") : "入口节点"}</p>
       <h3>下游</h3><p>${downstream.length ? downstream.map(escapeHTML).join("、") : "终点或旁路节点"}</p>
-      ${node.code?.length ? `<h3>代码落点</h3><div class="detail-links">${localLinks(node.code, "../../yk-tako-eino/")}</div>` : ""}
+      ${node.code?.length ? `<h3>代码落点</h3><div class="detail-links">${localLinks(node.code, CODE_BASE)}</div>` : ""}
       ${node.docs?.length ? `<h3>现行文档</h3><div class="detail-links">${localLinks(node.docs, "../")}</div>` : ""}`;
   };
   const selectEdge = (id, keepPlaying = false) => {
@@ -413,7 +416,7 @@
         ${node.need ? `<p><strong>没有它：</strong>${inline(node.need)}</p>` : ""}
         ${node.input ? `<p><strong>输入：</strong>${inline(node.input)}</p>` : ""}
         ${node.output ? `<p><strong>输出：</strong>${inline(node.output)}</p>` : ""}
-        ${node.code?.length ? `<div class="row-links">${localLinks(node.code, "../../yk-tako-eino/")}</div>` : ""}
+        ${node.code?.length ? `<div class="row-links">${localLinks(node.code, CODE_BASE)}</div>` : ""}
         ${node.docs?.length ? `<div class="row-links">${localLinks(node.docs, "../")}</div>` : ""}
       </li>`).join("")}</ul>`;
   };

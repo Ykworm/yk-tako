@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>历史查找用什么索引 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="历史查找用什么索引">历史查找用什么索引</h1>
+<blockquote>
+<p>模块：同会话历史查找（<code>internal/runengine/search.go</code>）｜ 状态：已落地（<code>dd63b8e</code> / <code>38a230f</code>）｜ 证据：<code>doc/21-同会话历史查找.md</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>用户在同一个会话的下一场问：「上次那个错误码是什么？就是 <code>E_DECK_17</code> 那个。」</p>
+<p>模型需要一个工具去翻本会话的历史。看起来最标准的做法是 PostgreSQL 全文检索，但实测：</p>
+<ul>
+<li>PG 默认的 <code>pg_catalog.english</code> 把中文整段切成一个词，把 <code>E_DECK_17</code> 拆成 <code>e</code>、<code>deck</code>、<code>17，deck</code>；</li>
+<li><code>plainto_tsquery</code> 查「错误码」和 <code>E_DECK_17</code> 都不命中；</li>
+<li>开发库没有 <code>pg_search</code>，也没有中文分词扩展。</li>
+</ul>
+<p>也就是说，<strong>在「中文 + 代码标识符」这个真实语料上，默认全文索引的召回是零</strong>。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A <code>ILIKE</code> 子串</td>
+<td>按词做大小写无关的子串匹配</td>
+<td>中文与错误码都命中；零新索引、零新扩展</td>
+<td>扫本会话本场之前的行；语义近义查不到</td>
+</tr>
+<tr>
+<td>B <code>to_tsvector</code></td>
+<td>标准全文检索</td>
+<td>索引快、标准</td>
+<td>实测中文/错误码不命中</td>
+</tr>
+<tr>
+<td>C ParadeDB / BM25 / 向量</td>
+<td>换库或加扩展</td>
+<td>召回强</td>
+<td>换库或新依赖，超出本篇；与 doc/29 的对话召回是两条不同语料</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>裁定：A。</strong> 本篇不换 ParadeDB，也不走 <code>to_tsvector</code>。用 <code>ILIKE</code> 而不是 <code>LIKE</code>：库里是 <code>E_DECK_17</code>，问句写成 <code>e_deck_17</code> 时 <code>LIKE</code> 落空，<code>ILIKE</code> 仍中。</p>
+<h2 id="3-同族小裁定">3. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>结果超长怎么办？</td>
+<td>4000 字上限；<strong>发生截断时</strong>把完整结果落 <code>.tako/search/</code>，未被截断则一个字节不变</td>
+<td>上限是为了避免一次工具结果把刚折掉的正文原样灌回窗口；落盘让丢掉的命中仍可再读。写失败退化为纯截断、不报错</td>
+</tr>
+<tr>
+<td>落盘要不要登记 <code>file_effect</code>？</td>
+<td>要，登记为 write</td>
+<td>否则清理与审计看不到这些文件</td>
+</tr>
+<tr>
+<td>子代理拿真工具还是拒绝壳？</td>
+<td>拿同一个真工具对象，不设壳</td>
+<td>拒绝壳会让查询逐轮落回主线程历史，mid-run 折叠被提前触发，子代理独立窗口形同虚设（2026-10-12 当日由壳改为真工具）</td>
+</tr>
+<tr>
+<td>查询包含本场 run 吗？</td>
+<td>排除本场 <code>run_id</code></td>
+<td>本场 user 行在抢闸时已进 <code>runlog_entries</code>，按 seq 从新到旧取，最新一行会是问句自己，把真正结果挤出 <code>limit</code></td>
+</tr>
+<tr>
+<td>读未提交内存吗？</td>
+<td>不读，只读已提交的 <code>runlog_entries</code></td>
+<td>否则会看见可能被丢弃的半截生成</td>
+</tr>
+<tr>
+<td>跨会话能查吗？</td>
+<td>不能，只查同一会话</td>
+<td>跨会话找结论是 doc/29 的两条召回线，不是这把工具</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-证据">4. 证据</h2>
+<ul>
+<li>方案：<code>doc/21-同会话历史查找.md</code> §3.2（按词查找、截断落盘）、§3.4（子代理）、§3 工具、§4 本篇不做。</li>
+<li>代码：<code>search.go</code> 的 <code>newSearchHistoryTool</code>、ILIKE 条件、<code>searchResultCap</code>、<code>spillIfTruncated</code> / <code>spillSearchResult</code>；<code>agents_test.go</code> 的 <code>TestSubagentPoolKeepsRealSearchHistory</code>（钉住子代理拿到真工具）。</li>
+<li>复核命令：<code>grep -n "searchResultCap\|ILIKE\|func spillSearchResult" yk-tako-eino/internal/runengine/search.go</code>。</li>
+</ul>
+<h2 id="5-现状">5. 现状</h2>
+<p>仍有效。「换说法问旧事」在这里是明确的能力边界——字面不重合就是 0 命中，不是 bug；语义召回在 doc/29 的对话线里用 pg_search 解决，见 <code>doc/problems/记忆要不要上向量</code>。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E5%8E%86%E5%8F%B2%E6%9F%A5%E6%89%BE%E7%94%A8%E4%BB%80%E4%B9%88%E7%B4%A2%E5%BC%95/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/历史查找用什么索引/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

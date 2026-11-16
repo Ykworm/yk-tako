@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>品牌只落 Logo：换图标，不动产品配色 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="品牌只落-logo换图标不动产品配色">品牌只落 Logo：换图标，不动产品配色</h1>
+<blockquote>
+<p>模块：前端 · 品牌资产接入（tmp/tako-brand-integration）｜状态：<strong>方案已定、未施工</strong>（2026-10-31 核实：<code>web/public/</code> 不存在，<code>index.html</code> 无 icon 链接，<code>App.vue</code> 仍是旧 <code>t</code>）｜证据：<code>tmp/tako-brand-integration/{planning,todos}.md</code>、<code>tmp/tako-brand/final/</code>、<code>yk-tako-eino/web/{index.html,src/App.vue}</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>品牌已经定稿——「Tako Grid」图形 + 06 燕麦焦糖双色 + 轮廓化字标。素材在 <code>tmp/tako-brand/final/</code>（<code>tako-mark.svg</code>、<code>tako-logo-horizontal.svg</code>、<code>AppIcon.appiconset/</code> 等）。</p>
+<p>但运行 <code>./scripts/dev.sh</code> 打开页面，看到的还是旧的<strong>黑底白字字母 <code>t</code></strong>；浏览器标签没有 favicon；Safari「添加到主屏幕」也没有方形图标。</p>
+<p>原因不是设计没做，而是<strong>两处断链</strong>：</p>
+<ol type="1">
+<li><strong>素材在 <code>tmp/</code></strong>——<code>tmp/</code> 被 <code>.gitignore</code> 排除、验收后会被清理，它不是资产存放处。换个 clone 或清一次台账，定稿素材就没了；这与「验收脚本必须从 <code>tmp/</code> 搬进 <code>scripts/acceptance/</code>」是同一个病。</li>
+<li><strong>页面没有引用</strong>——<code>web/public/</code> 目录不存在，<code>index.html</code> 里没有 <code>&lt;link rel="icon"&gt;</code> / <code>apple-touch-icon</code>，<code>App.vue</code> 的侧栏与登录页仍是 <code>.mark</code> 的字母 <code>t</code>（<code>App.vue:1272</code>、<code>:1468</code>）。素材再漂亮，没有一条稳定的 HTTP 路径到达它，等于不存在。</li>
+</ol>
+<p>后果很具体：演示时第一眼是旧品牌，截图与文档对不上；若此时有人清 <code>tmp/</code>，定稿 SVG 与 PNG 源文件一起消失，只能重做。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 继续用字母 <code>t</code> + CSS</td>
+<td>现状</td>
+<td>零改动</td>
+<td>品牌与产品不一致；定稿素材闲置；主屏幕图标缺失</td>
+</tr>
+<tr>
+<td>B 内联进组件（base64 / 大段 <code>&lt;svg&gt;</code>）</td>
+<td>把 Logo 塞进 <code>App.vue</code></td>
+<td>少一个静态文件</td>
+<td>每次渲染重复携带；favicon / apple-touch-icon 仍需要独立文件；改图要改组件</td>
+</tr>
+<tr>
+<td>C 静态资产进 <code>web/public/brand/</code> + 三处引用（选定）</td>
+<td>复制三份定稿资产；<code>index.html</code> 接 favicon 与 apple-touch-icon；侧栏与登录页换成同一横向 Logo</td>
+<td>一条稳定路径（<code>/brand/...</code>）；页面与标签/主屏幕同源；回滚只需删目录 + 还原两个文件</td>
+<td>多三份二进制/矢量资产；两处品牌要同时换，漏一处会出现两套</td>
+</tr>
+<tr>
+<td>D 顺便把整套 UI 换成燕麦焦糖主题</td>
+<td>改 token / 全局配色</td>
+<td>「统一」</td>
+<td>产品配色是另一条已验收的设计线（doc/51 中性现代风）；品牌替换借机改主题会把两件事的验收混在一起</td>
+</tr>
+<tr>
+<td>E 建原生 iOS 工程 + 完整 AppIcon</td>
+<td>拷 <code>AppIcon.appiconset</code> 进 iOS target</td>
+<td>原生图标完整</td>
+<td>仓库今天没有 iOS target；为一个不存在的宿主建工程是空转</td>
+</tr>
+</tbody>
+</table></div>
+<p>选 C。边界写死：<strong>只换品牌呈现，不改产品配色 token、不改任何 API/存储/运行协议。</strong> 完整 <code>AppIcon.appiconset</code> 留在素材 ZIP 里，将来真有 iOS target 再拷。</p>
+<h2 id="3-接线的四个落点">3. 接线的四个落点</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>落点</th>
+<th>做法</th>
+<th>为什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>web/public/brand/tako-mark.svg</code></td>
+<td>独立图形，作 favicon</td>
+<td>Vite 从 <code>/brand/...</code> 直接提供静态文件，无需打包</td>
+</tr>
+<tr>
+<td><code>web/public/brand/tako-logo-horizontal.svg</code></td>
+<td>横向 Logo，<strong>字标已轮廓化</strong></td>
+<td>不依赖访问者本机是否装 Menlo；否则换台电脑字标就变字体</td>
+</tr>
+<tr>
+<td><code>web/public/brand/tako-apple-touch-icon.png</code></td>
+<td>180×180 方形图标（源 <code>icon-iphone-60@3x.png</code>）</td>
+<td>iOS「添加到主屏幕」要 PNG，不吃 SVG</td>
+</tr>
+<tr>
+<td><code>web/index.html</code></td>
+<td>加 SVG favicon + apple-touch-icon 两个 <code>&lt;link&gt;</code>，保留 <code>theme-color</code> 与标题</td>
+<td>标签页与主屏幕先于页面内容可见</td>
+</tr>
+<tr>
+<td><code>App.vue</code> 登录后侧栏 <code>.brand</code></td>
+<td>用横向 Logo 替换字母 <code>t</code>；保留「工作区」副标或等价可访问名称</td>
+<td>主工作台入口的品牌</td>
+</tr>
+<tr>
+<td><code>App.vue</code> 未登录 <code>.gate-copy</code></td>
+<td>同一张横向 Logo；保留 <code>h1</code> 语义或等价可访问标题</td>
+<td>冷启动第一眼；两处必须同一套</td>
+</tr>
+</tbody>
+</table></div>
+<p>窄屏约束：860px 以下顶栏不允许横向溢出，品牌副标按现有窄屏规则隐藏（<code>App.vue:3213-3214</code>）；390px 下登录页 Logo 不挤压右侧登录卡片、不出现横向滚动。</p>
+<p>回滚：删 <code>web/public/brand/</code>，还原 <code>index.html</code> 与 <code>App.vue</code> 的本拍小块改动即可，不触碰其他文件。</p>
+<h2 id="4-同族小裁定">4. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>资产放哪</td>
+<td><strong><code>web/public/brand/</code></strong>，不放 <code>tmp/</code>、不内联</td>
+<td><code>tmp/</code> 不入库且会被清理；内联解决不了 favicon / 主屏幕图标</td>
+</tr>
+<tr>
+<td>改名后的 PNG 叫什么</td>
+<td><code>tako-apple-touch-icon.png</code></td>
+<td>语义化命名，避免把 <code>icon-iphone-60@3x</code> 这种源文件名带进代码面</td>
+</tr>
+<tr>
+<td>字标用字体还是轮廓</td>
+<td><strong>轮廓化 SVG</strong></td>
+<td>不依赖访问者本机字体；跨平台一致</td>
+</tr>
+<tr>
+<td>换不换产品配色</td>
+<td><strong>不换</strong></td>
+<td>doc/51 已定中性现代风；品牌是图形与字标，不是主题</td>
+</tr>
+<tr>
+<td>登录页与侧栏</td>
+<td><strong>同一套横向 Logo</strong></td>
+<td>两处不同会出现「两个品牌」</td>
+</tr>
+<tr>
+<td>旧 <code>.mark</code> 样式</td>
+<td><strong>本拍清掉</strong>，不留两套</td>
+<td>否则下次改品牌会漏改一处</td>
+</tr>
+<tr>
+<td>是否建 iOS 工程</td>
+<td><strong>不建</strong></td>
+<td>没有 target；完整 AppIcon 留在素材 ZIP</td>
+</tr>
+<tr>
+<td>可访问性</td>
+<td>保留 <code>h1</code> 或等价标题、图形 <code>aria-hidden</code></td>
+<td>图形不是文字，读屏要读得到「tako」</td>
+</tr>
+<tr>
+<td>验收方式</td>
+<td>先 curl 静态字节，再看浏览器两处 + 窄屏</td>
+<td>资产先能被 HTTP 打到，页面才谈得上引用</td>
+</tr>
+<tr>
+<td>要不要改 <code>doc/</code></td>
+<td><strong>不改</strong>（当时判断）</td>
+<td>这是视觉资产接入，不是产品能力增减；本次补录进问题库以保住决策</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="5-证据">5. 证据</h2>
+<p><strong>台账</strong>：<code>tmp/tako-brand-integration/planning.md</code>（背景、非目标、文件计划、A1–A5 顺序、回滚）、<code>todos.md</code>（每拍 curl 字节 + 浏览器走查；A1 验 <code>public/brand</code> 三个地址，A2 验 HTML 链接，A5 验类型/构建/无 404）。素材：<code>tmp/tako-brand/final/{tako-mark.svg,tako-logo-horizontal.svg,AppIcon.appiconset/,tako-icon-1024.png,...}</code>。</p>
+<p><strong>当前代码事实（2026-10-31 核实）</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yk-tako-eino/web/public/</code></td>
+<td><strong>不存在</strong>（资产未入库）</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/web/index.html</code></td>
+<td><strong>无</strong> favicon / apple-touch-icon 链接</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/web/src/App.vue:1272</code></td>
+<td>侧栏仍是 <code>&lt;span class="mark"&gt;t&lt;/span&gt;</code></td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/web/src/App.vue:1468</code></td>
+<td>登录页仍是 <code>&lt;span class="mark lg"&gt;t&lt;/span&gt;</code></td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/web/src/App.vue:3213-3214</code></td>
+<td>窄屏 <code>.brand</code> 与 <code>.brand-sub</code> 的现有规则</td>
+</tr>
+<tr>
+<td><code>tmp/tako-brand/final/tako-logo-horizontal.svg</code></td>
+<td>定稿横向 Logo（字标轮廓化）</td>
+</tr>
+<tr>
+<td><code>tmp/tako-brand/final/AppIcon.appiconset/</code></td>
+<td>完整 iOS 图标集（本拍只取 180px 一张）</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>复核命令</strong>：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> yk-tako-eino/web/public/brand <span class="dv">2</span><span class="op">&gt;&amp;</span><span class="dv">1</span>                 <span class="co"># 当前：No such file or directory</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;favicon\|apple-touch-icon&quot;</span> yk-tako-eino/web/index.html   <span class="co"># 当前：无输出</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&#39;class=&quot;mark&#39;</span> yk-tako-eino/web/src/App.vue    <span class="co"># 当前：1272 / 1468 两处旧字母</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">ls</span> tmp/tako-brand/final/                               <span class="co"># 资产仍在台账目录（随时可能被清）</span></span></code></pre></div>
+<p><strong>施工后的验收（按台账）</strong>：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino/web <span class="kw">&amp;&amp;</span> <span class="ex">npm</span> run dev <span class="at">--</span> <span class="at">--host</span> 127.0.0.1 <span class="at">--port</span> 5199</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> http://127.0.0.1:5199/brand/tako-mark.svg <span class="kw">|</span> <span class="fu">head</span> <span class="at">-c</span> 4          <span class="co"># &lt;svg</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> http://127.0.0.1:5199/brand/tako-logo-horizontal.svg <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-c</span> <span class="st">&#39;&lt;path&#39;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> http://127.0.0.1:5199/brand/tako-apple-touch-icon.png <span class="kw">|</span> <span class="ex">xxd</span> <span class="at">-l</span> 8  <span class="co"># 8950 4e47 0d0a 1a0a</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> http://127.0.0.1:5199/ <span class="kw">|</span> <span class="fu">grep</span> <span class="st">&#39;/brand/tako-mark.svg&#39;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="ex">npm</span> run typecheck <span class="kw">&amp;&amp;</span> <span class="ex">npm</span> run build</span></code></pre></div>
+<h2 id="6-现状">6. 现状</h2>
+<ul>
+<li><strong>方案仍有效</strong>：静态资产进 <code>web/public/brand/</code>、三处引用、字标轮廓化、不换主题、不建 iOS 工程、回滚只碰三个文件。</li>
+<li><strong>未施工</strong>：截至 2026-10-31，<code>web/public/</code> 与 <code>index.html</code> 的 icon 链接都不存在，<code>App.vue</code> 两处仍是旧字母 <code>t</code>。<strong>定稿素材只存在于 <code>tmp/tako-brand/final/</code>，而 <code>tmp/</code> 不入库、会清理</strong>——这是当前最实际的风险：台账一清，方案与素材一起丢。</li>
+<li><strong>为什么补录进问题库</strong>：原计划判断「不改 doc/」，于是决策只活在 <code>tmp/</code> 台账里。问题库这一层正好接住这类「做过判断、还没施工、台账又不入库」的事，避免它随 <code>tmp/</code> 消失。</li>
+<li><strong>同族问题</strong>：素材与脚本不入库的共同病 → <a href="../验收机器化/问题与方案.html">验收机器化</a>；界面呈现层的验收方式 → <a href="../界面验收双轨/问题与方案.html">界面验收双轨</a>；产品配色的真源 → <a href="../前端可用性欠账/问题与方案.html">前端可用性欠账</a>。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E5%93%81%E7%89%8C%E5%8F%AA%E8%90%BDLogo/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/品牌只落Logo/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

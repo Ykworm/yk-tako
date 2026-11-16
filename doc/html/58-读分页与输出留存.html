@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>58 · 读分页与输出留存（read 分页 + bash 留尾落盘） · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="58--读分页与输出留存read-分页--bash-留尾落盘">58 · 读分页与输出留存（read 分页 + bash 留尾落盘）</h1>
+<blockquote>
+<p>性质：<strong>方案（2026-11-01 点头；五条待裁按 dsh 定）</strong>。回答「模型怎么把一份大的东西完整拿到手里」。 状态：<strong>已落地</strong>（2026-11-01，A0–A8 全部施工并验收；bash 落盘落点与清扫触发点后被 doc/82 改定——落命令目录、首字节起落盘、清理归 job sweeper，见本文 §4.1/§4.4）。read 改成 <code>offset</code>/<code>limit</code> 分页（撤 200KB 硬报错、删 <code>head</code>/<code>tail</code>）；bash 改成<strong>留尾 64000 字节/流 + 全文落盘 + 回路径</strong>（30 天保留）。四条产品 API 的请求／响应字节<strong>一个没动</strong>——本篇改的是模型看见的<strong>工具结果</strong>字节。 代码落点：<code>yk-tako-eino/internal/runengine/{readwindow.go,filetools.go,bash.go,bashspill.go,notes.go,product_api.go}</code>；快闸单测 <code>filetools_test.go</code>、<code>bashspill_test.go</code>；契约字节 <code>scripts/acceptance/expected.json</code>（用例 32/33）与 <code>doc/19-v6/19v6-04-验收-curl.md</code>（用例 32/33）；契约表 <code>doc/19-v6/19v6-08-file-tools.md</code> §3。 验收（2026-11-01，隔离引擎 8943）：<code>go test -count=1 ./internal/runengine</code> 全绿；<code>assert_contract.py --tier core</code> 125 步全过（含新增的用例 32 读分页、33 bash 输出留存）；<code>check-expected.sh</code> 用例号集合一致；<code>check-master-plan.sh</code> 通过。 参照：<strong>dsh <code>deepseek-harness</code></strong>（<code>packages/fs/tool-fs/src/{read.ts,read-render.ts}</code>、<code>packages/shell/{bash-local,tool-bash}/src/</code>、<code>packages/subprocess/subprocess-local/src/output.ts</code>、<code>packages/spill/spill-local/src/</code>）；pi <code>packages/coding-agent/src/core/{tools/read.ts,tools/truncate.ts,tools/output-accumulator.ts,bash-executor.ts}</code>。 上游：doc/57（<code>web_fetch</code> 把整页落盘、模型自己读）——<strong>本文是它的下游</strong>：doc/57 的「落盘之后模型自己读」要成立，read 必须能分页。立项来源是 doc/56 §4.6 的那句「coding agent 该补的是『留尾 + 全文落盘 + 回路径』与『分页读』」。</p>
+</blockquote>
+<hr />
+<h2 id="0-一句话结论">0. 一句话结论</h2>
+<p>tako 今天有<strong>两处「拿不到就永远拿不到」</strong>：</p>
+<ol type="1">
+<li><strong><code>read_file</code> 读超过 200KB 的文件直接报错</strong>，模型只剩 <code>head</code> / <code>tail</code> 两条路——<strong>没有任何办法读到文件中间</strong>；</li>
+<li><strong><code>bash</code> 的输出超 32KB 时留头丢尾</strong>，尾部那半（报错、失败原因、最后几行）<strong>当场销毁、不可恢复</strong>。</li>
+</ol>
+<p>本篇把两处都改成「<strong>分页</strong>」与「<strong>留尾 + 全文落盘 + 回路径</strong>」： read 加 <code>offset</code>/<code>limit</code>（dsh 与 pi 各自独立同形），bash 改成留尾并把全文写到盘上、回一个可读的路径（dsh 与 pi 同形）。</p>
+<hr />
+<h2 id="1-病灶两个会真实发生的失败故事">1. 病灶：两个会真实发生的失败故事</h2>
+<h3 id="11-故事一抓回来的文档读不到中间">1.1 故事一：抓回来的文档，读不到中间</h3>
+<p><a href="57-网络抓取.html">doc/57</a> 的 <code>web_fetch</code> 把整页 Markdown 落盘 <code>.tako/fetch/</code>，工具只回三行描述（来源／链接／token／路径）。</p>
+<p><strong>场景</strong>：用户问「这份技术规范里，接口限流阈值是多少」。模型 <code>web_fetch</code> 拿到描述段 → <code>read_file</code> 读那个文件 →</p>
+<pre><code>错误：文件 .tako/fetch/https-example-com-spec.md 有 812345 字节、超过 200KB 上限，
+无界读会灌爆上下文——请用 head（前 N 行）或 tail（后 N 行）截读</code></pre>
+<p>模型只剩两条路：<code>head 100</code> 读到的是文档开头的目录与前言；<code>tail 100</code> 读到的是末尾的版权声明与联系方式。<strong>限流阈值在第 4000 行</strong>，两条路都到不了。结果是模型瞎猜、或者答「未能查证」。</p>
+<p><strong>这条故事同时说明 doc/57 §10 的一句话今天是假的</strong>：「模型 <code>read_file</code> 读到全文，答案有出处」——对大页不成立。</p>
+<h3 id="12-故事二装依赖跑测试报错看不见">1.2 故事二：装依赖跑测试，报错看不见</h3>
+<p><strong>场景</strong>：模型跑 <code>npm ci &amp;&amp; npm test</code>。这条命令输出 60KB：前 45KB 是安装日志（<code>added 812 packages…</code>），尾部 3KB 是</p>
+<pre><code>npm ERR! code ELIFECYCLE
+npm ERR! src/parser.spec.ts:42:9  expected 3 received 4</code></pre>
+<p>tako 的 <code>bash</code> 每流 32KB 上限、<strong>留头丢尾</strong>（<code>bash.go</code> 的 <code>capWriter</code>）→ 模型拿到 32KB 安装日志 + 一句「（stdout 超 32 KB 已截断——把需要的内容写进文件再读，不要直接重跑打印）」。</p>
+<p><strong>报错那 3KB 已经不存在了</strong>：没落盘、不可恢复。模型看到「装了一堆包」，最可能的下一步是<strong>原样再跑一遍</strong>（命令相同 → 输出相同 → 还是看不到报错），或者改命令瞎试。doc/56 §4.6 记的就是这件事：「装依赖、跑测试的错误通常在尾部，模型会看到开头、看不到报错，这比『上限小』更糟」。</p>
+<hr />
+<h2 id="2-借谁dsh-为主pi-为辅">2. 借谁：dsh 为主，pi 为辅</h2>
+<p><strong>2026-11-01 拍板：五条待裁（§7）一律以 dsh 的实现为准</strong>——dsh 是这两件事上把同一形状做全的那一套（read 的分页、bash 的留尾与全文落盘、落盘文件的保留期都有一套自洽的数），pi 的形状与它同构，互为印证。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>参考</th>
+<th>借什么</th>
+<th>不借什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>dsh <code>tool-fs</code> 的 <code>read</code>（<code>read.ts</code> / <code>read-render.ts</code>）</td>
+<td><code>offset</code>（1-based）+ <code>limit</code>（行）+ 页脚续读提示；页上限 <strong>2000 行 / 50KB / 单行 2000 字符</strong>；<code>offset</code> 越界报错；<strong>read 只有这三个参数，没有 head/tail</strong></td>
+<td>它的 <code>file_path</code> 参数名；它的 MCP 目录工具族；它的<strong>行号前缀输出</strong>（<code>1: text</code>）——见 §5</td>
+</tr>
+<tr>
+<td>pi 的 <code>read</code>（<code>packages/coding-agent/src/core/tools/read.ts</code>）</td>
+<td>同上（<strong>另一套独立实现</strong>：两家各自收敛到同一形状 → 这不是某人的口味，是被两代实现验证过的形状）</td>
+<td>pi 的图片处理分支（tako 有 <code>read_media_file</code>／<code>read_pdf_text</code> 另走）</td>
+</tr>
+<tr>
+<td>dsh <code>subprocess-local</code> 的 <code>OutputCollector</code> + <code>bash-local</code> 的配置（<code>output.ts</code> / <code>index.ts</code>）</td>
+<td>内存<strong>滚动留尾</strong>（字节精确的尾窗）；首次溢出时<strong>建文件并把已有字节补写进去</strong>（文件是全文）；内存上限 <strong>64,000 字节/流</strong>、落盘上限 <strong>64MB/流</strong>；<strong>文件装不下全文就删掉它</strong>（不做半截文件）</td>
+<td>dsh 落系统临时目录（tako 落作业根内、跟着租户与保留窗口走）</td>
+</tr>
+<tr>
+<td>pi 的 <code>bash</code> + <code>output-accumulator</code></td>
+<td><strong>留尾</strong>（不是留头）+ <strong>全文落盘</strong> + <strong>回路径</strong>（与 dsh 同构）</td>
+<td>pi 落在系统临时目录、进程退出即失的位置（tako 要落在作业根内、跟着租户与保留窗口走）</td>
+</tr>
+<tr>
+<td>dsh <code>spill-local</code> 的 <code>cleanupPeriodDays</code></td>
+<td>落盘全文保留 <strong>30 天</strong>（默认），到期清扫；<strong>清扫失败只记日志</strong></td>
+<td>dsh 的「启动时扫一次」触发点（tako 是长驻进程，见 §4.4）</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>一处必须说清的差别</strong>：dsh 的 <code>web_fetch</code> 超限时<strong>真丢内容</strong>——它既没有 range 参数，也不落盘。pi 的 <code>bash</code> <strong>不丢</strong>：落盘可回读。</p>
+<p>tako 在 doc/57 里已经选了「整页落盘」这条路（DeepSeek Fetch 接口只认 url、不给 range → 唯一的出路就是整页落盘），<strong>所以 tako's read 必须能分页</strong>，否则 doc/57 的设计在长文档上自相矛盾。这两篇是一件事的两半。</p>
+<hr />
+<h2 id="3-方案-aread-分页read_file--read_text_file">3. 方案 A：read 分页（<code>read_file</code> / <code>read_text_file</code>）</h2>
+<p><code>read_file</code> 与 <code>read_text_file</code> 是同一实现的两个名字（19v6-08 §3），<strong>两个名字一起改</strong>。</p>
+<h3 id="31-契约">3.1 契约</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>项</th>
+<th>今天</th>
+<th>改后（dsh 形态）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>入参</td>
+<td><code>path</code> + <code>head?</code>/<code>tail?</code></td>
+<td><code>path</code> + <strong><code>offset?</code></strong> + <strong><code>limit?</code></strong>（<strong><code>head</code>/<code>tail</code> 删掉</strong>）</td>
+</tr>
+<tr>
+<td>读超大文件</td>
+<td>报错「超过 200KB 上限」</td>
+<td><strong>不报错</strong>：返回第 1 页 + 页脚续读提示</td>
+</tr>
+<tr>
+<td>单次上限</td>
+<td>无界读 ≤ 200KB</td>
+<td><strong>2000 行 / 50KB / 单行 2000 字符</strong>（先到先算，与 dsh 同数）</td>
+</tr>
+<tr>
+<td>行数</td>
+<td>不报</td>
+<td>报总行数（<code>共 N 行</code>）</td>
+</tr>
+</tbody>
+</table></div>
+<ul>
+<li><code>offset</code>：<strong>1-based</strong> 起始行号，默认 1；给 0 或负数 → 报错 <code>offset 须为正整数（给的是 N）</code>。</li>
+<li><code>limit</code>：本次最多返回多少行，默认 2000、<strong>上限 2000</strong>；给超过 → 报错 <code>limit 不得大于 2000（给的是 N）</code>。</li>
+<li><strong><code>head</code>/<code>tail</code> 删掉</strong>（dsh 的 read 只有这三个参数）：一套截读方言比两套好——模型不必在「前 N 行／后 N 行／第几行起」之间做选择题，也没有「两个参数打架」的组合要判。
+<ul>
+<li><strong>代价</strong>（认）：想读尾部要<strong>两跳</strong>——先读一次拿到总行数，再 <code>offset=总-N+1</code> 读第二页。</li>
+<li><strong>缓解</strong>：页脚<strong>恒带总行数</strong>（dsh 的 <code>(End of file - total N lines)</code> 也带），模型第一跳就知道该从哪跳。</li>
+</ul></li>
+<li><code>offset</code> 超出文件末尾 → 报错 <code>offset %d 超出文件末尾（共 %d 行）</code>。</li>
+</ul>
+<p><strong>两处字节变化（要认）</strong>：</p>
+<ol type="1">
+<li>读出来的文本统一是「<strong>行用 <code>\n</code> 连接</strong>」，<strong>末尾那个换行不再保留</strong>。今天无界读是把文件原样直出（末尾换行带着），而 head/tail 分支是拼行（末尾换行已经没了）——改后两条路合成一条，形状统一。影响面：所有以 <code>\n</code> 收尾的文件，read 的返回值少一个末尾换行。</li>
+<li><strong>每次 read 都追加一行页脚</strong>（dsh 的三态页脚，见 §3.2）——小文件的读回值也多这一行。</li>
+</ol>
+<h3 id="32-页脚字节定死是契约">3.2 页脚（<strong>字节定死</strong>，是契约）</h3>
+<p>三种情形，三条固定文案（都追加在正文之后、空行分隔）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>情形</th>
+<th>追加的那一行</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>还有更多（2000 行用尽，或模型自带 <code>limit</code> 停早）</td>
+<td><code>（已显示第 3-2002 行，共 50230 行；继续读用 offset=2003）</code></td>
+</tr>
+<tr>
+<td>字节上限先到（50KB）</td>
+<td><code>（已显示第 3-847 行，共 50230 行；本次被 50KB 上限截断，继续读用 offset=848）</code></td>
+</tr>
+<tr>
+<td>读完了</td>
+<td><code>（已读到文件末尾，共 50230 行）</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>行号用 ASCII <code>-</code>；<code>共 N 行</code> 是总行数；<code>offset=</code> 是下一次调用的起始行号。</p>
+<p><strong>为什么要分「还有更多」与「被 50KB 截断」两条</strong>：前者可以靠调大 <code>limit</code> 解决，后者不行（行数再多也超 50KB），只能靠 <code>offset</code> 跳着读。混成一条会让模型反复调大 <code>limit</code> 空转——pi 特意分开，dsh 也分开。</p>
+<p><strong>为什么「读完了」也要带总行数</strong>（dsh 的 <code>(End of file - total N lines)</code>）：head/tail 删掉之后，<strong>总行数是模型唯一的定位坐标</strong>——它要跳到第 N 行附近，就必须先知道 N 在哪。</p>
+<h3 id="33-怎么读一遍流式不把整文件读进内存">3.3 怎么读：一遍流式，不把整文件读进内存</h3>
+<p>今天的实现是 <code>os.ReadFile</code> 整份进内存（≤200KB 才放行）。改后文件可能几十 MB，<strong>不能整份进内存</strong>：</p>
+<p>一趟流式扫描同时干三件事——① 算整文件 sha256（<code>fingerprintOf</code> 已有流式实现，内存恒定）；② 数总行数；③ 只把请求的那一页收进内存。</p>
+<ul>
+<li><strong>行数口径</strong>：以 <code>\n</code> 收尾的文件，末尾那个换行<strong>不算多出一行</strong>（沿用今天 head/tail 分支的 <code>TrimSuffix</code> 规则）；空文件 = 0 行。</li>
+<li><strong>单行超长</strong>：一行本身超过 <strong>2000 字符</strong>时，不切半行——按字符截到上限内，行尾标 <code>…（本行超长已截断）</code>，并在页脚说明「本次被 50KB 上限截断」（dsh 的 <code>READ_MAX_LINE_LENGTH = 2000</code>）。</li>
+<li><strong>单行扫描</strong>：一行可以很长（几 MB 的 minified JS），所以读一行的循环<strong>只累计前 2000 字符</strong>，后面的字节照读照丢（否则一个无换行的文件能把内存吃穿）——dsh 的 <code>buildWindow</code> 就是这个形状。</li>
+</ul>
+<h3 id="34-指纹不变写前判据不受影响">3.4 指纹不变（写前判据不受影响）</h3>
+<p><code>write_file</code> 的「先读后写」纪律靠 <code>fileBaseline</code> 里那份<strong>整文件指纹</strong>判冲突（filefp.go）。改后虽然只把一页收进内存，但 sha256 仍是<strong>整文件</strong>的（流式算的），<strong>判据逐字不变</strong>——尾部被改动照样会被 <code>write_file</code> 拒。</p>
+<h3 id="35-今天那条错误会消失">3.5 今天那条错误会消失</h3>
+<p><code>文件 %s 有 %d 字节、超过 200KB 上限…</code> 这条错误在改后<strong>不再存在</strong>（大文件走分页，不再是错误）。它今天出现在 <code>filetools.go</code> 的实现里、<code>filetools_test.go</code> 有一条单测钉它、19v6-08 §3 表格里写着它——<strong>三处同批改</strong>（见 §6）。</p>
+<hr />
+<h2 id="4-方案-bbash-留尾--全文落盘--回路径">4. 方案 B：bash 留尾 + 全文落盘 + 回路径</h2>
+<h3 id="41-契约">4.1 契约</h3>
+<ul>
+<li><strong>内存上限：每流 64,000 字节</strong>（dsh 的 <code>maxOutputBytes</code> 默认值；stdout / stderr 各一份，与今天同口径——今天也是每流一份上限，只是数是 32KB）。</li>
+<li><strong>留的那一半翻转</strong>：今天留<strong>头</strong>、丢尾；改后留<strong>尾</strong>、丢头（尾 = 报错、失败原因、最后几行——这才是模型要的）。留的是<strong>字节精确的尾窗</strong>（dsh 的 <code>OutputCollector</code>：整块丢头块，头块装不下时按字节切准到上限）。</li>
+<li><strong>丢的那一半不再丢</strong>：首次溢出时建文件，把<strong>已有字节先补写进去</strong>，之后边到边写 → 文件里是该流的<strong>全文</strong>。</li>
+<li><strong>落盘上限：每流 64MB</strong>（dsh 的 <code>maxSpillBytes</code>）。<strong>装不下全文就把文件删掉</strong>（dsh 的 <code>discardSpill</code>）——只报「内存尾窗」，<strong>不报路径</strong>。
+<ul>
+<li>这是 dsh 最值钱的一处纪律：<strong>要么是全文，要么不存在</strong>。留一个半截文件比不留更坏——模型读到的是一份看起来完整、其实缺了尾巴的输出。</li>
+</ul></li>
+<li><strong>落盘位置</strong>（doc/82 施工批改定）：后台命令输出落<strong>命令自己的固定目录</strong>——挂项目的会话是 <code>runtime/tmp/bash/jobs/&lt;bj&gt;/</code>、纯会话是 <code>.tako/bash/jobs/&lt;bj&gt;/</code>（<code>stdout.out</code> 与 <code>stderr.out</code>，内容是该流的原始字节，从首字节起落盘，不等溢出）。
+<ul>
+<li>doc/58 原设计按 runId 建目录（<code>&lt;作业根&gt;/.tako/bash/&lt;runId&gt;/</code>），doc/82 改为按命令号：命令要活过前台窗口、可被来源会话之外的面板读取，落点跟着 job 走而不是跟着 run 走；首字节起落盘同样是为了转后台后的早期输出不丢。</li>
+<li>旧历史消息里的 <code>.tako/bash/&lt;runId&gt;/…</code> 回执路径由 <code>resolveRuntimeReadPath</code> 映射读取，不迁移文件。</li>
+<li>「作业根」= 会话挂项目时是项目目录，没挂项目时是会话目录（<code>runWorkspace</code> 的口径）——<code>.tako/search</code>、<code>.tako/fetch</code> 用的是同一个根。</li>
+<li><code>.tako/</code> 已经是内部目录（<code>workspaceInternalDirs</code>，用户与产品 API 都看不见）→ 不会混进项目文件清单。</li>
+<li>落在作业根下 → <code>read_file</code> 能直接读它（<code>resolveInWorkspace</code> 允许根内任意路径），路径按<strong>相对作业根</strong>给模型。</li>
+</ul></li>
+<li><strong>回执行</strong>（追加在那一流的内容之后）：
+<pre><code>（stderr 完整输出已存到 .tako/bash/r_01ABC/2.err，共 123456 字节；用 read_file 分页读它）</code></pre>
+<ul>
+<li>哪一流超限就提哪一路；两路都超就提两行（每流一行）。</li>
+<li>全文没超 → <strong>不落盘、不追加</strong>（今天的字节逐字不变）。</li>
+</ul></li>
+</ul>
+<h3 id="42-为什么是留尾而不是留头--留尾各一半">4.2 为什么是「留尾」而不是「留头 + 留尾各一半」</h3>
+<ul>
+<li><strong>留头 + 留尾各一半</strong>（dsh 的 spill 预览、pi 的 <code>truncateMiddle</code> 那种）是给<strong>通用大结果</strong>用的：既要开头（结论）又要结尾（报错）。</li>
+<li><strong>bash 的输出有明确的「结论在最后」性质</strong>：装依赖、跑测试、跑 grep 的失败信息都在尾部。留一半开头等于把预算花在最没用的地方。</li>
+<li>dsh 与 pi 都是留尾（dsh 的 <code>OutputCollector</code> 注释直说「Tail-keep rationale (pi/OpenCode): 报错和最终结果都聚在命令输出的末尾」）。<strong>照它们走</strong>，不自己发明第三种。</li>
+</ul>
+<h3 id="43-全文落盘怎么做到文件是全文">4.3 全文落盘怎么做到「文件是全文」</h3>
+<p>今天 <code>capWriter</code> 只留头、其余直接丢——<strong>被丢的字节当场没了</strong>。改后照 dsh 的 <code>OutputCollector</code> 做（它与 pi 的 <code>OutputAccumulator</code> 同构）：</p>
+<ul>
+<li>内存里滚动保留<strong>尾部</strong> ≤64,000 字节（整块丢头块；头块装不下时按字节切准到上限，保证尾窗字节精确）；</li>
+<li>一旦累计超过 64,000 字节 → <strong>建文件</strong>，先把<strong>已有的全部字节</strong>补写进去（此刻内存里还握着整条流的前缀），之后的字节边到边写；</li>
+<li>收尾时文件里就是该流的<strong>全文</strong>，内存里那份尾部是给模型看的；</li>
+<li>文件写失败（磁盘满、目录不可写）→ <strong>弃掉文件、继续留尾</strong>（dsh 的 fail-open：落盘是补救手段，不是执行的前提），并只报一次。</li>
+</ul>
+<p>内存占用 ≤ 64KB/流（尾部）+ 一份正在写的文件；未超限的调用<strong>一个文件都不建</strong>（磁盘零开销）。</p>
+<h3 id="44-落盘文件的去处保留期-30-天">4.4 落盘文件的去处（保留期 30 天）</h3>
+<p><strong>保留 30 天</strong>（dsh 的 <code>cleanupPeriodDays</code> 默认值）。dsh 的理由照搬：「保留期是刻意的——被恢复或被分叉的会话可能还在引用一个更早的路径，直到它过期」。</p>
+<p><strong>清扫触发点（doc/82 施工批改定）</strong>：bash 落盘的清理归后台命令的清理循环（<code>bash_job_sweeper.go</code>，每小时一轮、终态行超 30 天连输出目录一起删、主键 DELETE 幂等多副本可同跑）；<code>.tako/search</code>、<code>.tako/fetch</code> 仍是「每次 bash 调用前扫一次」的旧触发点，失败只记日志，不影响命令执行。</p>
+<hr />
+<h2 id="5-明确不做登记未来用例逼出再立项">5. 明确不做（登记，未来用例逼出再立项）</h2>
+<ul>
+<li><strong>不做通用 spill 插件</strong>（dsh 那种「所有 tool_result 都流经它」的横切层）：tako 只有两处真需要（read 分页、bash 输出），<strong>为一个需求建一层横切机制不值</strong>；真出现第三个大结果来源再说。</li>
+<li><strong>不跟 dsh 的行号前缀输出</strong>（dsh 的 read 回 <code>1: text</code> 带行号）：tako 的 <code>edit_file</code> 要求 <code>old_text</code> 与文件<strong>逐字符一致</strong>，带行号的回读文本没法直接喂给它——为了看行号牺牲「读到的能直接改」不值。（dsh 没有 <code>edit_file</code> 这个约束，所以它能这么选。）</li>
+<li><strong>不做 <code>read</code> 的 range/字节区间参数</strong>：<code>offset</code>（行）+ <code>limit</code>（行）已经够用，字节区间会让模型算偏移量。</li>
+<li><strong>不做 <code>write_file</code> 的乐观并发</strong>（doc/35 已拍远期缝）：本篇不动写路径。</li>
+<li><strong>不做 bash 单命令超时可配</strong>：doc/56 §4.6 提到 pi 每次调用可选 <code>timeout</code>，但那是<strong>另一条需求</strong>（今天 bash 固定 30 秒，见 bash.go），不在本篇范围，另立项。</li>
+<li><strong>不改 <code>search_files</code> / <code>read_media_file</code> / <code>read_pdf_text</code></strong>：它们的返回面已经有自己的上限口径。</li>
+<li><strong>已知缺口（登记不修）</strong>：bash 落盘文件<strong>不进租户存储配额</strong>（tako 的配额在 <code>write_file</code>／工具上传那条路上，bash 输出是执行副产物）——靠 64MB/流的上限兜底；真出现磁盘压力再立项。</li>
+</ul>
+<hr />
+<h2 id="6-契约字节与验收两台机器各管一段">6. 契约字节与验收（两台机器各管一段）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>层</th>
+<th>落点</th>
+<th>钉什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>dev 钩子</strong></td>
+<td><code>POST /api/dev/workspace/read</code>（<strong>本篇新增</strong>，形状照既有的 <code>POST /api/dev/workspace/bash</code>——那个也是直接调 bash 工具、回 <code>data.output</code>）</td>
+<td>read 的输出字节是<strong>模型侧</strong>字节，四个 API 打不到它。没有这个口，「read 的字节对不对」只能靠「起 run + 盼模型照着调」来验（模型不听就假红）。它让 read 的契约<strong>可 curl、可逐字节断言</strong>，且只在 <code>-dev</code> 模式注册。</td>
+</tr>
+<tr>
+<td><strong>快闸</strong></td>
+<td><code>yk-tako-eino/internal/runengine/filetools_test.go</code>、<code>bash_test.go</code>（或新文件）</td>
+<td>read 的三条页脚逐字、offset 越界文案、bash 留尾后的结果形状、落盘文件是全文。<strong>期望字节不许手写</strong>——先跑一次把真实字节抄进去。</td>
+</tr>
+<tr>
+<td><strong>活体</strong></td>
+<td><code>scripts/acceptance/</code>（新增一条用例，或并进现有 workspace-files 用例）</td>
+<td>真实起引擎、真实跑一轮：模型分页读大文件的结果里有 <code>共 N 行</code> 与 <code>继续读用 offset=</code>；bash 大输出的结果里有 <code>完整输出已存到</code> 与一个<strong>能真的读出来</strong>的路径。</td>
+</tr>
+</tbody>
+</table></div>
+<p>另外三处<strong>同批改</strong>（改行为必改的旁证）：</p>
+<ul>
+<li><code>doc/19-v6/19v6-08-file-tools.md</code> §3 契约表两行（<code>read_text_file</code> / <code>read_file</code>）：入参加 <code>offset</code>/<code>limit</code>、<strong>删掉 <code>head</code>/<code>tail</code> 两列</strong>、错误分支去掉「&gt;200KB」、返回列写明页上限与页脚；§2/§3 的「上限是减灾档」一段补「分页后每页 50KB/2000 行」。</li>
+<li><code>doc/19-v6/19v6-04-验收-curl.md</code> + <code>scripts/acceptance/expected.json</code>：同批改，用例号两边一致（<code>scripts/acceptance/check-expected.sh</code> 守）。</li>
+<li><code>doc/16</code> 总纲 + <code>doc/README.md</code> 索引：本篇登记后要两页同批更新（见 §7 拍板 5 与 §8）。</li>
+</ul>
+<hr />
+<h2 id="7-待拍项2026-11-01-已拍五条一律照-dsh">7. 待拍项（2026-11-01 已拍：五条一律照 dsh）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>问题</th>
+<th><strong>拍板</strong></th>
+<th>依据与代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>head</code>/<code>tail</code> 保留还是废掉？</td>
+<td><strong>废掉</strong>（read 只剩 <code>path</code>/<code>offset</code>/<code>limit</code>）</td>
+<td>dsh 的 read 就是这三个参数（<code>read.ts</code> 的 <code>parameters</code> 只有 <code>file_path</code>/<code>offset</code>/<code>limit</code>）。<strong>代价</strong>：读尾部要两跳（先拿总行数再跳）；<strong>缓解</strong>：页脚恒带总行数。<strong>收益</strong>：一套截读方言而不是两套，少一组「参数打架」的组合，少两个入参的 token</td>
+</tr>
+<tr>
+<td>2</td>
+<td>read 的单次字节上限取多少？</td>
+<td><strong>2000 行 / 50KB / 单行 2000 字符</strong></td>
+<td>dsh 的 <code>READ_LIMIT = 2000</code>、<code>READ_MAX_BYTES = 50 * 1024</code>、<code>READ_MAX_LINE_LENGTH = 2000</code>（<code>read.ts</code> / <code>read-render.ts</code>）。今天 200KB 是「无界读的减灾档」，有了分页就不该再让一次调用吞 200KB</td>
+</tr>
+<tr>
+<td>3</td>
+<td>bash 的上限取多少？</td>
+<td><strong>内存 64,000 字节/流、落盘 64MB/流</strong></td>
+<td>dsh <code>bash-local</code> 的 <code>maxOutputBytes</code> 默认 <code>64_000</code>、<code>maxSpillBytes</code> 默认 <code>64MB</code>（<code>bash-local/src/index.ts</code>）。落盘上限从 dsh 抄，因为「装不下全文就删文件」这条纪律要求有个明确上限</td>
+</tr>
+<tr>
+<td>4</td>
+<td>bash 全文文件怎么清？</td>
+<td><strong>保留 30 天 + 每次 bash 调用前扫一次</strong></td>
+<td>dsh 的 <code>cleanupPeriodDays</code> 默认 <code>30</code>（<code>spill-local/src/index.ts</code>）。触发点与 dsh 不同（dsh 扫一次，tako 长驻 → 改成调用前扫），理由见 §4.4</td>
+</tr>
+<tr>
+<td>5</td>
+<td>本篇登记进 <code>doc/16</code> §2 能力表的哪个位置？</td>
+<td><strong>挂在第 1 行（主循环 + 工具）下作子项</strong>，不新开能力号</td>
+<td>这是既有能力（文件工具 / bash）的缺陷收口，不是新能力；doc/49 的做法同此</td>
+</tr>
+</tbody>
+</table></div>
+<hr />
+<h2 id="8-分阶段按-7-拍板结果拆-action">8. 分阶段（按 §7 拍板结果拆 action）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>做什么</th>
+<th>验收的第一行（打一个跑着的东西）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>R1</strong></td>
+<td>① <code>POST /api/dev/workspace/read</code> 钩子（打 read 工具、回它的输出原文）② read 加 <code>offset</code>/<code>limit</code> + 分页语义 + 页脚（<strong>head/tail 暂留、与之互斥</strong>，免得中间态出现「大文件反而读不了」的倒退）③ 换流式读 + 50KB/2000 行/单行 2000 字符页上限 + <strong>删 head/tail</strong> + 大文件不再报错</td>
+<td>起隔离引擎 → curl <code>POST /api/dev/workspace/read</code> → 看工具结果字节</td>
+</tr>
+<tr>
+<td><strong>R2</strong></td>
+<td>bash 留尾（64,000 字节/流）→ 全文落盘 + 回路径（≤64MB/流，要么完整要么不存在）→ 30 天清扫（落点与触发点后被 doc/82 改定：命令目录、job sweeper 清理）</td>
+<td>起隔离引擎 → curl <code>POST /api/dev/workspace/bash</code> → 看尾部与落盘路径</td>
+</tr>
+<tr>
+<td><strong>R3</strong></td>
+<td>契约字节与文档同批收口（快闸单测 + <code>expected.json</code> + 19v6-04 + 19v6-08 + doc/57 §10 + doc/56 + doc/16 + doc/README）</td>
+<td><code>scripts/acceptance/check-expected.sh</code> 绿 + <code>go test ./internal/runengine</code> 绿 + <code>scripts/check-master-plan.sh</code> 绿</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>顺序理由</strong>：R1 先做，因为 doc/57 的「落盘之后模型自己读」在它之后才成立；R2 独立于 R1（两处是不同的失败故事），但同样先于 R3（契约字节要一次收口）。</p>
+<p><strong>每一拍的 diff 目标 ≤80 行</strong>；R1 的流式读取与 R2 的滚动尾部各是一个独立的小任务，不混在一拍里。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/58-%E8%AF%BB%E5%88%86%E9%A1%B5%E4%B8%8E%E8%BE%93%E5%87%BA%E7%95%99%E5%AD%98.md"><code>doc/58-读分页与输出留存.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

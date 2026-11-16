@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>09 · 设计了解（Eino 机制笔记） · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="09--设计了解eino-机制笔记">09 · 设计了解（Eino 机制笔记）</h1>
+<blockquote>
+<p><strong>文件性质与修改权限（先读）</strong>：本文件是开发者对本项目设计、以及自己不甚了解的知识点的记录， 分两类，权限不同——</p>
+<ul>
+<li><strong>知识点（为面试准备的内容）</strong>：不得随意删除或改写；要修改必须先征得用户同意。</li>
+<li><strong>项目设计（描述本仓库设计的章节）</strong>：若实现已改动导致文档过时，模型可直接更正， 无需用户同意，但应保持锚点与当前代码一致。</li>
+</ul>
+</blockquote>
+<blockquote>
+<p>性质：<strong>机制笔记</strong>。新系列第九篇，从旧《设计了解》改写：<code>WrapInvokableToolCall</code> 的时机、 <code>endpoint</code> 是什么、<code>adkrun.Run</code> 的两个标识（checkpointID 与 root）都保留并<strong>按当前代码刷新锚点</strong>， 另加两节定案后新引入、也最容易被误读的机制：<code>BeforeAgent</code> 注入工具、session 值随 checkpoint 落盘。 关联：《06》§3.4 是从守卫视角看同一批钩子，本篇是"读 Eino 源码时的随手笔记"。 末五节（§6–§10）是通用 Go 与 Eino 接入笔记：编译期断言提前发现接口漏实现、map 无序靠 order 保障顺序、 接口切片字面量把 middleware 拼进 handlers 链、Handlers/Middleware/handler 三个名字与钩子串行执行、 <code>//go:embed</code> 把厂商目录编译进二进制。 §11 补记一个被命名误导的契约：interrupt 信号树里 <code>IsRootCause=true</code> 的是叶子（真因）， 祖先走 <code>Parent</code> 链；<code>adk</code> 的字段文档与实现表述互斥，<code>adkrun</code> 的过滤是防御性写法（当前为 no-op）。 §12 拆开 resume 的中段：<code>ResumeWithParams</code> 只做「恢复现场 + 立公告板」，重入时 <code>AppendAddressSegment</code> 按地址认领数据挂到 ctx，wrapper 重跑时自己读走——两端靠地址相遇，无函数调用相连。 版本：eino v0.9.21；行号以该版本为准。</p>
+</blockquote>
+<h2 id="1-wrapinvokabletoolcall决策之后执行之前的干预点">1. <code>WrapInvokableToolCall</code>：决策之后、执行之前的干预点</h2>
+<p><code>internal/guard/middleware.go</code> 里的三个 handler 都实现了 <code>WrapInvokableToolCall</code>。 Eino 的注释原文只说了 "called at request time when the tool is about to be executed" （<code>adk/handler.go:193</code>）——这句话其实已经暗示了时机。</p>
+<p><code>WrapInvokableToolCall</code> 的触发时机正是：<strong>LLM 决策完成之后、工具真正被执行之前</strong>。</p>
+<p>也就是说，模型吐出 tool call 之后，等 tool 真跑起来再拦就晚了； 理想的拦截点只有一个，就是这里。</p>
+<h2 id="2-endpoint-是什么">2. "endpoint" 是什么</h2>
+<p><code>InvokableToolCallEndpoint</code> 的定义（<code>adk/handler.go:34</code>）只有一行：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> InvokableToolCallEndpoint <span class="kw">func</span><span class="op">(</span>ctx context<span class="op">.</span>Context<span class="op">,</span> argumentsInJSON <span class="dt">string</span><span class="op">,</span> opts <span class="op">...</span>tool<span class="op">.</span>Option<span class="op">)</span> <span class="op">(</span><span class="dt">string</span><span class="op">,</span> <span class="dt">error</span><span class="op">)</span></span></code></pre></div>
+<p>它就是真正干活的那个工具执行函数本身（<code>handler.go:32</code> 注释原文： "the function signature for invoking a tool synchronously"）。 框架把实际的 tool invokable 抽象成了这个统一签名——不用关心工具是 bash 还是写文件， 调用方式永远是「传 JSON args，返回 string 结果」。</p>
+<p>于是 <code>WrapInvokableToolCall</code> 的职责就很好理解了：框架把 <code>endpoint</code>（真工具）交给你， 你必须<strong>返回一个新的函数</strong>。这个新函数变成了实际被调用的入口，而 <code>endpoint</code> 在你手里：</p>
+<ul>
+<li>直接透传：<code>return endpoint(ctx, args, opts...)</code> —— 放行</li>
+<li>换参数再调：<code>endpoint(ctx, stored.Args, opts...)</code> —— 审批通过后恢复原调用</li>
+<li>不调它，直接返回一段 string —— 硬拒 / 拒绝消息，这条 string 会作为结果回填给模型</li>
+</ul>
+<h3 id="21-硬拒时-agent-会中断吗">2.1 硬拒时 Agent 会中断吗？</h3>
+<p>不会。要分两种情况看：</p>
+<p><strong>硬拒（<code>return string, nil</code>）</strong>：agent 的 run 循环<strong>继续走</strong>。 这条 string 作为这个 tool call 的"结果"回填进消息历史，轮次正常往下走—— 模型下一轮看到 "permission denied，不要重试相同路径"，通常就会改道或收手。 准确的说法是：<strong>当前这次工具调用从未发生，但整个 agent 思考循环没有中断</strong>。 这不是偷懒，是刻意的沟通策略：如果抛 error，模型只能看到 "tool execution failed"， 不知道为什么错，容易傻乎乎重试；返回一句解释性的 string，模型知道"是人拒绝的、因为什么、别重试"。</p>
+<p><strong>interrupt（ask 分支的 <code>compose.StatefulInterrupt</code>）</strong>：这个才是真正的中断—— 整个 run 被挂起，进程返回、状态存 checkpoint，等人审批后 resume。 恢复时走 <code>ownInterrupt</code> 的 <code>stored</code> 分支：拒绝时也是返回 string 而非 error，同样回填给模型。</p>
+<p>整个 guard 的本质就是三个字：<strong>包、查、调</strong>——包住 endpoint，每次调用先查规则/中断状态，决策对了才碰 endpoint。 同一个 <code>endpoint</code> 类型也解释了为什么审批恢复后能"原样重放"：<code>savedCall</code> 里存的就是 args， resume 时拿 <code>stored.Args</code> 重新喂给同一个 endpoint 即可。</p>
+<h3 id="22-为什么叫-endpoint">2.2 为什么叫 "endpoint"</h3>
+<ol type="1">
+<li><strong>go-kit 的继承</strong>。Go 微服务圈（CloudWeGo 与 go-kit 一脉都受影响）有个经典模式： <code>type Endpoint func(ctx, req) (resp, error)</code>——把任何服务调用统一抽象成一个"单一函数端点"， middleware 在它外面包洋葱层。eino 的 <code>InvokableToolCallEndpoint func(ctx, args, opts...) (string, error)</code> 与 go-kit 的 <code>Endpoint</code> 形状几乎一致，只是 request/response 换成了 JSON string。</li>
+<li><strong>"链的终点"语义</strong>。Middleware 一层套一层，责任链总得有个终点。 任何一层执行 <code>endpoint(ctx, args, ...)</code> 就是"把控制权沿链传到最深处，让真工具干活"。 叫它 handler 也行，但 handler 容易混淆（外面那层也是某种 handler）， endpoint 强调的是<strong>链的端点：这是最后一站，穿过它就出了框架、进了实现</strong>。</li>
+<li><strong>对应"调用点"而非"实现"</strong>。它不是工具本身（<code>tool.InvokableTool</code> 有自己的 schema、definition）， 而是工具在框架视角下的<strong>统一调用面</strong>——就像 API endpoint 是"你发请求打到的地方"， 不关心后面代码怎么写。框架只认这个签名，所以才能做到：无论模型吐什么工具， 都能被同一种方式包裹和重放。</li>
+</ol>
+<p>简单说：<strong>endpoint = 中间件洋葱的最内层</strong>，名字借自 go-kit / HTTP 世界，强调"统一签名的最终执行点"。</p>
+<h2 id="3-beforeagent往本轮工具表里加工具的钩子">3. <code>BeforeAgent</code>：往本轮工具表里加工具的钩子</h2>
+<p>任务看板不是靠 <code>WrapInvokableToolCall</code> 拦已有的工具，而是<strong>先把自己的四个工具塞进去</strong>—— 这件事发生在 <code>BeforeAgent</code>：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 签名（adk/handler.go:142）</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>BeforeAgent<span class="op">(</span>ctx context<span class="op">.</span>Context<span class="op">,</span> runCtx <span class="op">*</span>ChatModelAgentContext<span class="op">)</span> <span class="op">(</span>context<span class="op">.</span>Context<span class="op">,</span> <span class="op">*</span>ChatModelAgentContext<span class="op">,</span> <span class="dt">error</span><span class="op">)</span></span></code></pre></div>
+<ul>
+<li><p><code>ChatModelAgentContext</code>（<code>adk/handler.go:87</code>）里的 <code>Tools []tool.BaseTool</code> 是<strong>本轮的工具表</strong>： <code>AgentConfig</code> 里配的工具 + 框架隐式加的工具（transfer / exit 之类）+ 前面 middleware 已经加过的工具， 逐步往里追加。</p></li>
+<li><p>返回 <code>*ChatModelAgentContext</code> 是有意的<strong>拷贝语义</strong>：官方和 eino 自己的 plantask （<code>adk/middlewares/plantask/plantask.go:66-73</code>）都这么写：</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>nRunCtx <span class="op">:=</span> <span class="op">*</span>runCtx</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>nRunCtx<span class="op">.</span>Tools <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>nRunCtx<span class="op">.</span>Tools<span class="op">,</span> m<span class="op">.</span>tools<span class="op">...)</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="cf">return</span> ctx<span class="op">,</span> <span class="op">&amp;</span>nRunCtx<span class="op">,</span> <span class="ot">nil</span></span></code></pre></div>
+<p>改副本、不动调用方的原值，所以单测可以直接断言"原 runCtx 的工具数没变"。</p></li>
+<li><p>同一个结构体还有 <code>Instruction</code> 字段（<code>BeforeAgent</code> 里改它 = 动态改系统提示词）。 我们没走动态改：入口用 <code>config.SystemPrompt() + "\n\n" + taskboard.Instruction</code> 静态拼接， 理由是这样提示词来源单一、可读，不必藏在钩子里。</p></li>
+<li><p><code>adk.BaseChatModelAgentMiddleware</code>（<code>handler.go:277</code> 起）提供所有钩子的空实现， 所以中间件只需内嵌它、覆盖自己关心的那个钩子——guard 覆盖 <code>WrapInvokableToolCall</code>， taskboard 覆盖 <code>BeforeAgent</code>。</p></li>
+</ul>
+<h2 id="4-session-值为什么免费随-checkpoint-落盘">4. session 值为什么"免费"随 checkpoint 落盘</h2>
+<p>任务看板的镜像（<code>adk.AddSessionValue(taskboard.SessionKey, snapshot)</code>）能在 interrupt 时跟着落盘， 靠的是 eino 对 session 的序列化声明，不是我们写了额外代码：</p>
+<ul>
+<li><p><code>adk/runctx.go:33-35</code>：<code>runSession</code> 结构体上标着 <code>CheckpointSchema: persisted via serialization.RunCtx (gob)</code>，<code>Values map[string]any</code> 就是 session 值。 同文件 <code>:48</code>、<code>:54</code> 的 laneEvents / agentEventWrapper 有同样的标注——<strong>凡是标了这行的字段， 都会随整个 runContext 一起 gob 进 <code>CheckPointStore</code></strong>。</p></li>
+<li><p><code>adk/runctx.go:214</code> 的 <code>AddSessionValue</code>：</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> AddSessionValue<span class="op">(</span>ctx context<span class="op">.</span>Context<span class="op">,</span> key <span class="dt">string</span><span class="op">,</span> value <span class="dt">any</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    session <span class="op">:=</span> getSession<span class="op">(</span>ctx<span class="op">)</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> session <span class="op">==</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span>   <span class="co">// 没有 session 就静默返回，不报错</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    session<span class="op">.</span>addValue<span class="op">(</span>key<span class="op">,</span> value<span class="op">)</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>这解释了为什么单测里直接调工具函数不炸——ctx 里没有 runCtx，镜像那步是空操作。</p></li>
+<li><p><strong>类型必须注册</strong>（<code>map[string]any</code> 里的具体类型 gob 认不出来）：</p>
+<ul>
+<li>eino 自己注册了 <code>gob.Register([]byte{})</code>（<code>adk/interrupt.go:205</code>）；</li>
+<li>我们注册了 <code>gob.Register([]Task{})</code>（<code>internal/taskboard/taskboard.go</code> 的 <code>init</code>）；</li>
+<li>另一种是给 gob 起稳定名字：<code>schema.RegisterName[ApprovalInfo]("tako_approval_info")</code> （<code>internal/guard/middleware.go</code> 的 <code>init</code>）——审批载荷要跨进程/跨恢复活着，名字必须稳定。</li>
+</ul></li>
+<li><p><strong>但正本不能放 session</strong>：session 每轮 <code>runner.Run</code> 新建，能把父 session 带进子 run 的 option 在 eino 里未导出，外部拿不到。所以跨轮存活的正本是 middleware 自持的 <code>*Store</code>， session 里只放"随 checkpoint 走的镜像"（定案见《01》§3、实现见《07》§4.3）。</p></li>
+</ul>
+<p>一句话：<strong>"落盘不依赖模型自觉"里的落盘，是 eino 的 session 序列化白送的；我们只负责把快照类型注册好。</strong></p>
+<h2 id="5-adkrunrun-的两个标识checkpointid-与-root">5. <code>adkrun.Run</code> 的两个标识：checkpointID 与 root</h2>
+<p>驱动层的入口是 <code>internal/adkrun/turn.go:77</code>：</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> Run<span class="op">(</span>ctx context<span class="op">.</span>Context<span class="op">,</span> runner <span class="op">*</span>adk<span class="op">.</span>Runner<span class="op">,</span> agent adk<span class="op">.</span>Agent<span class="op">,</span> checkpointID <span class="dt">string</span><span class="op">,</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>    input <span class="op">[]*</span>schema<span class="op">.</span>Message<span class="op">,</span> sink Sink<span class="op">,</span> ask Ask<span class="op">)</span> <span class="op">([]*</span>schema<span class="op">.</span>Message<span class="op">,</span> <span class="dt">error</span><span class="op">)</span></span></code></pre></div>
+<p>参数里有两个"标识"，管的是两件互不相干的事：</p>
+<ul>
+<li><code>checkpointID</code>：<strong>被挂起的那次执行状态存在哪</strong>——<code>CheckPointStore</code> 里的键，只有需要审批的入口才给得出值；</li>
+<li><code>root</code>：<strong>哪个 agent 说的话算这次对话的产出</strong>——用来过滤历史、给子代理的消息加前缀。 它由 <code>root := agent.Name(ctx)</code>（<code>turn.go:78</code>）从主 agent 自己身上取，不是脚本传进来的。</li>
+</ul>
+<p>它们唯一的交点在时间上：<code>resume</code> 之后 <code>Run</code> 的 <code>for</code> 循环会<strong>再调一次</strong> <code>consume(iter, root, sink)</code>（<code>turn.go:86</code>），也就是恢复后新产生的事件仍然按同一个 <code>root</code> 过滤、经 sink 呈现。由同一个参数承载、同一次 <code>Run</code> 内不变，这一点天然成立。</p>
+<h3 id="51-checkpointidcheckpointstore-里的键是暂停--恢复的-join-key">5.1 checkpointID：CheckPointStore 里的键，是"暂停 / 恢复"的 join key</h3>
+<p><code>Run</code> 里它只出现两次（<code>turn.go:80-82</code>、<code>:109</code>）：</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> checkpointID <span class="op">!=</span> <span class="st">&quot;&quot;</span> <span class="op">{</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    opts <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>opts<span class="op">,</span> adk<span class="op">.</span>WithCheckPointID<span class="op">(</span>checkpointID<span class="op">))</span> <span class="co">// 暂停时按这个键存快照</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="op">...</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>iter<span class="op">,</span> err <span class="op">=</span> runner<span class="op">.</span>ResumeWithParams<span class="op">(</span>ctx<span class="op">,</span> checkpointID<span class="op">,</span> <span class="op">&amp;</span>adk<span class="op">.</span>ResumeParams<span class="op">{</span>Targets<span class="op">:</span> targets<span class="op">})</span> <span class="co">// 按同一个键取回</span></span></code></pre></div>
+<p>两个阶段在 eino 里各自做了什么（eino v0.9.21）：</p>
+<ol type="1">
+<li><strong>暂停</strong>：<code>runner.Run(..., adk.WithCheckPointID(id))</code> 把 id 放进 <code>options.checkPointID</code>； 守卫中间件里 <code>compose.StatefulInterrupt</code>（<code>guard/middleware.go</code> 的 toolGuard / filesystem 两处； 定义在 <code>compose/interrupt.go:130</code>）让图停下时，<code>typedRunnerHandleIterImpl</code> 把<strong>整个 run 状态</strong> （<code>runContext</code>：session、ReAct 循环进度、<code>InterruptID2Address</code> / <code>InterruptID2State</code>、 <code>EnableStreaming</code>，外加 interrupt 载荷）gob 序列化后写进 <code>store[id]</code>——就是 <code>adk/runner.go:330-331</code> 那句 <code>if checkPointID != nil { runnerSaveCheckPointImpl(...) }</code>。 事件流最后以 <code>Action.Interrupted</code> 收尾。</li>
+<li><strong>恢复</strong>：<code>ResumeWithParams</code> → <code>runnerLoadCheckPointImpl</code>（<code>adk/interrupt.go:223</code>） 读 <code>store.Get(ctx, checkpointID)</code>；读不到就是那行 <code>checkpoint[%s] not exist</code> （<code>adk/interrupt.go:230</code>）。读回来后 <code>core.PopulateInterruptState</code>（<code>:243</code>）把中断点状态 还原进 ctx，<code>core.BatchResumeWithData</code>（<code>adk/runner.go:241</code>）把 <code>Targets</code> 注进 ctx， 然后从暂停点继续跑。</li>
+</ol>
+<p><code>internal/adkrun/turn.go:16</code> 的 <code>Store</code>（编译期断言 <code>var _ adk.CheckPointStore</code> 在 <code>:26-27</code>） 就是这个 store 的内存实现，注释原文"进程退出就没了，够演 interrupt"。</p>
+<p>所以：<strong>checkpointID 是一次"被挂起的执行"在 store 里的句柄</strong>，是 <code>Run</code> 与 <code>ResumeWithParams</code> 之间唯一的连接键。没有它，人做完审批也没有东西可以"接着跑"。</p>
+<p>顺带解释循环的顺序：<code>history = append(history, msgs...)</code>（<code>turn.go:87</code>）发生在检查 <code>interrupts</code> <strong>之前</strong>，所以中断前已经产生的事件（比如那次要求调用工具的助手消息）不会丢—— 最终 <code>history</code> 是跨越 interrupt / resume 边界的完整一轮产出。</p>
+<h3 id="52-root主-agent-的名字决定谁说的话进历史">5.2 root：主 agent 的名字，决定"谁说的话进历史"</h3>
+<p><code>root := agent.Name(ctx)</code>（<code>turn.go:78</code>），值来自 <code>config.AgentName()</code>：全仓库单点定义 <code>"yk-tako"</code> （<code>internal/config/model.go:28</code> 的 <code>const agentName</code>，由 <code>:31</code> 的 <code>AgentName()</code> 暴露）， 唯一入口的 <code>ChatModelAgentConfig.Name</code> 写它。</p>
+<p><code>root</code> 只有两个用途：</p>
+<ol type="1">
+<li><strong>筛历史</strong>（<code>turn.go:143</code>）：<code>if msg != nil &amp;&amp; event.AgentName == root { ... }</code>—— 只有 root 的消息进返回给调用方的 <code>history</code>；</li>
+<li><strong>加前缀</strong>（<code>cmd/yktako/sink.go:22-25</code> 的 <code>newREPLSink</code>）：非 root 的 agent 事件带 <code>[子代理名] </code> 前缀，终端里分得清谁在说话——T1 前这段逻辑在 <code>adkrun</code>，随打印一起搬走。</li>
+</ol>
+<p>为什么必须筛：runner 会 emit <strong>整个 agent 层级</strong>的事件——DeepAgent 的子代理、<code>AgentTool</code> 包住的内层 agent 都有自己的 ReAct 循环和 tool 消息。而 <code>history</code> 是下一轮喂回 root agent 的输入， 必须是结构合法的对话序列（<code>user</code> + root 的 <code>assistant</code>（带 tool calls）/ <code>tool</code> 回执）； 子代理内部的 tool 消息混进来，对 root 来说就是"没有对应 tool call 的 ToolMessage"，接口直接 400。</p>
+<p><strong>这个参数原来是要脚本手写的</strong>（旧签名 <code>Run(ctx, runner, checkpointID, root string, ...)</code>）。 改掉它是因为手写的那份与 <code>ChatModelAgentConfig.Name</code> 重复：对不上时不报错也不 panic， 只是 <code>history</code> 悄悄变空、子代理前缀不打了，属于最难查的那种错（<code>turn.go:64-70</code> 记了这笔账）。 现在 <code>root</code> 从"将要被 runner 跑的那个 agent"自己取，名字错位的可能性直接消失。</p>
+<blockquote>
+<p>历史注：<code>turn.go</code> 里还留过 <code>writeTodosTool</code> / <code>formatTodoReceipt</code>（认官方 <code>write_todos</code> 回执、 打印任务清单）与 <code>ensureNudgeCall</code>（修"有 tool_calls 但没有对应 ToolMessage"的配对问题，同一类 400 风险）。 前者由《02》Task 4 换成看板投影（认 <code>taskboard.IsBoardTool</code>），后者已随 <code>internal/planning</code> 删除。 保留这一句是为了让读者知道：<strong>这个文件里的行号会随任务推进变化，锚点以当前代码为准。</strong></p>
+</blockquote>
+<h2 id="6-编译期断言把漏实现提前到编译期">6. 编译期断言：把「漏实现」提前到编译期</h2>
+<p>Go 是结构化类型（structural typing）：类型不需要声明 <code>implements</code>，只要<strong>方法集 ⊇ 接口要求的方法集</strong> 就算实现了该接口——缺一个方法都不算。问题是「缺方法」平时不显形，直到某处把值赋给接口变量才报错， 而报错位置可能离类型定义十万八千里。于是本仓库在每个实现接口的类型旁边钉一行：</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 编译期校验 handler 实现了 adk.ChatModelAgentMiddleware。</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="kw">var</span> _ adk<span class="op">.</span>ChatModelAgentMiddleware <span class="op">=</span> <span class="op">(*</span>handler<span class="op">)(</span><span class="ot">nil</span><span class="op">)</span>   <span class="co">// internal/taskboard/middleware.go:27</span></span></code></pre></div>
+<p>拆开看这行语法在做什么：</p>
+<ul>
+<li><code>(*handler)(nil)</code> 是一个<strong>类型为 <code>*handler</code> 的 nil 指针</strong>；赋给 <code>_</code> 后从未被解引用， 运行时什么都不做。编译器只做一件事：检查 <code>*handler</code> 的方法集是否满足接口。</li>
+<li>用指针类型而不是 <code>handler{}</code>，是因为钩子方法都是指针接收者 （<code>func (h *handler) BeforeAgent(...)</code>）——<strong>只有 <code>*handler</code> 才有完整方法集</strong>， 值类型 <code>handler</code> 不含这些方法，拿去断言反而会报「未实现」。</li>
+</ul>
+<p>哪些改动会被它当场抓住：</p>
+<ol type="1">
+<li><strong>升级 eino 后接口新增方法</strong>，而 <code>handler</code> 和内嵌的 <code>BaseChatModelAgentMiddleware</code> 都没提供；</li>
+<li><strong>覆盖的方法签名改错</strong>（参数/返回值类型对不上接口）；</li>
+<li><strong>误删内嵌字段</strong>——这正是下一段的坑：方法提升让「谁补齐了哪些方法」读代码看不出来 （见 §3，<code>handler</code> 只写了 <code>BeforeAgent</code>，其余全靠 <code>adk.BaseChatModelAgentMiddleware</code> 提升）， 光看类型定义没法肉眼确认方法集是否全覆盖，只能让编译器验。</li>
+</ol>
+<p>没有断言时，这些错误会推迟到「第一次把值赋给接口」处（比如 <code>New</code> 的 <code>return &amp;handler{...}</code>） 才暴露，甚至随依赖升级悄悄潜伏；有断言则错误直接钉在类型定义旁边，一行注释说明校验的是什么。</p>
+<p>本仓库的同类断言：<code>internal/guard/middleware.go</code> 的 <code>toolGuardHandler</code>、 <code>internal/adkrun/turn.go:26-27</code> 的 <code>var _ adk.CheckPointStore</code>（Store 内存实现）。 这也是 AGENTS.md 把「实现接口必须配编译期断言」定为硬性规则的原因： <strong>接口归属靠注释给人看，方法集完整靠断言给编译器验，两者缺一不可。</strong></p>
+<h2 id="7-map-是无序的顺序用-order-切片--排序另行保障">7. map 是无序的：顺序用 <code>order</code> 切片 / 排序另行保障</h2>
+<p>Go 的 map 迭代顺序<strong>规范就不保证</strong>（运行时故意随机化，防止代码依赖插入序）。 <code>range map</code> 不报错、不 panic，只是每次顺序都可能不同——凡是要把 map 内容 <strong>输出给人或模型看</strong>的地方，顺序必须自己保障，否则同一份数据两次渲染的顺序都会抖。</p>
+<p>本仓库两处实例：</p>
+<ol type="1">
+<li><p><strong>任务看板</strong>（<code>internal/taskboard/taskboard.go:66-71</code>）：</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> Store <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    mu     sync<span class="op">.</span>Mutex</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    tasks  <span class="kw">map</span><span class="op">[</span><span class="dt">string</span><span class="op">]*</span>Task</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>    order  <span class="op">[]</span><span class="dt">string</span> <span class="co">// 创建顺序，看板按它排</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    nextID <span class="dt">int</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>分工是：<code>tasks map</code> 负责按 taskId 的 O(1) 寻址（<code>Get</code>/<code>Update</code>）， <code>order []string</code> 负责创建顺序——<code>Create</code> 在同一把锁里 <code>s.order = append(s.order, id)</code>， <code>List</code>/<code>Snapshot</code> 一律 <code>range s.order</code> 再回查 map、跳过 deleted。 于是看板（<code>board</code> 渲染的 <code>📋 任务看板</code>）永远按创建序输出， 模型每轮看到的清单顺序稳定，单测断言也不受 map 随机性影响。</p></li>
+<li><p><strong>provider 发现</strong>（<code>internal/config/resolve.go:94-108</code>）：<code>byID</code> map 存结果、 <code>order</code> 切片记首见顺序；扫环境变量前先收集 key 再 <code>sort.Strings(keys)</code> （注释原话「按变量名排序，结果稳定」）。map + order + 显式排序三件套， 与看板是同一个套路。</p></li>
+</ol>
+<p>三个坑点：</p>
+<ul>
+<li><strong>order 和 map 必须同锁读写</strong>。看板靠 <code>Store.mu</code> 保证原子性， 否则并发下会出现「map 里有、order 里没有」的撕裂——<code>List</code> 漏项且无从察觉。</li>
+<li><strong>deleted 不从 order 移除</strong>：<code>Snapshot</code> 含 deleted、<code>List</code> 过滤， 配合 <code>nextID</code> 单调自增，order 里不会出现悬空 id，也不需要删项逻辑。</li>
+<li><strong>别直接 <code>range tasks</code> 渲染看板</strong>：功能上全对，只是每次顺序都不一样， 属于最难查的「输出抖动」类 bug——测试偶尔挂、模型看到的清单忽前忽后。</li>
+</ul>
+<p>一句话：<strong>map 只管寻址，顺序是另一份数据结构的职责</strong>；要稳定输出，就在写入时顺手记 order， 或在输出前显式排序，二者选其一，别指望 range 帮你。</p>
+<h2 id="8-adkchatmodelagentmiddlewareboardmw接口切片字面量与-append-拼链">8. <code>[]adk.ChatModelAgentMiddleware{boardMW}</code>：接口切片字面量与 <code>append</code> 拼链</h2>
+<p><code>cmd/yktako/main.go:50</code> 组装 handlers 的那行，拆成三截看：</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a>handlers <span class="op">:=</span> <span class="bu">append</span><span class="op">([]</span>adk<span class="op">.</span>ChatModelAgentMiddleware<span class="op">{</span>boardMW<span class="op">},</span> guard<span class="op">.</span>Handlers<span class="op">(</span>engine<span class="op">,</span> guard<span class="op">.</span>Options<span class="op">{</span>WorkspaceRoot<span class="op">:</span> cwd<span class="op">})...)</span></span></code></pre></div>
+<ul>
+<li><code>[]adk.ChatModelAgentMiddleware{boardMW}</code>：<strong>接口类型的切片字面量</strong>。Go 里 <code>[]T{a, b}</code> 就是建一个装了初值的切片，<code>T</code> 可以是接口——元素放任何实现了该接口的值都行。 这里先造出只含 <code>boardMW</code> 的单元素切片。</li>
+<li><code>guard.Handlers(...)</code> 返回的也是 <code>[]adk.ChatModelAgentMiddleware</code>（<code>internal/guard/middleware.go:83</code>， 内含三件套 handler 指针）。</li>
+<li>第二个参数后的 <code>...</code> 把切片<strong>打散成逐个实参</strong>传给 <code>append</code>，效果是拼接两个切片； 不加 <code>...</code> 则会把整个切片当一个元素、类型直接不对。</li>
+</ul>
+<p>拼完 <code>handlers = [boardMW, toolGuard, filesystem, PII]</code>。顺序即注册顺序： <code>BeforeAgent</code> 按这个序串行执行（taskboard 先注入工具）， <code>WrapInvokableToolCall</code> 也按它包裹（命令守卫最外、PII 最贴工具，见《06》）。</p>
+<p><strong>为什么 <code>boardMW</code> 装得进去</strong>，两层原因：</p>
+<ol type="1">
+<li>Go 是结构化类型（见 §6）：<code>*handler</code> 内嵌 <code>adk.BaseChatModelAgentMiddleware</code>， 基类给出全部钩子的空实现，<code>*handler</code> 只覆盖 <code>BeforeAgent</code>——方法集依然覆盖接口要求， 编译器就认。<code>middleware.go:27</code> 的 <code>var _ adk.ChatModelAgentMiddleware = (*handler)(nil)</code> 正是把这件事提前交给编译器验。</li>
+<li>其实 <code>taskboard.New</code> 的返回类型本来就是 <code>adk.ChatModelAgentMiddleware</code> （<code>middleware.go:31</code>，<code>return &amp;handler{...}</code> 在函数边界已完成隐式装箱）。 <code>boardMW</code> 在 main 里已经是接口值，装进同类型切片是平凡操作。 接口值 =（动态类型 <code>*handler</code>, 动态值），切片元素存的就是这对信息。</li>
+</ol>
+<p><strong><code>adk.ChatModelAgentMiddleware</code> 是别名，不是新类型</strong>（<code>adk/handler.go:259</code>）：</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> ChatModelAgentMiddleware <span class="op">=</span> TypedChatModelAgentMiddleware<span class="op">[*</span>schema<span class="op">.</span>Message<span class="op">]</span></span></code></pre></div>
+<p>单个 <code>=</code> 是类型别名：它就是泛型接口 <code>TypedChatModelAgentMiddleware[M]</code> 在 <code>M = *schema.Message</code> 时的另一个名字。写 <code>[]adk.ChatModelAgentMiddleware</code> 和写 <code>[]adk.TypedChatModelAgentMiddleware[*schema.Message]</code> 完全等价，前者短得多。</p>
+<p>与 §3 的分工：§3 讲每个 handler 轮到自己时<strong>怎么改 runCtx</strong>；本节讲这些 handler <strong>以什么类型、按什么顺序</strong>排进 <code>ChatModelAgentConfig.Handlers</code> 这条链。</p>
+<p>一句话：<strong><code>[]接口{初值}</code> + <code>append(切片, 另一个切片...)</code> 是 Go 拼接口切片的标准写法； 一个值能不能装进去只看方法集，与它在哪儿定义、谁先返回无关。</strong></p>
+<h2 id="9-handlers-字段middleware-接口handler-实现三个名字指同一批东西">9. <code>Handlers</code> 字段、<code>Middleware</code> 接口、<code>handler</code> 实现：三个名字指同一批东西</h2>
+<p>读 eino 和本仓库代码容易被三个名字绊住：字段叫 <code>Handlers</code>、接口叫 <code>...Middleware</code>、 实现类型叫 <code>handler</code>（<code>internal/taskboard/middleware.go:20</code>、guard 的 <code>toolGuardHandler</code> 等）。 它们指的是同一批对象：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>叫法</th>
+<th>出处</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Handlers</code></td>
+<td>配置字段 <code>ChatModelAgentConfig.Handlers []TypedChatModelAgentMiddleware[M]</code>（<code>adk/chatmodel.go:401</code>）</td>
+</tr>
+<tr>
+<td><code>ChatModelAgentMiddleware</code></td>
+<td>这批东西的接口类型（<code>adk/handler.go:259</code> 的别名；基类 <code>BaseChatModelAgentMiddleware</code> 同理）</td>
+</tr>
+<tr>
+<td>handler</td>
+<td>eino 源码文件 <code>handler.go</code>、内部变量 <code>a.handlers</code>、文档用语 "interface-based handlers"（<code>chatmodel.go:314</code>）；本仓库的实现类型名也跟这个</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>为什么接口名里带 Middleware</strong>：历史包袱。旧 API 是 struct 型的 <code>Middlewares []AgentMiddleware</code>（<code>chatmodel.go:310-312</code>，已标 Deprecated，注释原话 "Use Handlers instead"）；新 API 把字段换成 interface 型的 <code>Handlers</code>， 接口名保留了 Middleware 词根（它们干的确实还是中间件的活：包模型调用、包工具执行）。</p>
+<p>规律：<strong>看到字段/文档说 Handlers，看到类型名说 Middleware，看到文件/变量/本仓库类型说 handler—— 一回事。</strong> 说"注册进 Handlers 的 middleware"不算错，只是把两个名字各取一半。</p>
+<h3 id="91-执行模型注册顺序--钩子顺序串行传递-runctx">9.1 执行模型：注册顺序 = 钩子顺序，串行传递 runCtx</h3>
+<p><code>config.Handlers</code> 在构造时存进 <code>a.handlers</code>（<code>chatmodel.go:565</code>），之后每个钩子点 都用同一个模式按序串行消费（<code>chatmodel.go:820</code>，<code>BeforeAgent</code> 为例；<code>:865</code> 的 <code>AfterAgent</code> 同型）：</p>
+<div class="sourceCode" id="cb11"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> i<span class="op">,</span> handler <span class="op">:=</span> <span class="kw">range</span> a<span class="op">.</span>handlers <span class="op">{</span>                    <span class="co">// 按注册顺序</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>    ctx<span class="op">,</span> runCtx<span class="op">,</span> err <span class="op">=</span> handler<span class="op">.</span>BeforeAgent<span class="op">(</span>ctx<span class="op">,</span> runCtx<span class="op">)</span> <span class="co">// 串行：上一个的输出是下一个的输入</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> ctx<span class="op">,</span> <span class="ot">nil</span><span class="op">,</span> fmt<span class="op">.</span>Errorf<span class="op">(</span><span class="st">&quot;handler[%d] (%T) BeforeAgent failed: %w&quot;</span><span class="op">,</span> i<span class="op">,</span> handler<span class="op">,</span> err<span class="op">)</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>三个推论：</p>
+<ol type="1">
+<li><strong>顺序由注册时的 <code>append</code> 定死</strong>：<code>cmd/yktako/main.go:50</code> 拼出 <code>[taskboard, 命令守卫, 文件守卫, PII]</code>——<code>BeforeAgent</code> 阶段 taskboard 先注入工具， 守卫三件套的 <code>BeforeAgent</code> 是基类空实现、原样透传。</li>
+<li><strong>同一个顺序也管工具执行时的包裹</strong>：<code>handlersToToolMiddlewares(a.handlers)</code> （<code>chatmodel.go:912</code>）把这批 handler 转成 <code>WrapInvokableToolCall</code> 链， 注册序 = 外层在前，所以是《06》说的"命令守卫最外、PII 最贴工具"。</li>
+<li><strong>runCtx 是逐手传递的状态</strong>：<code>nRunCtx := *runCtx</code> 的拷贝语义（§3）+ 循环里的 <code>runCtx = 返回值</code>，合起来保证每个 handler 看到的都是前一个改完的版本， 且谁都不动别人的原值；任一环报错，整个 run 以 <code>handler[i]</code> 定位失败并中止。</li>
+</ol>
+<p>一句话：<strong>Handlers 是字段名、Middleware 是接口名、handler 是源码与实现的称呼； 顺序在 <code>append</code> 进切片那一刻就定死，钩子沿序串行、靠 runCtx 逐手交接。</strong></p>
+<h2 id="10-goembed编译期把文件焊进二进制">10. <code>//go:embed</code>：编译期把文件"焊"进二进制</h2>
+<p><code>internal/config/catalog.go:13-14</code> 就是全部用法：</p>
+<div class="sourceCode" id="cb12"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">//go:embed provider-catalog.json</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="kw">var</span> catalogJSON <span class="op">[]</span><span class="dt">byte</span></span></code></pre></div>
+<p>很多人第一眼会以为"变量名 <code>catalogJSON</code> 配上了 <code>provider-catalog.json</code>，所以自动赋值"—— <strong>不是。绑定是位置式的，与变量名无关</strong>。编译器做的事等价于：</p>
+<div class="sourceCode" id="cb13"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="kw">var</span> catalogJSON <span class="op">[]</span><span class="dt">byte</span> <span class="op">=</span> <span class="op">&lt;</span>紧邻指令里那个文件的全部原始字节<span class="op">&gt;</span></span></code></pre></div>
+<p>决定装哪个文件的是指令后面的路径，变量只是接收方。实测：<code>//go:embed some/other.json</code> 紧贴 <code>var catalogJSON []byte</code>，装进去的就是 <code>other.json</code>；反过来 <code>//go:embed provider-catalog.json</code> 配 <code>var anything []byte</code> 一样成立。</p>
+<h3 id="101-硬性条件附实测报错">10.1 硬性条件（附实测报错）</h3>
+<ol type="1">
+<li><strong><code>//</code> 与 <code>go:embed</code> 之间不能有空格</strong>——它是编译器指令（Go 1.16+），不是注释。 写成 <code>// go:embed</code> 不报错、不警告（<code>go vet</code> 也查不出），只是<strong>静默退化成普通注释</strong>、 变量保持零值；在本仓库的后果是启动才报 <code>解析厂商目录: unexpected end of JSON input</code>， 错误信息完全指不到真正的笔误。</li>
+<li><strong>文件必须导入 <code>embed</code></strong>，哪怕一个符号都不用：<code>import _ "embed"</code>。少了它编译报 <code>go:embed requires import "embed" (or import _ "embed", if package is not used)</code>。</li>
+<li><strong>只能修饰包级 var</strong>（单个，或在 <code>var (...)</code> 块里）。函数内报 <code>go:embed cannot apply to var inside func</code>；变量类型不是 <code>string</code> / <code>[]byte</code> / <code>embed.FS</code> 报 <code>go:embed cannot apply to var of type int</code>；指令后面没有变量报 <code>misplaced go:embed directive</code>。</li>
+<li><strong>路径相对源码文件所在目录</strong>：可以进子目录（<code>//go:embed assets/data.json</code>）， 但不能含 <code>..</code>（报 <code>invalid pattern syntax</code>）。</li>
+<li><strong>文件/模式必须在编译期就匹配上</strong>：<code>pattern nono.json: no matching files found</code>。 注意这是<strong>编译错误</strong>——"文件不存在"这类运行期风险被整个消灭了。</li>
+<li><strong><code>[]byte</code> / <code>string</code> 只能装恰好一个文件</strong>：<code>//go:embed *.json</code> 匹配到两个时报 <code>invalid go:embed: multiple files for type []byte</code>。多个文件或整个目录要声明成 <code>embed.FS</code> （读时 <code>fs.ReadFile("other.json")</code>；<code>all:</code> 前缀才会带上 <code>.</code>、<code>_</code> 开头的文件）。</li>
+<li>指令与 var 之间只允许空行或 <code>//</code> 行注释（实测夹一个空行仍生效；多条 <code>//go:embed</code> 可叠加到同一个 var）。</li>
+</ol>
+<h3 id="102-运行期语义与选它的理由">10.2 运行期语义与选它的理由</h3>
+<p>编译时文件字节被写进可执行文件（只读数据段），运行期 <code>catalogJSON</code> 就是个普通 <code>[]byte</code>： 无 <code>os.Open</code>、不依赖工作目录、二进制拷到哪都能跑；<strong>改 JSON 必须重新编译</strong>，二进制体积 += 文件大小。</p>
+<p><code>catalog.go</code> 选 embed 而不是 <code>os.ReadFile</code>，图的不是"方便"，是<strong>把保证挪到编译期</strong>： 厂商目录"一定在"成为构建的一部分，<code>mustPresets()</code>（catalog.go:88）的 panic 只剩 "JSON 格式坏"一种触发方式；同时部署零配置、零路径依赖。代价是目录不能在部署后热改—— 要覆盖只能走环境变量三级覆盖（resolve.go:50-75），这本来就是设计的一部分。</p>
+<p>一句话：<strong><code>//go:embed &lt;相对路径&gt;</code> = 编译期把该文件内容赋给紧邻的包级 var； 认的是"位置 + 路径"而不是变量名，文件缺失、类型不符当场编译失败， 唯一的静默坑是 <code>//</code> 后多打出的那个空格。</strong></p>
+<h2 id="11-interrupt-信号树的方向与-isrootcause一个被命名误导的契约">11. interrupt 信号树的方向与 <code>IsRootCause</code>：一个被命名误导的契约</h2>
+<blockquote>
+<p>本节记录一个真实的误读案例与排查结论。它同时是一道很好的面试题： 「<code>InterruptContexts</code> 里装的是真因还是祖先？」——答对的前提是分清两种「root」。</p>
+</blockquote>
+<h3 id="111-症状adkrun-里那行没人解释得清的过滤">11.1 症状：<code>adkrun</code> 里那行没人解释得清的过滤</h3>
+<p><code>internal/adkrun/turn.go:147-156</code>：</p>
+<div class="sourceCode" id="cb14"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> _<span class="op">,</span> point <span class="op">:=</span> <span class="kw">range</span> event<span class="op">.</span>Action<span class="op">.</span>Interrupted<span class="op">.</span>InterruptContexts <span class="op">{</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> point <span class="op">!=</span> <span class="ot">nil</span> <span class="op">&amp;&amp;</span> point<span class="op">.</span>IsRootCause <span class="op">{</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>        interrupts <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>interrupts<span class="op">,</span> point<span class="op">)</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="bu">len</span><span class="op">(</span>interrupts<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>    interrupts <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>interrupts<span class="op">,</span> event<span class="op">.</span>Action<span class="op">.</span>Interrupted<span class="op">.</span>InterruptContexts<span class="op">...)</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>一个自然但<strong>方向反了</strong>的读法：「信号树会在 root 汇聚，root 拥有所有叶子的中断， 所以 <code>IsRootCause==true</code> 的应该是树根，这行过滤是在挑祖先。」 实情恰好相反：<strong><code>IsRootCause=true</code> 的是叶子</strong>（最内层真正按下暂停的组件）， 树根（最外层包装者）恰恰是 <code>false</code>，永远不会进列表。</p>
+<p>根源是术语撞车：<code>root cause</code>（因果起点，在树底）与信号树的 root（结构顶端）指向两端。 英文一个词，中文若都叫「根」，必错。</p>
+<h3 id="112-事实一哪端是-true由有没有子节点现场决定">11.2 事实一：哪端是 true，由「有没有子节点」现场决定</h3>
+<p><code>core.Interrupt</code>（<code>internal/core/interrupt.go:88-125</code>）创建信号时只做一句判定：</p>
+<div class="sourceCode" id="cb15"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="bu">len</span><span class="op">(</span>subContexts<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>    myPoint<span class="op">.</span>IsRootCause <span class="op">=</span> <span class="ot">true</span>   <span class="co">// :102-103</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>「没有子节点」= 这个组件不是替谁传话，是它自己发起了中断。 对照项目里一条完整的包装链：</p>
+<pre><code>guard 的 WrapInvokableToolCall
+  └ compose.StatefulInterrupt(...)           → 叶子信号：无 Subs，true
+      （internal/guard/middleware.go:119 / :192）
+ToolsNode 捕获各工具错误
+  └ WrapInterruptAndRerunIfNeeded            （compose/tool_node.go:1217）
+  └ CompositeInterrupt(..., errs...)         → 父信号：Subs=[这些错误]，false
+      （compose/tool_node.go:1246；实现 compose/interrupt.go:174-237）
+ChatModelAgent 捕获 compose 中断
+  └ FromInterruptContexts + TypedCompositeInterrupt → 再包一层父，false
+      （adk/chatmodel.go:970-971）
+Runner 顶层
+  └ interruptSignal = 最外层信号             （adk/runner.go:314）</code></pre>
+<p>画成树（Runner 手里的 <code>is</code> 就是最外层那个；中间层数随嵌套深度变化）：</p>
+<pre><code>信号树（从 Runner 的 is 往下看）              IsRootCause
+└─ ChatModelAgent composite                     false   ← 结构性「树根」，拥有所有叶子
+   └─ ToolsNode composite                        false
+      └─ guard StatefulInterrupt 的叶子           true   ← 列表里只有它</code></pre>
+<p><code>CompositeInterrupt</code> 保住了这棵树：裸的 <code>*core.InterruptSignal</code> 直接收下 （<code>compose/interrupt.go:216-220</code>），最后统一 <code>core.Interrupt(ctx, info, state, cErrs)</code>（<code>:232</code>）—— 父节点因有子节点，<code>IsRootCause</code> 保持 false。</p>
+<h3 id="113-事实二导出列表只收真因祖先走-parent">11.3 事实二：导出列表只收真因，祖先走 <code>Parent</code></h3>
+<p><code>ToInterruptContexts</code>（<code>internal/core/interrupt.go:249-298</code>）从树顶往下遍历，每个节点都看， 但只 append 真因（<code>:274-276</code>）：</p>
+<div class="sourceCode" id="cb18"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> currentCtx<span class="op">.</span>IsRootCause <span class="op">{</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a>    rootCauseContexts <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>rootCauseContexts<span class="op">,</span> currentCtx<span class="op">)</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>官方文档把不变量写得明白（pkg.go.dev，<code>ToInterruptContexts</code>）：</p>
+<blockquote>
+<p>a list of user-facing InterruptCtx objects <strong>for the root causes</strong> of the interruption. Each returned context has its Parent field populated..., allowing traversal up the interrupt chain.</p>
+</blockquote>
+<p>即：<strong>列表恒为真因；祖先只经 <code>Parent</code> 链可达，且在链上恒为 false</strong>—— eino 自己的测试断言这一点（<code>compose/resume_test.go:339</code> 的 <code>assert.False(t, rootCause.Parent.IsRootCause)</code>）。</p>
+<p><code>Parent</code> 链不是装饰，是跨层桥接的必需品：<code>FromInterruptContexts</code>（<code>:202-247</code>） 沿 <code>Parent</code> 往上回溯、逐级 <code>getOrCreateSignal</code> 重建整棵树（<code>rootSignal</code> 收在最顶端，<code>:236</code>）， <code>adk/chatmodel.go:970</code> 那种跨 agent 边界的中断才能带着完整地址链重新上抛。 <strong>变量命名再次埋雷</strong>：这个顶端叫 <code>rootSignal</code>——结构性树根，与 <code>IsRootCause</code> 的「真因」反向。</p>
+<h3 id="114-事实三v0921-全部导出点都走同一个函数">11.4 事实三：v0.9.21 全部导出点都走同一个函数</h3>
+<p>给 <code>InterruptContexts</code> 赋值的地方穷举：<code>compose/graph_run.go:631/787</code>、 <code>adk/runner.go:299/315</code>、<code>adk/interrupt.go:72/107/143</code>、<code>adk/workflow.go:616</code>—— 全部调用 <code>core.ToInterruptContexts</code>。 推论：<strong>「列表里混有祖先」在当前版本不会发生</strong>。<code>adkrun</code> 那行过滤在标准 ADK 路径上是 无害的 no-op；<code>if len==0</code> 兜底防的是罕见退化形态（如 legacy 包装丢子树， 见 <code>compose/interrupt.go:197-211</code>），不是日常路径。</p>
+<h3 id="115-事实四文档自相矛盾官方测试还在传播防御写法">11.5 事实四：文档自相矛盾，官方测试还在传播防御写法</h3>
+<p>字段注释（<code>adk/interrupt.go:52-54</code>）说：</p>
+<blockquote>
+<p>InterruptContexts provides a structured, user-facing view of the interrupt chain. <strong>Each context represents a step in the agent hierarchy that was interrupted.</strong></p>
+</blockquote>
+<p>照字面读 = 列表是混合的、祖先也在，过滤当然必要。这与 <code>ToInterruptContexts</code> 的文档正好相反。</p>
+<p>而 eino 自己的测试就写着这行过滤（<code>adk/agentic_react_test.go:1155-1162</code>、<code>:1310-1316</code>）：</p>
+<div class="sourceCode" id="cb19"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> _<span class="op">,</span> intCtx <span class="op">:=</span> <span class="kw">range</span> interruptEvent<span class="op">.</span>Action<span class="op">.</span>Interrupted<span class="op">.</span>InterruptContexts <span class="op">{</span></span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> intCtx<span class="op">.</span>IsRootCause <span class="op">{</span></span>
+<span id="cb19-3"><a href="#cb19-3" aria-hidden="true" tabindex="-1"></a>        rootCauseID <span class="op">=</span> intCtx<span class="op">.</span>ID</span>
+<span id="cb19-4"><a href="#cb19-4" aria-hidden="true" tabindex="-1"></a>        <span class="cf">break</span></span>
+<span id="cb19-5"><a href="#cb19-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb19-6"><a href="#cb19-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>于是形成闭环：字段文档暗示混合 → 官方测试/示例防御性过滤 → 使用者照抄。 <strong>没有哪个开发者有义务靠读实现来猜对。</strong></p>
+<h3 id="116-结论机制没错契约缺陷">11.6 结论：机制没错，契约缺陷</h3>
+<ul>
+<li>机制上树与叶子都必需：树撑住跨层地址（resume 按地址重入），列表给出待回答的问题。</li>
+<li><code>IsRootCause</code> 字段真正的用途是<strong>区分手里这个 ctx 的角色</strong>——列表成员=真因 / <code>Parent</code> 链上的祖先=包装——而不是让你过滤列表。这一点框架从未说清。</li>
+<li>缺陷在对外表达：一个冗余的 flag、两段互斥的文档、官方测试亲手示范冗余过滤。</li>
+<li>若重设计：字段改名 <code>RootCauses []*InterruptCtx</code> 并从公共类型删掉 flag；或保留单类型 但把 invariant 写死；或 resume 改发句柄 <code>point.ResumeKey()</code> 而非裸 ID。</li>
+</ul>
+<p><strong>对本仓库的实践结论</strong>：<code>internal/adkrun/turn.go:147-156</code> 的过滤保留无害 （意图自明 + 防御），但真正承担正确性的是 <code>targets[point.ID] = decision</code> （<code>turn.go:97-107</code>）与只回答 <code>point.Info</code>；想验证「no-op」判断，去掉 <code>if</code> 条件跑全量测试， 标准 adk 路径应全绿。</p>
+<p>一句话：<strong>列表装的是真因（叶子），树根只是携带者；<code>IsRootCause</code> 判断的是「手里这个 ctx 是提问者还是信封」——「root」一词同时指向因果起点与结构顶端，是这个 API 最坑人的地方。</strong></p>
+<h2 id="12-resume-的中段targets-与-getresumecontext-如何相遇地址钥匙--ctx-公告板">12. resume 的中段：<code>Targets</code> 与 <code>GetResumeContext</code> 如何相遇（地址钥匙 + ctx 公告板）</h2>
+<blockquote>
+<p>承接 §5（checkpointID 是 join key）与 §11（真因与列表）。本节回答： <code>adkrun</code> 写的 <code>Targets</code> 和 guard 读的 <code>GetResumeContext</code> 分居两个文件、互不引用， 中间到底发生了什么？结论先行：<strong>两端没有任何函数调用相连，耦合发生在运行时 ctx 里—— 中断时树把「ID ↔︎ 地址」登记进 checkpoint，resume 时 <code>AppendAddressSegment</code> 按当前地址认领 <code>Targets</code> 里的数据挂到 ctx，wrapper 重跑时自己读走。</strong></p>
+</blockquote>
+<h3 id="121-症状两端互不引用跨度大得可疑">12.1 症状：两端互不引用，跨度大得可疑</h3>
+<ul>
+<li>写入端（<code>internal/adkrun/turn.go:97-109</code>）：<code>targets[point.ID] = decision</code>， 然后 <code>runner.ResumeWithParams(ctx, checkpointID, &amp;adk.ResumeParams{Targets: targets})</code>。</li>
+<li>读取端（<code>internal/guard/middleware.go:98-107</code>）：<code>ownInterrupt</code> + <code>resumeDecision</code> → <code>compose.GetResumeContext[string](ctx)</code>。</li>
+<li>grep 结果：<code>turn.go</code> 里没有 <code>compose.GetResumeContext</code>，<code>middleware.go</code> 里没有 <code>Targets</code>。 两边像是各说各话，却精确地接上了。</li>
+</ul>
+<h3 id="122-事实一resumewithparams-只做两件事恢复现场--立公告板">12.2 事实一：<code>ResumeWithParams</code> 只做两件事——恢复现场 + 立公告板</h3>
+<p><code>resumeInternal</code>（<code>adk/runner.go:210-242</code>）里：</p>
+<div class="sourceCode" id="cb20"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a>ctx<span class="op">,</span> runCtx<span class="op">,</span> resumeInfo<span class="op">,</span> err <span class="op">:=</span> runnerLoadCheckPointImpl<span class="op">(...)</span>  <span class="co">// :211 读回整个执行现场</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="op">...</span></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a>ctx <span class="op">=</span> setRunCtx<span class="op">(</span>ctx<span class="op">,</span> runCtx<span class="op">)</span>                                   <span class="co">// :237 现场进 ctx</span></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a><span class="op">...</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="bu">len</span><span class="op">(</span>resumeData<span class="op">)</span> <span class="op">&gt;</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a>    ctx <span class="op">=</span> core<span class="op">.</span>BatchResumeWithData<span class="op">(</span>ctx<span class="op">,</span> resumeData<span class="op">)</span>            <span class="co">// :241 Targets 进 ctx</span></span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a><span class="op">...</span></span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a>aIter <span class="op">:=</span> ra<span class="op">.</span>Resume<span class="op">(</span>ctx<span class="op">,</span> resumeInfo<span class="op">,</span> opts<span class="op">...)</span>                   <span class="co">// :252 重新驱动 agent</span></span></code></pre></div>
+<ul>
+<li>解码 checkpoint 得到序列化结构体里的 <code>InterruptID2Address</code> / <code>InterruptID2State</code> （<code>adk/interrupt.go:219-220</code>），随即 <code>core.PopulateInterruptState(ctx, ...)</code> （<code>adk/interrupt.go:243</code>）把「哪个 ID 在哪个地址、旧状态是什么」铺进 ctx。</li>
+<li><code>BatchResumeWithData</code>（<code>internal/core/address.go:245-269</code>）只把 map 拷贝进 <code>globalResumeInfo.id2ResumeData</code>。<strong>到这里为止什么都没「送」给谁，只是立了块公告板。</strong></li>
+<li>提醒（§11 的续集）：<code>InterruptCtx.ID</code> 注释说它是「地址拼成的字符串」，但 v0.9.21 实现里 它是中断时生成的 UUID（<code>internal/core/interrupt.go:105/116</code>）；把 ID 与地址挂钩的， 正是 checkpoint 里这张 <code>id2addr</code> 映射。所以 <code>Targets</code> 的 key 只能照抄 <code>point.ID</code>， 不要试图从 key 字面读出地址。</li>
+</ul>
+<h3 id="123-事实二重入时-appendaddresssegment-按地址认领">12.3 事实二：重入时 <code>AppendAddressSegment</code> 按地址认领</h3>
+<p>resume 不是「跳到断点」，而是从 checkpoint 恢复现场后沿地址链重入 （ADK 层用 <code>GetNextResumptionPoints</code> 找出该重入的子链路，<code>adk/interrupt.go:419/444</code>）。 执行每下钻一层，框架就调一次 <code>AppendAddressSegment(ctx, 类型, ID, 子ID)</code> （<code>internal/core/address.go:118-187</code>）生成本层地址；而这个函数后半段顺便查公告板：</p>
+<div class="sourceCode" id="cb21"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> id_<span class="op">,</span> addr <span class="op">:=</span> <span class="kw">range</span> rInfo<span class="op">.</span>id2Addr <span class="op">{</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> addr<span class="op">.</span>Equals<span class="op">(</span>currentAddress<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a>        runCtx<span class="op">.</span>interruptState <span class="op">=</span> generic<span class="op">.</span>PtrOf<span class="op">(</span>rInfo<span class="op">.</span>id2State<span class="op">[</span>id_<span class="op">])</span>  <span class="co">// :157 旧状态挂上</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a>        <span class="op">...</span></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">!</span>used <span class="op">{</span></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a>            runCtx<span class="op">.</span>isResumeTarget <span class="op">=</span> <span class="ot">true</span>                            <span class="co">// :171 回执挂上</span></span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a>            runCtx<span class="op">.</span>resumeData <span class="op">=</span> rData</span>
+<span id="cb21-8"><a href="#cb21-8" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb21-9"><a href="#cb21-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb21-10"><a href="#cb21-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb21-11"><a href="#cb21-11" aria-hidden="true" tabindex="-1"></a><span class="co">// :175-184 自己没被点名、但有子孙被点名 → isResumeTarget=true（只当导管，不领数据）</span></span></code></pre></div>
+<p><strong>地址对上号的瞬间，数据被挂到该组件的 ctx 上</strong>——不是参数传下来的，是自查出来的。 地址之所以能对上，是因为工具段的地址子 ID 就是 tool_call_id，重入时从 checkpoint 恢复的同一条消息历史里取回，前后一致。</p>
+<h3 id="124-事实三wrapper-重跑自己读信">12.4 事实三：wrapper 重跑，自己读信</h3>
+<p>被中断的节点重入 = 它的执行链原样再走一遍，所以 <code>WrapInvokableToolCall</code> 包出的函数 自然再跑一次。<strong>这不是「框架悄悄帮你执行」，而是首次执行路径的直接复用，没有任何 resume 专用分支</strong>；read 端只在 guard 自己写的两行里（<code>guard/middleware.go:98-99</code>）：</p>
+<div class="sourceCode" id="cb22"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> stored<span class="op">,</span> ok <span class="op">:=</span> ownInterrupt<span class="op">(</span>ctx<span class="op">,</span> kindToolGuard<span class="op">);</span> ok <span class="op">{</span>  <span class="co">// GetInterruptState：认出「我被打断过」</span></span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a>    decision<span class="op">,</span> decided <span class="op">:=</span> resumeDecision<span class="op">(</span>ctx<span class="op">)</span>              <span class="co">// GetResumeContext：取回执</span></span></code></pre></div>
+<p><code>GetInterruptState</code> / <code>GetResumeContext</code>（<code>internal/core/resume.go:28-41、86-104</code>） 都只是当前 <code>addrCtx</code>（<code>internal/core/address.go:81-86</code>）的薄读取器——不看 <code>Targets</code>、 不看信号树、不看 checkpoint。这就是为什么 <code>middleware.go</code> 里「看不到跨度」：它不需要看到。</p>
+<h3 id="125-为什么读代码会觉得跨度大三个隐性耦合">12.5 为什么读代码会觉得跨度大：三个隐性耦合</h3>
+<ol type="1">
+<li><strong>数据耦合，不是调用耦合</strong>。写入端写 <code>targets[point.ID]</code>，读取端被 core 按地址匹配后 自动挂数据；两端唯一共识是那把钥匙（ID/地址），没有任何函数把两边连起来。</li>
+<li><strong>词汇在边界换名三次</strong>：<code>Targets</code>（ADK 词汇）→ <code>id2ResumeData</code> / <code>resumeData</code> （core 词汇）→ <code>GetResumeContext</code>（compose API）。同一个 map，三个名字。</li>
+<li><strong>重入是隐式的</strong>：hook 语义是「每次工具即将执行时调用」，resume 重入天然再次触发； 不先知道「resume = 重入」，就会以为哪里藏了个开关。</li>
+</ol>
+<h3 id="126-全链路一图把-5-与-11-串起来">12.6 全链路一图（把 §5 与 §11 串起来）</h3>
+<pre><code>中断时刻：
+  guard StatefulInterrupt（叶子信号）
+    → 层层 CompositeInterrupt 成树
+    → SignalToPersistenceMaps 压成 id2addr / id2state（core/interrupt.go:330-353）
+    → 随 runContext 写进 CheckPointStore（adk/runner.go:330-331）
+    → ToInterruptContexts 导出真因列表给 adkrun（turn.go 拿到 point.ID / point.Info）
+
+resume 时刻：
+  targets[point.ID] = decision
+    → runnerLoadCheckPointImpl 读回 id2addr / id2state（adk/interrupt.go:223-249）
+    → PopulateInterruptState：状态表进 ctx（:243）
+    → BatchResumeWithData：回执表进 ctx（runner.go:241）
+    → 重入被中断的节点链（GetNextResumptionPoints，adk/interrupt.go:419/444）
+    → AppendAddressSegment 按当前地址认领状态与回执，挂到 addrCtx（address.go:154-184）
+    → wrapper 重跑，GetResumeContext 读走决定
+    → 批准：真工具执行，输出成 ToolMessage；拒绝：拒绝文案成 ToolMessage
+    → ReAct 循环继续下一轮模型调用</code></pre>
+<p>一句话：<strong>中断时树当登记员，把「ID ↔︎ 地址」写进 checkpoint；resume 时按地址认领、 数据挂在 ctx 上；wrapper 重跑时自己读走——没有传话员，只有认领。</strong></p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/archive/old-line/09-%E8%AE%BE%E8%AE%A1%E4%BA%86%E8%A7%A3.md"><code>doc/archive/old-line/09-设计了解.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

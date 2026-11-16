@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>54 · 运行级追踪：OTel GenAI 语义 + CozeLoop 上报 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="54--运行级追踪otel-genai-语义--cozeloop-上报">54 · 运行级追踪：OTel GenAI 语义 + CozeLoop 上报</h1>
+<blockquote>
+<p>性质：<strong>方案（已落地，2026-10-31）</strong>。 状态：✅ A1–A9 全部施工并验收（2026-10-31）：<code>POST /api/dev/trace-check</code> 回 <code>exported:true</code>；真 run 产出根 <code>invoke_agent yktako</code> + <code>chat</code> / <code>execute_tool</code> / <code>tako.step.*</code> 子 span，引擎日志带 <code>traceId=</code>；<code>go test ./internal/runengine ./internal/observability</code> 全绿。台账在 <code>tmp/cozeloop/</code>（不入库）。<strong>2026-11-01 增补</strong>：第二个出口 Langfuse（<code>LANGFUSE_*</code>，与 CozeLoop 可双发、可单发），并实测确认 <code>gen_ai.*</code> 到 Langfuse 原生模型的映射与 v2 读回路径（§3.1）。 日期：2026-10-31。 代码落点：<code>yk-tako-eino/internal/observability/</code>（装配、内容序列化、开关）、<code>internal/runengine/{trace.go,trace_run.go}</code>（run 根 span / chat / 入口 / 探针 / 求和）、<code>worker.go</code>、<code>journal.go</code>、<code>recall.go</code>、<code>compact.go</code>、<code>memory.go</code>、<code>server.go</code>、<code>cmd/yktako/main.go</code>、<code>yk-tako-eino/.env</code>（内容开关，不入库）。 参照：OpenTelemetry GenAI 语义（<code>gen_ai.*</code>，semantic-conventions-genai）；CozeLoop 的 OTLP 接入点（<code>https://api.coze.cn/v1/loop/opentelemetry/v1/traces</code>，http/protobuf）。 与 doc/27 的关系：27 把<strong>单次模型调用的账单</strong>摆到 runlive 帧与 runlog 行；本篇把<strong>整场 run 的结果</strong>摆到外部观测面。27 是账本，54 是门牌——不改 27 的帧与行。</p>
+</blockquote>
+<hr />
+<h2 id="0-为什么现在做这一层">0. 为什么现在做这一层</h2>
+<h3 id="01-一个具体的排查故事">0.1 一个具体的排查故事</h3>
+<p>今天要看一场 run 干得怎么样，人得打开页面翻帧、或者 <code>curl /api/runs/{id}/frames</code> 把几十上百帧拉下来，自己按 <code>eventOffset</code> 拼时间线：哪一枪模型慢、哪次工具等了三分钟、折叠发生在第几轮、最后为什么 error。</p>
+<p>这在「一场 run」里勉强能用。跨 run 就断了：</p>
+<ul>
+<li>某个租户连续十场 run 都在 2 秒内失败——没人知道，直到他投诉；</li>
+<li>同一句提示词换模型后平均耗时翻倍——要靠人手动跑两次掐表；</li>
+<li>线上出现一个慢 run，你想把它和昨天那批「同项目、同模型、同租户」的 run 放一起比——现在没有一个按字段可检索的集合。</li>
+</ul>
+<p>CozeLoop（扣子罗盘）的 Trace 面正好是这样一个集合：一条 run 一条可检索记录，带起止时间、状态、模型、token 用量；点进去能看时间线。把它接上，上面三件事从「手工翻」变成「搜一下」。</p>
+<h3 id="02-为什么是-otel-genai不是-cozeloop-私有格式">0.2 为什么是 OTel GenAI，不是 CozeLoop 私有格式</h3>
+<p>CozeLoop 的 Go SDK 和 eino adapter 产出的是它自己的 span 模型：<code>span_type</code> 只有 agent / model / tool，业务属性是 <code>model_name</code>、<code>input_tokens</code>、<code>output_tokens</code>、<code>input</code>、<code>output</code> 这些自家 tag。用它接，字段名就绑死在 Loop 这一个后端；哪天换 Tempo、Jaeger、云厂商 APM，整套埋点要重写。</p>
+<p>OpenTelemetry GenAI 语义约定（<code>gen_ai.*</code>）是这一层的公共语言：模型调用叫 <code>chat</code>、agent 调用叫 <code>invoke_agent</code>、token 叫 <code>gen_ai.usage.input_tokens</code>。按它写，Loop 只是<strong>第一个消费方</strong>，换后端不用改代码。</p>
+<p>好消息是 Loop 支持 OTLP 接入（HTTP/protobuf），所以两条都要：<strong>语义按 OTel GenAI 写，传输走 OTLP 发给 Loop</strong>。</p>
+<h3 id="03-代价记录是一棵逐步长出来的树">0.3 代价：记录是一棵逐步长出来的树</h3>
+<p>Loop 原生 adapter 能自动产出「每次模型调用、每次工具执行」的子 span；走 OTel 自建，这棵树要一拍一拍搭：</p>
+<ul>
+<li>第一段（A1–A3）只有一条 run 级 <code>invoke_agent</code> span——时间线上是一个点，不是一棵树；</li>
+<li>A4 用模型包装层补每次模型调用的 <code>chat</code> 子 span（§2.1）；</li>
+<li>A5 用工具包装层补每次工具执行的 <code>execute_tool</code> 子 span；</li>
+<li>A6 再往上补一条 HTTP 入口 span（<code>POST /api/runs</code>），让 trace 从「服务收到请求」开始，而不是从 worker 起跑开始（§2.4）；</li>
+<li>A7–A9 补 run 内部的步骤 span：召回（<code>tako.step.recall</code> → <code>search_memory</code> / <code>retrieval</code>）、折叠（<code>tako.step.compact</code>）、准入/装历史/定稿（<code>tako.step.quota</code> / <code>workspace</code> / <code>history</code> / <code>finalize</code>）、后台记忆抽取（独立 trace 的 <code>tako.step.memory_extract</code>），回答「recall/compact 这些步骤各花了多久」（§2.6）。</li>
+</ul>
+<p>换来的是：字段名与后端解耦；而且每一拍落下来都有独立价值——run 记录先能检索、对账、告警，子 span 再逐步把时间线补全。</p>
+<hr />
+<h2 id="1-名词钉死">1. 名词钉死</h2>
+<ul>
+<li><strong>span（跨度）</strong>：一段有开始时间、结束时间、一组属性的操作记录。OTel 里一次 trace 是一棵 span 树，根 span 代表整件事。<strong>本篇要的「Run 记录」是这棵树里那条 <code>invoke_agent</code> span</strong>——不是一行日志。第一段（A2）它就是根；A6 加上 HTTP 入口 span 后，根变成「服务收到 POST /api/runs」那条 span，run 记录挂在它下面（同一 traceId、同一次业务动作）。OTel GenAI 语义约定的主载体是 span，日志行（LogRecord）不是。</li>
+<li><strong>OTLP</strong>：OpenTelemetry 的标准导出协议。SDK 把 span 编码成 protobuf，按 HTTP POST 发给采集端。Loop 的接入点是 <code>https://api.coze.cn/v1/loop/opentelemetry/v1/traces</code>，请求头两个：<code>cozeloop-workspace-id: &lt;空间 ID&gt;</code>、<code>authorization: Bearer &lt;访问令牌&gt;</code>。</li>
+<li><strong><code>gen_ai.*</code> 属性</strong>：OTel GenAI 语义约定规定的属性名。例如 <code>gen_ai.operation.name=invoke_agent</code>、<code>gen_ai.request.model=deepseek-flash</code>、<code>gen_ai.usage.input_tokens=1234</code>。</li>
+<li><strong><code>cozeloop.span_type</code></strong>：Loop 用来给自定义 span 分类的属性。不写它，Loop 会把 span 归成不可分类；本篇写 <code>agent</code>，A1 实跑若显示 CUSTOM 就改回 <code>custom</code>（以观测结果为准）。</li>
+<li><strong>步骤 span</strong>：run 内部一段非 GenAI 操作（召回、折叠、准入、定稿、后台抽取）的 INTERNAL span，用 <code>tako.step.*</code> 命名、父 span 是 run 根 span。它不是 <code>chat</code>/<code>execute_tool</code> 那种语义约定操作，只用来回答「这一段花了多久」（§2.6）。</li>
+<li><strong>内容开关</strong>：<code>OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT</code>，规范定义的 Opt-In 开关。<code>SPAN_ONLY</code> = 内容写进 span 属性；<code>NO_CONTENT</code> = 不写。它只控制内容是否存在，不影响 span 的存在与结构（§2.2）。</li>
+</ul>
+<hr />
+<h2 id="2-run-级记录的形状">2. Run 级记录的形状</h2>
+<p>一条名为 <code>invoke_agent yktako</code> 的 span。A6 之前它是 trace 的根；A6 之后它是 HTTP 入口 span 的子 span，trace 的根变成入口 span（§2.4）。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>项</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>span 名</td>
+<td><code>invoke_agent yktako</code>（语义约定：<code>{gen_ai.operation.name} {gen_ai.agent.name}</code>）</td>
+</tr>
+<tr>
+<td>span kind</td>
+<td><code>CLIENT</code>（语义约定对 invoke_agent 的规定）</td>
+</tr>
+<tr>
+<td>resource</td>
+<td><code>service.name=yktako</code>、<code>service.instance.id=&lt;hostname&gt;:&lt;pid&gt;</code>（多副本下区分执行者）</td>
+</tr>
+<tr>
+<td>状态</td>
+<td>正常收尾 <code>OK</code>；<code>error</code> 终态 <code>ERROR</code>；用户停止 <code>Unset</code>（不是失败也不是成功）</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>gen_ai.operation.name</code> 先单独解释，因为它是整条记录的「类型标签」：语义约定给 GenAI 操作定义了一张固定词表——<code>chat</code> 是一次模型对话补全、<code>execute_tool</code> 是一次工具执行、<code>invoke_agent</code> 是一次 agent 调用（agent 内部可能跑很多轮模型和工具）、<code>create_agent</code> 是装配一个 agent。接收端（Loop、Tempo 等都一样）靠这个属性决定把记录画成哪一类。我们这条 span 代表<strong>整场 run 的一次 agent 调用</strong>，所以取 <code>invoke_agent</code>；它和 span 名里的前半段同源（<code>{gen_ai.operation.name} {gen_ai.agent.name}</code>）。</p>
+<p>属性分两批写：起手能确定的，收尾才能确定的。属性名分三类，别混：</p>
+<ol type="1">
+<li><strong>语义约定原名</strong>（<code>gen_ai.*</code>、<code>error.type</code>）：不是我们自造，逐字取自 OpenTelemetry 的 GenAI 语义约定 registry（2026-10-31 拉取；这些 <code>gen_ai.*</code> 目前都标 Development，<code>error.type</code> 是 Stable）。<code>gen_ai.operation.name</code>、<code>gen_ai.agent.name</code>、<code>gen_ai.provider.name</code>、<code>gen_ai.request.model</code>、<code>gen_ai.conversation.id</code>、<code>gen_ai.usage.input_tokens</code>、<code>gen_ai.usage.output_tokens</code>、<code>gen_ai.conversation.compacted</code> 都在 registry 里有原文定义，不是我们起的名字。</li>
+<li><strong>tako 自建</strong>（<code>tako.*</code>）：语义约定没有对应字段，按 OTel 的命名规则用自有命名空间补。接收端不认识它们，只作为附加属性可见；哪天语义约定出现了同义字段，优先改用规范名。</li>
+<li><strong>CozeLoop 私有</strong>（<code>cozeloop.span_type</code>）：不属于 OTel 规范，只服务 Loop 的分类显示。</li>
+</ol>
+<p><code>service.name</code> / <code>service.instance.id</code> 来自 OTel 的资源语义约定（不是 GenAI 命名空间）。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>属性</th>
+<th>取值</th>
+<th>含义（接收端拿它干什么）</th>
+<th>来源</th>
+<th>何时写</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>gen_ai.operation.name</code></td>
+<td><code>invoke_agent</code></td>
+<td>这条记录代表哪种 GenAI 操作；<code>invoke_agent</code> = 一次 agent 调用（区别于模型调用的 <code>chat</code>、工具执行的 <code>execute_tool</code>）</td>
+<td>常量</td>
+<td>起手</td>
+</tr>
+<tr>
+<td><code>gen_ai.agent.name</code></td>
+<td><code>yktako</code></td>
+<td>被调用的 agent 名；run 级只标主代理，子代理的模型调用在 A4 的 <code>chat</code> 子 span 里出现</td>
+<td>常量（与 <code>newRunAgent</code> 的 <code>Name</code> 同值）</td>
+<td>起手</td>
+</tr>
+<tr>
+<td><code>gen_ai.provider.name</code></td>
+<td>模型 ref 的前缀，如 <code>deepseek</code></td>
+<td>模型厂商，接收端按它分组统计</td>
+<td>生效 ref（<code>rootRef</code>）按 <code>/</code> 切开</td>
+<td>起手</td>
+</tr>
+<tr>
+<td><code>gen_ai.request.model</code></td>
+<td>模型 ref 的后缀，如 <code>deepseek-flash</code></td>
+<td>请求的模型名；语义约定要求厂商放 <code>provider.name</code>，这里只放模型</td>
+<td>同上</td>
+<td>起手</td>
+</tr>
+<tr>
+<td><code>gen_ai.conversation.id</code></td>
+<td><code>sessionId</code></td>
+<td>会话 ID，Loop 用它把同一会话的多场 run 串在一起</td>
+<td>run 参数</td>
+<td>起手</td>
+</tr>
+<tr>
+<td><code>tako.run.id</code></td>
+<td><code>runId</code></td>
+<td>tako 的 run 主键，从 Loop 跳回库里查帧与日志</td>
+<td>run 参数</td>
+<td>起手</td>
+</tr>
+<tr>
+<td><code>tako.run.epoch</code></td>
+<td>租约代数（1 = 首发，&gt;1 = 续跑）</td>
+<td>区分同一 run 的第几次执行；续跑是另一条 trace</td>
+<td>run 参数</td>
+<td>起手</td>
+</tr>
+<tr>
+<td><code>tako.model.ref</code></td>
+<td>完整生效 ref，如 <code>deepseek/deepseek-flash</code></td>
+<td>tako 内部原样的模型标识；拆成 provider/model 两列会丢「这就是 tako 配置里那一串」的对应关系</td>
+<td>同上</td>
+<td>起手</td>
+</tr>
+<tr>
+<td><code>tako.tenant.id</code></td>
+<td>租户 ID</td>
+<td>多租户下按租户聚合 run（失败率、耗时、用量）</td>
+<td><code>principalFromCtx</code></td>
+<td>起手</td>
+</tr>
+<tr>
+<td><code>tako.workspace.id</code></td>
+<td>项目 ID</td>
+<td>项目维度的业务归组：用户换了会话继续同一件事，仍能按项目找回（§2.5）；为空不写</td>
+<td><code>store.SessionWorkspaceID(ctx, sessionId)</code></td>
+<td>起手</td>
+</tr>
+<tr>
+<td><code>gen_ai.usage.input_tokens</code></td>
+<td>Σ <code>promptTokens</code></td>
+<td>本 run 输入 token 总数（主代理 + 子代理），用于成本与用量看板</td>
+<td><code>turn</code> 里全部带账单的 assistant 条目（含子代理）</td>
+<td>收尾</td>
+</tr>
+<tr>
+<td><code>gen_ai.usage.output_tokens</code></td>
+<td>Σ <code>completionTokens</code></td>
+<td>本 run 输出 token 总数</td>
+<td>同上</td>
+<td>收尾</td>
+</tr>
+<tr>
+<td><code>tako.usage.scope</code></td>
+<td><code>conversation</code></td>
+<td>钉死这两个 token 的口径 = 对话账本（= usage 帧/runlog 的 <code>turn</code> 求和），不含折叠摘要与记忆抽取；接收端对账时按这个口径（§2.3）</td>
+<td>常量</td>
+<td>起手</td>
+</tr>
+<tr>
+<td><code>gen_ai.input.messages</code></td>
+<td>JSON 字符串（semconv 消息数组）</td>
+<td>本轮用户原文（召回注入前，业务输入）；开关关时不写</td>
+<td>run 级 trace 容器里的本轮 user 行</td>
+<td>内容开关开时，召回前</td>
+</tr>
+<tr>
+<td><code>gen_ai.output.messages</code></td>
+<td>JSON 字符串（semconv 消息数组）</td>
+<td>本轮 root agent 的 assistant 产出（含 tool_call parts）；子代理条目不进根输出</td>
+<td><code>turn</code> 里 <code>Agent==""</code> 的 assistant 条目</td>
+<td>内容开关开时，收尾</td>
+</tr>
+<tr>
+<td><code>gen_ai.system_instructions</code></td>
+<td>JSON 字符串（<code>[{"type":"text",...}]</code>）</td>
+<td>本轮系统提示词；开关关时不写</td>
+<td><code>w.instruction(ctx)</code></td>
+<td>内容开关开时，解析后</td>
+</tr>
+<tr>
+<td><code>tako.content.truncated</code></td>
+<td><code>true</code></td>
+<td>内容属性被体积上限截断过；接收端据此知道内容不完整</td>
+<td>内容序列化 helper</td>
+<td>写内容时</td>
+</tr>
+<tr>
+<td><code>gen_ai.conversation.compacted</code></td>
+<td><code>true</code></td>
+<td>本 run 是否折过历史；语义约定要求只在确定折过时写 <code>true</code>，<strong>不写 <code>false</code></strong></td>
+<td>本 run 产生过折叠产物（<code>foldBox.stagedList()</code> 非空）</td>
+<td>收尾</td>
+</tr>
+<tr>
+<td><code>error.type</code></td>
+<td><code>run_error</code></td>
+<td>失败分类，接收端按它做错误分组；本篇只有这一个粗分类，拿得到更细的错误码再细分</td>
+<td><code>status=error</code> 时写</td>
+<td>收尾</td>
+</tr>
+<tr>
+<td><code>tako.run.status</code></td>
+<td><code>complete</code> / <code>error</code> / <code>stopped</code></td>
+<td>最终态；用户停止由停止端点翻库，所以要从库里回读，不能只信本地变量</td>
+<td>收尾时读 <code>runs.status</code></td>
+<td>收尾</td>
+</tr>
+<tr>
+<td><code>tako.run.turns</code></td>
+<td>assistant 条目数</td>
+<td>这场 run 模型回了几轮，用于识别「话多/空转」</td>
+<td><code>turn</code></td>
+<td>收尾</td>
+</tr>
+<tr>
+<td><code>tako.run.tool_calls</code></td>
+<td>模型请求的工具调用数</td>
+<td>这场 run 调了几次工具</td>
+<td><code>turn</code> 里 assistant 条目的 <code>ToolCalls</code> 长度求和</td>
+<td>收尾</td>
+</tr>
+<tr>
+<td><code>tako.run.frames</code></td>
+<td>本 run 帧数</td>
+<td>本 run 往 runlive 写了多少帧</td>
+<td><code>foldBox.frameCount()</code></td>
+<td>收尾</td>
+</tr>
+<tr>
+<td><code>tako.run.start_delay_ms</code></td>
+<td>毫秒数（≥0）</td>
+<td>「服务收到请求 → run 起跑」的延迟，把入口 span 与 run span 之间那段空隙变成一个可检索的数（§2.4）</td>
+<td>A6 随 ctx 带入的入口起手时刻</td>
+<td>起手（A6 起）</td>
+</tr>
+<tr>
+<td><code>cozeloop.span_type</code></td>
+<td><code>agent</code></td>
+<td>Loop 私有的归类标签，决定这条 span 在时间线上显示成 AGENT 类型</td>
+<td>常量</td>
+<td>起手</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="22-内容属性默认开可关pii-开关">2.2 内容属性：默认开、可关（PII 开关）</h3>
+<p><strong>决定</strong>：内容属性写，但由标准开关控制；本仓库 <code>.env</code> 默认打开。</p>
+<p>开关不自己起名，用 OTel GenAI 规范定义的 <code>OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT</code>（Content capture configuration）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>值</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NO_CONTENT</code>（规范默认）</td>
+<td>不写任何内容属性</td>
+</tr>
+<tr>
+<td><code>SPAN_ONLY</code></td>
+<td>只在 span 上写内容；本篇用它（<code>.env</code> 已写 <code>SPAN_ONLY</code>，等价于你说的「默认 true」）</td>
+</tr>
+<tr>
+<td><code>SPAN_AND_EVENT</code></td>
+<td>规范允许；tako 不产出内容事件，退化为 <code>SPAN_ONLY</code></td>
+</tr>
+<tr>
+<td><code>EVENT_ONLY</code></td>
+<td>规范允许；tako 不产出内容事件，等于关闭</td>
+</tr>
+</tbody>
+</table></div>
+<p>未配置或非法值按规范回退 <code>NO_CONTENT</code>。开关只在 <code>internal/observability</code> 解析一次，业务代码只问 <code>ContentCaptureEnabled()</code>，不在各处重复读 env。</p>
+<p><strong>写哪些、写在哪：</strong></p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>span</th>
+<th>属性</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>run 根 span</td>
+<td><code>gen_ai.input.messages</code></td>
+<td>本轮用户原文（召回注入前，业务输入）</td>
+</tr>
+<tr>
+<td>run 根 span</td>
+<td><code>gen_ai.output.messages</code></td>
+<td>本轮 root agent 的 assistant 产出（含 tool_call parts）</td>
+</tr>
+<tr>
+<td>run 根 span</td>
+<td><code>gen_ai.system_instructions</code></td>
+<td>本轮系统提示词</td>
+</tr>
+<tr>
+<td><code>chat</code> 子 span（A4）</td>
+<td>同上三个</td>
+<td>该次调用真正的 wire 输入/输出；system 单独拆出</td>
+</tr>
+<tr>
+<td><code>execute_tool</code>（A5）</td>
+<td><code>gen_ai.tool.call.arguments</code> / <code>gen_ai.tool.call.result</code></td>
+<td>工具入参与结果</td>
+</tr>
+<tr>
+<td><code>search_memory</code>（A7）</td>
+<td><code>gen_ai.memory.query.text</code> / <code>gen_ai.memory.records</code></td>
+<td>召回查询与命中的记忆条目</td>
+</tr>
+<tr>
+<td><code>retrieval</code>（A7）</td>
+<td><code>gen_ai.retrieval.query.text</code> / <code>gen_ai.retrieval.documents</code></td>
+<td>召回查询与命中的历史对话块</td>
+</tr>
+<tr>
+<td><code>tako.step.compact</code>（A7）</td>
+<td>不额外写</td>
+<td>摘要正文在它的 <code>chat</code> 子 span 的 output 里</td>
+</tr>
+<tr>
+<td><code>tako.step.memory_extract</code>（A9）</td>
+<td>不额外写</td>
+<td>抽取输入/输出在它的 <code>chat</code> 子 span 里</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>gen_ai.tool.definitions</code> 不写：它装的是 schema 而不是用户/模型内容，规范也把它排除在内容开关之外、体积另算。</p>
+<p><strong>格式</strong>：按 semconv 的 JSON schema 序列化成 <strong>JSON 字符串</strong>（Go 的 OTel span 还不支持结构化属性；规范允许在 span 上退化为字符串）。消息对象是 <code>{"role":"user","parts":[...]}</code>；文本 part <code>{"type":"text","content":"..."}</code>；工具调用 <code>{"type":"tool_call","id":...,"name":...,"arguments":...}</code>；工具结果 <code>{"type":"tool_call_response","id":...,"response":...}</code>；思考内容 <code>{"type":"reasoning","content":...}</code>。图片不内联 base64，用 <code>{"type":"uri","uri":"tako://media/&lt;id&gt;","modality":"image"}</code> 引用，字节仍走 tako 的 media 出口。</p>
+<p><strong>体积上限</strong>（常量，不做配置）：每个文本 part 最多 8 KiB；每个属性序列化后最多 64 KiB，超了保留最近的 part/message 并写 <code>tako.content.truncated=true</code>。不设上限会撞上传体上限，也会把 trace 存储成本放大。</p>
+<p><strong>PII 说明</strong>：默认开意味着用户原文、工具结果、系统提示词会随 span 发到 Loop。这是本仓库 <code>.env</code> 的选择——排障需要内容。关掉只需把值改成 <code>NO_CONTENT</code>；本篇不做掩码、不做租户级开关、不做外部存储引用（§6 登记）。将来给多租户用，先补掩码再谈默认值。</p>
+<h4 id="大厂是怎么处理的2026-10-31-查官方文档">大厂是怎么处理的（2026-10-31 查官方文档）</h4>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>产品</th>
+<th>默认行为</th>
+<th>关掉/打开的开关</th>
+<th>开关作用在哪一层</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OTel GenAI 语义约定</td>
+<td><strong>默认不记录</strong>：规范原文的建议就是「不要记录指令、输入或输出」；内容字段标为 Opt-In，并写明可能含敏感数据</td>
+<td>标准 env <code>OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT</code>，值 <code>NO_CONTENT</code> / <code>SPAN_ONLY</code> / <code>EVENT_ONLY</code> / <code>SPAN_AND_EVENT</code></td>
+<td>SDK/厂商实现；规范还建议生产环境把内容存外部、span 里只放引用</td>
+</tr>
+<tr>
+<td>LangSmith</td>
+<td><strong>默认记录</strong>：trace 里带模型的 inputs/outputs</td>
+<td><code>LANGSMITH_HIDE_INPUTS</code> / <code>LANGSMITH_HIDE_OUTPUTS</code>，或 Client 的 <code>hide_inputs</code> / <code>hide_outputs</code></td>
+<td>SDK 发送之前，按 trace 类型过滤</td>
+</tr>
+<tr>
+<td>Langfuse</td>
+<td>记录；但提供<strong>数据离开应用前的掩码</strong>机制</td>
+<td>SDK hook / OTel processor 做 masking 与截断</td>
+<td>应用进程内、导出之前；官方明说不内置 PII 识别，规则要自己写</td>
+</tr>
+<tr>
+<td>OpenAI Agents SDK</td>
+<td><strong>默认记录</strong>：generation/function span 带输入输出，<code>trace_include_sensitive_data</code> 默认 <code>True</code></td>
+<td><code>RunConfig.trace_include_sensitive_data=False</code> 或同名环境变量</td>
+<td>SDK 导出之前，一次性关掉全部敏感数据</td>
+</tr>
+<tr>
+<td>Azure AI Foundry</td>
+<td>内容捕获由<strong>显式环境变量</strong>控制</td>
+<td><code>OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT</code>（如开发期用 <code>SPAN_AND_EVENT</code>）</td>
+<td>导出器/进程配置</td>
+</tr>
+</tbody>
+</table></div>
+<p>三条可复用的结论：</p>
+<ol type="1">
+<li><strong>默认值行业里没有统一答案。</strong> OTel 规范与 Azure 是「默认不采」，LangSmith 与 OpenAI Agents SDK 是「默认采、给关掉的开关」。默认值取决于产品把 trace 当调试工具（需要内容）还是当运营台账（只需要元数据）。</li>
+<li><strong>只有「全采/全不采」不够，真正要的是出口前的掩码。</strong> Langfuse 的做法值得抄：内容不是不能记，而是必须在离开应用之前把手机号、身份证、token 这类字段替换掉。这件事必须在进程内做（SDK hook 或 OTel processor），不能指望后端。本篇先不做，登记在 §6。</li>
+<li><strong>内容体积是独立于 PII 的问题。</strong> 几 MB 的 messages 会撞上传体上限、拖慢导出、把 trace 存储成本放大几十倍；所以即使开关打开，也要有体积上限（上文 8 KiB / 64 KiB）。</li>
+</ol>
+<p><strong>tako 选规范里的第 2 种用法</strong>：内容记录在 span 属性上，加标准开关。第 1 种是 OTel 默认（不采），第 3 种是生产态（外部存储 + 引用）。现在处于开发/自用阶段，内容直接放 span 最省事；开关和体积上限先立好，将来切第 3 种时只换出口，不换调用点。</p>
+<p>出处（官方文档，2026-10-31 核对）：<a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/">OTel GenAI spans 语义约定</a>、<a href="https://docs.smith.langchain.com/">LangSmith 文档</a>、<a href="https://langfuse.com/docs">Langfuse 文档</a>、<a href="https://openai.github.io/openai-agents-python/tracing/">OpenAI Agents SDK tracing</a>、<a href="https://learn.microsoft.com/en-us/azure/ai-foundry/">Azure AI Foundry 文档</a>。</p>
+<h3 id="21-模型调用子-span-的时钟与算法a4">2.1 模型调用子 span 的时钟与算法（A4）</h3>
+<p>run 级 span 算不出 TTFT/TPOT，因为一场 run 里混着多次模型调用和工具执行；把它们摊平再除，工具耗时会被算进「每个 token」。要算这两项，必须在模型客户端包一层，每次调用单独记时。</p>
+<p>一次模型调用，客户端能可靠拿到的只有三个时间戳：</p>
+<pre class="text"><code>t0 ── 请求发出（调用 Stream 之前）
+t1 ── 第一个 chunk 到达（第一次 Recv 拿到非空消息）
+tn ── 流结束（Recv 返回 io.EOF）</code></pre>
+<ul>
+<li><strong>TTFT</strong> = <code>t1 − t0</code>。包含网络往返、厂商排队、prefill 三段；语义约定的名字是 <code>time_to_first_chunk</code>（首块），不是「首 token」——第一块里可能装了好几个 token。</li>
+<li><strong>解码段</strong> = <code>tn − t1</code>。第一块之后，剩余 token 在这段时间里陆续到达。</li>
+<li><strong>TPOT</strong> = <code>(tn − t1) / (output_tokens − 1)</code>。分母减一：第一个 token 的耗时已经算进 TTFT，从第一个到最后一个之间只剩 N−1 个间隔。</li>
+<li><strong>output_tokens</strong> 取厂商回执里的 <code>CompletionTokens</code>（tako 已有：<code>usageBill</code>），不本地数。<strong>口径就是全部输出 token，含 reasoning</strong>：分子里思考的时间也在跑，分母把它们排除会把 TPOT 算高。<code>tako.chat.reasoning_tokens</code> 另写一份只为诊断，不参与分母选择。</li>
+</ul>
+<p>算例：<code>t0=0</code>、<code>t1=0.80s</code>、<code>tn=3.30s</code>、<code>output_tokens=100</code> → TTFT = 0.80s，解码段 = 2.50s，TPOT = 2.50 / 99 ≈ 25.3ms。</p>
+<p>三个边界：</p>
+<ol type="1">
+<li><strong>要的是 token 口径，不是 chunk 口径</strong>：<code>output_tokens</code> 是 token 数，所以算出来的 TPOT 是「平均每 token」。chunk 只用来取 <code>t1</code> 的到达时刻，不参与分母；协议里没有逐 token 的到达时间戳，所以 TPOT 只能是平均值，给不出 p99 或分布。规范客户端那个 <code>time_per_output_chunk</code> 是每块间隔，和这个不是一回事，不要拿它冒充。</li>
+<li><strong>厂商不报 usage</strong>（Prompt/Completion/Total 三数全 0）：优先用账单，没有账单就用本地计数器对合并后的正文（含 <code>ReasoningContent</code>）估算，并在属性上标 <code>tako.chat.output_tokens_estimated=true</code>；TPOT 跟着标估算。本地计数器是 cl100k，和厂商分词器不一定一致，只能当近似值，不能当账单。</li>
+<li><strong>非流式调用没有 t1/tn 序列</strong>：不写 TTFT/TPOT。run 主链（主代理、子代理、折叠摘要）都是流式；记忆抽取走 <code>Generate</code> 非流式（<code>memory.go</code>），它只有总时长与 usage。</li>
+</ol>
+<p><strong>内容</strong>：A4 的 <code>chat</code> span 同时是内容属性的主载体（§2.2）——<code>gen_ai.system_instructions</code>（从 system 消息拆出）、<code>gen_ai.input.messages</code>（其余 wire 输入）、<code>gen_ai.output.messages</code>（本次返回的 assistant 消息，含 tool_call / reasoning parts）。流式与非流式都写；非流式没有 TTFT，但有内容、usage 与总时长。内容开关关时这些属性全不写。</p>
+<h3 id="23-usage-求和口径为什么折叠摘要与记忆抽取不算在内">2.3 usage 求和口径：为什么折叠摘要与记忆抽取不算在内</h3>
+<p><strong>先把三个名字都带「记忆」的动作分开</strong>——它们不在同一条路上，混淆了就会问出「记忆抽取是不是从 BM25 取相似度高的记忆」：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>动作</th>
+<th>方向</th>
+<th>何时跑</th>
+<th>代码</th>
+<th>结果去哪</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>折叠摘要（compact）</td>
+<td>写</td>
+<td>run 中途，历史超窗时</td>
+<td><code>compact.go</code> 的 <code>summarizer.attempt</code></td>
+<td>一条摘要行替换掉一批历史消息，之后进后续 prompt</td>
+</tr>
+<tr>
+<td>记忆抽取（extract）</td>
+<td>写</td>
+<td>run <strong>结束后</strong>，<code>memory_jobs</code> 异步任务</td>
+<td><code>store.go:737</code> 登记 → <code>memory.go:187</code> 轮询 → <code>memory.go:336</code> <code>Generate</code></td>
+<td>写 <code>memory_items</code> 表</td>
+</tr>
+<tr>
+<td>记忆召回（recall）</td>
+<td>读</td>
+<td>run <strong>起手</strong>时</td>
+<td><code>recall.go:35</code>：线一词法查 <code>memory_items</code>，线二 pg_search BM25 查 <code>dialogue_chunks</code>（<code>dialogue.go:187</code>）</td>
+<td>拼成一段文本追加到本轮 user 消息</td>
+</tr>
+</tbody>
+</table></div>
+<p>「从 BM25 取一批相似度高的记忆」是第三行（召回，读侧），不是第二行（抽取，写侧）。本篇争的 usage 归属只涉及第一行和第二行——它们各自触发了一次模型调用；第三行只往 prompt 里拼文本，自身不调模型、不花 token（它拼进去的内容会算进那次主调用的 <code>prompt_tokens</code>）。另外 <code>toolsearch.go</code> 里也有一份 BM25，那是给延迟加载的工具挑声明，与记忆无关。</p>
+<p><strong>再澄清：这不是「测不到」。</strong> A4 之后每次模型调用都按黑盒记 provider 报的 usage 和耗时——不拆它内部读了哪些记忆、折了哪些历史，只看这次调用自己报的数。摘要调用有自己的一条 <code>chat</code> span（A7 后挂在 <code>tako.step.compact</code> 下），记忆抽取有自己的一条（A9 后根是独立 trace 的 <code>tako.step.memory_extract</code>），成本都看得到。下面争的只是<strong>根 span 那一个 <code>gen_ai.usage.*</code> 字段的归属</strong>：它要和 usage 帧逐值对账。</p>
+<p>先演一场会真实发生的对账：某场 run 在页面上有三条带 usage 的 assistant 条目，求和输入 2,400 / 输出 800；同一天账单显示这个时段多扣了 750（折叠一次）和一笔记忆抽取。三个数各自都是真的，混在一个字段里就没人能说清差额从哪来。</p>
+<p>tako 里同时存在两个账本，口径不同：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>账本</th>
+<th>内容</th>
+<th>今天在哪能看到</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 对话账本</td>
+<td>每条进入对话历史的 assistant 消息的 provider usage（主代理 + 子代理）</td>
+<td><code>turn</code> → runlog 行 + runlive 的 usage 帧</td>
+</tr>
+<tr>
+<td>B 本进程为这场 run 触发的全部模型调用</td>
+<td>A + 折叠摘要 +（run 结束后异步跑的）记忆抽取</td>
+<td>没有单一字段；A4 后本 run trace 里的 <code>chat</code> 求和 = A + 折叠；记忆抽取是另一条独立 trace（根是 A9 的 <code>tako.step.memory_extract</code>），不在本 run 的 trace 里</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>折叠摘要为什么不进 A。</strong> 看代码路径：<code>foldInput</code> 调 <code>summarizer.attempt</code>，用 <code>chatFrom(ctx, s.chat).Stream(...)</code> 发一次摘要请求（<code>compact.go:957</code>）；拿回的 <code>ResponseMeta.Usage.CompletionTokens</code> 只被 <code>rejectReason(...)</code> 和一行日志使用（<code>compact.go:979-987</code>），既不写成 assistant 条目，也不发 usage 帧。这是有意的：摘要是一条内部产物行（替换掉一批历史消息），不是对话里说过的话。如果把它算进本 run 的对话账本，run span 的 token 就和页面帧对不上；而且同一段历史每折一次，就会在新 run 上再记一笔——它不是这场对话新花的钱。</p>
+<p><strong>记忆抽取为什么更不可能进。</strong> 只有 <code>complete</code> 终态会在 <code>EndRun</code> 事务里登记一条 <code>memory_jobs</code>（<code>store.go:737</code>），进程里的常驻循环每 2 秒 claim 一条（<code>memory.go:187</code>），用非流式 <code>Generate</code> 调模型（<code>memory.go:336</code>）；它连 provider usage 都没落库，统计量是本地 cl100k 计数器算的（<code>memory.go:354-357</code>）。它跑在 run 定稿之后、可能重试、可能几分钟后才执行——不在 run 的 ctx 里，也不可能是 run span 的子 span。A4 的包装器会在它自己的执行里开一条 <code>chat</code> span，A9 再给它套一条 <code>tako.step.memory_extract</code> 作为这条独立 trace 的根；那条 trace 与 run 无关（run 早已结束），run 根 span 的 token 和永远不含它。</p>
+<p><strong>「摘要会进后续消息」不改变这个结论。</strong> 摘要文本之后会作为后续请求的输入，但那只体现在后续那次调用的 <code>prompt_tokens</code> 里（provider 报的输入 token），不是摘要调用自己的 <code>completion_tokens</code>；两次调用各记一次，是两笔真实计费。A4 的每次 <code>chat</code> span 已经天然包含这两笔，不需要在根 span 里再把内容拆开算一遍。</p>
+<p>所以定两条规则：</p>
+<ol type="1">
+<li><strong>根 span 的 <code>gen_ai.usage.*</code> 只取 A 口径</strong>，并用 <code>tako.usage.scope=conversation</code> 显式钉住。A2 的验收就是拿它和 usage 帧求和逐值对账；口径不一致这个验收永远过不了，也就没人能拿它做假报表。</li>
+<li><strong>要看 B 就求和子 span</strong>：A4 之后每个模型调用一条 <code>chat</code> span，折叠摘要也在其中（它走 <code>Stream</code>，所以有 TTFT）；A5 的工具 span 不带 token；A7/A8/A9 的步骤 span 只有计数，token 只在它们嵌套的 <code>chat</code> 子 span 上。记忆抽取的那条 <code>chat</code> span 在另一条独立 trace 里，不属于本 run 的 trace；要把 B 算全，得把两边的 span 相加，并且它是否发生取决于后台调度（§6 登记）。</li>
+</ol>
+<p><strong>为什么必须在根 span 这一层选口径。</strong> 只有 <code>turn</code> 是权威且可核对的来源：provider 报的 usage 原样落在那里，帧和 runlog 都从它投影。根 span 若自己发明一个「全都算上」的数，它既对不上帧，也对不上 A4 的子 span，接收端拿它做成本看板就会和 tako 自己的账本打架。<strong>选一个能对账的口径并写明，比选一个看起来更全的口径有用。</strong></p>
+<p>数字示例：根 span 写 2,400 / 800（<code>tako.usage.scope=conversation</code>）；折叠摘要 600 / 150 单独出现在它的 <code>chat</code> 子 span 上；本 run 的 trace 里所有 <code>chat</code> span 求和 = 3,000 / 950；记忆抽取约 400 出现在它自己那条独立 trace 里。谁想回答哪个问题，就用对应的数。</p>
+<h3 id="24-入口-span排队与父子关系a6">2.4 入口 span、排队与父子关系（A6）</h3>
+<p>现在的 202 路径是：<code>postRuns</code> 抢闸成功 → <code>go worker.Run(context.Background()+principal, …)</code> → 写 202。run span 在 worker 里起手，所以「服务收到请求」到「run 起跑」这段（鉴权、准入事务、项目预检、goroutine 调度）没有任何记录；trace 从起跑才开始。</p>
+<p>A6 补一条 HTTP 入口 span：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>项</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>span 名</td>
+<td><code>POST /api/runs</code> / <code>POST /api/runs/:id/resume</code>（<code>{method} {route}</code>）</td>
+</tr>
+<tr>
+<td>span kind</td>
+<td><code>SERVER</code>（OTel HTTP 语义：入站请求）</td>
+</tr>
+<tr>
+<td>起止</td>
+<td>请求进入 handler 链时起手；响应写完（202/401/404/409/…) 时收尾</td>
+</tr>
+<tr>
+<td>属性</td>
+<td><code>http.request.method</code>、<code>http.route</code>、<code>url.path</code>、<code>http.response.status_code</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>中间件挂在这两条路由的 <code>authn</code> <strong>之前</strong>，所以 401 也能留下一条只有入口 span 的 trace（失败请求没有 run span，正好靠状态码分类）。</p>
+<p>关系用<strong>父子</strong>，不用 link：入口 span 的 span context 和起手时刻随 ctx 带进 worker，run span 以它为 parent。这样一次请求触发的入口、排队、run、chat、tool 全在同一个 traceId 下，Loop 按 trace 打开就是完整时间线。</p>
+<p>两个容易踩的点：</p>
+<ol type="1">
+<li><strong>parent 结束得比 child 早是合法的</strong>：入口 span 在写完 202 时就 End 了，run span 之后才结束。OTel 不要求父子时间重叠；Loop 的时间线会显示成「入口一段 → 空隙 → run 一段」。如果把入口 span 一直开到 run 结束，HTTP 耗时就会被 run 时长污染，等于没有入口指标。</li>
+<li><strong>不能把请求 ctx 直接交给 worker</strong>：<code>postRuns</code> 现在就有意用 <code>context.Background()</code>（请求生命周期不属于 run，响应写完请求 ctx 就取消了）。所以带过去的是 span context + 入口起手时刻，不是可取消的 ctx；<code>tako.run.start_delay_ms</code> = run 起跑 − 入口起手。</li>
+</ol>
+<p>「202 到起跑」的等待在这个进程里几乎为零：goroutine 在写响应之前就 launch 了。真正值得看的是「收到请求 → 起跑」的准入延迟，所以属性用入口起手时刻做基准，而不是用 202 的写出时刻——后者甚至可能晚于 run 起跑，算出负数。</p>
+<h3 id="25-业务关联同一件事的多场-run-怎么串">2.5 业务关联：同一件事的多场 run 怎么串</h3>
+<p>一条 trace 对应一次 HTTP 请求；「同一件事」往往不止一次请求：run 1 失败，用户补一句话再发一轮；或者崩溃后续跑；或者用户换了个会话继续。</p>
+<p>根因是两个维度本来就多对多：一个 session 里可以聊很多件事，一件业务也可能跨多个 session（甚至多个项目）。<strong>加一列或加一张表本身不难</strong>——难的是先把这个 ID 代表什么定义清楚，而这一步今天没有答案：</p>
+<ul>
+<li><strong>谁创建、什么时候创建。</strong> 客户端在第一次提问时自己铸一个 UUID 并一直带着？还是服务端看到一句「补充」时猜它属于上一场 run？前者要求产品里有「任务」这个对象，后者需要用户显式标注或模型判断，两者都还没有。</li>
+<li><strong>一场 run 属于几个任务。</strong> 一次提问可能同时推进两件事；一个任务也可能一场 run 只做其中一步。一对一、一对多、多对多选哪种，决定了这个字段放在 <code>runs</code> 行上还是一张关联表——现在连选哪种都没定。</li>
+<li><strong>生命周期归谁。</strong> 任务什么时候算完成、失败、被放弃？谁来翻状态？今天 <code>runs.status</code> 是 run 的权威、session 由用户显式结束、workspace 没有终态；再加一个对象就要再定一套状态机。</li>
+<li><strong>UI 怎么承载。</strong> 用户能重命名、合并、拆分任务吗？如果没有入口，这个 ID 只是客户端悄悄带上的一个不透明字符串，那它就不是可运营的业务对象。</li>
+</ul>
+<p>所以今天缺的不是「一个能加字段的地方」，而是<strong>任务的产品语义</strong>。能先做的最小形态是<strong>不透明的客户端归组键</strong>：客户端保证同一件事带同一个值，服务端只存、只写进 trace 属性，不解释、不校验、不做生命周期。它能解决「换会话/换项目后怎么连起来」，但要求客户端改造，也解决不了「服务端怎么判断两次提问属于同一件事」。完整的任务实体（建表、状态机、UI 入口）是产品级决定，本篇不发明（§6）。</p>
+<p>在那之前，用现有三种键做近似：</p>
+<p>按范围从窄到宽有三个键：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>要回答的问题</th>
+<th>用哪个键</th>
+<th>怎么用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>同一场对话里的多次提问</td>
+<td><code>gen_ai.conversation.id = sessionId</code></td>
+<td>用户在同一个会话里补发消息时，<code>POST /api/runs</code> 带同一个 <code>sessionId</code>，但会铸一个新 <code>runId</code> → 新 trace、同一个 conversation.id。Loop 里按它搜，两场 run 按时间排在一起</td>
+</tr>
+<tr>
+<td>同一场 run 的多次执行（续跑）</td>
+<td><code>tako.run.id</code> + <code>tako.run.epoch</code></td>
+<td>崩溃/停止后续跑沿用同一个 runId，epoch 递增；每次执行是一条独立 trace，按 run.id 搜得到全部代数</td>
+</tr>
+<tr>
+<td>同一个项目里的多场会话</td>
+<td><code>tako.workspace.id</code></td>
+<td>用户换了新会话（新 sessionId）继续同一件事时，会话仍挂在同一个项目下；按项目搜能收拢（同一项目里也可能有别的任务，这是粗归组）</td>
+</tr>
+</tbody>
+</table></div>
+<p>今天<strong>没有</strong>一个显式的业务/任务 ID：API 里没有「这是一次重试」或「这条补充属于哪个失败」的字段，客户端也不传 traceparent。所以：</p>
+<ul>
+<li>「同一会话里补发」能精确归组（conversation.id）；</li>
+<li>「换会话继续」只能靠项目（workspace.id），项目里混着别的任务时无法再细分；</li>
+<li>「换项目继续」没有任何键能连起来——要连就必须加一个归组键（例如客户端生成的不透明 taskId），这要客户端配合且属于产品决定，本篇不做，登记在 §6。</li>
+</ul>
+<h3 id="26-内部步骤-span把-run-拆成可读的时间线a7a9">2.6 内部步骤 span：把 run 拆成可读的时间线（A7–A9）</h3>
+<p>run 根 span 只回答「整场多久」，A4/A5 只回答「模型/工具各自多久」。中间还有几段既不调模型也不是工具的动作：准入、装历史、召回、折叠、定稿、后台记忆抽取。它们可能各自吃掉几百毫秒，出问题时却只能在一行日志里猜。A7–A9 给它们各开一条 INTERNAL 子 span，父 span 是 run 根 span；不改任何业务行为。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>span 名</th>
+<th>语义</th>
+<th>关键属性</th>
+<th>代码点</th>
+<th>拍</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>配额</td>
+<td><code>tako.step.quota</code></td>
+<td>自有步骤</td>
+<td><code>tako.quota.daily</code>、<code>tako.quota.used</code>、<code>tako.quota.exceeded</code></td>
+<td><code>worker.run</code> 的 quota 检查</td>
+<td>A8</td>
+</tr>
+<tr>
+<td>项目目录</td>
+<td><code>tako.step.workspace</code></td>
+<td>自有步骤</td>
+<td><code>tako.workspace.id</code>、<code>tako.workspace.max_bytes</code>、<code>error.type</code></td>
+<td><code>runWorkspace</code> + 配额 reserve</td>
+<td>A8</td>
+</tr>
+<tr>
+<td>装历史</td>
+<td><code>tako.step.history</code></td>
+<td>自有步骤</td>
+<td><code>tako.history.messages</code>、<code>tako.history.resume</code></td>
+<td><code>ModelMessages</code> 调用处（两条 prepareInput 路径）</td>
+<td>A8</td>
+</tr>
+<tr>
+<td>召回总</td>
+<td><code>tako.step.recall</code></td>
+<td>自有步骤</td>
+<td><code>tako.recall.terms</code>、<code>memory_hits</code>、<code>dialogue_hits</code>、<code>injected_runes</code></td>
+<td><code>recall.go</code> <code>Store.Recall</code></td>
+<td>A7</td>
+</tr>
+<tr>
+<td>线一记忆</td>
+<td><code>search_memory</code></td>
+<td><code>gen_ai.operation.name=search_memory</code>、<code>gen_ai.memory.store.id=tako-memory</code>、<code>gen_ai.memory.record.count</code></td>
+<td>内容开关开时 <code>gen_ai.memory.query.text</code>、<code>gen_ai.memory.records</code></td>
+<td><code>recallMemoryItems</code></td>
+<td>A7</td>
+</tr>
+<tr>
+<td>线二对话</td>
+<td><code>retrieval</code></td>
+<td><code>gen_ai.operation.name=retrieval</code>、<code>gen_ai.data_source.id=pg_search</code></td>
+<td><code>gen_ai.retrieval.top_k</code>；内容开关开时 query/documents</td>
+<td><code>recallDialogueItems</code></td>
+<td>A7</td>
+</tr>
+<tr>
+<td>折叠</td>
+<td><code>tako.step.compact</code></td>
+<td>自有步骤</td>
+<td><code>tako.compact.trigger</code>（initial/midfold/rescue）、输入/摘要 token、drop runs、结果</td>
+<td><code>foldInput</code></td>
+<td>A7</td>
+</tr>
+<tr>
+<td>定稿</td>
+<td><code>tako.step.finalize</code></td>
+<td>自有步骤</td>
+<td><code>tako.finalize.status</code>、staged/mh 行数</td>
+<td><code>EndRun</code> defer</td>
+<td>A8</td>
+</tr>
+<tr>
+<td>记忆抽取</td>
+<td><code>tako.step.memory_extract</code></td>
+<td>自有步骤</td>
+<td>job/run/session/attempt、item 数</td>
+<td><code>processMemoryJob</code></td>
+<td>A9</td>
+</tr>
+</tbody>
+</table></div>
+<p>四条关系：</p>
+<ol type="1">
+<li><strong>父子</strong>：除记忆抽取外，所有步骤 span 的 parent 是 run 根 span。<code>tako.step.compact</code> 里的摘要调用由 A4 包出一条 <code>chat</code> 子 span，所以「折叠总耗时 − chat 耗时 = 本地折叠耗时」。<code>tako.step.memory_extract</code> 跑在 run 之外，是<strong>独立 trace 的根</strong>，它的 <code>chat</code> 子 span 也在这条 trace 里。</li>
+<li><strong>召回拆两段</strong>：<code>tako.step.recall</code> 是总时长，两个子 span 分别是线一词法查询与线二 pg_search。哪条慢直接看子 span；总时长与两子段之差是切词/拼装开销。</li>
+<li><strong>不携带 token</strong>：步骤 span 只有记录数、token 数（折叠的输入/摘要统计）等；唯一的模型 token 在嵌套的 <code>chat</code> 子 span 上。根 span 的 usage 口径不变（§2.3）。</li>
+<li><strong>内容不重复抄</strong>：步骤 span 只在 §2.2 列出的位置写内容（召回 query/records/documents；折叠与抽取靠嵌套 <code>chat</code>），不在每个步骤里再抄一份正文。</li>
+</ol>
+<p><strong>为什么放在这一层</strong>：这些步骤不是 GenAI 操作，不能编 <code>gen_ai.operation.name</code>（规范词表里没有 compact/finalize）；但它们又确实发生在 run 内部、需要一个共同父 span 才能和模型/工具时间对齐。所以用 <code>tako.step.*</code> 自有命名空间、kind <code>INTERNAL</code>；<code>cozeloop.span_type</code> 先不写，Loop 归不了类就按 CUSTOM 显示，A7 实跑后再决定是否补标签。</p>
+<p><strong>不做</strong>：子代理内部工具调用仍无 span（A5 的包装链限制）；工具检索（<code>toolsearch.go</code> 的 BM25）不单独开 span，它发生在工具声明装配期、耗时通常可忽略，真要查再说。</p>
+<hr />
+<h2 id="3-数据从哪来端到端链路">3. 数据从哪来（端到端链路）</h2>
+<pre><code>用户 POST /api/runs
+   → HTTP 入口 span 起手（t0 = 服务收到请求；A6）
+   → server 鉴权、铸会话/run 行、抢闸、写 user 行、返回 202
+        （准入耗时 = 入口 span 自己的时长；写完 202 时入口 span 收尾）
+   → worker.run 起手：principal → 开 invoke_agent 子 span（t1 = 起跑；A6 起写 tako.run.start_delay_ms = t1 − t0；quota 早退也留记录）
+        → tako.step.quota → tako.step.workspace
+        → tako.step.history（读 model_history）
+        → tako.step.recall → search_memory / retrieval（内容开关开时带 query/records）
+        → tako.step.compact（超限时）→ 它的 chat 子 span（摘要调用）
+        → 主循环：chat 子 span（A4）+ execute_tool 子 span（A5）；turn 累积 assistant/tool 条目
+   → tako.step.finalize（EndRun：写 runlog/mh、登记记忆任务、放闸）
+   → run span 收尾 defer：读 runs.status → 求和 usage → 写收尾属性/内容 → span.End()
+   → SDK 批量导出（约 5 秒一批）→ OTLP POST → CozeLoop
+
+后台（run 结束之后，独立 trace）：
+   memory_jobs claim → tako.step.memory_extract → chat 子 span → memory_items</code></pre>
+<ul>
+<li>求和口径是 <strong>turn 全量</strong>，含子代理的模型调用；不含折叠摘要与记忆抽取（§2.3 讲了两本账的口径）。</li>
+<li>run span 收尾的 defer 注册在 EndRun 的 defer 之前——LIFO 决定它最后跑，所以能读到定稿后的 <code>runs.status</code>，并在 <code>tako.step.finalize</code> 关闭之后才关闭根 span。</li>
+<li>入口 span 与 run span 同一条 trace；A6 之前没有入口 span，run span 自己就是根（§2.4）。</li>
+<li>内容属性受 <code>OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT</code> 控制（<code>.env</code> 默认 <code>SPAN_ONLY</code>）：根 span 写本轮业务输入/输出/系统提示词，<code>chat</code>/<code>execute_tool</code>/召回 span 写各自的内容（§2.2）。</li>
+<li>日志里打一行 <code>trace &lt;sessionId&gt;/&lt;runId&gt; traceId=&lt;32 hex&gt;</code>，客服/排查从 runId 能跳到 Loop。</li>
+</ul>
+<h3 id="31-第二个出口langfuse2026-11-01-起可双发">3.1 第二个出口：Langfuse（2026-11-01 起可双发）</h3>
+<p><strong>为什么加</strong>：CozeLoop 的 trace 查询只开在网页面（查询接口要浏览器 <code>session_key</code> cookie，PAT 能调的 <code>/v1/loop</code> 路由只有 files/prompts/ingest）。所以「把跑过的 trace 拉回来做归因」在 Loop 上做不到——只能人眼看。Langfuse 的 public API 能用 <code>Basic(pk:sk)</code> 直接读回 span 与 metrics，bench 的归因（doc/56 §D1）需要这条路。</p>
+<p><strong>怎么接</strong>：同一份 OTLP span，再来一个 exporter，互不影响：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>变量</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>LANGFUSE_PUBLIC_KEY</code> / <code>LANGFUSE_SECRET_KEY</code></td>
+<td>Basic 认证的用户名与密码</td>
+</tr>
+<tr>
+<td><code>LANGFUSE_BASE_URL</code></td>
+<td>例 <code>https://us.cloud.langfuse.com</code>；实际打到 <code>&lt;base&gt;/api/public/otel/v1/traces</code>，额外带 <code>x-langfuse-ingestion-version: 4</code></td>
+</tr>
+</tbody>
+</table></div>
+<ul>
+<li>两套凭据都配 → 双发；只配一套 → 只发那一套；都不配 → noop（与原行为一致）。启动日志打 <code>trace: enabled (cozeloop=on langfuse=on)</code>。</li>
+<li>失败仍按 §4 第 1 条隔离：某个 exporter 建不起来只记日志，另一个照发；导出失败只进全局 error handler。</li>
+</ul>
+<p><strong>映射（2026-11-01 真 run 实测，非文档推断）</strong>：Langfuse 直接认 <code>gen_ai.*</code>，不需要另写 adapter：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>tako 发的</th>
+<th>Langfuse 落成</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>span 名 <code>invoke_agent yktako</code> + <code>gen_ai.operation.name=invoke_agent</code></td>
+<td><code>AGENT</code>（根）</td>
+</tr>
+<tr>
+<td><code>gen_ai.conversation.id</code></td>
+<td>观测上的 <code>sessionId</code>（按会话归组）</td>
+</tr>
+<tr>
+<td>span 名 <code>chat &lt;model&gt;</code></td>
+<td><code>GENERATION</code>，带 model、usage（input/output/total）、<code>input</code>/<code>output</code> 消息数组</td>
+</tr>
+<tr>
+<td>span 名 <code>execute_tool &lt;name&gt;</code></td>
+<td><code>TOOL</code>，名字裁成 <code>&lt;name&gt;</code>，带参数与回执、latency</td>
+</tr>
+<tr>
+<td><code>tako.*</code>、<code>cozeloop.span_type</code></td>
+<td>落 <code>metadata.attributes.*</code>（Loop 私有标签不干扰 Langfuse 分类）</td>
+</tr>
+</tbody>
+</table></div>
+<p>实测一场 2 次模型调用 + 1 次 <code>bash</code> 的 run：树是 <code>POST /api/runs</code> → <code>invoke_agent yktako</code> → {<code>tako.step.*</code>, 两个 <code>GENERATION</code>, 一个 <code>TOOL</code>}；两枪 usage 求和 6496+73+6596+7 = <strong>13172</strong>，与 usage 帧求和逐值一致。</p>
+<p><strong>怎么读回来</strong>（这两条是现行通道、没有下线日期，脚本照这两条写；旧 v1 资源 <code>/api/public/traces</code>、<code>/api/public/observations/{id}</code>、<code>/api/public/sessions</code>、<code>/api/public/metrics</code> 在 Cloud 上 2026-11-16 下线，不要用）：</p>
+<pre><code>GET &lt;base&gt;/api/public/v2/observations?filter=&lt;JSON&gt;[&amp;limit=&lt;n&gt;][&amp;fields=core,basic,usage,io,metadata,model]
+GET &lt;base&gt;/api/public/v2/metrics</code></pre>
+<p><code>filter</code> 是 JSON 数组，按单条 trace 取数的写法（<code>scripts/bench/traces.py</code> 就是这么调的，实测返回 12 条 span）：</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ot">[</span><span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;string&quot;</span><span class="fu">,</span><span class="dt">&quot;column&quot;</span><span class="fu">:</span><span class="st">&quot;traceId&quot;</span><span class="fu">,</span><span class="dt">&quot;operator&quot;</span><span class="fu">:</span><span class="st">&quot;=&quot;</span><span class="fu">,</span><span class="dt">&quot;value&quot;</span><span class="fu">:</span><span class="st">&quot;&lt;32 hex&gt;&quot;</span><span class="fu">}</span><span class="ot">]</span></span></code></pre></div>
+<p><code>fromStartTime</code>/<code>toStartTime</code> 是 UTC，只在按时间窗扫的时候用。<code>/api/public/observations/{id}</code> 另有 5 次/分钟限流，不要逐条拉详情——按 traceId 一次拉整棵树（<code>limit=200</code>）就够。</p>
+<p><strong>列表接口本身也有限流：30 次/分钟</strong>（2026-11-02 实测，<code>429 {"limit":30,"retryAfterSeconds":19}</code>）。逐 trace 拉一批（比如 bench 的 125 场）会撞上，必须读 <code>retryAfterSeconds</code> 退避重试；<code>traces.py</code> 已内建，勿用裸 for 循环拉。</p>
+<hr />
+<h2 id="4-四条硬约束">4. 四条硬约束</h2>
+<ol type="1">
+<li><strong>观测失败不许碰业务</strong>：令牌/空间 ID 任一为空 → 全程 noop（本地开发与单测零联网）；配了但网络失败 → 导出报错只记日志，run 照常跑、启动照常成功。trace 不是模型配置，不走 fail fast。</li>
+<li><strong>内容受开关控制</strong>（§2.2）：<code>.env</code> 默认 <code>SPAN_ONLY</code>，会把用户原文、工具结果、系统提示词写进 span；改成 <code>NO_CONTENT</code> 则回到只发元数据。掩码与租户级开关没做，多租户上线前必须补（§6）。这不是性能取舍，是 PII 边界。</li>
+<li><strong>不改契约字节</strong>：帧、runlog、任何 API 响应都不加 traceId；traceId 只进进程日志。前端要看 trace，去 Loop。</li>
+<li><strong>多副本无共享态</strong>：每个进程自建 TracerProvider，没有跨进程锁或注册表；<code>service.instance.id</code> 区分副本。崩溃时最多丢批量缓冲里那几秒的 span——可接受，run 的权威结果仍在 tako 库里。</li>
+</ol>
+<hr />
+<h2 id="5-落地步骤">5. 落地步骤</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>步</th>
+<th>做什么</th>
+<th>解决了什么</th>
+<th>验收（第一行是打一个跑着的东西）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A1</td>
+<td><code>internal/observability</code> 装配（env → OTLP exporter → TracerProvider，缺配置即 noop；解析 <code>OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT</code> 并提供内容序列化 helper）+ <code>POST /api/dev/trace-check</code> 发一条样例根 span（开关开时带样例 input/output/system，验证 JSON 与体积上限）并 ForceFlush</td>
+<td>先证明「令牌 + 空间 ID + 端点 + 属性名 + 内容开关」这条管道通；不通时能隔离在观测层</td>
+<td><code>curl -X POST /api/dev/trace-check</code> → <code>{"code":0,...,"data":{"traceId":"&lt;32 hex&gt;","exported":true}}</code>；Loop 按 traceId 搜到 <code>invoke_agent yktako</code>，内容开关开时能看到 <code>gen_ai.input.messages</code>/<code>output.messages</code>；把 env 改成 <code>NO_CONTENT</code> 重起 → 同一条探针没有内容属性；清空 COZELOOP env → <code>exported:false</code></td>
+</tr>
+<tr>
+<td>A2</td>
+<td><code>worker.run</code> 起手开 span、收尾写属性；<code>runs.status</code> 回读；<code>tako.workspace.id</code> 回读；根 span 内容属性（本轮用户原文 / root assistant 输出 / 系统提示词）；日志打 traceId</td>
+<td>把真 run 的会话/租户/项目/用量/状态/业务输入输出装进记录</td>
+<td>curl 起一场真 run → 完成后 Loop 搜 <code>conversation.id=&lt;sessionId&gt;</code>；<code>gen_ai.usage.*</code> 与 <code>/api/runs/{id}/frames</code> 的 usage 帧求和逐值相等；<code>tako.workspace.id</code> 与 <code>sessions.workspace_id</code> 一致；内容开时三个内容属性可 JSON 解析，<code>NO_CONTENT</code> 时一个都没有</td>
+</tr>
+<tr>
+<td>A3</td>
+<td>doc/54 收口、doc/README 索引、doc/16 基线、<code>.env</code> 注释与启动日志说明（含内容开关与 A7–A9 已登记）</td>
+<td>状态与真源一致，下一场会话知道第一段已落地、后续拍已登记</td>
+<td><code>bash scripts/check-master-plan.sh</code> 通过；A1/A2 两条 curl 复打仍绿</td>
+</tr>
+<tr>
+<td>A4（第二段，A3 绿后接）</td>
+<td>模型调用子 span：包装 <code>model.BaseChatModel</code>，每次调用一条 <code>chat {model}</code> CLIENT span，写 <code>gen_ai.response.time_to_first_chunk</code>、usage、<code>gen_ai.response.finish_reasons</code>；内容开关开时写 <code>gen_ai.system_instructions</code> / <code>input.messages</code> / <code>output.messages</code>；TTFT/TPOT 从这里出</td>
+<td>run 级只有总时长，TTFT/TPOT 是推理调用层的度量；内容属性落到每次真实调用上</td>
+<td>curl 起一场流式 run → Loop 里 run span 下出现 <code>chat &lt;model&gt;</code> 子 span；<code>time_to_first_chunk</code> 非空且 &lt; 总时长；<code>(总时长 − TTFT) / (output_tokens − 1)</code> 与手算值一致；内容开时 input/output 可解析，output 含 tool_call parts</td>
+</tr>
+<tr>
+<td>A5</td>
+<td>工具执行子 span：在 <code>journalInvokableTool.InvokableRun</code> 最外层（早于所有 early return）开 <code>execute_tool {name}</code> INTERNAL span，写 <code>gen_ai.operation.name=execute_tool</code>、<code>gen_ai.tool.name</code>、<code>gen_ai.tool.call.id</code>；内容开时写 <code>gen_ai.tool.call.arguments</code> / <code>result</code>；工具报错被 <code>wrapToolErrors</code> 转成文本 → 仍算 OK，取消/中断 → Unset</td>
+<td>run 总时长能拆成模型时间与工具时间，直接看出「哪次工具等了三分钟」</td>
+<td>curl 起一场会调工具（如 <code>get_time</code>）的 run → Loop 里 run span 下出现 <code>execute_tool &lt;name&gt;</code>；<code>gen_ai.tool.call.id</code> 与 frames 里该次 tool_call 的 id 相同；子 span 时长 &gt; 0 且 &lt; run span 总时长；内容开时 arguments/result 非空</td>
+</tr>
+<tr>
+<td>A6</td>
+<td>HTTP 入口 span：两条铸 run 路由（<code>POST /api/runs</code>、<code>POST /api/runs/:runId/resume</code>）在 <code>authn</code> 之前挂中间件，开 SERVER span；把 span context + 起手时刻带给 worker，run span 挂成子 span；写 <code>tako.run.start_delay_ms</code></td>
+<td>trace 从「服务收到请求」开始，准入延迟与排队空隙可见；失败请求也有记录</td>
+<td>curl 起一场 run → Loop 里一条 trace 的根是 <code>POST /api/runs</code>、子 span 是 <code>invoke_agent yktako</code>；<code>tako.run.start_delay_ms</code> 非负；用无 token 打 <code>POST /api/runs</code> → 只有入口 span、<code>http.response.status_code=401</code></td>
+</tr>
+<tr>
+<td>A7（步骤 span 第一批）</td>
+<td>召回与折叠：<code>Store.Recall</code> 开 <code>tako.step.recall</code>，两线各开 <code>search_memory</code> / <code>retrieval</code> 子 span（带记录数；内容开时带 query/records/documents）；<code>foldInput</code> 开 <code>tako.step.compact</code>（加 trigger 参数 initial/midfold/rescue，写输入/摘要 token、drop runs、结果），摘要 <code>chat</code> span 挂成它的子 span</td>
+<td>回答「召回花了多久、折叠花了多久」，并把召回两线拆开；折叠总时长能减去模型时长得到本地耗时</td>
+<td>curl 起一场记忆打开的 run → Loop 里 <code>tako.step.recall</code> 下有 <code>search_memory</code> + <code>retrieval</code>，三者时长均 ≥0；用 <code>-compact-window 1000</code> 起隔离引擎跑长会话 → 出现 <code>tako.step.compact</code>，其下出现摘要 <code>chat</code>；根 span 的 usage 仍与 usage 帧相等；内容开时 records/documents 非空</td>
+</tr>
+<tr>
+<td>A8（步骤 span 第二批）</td>
+<td>准入/装历史/定稿：<code>tako.step.quota</code>、<code>tako.step.workspace</code>、<code>tako.step.history</code>（两条 prepareInput 路径）、<code>tako.step.finalize</code>（EndRun defer，包住整笔事务）</td>
+<td>把 run 开始前和结束时的本地耗时与水落可见，解释「总时长里还有哪几段」</td>
+<td>curl 起一场 run → Loop 里 run span 下出现 quota/workspace/history/finalize 四条子 span；finalize 时长 &gt; 0；quota 早退时 run span 下仍能看到 <code>tako.step.quota</code> 与失败原因</td>
+</tr>
+<tr>
+<td>A9（步骤 span 第三批）</td>
+<td>后台记忆抽取：<code>processMemoryJob</code> 开 <code>tako.step.memory_extract</code>（独立 trace 的根），把 ctx 传给 <code>Generate</code>，让 A4 的 <code>chat</code> span 挂成子 span；写 job/run/session/attempt/item 数</td>
+<td>记忆抽取的模型耗时与本地解析/写库耗时可见，且明确它不属于 run trace</td>
+<td>完成一场 run 并等到 memory job 跑完 → Loop 搜 <code>tako.step.memory_extract</code>，看到独立 trace 与 <code>chat</code> 子 span；该 trace 里没有 run span；run trace 里没有这条 span</td>
+</tr>
+</tbody>
+</table></div>
+<p>实跑发现的两条运维事实：① <code>COZELOOP_WORKSPACE_ID</code> 必须是令牌所属工作区（用 <code>GET https://api.coze.cn/v1/workspaces</code> 核对）；不一致时 OTLP 回 400，SDK 只把错误交给全局 error handler，业务不受影响但看不到任何 trace。② 传输固定 HTTP/protobuf（同一份 span 用 JSON 上报回 500），exporter 保持默认 gzip。</p>
+<p>A4–A9 都只依赖 A2 的 run span 与 A3 的文档收口；A7 的折叠 <code>chat</code> 子 span、A9 的抽取 <code>chat</code> 子 span需要 A4 已落地，A7/A8/A9 其余部分可与 A6 换序。A5 只覆盖根级工具调用；子代理内部工具调用不在 <code>journalWrapHandler</code> 的包装链上，没有 span（§6 登记）。</p>
+<hr />
+<h2 id="6-本篇明确不做登记不假装覆盖">6. 本篇明确不做（登记，不假装覆盖）</h2>
+<ul>
+<li><strong>子代理内部工具调用没有 span</strong>：A5 的包装点 <code>journalWrapHandler</code> 只把根级工具池换成记账壳；子代理的入口快照在包壳之前拍下，它内部再调工具不进包装链。要补得先有子代理的 agent span，本计划不做（子代理调用本身是一个根级工具，A5 会给它一条 <code>execute_tool &lt;subagent&gt;</code> span）。</li>
+<li><strong>折叠摘要与记忆抽取不进 run span 的 usage 求和</strong>：A4 的包装器会给折叠摘要一条 <code>chat</code> 子 span（流式、有 TTFT），给记忆抽取一条 <code>chat</code> span 但落在独立 trace 里（非流式、只有总时长）；run span 的 token 和仍只算 <code>turn</code>（主代理 + 子代理的对话调用），并用 <code>tako.usage.scope=conversation</code> 钉住口径。根 span 回答的是「这场对话花了多少」，不是「本 run 触发的全部模型花费」——对账时按这个口径（§2.3）。</li>
+<li><strong>内容属性的掩码、租户级开关、外部存储引用</strong>：内容本身按 §2.2 的开关记录（<code>.env</code> 默认开）；本篇不做出口前掩码、不做按租户开关、不把内容搬到外部存储再放引用（OTel 规范的生产态用法）。多租户上线前必须先补掩码，否则默认开就是把用户原文推给 Loop SaaS。</li>
+<li><strong>内容事件（events）与 <code>gen_ai.tool.definitions</code></strong>：只写 span 属性；<code>SPAN_AND_EVENT</code> 退化为 <code>SPAN_ONLY</code>，<code>EVENT_ONLY</code> 等于关闭（tako 不产出内容事件）。工具 schema 不是用户/模型内容，不写。</li>
+<li><strong>工具检索的 BM25 span</strong>：<code>toolsearch.go</code> 的 BM25 给延迟加载的工具挑声明，发生在工具装配/首轮，耗时通常可忽略；本篇不单独开 span。</li>
+<li><strong>CozeLoop 的 Eval / 实验管理</strong>：doc/45 的场景化 Eval 仍是我们自己的回归层；Loop 的 experiment 不替代它。trace 只解决「看」。</li>
+<li><strong>入站 trace context 与跨请求链路传播</strong>：客户端不传 traceparent，每次 HTTP 请求一条独立 trace；同一 run 的续跑是另一条 trace，靠 <code>tako.run.id</code> + <code>tako.run.epoch</code> 归组，跨会话靠 <code>gen_ai.conversation.id</code> / <code>tako.workspace.id</code>（§2.5）。</li>
+<li><strong>产品级业务/任务 ID</strong>：加字段本身可行，缺的是任务语义——谁创建、一场 run 归属几个任务、生命周期归谁、UI 怎么承载都未定义（§2.5）。最小形态是客户端自带的不透明归组键，那要求客户端改造，属于产品决定；本篇不发明。</li>
+</ul>
+<hr />
+<h2 id="7-收尾所以这解决了什么">7. 收尾：所以这解决了什么</h2>
+<p>今天「一场 run 干得怎么样」只能靠人翻帧；跨 run 的比较、租户维度的失败聚集、换模型前后的耗时对比都没有一个可检索的集合。这一层把每场 run 变成一条按 OTel GenAI 语义命名的记录，经 OTLP 报到 CozeLoop：<strong>字段名是公共语言（换后端不改代码），内容由标准开关控制（<code>.env</code> 默认开、改 <code>NO_CONTENT</code> 一键关），失败隔离（观测坏了业务照跑）</strong>。完整形态下，一条 trace 从服务收到请求开始，包住 run、每次模型调用、每次工具执行，以及召回/折叠/准入/定稿这些内部步骤（§2.6）；同一场对话的后续提问按 <code>gen_ai.conversation.id</code> 归组，换了会话还能按 <code>tako.workspace.id</code> 找回（§2.5）；token 口径显式钉为对话账本（§2.3），与 usage 帧逐值对得上。</p>
+<p>它不替代 doc/27 的账本，也不替代 doc/45 的回归——它补的是「门牌」：出了事，先能按租户、会话、项目、状态、模型把相关 run 找出来。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/54-%E8%BF%90%E8%A1%8C%E7%BA%A7OTel%E8%BF%BD%E8%B8%AA.md"><code>doc/54-运行级OTel追踪.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

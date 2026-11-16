@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>76 · 项目内容目录与运行资源容器 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="76--项目内容目录与运行资源容器">76 · 项目内容目录与运行资源容器</h1>
+<blockquote>
+<p>性质：<strong>已落地</strong>。本稿解决用户内容与异步执行资源混在一个项目目录里的问题：用户只看 <code>content/</code>，其余归 <code>runtime/</code>。 状态：✅ 已落地；2026-11-12 立项并方案收口，同日施工，2026-11-13 活体验收与文档收口。 施工包：tmp/75-76-目标重规划与项目目录/施工包.md（与 doc/75 合并施工；施工期材料，用户验收后留档 <code>doc/log/</code>）。 日期：2026-11-12 成文，2026-11-13 落地。 代码落点：<code>internal/runengine/project_layout.go</code>（容器／content／runtime 路径与旧布局准入）、<code>scope.go</code>／<code>worker.go</code>（WorkspaceRef 带 RuntimeRoot）、<code>media*.go</code>、<code>bashspill.go</code>、<code>webfetch.go</code>、<code>websearch.go</code>、<code>memory_markdown.go</code>／<code>memory_migrate.go</code>、<code>workspace_{provider,engine,git,directory,result,publish,view}.go</code>、<code>filetools.go</code>／<code>product_api.go</code>（文件清单与整容器删除 + <code>cleanup=done|pending</code>）、<code>pgstore.go</code>／<code>store.go</code>（<code>project_cleanups</code> 与补偿）、<code>archive_sweep.go</code>／<code>tempsweep.go</code>、<code>cmd/yktako/main.go</code>（<code>-migrate-project-layout</code> 离线迁移）；前端 <code>web/src/{ProjectsView.vue,TasksView.vue,api.ts}</code>（删除反馈与工作区标识）。验收：<code>scripts/acceptance/{project_layout,project_layout_migration,workspace_directory,workspace_git,workspace_publication,workspace_crash,memory_markdown,memory_migrate,memory_project_delete}_live.sh</code>、契约用例 58／60 与 <code>contract_test.go</code>（删除体 <code>cleanup</code> 字段、117116 字节）、<code>go test ./internal/runengine</code>、<code>npm run typecheck</code>／<code>npm run build</code>。 前置真源：<a href="35-项目目录.html">doc/35</a>（现有项目目录）、<a href="37-删除与档案清理.html">doc/37</a>（删除与保留窗口）、<a href="52-技能.html">doc/52</a>（技能与工具归属）、<a href="65-记忆两层方案.html">doc/65</a>（记忆文件）、<a href="74-并行任务工作区隔离.html">doc/74</a>（异步工作区与结果发布）。 边界：本篇只调整目录归属、内容可见性、迁移和删除；动态重规划归 <a href="75-目标重规划与继任编排组.html">doc/75</a>，用户级 skill／plugin 本期不做。</p>
+</blockquote>
+<h2 id="1-目标用户内容与执行资源不再混在一起">1. 目标：用户内容与执行资源不再混在一起</h2>
+<p>以用户项目 Tomcat 为例，目标逻辑布局是：</p>
+<pre class="text"><code>Tomcat-project/                    # 项目资源容器：删除项目时整容器清理
+├── Tomcat/                        # 项目内容根：用户真正需要看到的内容
+└── runtime/                       # 执行资源：默认不出现在用户文件清单
+    ├── orchestrations/&lt;编排组ID&gt;/  # 异步工作区、不可变结果、验证与发布记录
+    ├── tmp/                       # 有明确清理规则的临时文件
+    ├── media/                     # 上传媒体与内部读取副本
+    └── memory/MEMORY.md           # Markdown 模式的项目记忆</code></pre>
+<p>真实磁盘仍可使用租户与工作区 ID 防重名，例如：</p>
+<pre class="text"><code>&lt;workspace&gt;/tenants/&lt;tenantId&gt;/workspaces/&lt;workspaceId&gt;/
+├── content/
+└── runtime/</code></pre>
+<p><code>workspaces/&lt;workspaceId&gt;</code> 从“模型直接读写的项目根”改成“项目资源容器”；<code>content/</code> 才是用户内容根。UI 中的项目名 Tomcat 与磁盘 ID 分离，不因项目改名移动目录。</p>
+<p>这个方案解决的是：用户打开 Tomcat 时只看到自己想看的内容，而不是 <code>.tako</code>、<code>.media</code>、工作副本、验证记录或项目记忆。</p>
+<h2 id="2-当前真实布局与差距">2. 当前真实布局与差距</h2>
+<p>当前代码把以下内容混在项目根：</p>
+<pre class="text"><code>workspaces/&lt;workspaceId&gt;/
+├── .media/
+├── .tako/bash/
+├── .tako/fetch/
+├── MEMORY.md
+└── &lt;用户文件&gt;</code></pre>
+<p>同时，异步隔离组在租户级：</p>
+<pre class="text"><code>tenants/&lt;tenantId&gt;/.tako/orchestrations/&lt;orchestrationId&gt;/workspace/</code></pre>
+<p>技能与工具则在：</p>
+<pre class="text"><code>tenants/&lt;tenantId&gt;/skills/
+tenants/&lt;tenantId&gt;/tools/</code></pre>
+<p>当前项目删除只删除项目根和关联会话目录；编排组目录仍等终态过窗后清理。技能、工具与用户 <code>USER.md</code> 不随项目删除。</p>
+<p>所以目标与现状有三个根本差距：</p>
+<ol type="1">
+<li>项目根既是用户内容，又承载运行资源；</li>
+<li>编排组归租户目录，不归项目资源容器；</li>
+<li>删除没有一个可以完整代表项目磁盘资源的容器边界。</li>
+</ol>
+<h2 id="3-两个目录概念必须分开">3. 两个目录概念必须分开</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>概念</th>
+<th>操作定义</th>
+<th>谁使用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>项目内容根 <code>content/</code></td>
+<td>文件工具、普通聊天和用户文件列表所看到的项目根</td>
+<td>用户与普通文件操作</td>
+</tr>
+<tr>
+<td>项目资源容器</td>
+<td>内容根与 runtime 的共同父目录；删除项目时的磁盘边界</td>
+<td>引擎、迁移与删除</td>
+</tr>
+<tr>
+<td>运行资源根 <code>runtime/</code></td>
+<td>保存异步工作区、结果、临时文件、媒体与项目记忆</td>
+<td>Provider、Worker、清理器</td>
+</tr>
+<tr>
+<td>会话目录</td>
+<td>保存子代理 wire 等会话自有档案</td>
+<td>现有会话生命周期</td>
+</tr>
+<tr>
+<td>租户资源根</td>
+<td>保存租户共享技能、工具与用户记忆</td>
+<td>租户级能力，不归单个项目</td>
+</tr>
+</tbody>
+</table></div>
+<p>代码不能继续让 <code>workspaceDir()</code> 同时回答“内容根”和“资源容器”。需要拆成：</p>
+<pre class="text"><code>projectContainerDir(root, tenantId, workspaceId)
+projectContentDir(root, tenantId, workspaceId)
+projectRuntimeDir(root, tenantId, workspaceId)</code></pre>
+<p><code>WorkspaceRef.Root</code> 表示当前执行者真正的工作根；另增通用 <code>RuntimeRoot</code> 承载 bash 输出、抓取全文等内部落盘。媒体与项目记忆通过各自路径函数定位，不再从 Root 猜资源位置。</p>
+<h2 id="4-shared-与-isolated-在容器里的准确含义">4. shared 与 isolated 在容器里的准确含义</h2>
+<p>本方案讨论的是<strong>异步 Task</strong>。普通聊天仍可直接修改 <code>content/</code>，行为不变。</p>
+<h3 id="41-shared-异步工作区">4.1 shared 异步工作区</h3>
+<p><code>shared</code> 表示同一编排组里的 Task 共用一个工作现场，不是直接写用户内容根：</p>
+<pre class="text"><code>runtime/orchestrations/&lt;编排组ID&gt;/workspace/work/shared/</code></pre>
+<ul>
+<li>A/B 在同一个共享工作目录中工作；</li>
+<li>文件工具的短写入保护仍生效，但 bash 任意写仍是非合作边界；</li>
+<li>中间结果不直接进入 <code>content/</code>；</li>
+<li>最终结果经过接受与发布后进入 <code>content/</code>。</li>
+</ul>
+<h3 id="42-isolated-异步工作区">4.2 isolated 异步工作区</h3>
+<p><code>isolated</code> 表示每 Task 一个工作现场：</p>
+<pre class="text"><code>runtime/orchestrations/&lt;编排组ID&gt;/workspace/work/&lt;taskId&gt;/</code></pre>
+<ul>
+<li>Git 项目仍由 GitProvider 使用本组中间仓库与 linked worktree；</li>
+<li>非 Git 项目仍由 DirectoryProvider 使用独立目录副本与变更清单；</li>
+<li>不可变父结果通过现有结果引用交接；</li>
+<li>最终发布仍走 doc/74 的验证、项目准入与恢复。</li>
+</ul>
+<p>因此 shared／isolated 的区别是“<strong>同组共享现场还是每 Task 独立现场</strong>”，不是“一个写项目、另一个不写项目”。两种异步模式都不把中间产物直接暴露到用户内容根。</p>
+<p>模式选择与默认值是否调整不在本篇范围；本篇只改变目录归属与发布边界。</p>
+<h2 id="5-结果产物与临时文件">5. 结果、产物与临时文件</h2>
+<h3 id="51-不可变结果">5.1 不可变结果</h3>
+<p>每个 Task 的已接受结果保存在：</p>
+<pre class="text"><code>runtime/orchestrations/&lt;编排组ID&gt;/workspace/results/&lt;taskId&gt;/&lt;resultRevision&gt;/</code></pre>
+<p>中间 Task 结果只供下游、审查与恢复使用，不复制进 <code>content/</code>。只有最终 Task 的结果经发布链进入用户内容根。</p>
+<p>结果产物仍通过 doc/74 的 Task artifact 端点按版本读取；项目当前文件仍走现有 media／文件出口。两者不能因为路径相同就混用。</p>
+<h3 id="52-临时文件">5.2 临时文件</h3>
+<p>统一逻辑落点为 <code>runtime/tmp/</code>，但不同用途仍分子目录与清理规则：</p>
+<ul>
+<li>Provider staging；</li>
+<li>目录复制与迁移 staging；</li>
+<li>内部 Git 临时输出；</li>
+<li>其他有明确超时与清理者的临时内容。</li>
+</ul>
+<p>不能把所有临时文件堆到一个无归属目录。每个条目必须带组／任务／操作归属，过期清扫只删满足既有时间与安全条件的条目；正在使用、身份不明或包含唯一未保存工作的目录保留。</p>
+<p>bash 全文与 web_fetch 全文是有恢复价值的运行输出，不叫临时垃圾。它们分别进入当前工作现场对应的 <code>runtime/</code> 记录区，不进入 <code>content/.tako/</code>。</p>
+<h2 id="6-技能工具plugin-与记忆的归属">6. 技能、工具、plugin 与记忆的归属</h2>
+<h3 id="61-本期不变的部分">6.1 本期不变的部分</h3>
+<pre class="text"><code>&lt;workspace&gt;/system-skills/                  # 系统技能
+&lt;tenant&gt;/skills/                            # 租户技能
+&lt;tenant&gt;/tools/                             # 租户上传工具
+&lt;tenant&gt;/users/&lt;userId&gt;/USER.md             # 用户记忆</code></pre>
+<p>这些不是 Tomcat 项目独占资产，不移动到 Tomcat 的资源容器，也不随 Tomcat 删除。</p>
+<p>当前没有用户级 skill／plugin；本期不增加。当前也没有项目级技能归属，不从现有租户技能推造一层。</p>
+<h3 id="62-项目记忆">6.2 项目记忆</h3>
+<p>Markdown 模式的项目 <code>MEMORY.md</code> 改到：</p>
+<pre class="text"><code>runtime/memory/MEMORY.md</code></pre>
+<p>它仍按原 WorkspaceID 归属与加锁，仍随项目删除；只是不再出现在用户文件清单中。pipeline 模式的 PG 记忆与任务不受目录迁移影响，项目删除仍按 scope 清理。</p>
+<h2 id="7-项目删除整容器删除但不误删租户资产">7. 项目删除：整容器删除，但不误删租户资产</h2>
+<p>目标删除链：</p>
+<pre class="text"><code>用户删除项目
+→ 锁项目与发布准入
+→ 拒绝默认项目、活 run、未收口组、publishing／blocked 发布
+→ PG 事务软删会话、清项目记忆／记忆任务、删项目行
+→ 提交后删除整个项目资源容器
+→ 删除关联会话目录中的项目私有档案
+→ 发既有 workspace_deleted 事件</code></pre>
+<p>整容器删除包括：</p>
+<ul>
+<li><code>content/</code>；</li>
+<li><code>runtime/</code>；</li>
+<li>本项目的全部异步工作区、结果、验证与发布记录；</li>
+<li>项目记忆文件与媒体；</li>
+<li>本项目临时文件。</li>
+</ul>
+<p>不删除：</p>
+<ul>
+<li>租户技能与工具；</li>
+<li>系统技能；</li>
+<li>用户 <code>USER.md</code> 与用户级记忆；</li>
+<li>按 doc/37 仍需保留的 PG run／runlog／用量档案。</li>
+</ul>
+<p>目录删除失败只记日志并保留清理记录，API 不把“目录没删掉”伪装成磁盘已清理；现有业务响应与保留策略如需调整，在施工包中单独钉契约，不顺手改旧接口。</p>
+<h2 id="8-存量项目迁移">8. 存量项目迁移</h2>
+<p>不能因为目录改名就丢现有项目。每个存量项目独立迁移，迁移期间禁止该项目新 run 与发布：</p>
+<pre class="text"><code>锁项目
+→ 检查无活 run／未收口组／发布
+→ 在同级创建唯一 staging 容器
+→ 把现有用户文件复制到 staging/content/
+→ 把 .media、.tako、MEMORY.md 复制到 staging/runtime/ 的对应位置
+→ 把本项目已有编排组目录复制到 staging/runtime/orchestrations/
+→ 校验迁移清单与文件哈希
+→ 当前容器改名为 backup，staging 原子改名为正式容器
+→ 成功后按保留策略清 backup</code></pre>
+<p>要求：</p>
+<ul>
+<li>迁移清单记录源、目标、哈希与完成状态，崩溃后可对账；</li>
+<li>不把未知目录或别人的容器删了；backup 清理只认本次迁移身份；</li>
+<li>任何一个文件校验失败则该项目不切换，旧容器仍可用；</li>
+<li>同一项目同时只有一个迁移者，其他项目可独立迁移；</li>
+<li>迁移与启动装配解耦，不能让引擎启动时无界扫盘；由显式迁移命令或有限批量任务执行；</li>
+<li>已有 PG 路径字段若只存逻辑项目 ID 则不变；若存有绝对路径，施工时先列清单并迁移，不留双写。</li>
+</ul>
+<p>doc/74 当前工作区实现需要同步改路径来源；不得保留一个仍指向租户 <code>.tako/orchestrations/</code> 的旧写口。</p>
+<h2 id="9-权限安全与多副本">9. 权限、安全与多副本</h2>
+<ol type="1">
+<li>文件列表、项目文件下载和普通文件工具只以 content 为根；runtime 不通过项目文件枚举暴露。</li>
+<li>Task artifact 是唯一的不可变结果读口；权限仍走 Task 属主链。</li>
+<li>所有路径由租户、工作区、编排组和 Task ID 推导，模型不能指定容器路径。</li>
+<li>项目容器、会话目录与租户资源仍位于所有引擎副本共享的持久卷；本机另造目录不算恢复。</li>
+<li>内容迁移、工作区准备、发布和删除各有共享锁与恢复记录；不把文件操作塞进 PG 事务。</li>
+<li>存储配额继续按整租户目录计算；容器重归后不得重复计数或绕过配额。</li>
+<li>日志与 trace 不记录敏感文件正文；迁移报告使用相对路径与哈希。</li>
+</ol>
+<h2 id="10-验收与完成线">10. 验收与完成线</h2>
+<h3 id="101-目录与迁移">10.1 目录与迁移</h3>
+<ol type="1">
+<li>新建项目得到 content/runtime 容器；普通聊天写文件只影响 content。</li>
+<li>媒体、bash 输出、抓取全文与项目 MEMORY.md 不出现在 content 或用户文件清单。</li>
+<li>存量项目迁移后用户文件逐字不变，运行资源进入 runtime；迁移中途 kill -9 可恢复，不双份混入正式目录。</li>
+<li>迁移过程中该项目不能开新 run 或发布；其他项目不受影响。</li>
+<li>租户技能、工具、系统技能与用户 USER.md 路径不变。</li>
+</ol>
+<h3 id="102-异步链">10.2 异步链</h3>
+<ol type="1">
+<li>shared 同组 Task 共用工作目录，不直接写 content；最终发布后才看到结果。</li>
+<li>isolated Git／Directory 各 Task 使用独立目录，不可变结果与父结果交接不受迁移影响。</li>
+<li>中间 Task 完成不污染 content；最终 Task 验证与发布失败时 content 不被冒充更新。</li>
+<li>结果产物仍可按版本读取；项目当前文件与结果版本不混淆。</li>
+<li>doc/74 的 Git、Directory、双副本与崩溃场景在新路径下全绿。</li>
+</ol>
+<h3 id="103-删除">10.3 删除</h3>
+<ol type="1">
+<li>活 run、未收口组与发布受阻仍阻止删除；默认项目仍不可删。</li>
+<li>删除成功后整个项目容器不存在，包括 content、工作区、结果、媒体、项目记忆与临时文件。</li>
+<li>关联会话私有档案按现有规则清理；租户技能／工具、系统技能、用户记忆与 PG 保留档案不受影响。</li>
+<li>目录删除失败有日志与清理记录，不能宣称物理清理成功。</li>
+</ol>
+<h3 id="104-标准门禁">10.4 标准门禁</h3>
+<p>除 Go／前端／契约测试外，还需真实跑：存量迁移、shared／isolated、Git／Directory、项目删除、kill -9、双副本、浏览器文件可见性与 doc/70／72／73／74 回归。</p>
+<p>完成线是：<strong>用户只看到项目内容；所有异步执行资源都归项目容器；中间结果不提前污染项目；最终发布与删除边界一致；存量项目不丢文件；租户共享资产不被误删。</strong></p>
+<h3 id="105-施工中确认的发布边界">10.5 施工中确认的发布边界</h3>
+<p>shared 组的结果现在也走 doc/74 的发布链（先写 <code>runtime/</code>，发布后才进 <code>content/</code>），这带来两条必须写清楚的边界，否则测试和后续实现都会误判：</p>
+<ol type="1">
+<li><strong>发布准入按项目静默，不按组静默。</strong> <code>admitPublication</code> 排除的是 <strong>同一个项目的所有其它活 run</strong>（<code>runs.workspace_id = 项目 AND status='running' AND lease_until &gt; now()</code>），不只是同一编排组的 run。真实失败故事：一个项目里有一场挂在 <code>ask_user</code> 上等人的 Task，人还没回答；同时另一场带检查点的最终 Task 跑完了。挂起 run 的 <code>status</code> 仍是 <code>running</code>、租约仍有效——发布准入一直等不到项目静默；而最终 Task 的检查点暂停又是在发布收口之后才应用，于是那场检查点永远进不了“计划待决策”。 构造“检查点暂停”场景时，忙线 run 必须挂到另一个项目（或先回答完）；doc/70 的 busy 活体与 doc/72／73 的处理项活体已按这条改动，脚本注释写明原因。挂起问题 Task 与检查点 Task 不应放在同一项目里同时等人工。</li>
+<li><strong>“新增或修改”仍是产物声明的唯一依据。</strong> 共享现场以组基线做 diff，任务声明的 artifact 必须是本次执行新增或修改的文件。把文件提前放进 <code>content/</code> 再让任务“声明”它，会被提交校验拒绝（回执明确写 <code>artifact 必须是本次新增或修改的文件</code>），结果里就没有产物。活体 fixture 改为由任务自己创建产物，再按 <code>workspaces/&lt;wid&gt;/&lt;path&gt;</code> 读取。</li>
+<li><strong>shared 受阻后与 isolated 共用同一条恢复路径。</strong> shared 组走发布链后，同样会因项目被推进或工作区脏而让最终 Task 进 <code>blocked</code>（<code>workspace_changed</code>／<code>workspace_dirty</code>／<code>publication_recovery</code>），注意力面板把它标成 <code>publication_blocked</code>。恢复入口仍是 <code>POST /api/tasks/:id/retry-publication</code>：它不按工作区模式分叉，只认「最终 Task、blocked 且带发布三码、当前结果版本与不可变结果仍有效」。若这里还按 isolated 拦截，shared 的最终 Task 会停在 blocked 且没有任何人工出口（117112 死路）。契约用例 59 的 shared 夹具是非 blocked 任务，所以字节期望不变（117112），差别只在「blocked + 发布三码」这一档。</li>
+<li><strong>新项目首次使用的并发请求不能被误判成存量。</strong> 初始化先写 <code>layout.json</code> 再建 <code>content/</code>／<code>runtime/</code>；「容器已有条目、但这次没读到 layout」时再读一次；原子写的 <code>.tako-tmp-*</code> 临时文件不计入存量条目。反例是本轮契约套件抓到的真实 117116：同一个新项目的第一场 run 在后台初始化容器，紧接着第二个 <code>POST /api/runs</code> 在「<code>content/</code> 已建、<code>layout.json</code> 还没落盘」的窗口里查 <code>projectLayoutNeedsMigration</code>，把刚建的项目判成存量。活体表现是一条随机 409，<code>TestEnsureProjectLayoutConcurrentFirstUse</code> 钉住。</li>
+</ol>
+<h2 id="11-代码落点与施工纪律">11. 代码落点与施工纪律</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>实际修改点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>project_layout.go</code></td>
+<td><code>projectContainerDir</code>／<code>projectContentDir</code>／<code>projectRuntimeDir</code>／<code>ensureProjectLayout</code>；容器非空而无 <code>layout.json</code> 回旧布局错误，HTTP 层统一 117116</td>
+</tr>
+<tr>
+<td><code>scope.go</code> / <code>worker.go</code></td>
+<td>项目绑定会话的 <code>runWorkspace</code> 同时给出 content 根与 runtime 根；<code>WorkspaceRef.RuntimeRoot</code></td>
+</tr>
+<tr>
+<td><code>media.go</code> / <code>media_send.go</code></td>
+<td>媒体物理落点移 runtime，逻辑授权与读取不变；<code>workspaces/&lt;wid&gt;/&lt;path&gt;</code> 映射 content</td>
+</tr>
+<tr>
+<td><code>bashspill.go</code> / <code>webfetch.go</code> / <code>websearch.go</code></td>
+<td>内部输出落 runtime/记录区，不再写 <code>content/.tako</code></td>
+</tr>
+<tr>
+<td><code>memory_markdown.go</code> / <code>memory_migrate.go</code></td>
+<td>项目 <code>MEMORY.md</code> 移 <code>runtime/memory/</code>，锁与归属不变</td>
+</tr>
+<tr>
+<td><code>workspace_{provider,engine,git,directory,result,publish,view}.go</code></td>
+<td>编排组目录从项目容器推导（<code>runtime/orchestrations/&lt;id&gt;</code>）；shared 也走发布链；Provider 只消费路径函数</td>
+</tr>
+<tr>
+<td><code>filetools.go</code> / <code>product_api.go</code></td>
+<td>文件清单与媒体只暴露 content；删除整容器，响应带 `cleanup=done</td>
+</tr>
+<tr>
+<td><code>pgstore.go</code> / <code>store.go</code></td>
+<td>删除事务写 <code>project_cleanups.pending</code>，提交后删容器；调度器补偿回写 done</td>
+</tr>
+<tr>
+<td><code>archive_sweep.go</code> / <code>tempsweep.go</code></td>
+<td>清扫按新容器与恢复边界执行</td>
+</tr>
+<tr>
+<td><code>cmd/yktako/main.go</code></td>
+<td>离线 <code>-migrate-project-layout</code>：复制 → 校验 → 原子切换，可重复执行</td>
+</tr>
+<tr>
+<td><code>web/src/</code></td>
+<td>项目文件区只显示 content；删除后按 <code>cleanup</code> 提示“磁盘清理稍后完成”；Task 详情标共享／隔离工作区</td>
+</tr>
+<tr>
+<td><code>scripts/acceptance/</code></td>
+<td><code>project_layout_live.sh</code>（36 条）、<code>project_layout_migration_live.sh</code>（51 条），以及既有目录／Git／发布／崩溃／记忆活体按新路径回归</td>
+</tr>
+</tbody>
+</table></div>
+<p>施工纪律（2026-11-13 回填）：没有临时实现或过渡开关——旧布局项目在 HTTP 层直接 117116，迁移只走离线命令；没有 <code>content/</code> 的直写旁路，所有异步结果都经发布链进入内容根。</p>
+<h2 id="12-所以这解决了什么">12. 所以这解决了什么</h2>
+<p>doc/76 把“项目目录”从一个混杂的大目录拆成用户内容根与项目资源容器：用户只看到 Tomcat，异步工作区、结果、媒体、项目记忆和临时文件都在容器内但不污染内容根。</p>
+<p>它同时统一了 shared／isolated 的最终发布边界和项目删除边界，并明确租户共享技能、工具与用户记忆不属于某个项目。这样目录结构、可见性、隔离与生命周期才指向同一个项目模型。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/76-%E9%A1%B9%E7%9B%AE%E5%86%85%E5%AE%B9%E7%9B%AE%E5%BD%95%E4%B8%8E%E8%BF%90%E8%A1%8C%E8%B5%84%E6%BA%90%E5%AE%B9%E5%99%A8.md"><code>doc/76-项目内容目录与运行资源容器.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

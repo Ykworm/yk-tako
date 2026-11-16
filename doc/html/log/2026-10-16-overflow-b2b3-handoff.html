@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Handoff · 溢出修复层二期 B2/B3 落地（guard 救援链 + 采用/槽位落库）（2026-10-16） · tako 文档</title>
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="handoff--溢出修复层二期-b2b3-落地guard-救援链--采用槽位落库2026-10-16">Handoff · 溢出修复层二期 B2/B3 落地（guard 救援链 + 采用/槽位落库）（2026-10-16）</h1>
+<blockquote>
+<p>性质：<strong>执行 handoff</strong>——供接手会话直接开工。范围 = <strong>二期 B2–B3 两拍</strong>（guard 救援链 = 进程内自愈；采用 + 槽位落库 = 状态层）；B4（trimToolResults）/ B5（回归收口）不在内。 触发：用户令「给我 handoff 我让另一个 agent 去做」——B2/B3 必要性已于今日对话确认 （中途拒收 = 一期零帧谓词救不了的面，B1 真栈实测撞活过），语义澄清（×4/5 = 验收线不是 砍量；B2/B3 是一个整体、只落一半 = 死缓）已吸收进本文，<strong>无需重开讨论</strong>。 状态：<strong>台账待用户过审</strong>（tmp/19-v6/overflow/ 2026-10-12 拆出）——<strong>用户把本 handoff 发给 接手会话即视为过审、可从 B2 开工</strong>。 取信口径：§0 状态为 2026-10-16 当日实读（git/文件坐标在文内）；机制结论的权威源坐标都在 §5。 <strong>前置阅读（按序）</strong>：<code>doc/19-v6/19v6-09-溢出修复层.md</code> §8（机制设计原文）→ <code>tmp/19-v6/overflow/planning.md</code> 二期节（D12–D16 + 缝勘察五条）→ <code>tmp/19-v6/overflow/todos.md</code> B2/B3 两节（<strong>四要素权威原文——冲突以台账为准</strong>）。</p>
+</blockquote>
+<h2 id="0-一句话现状2026-10-16-实读动工当日重新-git-status-复核">0. 一句话现状（2026-10-16 实读；动工当日重新 <code>git status</code> 复核）</h2>
+<ul>
+<li>代码 @ <code>cf2bde3</code>（另一会话的批已 commit；树上未 commit = <strong>B2 本拍</strong> 5 文件 411+/85-， 归属已明）。<code>midfold.go</code> 的 BeforeModelRewriteState 内部结构（现役 = box nil 直通 → 休眠门 （stripReasoning+return）→ convertState → 账单/全量估算 → 折叠或放行；注释钉死顺序 「先估→再折→最后滤」，midfold.go:375-424）——<strong>B3 施工期实读定夺：planning D15 的 「头部（休眠门后）」= 休眠门块（midfold.go:381-384）之后、<code>base := box.baseRows()</code>（:385）之前</strong>。</li>
+<li><strong>计数口径已升级</strong>（<code>8d938ee</code> 起）：countInput 基数 = system + 每行 text + 每行 tool_calls JSON（compact.go:249 一带）——B2 的 C_rej 用现役口径，勿用立项时快照印象。</li>
+<li><strong>B2 已完工验收</strong>（2026-10-16，口径 = 裁定 A 四条「救回一次 / 重试成功 / 工具不重跑 / 数据没动」；回填 = todos B2 节末、证据 = <code>tmp/19-v6/evidence-overflow/b2/</code>）——guard.go 手已装、worker.go 闸已收编（box.recovered() / tryMarkRecovered()，三点同一闸）。终态基线： r1 救援后 call4 照鼓 state 再拒 → error（B2/B3 成对差分的一半——B3 后应翻成完整轮 + 落库）。</li>
+<li><strong>B3 已完工验收</strong>（2026-10-16，三场景活体：run1 采用点 1 中间轮 / run2 采用点 2 收尾轮 + 下一 POST 活；回填 = todos B3 节末「B3 验收结果」、证据 = <code>tmp/19-v6/evidence-overflow/b3/</code>） ——foldBox adopted 槽 + setAdopted/takeAdopted、采用点 1（休眠门后）+ 采用点 2（AfterAgent） 两点已装；B2 终态基线的「下一 POST 仍拒」已翻「下一 POST 活」（差分另一半闭环）。</li>
+<li><strong>B4 已完工验收</strong>（2026-10-16）：代码 + 单测已落（foldInput trim 兜底 + 循环守卫修 + window 入签名）；<strong>活体验收带一项重大发现</strong>——差分半边在活体上<strong>不可达</strong>（ADK 默认 MaxIterations=20 → 本 run 折行排队列 ≤ 20 → 唯一带工具行的 trim 出口「phase-2 封顶」需 units ≥ 21 → 活体不存在；两代二进制同话本同死 <code>exceeds max iterations</code> 已钉），trim 今日 = 单测钉形态（六件全过）+ 零变化半边活体对照两代同形（无 trim 行、complete、库行同构）。 <strong>已裁（2026-10-16 用户令「放开到50」）：MaxIterations 放开 = 50</strong>（<code>agentMaxIterations</code>， worker.go 常量，主 / 子代理两装配点同值）——同话本① 即刻重放两跑、差分成立：封顶出口 <code>compact trim:</code> 行（预算 8192 tok，还原 0 条，夹 1 条）+ terminal{complete}（帧原文 + 两跑引擎日志 + psql，证据 <code>tmp/19-v6/evidence-overflow/b4-max50/</code>）。详 = todos B4 节末「验收结果」+ 证据 <code>tmp/19-v6/evidence-overflow/b4/</code>（README 含三重论证与重跑指引）。</li>
+<li><strong>B5 已完工</strong>（2026-10-16，回归网 + 收口）：五场全量重放逐项同形——① m_d1 四端点 （202+102+字段序/session/frames n=51/log 字段集）对 A4 基线；② A3 截断链（两超窗行格式 逐字同、末折两态、m_3/m_4 零命中、psql 同构）；③ window=0 负路径（零折/零翻转/无 seq0）； ④ A2 拒收链（rescue 行估算 2625116 逐值同、psql 11 行逐位同构、重跑 complete）；⑤ 强折 失败负路径（rescue 行逐字同、terminal 帧逐字节同 A1、零写入）；<strong>全程 <code>compact trim</code> 行零 出现</strong>（B5 时默认栈下——同日午后放 50 后差分已重放成立，见 B4 条）。单测 13.708s 绿 + vet 干净。doc 回填同拍：19v6-09 head/§8 勘误/§13-4 ✅+D15 旁注/§14 核对、子台账 planning head+演进、主台账 86 行+§10.6-④。 证据 = <code>tmp/19-v6/evidence-overflow/b5-regression/</code>（README 五场对照表）。<strong>二期 B1–B5 至此全部落地、19v6-09 §13 五项收官</strong>；唯一开口项 MaxIterations 已裁 50、重放通过（见上）。</li>
+<li>commit 安排（2026-10-16 用户令「放开到50，然后commit」）：本批 = B2–B5 + max50 单 commit 入库（本文件随批）；不替别的会话 commit——另一会话的批（doc/22、doc/23 等）已由其 commit 为 <code>cf2bde3</code>。</li>
+<li><strong>话本校准（B1 实测回填，B2/B3 沿用）</strong>：deepseek-flash 真窗 = <strong>1048576</strong>（不是 ~128k）；实配 = 新会话塞 <strong>3×580,011 字符</strong>填充 + 指令「读 a.txt、b.txt、c.txt 后总结」 （F 工具环连读；模型行为 = 先 list_directory 再 read_text_file，首读后下一调用即过窗）+ <code>-compact-window 4000000</code>（limit 3983616）。B1 实测拒收：<code>requested 1057854 &gt; 1048576</code>， 报文逐字节在 <code>tmp/19-v6/evidence-overflow/b1/b1-detect-rescue-lines.txt</code>（B2 实测用 3×575,007 字符脚本，逐条判读见 b2 报告）。</li>
+<li>施工顺序（2026-10-16 用户修订）：<strong>B2 ✅ → B3 ✅ → B4 ✅ → B5 ✅（全部完工交付）</strong> （用户令「你改完以后就请另外完成后 继续 b4 b5」）；每拍仍出验收记录、B2/B3 差分成对不合并 （「下一 POST 仍拒」已由 B2 终态观察钉住、B3 已翻「下一 POST 活」——判例同 A1→A2）； 不自动 commit、每拍收尾杀自己起的引擎并 lsof 复核。</li>
+</ul>
+<h2 id="1-硬约束与环境动手前先过一遍">1. 硬约束与环境（动手前先过一遍）</h2>
+<ul>
+<li>硬闸门（AGENTS.md）：<strong>逐 action 停下交审</strong>；验收第一行必须是 curl/日志/psql 打跑着的东西； diff 目标 ≤80 行（B2 ≈220 / B3 ≈200 含单测，已论证不拆，判例同 A2，见 todos 原文）。</li>
+<li>Go 不在 PATH：<code>export PATH="$HOME/sdk/go1.27.0/bin:$PATH"</code>；代码在 <code>yk-tako-eino/</code>。</li>
+<li>起栈：引擎 <code>go run ./cmd/yktako -engine 127.0.0.1:8934</code>（缺省 redis 6390 / pg 5433；<code>.env</code> 在 <code>yk-tako-eino/</code>）。<strong>8934 起前 <code>lsof -i :8934</code> 查占</strong>，被占换端口、不杀别人的进程；每拍结束 杀自己起的引擎并 lsof 复核。</li>
+<li><strong>危险区</strong>：6379 Redis 与 5432 PG 是 otel-ch-native 的活实例——全程不动。</li>
+<li>psql：<code>PGBIN=~/dev/ykcode/learn-golang/otel-ch-native/bin/postgres/bin</code>， <code>$PGBIN/psql -h 127.0.0.1 -p 5433 -d tako</code>。</li>
+<li>测试网 = 真实例：<code>go test ./internal/runengine/ -count=1</code>（需 6390 + 5433 已起）。</li>
+<li>实测证据落 <code>tmp/19-v6/evidence-overflow/b2/</code>、<code>b3/</code>（本 loop 新建）。</li>
+<li>话本校准纪律（塞历史三条出路：overflow 行=成活 / compact 行=减料 / complete=加料）见 planning 裁定 10；B2/B3 话本要真 provider 拒收，<strong>不造假</strong>。</li>
+</ul>
+<h2 id="2-两个-action权威四要素见-tmp19-v6overflowtodosmd-b2b3-节这里给导览--已勘察的接线--施工期实读钉">2. 两个 action（权威四要素见 <code>tmp/19-v6/overflow/todos.md</code> B2/B3 节；这里给导览 + 已勘察的接线 + 施工期实读钉）</h2>
+<h3 id="21-b2--guard-救援链折叠被拒输入--重调一次进程内自愈-已完工验收-2026-10-16">2.1 B2 · guard 救援链：折叠被拒输入 + 重调一次（进程内自愈）· <strong>已完工验收 2026-10-16</strong></h3>
+<ul>
+<li><strong>升级点已勘察</strong>：<code>guard.go:63-71</code>（guardModel.Stream 错误分支，B1 的观测行处升级）。 ctx 里拿得到 foldBox 已由 B1 活体证实（<code>foldBoxFrom(ctx)</code> 非 nil + frameCount()&gt;0 即 「中途」；零帧静默让位 A2，行为原样）。</li>
+<li><strong>判据四条件</strong>（D14）：<code>IsOverflowError(err) ∧ windowOn ∧ box.frameCount()&gt;0 ∧ box.tryMarkRecovered()</code>（<strong>闸先花</strong>——收编对象 = worker.go:337 的 overflowRecovered 局部变量，D12：A2 谓词两处 :349、A3 闸读写 :434-435、日志分叉 :368 随之改读 box， <strong>行为零变化，同一闸换载体</strong>）。</li>
+<li><strong>折叠链全复用</strong>（D14）：<code>convertState(box.baseRows(), box.run, input)</code>（midfold 现役） → <code>countInput</code>（<strong>C_rej = 这份被拒输入的估算，现役口径</strong>：system 从 input[0] 取， 与 convertState 同款）→ <code>rescueLimit(C_rej, extractWindow(err) 真值, hasWindow)</code> （overflow.go:167 现役）→ <code>foldInput(ctx, sys, history, box.run, limit', ...)</code>（compact.go:388， <strong>签名无 force——「force」的施工形态 = 传 rescueLimit 现算的 limit'，A2 的 rescueOverflow 块同款，worker.go :349-368 区域实读</strong>）→ 摘要行打戳（AttachRun/seq0，worker.go:486-487 的 A2 先例同款）→ <code>inner.Stream(ctx, toSchemaMessages(folded), opts...)</code> <strong>重调一次</strong>： 成功返新流 + <strong>guard rescue 行</strong>（格式 D14 钉死：<code>overflow guard rescue: provider 拒收 （估算 C tok；真值 W' 或盲降）；强折 k 个 run，摘要 S tok；重试</code>）。</li>
+<li><strong>负路径</strong>：折败 / 重调再拒 → <strong>原样上抛（上抛第二次的错误——首次拒已进 guard 日志； 闸已花不再救）</strong>，救援链自身失败 = 原始错误走既有 error 出口（零写入家族不变）。</li>
+<li><strong>B2 的边界（验收列③，越界 = 本拍白做）</strong>：<strong>不动 box.base、不 appendStaged、不改 foldBox.baseCount</strong>——救援产物只在进程内，库未动是 B2/B3 差分的对照基线。</li>
+<li><strong>施工期实读钉</strong>： a) rescueOverflow（worker.go A2 救援块）逐行实读——B2 复用它的 rescueLimit/foldInput 调用形态，但<strong>不</strong>重跑整条 agent.Run、<strong>不</strong>重读 mh（原料 = 当次 input 转录，A2 重读 mh 的理由「prepareInput 本地变量可能折过」在 B2 不成立：装饰器看到的是实发的那份）； b) 重调输入 = <code>toSchemaMessages(folded)</code>——折后行由 renderFold/mh 形状派生、<strong>本不带 思考</strong>（doc/24 的 stripReasoning 管的是「没折的直通路径」），无需重复滤；单测钉 「重调输入无 ReasoningContent 残留」； c) eino 错误 fixtures 已随 A1 钉（overflow_test），IsOverflowError/extractWindow 直接用； d) 闸收编后 A3 检出②不重复触发（单测必做项，todos 原文）。</li>
+<li><strong>验收导览（已完工，口径 = 裁定 A 四条；记录 = todos B2 节末「B2 验收结果」，证据 = <code>tmp/19-v6/evidence-overflow/b2/</code>）</strong>：① 救回一次——r1 rescue 行（:445，估算 2241697 / 摘要 623 tok）；② 重试成功——重试输入过关、其后 get_file_info×4 是重试活的硬证据； ③ 工具不重跑——tool_result 条数 = 读取次数（r1 26 帧形状见 b2 报告）；④ 数据没动—— psql 7 行 0 翻 / 0 seq0；A2 零帧回归照旧（r3 8 翻死 + 1 seq0）。<strong>归 B3 验收记录的项</strong>： 「下一 POST 仍拒」= B2 终态基线（r1 call4 照鼓 state 再拒 requested 1049976 → error， 即死缓活证——B3 后应翻成完整轮 + 落库）；「整轮跑完 done/complete」在 B3 拍验收。</li>
+</ul>
+<h3 id="22-b3--采用--槽位落库状态层d15-已完工验收-2026-10-16">2.2 B3 · 采用 + 槽位落库（状态层，D15）· <strong>已完工验收 2026-10-16</strong></h3>
+<blockquote>
+<p>验收记录 = todos B3 节末「B3 验收结果」；证据 = <code>tmp/19-v6/evidence-overflow/b3/</code> （run1/run2：rescue 行、psql 行形状、frames、g2「下一 POST 活」两连完）。以下导览保留作 施工对照（机制坐标仍在文内）；施工期修订（采用 = 槽 + 尾随行）已被活体证成。</p>
+</blockquote>
+<blockquote>
+<p>施工期修订（动工前已落账，todos B3 节末）：采用 = 「system + 槽 + <strong>尾随行</strong>」，不是 §2.2 原文的字面 <code>[system]+槽</code>——字面版会丢救援点之后的「重试回复 + 工具结果」（重生调用 = 帧双份、工具两遍，与 B2 验收③冲突）或丢最终答复行（场景 b）。尾随行 = 救援点之后 ADK 追加的新行，guard 写槽时记行数（len(input)）供切分。全文与理由在 todos。</p>
+</blockquote>
+<ul>
+<li><strong>槽位新件</strong>：foldBox（midfold.go:70 一带）加 adopted 槽 + <code>setAdopted/takeAdopted</code>； guard 折成后 <code>box.setAdopted(folded)</code> + <code>box.appendStaged(*staged)</code>（appendStaged 现役 :94，先例 :391——<strong>落库走 EndRun 吃 staged 列表的现役路径，不改 EndRun/存储层</strong>）。</li>
+<li><strong>采用点 1（主路径）</strong>：<code>BeforeModelRewriteState</code> 头部——<code>takeAdopted</code> 非空 → <code>state.Messages = [state.Messages[0] 原样] + toSchemaMessages(槽)</code> + <code>box.setBase(槽)</code> + 返回（<strong>跳过本轮估算折叠</strong>：形状刚折成、目标线已按被拒输入校准，再折一遍 = 同段历史 两份漂移摘要）。</li>
+<li><strong>采用点 2（兜底）</strong>：<code>AfterAgent</code>——槽非空 → <code>box.setFinal(槽)</code> 直接返回（<strong>跳过 convertState</strong>——state 鼓着、base 未动，不能从它算）。缺这点 = 「被救的是最后一轮」 落坏账。现役 AfterAgent（midfold.go:402-413）先 convertState 后 setFinal，加头部早退分支。</li>
+<li><strong>施工期实读钉（6c0d525 后的新接缝，本文出前刚实读）</strong>： a) <strong>采用点与「先估→再折→最后滤」的共存位置</strong>：planning D15 写于 doc/24 之前，「头部 （休眠门后）」落在现役代码哪一行施工期实读定夺。已知交互两条，登记不裁：① 采用重写 后的 state 由 toSchemaMessages 派生、<strong>无 ResponseMeta</strong> → 下一轮 usageBasedInput 找不到锚点 → 自动回退全量 countInput = doc/24 §6「刚折完」分支的<strong>既有行为，不是 缺陷</strong>，单测钉即可；② 采用路径跳过 stripReasoning 的安全性——折后行本无思考， 大概率无操作，单测钉「采用后 state 无思考残留」； b) 采用不重新摘要 = 写两处同一份（state 重写 + staged），单测钉 staged.Summary 与 state 里的摘要行同源； c) guard 折 + 采用与 midfold 自身折叠的共存序列（todos 原文：不重复摘要）。</li>
+<li><strong>验收导览</strong>（话本同 B2，期望再换）：① rescue 行照旧 + frames done/complete； psql = 被折行 compacted=t + 新 seq0 摘要行 compacted=f + <strong>本 run 行 = 折后保留单位</strong> （被折走的本 run 单位不在库中——mhRowsFromFold 从折后 final 派生）；② <strong>下一 POST 活</strong> （墙消失——B2/B3 的成对判据反转）；③ 采用两点各一场景：a) 中间轮被救（读后模型继续 调工具/再答）→ 下一轮钩子采用生效；b) 最后轮被救（读后直接收尾）→ AfterAgent 兜底 （① 的 psql 形状即其证）。单测全绿收尾。</li>
+</ul>
+<h2 id="3-已裁承重裁定防重开论战">3. 已裁承重裁定（防重开论战）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>裁定</th>
+<th>内容</th>
+<th>出处</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>B2/B3 拆拍</td>
+<td>官方定界：WrapModel 改输入不持久进 state（单次调用层 = B2），state 重写归 BeforeModelRewriteState（状态层 = B3）；合拍 ≈350 行超 A2 判例体量线</td>
+<td>planning 拆分明线第 2 条；handler.go:246-250 实读</td>
+</tr>
+<tr>
+<td>B2 边界</td>
+<td>不动 base / 不 appendStaged / 不动 baseCount——库未动是差分对照基线</td>
+<td>todos B2 验收列③</td>
+</tr>
+<tr>
+<td>闸先花</td>
+<td>tryMarkRecovered 成功才进折叠；折败/再拒上抛第二次错误；一 run 一救（D5）</td>
+<td>planning D14</td>
+</tr>
+<tr>
+<td>日志行</td>
+<td>B2 rescue 行 / B1 观测行全文钉死（只多 guard 一词，与 A2 rescue 行同族便于对照）</td>
+<td>planning D14</td>
+</tr>
+<tr>
+<td>C_rej 口径</td>
+<td>C_rej = 被拒输入的 countInput（现役：system+text+tool_calls JSON），不是 box.baseCount</td>
+<td>planning D14；compact.go:249</td>
+</tr>
+<tr>
+<td>采用不重新摘要</td>
+<td>同一份折后形状写 state + staged 两处，防两份漂移摘要</td>
+<td>19v6-09 §8；planning D15</td>
+</tr>
+<tr>
+<td>落库不改存储层</td>
+<td>staged 进现役列表 → EndRun 既有单写点天然落库（「EndRun 槽位落库」的施工等价）</td>
+<td>planning D15</td>
+</tr>
+<tr>
+<td>采用双点</td>
+<td>主路径 BeforeModelRewriteState + 兜底 AfterAgent（缺兜底 = 最后一轮被救落坏账）</td>
+<td>planning D15</td>
+</tr>
+<tr>
+<td>话本校准</td>
+<td>真窗 1048576（非 ~128k）；3×580,011 字符 + 工具连读 + window 4000000</td>
+<td>B1 验收回填（todos B1 节末）</td>
+</tr>
+<tr>
+<td>子代理不挂</td>
+<td>guard 装配面天然排除（agents.go 无 Handlers 字段），零排除代码</td>
+<td>guard.go 头注</td>
+</tr>
+<tr>
+<td>D12–D16 全部</td>
+<td>帧计数收编 foldBox / guard 链尾 / 折叠全复用 / 采用双点 / trim 挂点（B4 用）</td>
+<td>planning 二期节，无留待拍</td>
+</tr>
+<tr>
+<td>B2 验收口径（裁定 A）</td>
+<td>B2 = 「救回一次 / 重试成功 / 工具不重跑 / 数据没动」四条；「整轮跑完」与「下一 POST 活」归 B3 验收记录</td>
+<td>2026-10-16 用户「本来就是选A啊」</td>
+</tr>
+<tr>
+<td>连续推进令</td>
+<td>自 B3 起连续推进 B3 → B4 → B5，不再逐拍停审；每拍仍出验收记录、差分成对、不自动 commit</td>
+<td>2026-10-16 用户「你改完以后就请另外完成后 继续 b4 b5」</td>
+</tr>
+<tr>
+<td>采用 = 槽 + 尾随行</td>
+<td>B3 施工期修订：字面 <code>[system]+槽</code> 会砸 B2 已验收不变量（场景 a/b 见 todos B3 节末）；尾随行 = 救援点之后 ADK 追加的新行</td>
+<td>todos B3 节末施工期修订（交审重点项）</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-停线不在本-handoff-范围">4. 停线（不在本 handoff 范围）</h2>
+<ul>
+<li><strong>B4 trimToolResults</strong>（n=0 兜底瘦身，规则四件）与 <strong>B5 回归收口</strong>——另拆四要素后动工。</li>
+<li>一期 A1–A4、三期（limit 重裁）已落地验收——只回归、不改。</li>
+<li>子代理溢出不救、(c) 子检、Usage 基线复审项——均已裁，见 19v6-09 §11。</li>
+<li>四端点字节 / runlog / 闸 / 计数口径（D11）/ 帧 kind 全不动。</li>
+</ul>
+<h2 id="5-素材坐标索引2026-10-16-实读">5. 素材坐标索引（2026-10-16 实读）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>素材</th>
+<th>位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>机制设计真源</td>
+<td><code>doc/19-v6/19v6-09-溢出修复层.md</code> §8（装饰器形态 / 采用没它会死 / D6 落库）</td>
+</tr>
+<tr>
+<td>施工级裁定</td>
+<td><code>tmp/19-v6/overflow/planning.md</code> 二期节（D12–D16 + 缝勘察五条 + 拆分明线四条）</td>
+</tr>
+<tr>
+<td>四要素权威</td>
+<td><code>tmp/19-v6/overflow/todos.md</code> B2/B3 节（改什么/为什么/怎么验收/回答什么问题）</td>
+</tr>
+<tr>
+<td>B2 升级点</td>
+<td><code>guard.go:63-71</code>（B1 观测分支）；闸收编 <code>worker.go:337</code>（A2 块 :349-368、box 同步先例 :486-487）</td>
+</tr>
+<tr>
+<td>B3 采用点</td>
+<td><code>midfold.go</code>：foldBox :70（appendStaged :94、frameCount :127）、BeforeModelRewriteState :348（休眠门 :354-357、重写+同步先例 :389-391）、AfterAgent :402</td>
+</tr>
+<tr>
+<td>折叠链</td>
+<td><code>compact.go:388</code> foldInput（注释 :385-386 明写救援形态）、<code>overflow.go:76</code> IsOverflowError / :118 extractWindow / :167 rescueLimit</td>
+</tr>
+<tr>
+<td>doc/24 新接缝</td>
+<td><code>midfold.go:262</code> stripReasoning、:283 usageBasedInput、:343-397 先估→再折→后滤（B3 实读钉 a 的原文）</td>
+</tr>
+<tr>
+<td>B1 话本与证据</td>
+<td><code>tmp/19-v6/evidence-overflow/b1/</code>（报文逐字节、psql、帧序）；拒收行 <code>requested 1057854 &gt; 1048576</code></td>
+</tr>
+<tr>
+<td>新证据落点</td>
+<td><code>tmp/19-v6/evidence-overflow/b2/</code>、<code>b3/</code>（本 loop 新建）</td>
+</tr>
+<tr>
+<td>环境</td>
+<td><code>scripts/dev.sh</code>；<code>yk-tako-eino/.env</code>；PG 5433 / Redis 6390；同判例 handoff = <code>doc/log/2026-10-12-overflow-handoff.md</code>（A1–A4 已完工，仅供查环境纪律）</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="6-纪律提醒给接手会话">6. 纪律提醒（给接手会话）</h2>
+<ul>
+<li>本文件是导览不是裁定：机制级事实都有源坐标；<strong>冲突以 doc/19v6-09 与子台账原文为准</strong>。</li>
+<li>承重论断先验前提（AGENTS.md）：文档注释、记忆、印象、已废代码都不是证据，证据只有代码、 配置和用户原话。凡本文写「实读」处，先实读再动手。</li>
+<li>每拍仍出验收记录；不自动 commit；<code>tmp/</code> 台账不入 git。</li>
+<li>施工顺序（2026-10-16 修订）：B2 ✅ → B3 ✅ → <strong>B4（进行中：代码+单测已落，活体差分待跑） → B5</strong> 连续推进、不再逐拍停审（用户令）；差分成对不合并验收；B4 在 B2/B3 未 commit diff 上 续叠（同一拍分拍）。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/log/2026-10-16-overflow-b2b3-handoff.md"><code>doc/log/2026-10-16-overflow-b2b3-handoff.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

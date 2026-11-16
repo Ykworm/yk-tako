@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>WebUI net/http → Gin 迁移 Implementation Plan · tako 文档</title>
+<link rel="stylesheet" href="../../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../../assets/tako-architecture.html">架构总览</a><a href="../../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="webui-nethttp--gin-迁移-implementation-plan">WebUI net/http → Gin 迁移 Implementation Plan</h1>
+<blockquote>
+<p><strong>For agentic workers:</strong> 按本计划逐任务实现。步骤用 checkbox（<code>- [x]</code>）跟踪。 本计划不重新打开任何已拍板项，只做 HTTP 层的等价迁移：路由、Handler 签名、响应写入三处替换。</p>
+</blockquote>
+<p><strong>Goal:</strong> 把 <code>internal/webui</code> 包从 Go 标准库 <code>net/http</code>（<code>http.ServeMux</code> + <code>func(w http.ResponseWriter, r *http.Request)</code>）迁移到 <code>github.com/gin-gonic/gin</code>（<code>*gin.Engine</code> + <code>gin.HandlerFunc</code>）。外部行为零变化：响应状态码、Header、SSE 帧格式、JSON 字段顺序均与迁移前完全一致。</p>
+<p><strong>Architecture:</strong> <code>Server</code> 结构体的 <code>mux</code> 字段从 <code>*http.ServeMux</code> 换成 <code>*gin.Engine</code>；所有 <code>handle*</code> 方法签名从 <code>(w http.ResponseWriter, r *http.Request)</code> 改成 <code>(c *gin.Context)</code>；<code>cmd/yktako/main.go</code> 中 <code>http.ListenAndServe(addr, srv)</code> 无需改动，因为 <code>gin.Engine</code> 本身实现了 <code>http.Handler</code>，通过 <code>Server.ServeHTTP</code> 转发即可。SSE 的 <code>http.Flusher</code> 用 <code>c.Writer</code>（<code>gin.ResponseWriter</code> 内嵌 <code>http.Flusher</code>）。</p>
+<p><strong>Tech Stack:</strong> Go 1.25、<code>github.com/gin-gonic/gin</code>（最新稳定版，v1.10.x）、其余依赖不变。</p>
+<p><strong>执行说明：</strong></p>
+<ol type="1">
+<li>不新建 worktree。提交沿用仓库习惯：中文短句、不加 <code>feat:</code> 前缀；用户没点名提交时，代码留在工作区。</li>
+<li>注释按 <code>AGENTS.md</code>：中文，文件头与函数头齐全；行为不变的注释原封不动。</li>
+<li>等价迁移纪律：<strong>不</strong>顺手改任何业务逻辑（会话状态机、落盘事务、轮询间隔、SSE 帧格式全不动）。只改"怎么拿请求参数、怎么写响应"这一层。</li>
+<li>验收命令在 <code>yk-tako-eino/</code>：<code>gofmt -l .</code> 为空，<code>go test -race ./...</code> 全绿。</li>
+</ol>
+<hr />
+<h2 id="file-structure">File Structure</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文件</th>
+<th>动作</th>
+<th>改什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yk-tako-eino/go.mod</code></td>
+<td>修改</td>
+<td>新增 <code>github.com/gin-gonic/gin</code> 直接依赖；<code>go mod tidy</code> 拉取 transitive</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/webui/server.go</code></td>
+<td>修改</td>
+<td><code>mux *http.ServeMux</code> → <code>engine *gin.Engine</code>；所有 <code>handleXxx</code> 从 <code>(w, r)</code> 改成 <code>(c *gin.Context)</code>；路由注册 <code>mux.HandleFunc</code> → <code>engine.GET/POST</code>；<code>ServeHTTP</code> 转调 <code>engine.ServeHTTP</code></td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/webui/server_test.go</code></td>
+<td>不改（可选微调）</td>
+<td>测试用 <code>httptest.NewServer(srv)</code> 不变，因为 <code>*Server</code> 仍实现 <code>http.Handler</code>；若有个别断言 <code>http.ResponseWriter</code> 的内部细节才改，否则原样</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/cmd/yktako/main.go</code></td>
+<td>不改</td>
+<td><code>http.ListenAndServe(addr, srv)</code> 走 <code>Server.ServeHTTP</code>，无需变动</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/webui/session.go</code>、<code>logdb.go</code></td>
+<td>不改</td>
+<td>不碰 HTTP 层之外的逻辑</td>
+</tr>
+</tbody>
+</table></div>
+<p>不改：<code>internal/adkrun</code>、<code>internal/guard</code>、<code>internal/taskboard</code>、<code>internal/repl</code>、静态页 <code>index.html</code>、所有设计文档。</p>
+<hr />
+<h2 id="任务与等价保证的对应">任务与等价保证的对应</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>本计划</th>
+<th>完成后用户/测试能看见的行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>任务 1</td>
+<td><code>go.mod</code> 含 gin 依赖；<code>go build ./...</code> 成功</td>
+</tr>
+<tr>
+<td>任务 2</td>
+<td>所有 handler 已切到 <code>gin.Context</code>；<code>Server.mux</code> 不复存在，改叫 <code>engine</code>；路由全注册；<code>ServeHTTP</code> 转调 <code>engine.ServeHTTP</code></td>
+</tr>
+<tr>
+<td>任务 3</td>
+<td><code>go test -race ./internal/webui</code> 全绿（现有 SSE / 409 / 审批 / 续传 等用例全部通过，行为等价）</td>
+</tr>
+<tr>
+<td>任务 4</td>
+<td><code>go test -race ./...</code> 全绿；<code>gofmt -l .</code> 无输出</td>
+</tr>
+</tbody>
+</table></div>
+<hr />
+<h2 id="任务-1引入-gin-依赖">任务 1：引入 Gin 依赖</h2>
+<p><strong>Files:</strong> <code>yk-tako-eino/go.mod</code>、<code>yk-tako-eino/go.sum</code>。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 1: 在 go.mod 追加 gin 直接依赖</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> get github.com/gin-gonic/gin@latest</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> mod tidy</span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 2: 确认可编译</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> build ./...</span></code></pre></div>
+<p>预期：无错误。<code>go.mod</code> 里 <code>require</code> 段多了 <code>github.com/gin-gonic/gin</code>，<code>go.sum</code> 有对应条目。</p>
+<hr />
+<h2 id="任务-2servergo-等价迁移到-gin">任务 2：<code>server.go</code> 等价迁移到 Gin</h2>
+<p><strong>Files:</strong> <code>yk-tako-eino/internal/webui/server.go</code>。</p>
+<p>改造原则：逐字段、逐方法、逐行等价替换。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 1: import 替换</strong></label></li>
+</ul>
+<p>删掉 <code>"net/http"</code>？——<strong>不删</strong>，因为 SSE 里仍然用 <code>http.Flusher</code>、<code>http.Status*</code> 常量，以及 <code>ServeHTTP</code> 方法签名需要。只新增：</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;github.com/gin-gonic/gin&quot;</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 2: <code>Server</code> 结构体的 <code>mux</code> 字段换类型</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb4"><pre class="sourceCode diff"><code class="sourceCode diff"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="st">- mux      *http.ServeMux</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="va">+ engine   *gin.Engine</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 3: <code>New</code> 函数里的路由注册换 Gin API</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb5"><pre class="sourceCode diff"><code class="sourceCode diff"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="st">- mux := http.NewServeMux()</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="st">- mux.HandleFunc(&quot;GET /{$}&quot;, s.handleIndex)</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="st">- mux.HandleFunc(&quot;GET /api/session&quot;, s.handleSession)</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="st">- mux.HandleFunc(&quot;GET /api/session/history&quot;, s.handleHistory)</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="st">- mux.HandleFunc(&quot;POST /api/chat&quot;, s.handleChat)</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="st">- mux.HandleFunc(&quot;GET /api/chat/stream&quot;, s.handleStream)</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="st">- mux.HandleFunc(&quot;POST /api/approval&quot;, s.handleApproval)</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="st">- mux.HandleFunc(&quot;POST /api/stop&quot;, s.handleStop)</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="st">- mux.HandleFunc(&quot;POST /api/chat/restore&quot;, s.handleRestore)</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="st">- s.mux = mux</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="va">+ engine := gin.New()          // 不写默认日志，避免每条请求打一行；保持原有静默行为</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="va">+ engine.GET(&quot;/&quot;, s.handleIndex)                   // 注意：Gin 的 &quot;/&quot; 等价于 &quot;GET /{$}&quot;</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="va">+ engine.GET(&quot;/api/session&quot;, s.handleSession)</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="va">+ engine.GET(&quot;/api/session/history&quot;, s.handleHistory)</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="va">+ engine.POST(&quot;/api/chat&quot;, s.handleChat)</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a><span class="va">+ engine.GET(&quot;/api/chat/stream&quot;, s.handleStream)</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="va">+ engine.POST(&quot;/api/approval&quot;, s.handleApproval)</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a><span class="va">+ engine.POST(&quot;/api/stop&quot;, s.handleStop)</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a><span class="va">+ engine.POST(&quot;/api/chat/restore&quot;, s.handleRestore)</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a><span class="va">+ s.engine = engine</span></span></code></pre></div>
+<p>（路由模式等价性：Gin 里 <code>/</code> 就是精确匹配根路径，和标准库 <code>/{$}</code> 行为一致；<code>/api/session</code> 等不含尾部斜杠，Gin 默认 <code>RedirectTrailingSlash = true</code>，与现有行为没有可观察差异，因为前端都不带尾部斜杠。）</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 4: <code>ServeHTTP</code> 转调改 engine</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb6"><pre class="sourceCode diff"><code class="sourceCode diff"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a>  func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="st">-     s.mux.ServeHTTP(w, r)</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="va">+     s.engine.ServeHTTP(w, r)</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>  }</span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 5: 所有 <code>handle*</code> 方法逐个切到 <code>gin.Context</code></strong></label></li>
+</ul>
+<p>逐个 handler 的等价映射规则：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>标准库写法</th>
+<th>Gin 等价写法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>w http.ResponseWriter, r *http.Request</code></td>
+<td><code>c *gin.Context</code></td>
+</tr>
+<tr>
+<td><code>json.NewDecoder(r.Body).Decode(&amp;req)</code></td>
+<td><code>c.ShouldBindJSON(&amp;req)</code>（失败时 <code>c.JSON(http.StatusBadRequest, ...)</code> 即可；<strong>但</strong>为了完全等价旧消息文本，建议继续用 <code>json.NewDecoder(c.Request.Body).Decode(&amp;req)</code>，保持错误返回的文案完全一致）</td>
+</tr>
+<tr>
+<td><code>http.Error(w, msg, code)</code></td>
+<td><code>c.String(code, msg)</code>（<code>http.Error</code> 内部是 <code>w.WriteHeader(code)</code> + <code>fmt.Fprintln</code>，<code>c.String</code> 也会写 <code>text/plain</code>，语义一致；但要注意旧代码 <code>http.Error</code> 会在末尾多一个 <code>\n</code>，用 <code>c.String</code> 时手动补上？——<strong>更稳妥的等价写法</strong>：保留 <code>http.Error(c.Writer, msg, code)</code>，因为 <code>gin.ResponseWriter</code> 实现了 <code>http.ResponseWriter</code>）</td>
+</tr>
+<tr>
+<td><code>r.URL.Query().Get("run")</code></td>
+<td><code>c.Query("run")</code>（或继续用 <code>c.Request.URL.Query().Get</code>，保持 100% 等价都行）</td>
+</tr>
+<tr>
+<td><code>w.Header().Set("Content-Type", "application/json")</code> + <code>json.NewEncoder(w).Encode(...)</code></td>
+<td><code>c.JSON(code, obj)</code>（但要注意<strong>错误处理的顺序</strong>：<code>http.Error</code> 之后不能再写 JSON；旧代码都满足这个顺序，所以用 <code>c.JSON</code> 不会有问题。为了 100% 等价，如果旧代码用的是 <code>w.Header().Set</code> + <code>Encode</code>，就继续用 <code>c.Writer</code> 这套，别换 <code>c.JSON</code>——避免 JSON 编码细节差异（字段顺序 <code>json.Encoder</code> 和 Gin 内部的都走 <code>encoding/json</code>，其实一致，但保守起见保留原样更安全）</td>
+</tr>
+<tr>
+<td><code>w.Header().Set(k, v)</code></td>
+<td><code>c.Writer.Header().Set(k, v)</code> 或 <code>c.Header(k, v)</code>，一样</td>
+</tr>
+<tr>
+<td><code>flusher, ok := w.(http.Flusher)</code></td>
+<td><code>flusher, ok := c.Writer.(http.Flusher)</code>（<code>gin.ResponseWriter</code> 一定实现 <code>http.Flusher</code>，不过保留断言判断与旧代码一致，不要省略）</td>
+</tr>
+<tr>
+<td><code>r.Context()</code></td>
+<td><code>c.Request.Context()</code></td>
+</tr>
+<tr>
+<td><code>r.Body</code>（读原始流）</td>
+<td><code>c.Request.Body</code></td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>关键决策：完全等价优先。</strong> 能继续用旧 API（<code>http.Error(c.Writer, ...)</code>、<code>json.NewEncoder(c.Writer).Encode(...)</code>、<code>c.Request.URL.Query().Get(...)</code>）的地方就不改，只改"拿不到 <code>w</code> / <code>r</code>"那一层的签名替换。这样行为 100% 一致，不会因为 Gin 的 <code>c.JSON</code> / <code>c.ShouldBindJSON</code> 与旧写法在错误文案、Content-Type charset 上有细微差异导致测试飘红。</p>
+<p>逐 handler 清单（每个 handler 改完要自己肉眼对上上面的规则）：</p>
+<ol type="1">
+<li>[x] <code>handleIndex</code>：原本直接写 <code>w</code> 的 HTML，改成 <code>c.Writer</code></li>
+<li>[x] <code>handleSession</code>：<code>r.URL.Query().Get("id")</code> → <code>c.Query("id")</code> 或保留；响应写 JSON 同上</li>
+<li>[x] <code>handleHistory</code>：三个 query 参数；JSON 响应</li>
+<li>[x] <code>handleChat</code>：JSON 解码；SSE 写头；<code>flusher, ok := w.(http.Flusher)</code>；<code>go driveRun</code>；<code>writeEvents(r.Context(), w, flusher, ...)</code> —— <code>writeEvents</code> 的签名<strong>也要改</strong>：它接受的 <code>w http.ResponseWriter</code> 换成 <code>gin.ResponseWriter</code> 或继续 <code>http.ResponseWriter</code>（<code>c.Writer</code> 实现了后者，所以直接传 <code>c.Writer</code> 就行，<strong><code>writeEvents</code> 函数签名不用改</strong>）</li>
+<li>[x] <code>handleStream</code>：两个 query 参数；SSE；同样 <code>writeEvents</code> 传 <code>c.Writer</code></li>
+<li>[x] <code>handleStop</code>：JSON 解码；<code>c.Writer.WriteHeader(http.StatusOK)</code></li>
+<li>[x] <code>handleRestore</code>：JSON 解码；JSON 响应</li>
+<li>[x] <code>handleApproval</code>：JSON 解码；<code>WriteHeader(http.StatusOK)</code></li>
+</ol>
+<p>注意 <code>writeEvents</code> 和 <code>writeSSE</code>（应该在另一个文件？查一下：sse 相关的 writeSSE 可能在 <code>server.go</code> 内或 <code>session.go</code> 里，只要它的形参是 <code>http.ResponseWriter</code>，就能传 <code>gin.ResponseWriter</code> 不变）。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 6: 确认 <code>server.go</code> 可通过编译</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb7"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> build ./internal/webui</span></code></pre></div>
+<p>预期：无错误。</p>
+<hr />
+<h2 id="任务-3webui-包测试全绿">任务 3：webui 包测试全绿</h2>
+<p><strong>Files:</strong> <code>yk-tako-eino/internal/webui/server_test.go</code>（大概率不用改）。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 1: 跑 webui 包测试</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb8"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> test <span class="at">-race</span> <span class="at">-v</span> ./internal/webui</span></code></pre></div>
+<p>预期：<strong>全绿</strong>。如果有红的，对照失败信息排查。</p>
+<p>常见踩坑及处理（只在真出现时处理，不预防性修改）：</p>
+<ol type="1">
+<li>若某个 handler 因为先写了 header 又改 header 出错——旧代码没有这个问题，Gin 默认也允许写一次，一般不会出现。</li>
+<li>若 SSE 的 Flusher 断言 <code>ok=false</code>：检查是不是在某个地方用了 <code>c.Writer</code> 以外的对象；但本方案 <code>c.Writer</code> 就是 gin.ResponseWriter，它内嵌了 <code>http.Flusher</code>。</li>
+<li>若根路径 <code>/</code> 返回 404 或 301：确认 Gin 的 <code>engine.GET("/", ...)</code> 行为；如果它把不带 <code>/</code> 的请求重定向，手动调 <code>engine.RedirectTrailingSlash = false</code>（不影响现有测试用例，因为测试都是 <code>GET /</code> 精确匹配）。</li>
+</ol>
+<hr />
+<h2 id="任务-4全仓验收">任务 4：全仓验收</h2>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 1: 全仓测试</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb9"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> test <span class="at">-race</span> ./...</span></code></pre></div>
+<p>预期：全绿。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 2: gofmt 无差异</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb10"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">gofmt</span> <span class="at">-l</span> .</span></code></pre></div>
+<p>预期：无输出。若有，<code>gofmt -w</code> 修正。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 3: 入口 main 构建并冒烟</strong>（测试已经覆盖了 httptest 场景，可选执行）</label></li>
+</ul>
+<div class="sourceCode" id="cb11"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> build ./cmd/yktako</span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="ex">./yktako</span> <span class="at">-h</span>  <span class="co"># 看 -web 说明仍在</span></span></code></pre></div>
+<hr />
+<h2 id="自检写完计划时">自检（写完计划时）</h2>
+<ul>
+<li>路由数量不变：<code>GET /</code>、<code>GET /api/session</code>、<code>GET /api/session/history</code>、<code>POST /api/chat</code>、<code>GET /api/chat/stream</code>、<code>POST /api/approval</code>、<code>POST /api/stop</code>、<code>POST /api/chat/restore</code>，正好 8 条。</li>
+<li>SSE 仍然用 <code>text/event-stream</code> + <code>Cache-Control: no-cache</code>，没有改 Header；<code>writeEvents</code> 形参保留 <code>http.ResponseWriter</code>，所以不需要重写它的内部逻辑。</li>
+<li><code>httptest.NewServer(srv)</code> 仍然成立：因为 <code>*Server</code> 仍实现 <code>http.Handler</code>（有 <code>ServeHTTP</code> 方法，转调 gin.Engine 的 ServeHTTP）。</li>
+<li>没改业务逻辑：落盘事务、liveRun 状态机、轮询 pollInterval=100ms、pollBatch=50 都不动。</li>
+<li><code>cmd/yktako/main.go</code> 里 <code>http.ListenAndServe(*webAddr, srv)</code> 传的还是 <code>*Server</code>（因为 <code>*Server</code> 实现了 <code>http.Handler</code>），所以不用改成 <code>s.engine</code>——保持封装，外部看不见 gin 的存在。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/archive/old-line/plans/2026-09-30-webui-gin-migration.md"><code>doc/archive/old-line/plans/2026-09-30-webui-gin-migration.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

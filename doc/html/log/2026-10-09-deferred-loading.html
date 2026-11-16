@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Deferred loading：把工具 schema 移出前缀 · tako 文档</title>
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="deferred-loading把工具-schema-移出前缀">Deferred loading：把工具 schema 移出前缀</h1>
+<p>工具多到几百个，模型还没调用任何东西，成本就已经涨上去了——而且每多一轮，再多付一次。</p>
+<p><strong>TL;DR</strong>：把工具的完整 schema 移出模型上下文——模型侧只剩「名字 + 说明」；要用时查找，查到的完整定义从上下文尾部补回来。</p>
+<h2 id="为什么会贵前缀缓存">为什么会贵：前缀缓存</h2>
+<p>LLM API 无状态：每轮请求都要重发 system、工具清单和全部历史。provider 用<strong>前缀缓存</strong>压这笔成本——两次请求从头逐 token 比对，相同的前缀直接复用，从第一个不同处起全部重算。</p>
+<p>为什么需要重算？模型逐 token 推进，每个 token 的计算都依赖它前面的全部 token——前面有一个字节变了，它后面所有位置的缓存就都失效。所以改动越靠前，废掉的后缀越长；而工具清单排在最前：任何一个工具的 schema 动了，它后面的内容（包括全部历史）全部作废。</p>
+<p>那把工具挪到最后？挪不了：tools 是请求的顶层字段，拼进 prompt 的位置由 provider 定；而且缓存只认从头逐字节相同的公共前缀——历史每轮在末尾增长，工具若排在历史后面，就永远落在公共前缀之外。</p>
+<p>工具一多，两笔账一起来：<strong>占上下文</strong>（几百份 JSON Schema，多数本轮用不上）；<strong>断缓存</strong>（目录是活的——按租户生成、随版本更新，一个用不上的工具改了 schema，后面每轮都重付）。</p>
+<p>那把用不上的工具删掉？不行——模型不知道存在的工具，需要时就无从选择。要的不是更短的清单，而是<strong>一份模型看得见、却不携带 schema 的目录</strong>。</p>
+<h2 id="机制模型看目录完整定义进暂存区">机制：模型看目录，完整定义进暂存区</h2>
+<p>deferred 工具的完整定义不消失，只是不放进模型上下文——它留在上下文之外，叫它<strong>暂存区</strong>。三个角色（逻辑划分，不是三台机器）：</p>
+<ul>
+<li><strong>客户端</strong>（你的代码）：组装请求、执行模型调用的函数。</li>
+<li><strong>provider</strong>（你请求打到的 API 服务）：把请求拼成模型看到的上下文。</li>
+<li><strong>模型</strong>（真正跑推理的那部分）：只看得见模型上下文。</li>
+</ul>
+<p><strong>谁持有完整定义，谁负责查找</strong>，随模式分：</p>
+<ul>
+<li><strong>hosted</strong>：本地工具的完整定义随请求提交（deferred 的标 <code>defer_loading: true</code>，tools 里再加一个 <code>{"type":"tool_search"}</code>），MCP 服务器的定义由 provider 去取；查找也在 provider 侧、请求内部完成。</li>
+<li><strong>client</strong>：定义没提交，provider 手里没有；查找回到客户端，代价是多一轮（见「变体」）。</li>
+</ul>
+<p>模型开头一眼能看到什么，按对象分：</p>
+<ul>
+<li>namespace：只看到 <code>name</code> + <code>description</code>，namespace 内的函数加载前不可见（<code>defer_loading</code> 标在函数上，不标在 namespace 上）；</li>
+<li>MCP server：只看到服务名 + 说明，全部定义留在暂存区；</li>
+<li>单独 defer 的函数：名字 + 说明还看得见，被扣下的只是参数 schema；</li>
+<li><code>tool_search</code>、未标 deferred 的工具：完整留在前缀，不动。</li>
+</ul>
+<p>下面的故事按 hosted 模式走；报文用 OpenAI Responses API 的形态（gpt-5.4 及以后的模型支持）。</p>
+<p>请求里提交的是这一份：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;tools&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;namespace&quot;</span><span class="fu">,</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;name&quot;</span><span class="fu">:</span> <span class="st">&quot;crm&quot;</span><span class="fu">,</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;description&quot;</span><span class="fu">:</span> <span class="st">&quot;CRM tools for customer lookup and order management.&quot;</span><span class="fu">,</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;tools&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>        <span class="fu">{</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>          <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;function&quot;</span><span class="fu">,</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>          <span class="dt">&quot;name&quot;</span><span class="fu">:</span> <span class="st">&quot;list_open_orders&quot;</span><span class="fu">,</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>          <span class="dt">&quot;description&quot;</span><span class="fu">:</span> <span class="st">&quot;List open orders for a customer ID.&quot;</span><span class="fu">,</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>          <span class="dt">&quot;defer_loading&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">,</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>          <span class="dt">&quot;parameters&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>            <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;object&quot;</span><span class="fu">,</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>            <span class="dt">&quot;properties&quot;</span><span class="fu">:</span> <span class="fu">{</span> <span class="dt">&quot;customer_id&quot;</span><span class="fu">:</span> <span class="fu">{</span> <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;string&quot;</span> <span class="fu">}</span> <span class="fu">},</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>            <span class="dt">&quot;required&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;customer_id&quot;</span><span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>            <span class="dt">&quot;additionalProperties&quot;</span><span class="fu">:</span> <span class="kw">false</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>          <span class="fu">}</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>        <span class="fu">}</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>      <span class="ot">]</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a>    <span class="fu">{</span> <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;tool_search&quot;</span> <span class="fu">}</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>  <span class="ot">]</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>模型开头实际看到的就是这些：</p>
+<pre class="text"><code>namespace crm: CRM tools for customer lookup and order management.
+tool_search: 可用</code></pre>
+<p>这里有个信息不对称：要不要查找由模型决定，它手里却只有 <code>name</code> + <code>description</code>。<code>description</code> 不涉及的问题，模型就不会发起查找——namespace 里的工具等于不存在。所以 namespace 的 <code>description</code> 不是备注，是入口。</p>
+<h2 id="完整链路hosted七步">完整链路（hosted）：七步</h2>
+<p>用户问「这个客户有哪些未完成订单」，<code>crm</code> 的摘要对得上号：</p>
+<ol type="1">
+<li><strong>客户端 → provider</strong>：发请求——上一节那份 JSON。</li>
+<li><strong>provider</strong>：拆分——namespace <code>crm</code> 进上下文时只剩 <code>name</code> + <code>description</code>；<code>list_open_orders</code> 的完整定义留在暂存区。</li>
+<li><strong>模型</strong>：发 <code>tool_search_call</code>，<code>arguments.paths = ["crm"]</code>（一次可以带多个路径）——它落在本次响应的输出流里，provider 就地接走，不另起请求。</li>
+<li><strong>provider</strong>：按 <code>arguments.paths</code> 查找，把查到的定义追加到上下文<strong>末尾</strong>；前缀一个字节没动，缓存照旧命中。</li>
+<li><strong>模型</strong>：<code>list_open_orders</code> 的完整定义这时才进入视野，续写 <code>function_call</code>。</li>
+<li><strong>provider → 客户端</strong>：第 3–5 步都在同一次响应里，客户端依次收到三条输出项：</li>
+</ol>
+<div class="sourceCode" id="cb3"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ot">[</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;tool_search_call&quot;</span><span class="fu">,</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;execution&quot;</span><span class="fu">:</span> <span class="st">&quot;server&quot;</span><span class="fu">,</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;call_id&quot;</span><span class="fu">:</span> <span class="kw">null</span><span class="fu">,</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;status&quot;</span><span class="fu">:</span> <span class="st">&quot;completed&quot;</span><span class="fu">,</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;arguments&quot;</span><span class="fu">:</span> <span class="fu">{</span> <span class="dt">&quot;paths&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;crm&quot;</span><span class="ot">]</span> <span class="fu">}</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;tool_search_output&quot;</span><span class="fu">,</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;execution&quot;</span><span class="fu">:</span> <span class="st">&quot;server&quot;</span><span class="fu">,</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;call_id&quot;</span><span class="fu">:</span> <span class="kw">null</span><span class="fu">,</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;status&quot;</span><span class="fu">:</span> <span class="st">&quot;completed&quot;</span><span class="fu">,</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;tools&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>      <span class="fu">{</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;namespace&quot;</span><span class="fu">,</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;name&quot;</span><span class="fu">:</span> <span class="st">&quot;crm&quot;</span><span class="fu">,</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;description&quot;</span><span class="fu">:</span> <span class="st">&quot;CRM tools for customer lookup and order management.&quot;</span><span class="fu">,</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>        <span class="dt">&quot;tools&quot;</span><span class="fu">:</span> <span class="ot">[</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>          <span class="fu">{</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>            <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;function&quot;</span><span class="fu">,</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>            <span class="dt">&quot;name&quot;</span><span class="fu">:</span> <span class="st">&quot;list_open_orders&quot;</span><span class="fu">,</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>            <span class="dt">&quot;description&quot;</span><span class="fu">:</span> <span class="st">&quot;List open orders for a customer ID.&quot;</span><span class="fu">,</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>            <span class="dt">&quot;defer_loading&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">,</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>            <span class="dt">&quot;parameters&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>              <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;object&quot;</span><span class="fu">,</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>              <span class="dt">&quot;properties&quot;</span><span class="fu">:</span> <span class="fu">{</span> <span class="dt">&quot;customer_id&quot;</span><span class="fu">:</span> <span class="fu">{</span> <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;string&quot;</span> <span class="fu">}</span> <span class="fu">},</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>              <span class="dt">&quot;required&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;customer_id&quot;</span><span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>              <span class="dt">&quot;additionalProperties&quot;</span><span class="fu">:</span> <span class="kw">false</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>            <span class="fu">}</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>          <span class="fu">}</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>        <span class="ot">]</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>      <span class="fu">}</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>    <span class="ot">]</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;function_call&quot;</span><span class="fu">,</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;name&quot;</span><span class="fu">:</span> <span class="st">&quot;list_open_orders&quot;</span><span class="fu">,</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;namespace&quot;</span><span class="fu">:</span> <span class="st">&quot;crm&quot;</span><span class="fu">,</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;call_id&quot;</span><span class="fu">:</span> <span class="st">&quot;call_abc123&quot;</span><span class="fu">,</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;arguments&quot;</span><span class="fu">:</span> <span class="st">&quot;{</span><span class="ch">\&quot;</span><span class="st">customer_id</span><span class="ch">\&quot;</span><span class="st">:</span><span class="ch">\&quot;</span><span class="st">CUST-12345</span><span class="ch">\&quot;</span><span class="st">}&quot;</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a><span class="ot">]</span></span></code></pre></div>
+<ol start="7" type="1">
+<li><strong>客户端</strong>：执行函数、回送结果——和没有 deferred 时完全同构；已加载的定义跨轮保留，下次要调不必再查。</li>
+</ol>
+<p>两个细节：<strong>不额外多轮</strong>（查找和调用属于同一次响应）；<strong>没加载就调用会失败</strong>（<code>tool_search_output.tools</code> 里没有的工具，对模型就不可用）。</p>
+<h2 id="变体client-模式">变体：client 模式</h2>
+<p>清单不便预先提交（按租户实时生成等）时，暂存区换到客户端手里：请求里只放一个查找工具——模型开头看不到任何工具定义，凭它的说明决定查什么。声明带上 <code>"execution": "client"</code>，参数 schema 由你定（例如 <code>goal: string</code>）：</p>
+<ol type="1">
+<li>模型发 <code>tool_search_call</code>（<code>execution</code> 为 <code>"client"</code>，参数就是你声明的格式），就此停下；</li>
+<li>你在<strong>下一轮请求</strong>里带 <code>tool_search_output</code>——<code>call_id</code> 原样回指，<code>tools</code> 放查到的完整定义；</li>
+<li>模型拿到定义，继续调用。</li>
+</ol>
+<div class="sourceCode" id="cb4"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ot">[</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;tool_search_call&quot;</span><span class="fu">,</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;execution&quot;</span><span class="fu">:</span> <span class="st">&quot;client&quot;</span><span class="fu">,</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;call_id&quot;</span><span class="fu">:</span> <span class="st">&quot;call_abc123&quot;</span><span class="fu">,</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;status&quot;</span><span class="fu">:</span> <span class="st">&quot;completed&quot;</span><span class="fu">,</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;arguments&quot;</span><span class="fu">:</span> <span class="fu">{</span> <span class="dt">&quot;goal&quot;</span><span class="fu">:</span> <span class="st">&quot;Find the shipping ETA tool for order_42.&quot;</span> <span class="fu">}</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="ot">]</span></span></code></pre></div>
+<p>代价是<strong>多一轮</strong>：清单不在 provider 手里，查找没法在请求内部做完。</p>
+<h2 id="不变量">不变量</h2>
+<p><strong>变更只能落在「只增不改」的尾部，或者根本不在模型上下文里。</strong></p>
+<ul>
+<li>已加载的定义随对话保留，下一轮不用再查；但把它从加载集里删掉，缓存从该点起失效——那是一次真实的变更。</li>
+<li>最终账目：前缀只为稳定的摘要付费；schema 只为本轮要用的工具付费，且追加在尾部，不碰已经缓存的开头。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/log/2026-10-09-deferred-loading.md"><code>doc/log/2026-10-09-deferred-loading.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

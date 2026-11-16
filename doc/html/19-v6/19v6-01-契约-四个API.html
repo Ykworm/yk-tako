@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>19v6-01 · 契约：四个 API · tako 文档</title>
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="19v6-01--契约四个-api">19v6-01 · 契约：四个 API</h1>
+<blockquote>
+<p>本篇是 doc/19-v6 文档集的<strong>契约篇</strong>：四个端点的请求/响应/错误字节是真源。 目录、概念表、跨切面注意事项见 index（<code>19-运行引擎架构-v6.md</code>）；客户端总流程见 <code>19v6-02</code>；验收见 <code>19v6-04</code>；存储形态见 <code>19v6-03</code>。</p>
+</blockquote>
+<h2 id="0-第一步的范围">0. 第一步的范围</h2>
+<p>客户端要跑通的最小循环只有一件事：<strong>投一条消息，轮询看着回复一点点生成、定稿</strong>。 支撑它需要且仅需要四个 API：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>API</th>
+<th>干什么</th>
+<th>游标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>POST /api/runs</code></td>
+<td>创建一场 run（= 投递消息启动执行；含首条消息懒创建会话）</td>
+<td>—</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>GET /api/sessions/{sessionId}</code></td>
+<td>状态查询：有没有活 run + runlog 高水位</td>
+<td>—</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>GET /api/runs/{runId}/frames</code></td>
+<td>拉某场 run 的<strong>生成中帧</strong></td>
+<td><code>eventOffset</code>（run 内）</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>GET /api/sessions/{sessionId}/log</code></td>
+<td>拉 <strong>定稿历史</strong>记录</td>
+<td><code>runlogOffset</code>（全局）</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>URL 形状约定</strong>：run 是顶层资源（创建它 = 投递消息）；session 是归属资源，它的两个端点挂在 <code>/api/sessions/{sessionId}</code> 下。未知 session → 404 <code>112001</code>（找不到这场会话）；未知 run 在 frames 上<strong>不是 404</strong>， 而是 200 <code>gone</code>——「从未存在」与「已过期删除」<strong>故意不区分</strong>（客户端两者都转拉 log，行为相同）。</p>
+<p><strong>纯拉模型</strong>：无 SSE、无长连接、无推送、无 heartbeat。实时性 = 客户端轮询节奏（dev 建议 300–500 ms，服务端不管频率）。没有 inbox / 合并 / 跨 client 同步 / Stop / Delete / approval / 会话级帧——需要时后续 loop 照此扩，不预留。</p>
+<blockquote>
+<p><strong>【2026-10-18 翻案，doc/31】</strong>「无 SSE」句不再成立：<code>GET /api/runs/{runId}/stream</code>（§5）已落地，同一帧面的第二种运输方式。翻案边界钉死——<strong>本篇四 API 一字未动，拉仍是正确性</strong>：断线恢复、新 tab、补历史、收口对账全走拉；流是优化、不承诺可靠送达。</p>
+</blockquote>
+<blockquote>
+<p><strong>认证前置（doc/28 起）</strong>：本篇四个端点全部挂 <code>RequireAuth</code>，请求都要带 <code>Authorization: Bearer &lt;accessToken&gt;</code>； 不带一律 <code>401 {"code":111102,"message":"请先登录","data":null"}</code>。令牌来自 <code>POST /api/auth/signup</code> 或 <code>POST /api/auth/login</code>——<strong>全部 JSON 接口都用 <code>{code,message,data}</code> 信封</strong>（含本篇四个业务端点，doc/40）。 取令牌的 curl、租户模型前置与完整验收矩阵见 19v6-04 的「用例 0」。</p>
+</blockquote>
+<blockquote>
+<p><strong>响应信封细则（doc/40，2026-10-22 起）</strong>：成功 <code>code=0</code>、<code>message</code> 空串、业务体在 <code>data</code>；失败 <code>code</code> 是数字业务码、<code>message</code> 是弹窗文案、<code>data</code> 为 <code>null</code>（有诊断细节时放 <code>data</code>，如 413 的 <code>limit</code>/<code>tokens</code>）。 业务码表与逐端点对照在 <a href="../40-响应信封统一.html">doc/40</a>，本篇只给各端点的期望字节，<strong>不重复条款</strong>。 <strong>两样不进信封</strong>：<code>GET /api/media</code> 的成功体是图片字节（不是 JSON）；<code>GET /api/runs/{id}/stream</code> 的 SSE 帧面（§5）——帧是长连接里的事件，不是某个响应的 body。</p>
+</blockquote>
+<p><strong>拉取一律有界</strong>：两个拉取端点都受<strong>单批上限 W</strong> 约束（dev 默认 200，<code>-batch-window</code> 可调）；客户端初始游标取「高水位 − 窗口」而<strong>不是 0</strong>。理由：<code>runlog</code> 永久增长（compact 不动它），「从 0 全量重拉」在长会话下是无界请求。这不加端点、不加索引、不加请求参数——高水位本来就由 session 状态端点返回。</p>
+<h2 id="1-post-apiruns--创建-run-投递消息">1. <code>POST /api/runs</code> —— 创建 run（= 投递消息）</h2>
+<p>请求体三个字段，按情形发：</p>
+<p><strong>情形 1 · 首条消息（本地还没有 sessionId）</strong>——不带 <code>sessionId</code>：</p>
+<pre><code>POST /api/runs
+Content-Type: application/json
+
+{&quot;messageId&quot;:&quot;m_1&quot;,&quot;text&quot;:&quot;hi&quot;}</code></pre>
+<p>→ <code>202 {"code":0,"message":"","data":{"sessionId":"s_01","runId":"r_01","messageId":"m_1"}}</code>。服务端在投递事务内含铸会话（<code>s_&lt;ULID&gt;</code>）；<strong>客户端要把 <code>sessionId</code> 存下来</strong>，之后所有请求都带着它。响应同时带回 <code>runId</code>，客户端<strong>可直接开始轮询 frames</strong>（§2）——查 session（§4）是 reconnect / 新 tab 的入口，不是发消息后的必经步。</p>
+<p><strong>情形 2 · 会话里的后续消息</strong>——带 <code>sessionId</code>：</p>
+<pre><code>POST /api/runs
+Content-Type: application/json
+
+{&quot;sessionId&quot;:&quot;s_01&quot;,&quot;messageId&quot;:&quot;m_2&quot;,&quot;text&quot;:&quot;读一下 doc/19&quot;}</code></pre>
+<p>→ 带 = 准入检查：未登记一律 404，<strong>不隐式创建</strong>。</p>
+<p><strong>情形 3 · 超时重发</strong>——和情形 2 一模一样地重发（同 <code>messageId</code>、同 <code>text</code>）：<code>messageId</code> 请求前就得生成好（绑本地气泡），重发不换 id；服务端<strong>不承诺按 <code>messageId</code> 去重</strong>，本步幂等语义仅限「闸」层面。</p>
+<p>字段约定：<code>sessionId</code> 可省（不带=懒建会话，带=只认登记过的）；<code>messageId</code> 客户端生成、不参与排序。</p>
+<p>响应与错误：</p>
+<pre><code>202 {&quot;code&quot;:0,&quot;message&quot;:&quot;&quot;,&quot;data&quot;:{&quot;sessionId&quot;:&quot;s_01&quot;,&quot;runId&quot;:&quot;r_01&quot;,&quot;messageId&quot;:&quot;m_1&quot;}}
+400 {&quot;code&quot;:111001,&quot;message&quot;:&quot;请求格式不对&quot;,&quot;data&quot;:null}      ← 请求体不是合法 JSON
+400 {&quot;code&quot;:111004,&quot;message&quot;:&quot;图片不符合要求&quot;,&quot;data&quot;:{&quot;reason&quot;:…}}
+                                                              ← images 不合法（doc/32 A1）；reason 进 data
+404 {&quot;code&quot;:112001,&quot;message&quot;:&quot;找不到这场会话&quot;,&quot;data&quot;:null}    ← 只带未知 sessionId 时
+409 {&quot;code&quot;:112101,&quot;message&quot;:&quot;这场会话正在跑，等它跑完再发&quot;,&quot;data&quot;:null}
+                                                              ← 会话有活 run；什么都不写，客户端本地排队、本轮收口后补投
+413 {&quot;code&quot;:113003,&quot;message&quot;:&quot;这条消息太长，裁剪后再发&quot;,&quot;data&quot;:{&quot;limit&quot;:M,&quot;tokens&quot;:N}}
+                                                              ← 单条消息超准入线（仅 compact 开启时，C5-A1）：
+                                                                limit = window − min(window/5, 16384)（三期起；
+                                                                此前为 window×4/5），线 = limit/3；抢闸前拒收、
+                                                                零痕迹，客户端裁剪后可原样重投
+500 {&quot;code&quot;:111901,&quot;message&quot;:&quot;服务暂时不可用，请再试一次&quot;,&quot;data&quot;:null}</code></pre>
+<p>服务端行为（一笔事务，同生同灭）：闸检查（<code>one_live_run_per_session</code> 部分唯一索引）+ <code>run</code> 行 + <strong>把用户消息追加为 <code>runlog</code> 一条 <code>role:user</code> 记录</strong>（占一个 runlogOffset）+ <strong>建 <code>runlive:{runId}</code> 并压入 <code>start</code> 帧</strong>（eventOffset=1）。要么整笔成功（消息开跑），要么整笔回滚（409）。不存在「入队待调度」的中间态。</p>
+<blockquote>
+<p>事务成功后，客户端并不知道 run 会回什么——它拿着 <code>runId</code> 靠 19v6-02 的 reconcile 轮询 frames / log 观测。POST 本身不返回任何生成内容。</p>
+</blockquote>
+<h2 id="2-get-apirunsrunidframes--拉生成中的帧">2. <code>GET /api/runs/{runId}/frames</code> —— 拉生成中的帧</h2>
+<pre><code>GET /api/runs/r_1/frames?eventOffset=N        ← LRANGE runlive:{runId} N N+W-1（**index+1** 即 eventOffset；W = 单批上限）
+
+200 {&quot;code&quot;:0,&quot;message&quot;:&quot;&quot;,&quot;data&quot;:{&quot;frames&quot;:[
+  {&quot;eventOffset&quot;:1,&quot;kind&quot;:&quot;start&quot;,&quot;agent&quot;:&quot;&quot;,&quot;model&quot;:&quot;&quot;,&quot;messageId&quot;:&quot;m_1&quot;},
+  {&quot;eventOffset&quot;:2,&quot;kind&quot;:&quot;delta&quot;,&quot;agent&quot;:&quot;&quot;,&quot;model&quot;:&quot;deepseek/deepseek-flash&quot;,&quot;text&quot;:&quot;我查一下&quot;},
+  {&quot;eventOffset&quot;:3,&quot;kind&quot;:&quot;tool_call&quot;,&quot;agent&quot;:&quot;&quot;,&quot;model&quot;:&quot;deepseek/deepseek-flash&quot;,&quot;name&quot;:&quot;get_time&quot;,&quot;args&quot;:&quot;{\&quot;timezone\&quot;:\&quot;Asia/Shanghai\&quot;}&quot;},
+  {&quot;eventOffset&quot;:4,&quot;kind&quot;:&quot;tool_result&quot;,&quot;agent&quot;:&quot;&quot;,&quot;model&quot;:&quot;deepseek/deepseek-flash&quot;,&quot;name&quot;:&quot;get_time&quot;,&quot;output&quot;:&quot;2026-10-08 15:04:05 +0800 CST&quot;},
+  {&quot;eventOffset&quot;:5,&quot;kind&quot;:&quot;delta&quot;,&quot;agent&quot;:&quot;&quot;,&quot;model&quot;:&quot;deepseek/deepseek-flash&quot;,&quot;text&quot;:&quot;，现在是 15:04&quot;},
+  {&quot;eventOffset&quot;:6,&quot;kind&quot;:&quot;terminal&quot;,&quot;agent&quot;:&quot;&quot;,&quot;model&quot;:&quot;&quot;,&quot;status&quot;:&quot;complete&quot;}
+],&quot;nextOffset&quot;:6,&quot;status&quot;:&quot;done&quot;}}</code></pre>
+<ul>
+<li><code>eventOffset=N</code> 返回该 run 中 offset &gt; N 的帧，升序，<strong>单批最多 W 条</strong>；缺省或 <code>=0</code> 即从 <code>start</code> 起（新客户端从零看到整段生成，超长回复分几批拉完）。</li>
+<li><code>nextOffset</code> = 本批最大 offset；<strong>空则 = N</strong>（客户端直接拿它当下次的 <code>eventOffset</code>）。被 W 截断时它就是本批末帧的 offset，续拉即补齐。</li>
+<li><strong>W 与 log 共用同一条规则</strong>，不做特例：frames 本身有界于单条回复长度，上限对它只是防「超长回复把一次响应撑爆」。</li>
+<li><strong>帧有七种 <code>kind</code></strong>，顺序即真实事件序（<code>tool_call</code>/<code>tool_result</code> 夹在 <code>delta</code> 之间）：
+<ul>
+<li><code>start</code>：run 开头，带 <code>messageId</code>（这条回复绑哪个客户端气泡）。</li>
+<li><code>delta</code>：<code>text</code> 是<strong>增量片段</strong>（非累计全文）。</li>
+<li><code>tool_call</code>：模型决定调一次工具。<code>name</code> = 工具名；<code>args</code> = 模型给出的<strong>原始 JSON 字符串</strong>——原样透传、不重编码（形状由模型/工具 schema 定，服务端不裁剪）。</li>
+<li><code>tool_result</code>：工具执行完回来，<strong>非流式</strong>——一次调用一条帧。<code>name</code> = 工具名；<code>output</code> = 工具输出文本。</li>
+<li><code>usage</code>：账单帧（<strong>2026-10-18 落地，doc/27 §4a</strong>）。每枪一帧，数值列 = <code>promptTokens</code> / <code>completionTokens</code> / <code>reasoningTokens</code> / <code>totalTokens</code> / <code>window</code>（同 <code>UsageBill</code> 逐字段拷贝）； <code>agent</code>/<code>model</code> = 产出该枪的 agent 与生效 ref。<strong>多枪时取最后一帧</strong>（= 下一枪的基线）。</li>
+<li><code>resume</code>：续跑种子帧（<strong>2026-10-21 落地，doc/30 §8.3</strong>）。崩溃后接管那场 run 时， runlive 被 <code>seedResume</code> 删掉重建，<strong>第一条就是它</strong>。<strong>它的 <code>text</code> 是账本里已产出的整段正文， 不是增量片段</strong>——语义与 <code>delta</code> 相反：客户端必须<strong>替换</strong>（<code>=</code>）而不是追加（<code>+=</code>）， 否则会把崩溃前的正文重复拼一遍。续跑后追加的正文走正常 <code>delta</code> 帧。</li>
+<li><code>terminal</code>：见下条。</li>
+<li>客户端按 <code>kind</code> 分派，<strong>未知 kind 必须忽略而非报错</strong>——七种之外将来还会长（这七种是截至 2026-10-21 的全集，不是不变集合）。</li>
+</ul></li>
+<li><strong>每帧带 <code>agent</code></strong>：产出该帧的 agent 名，<strong>空 = root</strong>（主 agent）。任何帧都带它（含 <code>start</code>/<code>terminal</code>）——委派的子代理帧带子代理名（T3 已落地，样例见下），客户端不解析也知道「这帧不属主线程」。</li>
+<li><strong>每帧带 <code>model</code></strong>：产出该帧的模型身份——<code>厂商/模型</code> 形态的生效 ref（与 <code>TAKO_MODEL</code> 同一词表）。主 agent 帧 = 主模型 ref；子代理帧 = 该规格的生效模型 ref（规格 <code>model:</code> 写 <code>default</code>/<code>inherit</code>/<code>继承</code> 时，生效的就是主模型，帧上写主模型的 ref——规格语义见 <code>19v6-05</code> §4）。空 = 非模型产物（<code>start</code>/<code>terminal</code>）。与 <code>agent</code> 同为恒在字段：客户端不解析也知道「这帧由哪个模型生成」。</li>
+<li><strong>委派场景样例</strong>（T3；字节规则不变，<code>kind</code> 取值同上面七种）：root 的 <code>tool_call</code>/<code>tool_result</code> 帧 <code>name</code> = 子代理名（<code>args</code> = 委派任务描述原文），两帧之间夹子代理自己的帧流（<code>delta</code>/<code>tool_call</code>/<code>tool_result</code> 逐条带子代理名与它的生效 ref）：
+<pre><code>{&quot;eventOffset&quot;:4,&quot;kind&quot;:&quot;delta&quot;,&quot;agent&quot;:&quot;researcher&quot;,&quot;model&quot;:&quot;deepseek/deepseek-flash&quot;,&quot;text&quot;:&quot;…&quot;},
+{&quot;eventOffset&quot;:5,&quot;kind&quot;:&quot;tool_result&quot;,&quot;agent&quot;:&quot;&quot;,&quot;model&quot;:&quot;deepseek/deepseek-flash&quot;,&quot;name&quot;:&quot;researcher&quot;,&quot;output&quot;:&quot;…（回传终稿；超上限已裁剪、尾带 omitted 提示——19v6-05 §4）&quot;}</code></pre></li>
+<li><code>status</code> ∈ <code>generating</code>（还没 terminal）/ <code>done</code>（本批或已含 terminal）/ <code>gone</code>（<code>runlive</code> 键已过期删除）：
+<ul>
+<li><code>generating</code> → 客户端按轮询间隔继续拉 <code>nextOffset</code> 之后；</li>
+<li><code>done</code> → 见 terminal，<strong>收口</strong>（19v6-02 第 4 步）；</li>
+<li><code>gone</code> → 该 run 早已定稿清走，<strong>转拉 log</strong>。</li>
+</ul></li>
+<li><strong><code>terminal</code> 是这一场 run 的最后一个事件</strong>：终态 <code>status</code> 本步取 <code>complete</code>/<code>error</code> 两支（<code>stopped</code> 是后续 loop）。<code>error</code> 时照常压帧、放闸，但<strong>不写</strong> <code>runlog</code>——runlog 永远只有定稿记录（§3）。</li>
+<li>客户端把 <code>delta</code> 帧按 <code>eventOffset</code> 顺序<strong>追加</strong>进气泡；地址↔︎内容一对一，去重 = 「见过的 eventOffset 跳过」。</li>
+</ul>
+<h2 id="3-get-apisessionssessionidlog--拉定稿历史">3. <code>GET /api/sessions/{sessionId}/log</code> —— 拉定稿历史</h2>
+<pre><code>GET /api/sessions/s_01/log?runlogOffset=N        ← `seq &gt; N ORDER BY seq LIMIT W`（**`seq` 即 runlogOffset**；W = 单批上限）
+
+200 {&quot;code&quot;:0,&quot;message&quot;:&quot;&quot;,&quot;data&quot;:{&quot;rows&quot;:[
+  {&quot;runlogOffset&quot;:1,&quot;runId&quot;:&quot;r_1&quot;,&quot;role&quot;:&quot;user&quot;,&quot;agent&quot;:&quot;&quot;,&quot;model&quot;:&quot;&quot;,&quot;messageId&quot;:&quot;m_1&quot;,&quot;text&quot;:&quot;现在几点&quot;},
+  {&quot;runlogOffset&quot;:2,&quot;runId&quot;:&quot;r_1&quot;,&quot;role&quot;:&quot;tool_call&quot;,&quot;agent&quot;:&quot;&quot;,&quot;model&quot;:&quot;deepseek/deepseek-flash&quot;,&quot;text&quot;:&quot;get_time({\&quot;timezone\&quot;:\&quot;Asia/Shanghai\&quot;})&quot;,&quot;payload&quot;:&quot;{\&quot;name\&quot;:\&quot;get_time\&quot;,\&quot;args\&quot;:\&quot;{\\\&quot;timezone\\\&quot;:\\\&quot;Asia/Shanghai\\\&quot;}\&quot;}&quot;},
+  {&quot;runlogOffset&quot;:3,&quot;runId&quot;:&quot;r_1&quot;,&quot;role&quot;:&quot;tool_result&quot;,&quot;agent&quot;:&quot;&quot;,&quot;model&quot;:&quot;deepseek/deepseek-flash&quot;,&quot;text&quot;:&quot;2026-10-08 15:04:05 +0800 CST&quot;,&quot;payload&quot;:&quot;{\&quot;name\&quot;:\&quot;get_time\&quot;,\&quot;output\&quot;:\&quot;2026-10-08 15:04:05 +0800 CST\&quot;}&quot;},
+  {&quot;runlogOffset&quot;:4,&quot;runId&quot;:&quot;r_1&quot;,&quot;role&quot;:&quot;assistant&quot;,&quot;agent&quot;:&quot;&quot;,&quot;model&quot;:&quot;deepseek/deepseek-flash&quot;,&quot;text&quot;:&quot;现在是 15:04……&quot;}
+],&quot;nextOffset&quot;:4}}
+404 {&quot;code&quot;:112001,&quot;message&quot;:&quot;找不到这场会话&quot;,&quot;data&quot;:null}</code></pre>
+<ul>
+<li><strong>每行带 <code>agent</code></strong>：空 = root（与帧同义）；委派场景的行带子代理名（T3 已落地，样例见下）。</li>
+<li><strong>每行带 <code>model</code></strong>：与帧同义（同一 <code>厂商/模型</code> ref）——<code>user</code> 行为空（不是模型产物）；<code>tool_call</code>/<code>tool_result</code> 行 = 发起/承接该调用的 agent 循环所用模型；子代理行 = 该规格的生效 ref。</li>
+<li><strong>委派场景样例</strong>（T3）：行序 = 事件到达序（消息粒度，不做树形重排）——user → tool_call(委派，root) → [agent:"researcher" 的工具活动行 + 终稿 assistant 行] → tool_result(回传，root) → assistant(root 终稿)；回传文本 = 子代理终稿的字节前缀（先裁后落；尾缀语义见 <code>19v6-05</code> §4）：
+<pre><code>{&quot;runlogOffset&quot;:3,&quot;runId&quot;:&quot;r_1&quot;,&quot;role&quot;:&quot;assistant&quot;,&quot;agent&quot;:&quot;researcher&quot;,&quot;model&quot;:&quot;deepseek/deepseek-flash&quot;,&quot;text&quot;:&quot;…（子代理终稿全量）&quot;}</code></pre></li>
+<li><strong>行有两种粒度</strong>：<code>user</code>/<code>assistant</code> = 消息本身；<code>tool_call</code>/<code>tool_result</code> = 工具活动<strong>扩展行</strong>（消息粒度，不是帧——生成中的 delta 只进 runlive，不落 runlog）。</li>
+<li>扩展行的 <code>text</code> 是可直接展示的一行：<code>tool_call</code> = <code>name(args)</code>；<code>tool_result</code> = 输出原文。<code>payload</code> 是结构化 JSON（<code>{"name","args"}</code> / <code>{"name","output"}</code>，字段与同名帧一一对应），<strong>只有扩展行有</strong>；其内 <code>args</code> 仍是字符串（模型原始 JSON 原文，不重编码——坏 JSON 也不会破 payload）。</li>
+<li><code>user</code>/<code>assistant</code> 行的形状不变；assistant 定稿行 text = 本 run 全部 delta 累计（含工具轮前导语），仍是收口替换的锚。</li>
+<li><code>runlogOffset=N</code> 返回 offset &gt; N 的记录，升序，<strong>单批最多 W 条</strong>；缺省或 <code>=0</code> = 从头<strong>分批</strong>拉（要拉 ⌈总条数 / W⌉ 次），不是「一次拿全部」。</li>
+<li><strong>初始游标不是 0</strong>：新客户端先 <code>GET /api/sessions/{sessionId}</code> 拿高水位 <code>H</code>，取 <code>runlogOffset = max(0, H - 窗口)</code> 只拉尾巴；要更早的历史就把游标<strong>往回拨</strong>再拉一次。理由：<code>runlog</code> 永久增长（compact 压的是 <code>model_history</code>，不动 <code>runlog</code>），「从 0 全量」在长会话下是无界请求。窗口大小由客户端定，服务端的 W 兜底。</li>
+<li><strong>只有定稿记录</strong>：<code>runlog</code> 里永远只有已定稿的 message（§1 的 user 记录、概念表「定稿」的 assistant 记录——概念表在 index），没有半截——生成中的半截在 frames（§2）。<strong>（新 A6 已裁，2026-10-03）error 结局的残缺文本不进 runlog、不另留痕</strong>：frames 里的半截在 TTL 前可见，之后消失；<code>model_history</code> 在 error 结局只进 user 那一半（assistant 不进）——模型上下文里保留这次失败的尝试，重投时模型看得到它。</li>
+<li><code>nextOffset</code> = 本批最大 offset；<strong>空则 = N</strong>。被 W 截断时它就是本批末条记录的 offset，客户端从它继续拉即补齐。</li>
+<li>记录带 <code>runId</code>：客户端按 <code>runId</code> 把定稿的 <code>assistant</code> 记录对上「正在生成」气泡<strong>替换</strong>（收口）。</li>
+</ul>
+<h2 id="4-get-apisessionssessionid--状态查询">4. <code>GET /api/sessions/{sessionId}</code> —— 状态查询</h2>
+<pre><code>GET /api/sessions/s_01
+
+200 {&quot;code&quot;:0,&quot;message&quot;:&quot;&quot;,&quot;data&quot;:{&quot;liveRunId&quot;:&quot;r_1&quot;,&quot;runlogOffset&quot;:1,&quot;lastRunStatus&quot;:&quot;running&quot;,&quot;lastRunId&quot;:&quot;r_1&quot;,&quot;workspaceId&quot;:null}}
+                                                ← run 正在跑，runlog 已有 1 条（用户消息）
+200 {&quot;code&quot;:0,&quot;message&quot;:&quot;&quot;,&quot;data&quot;:{&quot;liveRunId&quot;:&quot;&quot;,&quot;runlogOffset&quot;:2,&quot;lastRunStatus&quot;:&quot;complete&quot;,&quot;lastRunId&quot;:&quot;r_1&quot;,&quot;workspaceId&quot;:&quot;ws_01&quot;}}
+                                                ← run 结束，助手全文已进 runlog
+404 {&quot;code&quot;:112001,&quot;message&quot;:&quot;找不到这场会话&quot;,&quot;data&quot;:null}</code></pre>
+<ul>
+<li><code>liveRunId</code>：读 <code>runs</code> 表活行（<code>WHERE session_id=$s AND status='running' AND lease_until &gt; now()</code> 的一行），<code>""</code> = 会话闲着。决定客户端要不要拉 frames。</li>
+<li><code>runlogOffset</code>：<code>runlog:{sessionId}</code> 的高水位（<code>LLEN</code>）。客户端据此判断有没有新定稿要补。</li>
+<li><code>lastRunStatus</code>（<strong>doc/17 §4，2026-10-17 落地</strong>）：<strong>最新一场</strong> run 的终态（<code>running</code>/<code>complete</code>/<code>error</code>/<code>stopped</code>），<code>""</code> = 这个会话还没有过 run。<code>stopped</code> 收口靠它分辨「用户停的」与「失败」——两者的 log 长得一样（都没有 assistant 行）。</li>
+<li><code>lastRunId</code>（<strong>doc/30 A1，2026-10-21 落地</strong>）：最新一场 run 的 id，<code>""</code> = 无 run。它与 <code>lastRunStatus="interrupted"</code> 配对时， 就是「崩溃后可以被接管的那一场」——续跑入口 <code>POST /api/runs/{id}/resume</code> 靠这两个字段定位。 注意它说的是<strong>最新一场</strong>，未必是客户端正在看的<strong>那一场</strong>；要判单场，用 <code>GET /api/runs/{id}</code>（doc/30 §10.1）。</li>
+<li><code>workspaceId</code>（<strong>doc/35 A4，2026-10-20 落地</strong>）：会话挂着的项目 id（<code>"ws_..."</code>），<strong>游离会话是 <code>null</code></strong>（不是空串）。</li>
+<li>字段序 = <code>liveRunId</code> → <code>runlogOffset</code> → <code>lastRunStatus</code> → <code>lastRunId</code> → <code>workspaceId</code>（Go 结构体声明序）。</li>
+</ul>
+<h2 id="5-get-apirunsrunidstream--帧面的-sse-运输doc312026-10-18-落地">5. <code>GET /api/runs/{runId}/stream</code> —— 帧面的 SSE 运输（doc/31，2026-10-18 落地）</h2>
+<p>第五个端点：同一帧面的<strong>第二种运输方式</strong>（<code>text/event-stream</code>），面向外部消费方（「一次 GET，读到 terminal 为止」）。真源与帧形状与 §2 完全同一份（runlive LIST、<code>ReadFrames</code>、七种 kind 原样透传、<code>id:</code> = eventOffset），契约字节、tail/心跳机制、gone 语义、边界情形表、验收实录的真源在 <strong>doc/31</strong>——本节只登记存在性与关系，不复制条款（同一机制一份真源）。</p>
+<p>与四 API 的关系一句话：<strong>拉是正确性，流是优化</strong>。流不承诺可靠送达，续传把手 = <code>Last-Event-ID</code>（同一 <code>eventOffset</code> 游标的第二种读法，没有第二个游标抽象）。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/19-v6/19v6-01-%E5%A5%91%E7%BA%A6-%E5%9B%9B%E4%B8%AAAPI.md"><code>doc/19-v6/19v6-01-契约-四个API.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

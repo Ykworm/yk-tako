@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>记忆方案：pipeline 与 markdown 两种独立模式 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="记忆方案pipeline-与-markdown-两种独立模式">记忆方案：<code>pipeline</code> 与 <code>markdown</code> 两种独立模式</h1>
+<blockquote>
+<p>性质：<strong>已落地（2026-11-10）</strong> 状态：✅ 已施工并验收；落地结论与验收记录见下节「落地与验收」，正文为方案原稿（措辞与实现如有出入，以代码为准）。 日期：2026-11-09 成文；2026-11-10 落地 基线：本稿把「抽取 + MQ」与「只用 Markdown」定为两种独立运行模式，不再把 Markdown 当作 PG 管线的可替换存储后端。演进记录见 <a href="log/2026-11-09-记忆两层方案演进.html">2026-11-09 记忆两层方案演进</a>（非方案）；本稿只描述当前方案。 代码落点：<code>yk-tako-eino/internal/runengine/</code> 的 memory 全族（明细见「落地与验收」）；观测端点在 <code>server.go</code>。</p>
+</blockquote>
+<h2 id="落地与验收2026-11-10">落地与验收（2026-11-10）</h2>
+<p><strong>代码落点</strong>（均在 <code>yk-tako-eino/internal/runengine/</code>）：</p>
+<ul>
+<li>两层存储与写回：<code>memory_types.go</code>（类型与编码）、<code>memory_store.go</code>（21 列存储层）、<code>memory_write.go</code>（抽取动作写库事务：行变化与批次标记同一事务、整批全滚、claim_epoch 守卫）；</li>
+<li>抽取管线：<code>memory_pipeline.go</code>（extractEntries → screenCandidates → finalActions 三段流；postrun 遇同 session 未完成 inrun 时保持 pending）、<code>memory_dispatch.go</code>（pipeline 版 <code>memory</code> 派工工具，只登记不写库）；</li>
+<li>投递：<code>memory_queue.go</code>（消费者主循环、租约、1/5/30 分钟退避、对账器补投）、<code>memory_redpanda.go</code>（按 session 分区生产）；</li>
+<li>读取与查询：<code>memory_search.go</code>（BM25 召回 + <code>search_memory</code>）；</li>
+<li>迁移与互切：<code>memory_migrate.go</code>（存量迁移）、<code>memory_mode.go</code>（模式装配）；</li>
+<li><code>markdown</code> 模式：<code>memory_markdown.go</code>（操作式同步写工具）+ 文件底座 <code>filelock.go</code>／<code>atomicfile.go</code>／<code>filefp.go</code>（经 <code>filetools.go</code> 接线）；</li>
+<li>共用件：<code>notes.go</code>（常驻层 notes 工具）、<code>memory_text_guard.go</code>（正文护栏）、<code>server.go</code>（items/jobs/recall 观测端点；markdown 模式统一 409 / 118001）。</li>
+</ul>
+<p><strong>验收</strong>：</p>
+<ul>
+<li>机器真源：<code>scripts/acceptance/expected.json</code> 用例 35–38（39–43 声明未断言，理由指向活体脚本），与 <a href="19-v6/19v6-04-验收-curl.html">19-v6/19v6-04-验收-curl.md</a> 同批；快闸 <code>contract_test.go</code> 的 <code>TestContractMemoryObserveBytes</code>（观测口字节 + markdown 模式 409/118001）。</li>
+<li>活体六件（<code>scripts/acceptance/memory_*.sh</code>）：<code>memory_pipeline_live.sh</code> 20/20、<code>memory_markdown_live.sh</code> 26/26、<code>memory_migrate_live.sh</code> 42/42、<code>memory_file_race.sh</code> 11/11、<code>memory_project_delete.sh</code> 9/9、<code>memory_redpanda_crash.sh</code> 10/13（真 broker kill -9 补投；三条失败见下）。</li>
+</ul>
+<p><strong>施工期发现</strong>（第 1–4 条已处理回填；第 5 条已知未做；第 6 条 2026-11-12 已修）：</p>
+<ol type="1">
+<li>recall 观测端点缺身份过滤 → 补租户/用户通道；</li>
+<li>抽取行缺来源指针 → 补 <code>source_session_id</code>／<code>source_run_id</code>／<code>source_seq</code>；</li>
+<li>抽取提示词协议补全：新条目与已有行分两套编号、targets 只允许已有行序号、重复事实回空动作数组；</li>
+<li>run_id 唯一索引垫片（施工期临时件）移除；</li>
+<li><code>dialogue.go</code> 词面切词留有隐患，本轮未动；</li>
+<li>coder 子代理规格曾列出 <code>memory</code>（drop helper 让子代理两种模式都拿不到它）→ 装配时报「工具解析失败」。已从 <code>agents/coder.md</code> 删掉这一项，出厂规格金样同步（doc/75-76 施工批）；</li>
+<li>run-3 行为观察：pipeline 派工工具无删除能力，模型改走 ask_user（doc/47 的人问流程）——按设计的正确行为。</li>
+</ol>
+<p><strong>评审裁定两条</strong>（主 Agent，2026-11-10）：① markdown 文件「规范形态」判定偏严——条目必须严格用 <code>\n§\n</code> 分隔、条目首尾无多余空白、末尾最多一个换行，人手编辑用 CRLF 或分隔符旁加空格会被拒绝写入（文件字节不变，错误文案写明期望格式）；这是刻意选的保守方向（§5.4：宁可这次不写，也不要替用户改坏记忆）。② markdown 模式的记忆文件不计入租户工作区存储配额——<code>write_file</code> 走配额预留、记忆工具不走；单文件有 rune 上限（项目 2200／用户 1375），文件数随用户/项目增长，累计无上限。</p>
+<p><strong>C3 召回两处实现偏差，以实现为准</strong>：召回查询用 tokenize + boolean 组合，不是 match 查询；BM25 长度归一与标准式有差异。</p>
+<p><strong>redpanda_crash 三条失败断言（如实记录，不粉饰）</strong>：</p>
+<ul>
+<li>「记忆任务 90s 收口」「active 茶行恰好 1 条」：postrun 首抽撞 provider 500，按 1/5/30 分钟退避，96s 后重试成功——重试链按设计工作，是脚本 90s 窗口定得太紧；迟到的重试把改口前的旧茶事实重新落行（replace 咖啡行），9 秒后 run-3 的 inrun 又写了另一措辞，短窗内两条 active 措辞，BM25 语义去重未合并这两句；</li>
+<li>「含 FACT 的 active 行恰好 1 条」断言时刻计到 0，最终态复核为恰好 1 条 active（行在原 apply 时刻落库、job 未被重投）；计数瞬间为 0 的成因未定（候选解释各断一环），如实挂账；</li>
+<li>顺带修掉脚本自身缺陷：重启串以 <code>&amp;</code> 结尾时 <code>eval</code> 会把重定向漏到脚本自身 stdout（输出全丢、脚本挂住），改用 <code>bash -c</code> 子进程执行。</li>
+</ul>
+<blockquote>
+<p>全局配置：<code>memory.mode = pipeline | markdown</code>。它切换的是写入工具、读取路径和后台任务整套机制，不只是数据库接口。</p>
+</blockquote>
+<h2 id="0-结论">0. 结论</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th></th>
+<th><code>pipeline</code>：完整管线</th>
+<th><code>markdown</code>：同步文件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>记忆真源</td>
+<td>PG <code>memory_items</code></td>
+<td>用户 <code>USER.md</code> + 当前项目 <code>MEMORY.md</code></td>
+</tr>
+<tr>
+<td>读取</td>
+<td>常驻全量 + 每回合 BM25 召回 + 主动查询</td>
+<td>两份文件全量常驻</td>
+</tr>
+<tr>
+<td>写入</td>
+<td>master 派工；统一抽取代理在 inrun/postrun 两个时点写入</td>
+<td>master 自己同步调用 <code>memory</code> 工具</td>
+</tr>
+<tr>
+<td>后台设施</td>
+<td>Redpanda + PG <code>memory_jobs</code> + 对账器</td>
+<td>不登记记忆 job，不启动抽取消费者，不需要 Redpanda</td>
+</tr>
+<tr>
+<td>改口与删除</td>
+<td>版本行、supersede 链、删除留痕</td>
+<td>直接修改当前文件，不保留记忆版本链</td>
+</tr>
+<tr>
+<td>自动学习</td>
+<td>inrun 当场记录 + postrun 整场兜底</td>
+<td>只有主代理当场判断；没有场后兜底</td>
+</tr>
+<tr>
+<td>主动历史查询</td>
+<td><code>search_memory</code> 支持当前检索、时点回放和历史链</td>
+<td>不提供</td>
+</tr>
+<tr>
+<td>主要收益</td>
+<td>自动、可检索、可审计、适合长期积累</td>
+<td>简单、同步有回执、透明可编辑、部署轻</td>
+</tr>
+</tbody>
+</table></div>
+<p>两种模式不是功能等价的 provider。<code>markdown</code> 是用自动学习和历史能力换简单与透明；不能给它挂上实际不支持的 <code>search_memory(as_of=…)</code>，也不能在配置切换时假装旧能力还在。</p>
+<p>本方案<strong>取消记忆管理面</strong>：不新增 <code>/api/memories</code> 产品 CRUD，不做记忆管理页，不再保留 POST/PATCH/DELETE 管理动作。用户通过对话修改记忆；Markdown 文件还可以被人直接编辑。现有只读观测端点可用于验收，但它们不是产品管理面。</p>
+<h2 id="1-为什么需要这两种模式">1. 为什么需要这两种模式</h2>
+<h3 id="11-改口与删除是共同问题">1.1 改口与删除是共同问题</h3>
+<p>用户先说「deck 放 <code>output/deck.html</code>」，几周后改口「以后放 <code>output/v2.html</code>」。如果旧事实仍在，下一场模型会同时看到两个答案。</p>
+<p>用户再说「deck 那件事别记了」，如果后台事后抽取仍能读旧 runlog，却没有「用户已经删除」的记录，它可能把同一件事重新写回来。</p>
+<p>两种模式都要让改口和删除生效，但代价不同：</p>
+<ul>
+<li><code>pipeline</code> 保留旧版本和删除证据，用它们约束后续自动抽取；机制更重，换来自动学习和历史查询。</li>
+<li><code>markdown</code> 直接改当前文件，没有 postrun 自动抽取，因此不需要为了防止后台重写而维护 removed tombstone。历史 runlog 仍是运行档案，不能把这说成「从所有系统中抹除」。</li>
+</ul>
+<h3 id="12-为什么不能把文件当成完整管线的另一个存储后端">1.2 为什么不能把文件当成完整管线的另一个存储后端</h3>
+<p>完整管线需要按行检索、跨行 supersede 指针、删除抑制、时间回放、幂等写入和后台整理。若要求 Markdown 后端也实现这些，最后会用文本文件重新实现一套数据库。</p>
+<p>反过来，若只允许文件保存两条当前状态，又会把它最有价值的「人打开就懂、可以直接改」变成复杂机制的附属品。</p>
+<p>所以本方案把选择放在<strong>运行模式</strong>，不是给完整管线硬套一个文件接口。</p>
+<h2 id="2-参考实现本次核实后各取什么">2. 参考实现：本次核实后各取什么</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>项目</th>
+<th>核实后的真实形态</th>
+<th>本方案取什么</th>
+<th>不取什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Letta / MemGPT</td>
+<td>core 必见与 archival 按需读取</td>
+<td><code>pipeline</code> 的两种读契约</td>
+<td>不原地覆盖历史正文</td>
+</tr>
+<tr>
+<td>Zep / Graphiti</td>
+<td>现实时间与系统认知时间分开</td>
+<td><code>valid_from</code>、<code>expires_at</code>、supersede 链和显式时点查询</td>
+<td>不引入图存储和完整双时间审计系统</td>
+</tr>
+<tr>
+<td>Rakazo</td>
+<td>内置 Markdown 文档实际存 PG <code>memory_documents</code>；每次修订写 <code>memory_revisions</code>；<code>expectedRevision</code> + Serializable 事务防覆盖；语义记忆由外部 provider 另算</td>
+<td>预算满度可见、拒写返回当前条目、改口/删除/写满等场景验收；PG 文档 CAS 思路</td>
+<td>不把 Rakazo 说成纯文件存储；不接外部语义 SaaS</td>
+</tr>
+<tr>
+<td>Hermes</td>
+<td>内置 <code>MEMORY.md</code> / <code>USER.md</code> 是真文件；锁内重读、条目 add/replace/remove、原子替换、快照整场冻结；subagent 默认无 memory 写权限</td>
+<td><code>markdown</code> 的主体机制</td>
+<td>不引入庞大的 MemoryProvider 插件体系，不把文件锁当成跨机器保证</td>
+</tr>
+<tr>
+<td>Kimi</td>
+<td>普通工具按文件访问关系排队；Tower 长任务给每个 agent 独立 Git worktree，再显式合并</td>
+<td>文件写入区分短临界区与长任务隔离</td>
+<td>不把进程内调度器当成多副本锁；不为 coding agent 引入 CRDT</td>
+</tr>
+</tbody>
+</table></div>
+<p>文件并发只采用两类手段：短写入用互斥与版本校验，长并行任务用独立副本再合并。CRDT/OT 服务实时协同编辑，不自动解决代码或方案的业务语义冲突。</p>
+<h2 id="3-两种模式共用的语义">3. 两种模式共用的语义</h2>
+<h3 id="31-归属只有-user-与-workspace">3.1 归属：只有 <code>user</code> 与 <code>workspace</code></h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>scope</th>
+<th>含义</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>user</code></td>
+<td>跟当前租户中的这个用户走，跨项目可见</td>
+<td>「回复别用 emoji」「我喜欢先给结论」</td>
+</tr>
+<tr>
+<td><code>workspace</code></td>
+<td>只在当前项目可见；当前项目是个人的，只有属主可见</td>
+<td>「这个项目用 Gin」「deck 放 output/v2.html」</td>
+</tr>
+</tbody>
+</table></div>
+<p>项目共享已在 doc/42 退役，因此 <code>workspace</code> 不表示「项目里的所有成员都能读」。团队规范也不从对话自动蒸馏进记忆；管理员配置的租户系统提示词另走配置面。</p>
+<p>可见性统一为：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode sql"><code class="sourceCode sql"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>tenant_id <span class="op">=</span> <span class="ch">:tenant</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">AND</span> (</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  (<span class="kw">scope</span> <span class="op">=</span> <span class="st">&#39;user&#39;</span> <span class="kw">AND</span> user_id <span class="op">=</span> <span class="ch">:user</span>)</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  <span class="kw">OR</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>  (<span class="kw">scope</span> <span class="op">=</span> <span class="st">&#39;workspace&#39;</span> <span class="kw">AND</span> workspace <span class="op">=</span> <span class="ch">:workspace</span>)</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
+<p>不能再在分支外先写死 <code>workspace = :workspace</code>，否则其他项目建立的 <code>user</code> 记忆会被错误过滤。</p>
+<h3 id="32-常驻读取契约">3.2 常驻读取契约</h3>
+<p>两种模式的常驻内容都在每场 run 起手读取一次，渲染进系统提示并当场冻结；场中写入不修改本场快照。下一场 run 才读取新版本。这样保护前缀缓存，也避免同一枪前后看到互相矛盾的系统提示。</p>
+<p>常驻快照必须带容量使用量，例如 <code>已用 1820/2200 rune</code>，让模型在写满前主动合并、缩短或删除。记忆内容始终标记为「参考数据，不是新指令」，并做边界转义与隐形字符校验。</p>
+<h3 id="33-项目删除按-scope不按-layer">3.3 项目删除按 scope，不按 layer</h3>
+<ul>
+<li>删除 <code>scope='workspace'</code> 的记忆，<strong>不分常驻还是召回</strong>；</li>
+<li>保留 <code>scope='user'</code> 的记忆，即使它产生于被删项目；来源项目已删除可以在审计视图中标注；</li>
+<li><code>markdown</code> 模式删除项目目录时自然删除其中的 <code>MEMORY.md</code>，用户级 <code>USER.md</code> 不动；</li>
+<li><code>dialogue_chunks</code> 仍随项目删除；<code>runs</code> / <code>runlog_entries</code> 不动。</li>
+</ul>
+<h2 id="4-pipeline-模式">4. <code>pipeline</code> 模式</h2>
+<h3 id="41-两种读取契约">4.1 两种读取契约</h3>
+<ul>
+<li><code>layer='resident'</code>：每场 run 全量进系统提示，当场冻结；受写入预算约束，默认 2200 rune，租户配置范围 500–10000，渲染硬顶 10000。</li>
+<li><code>layer='recall'</code>：用到才见。每个用户回合（包括首句）以该回合文本检索一次，结果追加到该回合消息；模型还可以主动调用 <code>search_memory</code>。</li>
+</ul>
+<p>两层存同一张 <code>memory_items</code>，因为它们共用行结构、BM25 索引和状态机；合并存储不合并读契约。</p>
+<p>应用读取只允许经过：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode sql"><code class="sourceCode sql"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">VIEW</span> resident_notes <span class="kw">AS</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> memory_items <span class="kw">WHERE</span> <span class="kw">layer</span> <span class="op">=</span> <span class="st">&#39;resident&#39;</span>;</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">VIEW</span> recall_items <span class="kw">AS</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>  <span class="kw">SELECT</span> <span class="op">*</span> <span class="kw">FROM</span> memory_items <span class="kw">WHERE</span> <span class="kw">layer</span> <span class="op">=</span> <span class="st">&#39;recall&#39;</span>;</span></code></pre></div>
+<p>写入与状态迁移由统一 Store 方法访问基表；普通查询不能各自散落 <code>layer</code> 条件。</p>
+<h3 id="42-行结构与时间">4.2 行结构与时间</h3>
+<p>保留或新增以下字段：</p>
+<pre class="text"><code>id, tenant_id, user_id, workspace
+layer = resident | recall
+scope = user | workspace
+content, quote
+state = active | superseded | removed | archived
+superseded_by, conflict_with
+created_at, updated_at, left_active_at, removed_at
+valid_from, expires_at
+source = user | extracted | model
+source_session_id, source_run_id, source_seq</code></pre>
+<p>约束：</p>
+<ul>
+<li><code>kind</code>、<code>topic</code>、<code>embedding</code>、精确内容去重索引全部取消；不再抽 episode。</li>
+<li><code>source='user'</code> 表示用户明确说「记住/改口/别记了」产生的行，程序整理不能合并、替代或淘汰它；<code>extracted</code> 是普通推断行；<code>model</code> 用于存量直接工具写入的迁移行。</li>
+<li>删除管理面后不再新增 <code>admin</code> 来源，也不保留没有入口的 <code>pinned</code> 字段。</li>
+<li><code>workspace</code> 在 <code>scope='user'</code> 行上只表示来源项目，不把该行变成项目所有。</li>
+</ul>
+<p>**证据时间取 <code>source_run_id + source_seq</code> 对应的 <code>runlog_entries.created_at</code>，不取 <code>runs.finished_at</code>。**inrun 写入时来源 run 尚未完成，<code>finished_at</code> 仍为空；并发 run 的完成顺序也不等于用户说话顺序。<code>source_seq</code> 用于同一 run 内排序。</p>
+<p>merge 新行携带最新贡献证据的来源指针与时间；quote 能引用用户原句则填，推断条目允许为空。程序不能用提交时间 <code>created_at</code> 反推哪句话先说。</p>
+<h3 id="43-状态机只进单行历史不复活旧行">4.3 状态机：只进单行历史，不复活旧行</h3>
+<p>允许的状态变化：</p>
+<pre class="text"><code>active → superseded   新行替代旧行，旧行 superseded_by 指向新行
+active → removed      用户明确删除，removed_at 留痕
+active → archived     过期或程序整理退场</code></pre>
+<p>不允许 <code>archived ↔︎ active</code> 或其他旧行复活。用户重新表达同一件事时插新行，不恢复旧行。</p>
+<p><code>left_active_at</code> 只在离开 active 时写一次，普通元数据更新不覆盖它。这样无需状态事件表，也能读出每条历史行从创建到离开 active 的单个区间。</p>
+<p>不变量：</p>
+<ol type="1">
+<li>历史行的 <code>content</code> 与 <code>quote</code> 不原地改；改口必须插新行并建立指针。</li>
+<li>删除默认留痕，唯一物理删除路径是项目删除时的 <code>scope='workspace'</code> 连带清。</li>
+<li>默认读取只认 <code>state='active'</code> 且未过期；历史只在显式查询中出现。</li>
+<li>用户明确删除后的抑制检查是正确性要求，查询失败时任务失败并重试，不能 fail-open 把旧事实写回来。</li>
+<li>冲突不自动选赢家；两行互写 <code>conflict_with</code>，召回时成对标记，用户在后续对话中裁决。</li>
+</ol>
+<h3 id="44-召回与主动查询">4.4 召回与主动查询</h3>
+<p>自动召回使用 pg_search 的 <code>chinese_lindera</code> + BM25，Go 侧不切中文词：</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode sql"><code class="sourceCode sql"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> <span class="kw">id</span>, <span class="kw">scope</span>, content, quote, created_at, paradedb.score(<span class="kw">id</span>) <span class="kw">AS</span> score</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">FROM</span> recall_items</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">WHERE</span> <span class="kw">id</span> @@@ paradedb.match(<span class="st">&#39;content&#39;</span>, <span class="ch">:current_user_text</span>)</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> <span class="op">&lt;</span><span class="kw">scope</span> 两分支可见性<span class="op">&gt;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> state <span class="op">=</span> <span class="st">&#39;active&#39;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>  <span class="kw">AND</span> (expires_at <span class="kw">IS</span> <span class="kw">NULL</span> <span class="kw">OR</span> expires_at <span class="op">&gt;</span> now())</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> score <span class="kw">DESC</span>, 证据时间 <span class="kw">DESC</span>, <span class="kw">id</span> <span class="kw">DESC</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="kw">LIMIT</span> <span class="dv">20</span>;</span></code></pre></div>
+<p>程序再取前 5 条，总预算 600 rune，整块进入当前用户回合并计入折叠预算。BM25 是词面检索，不能承诺「周末」命中「周六」，验收不得把语义相似写成词法引擎的保证。</p>
+<p><code>search_memory</code> 只挂主代理，不挂普通子代理：</p>
+<pre class="text"><code>search_memory(query, as_of?, include_history=false, limit=10)</code></pre>
+<ul>
+<li>不传 <code>as_of</code>：只查当前 active 且未过期。</li>
+<li>传 <code>as_of</code>：本期只承诺<strong>现实回放</strong>——<code>COALESCE(valid_from, created_at)</code> 覆盖目标时点，现实终点由 <code>expires_at</code> 与后继行的现实起点推导。</li>
+<li><code>include_history=true</code>：沿 <code>superseded_by</code> 双向取链，带 state、<code>left_active_at</code>、removed_at 和 layer；跨层指针可以走到常驻行，但常驻行本身不参与普通检索。</li>
+<li>链遍历必须有 visited 集合与深度上限；0 命中是正常结果。</li>
+</ul>
+<p>认知回放暂不作为工具参数开放；<code>left_active_at</code> 已保留单行一次翻转所需的明确时刻，将来若真需要「系统当时知道什么」再单独评审。</p>
+<h3 id="45-写入入口与目标层">4.5 写入入口与目标层</h3>
+<p><code>pipeline</code> 中 master 不直接写 <code>memory_items</code>，只调用派工工具登记 <code>memory_jobs</code>：</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;kind&quot;</span><span class="fu">:</span> <span class="st">&quot;inrun&quot;</span><span class="fu">,</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;target_layer&quot;</span><span class="fu">:</span> <span class="st">&quot;resident&quot;</span><span class="fu">,</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;quote&quot;</span><span class="fu">:</span> <span class="st">&quot;记住，以后 deck 放 output/v2.html&quot;</span><span class="fu">,</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;source_session_id&quot;</span><span class="fu">:</span> <span class="st">&quot;s_…&quot;</span><span class="fu">,</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;source_run_id&quot;</span><span class="fu">:</span> <span class="st">&quot;r_…&quot;</span><span class="fu">,</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;source_seq&quot;</span><span class="fu">:</span> <span class="dv">42</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>程序补齐 tenant/user/workspace、source 与 trace context，提交后向 Redpanda 发送 <code>{job_id}</code>。master 得到的是 <code>job_id 已受理</code>，不能声称已经写成功。</p>
+<p>目标层规则：</p>
+<ul>
+<li>inrun 由 master 在登记时写 <code>target_layer=resident|recall</code>；抽取代理不能换层；</li>
+<li>postrun 永远 <code>target_layer=recall</code>，后台兜底不能把推断晋升成每场必见；</li>
+<li>tidy 不晋升 layer；</li>
+<li>常驻写入必须在写时校验预算，拒绝时返回使用量与当前条目。</li>
+</ul>
+<p>run 定稿时在同一事务登记 postrun job。只从 complete run 抽取；error/stopped 没有完整可信结果，不抽。</p>
+<h3 id="46-redpanda-与-db-各管什么">4.6 Redpanda 与 DB 各管什么</h3>
+<p>Redpanda 使用：</p>
+<ul>
+<li>一个记忆抽取 topic；</li>
+<li><code>key = session_id</code>，让同 session 正常路径进入同一分区；</li>
+<li>一个 consumer group，同分区同一时刻只有一个消费者；</li>
+<li>消息只携带 <code>{job_id}</code> 与 trace 透传信息，不作为任务正文真源。</li>
+</ul>
+<p>PG <code>memory_jobs</code> 仍是状态真源：pending/running/done/failed、attempts、next_attempt_at、lease_until、<code>claim_epoch</code>、输入上下文与提交状态。Redpanda 的分区顺序不能覆盖 DB 提交后尚未发送、失败重试、消费者崩溃和补投，因此还要有：</p>
+<ol type="1">
+<li><strong>原子认领与接管令牌</strong>：到期 pending 或租约过期 running 才能被更新为 running，并令 <code>claim_epoch+1</code>；重复消息不能重复认领。旧消费者复活后只能拿旧 epoch，写库时必须被拒之门外。</li>
+<li><strong>postrun 前置条件</strong>：同 session 仍有未完成 inrun 时，postrun 不执行，保留 DB 状态并稍后重新叫醒。</li>
+<li><strong>对账器</strong>：定期发现已登记但未投递的超龄 pending、租约过期 running，以及到点待重试任务；补投前先把 DB 状态恢复成可认领形态。</li>
+<li><strong>有限重试</strong>：模型或基础设施失败按 1/5/30 分钟退避，三次后 failed；不能因 MQ 已投递就假装 DB 已完成。</li>
+</ol>
+<p>多副本下不依赖「每进程并发 1」证明顺序；Redpanda 负责正常路径的顺序优化，DB 前置条件负责最终正确性。</p>
+<h3 id="47-统一抽取代理全部扫描但分批进入模型">4.7 统一抽取代理：全部扫描，但分批进入模型</h3>
+<p>inrun 读取锚点原话及前后各 10 条消息；postrun 读取整场有界 runlog。两种输入都给同一份判定标准与相同的当前记忆视野。</p>
+<p>候选视野不设 150 行上限，也不要求所有行同时进入一次模型调用：</p>
+<ol type="1">
+<li>程序列出可见域全部 active 常驻行与全部 active 召回行，并给每行分配稳定的全局候选序号；</li>
+<li>按当前模型可用 token 预算分批；</li>
+<li>每批与本次新条目比较，模型只返回候选序号，不自由填写数据库 id；</li>
+<li>程序汇总所有批次的相关候选，由最终合并调用决定 insert/replace/merge/conflict/covered_by_resident/supersede_by_resident/remove；remove 只接受用户明确删除，普通推断不能删除；</li>
+<li>没有处理完全部批次前不得写库。</li>
+</ol>
+<p>这样既没有「第 151 行永远没机会参与」的截断，也不会把无限行一次塞进有限上下文。代价是同一任务可能需要多次模型调用。最终相关候选仍超模型预算时明确失败并重试，不能截断后先写一部分。</p>
+<p>模型输出条目只含：</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;scope&quot;</span><span class="fu">:</span> <span class="st">&quot;workspace&quot;</span><span class="fu">,</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;content&quot;</span><span class="fu">:</span> <span class="st">&quot;deck 放在 output/v2.html&quot;</span><span class="fu">,</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;quote&quot;</span><span class="fu">:</span> <span class="st">&quot;以后 deck 放 output/v2.html&quot;</span><span class="fu">,</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;expires_at&quot;</span><span class="fu">:</span> <span class="kw">null</span><span class="fu">,</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;valid_from&quot;</span><span class="fu">:</span> <span class="kw">null</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p><code>layer</code>、归属事实列、来源指针、状态与审计时间都由程序确定。replace/merge/remove/supersede_by_resident 使用候选序号，由程序映射真实 id；<code>target_id</code> 不在模型自由文本中传播。</p>
+<h3 id="48-writememory准入事务与幂等">4.8 <code>writeMemory</code>：准入、事务与幂等</h3>
+<p>写库事务先取 workspace 级 PG advisory lock，再核对 <code>job_id + 当前 claim_epoch</code>，随后做候选状态复核与行变化；旧消费者即使复活也不能凭旧 epoch 写入。这把锁覆盖跨 session 写同一项目的竞争。<code>user</code> 行跨项目同时写时不靠提交先后判新旧，而按 runlog 证据时间拒绝旧证据覆盖新证据。</p>
+<p>写入前机械校验：</p>
+<ul>
+<li>scope 词表、content 非空与长度、quote 长度、隐形字符、PII；</li>
+<li>expires_at 必须在未来；valid_from 无法解析则清该字段；与 expires_at 同填时起点必须早于终点；</li>
+<li>候选序号必须来自本任务候选表，映射出的行必须仍符合动作要求的 layer/state；</li>
+<li><code>source='user'</code> 行不能被后台整理替代或淘汰；</li>
+<li>merge 不得引入原文没有的新事实；使用 pg_search tokenizer 做词集校验，校验能力不可用时拒绝 merge，不悄悄放行；</li>
+<li>常驻预算与单批写动作数必须在事务内复核。</li>
+</ul>
+<p>失败语义统一为：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>失败</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>抽取整体 JSON 不可解析</td>
+<td>不写，job 退避重试</td>
+</tr>
+<tr>
+<td>单个候选字段非法</td>
+<td>丢该候选，其他候选继续分析</td>
+</tr>
+<tr>
+<td>候选序号非法、目标状态已变、动作越权</td>
+<td>整批拒绝，不降级 coexist；代理读取新状态后重组</td>
+</tr>
+<tr>
+<td>删除抑制或候选读取失败</td>
+<td>不写，job 重试</td>
+</tr>
+<tr>
+<td>写库事务失败</td>
+<td>整批回滚，job 重试</td>
+</tr>
+<tr>
+<td>常驻超预算</td>
+<td>不写，返回使用量与当前条目；有限次整理后仍失败则 job failed</td>
+</tr>
+</tbody>
+</table></div>
+<p>**不再使用 <code>(source_run_id, content)</code> 作为防重放唯一索引。**它会把同一场 run 中真实的 A → B → A 改口误判为重复。</p>
+<p>每个 job 至多成功提交一个写批次。程序先把批次与每个动作的逻辑操作号持久化，再在同一 PG 事务中完成所有行变化与 job「已提交」标记；消费者重放时看到已提交标记就直接收尾，不重新分析。批内动作全部成功或全部回滚。操作幂等由持久化的 job/批次身份保证，不由正文是否相同保证。</p>
+<h3 id="49-整理过期与跨层收拢">4.9 整理、过期与跨层收拢</h3>
+<p>后台 tidy 只处理召回层，常驻行只作比对锚：</p>
+<ul>
+<li>过期立即不参与读取；宽限 30 天后置 archived；</li>
+<li>对 <code>extracted</code> 召回行做 merge/drop/supersede_by_resident；</li>
+<li>不改 <code>source='user'</code> 行，不做常驻自动合并；</li>
+<li>常驻覆盖同一召回事实时，由后续 postrun 或 tidy 将旧召回行置 superseded 并挂指针；不用 BM25 相近就机械级联；</li>
+<li>改口写入到本场 postrun 收拢之间仍可能有 run 内旧召回窗口，这是已接受的瞬时状态，不能宣称零窗口。</li>
+</ul>
+<p>整理任务也登记 DB 状态并经 Redpanda 派送；定时器只负责产生任务，不在进程内悄悄执行不可恢复的工作。</p>
+<h2 id="5-markdown-模式">5. <code>markdown</code> 模式</h2>
+<h3 id="51-文件与读取">5.1 文件与读取</h3>
+<pre class="text"><code>用户文件：&lt;tenant&gt;/users/&lt;user&gt;/USER.md       scope=user，跨项目
+项目文件：&lt;当前 workspace&gt;/MEMORY.md         scope=workspace，随项目</code></pre>
+<p>两份文件都是当前态常驻记忆，不对应 resident/recall 两层。每场 run 读取并冻结两份快照，带各自容量使用量。默认沿用 Hermes 的量级：项目 2200 rune、用户 1375 rune；是否开放配置不影响本方案机制。</p>
+<p>文件内容是带 <code>.md</code> 后缀的纯文本条目，条目间用 <code>\n§\n</code> 分隔；不要求模型维护复杂 Markdown 标题树。人直接编辑同一份文件时必须维持这个规范形态：条目严格用 <code>\n§\n</code> 分隔、条目首尾无多余空白、末尾最多一个换行；用 CRLF 或在分隔符旁加空格，下一次写入会被校验拒绝（文件字节不变，错误文案写明期望格式）——宁可这次不写，也不要替用户改坏记忆。</p>
+<p>记忆文件不计入租户工作区存储配额（<code>write_file</code> 走配额预留，记忆工具不走）；单文件有上面的 rune 上限，但文件随用户/项目数量增长，累计无上限——这是评审裁定的已知取舍。</p>
+<h3 id="52-主代理同步写不开后台管线">5.2 主代理同步写，不开后台管线</h3>
+<p><code>markdown</code> 模式只给 master 一把同步 <code>memory</code> 工具，普通 subagent 不开放：</p>
+<pre class="text"><code>memory(action=add, target=user|workspace, content)
+memory(action=replace, target=…, old_text, new_content)
+memory(action=remove, target=…, old_text)
+memory(action=batch, target=…, operations=[…])  # 同一文件内整批原子</code></pre>
+<p>程序根据 target 固定文件路径，模型不能传任意路径。一次 batch 只操作一个文件；不承诺 <code>USER.md</code> 与 <code>MEMORY.md</code> 跨文件原子更新。</p>
+<p>完整链路：</p>
+<pre class="text"><code>用户发话
+→ master 判断需要记/改/删
+→ 调 memory 工具
+→ 程序在锁内重读当前文件并执行操作
+→ 校验容量
+→ 写临时文件并原子 rename
+→ 工具返回真实成功/失败与最新使用量
+→ master 回答用户</code></pre>
+<p>这让用户当场得到真实写入回执，也省去抽取代理、Redpanda、postrun、job 状态与对账器。代价是主代理当场没有判断要记，就没有第二条场后补救路径。</p>
+<h3 id="53-为什么这里不需要文件指纹-map">5.3 为什么这里不需要文件指纹 map</h3>
+<p>模型提交的是操作意图，不是根据旧快照预先生成的整份文件。程序在锁内从最新内容计算结果：</p>
+<ul>
+<li>add：精确重复则 no-op，否则追加；</li>
+<li>replace：优先整条精确匹配，再考虑唯一子串；0 个或多个不同匹配都拒绝；替换的是整个条目；</li>
+<li>remove：同一定位规则，删除整个条目；</li>
+<li>batch：按顺序在内存中试算，任一操作非法或最终超预算则全部不写。</li>
+</ul>
+<p><code>old_text</code> 是本次修改的内容前提，文件锁保证「重读 → 修改 → 写回」不被其他合作写者插入，因此不需要额外的「路径 → sha256/mtime」基准表。</p>
+<h3 id="54-锁与原子写的边界">5.4 锁与原子写的边界</h3>
+<p>通用文件竞争的完整故事（write_file/edit_file、指纹、锁、原子 rename、多副本与 worktree）见 <a href="71-文件写入竞争.html">doc/71</a>；本节只规定 Markdown 记忆文件如何消费这些原则。</p>
+<ul>
+<li>单副本可用独立锁文件 + flock；锁文件不能随目标 rename。</li>
+<li>多副本使用同一个 PG advisory lock：用户文件按 tenant/user 加锁，项目文件按 workspace 加锁。PG 只承担互斥，不存记忆正文。</li>
+<li>锁只覆盖「重读 → 执行操作 → 校验 → 原子替换」这段短临界区，不在 LLM 思考期间持锁，更不由 agent 整场持有。</li>
+<li>原子 rename 让普通读者无需排队，也只能看到完整旧版或完整新版；它不替代写者互斥。</li>
+<li>文件不可读、编码损坏或人工编辑后无法无损往返解析时拒绝写入，不能当成空文件覆盖；必要时保留 <code>.bak</code> 供用户修复。</li>
+<li>bash、外部编辑器和其他程序不遵守这把锁，仍可能产生竞争。本模式只承诺合作写者之间的写入正确性，不把外部写入说成已被分布式锁覆盖。</li>
+</ul>
+<h3 id="55-明确不提供">5.5 明确不提供</h3>
+<ul>
+<li>postrun 自动抽取与整理；</li>
+<li>每回合 BM25 记忆注入；</li>
+<li><code>search_memory</code>、as_of、include_history；</li>
+<li>supersede/removed 行状态机和版本回放；</li>
+<li>记忆管理页或管理 API；</li>
+<li>跨机器对外部编辑器、bash 的并发防护。</li>
+</ul>
+<p>跨会话原文检索仍可使用引擎已有的 <code>search_history</code> / <code>dialogue_chunks</code> 能力；它们不是这两份文件的隐藏副本。</p>
+<h2 id="6-迁移与模式切换">6. 迁移与模式切换</h2>
+<h3 id="61-存量迁移到-pipeline">6.1 存量迁移到 <code>pipeline</code></h3>
+<ul>
+<li><code>notes</code> 迁入 <code>memory_items</code>：<code>layer='resident'</code>，保留原 id、quote、scope 与已有 supersede 指针；旧 <code>scope='tenant'</code> 行转为租户团队规范配置，不留在个人/项目记忆轴里。</li>
+<li>存量 <code>memory_items</code> 迁入 <code>layer='recall'</code>、<code>scope='workspace'</code>；episode 行置 archived，不再参与召回。</li>
+<li>重复行先保留，由后续整理处理；不能在迁移时凭词面相似机械删除。</li>
+<li>证据时间改从 <code>source_run_id + source_seq → runlog_entries.created_at</code> 推导，不能再用 <code>runs.finished_at</code>。</li>
+</ul>
+<h3 id="62-两种模式互切">6.2 两种模式互切</h3>
+<p>模式配置至少是租户级或实例级，不允许不同 workspace 随意切换，因为 <code>USER.md</code> 跨项目。</p>
+<p>切换不是无动作配置重写：</p>
+<ol type="1">
+<li><code>pipeline → markdown</code>：先停止新 inrun/postrun 登记并等待已登记任务收口，再导出 active resident 行到两个文件；召回层、历史链和删除留痕不自动搬进当前态文件。</li>
+<li><code>markdown → pipeline</code>：把两个文件中的条目导入为 resident 行，按文件确定 scope；文件没有历史时不伪造历史版本。</li>
+<li>切换后按新模式装配工具；旧模式工具与后台消费者不能残留并行写。</li>
+</ol>
+<p>迁移工具与验收另行分拍，不在普通 run 中隐式搬家。</p>
+<h2 id="7-验收重点">7. 验收重点</h2>
+<h3 id="71-两种模式共同行为">7.1 两种模式共同行为</h3>
+<ul>
+<li>常驻读取：user 行跨项目出现，workspace 行只在当前项目出现；快照场中不刷新。</li>
+<li>改口：先记 London，再改 Berlin，下一场只把 Berlin 当现住址。</li>
+<li>删除：先记再明确删除，下一场不再出现；不得把运行档案未删除误报成全系统抹除。</li>
+<li>去重：同一偏好换三种说法，最终不重复且语义不丢。</li>
+<li>写满：接近上限时新增重要事实，模型必须合并/缩短而非丢掉全部旧事实；连续失败有上限，不阻断用户主任务。</li>
+<li>项目删除：workspace 记忆清掉，user 记忆保留，runs/runlog 不动。</li>
+</ul>
+<h3 id="72-pipeline-专项">7.2 <code>pipeline</code> 专项</h3>
+<ul>
+<li>inrun 的 <code>target_layer</code> 不被代理改写；postrun 永不写 resident。</li>
+<li>来源 run 尚未完成时仍能取得正确证据时间；两个完成顺序与说话顺序相反的并发 run 不按 finished_at 误判新旧。</li>
+<li>Redpanda 重复投递、DB 提交后未发送、消费者 kill -9、租约过期补投都不重复写。</li>
+<li>postrun 在同 session inrun 未完成时不越过；多分区内不同 session 可以并行。</li>
+<li>第 151 条及之后的记忆也会进入某一批判断；单批不超模型预算，未扫完不写。</li>
+<li>模型编造候选序号、目标已非 active、merge 引入新词、预算超限均按 §4.8 拒绝，不降级成矛盾双写。</li>
+<li>同一 job 在「写库已提交、消息尚未 ack」后重放，不重新抽取、不新增行。</li>
+<li>同一场真实 A → B → A 改口能建立新历史行，不被内容去重吞掉。</li>
+<li>BM25 的「周末 ≠ 周六」负路径保持词法契约，不伪装成语义召回。</li>
+</ul>
+<h3 id="73-markdown-专项">7.3 <code>markdown</code> 专项</h3>
+<ul>
+<li>两个 master 同时改同一文件：锁内重读使双方修改按顺序合并；replace 目标已变时拒绝而非覆盖。</li>
+<li>多副本同时写 <code>USER.md</code>：PG advisory lock 生效；不同项目文件仍可并行。</li>
+<li>写入过程中读文件：只能看到完整旧版或新版。</li>
+<li>subagent 工具池没有 memory；bash/外部编辑器绕过锁的边界有明确负路径记录。</li>
+<li>batch 任一操作失败则文件字节不变；成功时文件只提交一次最终版本。</li>
+<li>不启动 Redpanda 记忆消费者，不写 <code>memory_jobs</code>，不登记 postrun。</li>
+</ul>
+<p>模型行为用 Rakazo 的改口、删除、去重、简洁整理、写满整理五类场景做有版本号的评审；系统字节、文件状态、行数和指针用确定性断言，不拿模型措辞当系统判据。</p>
+<h2 id="8-施工边界">8. 施工边界</h2>
+<p>已按此推进：施工包（<code>tmp/65-记忆双模式/施工包.md</code>）编定并经用户点头后，开发模型一次完成本方案的完整交付；机器验收后由主 Agent 审查 diff、重跑关键场景再交付。施工内部按「契约 → 数据需求 → 存储 → 实现 → 验收」推进，先通过运行中的 <code>POST /api/runs</code>、只读观测端点与真实文件读写钉死行为，没有从假数据或纯存储层起手。</p>
+<p>内部实现顺序为「通用短写入与原子替换 → <code>markdown</code> → <code>pipeline</code> → 存量迁移与模式互切」，这些不是逐拍交审点。两种模式的工具与后台设施不能混装；完整交付必须包含权限、并发、崩溃恢复、项目删除和可机器重跑的活体证据。改了端点响应或帧字节时，同批更新机器验收真源与快闸。</p>
+<h2 id="9-所以这解决了什么">9. 所以这解决了什么</h2>
+<p><code>pipeline</code> 保留自动学习与完整历史能力：常驻规矩必见、召回事实用到才见，改口有链、删除不复活、过期会退场，多副本下由 Redpanda 与 DB 共同保证任务不丢不乱写。</p>
+<p><code>markdown</code> 保留同步、透明和可编辑：用户与项目各一份当前文件，master 用操作式工具在锁内更新并原子落盘，不为简单模式背负 MQ、事后抽取和历史状态机。</p>
+<p>两者是明确的产品选择，而不是一套接口背后的两个假等价实现。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/65-%E8%AE%B0%E5%BF%86%E4%B8%A4%E5%B1%82%E6%96%B9%E6%A1%88.md"><code>doc/65-记忆两层方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

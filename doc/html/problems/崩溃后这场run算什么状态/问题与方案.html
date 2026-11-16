@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>崩溃后这场 run 算什么状态 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="崩溃后这场-run-算什么状态">崩溃后这场 run 算什么状态</h1>
+<blockquote>
+<p>模块：运行生命周期（<code>internal/runengine/</code>）｜ 状态：已落地（2026-10-21 收口）｜ 证据：<code>doc/30-崩溃续跑.md</code>、<code>tmp/30-崩溃续跑/planning.md</code>、commit <code>37ec3dd</code> / <code>ab18c2f</code> / <code>cf9b55a</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>张三让 agent 拉完 40 份日志、写完一份报告。进程跑到第 12 分钟被 <code>kill -9</code>（机器回收、OOM、部署滚动重启都可能）。PG 里那一行 <code>runs</code> 还写着 <code>status='running'</code>，但它续租的 <code>lease_until</code> 已经过期。</p>
+<p>用户刷新页面，看到气泡停在半截，于是问系统：<strong>这场 run 是死了，还是还能接着跑？</strong></p>
+<p>三种做法各自会把事情弄坏：</p>
+<ul>
+<li><strong>把它翻成 <code>error</code></strong>。看起来干净，但 <code>error</code> 在用户语言里是「失败了、没救了」，而这场 run 其实还能续——账本、会话、工作区都还在。更糟的是状态机从此分不清「模型出错的失败」与「机器掉了的可续」。</li>
+<li><strong>新增一个 <code>interrupted</code> 存储状态</strong>。写进去的那一刻，会话级部分唯一索引 <code>one_live_run_per_session</code>（只盖 <code>status='running'</code> 的行）立刻放闸：用户再发一条消息就能起一场新 run，而旧的半截 run 还挂着可续。同一会话里于是出现两套模型上下文，谁先接上算谁的。</li>
+<li><strong>保持 <code>running</code> + 过期租约，读的时候再派生成「已中断」</strong>。闸仍然占着（同一会话不能开第二场），状态机一个字段都不用改；用户点「继续这一轮」时，CAS 把租约抢回来，状态自然回到 running。</li>
+</ul>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 翻 error</td>
+<td>崩溃后把行改成 <code>error</code></td>
+<td>状态简单</td>
+<td>语义污染；不可续；分不清「模型失败」与「机器掉了」</td>
+</tr>
+<tr>
+<td>B 新增 interrupted 状态</td>
+<td>落库一个新状态值</td>
+<td>读侧直观</td>
+<td>部分唯一索引放闸；新 run 与待续 run 并存；状态机、查询、前端全改</td>
+</tr>
+<tr>
+<td>C 读侧派生</td>
+<td>行仍 <code>running</code>，租约过期即对外显示「已中断」</td>
+<td>闸不放、零状态机变更；续跑成功自动转正</td>
+<td>读侧要解释「running 但租约过期」；旧客户端要兼容</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>裁定：选 C。</strong> 崩溃后不把 <code>runs</code> 行翻成 <code>error</code>——它是「暂时没人续租的 running」，不是「失败的 run」。</p>
+<h2 id="3-同族小裁定同一个问题的其他面">3. 同族小裁定（同一个问题的其他面）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>续跑信 eino checkpoint 还是自建账本？</td>
+<td>自建 <code>run_journal</code> 步骤账本</td>
+<td>eino v0.9.21 只在 cancel/interrupt 路径存 checkpoint，<code>kill -9</code> 不经过；也没有官方 PG 后端。接它等于把恢复建在覆盖不到目标故障的机制上</td>
+</tr>
+<tr>
+<td>账本表放哪？</td>
+<td>独立 PG 表 <code>run_journal</code></td>
+<td>复用 <code>runlog_entries</code> 会把「展示真源」与「恢复真源」绑死；放 Redis 则过期即丢，不能当恢复真源</td>
+</tr>
+<tr>
+<td>崩溃时在途的工具重跑吗？</td>
+<td>不重跑，回填固定文本「结果未知/已中断」</td>
+<td>账本只知道「intent 有、result 没有」，不知道底层副作用；自动重跑是 at-least-once，会把写文件、发搜索做两遍</td>
+</tr>
+<tr>
+<td>防旧执行者写脏数据只靠租约吗？</td>
+<td><code>runs.lease_epoch</code> + Redis <code>tk:runepoch</code> 双比</td>
+<td>租约只回答「现在有没有人续」，不回答「续的是不是当初那个」；接管后旧进程的 EndRun 守卫会重新成立</td>
+</tr>
+<tr>
+<td>账本 seq 用 <code>MAX+1</code> 吗？</td>
+<td><code>bigserial</code> 发号；重放按 call id 归组</td>
+<td><code>MAX+1</code> 在并行工具下撞主键；按 seq 猜配对会把并行结果配错</td>
+</tr>
+<tr>
+<td>恢复时旧 runlive 帧流追加还是重建？</td>
+<td>整个丢掉、重建，首帧是 <code>resume</code>、offset 从 0 开始</td>
+<td>崩溃前可能有半截 delta 从未进账本，留在流里会让「模型说过的字」与账本对不上</td>
+</tr>
+<tr>
+<td>谁触发续跑：服务端巡检还是客户端按钮？</td>
+<td>只做客户端显式按钮</td>
+<td>无人在场时自动恢复会悄悄烧 token、执行有副作用的工具；2026-10-21 用户拍板，原「server 巡检」作废</td>
+</tr>
+<tr>
+<td>同一会话，新消息与续跑谁优先？</td>
+<td>新消息优先</td>
+<td>活人优先；旧 turn 留在 interrupted，等用户之后处理</td>
+</tr>
+<tr>
+<td>工具一执行就写模型历史吗？</td>
+<td>只在 <code>EndRun</code> 定稿时写 mh</td>
+<td>否则 error 的 run 会在会话历史里留下「调了工具但没有结果」的半截环</td>
+</tr>
+<tr>
+<td>账本包在 handler 链哪里？</td>
+<td>链尾统一包</td>
+<td>只在池装配点包会漏掉 MCP 与委派工具；崩溃在 MCP 调用中时账本连 intent 都没有</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-证据">4. 证据</h2>
+<ul>
+<li>方案：<code>doc/30-崩溃续跑.md</code> §2.3（run 死在哪）、§3.2（eino checkpoint 救不了）、§6（账本三表分工）、§7（围栏）、§8（Redis 重建）、§9（重放）、§11（竞态）、§12（自动续跑）。</li>
+<li>台账：<code>tmp/30-崩溃续跑/planning.md</code> §6 演进记录（账本形态、围栏、seq、包装点、旧帧流）。</li>
+<li>代码：<code>pgstore.go</code> 的 <code>RunStatus</code> 与 interrupted 派生；<code>journal.go</code> 的 <code>journalWrapHandler</code> / <code>replayJournal</code> / <code>interruptedResultText</code>；<code>redisstore.go</code> 的 <code>seedResume</code>；<code>store.go</code> 的 <code>ClaimResume</code> 与 <code>EndRun</code>。</li>
+<li>复核命令：<code>grep -n "interrupted" yk-tako-eino/internal/runengine/pgstore.go</code>；<code>grep -n "func replayJournal\|func (h \*journalWrapHandler)" yk-tako-eino/internal/runengine/journal.go</code>。</li>
+</ul>
+<h2 id="5-现状">5. 现状</h2>
+<p>仍有效。<code>doc/38</code> 后来删掉了 draft 键，但没有改「读侧派生 interrupted」这条；<code>doc/39</code> 把同一条思路扩到子代理（只重接有 terminal 行的完整档案），见 <code>doc/problems/子代理档案放哪里</code>。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E5%B4%A9%E6%BA%83%E5%90%8E%E8%BF%99%E5%9C%BArun%E7%AE%97%E4%BB%80%E4%B9%88%E7%8A%B6%E6%80%81/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/崩溃后这场run算什么状态/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

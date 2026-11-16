@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>75 · 目标重规划与继任编排组 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="75--目标重规划与继任编排组">75 · 目标重规划与继任编排组</h1>
+<blockquote>
+<p>性质：<strong>已落地</strong>。本稿解决原方案失败后“下一步还该不该执行”的决策：先判目标可行性，再选同组修订或继任编排组。 状态：✅ 已落地；2026-11-12 立项并方案收口，同日施工，2026-11-13 活体验收与文档收口。 施工包：tmp/75-76-目标重规划与项目目录/施工包.md（与 doc/76 合并施工；施工期材料，用户验收后留档 <code>doc/log/</code>）。 日期：2026-11-12 成文，2026-11-13 落地。 代码落点：<code>internal/runengine/agent_task_{successor,handoff,tools,api,store,scheduler,types,delivery,runner}.go</code>、<code>project_layout.go</code>（旧布局准入）、<code>auth.go</code>（117004/117114/117115/117116）、<code>server.go</code>（<code>POST /api/orchestrations/:id/successors</code>、<code>GET /api/orchestrations/:id/handoff</code>）；前端 <code>web/src/{TasksView.vue,api.ts}</code>。验收：<code>scripts/acceptance/goal_replan_live.sh</code>（124 条）、<code>goal_replan_crash_live.sh</code>（46 条）、<code>expected.json</code> 用例 61–63、<a href="19-v6/19v6-04-验收-curl.html">19v6-04</a> §61–63、快闸 <code>contract_test.go</code>（202 四键序／handoff 五键序／117114–117116 字节）、<code>go test ./internal/runengine</code> 与 doc/70–74 回归。 前置真源：<a href="70-多Agent编排与Task/README.html">doc/70</a>（通用 Task 与 DAG）、<a href="72-多Agent编排下一阶段.html">doc/72</a>（同组有界修订）、<a href="73-协调通知与交付恢复.html">doc/73</a>（通知恢复）、<a href="74-并行任务工作区隔离.html">doc/74</a>（工作区与不可变结果）。 边界：本篇处理目标变化或原方案失效后的决策；不改变 doc/74 的 Provider 内部实现，不把 Git 字段带进 Task 或 PG。</p>
+</blockquote>
+<h2 id="1-要解决的不是失败后重试而是下一步还该不该执行">1. 要解决的不是“失败后重试”，而是“下一步还该不该执行”</h2>
+<p>一场真实失败：</p>
+<pre class="text"><code>原方案要求从数据源 X 收集资料并生成报告
+→ 抓取 Task 确认 X 已下线
+→ 原 DAG 的后续节点无法按原样完成
+→ 但数据源 Y 可能仍能提供同样资料</code></pre>
+<p>这时系统不该机械重跑抓取，也不该只报告 Task failed。它应让 mAgent 判断：原目标是否仍可行、哪些结果仍有效、是修订当前组还是另起继任组。</p>
+<p>另一个场景：</p>
+<pre class="text"><code>用户要求提供一份不存在且无法合法取得的数据
+→ 更换 DAG 不改变事实
+→ 不应创建继任组
+→ 应告诉用户证据与原因，必要时请用户调整目标</code></pre>
+<p>因此，本篇的核心是<strong>目标可行性判断 + 有依据的计划选择</strong>，不是自动重试。</p>
+<h2 id="2-范围与非目标">2. 范围与非目标</h2>
+<h3 id="21-本期完成线">2.1 本期完成线</h3>
+<ol type="1">
+<li>在原方案失败、阻断、检查点或用户明确要求换方案时，给 mAgent 提供完整决策输入。</li>
+<li>先判断目标可行性，再决定同组修订、创建继任组、补充调查或告知用户。</li>
+<li>同组修订继续走 doc/72，不另写一套改图协议。</li>
+<li>继任组通过 <code>replanOf</code>、决策原因和结果引用写 handoff 文件。</li>
+<li>复用旧组中已经接受的不可变结果，不复制仍在变化的工作现场。</li>
+<li>继任组启动前原组必须终态或被停止，避免两个方案同时执行和发布。</li>
+<li>重规划次数与深度有上限，不能通过新建组重置预算。</li>
+<li>页面能展示重规划原因、继任关系、复用结果与原组状态。</li>
+</ol>
+<h3 id="22-不做">2.2 不做</h3>
+<ul>
+<li>不在每次 Task error 后自动重试或自动新建组；</li>
+<li>不根据模型一句“做不到”判定目标不可行，必须展示支撑事实；</li>
+<li>不重新打开已终态的原组，不修改 running／succeeded Task 的历史；</li>
+<li>不建立跨组调度依赖边；</li>
+<li>不自动重放结果未知的外部动作；</li>
+<li>不做无限重规划、自由群聊或多个继任组竞争同一目标；</li>
+<li>不把 Git 引用、目录哈希或 Provider 路径写进 PG；</li>
+<li>不在本篇实现用户级 skill／plugin。</li>
+</ul>
+<h2 id="3-两个决策必须分开">3. 两个决策必须分开</h2>
+<h3 id="31-第一问目标是否仍可行">3.1 第一问：目标是否仍可行</h3>
+<p>mAgent 的输入必须包含：</p>
+<ul>
+<li>原始目标与用户附加约束；</li>
+<li>当前 DAG、各 Task 状态与错误；</li>
+<li>已有结果的摘要、产物和 <code>(taskId, resultRevision)</code>；</li>
+<li>已发生外部动作的提示；</li>
+<li>已有 handoff 链与重规划次数。</li>
+</ul>
+<p>输出不是简单布尔值，而是：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>判断</th>
+<th>含义</th>
+<th>下一步</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>feasible</code></td>
+<td>现有事实下仍有可执行方案</td>
+<td>进入第二问</td>
+</tr>
+<tr>
+<td><code>infeasible</code></td>
+<td>当前约束下没有可达成目标的方案</td>
+<td>告知用户原因，不创建组</td>
+</tr>
+<tr>
+<td><code>uncertain</code></td>
+<td>现有证据不足以判断</td>
+<td>先补充调查或问用户，不盲目重建</td>
+</tr>
+</tbody>
+</table></div>
+<p>模型负责语义判断，程序负责把判断对应的写操作限制在合法状态内。模型说 feasible 不等于程序必须接受一张违法图。</p>
+<h3 id="32-第二问修订当前组还是创建继任组">3.2 第二问：修订当前组还是创建继任组</h3>
+<p>**默认优先同组修订。**必须同时满足：</p>
+<ol type="1">
+<li>原组 active，最终 Task 尚未开始；</li>
+<li>doc/72 的修订规则与预算允许；</li>
+<li>不改写 running／succeeded Task 的历史；</li>
+<li>目标、最终交付物、项目与通用工作区配置不变；</li>
+<li>变化只涉及未来工作；</li>
+<li>保留同组身份有助于理解，而不是掩盖一次已经结束的尝试。</li>
+</ol>
+<p>满足时调用现有 <code>revise_orchestration</code>，新增节点可直接依赖原组已经成功的工作。</p>
+<p><strong>以下情况才创建继任组：</strong></p>
+<ul>
+<li>原组已经 failed／cancelled／succeeded；</li>
+<li>最终 Task 已开始，当前规则不允许继续改图；</li>
+<li>新方案需要替换大量未来节点，继续作为同一张计划会误导审计；</li>
+<li>最终交付物、项目或通用工作区配置改变；</li>
+<li>需要把上一轮明确收口，作为一次独立尝试重新开始。</li>
+</ul>
+<p>继任组不是绕过修订预算的方法。原组与继任组的关系、重规划深度和累计次数必须进入 handoff。</p>
+<h2 id="4-完整业务链">4. 完整业务链</h2>
+<pre class="text"><code>原组出现 Task 失败／阻断、计划检查点，或用户要求换方案
+→ 现有协调通知把事实带回来源会话
+→ mAgent 读取原目标、DAG、错误、已有结果与 handoff 历史
+→ 判断目标可行性
+   ├─ infeasible：向用户说明原因，不创建组
+   ├─ uncertain：补充调查或 ask_user
+   └─ feasible：进入方案选择
+      ├─ 当前组仍可修订：doc/72 追加／替换未来工作
+      └─ 当前组应收口：停止或确认原组终态
+          → 生成继任组与新 DAG
+          → 写 handoff（replanOf、原因、复用结果、预算、禁止重放事项）
+          → 引擎校验 handoff 与结果引用
+          → 继任组才可被调度
+→ Provider 按引用读取旧结果，带入需要它们的 Task
+→ 新 DAG 执行、验证、发布与交付</code></pre>
+<p>新旧组不并行争抢同一目标。若原组还有活 run，先走现有停止链；不能仅写一条继任关系就放任两边同时执行。</p>
+<h2 id="5-handoffmd机器可读关联与人读原因放在一起">5. handoff.md：机器可读关联与人读原因放在一起</h2>
+<p>继任组目录中必须有：</p>
+<pre class="text"><code>&lt;继任编排组目录&gt;/handoff.md</code></pre>
+<p>示例：</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode markdown"><code class="sourceCode markdown"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="an">kind:</span><span class="co"> orchestration-replan</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="an">orchestrationId:</span><span class="co"> or_new</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="an">replanOf:</span><span class="co"> or_old</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="an">replanDepth:</span><span class="co"> 1</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="an">reuse:</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co">  - taskId: at_B</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="co">    resultRevision: 2</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="co">  - taskId: at_D</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="co">    resultRevision: 1</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="fu"># 为什么重规划</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>数据源 X 已下线，原抓取步骤无法继续；Y 能提供同一资料。</span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a><span class="fu"># 为什么创建继任组</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>原组已 failed，且最终交付物从单一报告改为报告加数据附件。</span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a><span class="fu"># 目标可行性证据</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>Y 能提供与 X 同一口径的原始资料，原目标仍可达成。</span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a><span class="fu"># 哪些结果仍有效</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a>B 的统计结果不依赖 X，可以继续使用；D 的历史数据已完成清洗。</span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a><span class="fu"># 不得重放的动作</span></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a>原组已经发送的外部通知不得再次发送。</span></code></pre></div>
+<p>规则：</p>
+<ul>
+<li>frontmatter 是程序读取的机器字段；正文是给人看的决策说明；</li>
+<li>程序不通过解析自由文本正文提取 <code>replanOf</code> 或结果引用；</li>
+<li>文件使用现有锁内重读、临时文件和原子 rename；</li>
+<li>继任组在 handoff 成功落盘前保持不可调度；</li>
+<li>handoff 缺失或引用无效时明确失败，不伪造关联；</li>
+<li>不因 handoff 是 Markdown 就把正文当机器契约。</li>
+</ul>
+<p>PG 不需要复制 <code>replanOf</code>、结果内部引用或 Provider 路径。PG 继续保存通用编排组、Task、结果版本、run 与状态；需要展示继任原因时从 handoff 读取。</p>
+<h2 id="6-结果复用是输入快照不是跨组依赖边">6. 结果复用是输入快照，不是跨组依赖边</h2>
+<p>继任组创建请求中的 <code>reuse</code> 只包含通用引用：</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ot">[</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;taskId&quot;</span><span class="fu">:</span> <span class="st">&quot;at_B&quot;</span><span class="fu">,</span> <span class="dt">&quot;resultRevision&quot;</span><span class="fu">:</span> <span class="dv">2</span><span class="fu">}</span><span class="ot">,</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>  <span class="fu">{</span><span class="dt">&quot;taskId&quot;</span><span class="fu">:</span> <span class="st">&quot;at_D&quot;</span><span class="fu">,</span> <span class="dt">&quot;resultRevision&quot;</span><span class="fu">:</span> <span class="dv">1</span><span class="fu">}</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="ot">]</span></span></code></pre></div>
+<p>引擎校验：</p>
+<ul>
+<li>引用指向同一来源会话可见的旧组 Task；</li>
+<li>Task 已有成功接受的该版本结果；</li>
+<li>结果仍可由 Provider 读取；</li>
+<li>不把失败、未提交或仍在变化的结果当成有效输入。</li>
+</ul>
+<p>Provider 在准备继任组 Task 时读取这些结果：</p>
+<ul>
+<li>Git：解析旧组结果引用对应的确切提交；</li>
+<li>Directory：读取旧组结果目录中的清单与文件字节；</li>
+<li>只读结果摘要和声明产物，不继承旧组完整聊天与工具历史。</li>
+</ul>
+<p>跨组不建立 parent link。旧组已经终态，结果已经是输入快照；若让新组等待旧组状态，会把继任关系误成执行依赖。</p>
+<h2 id="7-触发工具与-api-草案">7. 触发、工具与 API 草案</h2>
+<h3 id="71-触发来源">7.1 触发来源</h3>
+<ul>
+<li>现有 <code>task_failed</code>／<code>task_interrupted</code> 通知；</li>
+<li>doc/72 的 <code>plan_review_required</code> 检查点；</li>
+<li>最终 Task 被显式标为检查点时，对最终目标做一次复核；</li>
+<li>用户在来源会话明确要求换方案。</li>
+</ul>
+<p>程序只提供事实与触发，不试图用固定规则理解“目标有没有达成”。不确定目标是否需要复核时，由 LLM 在计划阶段选择检查点；不为每组强制增加一次模型调用。</p>
+<h3 id="72-模型工具">7.2 模型工具</h3>
+<p>建议增加一个继任创建工具，而不是让 mAgent 手写 handoff 文件：</p>
+<pre class="text"><code>create_successor_orchestration(
+  orchestrationId,
+  goalAssessment,
+  reason,
+  successorReason,
+  reuse[],
+  goal,
+  tasks[],
+  links[],
+  workspaceMode?,
+  verifyCommand?
+)</code></pre>
+<p>它只提交意图。程序负责：</p>
+<ol type="1">
+<li>校验原组可见性、状态与当前无竞争继任者；</li>
+<li>校验目标判断、结果引用、DAG 与预算；</li>
+<li>停止尚未终态的原组；</li>
+<li>创建继任组记录与通用配置；</li>
+<li>写 handoff；</li>
+<li>原子发布继任组的调度资格；</li>
+<li>发既有编排组事件与调度唤醒。</li>
+</ol>
+<p>模型不直接写路径、handoff 文件或 Git 引用。</p>
+<h3 id="73-产品-api">7.3 产品 API</h3>
+<p>建议同一服务增加：</p>
+<pre class="text"><code>POST /api/orchestrations/:id/successors
+GET  /api/orchestrations/:id/handoff</code></pre>
+<ul>
+<li>创建继任组写面 member + 来源会话属主；</li>
+<li>handoff 读面沿用编排组属主链；</li>
+<li>响应使用统一信封；</li>
+<li>真实请求／响应与错误码在施工包中先 curl 钉死，不在本稿冒充已验收字节。</li>
+</ul>
+<p>同组修订仍使用 doc/72 的既有端点，不把两种操作合并成一个含义模糊的“更新计划”。</p>
+<h2 id="8-并发预算与副作用边界">8. 并发、预算与副作用边界</h2>
+<ol type="1">
+<li>同一原组最多一个正在创建或执行中的继任组；创建条件在原组锁与当前状态检查下成立。</li>
+<li>原组已有活 run 时，先持久化停止并等其收口；继任组不能提前执行。</li>
+<li>原组与继任组不得同时持有同一目标的发布资格；发布仍走 doc/74 的项目准入。</li>
+<li>重规划深度与累计次数从 handoff 链读取并校验；超过上限后必须问用户，不能另开组重置。</li>
+<li>结果复用不证明外部副作用可以重放；handoff 必须列出已知不可重放动作。</li>
+<li>交付失败仍走 doc/73；它不重跑 DAG，也不触发自动重规划。</li>
+<li>用户停止、删除项目或改变权限后，当前创建与执行资格立即失效。</li>
+</ol>
+<h2 id="9-页面与观测">9. 页面与观测</h2>
+<ul>
+<li>编排组详情显示“由哪个编排组重规划而来”、目标可行性判断、原因与复用结果；</li>
+<li>handoff 正文可展开，机器字段由程序渲染，不依赖模型 Markdown 画按钮；</li>
+<li>原组显示已停止／已结束事实；继任组创建后通过现有事件刷新；</li>
+<li>不可行时页面只显示原因与用户可选的补充动作，不显示空的新组；</li>
+<li>trace 记录原／新 orchestrationId、replanDepth、reuse 数量与决策结果；不记录敏感结果正文。</li>
+</ul>
+<h2 id="10-验收与完成线">10. 验收与完成线</h2>
+<p>至少真跑：</p>
+<ol type="1">
+<li><strong>同组修订</strong>：原组 active 且只需追加未来工作，走 doc/72，不创建继任组；成功结果不重跑。</li>
+<li><strong>继任组复用</strong>：原组失败后收口，新组通过引用读到两个旧结果，DAG 正常执行，旧组不再发布。</li>
+<li><strong>目标不可行</strong>：mAgent 给出证据与原因，不创建组、不写空 handoff。</li>
+<li><strong>目标不确定</strong>：先调查或问用户，不盲目重建。</li>
+<li><strong>并发创建</strong>：两个通知／两个副本同时创建继任者，只成功一个，原组不会继续执行。</li>
+<li><strong>预算</strong>：通过继任链不能重置重规划次数；超限后进入人工处理。</li>
+<li><strong>结果边界</strong>：失败／未提交／不可读结果被拒绝；复用产物字节与原版本一致。</li>
+<li><strong>副作用</strong>：handoff 标明不得重放的动作没有被继任组自动重复。</li>
+<li><strong>崩溃</strong>：继任组已建但 handoff 未固化时不可调度；handoff 完成后崩溃可恢复且不重复建组。</li>
+<li><strong>回归</strong>：doc/70／72／73／74 的现有场景全绿。</li>
+</ol>
+<p>完成不是“多一个创建继任组端点”，而是：<strong>目标可行时知道该修订还是继任，目标不可行时不再制造新组，旧结果可复用，历史可解释，故障与副作用有边界。</strong></p>
+<h2 id="11-代码落点与施工纪律">11. 代码落点与施工纪律</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>实际落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>agent_task_delivery.go</code> / <code>agent_task_runner.go</code></td>
+<td>交付／协调 prompt 与工具面：<code>create_successor_orchestration</code> 可调用，mAgent 拿到原目标、图、结果与 handoff 历史</td>
+</tr>
+<tr>
+<td><code>agent_task_revision.go</code></td>
+<td>复用同组修订资格与预算；<code>replanDepth</code> 从原组递增（上限 8），链上不重置</td>
+</tr>
+<tr>
+<td><code>agent_task_successor.go</code></td>
+<td>可行性决策（<code>goalAssessment.outcome == feasible</code>）、继任创建、结果复用快照、幂等与并发（同键同方案回读、同键异方案 117102、已有继任 117114）</td>
+</tr>
+<tr>
+<td><code>agent_task_handoff.go</code></td>
+<td><code>handoff.md</code> 原子落盘与读口：frontmatter（<code>replanOf</code>／<code>replanDepth</code>／<code>reuse</code>）机器读，五节正文给人读；组在但无完整交接 117004</td>
+</tr>
+<tr>
+<td><code>agent_task_store.go</code> / <code>pgstore.go</code></td>
+<td>组状态（<code>preparing</code>／<code>waiting_previous</code>／<code>active</code>）、原组收口与并发条件；不加 Git 字段</td>
+</tr>
+<tr>
+<td><code>workspace_result.go</code> / <code>workspace_provider.go</code></td>
+<td>按通用结果引用读取旧组不可变结果；复用条目只接受已成功且可读的 <code>(taskId, resultRevision)</code></td>
+</tr>
+<tr>
+<td><code>project_layout.go</code></td>
+<td>原项目与目标项目都必须已完成目录迁移；未迁移统一 117116，不提供旁路</td>
+</tr>
+<tr>
+<td><code>web/src/{TasksView.vue,api.ts}</code></td>
+<td>继任关系行（<code>replanOf</code> + 深度）、交接面板（复用清单 + 正文）、原组跳转</td>
+</tr>
+<tr>
+<td><code>scripts/acceptance/</code></td>
+<td>继任主链活体、双副本并发建组与崩溃恢复活体；契约用例 61–63</td>
+</tr>
+</tbody>
+</table></div>
+<p>施工纪律与验收（2026-11-13 回填）：</p>
+<ul>
+<li>可行性判定用真模型跑出 <code>goalAssessment</code>，没有用固定 JSON 或 SQL 改状态冒充验收；不可行／不确定两场由活体断言“不建组、不留空 handoff”。</li>
+<li>双副本并发建组由 <code>goal_replan_crash_live.sh</code> 的真实两进程压：同键不同方案一个 202、一个 409（117114），PG 只落一行继任组，<code>successor.json</code> 指向胜者；<code>preparing</code> 阶段崩溃后不可调度，恢复后不重复建组。</li>
+<li>复用快照的字节校验：继任组自己交付后，复用副本与原版本逐字一致；旧组不再发布。</li>
+</ul>
+<h2 id="12-所以这解决了什么">12. 所以这解决了什么</h2>
+<p>doc/75 把“原方案失败”变成一次有证据的决策：先判断目标是否仍可行，再决定修订还是继任；继任组有 handoff、有结果复用、有预算，也不会与原组竞争执行。</p>
+<p>它同时守住两端：该继续时不重做已有工作，不该继续时能明确告诉用户为什么，而不是用更多 DAG 掩盖无法达成的目标。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/75-%E7%9B%AE%E6%A0%87%E9%87%8D%E8%A7%84%E5%88%92%E4%B8%8E%E7%BB%A7%E4%BB%BB%E7%BC%96%E6%8E%92%E7%BB%84.md"><code>doc/75-目标重规划与继任编排组.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>折叠线用什么数 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="折叠线用什么数">折叠线用什么数</h1>
+<blockquote>
+<p>模块：上下文压缩（<code>internal/runengine/midfold.go</code> / <code>compact.go</code>）｜ 状态：已落地（<code>doc/24</code> 时期）｜ 证据：<code>doc/24-用量计数.md</code>、<code>tmp/17-子代理折叠/planning.md</code>（子代理侧同拍）</p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>一场 run 工具循环要打十几枪。每枪之后引擎都要判断：<strong>下一份输入会不会超过 <code>compactLimit</code>，要不要先折叠？</strong></p>
+<p>判断错了两个方向都疼：</p>
+<ul>
+<li><strong>数大了</strong> → 明明还有空间就折叠，模型反复读摘要，信息密度掉。</li>
+<li><strong>数小了</strong> → 自测放行，真实请求被 provider 拒收或吃掉窗口，整场 run 崩。</li>
+</ul>
+<p>真实崩过的链是这样的：思考模型先输出很长一段 <code>ReasoningContent</code>，再调工具。eino 的 openai 组件会把思考原样放进下一次请求；而 <code>convertState</code> 只保留 <code>Text</code> 与 <code>ToolCalls</code>，<code>countInput</code> 把思考数成 0。<strong>自测偏小被放行，厂商按真实长度拒收。</strong></p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>候选</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>下一枪还发不发思考？</td>
+<td>A 原样重发</td>
+<td>部分厂商要求带回</td>
+<td>自测漏数、白花钱、窗口早满</td>
+</tr>
+<tr>
+<td></td>
+<td>B 交给模型前清空 <code>ReasoningContent</code>（定案）</td>
+<td>自测与真实请求在「思考」上对齐；跨场形状一致</td>
+<td>若厂商因缺 reasoning 返回 400，走 error，不补假思考、不单独重试</td>
+</tr>
+<tr>
+<td>有账单时用哪条公式？</td>
+<td>A <code>TotalTokens + 新行</code></td>
+<td>简单</td>
+<td>completion 侧含思考，偏保守早折</td>
+</tr>
+<tr>
+<td></td>
+<td>B <code>CompletionTokens − 思考 + 新行</code></td>
+<td>不含思考</td>
+<td>缺 Prompt 侧历史</td>
+</tr>
+<tr>
+<td></td>
+<td>C <code>PromptTokens + 可见 completion + 新行</code>（定案）</td>
+<td>描述真实下一份输入</td>
+<td>依赖账单，需要 <code>reasoning_est</code></td>
+</tr>
+<tr>
+<td>无账单时？</td>
+<td>D 全量 BPE（定案）</td>
+<td>准确</td>
+<td>每轮重数贵</td>
+</tr>
+<tr>
+<td>工具 schema 计不计？</td>
+<td>A 计入</td>
+<td>表面完整</td>
+<td>声明折叠拆不掉；目录一大就「压完仍超限」，折叠反复空转</td>
+</tr>
+<tr>
+<td></td>
+<td>B 不计入（定案）</td>
+<td>只数可折叠的部分</td>
+<td>极端目录下低估，靠 limit 预留与溢出层兜底</td>
+</tr>
+<tr>
+<td>第一呼能不能用上一场末尾账单？</td>
+<td>A 用</td>
+<td>省一次 BPE</td>
+<td>旧账单量的是上一场发出去的长输入；跨场 Run fold 后可见行已变短，会误判超限、一开场再折一次</td>
+</tr>
+<tr>
+<td></td>
+<td>B 全量 <code>countInput</code>（定案）</td>
+<td>准确</td>
+<td>贵一次</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>裁定：B / C / D / B / B。</strong> 核心原则：<strong>折叠线只数「这次真正会发出去的可折叠部分」</strong>——思考不发就不数，schema 拆不掉就不数，上一场的账单量的不是这一场。</p>
+<h2 id="3-同族小裁定">3. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>滤思考与折叠同一拍吗？</td>
+<td>同拍；先把 <code>reasoning_est</code> 算好再清字段</td>
+<td>滤完字段就空了，后算拿不到</td>
+</tr>
+<tr>
+<td>子代理也接这套吗？</td>
+<td>接，复用主 run 同一条链</td>
+<td>子代理是多轮长结果重灾区；<code>doc/24:140</code> 原「不给子代理新挂折叠」已翻案</td>
+</tr>
+<tr>
+<td>锚点之后的新行怎么算？</td>
+<td>可见输出只算一次，锚点之后的新行才进 delta</td>
+<td>防止同一段 completion 被重复计入</td>
+</tr>
+<tr>
+<td>工具 schema 的变化要不要触发重折？</td>
+<td>不触发；靠溢出层暴露极端情况</td>
+<td>与「不计 schema」同一条纪律</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-证据">4. 证据</h2>
+<ul>
+<li>方案：<code>doc/24-用量计数.md</code> §3（主裁决：滤思考）、§5（有账单时的触发公式）、§6（无账单仍用全量 <code>countInput</code>）、§7（工具 schema 不进触发）。</li>
+<li>代码：<code>midfold.go</code> 的 <code>stripReasoning</code>、<code>usageBasedInput</code>；<code>compact.go</code> 的 <code>countInput</code>（三块基数，无 schema 参数）。</li>
+<li>复核命令：<code>grep -n "func stripReasoning\|func usageBasedInput" yk-tako-eino/internal/runengine/midfold.go</code>；<code>grep -n "func countInput" yk-tako-eino/internal/runengine/compact.go</code>。</li>
+</ul>
+<h2 id="5-现状">5. 现状</h2>
+<p>仍有效。子代理侧在同拍施工时一并接上（<code>ceecc28</code>）。展示给用户的「上下文占比」用的是同一把尺，见 <code>doc/problems/用量怎么让用户看见</code>。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E6%8A%98%E5%8F%A0%E7%BA%BF%E7%94%A8%E4%BB%80%E4%B9%88%E6%95%B0/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/折叠线用什么数/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

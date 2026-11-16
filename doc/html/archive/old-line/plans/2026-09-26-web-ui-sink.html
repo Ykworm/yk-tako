@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>最小 Web-UI T1：事件 sink 重构 Implementation Plan · tako 文档</title>
+<link rel="stylesheet" href="../../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../../assets/tako-architecture.html">架构总览</a><a href="../../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="最小-web-ui-t1事件-sink-重构-implementation-plan">最小 Web-UI T1：事件 sink 重构 Implementation Plan</h1>
+<blockquote>
+<p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (<code>- [ ]</code>) syntax for tracking.</p>
+</blockquote>
+<p><strong>Goal:</strong> 把 <code>adkrun</code> 的「产生事件」与「呈现事件」拆开——驱动层只产出结构化事件，REPL 退化成第一个 sink；重构前后终端输出逐字符一致（《10》§2.4 步 1）。</p>
+<p><strong>Architecture:</strong> 事件契约（<code>EventKind</code> / <code>Event</code> / <code>Sink</code> / 分类函数 <code>eventFrom</code>）留在 <code>internal/adkrun</code>——分类要 <code>IsBoardTool</code>，属于「产生」的一部分；REPL 的格式化搬到消费方 <code>cmd/yktako/sink.go</code>；<code>Run</code> / <code>consume</code> 穿透 <code>sink</code> 参数，<code>nil</code> = 不呈现。口径（doc/11 §3.2 T1.1）：T1 只落 4 类呈现事件 <code>message / tool_call / tool_result / board</code>；<code>approval</code> 不走 sink（将来由消费方 ask 产出，HTTP 在 T2.3 推 SSE）、<code>error</code> 由 <code>Run</code> 返回调用方。</p>
+<p><strong>Tech Stack:</strong> Go 1.27、eino v0.9.21（<code>adk</code> / <code>schema</code>）、标准库测试。上游依据：《10》§4 事件契约、doc/11 §3 侦察结论与 T1.1–T1.6 子步骤。</p>
+<p><strong>执行说明（与默认流程的有意偏离，原因可检验）：</strong></p>
+<ol type="1">
+<li>不新建 worktree/分支：改动面 = <code>yk-tako-eino/{internal/adkrun,cmd/yktako}</code> + README/doc，与仓库既有「直接提交 master」习惯一致（见 <code>git log</code>）。</li>
+<li>提交消息按仓库风格写中文短句，不加 <code>feat:</code> 前缀；每个 Task 末尾提交一次。</li>
+<li>Task 0 先清账（P1 移动 + 台账 + 本计划本身），此后每笔提交只含本计划改动。</li>
+<li>本计划只覆盖 T1；T2 按《10》§7 等 sink 定型后再出计划。</li>
+<li>所有新增/修改代码按 AGENTS.md：中文注释、文件头与函数头齐全，测试与假数据同样适用。</li>
+</ol>
+<hr />
+<h2 id="file-structure">File Structure</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文件</th>
+<th>动作</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yk-tako-eino/internal/adkrun/event.go</code></td>
+<td>新建</td>
+<td>事件契约：<code>EventKind</code> 常量、<code>Event</code>、<code>Sink</code>、分类函数 <code>eventFrom</code>；承接包文档（字母序第一个文件）</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/adkrun/event_test.go</code></td>
+<td>新建</td>
+<td>分类单测（Task 1）+ <code>consume</code> 事件序列测试（Task 3）</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/adkrun/turn.go</code></td>
+<td>修改</td>
+<td><code>Run</code> / <code>consume</code> 加 <code>sink</code> 参数；删 <code>printMessage</code>；包头改「本文件：」</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/adkrun/turn_test.go</code></td>
+<td>修改</td>
+<td><code>Run</code> 调用补 <code>nil</code> sink</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/cmd/yktako/sink.go</code></td>
+<td>新建</td>
+<td>REPL sink：事件 → 终端文本（原 <code>printMessage</code> 格式逐字符复刻）</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/cmd/yktako/sink_test.go</code></td>
+<td>新建</td>
+<td>格式锁定测试（字节级断言）</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/cmd/yktako/main.go</code></td>
+<td>修改</td>
+<td>构造 REPL sink 并注入 <code>Run</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>不改：<code>internal/repl</code>（保持「与 Eino 无关」的承诺）、<code>internal/taskboard</code>（集成测试直接用 <code>runner.Run</code>，不受 <code>adkrun.Run</code> 签名影响，doc/11 §3.1 第 1 条）。</p>
+<hr />
+<h2 id="task-0-清账提交p1-收尾--台账--本计划">Task 0: 清账提交（P1 收尾 + 台账 + 本计划）</h2>
+<p><strong>Files:</strong></p>
+<ul>
+<li>已暂存 rename：<code>doc/10-MAF审批回路与Eino对照.md</code> → <code>maf/doc/10-MAF审批回路与Eino对照.md</code></li>
+<li>已修改：<code>doc/01-任务看板与单入口.md</code>、<code>maf/README.md</code>、<code>maf/Program.cs</code></li>
+<li>未跟踪：<code>doc/11-最小Web-UI实施计划.md</code>、<code>docs/superpowers/plans/2026-09-26-web-ui-sink.md</code></li>
+</ul>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 1: 核对待提交清单</strong></label></li>
+</ul>
+<p>Run: <code>git status --short</code> Expected: 只有上面列出的 rename / 修改 / 两个新文件；<code>yk-tako-eino/</code> 下无改动。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 2: 提交</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> add <span class="at">-A</span> doc maf/README.md maf/Program.cs docs/superpowers/plans/2026-09-26-web-ui-sink.md</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> commit <span class="at">-m</span> <span class="st">&quot;doc 收尾：MAF 对照篇归入 maf/doc/；最小 Web-UI 台账与 T1 执行计划入档&quot;</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 3: 确认工作区干净</strong></label></li>
+</ul>
+<p>Run: <code>git status --short</code> Expected: 无输出。</p>
+<hr />
+<h2 id="task-1-t11-事件契约与分类函数">Task 1 (T1.1): 事件契约与分类函数</h2>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>yk-tako-eino/internal/adkrun/event.go</code></li>
+<li>Create: <code>yk-tako-eino/internal/adkrun/event_test.go</code></li>
+<li>Modify: <code>yk-tako-eino/internal/adkrun/turn.go:1-4</code>（包文档让位：<code>event.go</code> 字母序在前，AGENTS.md 注释规范）</li>
+</ul>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 1: 写分类测试（先失败）</strong></label></li>
+</ul>
+<p><code>yk-tako-eino/internal/adkrun/event_test.go</code>：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 本文件：事件契约的单元测试——eventFrom 的分类口径（《10》§4.2 呈现四类）</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 与 consume 的事件产出顺序逐条钉死；改口径必须同步改这里。</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">package</span> adkrun</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="op">(</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;strings&quot;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;testing&quot;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;yk-tako-eino/internal/taskboard&quot;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;github.com/cloudwego/eino/adk&quot;</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;github.com/cloudwego/eino/schema&quot;</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="op">)</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="co">// TestEventFrom 覆盖六类输入：工具调用、账本回执（board）、普通工具回执、</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="co">// 工具名从 msg 兜底、正文、子代理事件的名字透传。</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> TestEventFrom<span class="op">(</span>t <span class="op">*</span>testing<span class="op">.</span>T<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>    callMsg <span class="op">:=</span> schema<span class="op">.</span>AssistantMessage<span class="op">(</span><span class="st">&quot;&quot;</span><span class="op">,</span> <span class="op">[]</span>schema<span class="op">.</span>ToolCall<span class="op">{{</span>ID<span class="op">:</span> <span class="st">&quot;c1&quot;</span><span class="op">,</span> Function<span class="op">:</span> schema<span class="op">.</span>FunctionCall<span class="op">{</span>Name<span class="op">:</span> <span class="st">&quot;read_file&quot;</span><span class="op">}}})</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    replyMsg <span class="op">:=</span> schema<span class="op">.</span>ToolMessage<span class="op">(</span><span class="st">&quot;文件内容&quot;</span><span class="op">,</span> <span class="st">&quot;c1&quot;</span><span class="op">,</span> schema<span class="op">.</span>WithToolName<span class="op">(</span><span class="st">&quot;read_file&quot;</span><span class="op">))</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    boardMsg <span class="op">:=</span> schema<span class="op">.</span>ToolMessage<span class="op">(</span><span class="st">&quot;📋 看板&quot;</span><span class="op">,</span> <span class="st">&quot;c2&quot;</span><span class="op">,</span> schema<span class="op">.</span>WithToolName<span class="op">(</span>taskboard<span class="op">.</span>ToolList<span class="op">))</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    textMsg <span class="op">:=</span> schema<span class="op">.</span>AssistantMessage<span class="op">(</span><span class="st">&quot;你好&quot;</span><span class="op">,</span> <span class="ot">nil</span><span class="op">)</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>    cases <span class="op">:=</span> <span class="op">[]</span><span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>        name  <span class="dt">string</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>        agent <span class="dt">string</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>        mv    <span class="op">*</span>adk<span class="op">.</span>MessageVariant</span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>        msg   <span class="op">*</span>schema<span class="op">.</span>Message</span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>        want  Event</span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>    <span class="op">}{</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>            name<span class="op">:</span> <span class="st">&quot;工具调用&quot;</span><span class="op">,</span> agent<span class="op">:</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">,</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>            mv<span class="op">:</span>  <span class="op">&amp;</span>adk<span class="op">.</span>MessageVariant<span class="op">{</span>Role<span class="op">:</span> schema<span class="op">.</span>Assistant<span class="op">,</span> Message<span class="op">:</span> callMsg<span class="op">},</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>            msg<span class="op">:</span> callMsg<span class="op">,</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>            want<span class="op">:</span> Event<span class="op">{</span>Kind<span class="op">:</span> EventToolCall<span class="op">,</span> Agent<span class="op">:</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">,</span> Role<span class="op">:</span> schema<span class="op">.</span>Assistant<span class="op">,</span> ToolNames<span class="op">:</span> <span class="op">[]</span><span class="dt">string</span><span class="op">{</span><span class="st">&quot;read_file&quot;</span><span class="op">}},</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>        <span class="op">},</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>            name<span class="op">:</span> <span class="st">&quot;账本回执走看板&quot;</span><span class="op">,</span> agent<span class="op">:</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">,</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a>            mv<span class="op">:</span>  <span class="op">&amp;</span>adk<span class="op">.</span>MessageVariant<span class="op">{</span>Role<span class="op">:</span> schema<span class="op">.</span>Tool<span class="op">,</span> ToolName<span class="op">:</span> taskboard<span class="op">.</span>ToolList<span class="op">,</span> Message<span class="op">:</span> boardMsg<span class="op">},</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true" tabindex="-1"></a>            msg<span class="op">:</span> boardMsg<span class="op">,</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true" tabindex="-1"></a>            want<span class="op">:</span> Event<span class="op">{</span>Kind<span class="op">:</span> EventBoard<span class="op">,</span> Agent<span class="op">:</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">,</span> Role<span class="op">:</span> schema<span class="op">.</span>Tool<span class="op">,</span> ToolName<span class="op">:</span> taskboard<span class="op">.</span>ToolList<span class="op">,</span> Text<span class="op">:</span> <span class="st">&quot;📋 看板&quot;</span><span class="op">},</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true" tabindex="-1"></a>        <span class="op">},</span></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true" tabindex="-1"></a>            name<span class="op">:</span> <span class="st">&quot;普通工具回执&quot;</span><span class="op">,</span> agent<span class="op">:</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">,</span></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true" tabindex="-1"></a>            mv<span class="op">:</span>  <span class="op">&amp;</span>adk<span class="op">.</span>MessageVariant<span class="op">{</span>Role<span class="op">:</span> schema<span class="op">.</span>Tool<span class="op">,</span> ToolName<span class="op">:</span> <span class="st">&quot;read_file&quot;</span><span class="op">,</span> Message<span class="op">:</span> replyMsg<span class="op">},</span></span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true" tabindex="-1"></a>            msg<span class="op">:</span> replyMsg<span class="op">,</span></span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true" tabindex="-1"></a>            want<span class="op">:</span> Event<span class="op">{</span>Kind<span class="op">:</span> EventToolResult<span class="op">,</span> Agent<span class="op">:</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">,</span> Role<span class="op">:</span> schema<span class="op">.</span>Tool<span class="op">,</span> ToolName<span class="op">:</span> <span class="st">&quot;read_file&quot;</span><span class="op">,</span> Text<span class="op">:</span> <span class="st">&quot;文件内容&quot;</span><span class="op">},</span></span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true" tabindex="-1"></a>        <span class="op">},</span></span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb2-49"><a href="#cb2-49" aria-hidden="true" tabindex="-1"></a>            name<span class="op">:</span> <span class="st">&quot;工具名从 msg 兜底&quot;</span><span class="op">,</span> agent<span class="op">:</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">,</span></span>
+<span id="cb2-50"><a href="#cb2-50" aria-hidden="true" tabindex="-1"></a>            mv<span class="op">:</span>  <span class="op">&amp;</span>adk<span class="op">.</span>MessageVariant<span class="op">{</span>Role<span class="op">:</span> schema<span class="op">.</span>Tool<span class="op">,</span> Message<span class="op">:</span> replyMsg<span class="op">},</span></span>
+<span id="cb2-51"><a href="#cb2-51" aria-hidden="true" tabindex="-1"></a>            msg<span class="op">:</span> replyMsg<span class="op">,</span></span>
+<span id="cb2-52"><a href="#cb2-52" aria-hidden="true" tabindex="-1"></a>            want<span class="op">:</span> Event<span class="op">{</span>Kind<span class="op">:</span> EventToolResult<span class="op">,</span> Agent<span class="op">:</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">,</span> Role<span class="op">:</span> schema<span class="op">.</span>Tool<span class="op">,</span> ToolName<span class="op">:</span> <span class="st">&quot;read_file&quot;</span><span class="op">,</span> Text<span class="op">:</span> <span class="st">&quot;文件内容&quot;</span><span class="op">},</span></span>
+<span id="cb2-53"><a href="#cb2-53" aria-hidden="true" tabindex="-1"></a>        <span class="op">},</span></span>
+<span id="cb2-54"><a href="#cb2-54" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb2-55"><a href="#cb2-55" aria-hidden="true" tabindex="-1"></a>            name<span class="op">:</span> <span class="st">&quot;正文&quot;</span><span class="op">,</span> agent<span class="op">:</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">,</span></span>
+<span id="cb2-56"><a href="#cb2-56" aria-hidden="true" tabindex="-1"></a>            mv<span class="op">:</span>  <span class="op">&amp;</span>adk<span class="op">.</span>MessageVariant<span class="op">{</span>Role<span class="op">:</span> schema<span class="op">.</span>Assistant<span class="op">,</span> Message<span class="op">:</span> textMsg<span class="op">},</span></span>
+<span id="cb2-57"><a href="#cb2-57" aria-hidden="true" tabindex="-1"></a>            msg<span class="op">:</span> textMsg<span class="op">,</span></span>
+<span id="cb2-58"><a href="#cb2-58" aria-hidden="true" tabindex="-1"></a>            want<span class="op">:</span> Event<span class="op">{</span>Kind<span class="op">:</span> EventMessage<span class="op">,</span> Agent<span class="op">:</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">,</span> Role<span class="op">:</span> schema<span class="op">.</span>Assistant<span class="op">,</span> Text<span class="op">:</span> <span class="st">&quot;你好&quot;</span><span class="op">},</span></span>
+<span id="cb2-59"><a href="#cb2-59" aria-hidden="true" tabindex="-1"></a>        <span class="op">},</span></span>
+<span id="cb2-60"><a href="#cb2-60" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb2-61"><a href="#cb2-61" aria-hidden="true" tabindex="-1"></a>            name<span class="op">:</span> <span class="st">&quot;子代理名字透传&quot;</span><span class="op">,</span> agent<span class="op">:</span> <span class="st">&quot;worker&quot;</span><span class="op">,</span></span>
+<span id="cb2-62"><a href="#cb2-62" aria-hidden="true" tabindex="-1"></a>            mv<span class="op">:</span>  <span class="op">&amp;</span>adk<span class="op">.</span>MessageVariant<span class="op">{</span>Role<span class="op">:</span> schema<span class="op">.</span>Assistant<span class="op">,</span> Message<span class="op">:</span> textMsg<span class="op">},</span></span>
+<span id="cb2-63"><a href="#cb2-63" aria-hidden="true" tabindex="-1"></a>            msg<span class="op">:</span> textMsg<span class="op">,</span></span>
+<span id="cb2-64"><a href="#cb2-64" aria-hidden="true" tabindex="-1"></a>            want<span class="op">:</span> Event<span class="op">{</span>Kind<span class="op">:</span> EventMessage<span class="op">,</span> Agent<span class="op">:</span> <span class="st">&quot;worker&quot;</span><span class="op">,</span> Role<span class="op">:</span> schema<span class="op">.</span>Assistant<span class="op">,</span> Text<span class="op">:</span> <span class="st">&quot;你好&quot;</span><span class="op">},</span></span>
+<span id="cb2-65"><a href="#cb2-65" aria-hidden="true" tabindex="-1"></a>        <span class="op">},</span></span>
+<span id="cb2-66"><a href="#cb2-66" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-67"><a href="#cb2-67" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-68"><a href="#cb2-68" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _<span class="op">,</span> tc <span class="op">:=</span> <span class="kw">range</span> cases <span class="op">{</span></span>
+<span id="cb2-69"><a href="#cb2-69" aria-hidden="true" tabindex="-1"></a>        t<span class="op">.</span>Run<span class="op">(</span>tc<span class="op">.</span>name<span class="op">,</span> <span class="kw">func</span><span class="op">(</span>t <span class="op">*</span>testing<span class="op">.</span>T<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-70"><a href="#cb2-70" aria-hidden="true" tabindex="-1"></a>            got<span class="op">,</span> ok <span class="op">:=</span> eventFrom<span class="op">(</span>tc<span class="op">.</span>agent<span class="op">,</span> tc<span class="op">.</span>mv<span class="op">,</span> tc<span class="op">.</span>msg<span class="op">)</span></span>
+<span id="cb2-71"><a href="#cb2-71" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="op">!</span>ok <span class="op">{</span></span>
+<span id="cb2-72"><a href="#cb2-72" aria-hidden="true" tabindex="-1"></a>                t<span class="op">.</span>Fatal<span class="op">(</span><span class="st">&quot;eventFrom ok = false，want true&quot;</span><span class="op">)</span></span>
+<span id="cb2-73"><a href="#cb2-73" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb2-74"><a href="#cb2-74" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> got<span class="op">.</span>Kind <span class="op">!=</span> tc<span class="op">.</span>want<span class="op">.</span>Kind <span class="op">||</span> got<span class="op">.</span>Agent <span class="op">!=</span> tc<span class="op">.</span>want<span class="op">.</span>Agent <span class="op">||</span> got<span class="op">.</span>Role <span class="op">!=</span> tc<span class="op">.</span>want<span class="op">.</span>Role <span class="op">||</span></span>
+<span id="cb2-75"><a href="#cb2-75" aria-hidden="true" tabindex="-1"></a>                got<span class="op">.</span>Text <span class="op">!=</span> tc<span class="op">.</span>want<span class="op">.</span>Text <span class="op">||</span> got<span class="op">.</span>ToolName <span class="op">!=</span> tc<span class="op">.</span>want<span class="op">.</span>ToolName <span class="op">||</span></span>
+<span id="cb2-76"><a href="#cb2-76" aria-hidden="true" tabindex="-1"></a>                strings<span class="op">.</span>Join<span class="op">(</span>got<span class="op">.</span>ToolNames<span class="op">,</span> <span class="st">&quot;,&quot;</span><span class="op">)</span> <span class="op">!=</span> strings<span class="op">.</span>Join<span class="op">(</span>tc<span class="op">.</span>want<span class="op">.</span>ToolNames<span class="op">,</span> <span class="st">&quot;,&quot;</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-77"><a href="#cb2-77" aria-hidden="true" tabindex="-1"></a>                t<span class="op">.</span>Fatalf<span class="op">(</span><span class="st">&quot;eventFrom = %+v，want %+v&quot;</span><span class="op">,</span> got<span class="op">,</span> tc<span class="op">.</span>want<span class="op">)</span></span>
+<span id="cb2-78"><a href="#cb2-78" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb2-79"><a href="#cb2-79" aria-hidden="true" tabindex="-1"></a>        <span class="op">})</span></span>
+<span id="cb2-80"><a href="#cb2-80" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-81"><a href="#cb2-81" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-82"><a href="#cb2-82" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-83"><a href="#cb2-83" aria-hidden="true" tabindex="-1"></a><span class="co">// TestEventFromNoContent 验证没有可呈现内容时静默跳过（旧 printMessage 的空分支语义）：</span></span>
+<span id="cb2-84"><a href="#cb2-84" aria-hidden="true" tabindex="-1"></a><span class="co">// nil 消息与空内容都不产出事件。</span></span>
+<span id="cb2-85"><a href="#cb2-85" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> TestEventFromNoContent<span class="op">(</span>t <span class="op">*</span>testing<span class="op">.</span>T<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-86"><a href="#cb2-86" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> _<span class="op">,</span> ok <span class="op">:=</span> eventFrom<span class="op">(</span><span class="st">&quot;yk-tako&quot;</span><span class="op">,</span> <span class="op">&amp;</span>adk<span class="op">.</span>MessageVariant<span class="op">{</span>Role<span class="op">:</span> schema<span class="op">.</span>Assistant<span class="op">},</span> <span class="ot">nil</span><span class="op">);</span> ok <span class="op">{</span></span>
+<span id="cb2-87"><a href="#cb2-87" aria-hidden="true" tabindex="-1"></a>        t<span class="op">.</span>Fatal<span class="op">(</span><span class="st">&quot;nil 消息不应产出事件&quot;</span><span class="op">)</span></span>
+<span id="cb2-88"><a href="#cb2-88" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-89"><a href="#cb2-89" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> _<span class="op">,</span> ok <span class="op">:=</span> eventFrom<span class="op">(</span><span class="st">&quot;yk-tako&quot;</span><span class="op">,</span> <span class="op">&amp;</span>adk<span class="op">.</span>MessageVariant<span class="op">{</span>Role<span class="op">:</span> schema<span class="op">.</span>Assistant<span class="op">},</span> <span class="op">&amp;</span>schema<span class="op">.</span>Message<span class="op">{</span>Role<span class="op">:</span> schema<span class="op">.</span>Assistant<span class="op">});</span> ok <span class="op">{</span></span>
+<span id="cb2-90"><a href="#cb2-90" aria-hidden="true" tabindex="-1"></a>        t<span class="op">.</span>Fatal<span class="op">(</span><span class="st">&quot;空内容不应产出事件&quot;</span><span class="op">)</span></span>
+<span id="cb2-91"><a href="#cb2-91" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-92"><a href="#cb2-92" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 2: 跑测试确认失败</strong></label></li>
+</ul>
+<p>Run: <code>go test ./internal/adkrun/ -run 'TestEventFrom'</code> Expected: 编译失败，<code>undefined: eventFrom</code>、<code>undefined: EventKind</code>。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 3: 实现 <code>event.go</code></strong></label></li>
+</ul>
+<p><code>yk-tako-eino/internal/adkrun/event.go</code>：</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Package adkrun 是 ADK Runner 的驱动层：消费 Runner 的事件流并分类产出（呈现归消费方</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="co">// sink）、攒历史、跑 interrupt 审批回路，外加一个内存版 checkpoint store。唯一入口</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co">// cmd/yktako 使用；驱动循环在 turn.go，事件契约在本文件。</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="kw">package</span> adkrun</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="op">(</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;yk-tako-eino/internal/taskboard&quot;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;github.com/cloudwego/eino/adk&quot;</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;github.com/cloudwego/eino/schema&quot;</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="op">)</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="co">// EventKind 是事件的种类标签，取值对应《10》§4.2 事件契约的呈现四类。</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="co">// 只有这四类经过 Sink：approval 由消费方的 ask 实现产出（HTTP 入口在 T2.3 推 SSE）、</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="co">// error 由 Run 返回调用方——两者都不属于「呈现」，T1 保持原有行为不变。</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> EventKind <span class="dt">string</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a><span class="co">// 呈现事件的四种 Kind（《10》§4.2 表的 message / tool_call / tool_result / board）。</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a><span class="kw">const</span> <span class="op">(</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    <span class="co">// EventMessage 是代理正文（助手消息 Content）；子代理的由 sink 决定加前缀。</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    EventMessage EventKind <span class="op">=</span> <span class="st">&quot;message&quot;</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>    <span class="co">// EventToolCall 是模型请求调用工具，一条事件带本批全部工具名。</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>    EventToolCall EventKind <span class="op">=</span> <span class="st">&quot;tool_call&quot;</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>    <span class="co">// EventToolResult 是工具回执（Role=Tool 的消息），Text 为原始内容（截断归 sink）。</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>    EventToolResult EventKind <span class="op">=</span> <span class="st">&quot;tool_result&quot;</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>    <span class="co">// EventBoard 是账本工具回执的看板投影，Text 含看板与催更原文（sink 不得截断）。</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>    EventBoard EventKind <span class="op">=</span> <span class="st">&quot;board&quot;</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a><span class="op">)</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a><span class="co">// Event 是 adkrun 产出的一条结构化呈现事件。字段只带「发生了什么」：</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a><span class="co">// 前缀、emoji、截断等格式全部归 sink 决定（REPL sink 复刻旧 printMessage 的终端格式）。</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> Event <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>    Kind      EventKind       <span class="co">// 事件种类，决定 Text / ToolName / ToolNames 哪个有意义</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>    Agent     <span class="dt">string</span>          <span class="co">// 事件所属 agent 名（adk 盖的 AgentName），子代理前缀由 sink 决定</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>    Role      schema<span class="op">.</span>RoleType <span class="co">// 消息角色：正文/调用为 assistant，回执/看板为 tool</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>    Text      <span class="dt">string</span>          <span class="co">// 正文 / 工具回执原文 / 看板原文</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>    ToolName  <span class="dt">string</span>          <span class="co">// 工具名（tool_result / board 用）</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>    ToolNames <span class="op">[]</span><span class="dt">string</span>        <span class="co">// 工具名列表（tool_call 用，一条助手消息可带多个）</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a><span class="co">// Sink 是事件消费函数：adkrun 只负责产出，打印、推流等呈现由消费方实现。</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a><span class="co">// 用函数类型而非 interface：单方法、无状态，与同包的 Ask（turn.go）同一风格。</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a><span class="co">// nil 合法：Run 收到 nil 表示不呈现（只攒历史、收 interrupt），测试与无头调用可用。</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> Sink <span class="kw">func</span><span class="op">(</span>Event<span class="op">)</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a><span class="co">// eventFrom 把一条消息输出分类成呈现事件。ok=false 表示没有可呈现内容（空消息），</span></span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a><span class="co">// 调用方直接忽略。分类口径与重构前 printMessage 的分支一一对应：</span></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a><span class="co">// ToolCalls→tool_call、Role==Tool→tool_result/board、Content→message。</span></span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a><span class="co">// mv 与 msg 的关系：Role / ToolName 以 mv（框架元数据）优先，msg 兜底。</span></span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> eventFrom<span class="op">(</span>agentName <span class="dt">string</span><span class="op">,</span> mv <span class="op">*</span>adk<span class="op">.</span>MessageVariant<span class="op">,</span> msg <span class="op">*</span>schema<span class="op">.</span>Message<span class="op">)</span> <span class="op">(</span>Event<span class="op">,</span> <span class="dt">bool</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> msg <span class="op">==</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> Event<span class="op">{},</span> <span class="ot">false</span></span>
+<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-54"><a href="#cb3-54" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">len</span><span class="op">(</span>msg<span class="op">.</span>ToolCalls<span class="op">)</span> <span class="op">&gt;</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb3-55"><a href="#cb3-55" aria-hidden="true" tabindex="-1"></a>        names <span class="op">:=</span> <span class="bu">make</span><span class="op">([]</span><span class="dt">string</span><span class="op">,</span> <span class="dv">0</span><span class="op">,</span> <span class="bu">len</span><span class="op">(</span>msg<span class="op">.</span>ToolCalls<span class="op">))</span></span>
+<span id="cb3-56"><a href="#cb3-56" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> _<span class="op">,</span> call <span class="op">:=</span> <span class="kw">range</span> msg<span class="op">.</span>ToolCalls <span class="op">{</span></span>
+<span id="cb3-57"><a href="#cb3-57" aria-hidden="true" tabindex="-1"></a>            names <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>names<span class="op">,</span> call<span class="op">.</span>Function<span class="op">.</span>Name<span class="op">)</span></span>
+<span id="cb3-58"><a href="#cb3-58" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-59"><a href="#cb3-59" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> Event<span class="op">{</span>Kind<span class="op">:</span> EventToolCall<span class="op">,</span> Agent<span class="op">:</span> agentName<span class="op">,</span> Role<span class="op">:</span> msg<span class="op">.</span>Role<span class="op">,</span> ToolNames<span class="op">:</span> names<span class="op">},</span> <span class="ot">true</span></span>
+<span id="cb3-60"><a href="#cb3-60" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-61"><a href="#cb3-61" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> mv<span class="op">.</span>Role <span class="op">==</span> schema<span class="op">.</span>Tool <span class="op">||</span> msg<span class="op">.</span>Role <span class="op">==</span> schema<span class="op">.</span>Tool <span class="op">{</span></span>
+<span id="cb3-62"><a href="#cb3-62" aria-hidden="true" tabindex="-1"></a>        name <span class="op">:=</span> mv<span class="op">.</span>ToolName</span>
+<span id="cb3-63"><a href="#cb3-63" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> name <span class="op">==</span> <span class="st">&quot;&quot;</span> <span class="op">{</span></span>
+<span id="cb3-64"><a href="#cb3-64" aria-hidden="true" tabindex="-1"></a>            name <span class="op">=</span> msg<span class="op">.</span>ToolName</span>
+<span id="cb3-65"><a href="#cb3-65" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-66"><a href="#cb3-66" aria-hidden="true" tabindex="-1"></a>        kind <span class="op">:=</span> EventToolResult</span>
+<span id="cb3-67"><a href="#cb3-67" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> taskboard<span class="op">.</span>IsBoardTool<span class="op">(</span>name<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb3-68"><a href="#cb3-68" aria-hidden="true" tabindex="-1"></a>            kind <span class="op">=</span> EventBoard</span>
+<span id="cb3-69"><a href="#cb3-69" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-70"><a href="#cb3-70" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> Event<span class="op">{</span>Kind<span class="op">:</span> kind<span class="op">,</span> Agent<span class="op">:</span> agentName<span class="op">,</span> Role<span class="op">:</span> msg<span class="op">.</span>Role<span class="op">,</span> Text<span class="op">:</span> msg<span class="op">.</span>Content<span class="op">,</span> ToolName<span class="op">:</span> name<span class="op">},</span> <span class="ot">true</span></span>
+<span id="cb3-71"><a href="#cb3-71" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-72"><a href="#cb3-72" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> msg<span class="op">.</span>Content <span class="op">!=</span> <span class="st">&quot;&quot;</span> <span class="op">{</span></span>
+<span id="cb3-73"><a href="#cb3-73" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> Event<span class="op">{</span>Kind<span class="op">:</span> EventMessage<span class="op">,</span> Agent<span class="op">:</span> agentName<span class="op">,</span> Role<span class="op">:</span> msg<span class="op">.</span>Role<span class="op">,</span> Text<span class="op">:</span> msg<span class="op">.</span>Content<span class="op">},</span> <span class="ot">true</span></span>
+<span id="cb3-74"><a href="#cb3-74" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-75"><a href="#cb3-75" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> Event<span class="op">{},</span> <span class="ot">false</span></span>
+<span id="cb3-76"><a href="#cb3-76" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 4: 改 <code>turn.go</code> 包头注释（包文档移入 event.go）</strong></label></li>
+</ul>
+<p>原（<code>turn.go:1-4</code>）：</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Package adkrun 是 ADK Runner 的驱动层：事件消费（打印过程、攒历史）与</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co">// interrupt 审批回路，外加一个内存版 checkpoint store。唯一入口 cmd/yktako</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="co">// 使用，实现都在本文件。</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="kw">package</span> adkrun</span></code></pre></div>
+<p>改为：</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 本文件：ADK Runner 的驱动循环——Run 跑一轮、consume 收事件并产出、interrupt 审批。</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 事件契约（Event / Sink / eventFrom 的分类）在 event.go。</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">package</span> adkrun</span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 5: 跑测试与静态检查</strong></label></li>
+</ul>
+<p>Run: <code>gofmt -l . &amp;&amp; go build ./... &amp;&amp; go vet ./... &amp;&amp; go test ./internal/adkrun/ -v</code> Expected: <code>gofmt</code> 无输出；<code>TestEventFrom</code>、<code>TestEventFromNoContent</code>、既有 <code>TestRunDerivesRootFromAgent</code> 全过。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 6: 提交</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb6"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> add yk-tako-eino/internal/adkrun/event.go yk-tako-eino/internal/adkrun/event_test.go yk-tako-eino/internal/adkrun/turn.go</span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> commit <span class="at">-m</span> <span class="st">&quot;adkrun：事件契约（Event/Sink/分类）与单测；包文档移入 event.go&quot;</span></span></code></pre></div>
+<hr />
+<h2 id="task-2-t13-前半p2-关闭-repl-sink-与格式锁定">Task 2 (T1.3 前半，P2 关闭): REPL sink 与格式锁定</h2>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>yk-tako-eino/cmd/yktako/sink.go</code></li>
+<li>Create: <code>yk-tako-eino/cmd/yktako/sink_test.go</code></li>
+</ul>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 1: 写格式锁定测试（先失败）</strong></label></li>
+</ul>
+<p><code>yk-tako-eino/cmd/yktako/sink_test.go</code>：</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 本文件：REPL sink 的格式锁定测试——逐字符断言终端输出，钉住重构前的</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="co">// printMessage 格式（《10》§6 关口 2）；改输出格式必须同步改这里。</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="kw">package</span> main</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="op">(</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;bytes&quot;</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;strings&quot;</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;testing&quot;</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;yk-tako-eino/internal/adkrun&quot;</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a><span class="op">)</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="co">// TestREPLSinkFormat 覆盖四种事件 + 子代理前缀 + 长回执截断六种输出。</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> TestREPLSinkFormat<span class="op">(</span>t <span class="op">*</span>testing<span class="op">.</span>T<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>    long <span class="op">:=</span> strings<span class="op">.</span>Repeat<span class="op">(</span><span class="st">&quot;a&quot;</span><span class="op">,</span> <span class="dv">130</span><span class="op">)</span></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>    cases <span class="op">:=</span> <span class="op">[]</span><span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>        name <span class="dt">string</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>        ev   adkrun<span class="op">.</span>Event</span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>        want <span class="dt">string</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">}{</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>            name<span class="op">:</span> <span class="st">&quot;工具调用&quot;</span><span class="op">,</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a>            ev<span class="op">:</span>   adkrun<span class="op">.</span>Event<span class="op">{</span>Kind<span class="op">:</span> adkrun<span class="op">.</span>EventToolCall<span class="op">,</span> Agent<span class="op">:</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">,</span> ToolNames<span class="op">:</span> <span class="op">[]</span><span class="dt">string</span><span class="op">{</span><span class="st">&quot;read_file&quot;</span><span class="op">,</span> <span class="st">&quot;calculate&quot;</span><span class="op">}},</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a>            want<span class="op">:</span> <span class="st">&quot;  → 🔧 调用: read_file, calculate</span><span class="ch">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a>        <span class="op">},</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>            name<span class="op">:</span> <span class="st">&quot;工具回执&quot;</span><span class="op">,</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a>            ev<span class="op">:</span>   adkrun<span class="op">.</span>Event<span class="op">{</span>Kind<span class="op">:</span> adkrun<span class="op">.</span>EventToolResult<span class="op">,</span> Agent<span class="op">:</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">,</span> ToolName<span class="op">:</span> <span class="st">&quot;read_file&quot;</span><span class="op">,</span> Text<span class="op">:</span> <span class="st">&quot;第一行</span><span class="ch">\n</span><span class="st">第二行&quot;</span><span class="op">},</span></span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a>            want<span class="op">:</span> <span class="st">&quot;  ← 🔧 read_file: 第一行 第二行</span><span class="ch">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a>        <span class="op">},</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a>            name<span class="op">:</span> <span class="st">&quot;回执超长截断&quot;</span><span class="op">,</span></span>
+<span id="cb7-33"><a href="#cb7-33" aria-hidden="true" tabindex="-1"></a>            ev<span class="op">:</span>   adkrun<span class="op">.</span>Event<span class="op">{</span>Kind<span class="op">:</span> adkrun<span class="op">.</span>EventToolResult<span class="op">,</span> Agent<span class="op">:</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">,</span> ToolName<span class="op">:</span> <span class="st">&quot;read_file&quot;</span><span class="op">,</span> Text<span class="op">:</span> long<span class="op">},</span></span>
+<span id="cb7-34"><a href="#cb7-34" aria-hidden="true" tabindex="-1"></a>            want<span class="op">:</span> <span class="st">&quot;  ← 🔧 read_file: &quot;</span> <span class="op">+</span> strings<span class="op">.</span>Repeat<span class="op">(</span><span class="st">&quot;a&quot;</span><span class="op">,</span> <span class="dv">120</span><span class="op">)</span> <span class="op">+</span> <span class="st">&quot;…</span><span class="ch">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb7-35"><a href="#cb7-35" aria-hidden="true" tabindex="-1"></a>        <span class="op">},</span></span>
+<span id="cb7-36"><a href="#cb7-36" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb7-37"><a href="#cb7-37" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 看板原文自带「📋 任务看板」头（taskboard/tools.go 的 board），sink 又贴</span></span>
+<span id="cb7-38"><a href="#cb7-38" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 「  📋 」标记——重构前终端就是两个 📋，逐字符锁死，不许顺手去重。</span></span>
+<span id="cb7-39"><a href="#cb7-39" aria-hidden="true" tabindex="-1"></a>            name<span class="op">:</span> <span class="st">&quot;看板回执不截断&quot;</span><span class="op">,</span></span>
+<span id="cb7-40"><a href="#cb7-40" aria-hidden="true" tabindex="-1"></a>            ev<span class="op">:</span>   adkrun<span class="op">.</span>Event<span class="op">{</span>Kind<span class="op">:</span> adkrun<span class="op">.</span>EventBoard<span class="op">,</span> Agent<span class="op">:</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">,</span> ToolName<span class="op">:</span> <span class="st">&quot;TaskList&quot;</span><span class="op">,</span> Text<span class="op">:</span> <span class="st">&quot;📋 看板</span><span class="ch">\n</span><span class="st">第二行&quot;</span><span class="op">},</span></span>
+<span id="cb7-41"><a href="#cb7-41" aria-hidden="true" tabindex="-1"></a>            want<span class="op">:</span> <span class="st">&quot;  📋 📋 看板</span><span class="ch">\n</span><span class="st">第二行</span><span class="ch">\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb7-42"><a href="#cb7-42" aria-hidden="true" tabindex="-1"></a>        <span class="op">},</span></span>
+<span id="cb7-43"><a href="#cb7-43" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb7-44"><a href="#cb7-44" aria-hidden="true" tabindex="-1"></a>            name<span class="op">:</span> <span class="st">&quot;正文&quot;</span><span class="op">,</span></span>
+<span id="cb7-45"><a href="#cb7-45" aria-hidden="true" tabindex="-1"></a>            ev<span class="op">:</span>   adkrun<span class="op">.</span>Event<span class="op">{</span>Kind<span class="op">:</span> adkrun<span class="op">.</span>EventMessage<span class="op">,</span> Agent<span class="op">:</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">,</span> Text<span class="op">:</span> <span class="st">&quot;你好&quot;</span><span class="op">},</span></span>
+<span id="cb7-46"><a href="#cb7-46" aria-hidden="true" tabindex="-1"></a>            want<span class="op">:</span> <span class="st">&quot;</span><span class="ch">\n</span><span class="st">🐙 你好</span><span class="ch">\n\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb7-47"><a href="#cb7-47" aria-hidden="true" tabindex="-1"></a>        <span class="op">},</span></span>
+<span id="cb7-48"><a href="#cb7-48" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb7-49"><a href="#cb7-49" aria-hidden="true" tabindex="-1"></a>            name<span class="op">:</span> <span class="st">&quot;子代理带前缀&quot;</span><span class="op">,</span></span>
+<span id="cb7-50"><a href="#cb7-50" aria-hidden="true" tabindex="-1"></a>            ev<span class="op">:</span>   adkrun<span class="op">.</span>Event<span class="op">{</span>Kind<span class="op">:</span> adkrun<span class="op">.</span>EventMessage<span class="op">,</span> Agent<span class="op">:</span> <span class="st">&quot;worker&quot;</span><span class="op">,</span> Text<span class="op">:</span> <span class="st">&quot;子代理说&quot;</span><span class="op">},</span></span>
+<span id="cb7-51"><a href="#cb7-51" aria-hidden="true" tabindex="-1"></a>            want<span class="op">:</span> <span class="st">&quot;</span><span class="ch">\n</span><span class="st">🐙 [worker] 子代理说</span><span class="ch">\n\n</span><span class="st">&quot;</span><span class="op">,</span></span>
+<span id="cb7-52"><a href="#cb7-52" aria-hidden="true" tabindex="-1"></a>        <span class="op">},</span></span>
+<span id="cb7-53"><a href="#cb7-53" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-54"><a href="#cb7-54" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _<span class="op">,</span> tc <span class="op">:=</span> <span class="kw">range</span> cases <span class="op">{</span></span>
+<span id="cb7-55"><a href="#cb7-55" aria-hidden="true" tabindex="-1"></a>        t<span class="op">.</span>Run<span class="op">(</span>tc<span class="op">.</span>name<span class="op">,</span> <span class="kw">func</span><span class="op">(</span>t <span class="op">*</span>testing<span class="op">.</span>T<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb7-56"><a href="#cb7-56" aria-hidden="true" tabindex="-1"></a>            <span class="kw">var</span> buf bytes<span class="op">.</span>Buffer</span>
+<span id="cb7-57"><a href="#cb7-57" aria-hidden="true" tabindex="-1"></a>            newREPLSink<span class="op">(&amp;</span>buf<span class="op">,</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">)(</span>tc<span class="op">.</span>ev<span class="op">)</span></span>
+<span id="cb7-58"><a href="#cb7-58" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> got <span class="op">:=</span> buf<span class="op">.</span>String<span class="op">();</span> got <span class="op">!=</span> tc<span class="op">.</span>want <span class="op">{</span></span>
+<span id="cb7-59"><a href="#cb7-59" aria-hidden="true" tabindex="-1"></a>                t<span class="op">.</span>Fatalf<span class="op">(</span><span class="st">&quot;输出不符</span><span class="ch">\n</span><span class="st">want: %q</span><span class="ch">\n</span><span class="st"> got: %q&quot;</span><span class="op">,</span> tc<span class="op">.</span>want<span class="op">,</span> got<span class="op">)</span></span>
+<span id="cb7-60"><a href="#cb7-60" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb7-61"><a href="#cb7-61" aria-hidden="true" tabindex="-1"></a>        <span class="op">})</span></span>
+<span id="cb7-62"><a href="#cb7-62" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-63"><a href="#cb7-63" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 2: 跑测试确认失败</strong></label></li>
+</ul>
+<p>Run: <code>go test ./cmd/yktako/ -run 'TestREPLSinkFormat'</code> Expected: 编译失败，<code>undefined: newREPLSink</code>。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 3: 实现 <code>sink.go</code>（P2 落点在此定死：<code>cmd/yktako</code>）</strong></label></li>
+</ul>
+<p><code>yk-tako-eino/cmd/yktako/sink.go</code>：</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 本文件：REPL 的 sink——把 adkrun 产出的事件写成终端文本（呈现归消费方）。</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="kw">package</span> main</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="op">(</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;fmt&quot;</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;io&quot;</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;strings&quot;</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;yk-tako-eino/internal/adkrun&quot;</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;yk-tako-eino/internal/repl&quot;</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a><span class="op">)</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="co">// newREPLSink 造一个写终端的事件消费函数，输出格式与重构前 adkrun 的 printMessage</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="co">// 逐字符一致（《10》§6 关口 2「REPL sink 打印格式不破」）。</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a><span class="co">//</span></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="co">// w 由调用方给：main 传 os.Stdout，测试传 bytes.Buffer——格式锁定测试靠它做字节级断言。</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a><span class="co">// root 是主 agent 名：非 root 的 agent 事件带「[名字] 」前缀（原逻辑搬来）。</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="co">// 落点选 cmd/yktako 的理由（P2 关闭）：格式是消费方自己的事；将来 HTTP sink 输出的是</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="co">// SSE JSON，与终端文本没有可共享的格式化，不必为此新开 internal/sink。</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> newREPLSink<span class="op">(</span>w io<span class="op">.</span>Writer<span class="op">,</span> root <span class="dt">string</span><span class="op">)</span> adkrun<span class="op">.</span>Sink <span class="op">{</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">func</span><span class="op">(</span>ev adkrun<span class="op">.</span>Event<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a>        prefix <span class="op">:=</span> <span class="st">&quot;&quot;</span></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> ev<span class="op">.</span>Agent <span class="op">!=</span> <span class="st">&quot;&quot;</span> <span class="op">&amp;&amp;</span> ev<span class="op">.</span>Agent <span class="op">!=</span> root <span class="op">{</span></span>
+<span id="cb8-24"><a href="#cb8-24" aria-hidden="true" tabindex="-1"></a>            prefix <span class="op">=</span> <span class="st">&quot;[&quot;</span> <span class="op">+</span> ev<span class="op">.</span>Agent <span class="op">+</span> <span class="st">&quot;] &quot;</span></span>
+<span id="cb8-25"><a href="#cb8-25" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb8-26"><a href="#cb8-26" aria-hidden="true" tabindex="-1"></a>        <span class="cf">switch</span> ev<span class="op">.</span>Kind <span class="op">{</span></span>
+<span id="cb8-27"><a href="#cb8-27" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> adkrun<span class="op">.</span>EventToolCall<span class="op">:</span></span>
+<span id="cb8-28"><a href="#cb8-28" aria-hidden="true" tabindex="-1"></a>            fmt<span class="op">.</span>Fprintf<span class="op">(</span>w<span class="op">,</span> <span class="st">&quot;  → 🔧 %s调用: %s</span><span class="ch">\n</span><span class="st">&quot;</span><span class="op">,</span> prefix<span class="op">,</span> strings<span class="op">.</span>Join<span class="op">(</span>ev<span class="op">.</span>ToolNames<span class="op">,</span> <span class="st">&quot;, &quot;</span><span class="op">))</span></span>
+<span id="cb8-29"><a href="#cb8-29" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> adkrun<span class="op">.</span>EventBoard<span class="op">:</span></span>
+<span id="cb8-30"><a href="#cb8-30" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 账本工具的回执自带看板与催更块（taskboard/tools.go 的 withBoard），</span></span>
+<span id="cb8-31"><a href="#cb8-31" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 原样投影，不走 Clip 截断——截断会把看板截烂。看板原文自带</span></span>
+<span id="cb8-32"><a href="#cb8-32" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 「📋 任务看板」头，故终端显示「  📋 📋 …」两个标记——这是重构前的</span></span>
+<span id="cb8-33"><a href="#cb8-33" aria-hidden="true" tabindex="-1"></a>            <span class="co">// 既有格式，本重构只搬不改，不许顺手去重。</span></span>
+<span id="cb8-34"><a href="#cb8-34" aria-hidden="true" tabindex="-1"></a>            fmt<span class="op">.</span>Fprintf<span class="op">(</span>w<span class="op">,</span> <span class="st">&quot;  📋 %s%s</span><span class="ch">\n</span><span class="st">&quot;</span><span class="op">,</span> prefix<span class="op">,</span> ev<span class="op">.</span>Text<span class="op">)</span></span>
+<span id="cb8-35"><a href="#cb8-35" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> adkrun<span class="op">.</span>EventToolResult<span class="op">:</span></span>
+<span id="cb8-36"><a href="#cb8-36" aria-hidden="true" tabindex="-1"></a>            fmt<span class="op">.</span>Fprintf<span class="op">(</span>w<span class="op">,</span> <span class="st">&quot;  ← 🔧 %s%s: %s</span><span class="ch">\n</span><span class="st">&quot;</span><span class="op">,</span> prefix<span class="op">,</span> ev<span class="op">.</span>ToolName<span class="op">,</span> repl<span class="op">.</span>Clip<span class="op">(</span>ev<span class="op">.</span>Text<span class="op">,</span> <span class="dv">120</span><span class="op">))</span></span>
+<span id="cb8-37"><a href="#cb8-37" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> adkrun<span class="op">.</span>EventMessage<span class="op">:</span></span>
+<span id="cb8-38"><a href="#cb8-38" aria-hidden="true" tabindex="-1"></a>            fmt<span class="op">.</span>Fprintf<span class="op">(</span>w<span class="op">,</span> <span class="st">&quot;</span><span class="ch">\n</span><span class="st">🐙 %s%s</span><span class="ch">\n\n</span><span class="st">&quot;</span><span class="op">,</span> prefix<span class="op">,</span> ev<span class="op">.</span>Text<span class="op">)</span></span>
+<span id="cb8-39"><a href="#cb8-39" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb8-40"><a href="#cb8-40" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-41"><a href="#cb8-41" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 4: 跑测试通过</strong></label></li>
+</ul>
+<p>Run: <code>gofmt -l . &amp;&amp; go test ./cmd/yktako/ -v</code> Expected: <code>gofmt</code> 无输出；<code>TestREPLSinkFormat</code> 六个子用例全过。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 5: 提交</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb9"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> add yk-tako-eino/cmd/yktako/sink.go yk-tako-eino/cmd/yktako/sink_test.go</span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> commit <span class="at">-m</span> <span class="st">&quot;yktako：REPL sink（事件→终端）与格式锁定测试；P2 落点定在 cmd/yktako&quot;</span></span></code></pre></div>
+<hr />
+<h2 id="task-3-t12--t13-后半--t14-驱动层接线">Task 3 (T1.2 + T1.3 后半 + T1.4): 驱动层接线</h2>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Modify: <code>yk-tako-eino/internal/adkrun/event_test.go</code>（追加 consume 序列测试）</li>
+<li>Modify: <code>yk-tako-eino/internal/adkrun/turn.go</code>（<code>Run</code> / <code>consume</code> / 删 <code>printMessage</code> / imports）</li>
+<li>Modify: <code>yk-tako-eino/internal/adkrun/turn_test.go:61</code></li>
+<li>Modify: <code>yk-tako-eino/cmd/yktako/main.go</code>（构造 sink + 注入）</li>
+<li>Modify: <code>yk-tako-eino/internal/taskboard/tools.go:29</code>（<code>IsBoardTool</code> 注释里引用的 <code>printMessage</code> 改指 <code>eventFrom</code>——删函数后该引用会悬空，AGENTS 禁过时注释）</li>
+</ul>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 1: 先追加 consume 事件序列测试（失败）</strong></label></li>
+</ul>
+<p><code>event_test.go</code> 末尾追加：</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="co">// TestConsumeEmitsEvents 用脚本事件流验证 consume 的产出顺序与载荷：</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 工具调用 → 看板回执 → 正文（T1.5 的事件序列断言）；同时确认 root 消息仍进历史。</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> TestConsumeEmitsEvents<span class="op">(</span>t <span class="op">*</span>testing<span class="op">.</span>T<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    callMsg <span class="op">:=</span> schema<span class="op">.</span>AssistantMessage<span class="op">(</span><span class="st">&quot;&quot;</span><span class="op">,</span> <span class="op">[]</span>schema<span class="op">.</span>ToolCall<span class="op">{{</span>ID<span class="op">:</span> <span class="st">&quot;c1&quot;</span><span class="op">,</span> Function<span class="op">:</span> schema<span class="op">.</span>FunctionCall<span class="op">{</span>Name<span class="op">:</span> taskboard<span class="op">.</span>ToolList<span class="op">}}})</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    boardMsg <span class="op">:=</span> schema<span class="op">.</span>ToolMessage<span class="op">(</span><span class="st">&quot;📋 看板&quot;</span><span class="op">,</span> <span class="st">&quot;c1&quot;</span><span class="op">,</span> schema<span class="op">.</span>WithToolName<span class="op">(</span>taskboard<span class="op">.</span>ToolList<span class="op">))</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a>    textMsg <span class="op">:=</span> schema<span class="op">.</span>AssistantMessage<span class="op">(</span><span class="st">&quot;收尾&quot;</span><span class="op">,</span> <span class="ot">nil</span><span class="op">)</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a>    iter<span class="op">,</span> gen <span class="op">:=</span> adk<span class="op">.</span>NewAsyncIteratorPair<span class="op">[*</span>adk<span class="op">.</span>AgentEvent<span class="op">]()</span></span>
+<span id="cb10-9"><a href="#cb10-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">go</span> <span class="kw">func</span><span class="op">()</span> <span class="op">{</span></span>
+<span id="cb10-10"><a href="#cb10-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">defer</span> gen<span class="op">.</span>Close<span class="op">()</span></span>
+<span id="cb10-11"><a href="#cb10-11" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> _<span class="op">,</span> m <span class="op">:=</span> <span class="kw">range</span> <span class="op">[]*</span>schema<span class="op">.</span>Message<span class="op">{</span>callMsg<span class="op">,</span> boardMsg<span class="op">,</span> textMsg<span class="op">}</span> <span class="op">{</span></span>
+<span id="cb10-12"><a href="#cb10-12" aria-hidden="true" tabindex="-1"></a>            gen<span class="op">.</span>Send<span class="op">(&amp;</span>adk<span class="op">.</span>AgentEvent<span class="op">{</span></span>
+<span id="cb10-13"><a href="#cb10-13" aria-hidden="true" tabindex="-1"></a>                AgentName<span class="op">:</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">,</span></span>
+<span id="cb10-14"><a href="#cb10-14" aria-hidden="true" tabindex="-1"></a>                Output<span class="op">:</span> <span class="op">&amp;</span>adk<span class="op">.</span>AgentOutput<span class="op">{</span>MessageOutput<span class="op">:</span> <span class="op">&amp;</span>adk<span class="op">.</span>MessageVariant<span class="op">{</span></span>
+<span id="cb10-15"><a href="#cb10-15" aria-hidden="true" tabindex="-1"></a>                    Role<span class="op">:</span>     m<span class="op">.</span>Role<span class="op">,</span></span>
+<span id="cb10-16"><a href="#cb10-16" aria-hidden="true" tabindex="-1"></a>                    ToolName<span class="op">:</span> m<span class="op">.</span>ToolName<span class="op">,</span></span>
+<span id="cb10-17"><a href="#cb10-17" aria-hidden="true" tabindex="-1"></a>                    Message<span class="op">:</span>  m<span class="op">,</span></span>
+<span id="cb10-18"><a href="#cb10-18" aria-hidden="true" tabindex="-1"></a>                <span class="op">}},</span></span>
+<span id="cb10-19"><a href="#cb10-19" aria-hidden="true" tabindex="-1"></a>            <span class="op">})</span></span>
+<span id="cb10-20"><a href="#cb10-20" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb10-21"><a href="#cb10-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}()</span></span>
+<span id="cb10-22"><a href="#cb10-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-23"><a href="#cb10-23" aria-hidden="true" tabindex="-1"></a>    <span class="kw">var</span> got <span class="op">[]</span>Event</span>
+<span id="cb10-24"><a href="#cb10-24" aria-hidden="true" tabindex="-1"></a>    msgs<span class="op">,</span> interrupts<span class="op">,</span> err <span class="op">:=</span> consume<span class="op">(</span>iter<span class="op">,</span> <span class="st">&quot;yk-tako&quot;</span><span class="op">,</span> <span class="kw">func</span><span class="op">(</span>ev Event<span class="op">)</span> <span class="op">{</span> got <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>got<span class="op">,</span> ev<span class="op">)</span> <span class="op">})</span></span>
+<span id="cb10-25"><a href="#cb10-25" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb10-26"><a href="#cb10-26" aria-hidden="true" tabindex="-1"></a>        t<span class="op">.</span>Fatalf<span class="op">(</span><span class="st">&quot;consume: %v&quot;</span><span class="op">,</span> err<span class="op">)</span></span>
+<span id="cb10-27"><a href="#cb10-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-28"><a href="#cb10-28" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">len</span><span class="op">(</span>interrupts<span class="op">)</span> <span class="op">!=</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb10-29"><a href="#cb10-29" aria-hidden="true" tabindex="-1"></a>        t<span class="op">.</span>Fatalf<span class="op">(</span><span class="st">&quot;interrupts 应为空，实际 %v&quot;</span><span class="op">,</span> interrupts<span class="op">)</span></span>
+<span id="cb10-30"><a href="#cb10-30" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-31"><a href="#cb10-31" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">len</span><span class="op">(</span>got<span class="op">)</span> <span class="op">!=</span> <span class="dv">3</span> <span class="op">||</span> got<span class="op">[</span><span class="dv">0</span><span class="op">].</span>Kind <span class="op">!=</span> EventToolCall <span class="op">||</span> got<span class="op">[</span><span class="dv">1</span><span class="op">].</span>Kind <span class="op">!=</span> EventBoard <span class="op">||</span> got<span class="op">[</span><span class="dv">2</span><span class="op">].</span>Kind <span class="op">!=</span> EventMessage <span class="op">{</span></span>
+<span id="cb10-32"><a href="#cb10-32" aria-hidden="true" tabindex="-1"></a>        t<span class="op">.</span>Fatalf<span class="op">(</span><span class="st">&quot;事件序列 = %+v，want [tool_call board message]&quot;</span><span class="op">,</span> got<span class="op">)</span></span>
+<span id="cb10-33"><a href="#cb10-33" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-34"><a href="#cb10-34" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">len</span><span class="op">(</span>msgs<span class="op">)</span> <span class="op">!=</span> <span class="dv">3</span> <span class="op">{</span></span>
+<span id="cb10-35"><a href="#cb10-35" aria-hidden="true" tabindex="-1"></a>        t<span class="op">.</span>Fatalf<span class="op">(</span><span class="st">&quot;history 应收到 3 条 root 消息（含工具回执），实际 %d&quot;</span><span class="op">,</span> <span class="bu">len</span><span class="op">(</span>msgs<span class="op">))</span></span>
+<span id="cb10-36"><a href="#cb10-36" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb10-37"><a href="#cb10-37" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 2: 跑测试确认失败</strong></label></li>
+</ul>
+<p>Run: <code>go test ./internal/adkrun/ -run 'TestConsumeEmitsEvents'</code> Expected: 编译失败，<code>consume</code> 参数不匹配（当前只有 2 参）。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 3: 改 <code>turn.go</code></strong></label></li>
+</ul>
+<p>3a. imports 去掉 <code>strings</code>、<code>yk-tako-eino/internal/repl</code>、<code>yk-tako-eino/internal/taskboard</code>（前两者只被 <code>printMessage</code> 用，<code>taskboard</code> 的判定已移入 <code>event.go</code>），最终为：</p>
+<div class="sourceCode" id="cb11"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="kw">import</span> <span class="op">(</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;context&quot;</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;fmt&quot;</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;sync&quot;</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;yk-tako-eino/internal/guard&quot;</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;github.com/cloudwego/eino/adk&quot;</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;github.com/cloudwego/eino/schema&quot;</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="op">)</span></span></code></pre></div>
+<p>3b. <code>Run</code> 加 <code>sink Sink</code> 参数（位置在 <code>input</code> 之后、<code>ask</code> 之前），注释同步补 nil 语义、把「子代理的过程只打印」改为「只产事件」：</p>
+<div class="sourceCode" id="cb12"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Run 跑一轮，遇到 interrupt 就问人再 Resume，直到这轮结束。</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="co">// agent 是主 agent：过滤历史用的 root 名从它自己的 Name 取，不再让脚本另传一份。</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="co">// 以前 root 要脚本手写，和 ChatModelAgentConfig.Name 写重复——对不上时不报错也不 panic，</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="co">// 只是历史悄悄变空、子代理前缀不打了，属于最难查的那种错。</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="co">// 事件里的 AgentName 用的就是同一个 Name：adk 的 flowAgent 直接内嵌 Agent</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="co">// （adk/flow.go:42），Name 原样转发给里层的 ChatModelAgent。</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="co">// 只有 root 的消息回到历史，子代理的过程只产事件。</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="co">//</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="co">// sink 收每条呈现事件（《10》§4.2 的 message/tool_call/tool_result/board 四类）；</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="co">// 传 nil 合法，表示不呈现（只攒历史、收 interrupt），无头调用与测试可用。</span></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="co">//</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a><span class="co">// 参数类型用 adk.Agent（github.com/cloudwego/eino/adk 包 interface.go:467 的</span></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a><span class="co">// TypedAgent[*schema.Message] 别名，Name 在 :454 声明）：这里只要 Name，runner 自己拿着 agent。</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> Run<span class="op">(</span>ctx context<span class="op">.</span>Context<span class="op">,</span> runner <span class="op">*</span>adk<span class="op">.</span>Runner<span class="op">,</span> agent adk<span class="op">.</span>Agent<span class="op">,</span> checkpointID <span class="dt">string</span><span class="op">,</span> input <span class="op">[]*</span>schema<span class="op">.</span>Message<span class="op">,</span> sink Sink<span class="op">,</span> ask Ask<span class="op">)</span> <span class="op">([]*</span>schema<span class="op">.</span>Message<span class="op">,</span> <span class="dt">error</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a>    root <span class="op">:=</span> agent<span class="op">.</span>Name<span class="op">(</span>ctx<span class="op">)</span></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">var</span> opts <span class="op">[]</span>adk<span class="op">.</span>AgentRunOption</span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> checkpointID <span class="op">!=</span> <span class="st">&quot;&quot;</span> <span class="op">{</span></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a>        opts <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>opts<span class="op">,</span> adk<span class="op">.</span>WithCheckPointID<span class="op">(</span>checkpointID<span class="op">))</span></span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a>    iter <span class="op">:=</span> runner<span class="op">.</span>Run<span class="op">(</span>ctx<span class="op">,</span> input<span class="op">,</span> opts<span class="op">...)</span></span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a>    <span class="kw">var</span> history <span class="op">[]*</span>schema<span class="op">.</span>Message</span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">{</span></span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a>        msgs<span class="op">,</span> interrupts<span class="op">,</span> err <span class="op">:=</span> consume<span class="op">(</span>iter<span class="op">,</span> root<span class="op">,</span> sink<span class="op">)</span></span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a>        history <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>history<span class="op">,</span> msgs<span class="op">...)</span></span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> history<span class="op">,</span> err</span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="bu">len</span><span class="op">(</span>interrupts<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> history<span class="op">,</span> <span class="ot">nil</span></span>
+<span id="cb12-30"><a href="#cb12-30" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb12-31"><a href="#cb12-31" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> ask <span class="op">==</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb12-32"><a href="#cb12-32" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> history<span class="op">,</span> fmt<span class="op">.</span>Errorf<span class="op">(</span><span class="st">&quot;agent 暂停等待审批，但这个脚本没有接审批&quot;</span><span class="op">)</span></span>
+<span id="cb12-33"><a href="#cb12-33" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb12-34"><a href="#cb12-34" aria-hidden="true" tabindex="-1"></a>        targets <span class="op">:=</span> <span class="kw">map</span><span class="op">[</span><span class="dt">string</span><span class="op">]</span><span class="dt">any</span><span class="op">{}</span></span>
+<span id="cb12-35"><a href="#cb12-35" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> _<span class="op">,</span> point <span class="op">:=</span> <span class="kw">range</span> interrupts <span class="op">{</span></span>
+<span id="cb12-36"><a href="#cb12-36" aria-hidden="true" tabindex="-1"></a>            info <span class="op">:=</span> approvalFrom<span class="op">(</span>point<span class="op">.</span>Info<span class="op">)</span></span>
+<span id="cb12-37"><a href="#cb12-37" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> info<span class="op">.</span>Tool <span class="op">==</span> <span class="st">&quot;&quot;</span> <span class="op">{</span></span>
+<span id="cb12-38"><a href="#cb12-38" aria-hidden="true" tabindex="-1"></a>                info<span class="op">.</span>Message <span class="op">=</span> fmt<span class="op">.</span>Sprint<span class="op">(</span>point<span class="op">.</span>Info<span class="op">)</span></span>
+<span id="cb12-39"><a href="#cb12-39" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb12-40"><a href="#cb12-40" aria-hidden="true" tabindex="-1"></a>            decision<span class="op">,</span> err <span class="op">:=</span> ask<span class="op">(</span>info<span class="op">)</span></span>
+<span id="cb12-41"><a href="#cb12-41" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb12-42"><a href="#cb12-42" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span> history<span class="op">,</span> err</span>
+<span id="cb12-43"><a href="#cb12-43" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb12-44"><a href="#cb12-44" aria-hidden="true" tabindex="-1"></a>            targets<span class="op">[</span>point<span class="op">.</span>ID<span class="op">]</span> <span class="op">=</span> decision</span>
+<span id="cb12-45"><a href="#cb12-45" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb12-46"><a href="#cb12-46" aria-hidden="true" tabindex="-1"></a>        iter<span class="op">,</span> err <span class="op">=</span> runner<span class="op">.</span>ResumeWithParams<span class="op">(</span>ctx<span class="op">,</span> checkpointID<span class="op">,</span> <span class="op">&amp;</span>adk<span class="op">.</span>ResumeParams<span class="op">{</span>Targets<span class="op">:</span> targets<span class="op">})</span></span>
+<span id="cb12-47"><a href="#cb12-47" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb12-48"><a href="#cb12-48" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> history<span class="op">,</span> err</span>
+<span id="cb12-49"><a href="#cb12-49" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb12-50"><a href="#cb12-50" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-51"><a href="#cb12-51" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>3c. <code>consume</code> 加 <code>sink Sink</code> 参数，调用点改为「分类构事件 → sink」；history 攒取与 interrupt 收集一行不动：</p>
+<div class="sourceCode" id="cb13"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co">// consume 收完一轮事件：产出呈现事件、攒主 agent 的消息、收 interrupt。</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> consume<span class="op">(</span>iter <span class="op">*</span>adk<span class="op">.</span>AsyncIterator<span class="op">[*</span>adk<span class="op">.</span>AgentEvent<span class="op">],</span> root <span class="dt">string</span><span class="op">,</span> sink Sink<span class="op">)</span> <span class="op">([]*</span>schema<span class="op">.</span>Message<span class="op">,</span> <span class="op">[]*</span>adk<span class="op">.</span>InterruptCtx<span class="op">,</span> <span class="dt">error</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">var</span> msgs <span class="op">[]*</span>schema<span class="op">.</span>Message</span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">var</span> interrupts <span class="op">[]*</span>adk<span class="op">.</span>InterruptCtx</span>
+<span id="cb13-5"><a href="#cb13-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> iter <span class="op">==</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb13-6"><a href="#cb13-6" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ot">nil</span><span class="op">,</span> <span class="ot">nil</span><span class="op">,</span> fmt<span class="op">.</span>Errorf<span class="op">(</span><span class="st">&quot;agent 没有返回事件&quot;</span><span class="op">)</span></span>
+<span id="cb13-7"><a href="#cb13-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-8"><a href="#cb13-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">{</span></span>
+<span id="cb13-9"><a href="#cb13-9" aria-hidden="true" tabindex="-1"></a>        event<span class="op">,</span> ok <span class="op">:=</span> iter<span class="op">.</span>Next<span class="op">()</span></span>
+<span id="cb13-10"><a href="#cb13-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">!</span>ok <span class="op">{</span></span>
+<span id="cb13-11"><a href="#cb13-11" aria-hidden="true" tabindex="-1"></a>            <span class="cf">break</span></span>
+<span id="cb13-12"><a href="#cb13-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb13-13"><a href="#cb13-13" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> event<span class="op">.</span>Err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb13-14"><a href="#cb13-14" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> msgs<span class="op">,</span> interrupts<span class="op">,</span> event<span class="op">.</span>Err</span>
+<span id="cb13-15"><a href="#cb13-15" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb13-16"><a href="#cb13-16" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> event<span class="op">.</span>Output <span class="op">!=</span> <span class="ot">nil</span> <span class="op">&amp;&amp;</span> event<span class="op">.</span>Output<span class="op">.</span>MessageOutput <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb13-17"><a href="#cb13-17" aria-hidden="true" tabindex="-1"></a>            msg<span class="op">,</span> err <span class="op">:=</span> event<span class="op">.</span>Output<span class="op">.</span>MessageOutput<span class="op">.</span>GetMessage<span class="op">()</span></span>
+<span id="cb13-18"><a href="#cb13-18" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb13-19"><a href="#cb13-19" aria-hidden="true" tabindex="-1"></a>                <span class="cf">return</span> msgs<span class="op">,</span> interrupts<span class="op">,</span> err</span>
+<span id="cb13-20"><a href="#cb13-20" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb13-21"><a href="#cb13-21" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> sink <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb13-22"><a href="#cb13-22" aria-hidden="true" tabindex="-1"></a>                <span class="co">// 分类（含 IsBoardTool）在驱动层完成：HTTP sink 将来只做呈现，</span></span>
+<span id="cb13-23"><a href="#cb13-23" aria-hidden="true" tabindex="-1"></a>                <span class="co">// 不能再把 taskboard 的判定重做一遍。</span></span>
+<span id="cb13-24"><a href="#cb13-24" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> ev<span class="op">,</span> ok <span class="op">:=</span> eventFrom<span class="op">(</span>event<span class="op">.</span>AgentName<span class="op">,</span> event<span class="op">.</span>Output<span class="op">.</span>MessageOutput<span class="op">,</span> msg<span class="op">);</span> ok <span class="op">{</span></span>
+<span id="cb13-25"><a href="#cb13-25" aria-hidden="true" tabindex="-1"></a>                    sink<span class="op">(</span>ev<span class="op">)</span></span>
+<span id="cb13-26"><a href="#cb13-26" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb13-27"><a href="#cb13-27" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb13-28"><a href="#cb13-28" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> msg <span class="op">!=</span> <span class="ot">nil</span> <span class="op">&amp;&amp;</span> event<span class="op">.</span>AgentName <span class="op">==</span> root <span class="op">{</span></span>
+<span id="cb13-29"><a href="#cb13-29" aria-hidden="true" tabindex="-1"></a>                msgs <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>msgs<span class="op">,</span> msg<span class="op">)</span></span>
+<span id="cb13-30"><a href="#cb13-30" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb13-31"><a href="#cb13-31" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb13-32"><a href="#cb13-32" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> event<span class="op">.</span>Action <span class="op">!=</span> <span class="ot">nil</span> <span class="op">&amp;&amp;</span> event<span class="op">.</span>Action<span class="op">.</span>Interrupted <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb13-33"><a href="#cb13-33" aria-hidden="true" tabindex="-1"></a>            <span class="cf">for</span> _<span class="op">,</span> point <span class="op">:=</span> <span class="kw">range</span> event<span class="op">.</span>Action<span class="op">.</span>Interrupted<span class="op">.</span>InterruptContexts <span class="op">{</span></span>
+<span id="cb13-34"><a href="#cb13-34" aria-hidden="true" tabindex="-1"></a>                <span class="cf">if</span> point <span class="op">!=</span> <span class="ot">nil</span> <span class="op">&amp;&amp;</span> point<span class="op">.</span>IsRootCause <span class="op">{</span></span>
+<span id="cb13-35"><a href="#cb13-35" aria-hidden="true" tabindex="-1"></a>                    interrupts <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>interrupts<span class="op">,</span> point<span class="op">)</span></span>
+<span id="cb13-36"><a href="#cb13-36" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb13-37"><a href="#cb13-37" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb13-38"><a href="#cb13-38" aria-hidden="true" tabindex="-1"></a>            <span class="cf">if</span> <span class="bu">len</span><span class="op">(</span>interrupts<span class="op">)</span> <span class="op">==</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb13-39"><a href="#cb13-39" aria-hidden="true" tabindex="-1"></a>                interrupts <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>interrupts<span class="op">,</span> event<span class="op">.</span>Action<span class="op">.</span>Interrupted<span class="op">.</span>InterruptContexts<span class="op">...)</span></span>
+<span id="cb13-40"><a href="#cb13-40" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb13-41"><a href="#cb13-41" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb13-42"><a href="#cb13-42" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb13-43"><a href="#cb13-43" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> msgs<span class="op">,</span> interrupts<span class="op">,</span> <span class="ot">nil</span></span>
+<span id="cb13-44"><a href="#cb13-44" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>3d. 删除整个 <code>printMessage</code> 函数（原 <code>turn.go:156-193</code>，含其注释）。<code>approvalFrom</code> 及其后的 <code>Store</code> 相关代码不动。</p>
+<p>3e. 同步 <code>internal/taskboard/tools.go:29</code> 的注释（质量审查发现的原计划遗漏）：</p>
+<p>原：<code>// IsBoardTool 判断工具名是不是四个记账工具之一。adkrun 的 printMessage 用它做看板投影。</code> 改：<code>// IsBoardTool 判断工具名是不是四个记账工具之一。adkrun 的 eventFrom 用它把回执分到看板事件。</code></p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 4: 接线 <code>turn_test.go</code> 与 <code>main.go</code></strong></label></li>
+</ul>
+<p><code>turn_test.go:61</code>：</p>
+<div class="sourceCode" id="cb14"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a>    history<span class="op">,</span> err <span class="op">:=</span> Run<span class="op">(</span>ctx<span class="op">,</span> runner<span class="op">,</span> agent<span class="op">,</span> <span class="st">&quot;&quot;</span><span class="op">,</span> <span class="op">[]*</span>schema<span class="op">.</span>Message<span class="op">{</span>schema<span class="op">.</span>UserMessage<span class="op">(</span><span class="st">&quot;在吗&quot;</span><span class="op">)},</span> <span class="ot">nil</span><span class="op">,</span> <span class="ot">nil</span><span class="op">)</span></span></code></pre></div>
+<p><code>main.go</code>（<code>runner</code> 创建之后、REPL 循环之前加一行；<code>Run</code> 调用补 <code>sink</code>）：</p>
+<div class="sourceCode" id="cb15"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 呈现归消费方：REPL sink 写 stdout；root 从 agent 自己取，与 adkrun.Run 同源。</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a>    sink <span class="op">:=</span> newREPLSink<span class="op">(</span>os<span class="op">.</span>Stdout<span class="op">,</span> agent<span class="op">.</span>Name<span class="op">(</span>ctx<span class="op">))</span></span></code></pre></div>
+<div class="sourceCode" id="cb16"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a>        produced<span class="op">,</span> err <span class="op">:=</span> adkrun<span class="op">.</span>Run<span class="op">(</span>ctx<span class="op">,</span> runner<span class="op">,</span> agent<span class="op">,</span> fmt<span class="op">.</span>Sprintf<span class="op">(</span><span class="st">&quot;turn-%d&quot;</span><span class="op">,</span> turn<span class="op">),</span> messages<span class="op">,</span> sink<span class="op">,</span> <span class="kw">func</span><span class="op">(</span>info guard<span class="op">.</span>ApprovalInfo<span class="op">)</span> <span class="op">(</span><span class="dt">string</span><span class="op">,</span> <span class="dt">error</span><span class="op">)</span> <span class="op">{</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 5: 全量检查</strong></label></li>
+</ul>
+<p>Run: <code>gofmt -l . &amp;&amp; go build ./... &amp;&amp; go vet ./... &amp;&amp; go test ./... -race</code> Expected: <code>gofmt</code> 无输出；全部包测试通过（含 taskboard 集成测试——它们走 <code>runner.Run</code>，不受影响）。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 6: 提交</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb17"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> add yk-tako-eino/internal/adkrun/event_test.go yk-tako-eino/internal/adkrun/turn.go yk-tako-eino/internal/adkrun/turn_test.go yk-tako-eino/cmd/yktako/main.go yk-tako-eino/internal/taskboard/tools.go</span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> commit <span class="at">-m</span> <span class="st">&quot;adkrun：事件产出接线，打印从驱动层搬走；Run/consume 加 sink（nil=不呈现）&quot;</span></span></code></pre></div>
+<hr />
+<h2 id="task-4-t15-验收关口">Task 4 (T1.5): 验收关口</h2>
+<p><strong>Files:</strong> 无（发现问题回到对应 Task 修）</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 1: 机器验收（《10》§6 关口 2）</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb18"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino</span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="ex">gofmt</span> <span class="at">-l</span> .</span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> build ./...</span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> vet ./...</span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> test ./... <span class="at">-race</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-rn</span> <span class="st">&#39;fmt.Printf&#39;</span> internal/adkrun/</span></code></pre></div>
+<p>Expected: <code>gofmt</code> 无输出；build/vet 通过；测试全绿；<code>grep</code> 无输出（呈现彻底出包）。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 2: 人工判定（需要 <code>.env</code> 配好模型 key；没有可跳过并记录）</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb19"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino <span class="kw">&amp;&amp;</span> <span class="ex">go</span> run ./cmd/yktako</span></code></pre></div>
+<p>输入一句多步任务（例：<code>帮我看看：先查现在时间，再算 1234*5678，最后写个总结</code>），对照四条输出格式：</p>
+<ul>
+<li>工具调用：<code>  → 🔧 调用: &lt;工具名&gt;</code>（子代理带 <code>[名字] </code> 前缀）</li>
+<li>工具回执：<code>  ← 🔧 &lt;工具名&gt;: &lt;单行内容，超 120 字带 …&gt;</code></li>
+<li>看板：<code>  📋 &lt;看板原文，多行不截断&gt;</code></li>
+<li>正文：空行 + <code>🐙 &lt;内容&gt;</code> + 空行</li>
+</ul>
+<p>内容因模型而异，<strong>只看格式</strong>是否与重构前一致。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 3: 记录验收结论</strong></label></li>
+</ul>
+<p>把结果（含无法人工验收的原因，若跳过）写进 Task 5 的台账日志。</p>
+<hr />
+<h2 id="task-5-t16-文档同步与台账">Task 5 (T1.6): 文档同步与台账</h2>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Modify: <code>yk-tako-eino/README.md:73</code></li>
+<li>Modify: <code>doc/01-任务看板与单入口.md:85</code></li>
+<li>Modify: <code>doc/07-任务规划与看板.md:160</code></li>
+<li>Modify: <code>doc/10-最小Web-UI.md</code>（§4 锚点 + <code>approval</code> 行口径）</li>
+<li>Modify: <code>doc/09-设计了解.md</code>（§5/§11 锚点刷新）</li>
+<li>Modify: <code>doc/11-最小Web-UI实施计划.md</code>（状态、P2、日志）</li>
+<li>复查: 根 <code>README.md</code></li>
+</ul>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 1: <code>yk-tako-eino/README.md:73</code></strong></label></li>
+</ul>
+<p>原：<code>internal/adkrun    事件打印（含看板投影）、interrupt 审批回路、内存 checkpoint</code> 改：<code>internal/adkrun    事件产出（Event/Sink，呈现归消费方）、interrupt 审批回路、内存 checkpoint</code></p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 2: <code>doc/01-任务看板与单入口.md:85</code></strong></label></li>
+</ul>
+<p>原：<code>- **流式投影**：</code>adkrun<code>的</code>printMessage<code> 认四个账本工具名，回执格式化打印 📋 看板</code> 改：<code>- **流式投影**：</code>adkrun<code>按账本工具名把回执分类成 board 事件，📋 看板投影由消费方 sink 打印（REPL sink 在</code>cmd/yktako/sink.go<code>）</code></p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 3: <code>doc/07-任务规划与看板.md:160</code></strong></label></li>
+</ul>
+<p>原：<code>| 流式投影（</code>adkrun<code>认看板工具，原样打印 📋 看板） |</code>internal/adkrun/turn.go<code> | ✅ Task 4 |</code> 改：<code>| 流式投影（分类归 </code>adkrun<code>（</code>IsBoardTool<code>），打印归 REPL sink） | </code>internal/adkrun/event.go<code>+</code>cmd/yktako/sink.go<code> | ✅ Task 4 |</code></p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 4: <code>doc/10-最小Web-UI.md</code> 锚点刷新</strong></label></li>
+</ul>
+<p>先跑 <code>grep -n 'printMessage\|turn\.go' doc/10-最小Web-UI.md</code>，逐处替换（行号以执行时为准）：</p>
+<ul>
+<li><code>:28-29</code>、<code>:120</code>：<code>printMessage</code> / <code>turn.go:157</code> 的指向改为「分类在 <code>internal/adkrun/event.go</code>（<code>eventFrom</code>），格式化在 <code>cmd/yktako/sink.go</code>」；</li>
+<li><code>:123</code>：「<code>printMessage</code> 整体搬过去」改为「分类留 <code>adkrun.eventFrom</code>，格式化搬 <code>cmd/yktako/sink.go</code>」；</li>
+<li><code>:132</code>、<code>:137-140</code>、<code>:144</code>：<code>consume</code> / 分类行号 → 新 <code>turn.go</code> 的 <code>consume</code> 行号与 <code>event.go</code> 的 <code>eventFrom</code> 行号；</li>
+<li><code>:140</code>：<code>approval</code> 行末尾补「（T1 口径：由消费方 ask 产出，不经 sink）」；</li>
+<li><code>:154</code>、<code>:159</code>：<code>ask</code> / <code>ResumeWithParams</code> 行号按新 <code>turn.go</code> 刷新；</li>
+<li><code>:169</code>：<code>Store</code>（<code>turn.go:25</code>）确认是否漂移，未动则不改。</li>
+</ul>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 5: <code>doc/09-设计了解.md</code> 锚点刷新</strong></label></li>
+</ul>
+<p>先跑 <code>grep -n 'turn\.go:' doc/09-设计了解.md</code>（约 15 处），逐处按新代码刷新；重点：</p>
+<ul>
+<li><code>:157-160</code>（子代理前缀）：不再在 <code>adkrun</code>，改指 <code>cmd/yktako/sink.go</code> 的 <code>newREPLSink</code>；</li>
+<li><code>:134</code>（筛历史）：<code>consume</code> 新行号；</li>
+<li><code>Run</code> 入口 / <code>root</code> / <code>checkpointID</code>（原 <code>:74/:75/:83/:77-79/:106</code>）：按新 <code>turn.go</code> 刷新；</li>
+<li><code>:142-150</code>（interrupt 过滤）、<code>:98-110</code>（写入端）：按新 <code>turn.go</code> 刷新；</li>
+<li><code>:64-70</code>（Run 注释里 root 那笔账）：按新注释行号刷新；</li>
+<li><code>:20/:30-31</code>（Store 与编译期断言）：未动则不改。</li>
+</ul>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 6: 根 <code>README.md</code> 复查</strong></label></li>
+</ul>
+<p>Run: <code>grep -n '打印\|事件\|adkrun' README.md</code> Expected: 无涉及 <code>adkrun</code> 打印职责的表述；有则同步改，没有则跳过。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 7: 更新 <code>doc/11-最小Web-UI实施计划.md</code></strong></label></li>
+</ul>
+<ul>
+<li>§1 状态表：T1 行改 ✅（带 commits 与日期）；</li>
+<li>§3.2：T1.1–T1.6 全部勾 ✅；</li>
+<li>§3.1 第 2 条：「待 T1.3 定夺并记录理由」改为「已定：<code>cmd/yktako</code>（P2 关闭，理由记在 <code>sink.go</code> 注释）」；</li>
+<li>§5：P2 行改 ✅（落点 <code>cmd/yktako</code>，理由一行）；</li>
+<li>§3.4：清单逐项勾 ✅（<code>doc/02</code> 与 <code>maf/doc/10-MAF…</code> 两项「不改」同样勾）；</li>
+<li>§6：倒序追加 T1 完成日志（日期 | T1 | 各 commit | 摘要，含 Task 4 验收结论）。</li>
+</ul>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 8: 提交</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb20"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> add yk-tako-eino/README.md doc/01-任务看板与单入口.md doc/07-任务规划与看板.md doc/09-设计了解.md doc/10-最小Web-UI.md doc/11-最小Web-UI实施计划.md</span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> commit <span class="at">-m</span> <span class="st">&quot;doc：T1 事件 sink 完成——锚点刷新、README 与台账同步&quot;</span></span></code></pre></div>
+<hr />
+<h2 id="不在本计划范围防范围膨胀依据-doc11-5-与105">不在本计划范围（防范围膨胀，依据 doc/11 §5 与《10》§5）</h2>
+<ul>
+<li><code>approval</code> / <code>error</code> 的事件化：T2.3 再定（approval 目前由消费方 ask 产出）；</li>
+<li>token 级 delta、HTTP + SSE、会话存储、embed 单页：T2，等 T1 定型后另出计划；</li>
+<li><code>internal/repl</code> 的任何改动（保持「与 Eino 无关」）。</li>
+</ul>
+<hr />
+<h2 id="执行偏差记录执行后补记2026-09-26">执行偏差记录（执行后补记，2026-09-26）</h2>
+<p>计划在实施中被两轮审查修正，代码以提交为准，偏差逐条记录：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>计划原文</th>
+<th>实际执行</th>
+<th>依据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Task 1 测试</td>
+<td><code>TestEventFrom</code> 6 用例</td>
+<td>8 用例（补「调用与正文并存时弃正文」「回执角色只取 msg」）</td>
+<td>质量审查：钉分类优先级与 mv.Role 路径 → <code>eaa8e41</code></td>
+</tr>
+<tr>
+<td>Task 1 注释</td>
+<td>「Role / ToolName 以 mv 优先，msg 兜底」</td>
+<td>改为「tool 判定取 OR；ToolName mv 优先、msg 兜底；Event.Role 一律取 msg」</td>
+<td>同上（注释虚述）</td>
+</tr>
+<tr>
+<td>Task 2 看板用例</td>
+<td><code>want: "  📋 看板\n第二行\n"</code>（计划笔误）</td>
+<td><code>"  📋 📋 看板\n第二行\n"</code>——旧 printMessage 同样双 marker，逐字符一致优先</td>
+<td>实现者发现、双审确认</td>
+</tr>
+<tr>
+<td>Task 2 测试加固</td>
+<td>6 用例</td>
+<td>11 用例（前缀矩阵、空 Agent、未知 Kind）+ <code>default</code> 注释 + <code>taskboard.ToolList</code></td>
+<td>质量审查 → <code>6950f85</code></td>
+</tr>
+<tr>
+<td>Task 3 范围</td>
+<td>未列 <code>taskboard/tools.go</code></td>
+<td>增补 3e：<code>IsBoardTool</code> 注释改指 <code>eventFrom</code></td>
+<td>质量审查发现悬空引用</td>
+</tr>
+<tr>
+<td>Task 3 测试加固</td>
+<td>序列测试只断言 Kind</td>
+<td>断言载荷 + 子代理透传；新增 interrupt 同帧测试（后改名并钉根因过滤）</td>
+<td>质量审查 → <code>d609d3d</code>、<code>6ecd330</code></td>
+</tr>
+<tr>
+<td>Task 5 收尾</td>
+<td>Step 8 的 git add 清单未含计划文件本身；doc/10 §1 的 main.go 锚点首轮漏刷</td>
+<td>计划文件随本次 doc 提交入库；main.go 锚点于终审修正</td>
+<td>质量审查 → 本修正提交</td>
+</tr>
+<tr>
+<td>终审</td>
+<td><code>Run</code>→<code>sink</code> 转发无回归、<code>Event.Role</code> 注释不精确</td>
+<td>Run 级事件断言 + 字段注释补正</td>
+<td>终审审查 → 本提交</td>
+</tr>
+</tbody>
+</table></div>
+<p>T1 提交对应：Task 0 <code>e1aafd9</code>；Task 1 <code>31e88a6</code>+<code>eaa8e41</code>；Task 2 <code>12e08c0</code>+<code>6950f85</code>；Task 3 <code>c0e4c7b</code>+<code>d609d3d</code>+<code>6ecd330</code>；Task 4 验收（无代码提交，证据见 doc/11 §6）；Task 5 本文件所在提交。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/archive/old-line/plans/2026-09-26-web-ui-sink.md"><code>doc/archive/old-line/plans/2026-09-26-web-ui-sink.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

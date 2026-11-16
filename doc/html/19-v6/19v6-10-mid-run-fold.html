@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>19v6-10 · mid-run fold（run 中途压缩 · 立项方案） · tako 文档</title>
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="19v6-10--mid-run-foldrun-中途压缩--立项方案">19v6-10 · mid-run fold（run 中途压缩 · 立项方案）</h1>
+<blockquote>
+<p><strong>验收：2026-10-12 用户判定 A5 完成。</strong> 第 7 项的活体话本退役，保留区只翻 seq=0 的规则继续由 <code>store_test</code> 的合成行覆盖。第 9 项以同一份程序上、没有折叠的四端点形状为准，<code>d1-*</code> 里没有 <code>model</code> 的旧字节不再当对照。第 10 项以巨大 <code>write_file</code> 参数在同一次 run 里顶过 3200、并打出 <code>compact mid-run</code> 为准；「大参数留到下一掷才折」不再当通过条件。摘要上限 1024 三次拒收导致整折失败，记在文末实施偏离里，不挡住这一拍。证据与逐项记录见文末「验收回填」。</p>
+</blockquote>
+<blockquote>
+<p><strong>立项：2026-10-11（用户裁「现在就要立项…我是让你出方案的」）</strong>。本篇取代原需求登记， 把立项要裁的三件事 + 三件套不变量闸门全部裁掉；19v6-07 §5 的同名条目以本篇为准。 施工前的事实依据 = runengine 压缩链全量实读（worker/compact/pgstore + eino v0.9.21 钩子面），行号级证据在施工台账。 2026-10-11 自查修订：潜伏边由不可达变为正常态（初修 = 挂点退让；同日用户裁改为 <strong>同槽换代 UPSERT</strong>——mh 本有 id 主键，撞槽即换代、无退让无兜底）；user 行钉死与 后缀预算含 user 行（恒有解推导）；三处事实措辞修正。 2026-10-11 复审修订（证据 = eino v0.9.21 实源码 adk/handler.go、wrappers.go、 chatmodel.go、react.go 逐行核）：<strong>system 行进折叠公式</strong>——state.Messages[0] 恒是 ADK 种入的 system 消息，§8 补它的切分/重写/回写三处位置；<strong>传递机制点名</strong>——staged / 标签 / 折后 state 走 run 级容器（比照 agentModelTable 的 ctx 携带先例），折后 state 的取货口 = AfterAgent 钩子；<strong>新裁定</strong>——keep 区活摘要 run 的翻转粒度（§10，复审 发现的静毒洞）；§4 After 钩子机制纠错；§0 活摘要不变量改述；§9 errStillOver 可达 路径收窄；连续 user 行、挂载顺序、重试不重复触发登记入册。</p>
+</blockquote>
+<h2 id="0-地基五个词的真身">§0 地基：五个词的真身</h2>
+<p><strong>Run</strong> = 用户发一条消息到引擎给出终稿的一次执行。run 起手时引擎往 PG 抢闸 （<code>runs</code> 表部分唯一索引，<code>running</code> 行 = 会话同时只允许一个 run），并把这条 user 消息 写进 <code>run_model_messages</code> 表（简称 <strong>mh</strong>），恒 seq=1。run 进行中 mh 里这个 run <strong>只有 这一行</strong>——后面每轮模型产出在引擎内存累积，要等 run 结束（EndRun）才落库。</p>
+<p><strong>mh 行长什么样</strong>：一次带工具调用的 run 落库后共 4 行——</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>seq</th>
+<th>role</th>
+<th>text</th>
+<th>tool_calls 列</th>
+<th>tool_call_id 列</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>user</td>
+<td>用户消息</td>
+<td>NULL</td>
+<td>NULL</td>
+</tr>
+<tr>
+<td>2</td>
+<td>assistant</td>
+<td>本轮正文（可空）</td>
+<td>模型原生 JSON：<code>[{"id":"call_abc",…,"function":{…}}]</code></td>
+<td>NULL</td>
+</tr>
+<tr>
+<td>3</td>
+<td>tool</td>
+<td>工具结果全文</td>
+<td>NULL</td>
+<td><code>call_abc</code>（字面对上上一行某条 id）</td>
+</tr>
+<tr>
+<td>4</td>
+<td>assistant</td>
+<td>终稿正文</td>
+<td>NULL</td>
+<td>NULL</td>
+</tr>
+</tbody>
+</table></div>
+<p>多次工具调用 = 第 2、3 行重复几轮再接终稿行。provider 铁律：<strong>tool 行必须紧跟发起它的 assistant(tool_calls) 行</strong>，中间插任何消息都拒收——本篇 §7 的一切都从这一行字展开。</p>
+<p><strong>compacted 标记</strong>：每行一个布尔。<code>false</code> = 模型看得见；<code>true</code> = 已被压缩、只留档不进 输入。热查询只读 <code>compacted=false</code> 的行，按 <code>(run_id, seq)</code> 排（run_id 是 ULID，字典序 即时序）。</p>
+<p><strong>seq=0 摘要行</strong>：压缩的产物。把被压段的原文行翻成 <code>compacted=true</code>，调一次 summarize 产出<strong>一份</strong>摘要，作为 <code>seq=0</code>、<code>role=user</code> 的新行挂到「被压段里时间最晚的那个 run」 上；那个 run 的 0 号槽若已被占（mid-run 时代的正常态，见 §5），写入走<strong>同槽换代</strong> （UPSERT）而非撞车。摘要数量的准确不变量 = <strong>每次折叠事件把当时可见的旧摘要全部 并入新摘要、旧行翻死留档</strong>（换代点除外，见 §5 代价登记）；两个折叠事件之间，库里 可以并存分属不同 run 的多份活摘要——mid-run 时代每个被折过的 run 都带一份摘要 + 保留轮次（§5），它们概括不同时段、内容不重复，下一次折叠经 oldSummaryRuns 机制 一并收编（「此前摘要，请合并进新的摘要」）。</p>
+<p><strong>countInput</strong>：压缩的长度自测——<code>system 提示词 + 每行文本</code> 过 cl100k 分词器求和， 跟 <code>limit = window − min(window/5, 16384)</code> 比（三期重裁后；其前为 <code>window×4/5</code>）。 触发线、POST 准入线、摘要预算上限三处共用这一个 limit。 <strong>现口径的洞</strong>：只数 <code>text</code> 列，<code>tool_calls</code> 的 JSON 一个字不计——而工具参数才是工具环 时代的真实体积大头（<code>write_file</code> 一次调用可以把整份文件内容塞进参数）。本篇 §6 补。</p>
+<p><strong>Run fold（现役）</strong>：下刀点只有一处——<strong>run 起手前</strong>（prepareInput 发送前自测）。 那一刻当前 run 在 mh 里只有 user 一行，所以折叠对象 = 全部已完成 run；keep = 最近 n 个 完整 run（n 从 20 降档），drop = 更老的；foldInput 是纯函数不落库，产出 <code>stagedCompaction{DropRunIDs, Summary, AttachRun}</code> 暂存内存，run 结束（EndRun）时与 放闸、定稿<strong>同一笔 PG 事务</strong>落库：被折行 <code>UPDATE compacted=true</code> + <code>INSERT seq=0 摘要行</code>。 error / 闸失 / 进程死 = 零写入，下轮从原文重压。</p>
+<h2 id="1-病灶run-中途为什么会顶穿窗口">§1 病灶：run 中途为什么会顶穿窗口</h2>
+<p>今天 F 系列文件工具已落地，一个真实场景：用户说「把这三个日志文件读完，写一份汇总 报告」。</p>
+<ol type="1">
+<li>run 起手前自测通过（历史不长，远低于 limit）；</li>
+<li>模型进 ReAct 工具环：第一轮 <code>read_file</code> 读 a.log（200KB ≈ 5 万 token），结果<strong>灌进 上下文</strong>；再读 b.log、c.log，上下文又涨十几万 token；</li>
+<li>中途某次模型调用前，输入顶穿窗口 → provider 以「输入太长」打回 → run 走 error 结局 → 用户重投 → 自测还是通过 → 模型做出一模一样的调用、读一模一样的文件、死在 同一轮。<strong>会话事实上卡死在这条消息上。</strong></li>
+</ol>
+<p>注意病灶的准确形状：<strong>run 起手前确实压过一次（Run fold），问题不在那一次没压，而在 ReAct 中途读文件涨出来的部分根本没被那一次覆盖</strong>——起手前压，压不到起手后。Run fold 够不着它有两个结构性原因：</p>
+<ul>
+<li><strong>下刀点在前</strong>：fold 的时机是 run 起手前，超窗的增长发生在 run 中间，下刀时那部分 还不存在；</li>
+<li><strong>更根本的：run 中途的行不在 mh 里</strong>。assistant/工具结果轮次在引擎内存累积，EndRun 才落库。Run fold 的原料是 mh 表，它对 run 中途的增长<strong>连看都看不见</strong>，更别说压。</li>
+</ul>
+<p>同病灶还有两个兄弟方案（19v6-07 §5 登记）：<strong>溢出修复层</strong>（19v6-09：provider 报错后 强制压缩、只重试一次）与 <strong>trimToolResults</strong>（压缩后仍超则砍工具结果体积）。三者关系 在 §9 一并裁。</p>
+<p><strong>所以这解决了什么</strong>：把下刀点从「run 起手前」扩到「run 进行中每轮模型调用前」， 让「读大文件的长 run」不再死在中途——这是 mid-run fold 存在的全部理由。</p>
+<h2 id="2-端到端链路方案落在哪一环">§2 端到端链路：方案落在哪一环</h2>
+<p>今天的链路（<code>▼</code> = 本篇方案插入处）：</p>
+<pre><code>用户 POST → 准入（单条消息 ≤ limit/3）→ 抢闸（PG 唯一索引）
+  → goroutine Run：
+      prepareInput：读 mh 可见行 → countInput → 超线？→ Run fold（staged 暂存）
+      ▼
+      ADK 主循环（ReAct 工具环）：
+          ┌─ 每轮模型调用前：BeforeModelRewriteState 钩子        ◄── 方案落点
+          │    （本篇：自写 middleware 在此数长度、超线就折 state）
+          ├─ 模型调用（流式 delta 帧）
+          └─ 工具执行（tool_call/tool_result 帧；结果回注 state）
+      → EndRun（唯一 PG 写点）：放闸 + 定稿 + staged 落库 + mh 行 + runlog 行
+          （commit 后 Redis 半：terminal 帧 + 删 runepoch）</code></pre>
+<p>钩子是 eino ADK 的 <code>BeforeModelRewriteState</code>：<strong>run 内每一次模型调用前</strong>触发，入参是 本轮的 state（含全部消息列表），改动会持久进后续迭代。方案的机械结构一句话：<strong>middleware 在钩子里对 state 数长度，超线就调 v6 自己的折叠链把 state 里的旧消息折成一份摘要， 模型下一轮看到的就是「摘要 + 最近若干轮原文」</strong>；PG 一个字不动，run 结束后由 EndRun 把折后的世界照常住库。</p>
+<p>链路每一环的四问：触发者 = middleware（每轮模型调用前）；输入 = state 消息列表 + 「哪段是历史、哪段是当前 run 轮次」标签（run 级容器携带，机制见 §8）；产出 = 改后 的 state（消费者 = 本轮模型调用）；不动的 = mh 表、runlog、闸、帧（四端点字节零变化）。</p>
+<h2 id="3-裁定一览">§3 裁定一览</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>决策点</th>
+<th>裁定</th>
+<th>一句话理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>D1</td>
+<td>触发面</td>
+<td>自写 middleware 挂 <code>BeforeModelRewriteState</code>；<strong>每轮全量重数</strong>，超线才折</td>
+<td>成本被窗口钉死（≤1s vs 模型调用数秒起）；零漂、单代码路径</td>
+</tr>
+<tr>
+<td>D2</td>
+<td>落库</td>
+<td><strong>没有第二写点</strong>：只改内存 state；PG 写点仍是 EndRun 一处（staged 列表：只写最后一份摘要 + DropRunIDs 并集翻转）；mh 写入源改为折后 state；runlog 照写全量 turn</td>
+<td>闸串行化 + 无人中途读 mh ⇒ 中途落库无消费者；零写入家族原样保住</td>
+</tr>
+<tr>
+<td>D3</td>
+<td>计数</td>
+<td>基数 = text + tool_calls JSON（Run fold 与 mid-run <strong>统一</strong>）；工具 schema 不计（登记）</td>
+<td>现口径对工具参数全盲，工具环时代先瞎在这</td>
+</tr>
+<tr>
+<td>三件套①</td>
+<td>下刀粒度</td>
+<td>老 run 整 run 下刀（路线 A）；当前 run 内 user 行钉死 + 按「交换单位」后缀保留</td>
+<td>最小引入消息粒度——B 是被本篇用例逼出的最小形</td>
+</tr>
+<tr>
+<td>三件套②</td>
+<td>role 回扩</td>
+<td>保留的第一个交换单位不允许以 tool 行开头；候选切点回退到发起它的 assistant(tc) 行</td>
+<td>provider 铁律，违反 = 下一次调用 400</td>
+</tr>
+<tr>
+<td>三件套③</td>
+<td>在途豁免</td>
+<td>后缀保留天然罩住最新在途交换；保留一条断言防将来改保留策略</td>
+<td>drop 只发生在前缀，最新交换永远在被保留的后缀里</td>
+</tr>
+<tr>
+<td>挂点</td>
+<td>摘要挂哪</td>
+<td>规则不变 = 被折段时序最后的 run；槽被占则<strong>同槽换代</strong>（UPSERT）</td>
+<td>「同 run 活摘要 + 可见原文」在 mid-run 后是正常态；撞槽的物理含义是换代、不是换 run（§5/§10）</td>
+</tr>
+<tr>
+<td>失败出口</td>
+<td>mid-run 压不进</td>
+<td>errStillOver = 干净 A：run error、零写入</td>
+<td>与 C2 已定出口同形；卡死逃生归兄弟层</td>
+</tr>
+</tbody>
+</table></div>
+<p>下面每节给完整推理和「没裁会怎样」。</p>
+<h2 id="4-d1-触发面挂哪什么信号数多少">§4 D1 触发面：挂哪、什么信号、数多少</h2>
+<p><strong>挂哪</strong>：自写 middleware，挂主 agent 的 <code>BeforeModelRewriteState</code>，排在 agentlog 之前（钩子按 Handlers 注册顺序逐个调用——wrappers.go <code>for _, handler := range w.handlers</code>；agentlog 只观测不改，顺序不动行为，动的是观测口径：compact 在前，日志 看到的就是模型实际所见的折后输入）。不抄 eino 内置 summarization middleware——§12 的四条否决理由在本篇语境全部仍然成立，且它只钉 system 前缀、对话尾部无保留区，会把 「刚拿到、模型还没看」的工具结果一起压掉，与本方案的后缀保留根本对立。</p>
+<p><strong>什么信号</strong>：每轮模型调用前，对当前 state 全量 countInput（§6 基数），<code>&gt; limit</code> 才进折叠；折完必 <code>&lt; limit</code>（折叠定案条件本身），所以<strong>不存在「压后仍超、每轮重复重压」 的活锁</strong>——这是 n 降档 + errStillOver 已覆盖的家族语义，只是触发点挪进 run 内。</p>
+<p><strong>数多少（全量 vs 增量）</strong>：裁<strong>每轮全量重数</strong>。账：窗口把历史钉死在 ≤256k token （约 1MB 文本），cl100k 全量编码一遍 ≤1s；而钩子的服务对象是每次<strong>数秒起</strong>的模型 调用——占比可忽略。增量扣减要维护「累计值 + 每次追加的记账点 + 折叠后的重基」三套 记账，多一条计数代码路径就多一种和全量数对不上账的漂法；而折叠链内部本来就在反复做 组装后计数（n 降档每档一次）。<strong>没裁会怎样的对称面</strong>：若裁增量，省下的是每轮一次 亚秒级纯 CPU，换来的是漂账风险——不值得。</p>
+<p><strong>没裁触发面的具体事故</strong>：如果只挂 prepareInput（= 现状），§1 的故事就是终局； 如果挂别的钩子（AfterModelRewriteState）——它的返回 state 同样持久进后续迭代 （wrappers.go：After 循环后 <code>ProcessState</code> 写回），所以「白折」不是它的死因；真正的 死因是<strong>模型调用报错时 After 钩子根本不执行</strong>（wrappers.go：调用 err 直接 return， After 循环被跳过）——超窗场景恰恰是这次调用会被 provider 拒收，After 下刀永远晚于 死期。Before 是唯一能在「这次调用发出前」动 state 的位点。顺带登记：<strong>模型重试不 重复触发钩子</strong>（retry_chatmodel.go：retry 不再跑 state 管理钩子），不存在「重试叠 一次折叠」。</p>
+<h2 id="5-d2-落库为什么没有第二写点--挂点同槽换代">§5 D2 落库：为什么没有第二写点 + 挂点同槽换代</h2>
+<p>原登记担心「mid-run 下刀要在 run 中途落 compacted 态，第二个写点的事务边界与回滚 语义全部重推」。实读代码后这个前提<strong>不成立</strong>：run 中途落库没有任何消费者——</p>
+<ul>
+<li>闸在 PG 唯一索引上：run 活着期间，别的副本对这个会话的一切写入 409；没有任何 API 在 run 中途读 mh（frames 读 Redis，log 读 runlog，session 读 runs 表）；</li>
+<li>进程死（kill -9）：turn 本来就蒸发，折叠跟着一起蒸发——mh 原样，下轮 Run fold 从 原文重压，零写入家族原样成立（闸失/进程死；「失败且无产出」的 error 同理——失败留痕只让 <strong>有产出</strong>的 error 落已产出的内容，不改 staged 的落库条件）；</li>
+<li>error 结局：staged 被 complete 分支条件丢弃（现状如此），mid-run 折过的痕迹全在 内存，随 run 死光。「error 只留 user 半」的可见集语义不动。</li>
+</ul>
+<p>所以裁定：<strong>mid-run fold 只改内存 state，PG 仍只有 EndRun 一个写点</strong>。但这带来三个 连带改动，全是本篇施工面：</p>
+<ol type="1">
+<li><strong>mh 写入源从 turn 换成折后 state</strong>：今天 EndRun 按内存 <code>turn</code> 逐轮落 mh；mid-run fold 之后 state（模型视图）比 turn（全量审计视图）短——被折掉的轮次<strong>从未落库</strong>， 没有洞、没有补删。若仍按 turn 写，等于把折掉的又写回去，折叠白做。写入时跳过 当前 run 的 user 行（seq=1 已由 AcquireRun 落库，重写会撞 UNIQUE）。</li>
+<li><strong>runlog 照写全量 turn</strong>：展示历史一条不缺（用户回看时中间几轮工具调用都在）， 被折的只是模型的输入视图。两表投影分离（runlog 记产出、mh 记模型该看什么）的 既有原则原样延伸。</li>
+<li><strong>staged 从单个变列表</strong>：一轮 run 可能先经历 Run fold（起手前）再经历若干次 mid-run fold。每次折叠的 renderFold 都拿 state 里的上一份摘要当原料并掉，所以 <strong>只落最后一份摘要</strong>（其内容已包含前序各份）+ 各次 DropRunIDs 的并集翻转 （<code>UPDATE … WHERE compacted=false</code> 幂等，天然防半写；keep 区旧摘要 run 只翻 seq=0 行的粒度细化见 §10）。挂点 = 最后那次的 AttachRun。</li>
+</ol>
+<p><strong>挂点与同槽换代</strong>（消息粒度的挂点重推，三件套①的推理核；自查发现、用户裁机制）：</p>
+<p>挂点规则<strong>不变</strong>——仍挂「被折段时序最后的 run」（19v6-07 §2 原规则）。变的是对撞槽的 处理。Run fold 时代挂得上摘要的 run 必然没有 seq=0 行（它若被挂过，原文行当时就全翻 死、永不复见），所以 INSERT 从不撞车；mid-run fold 把摘要挂在当前 run 而当前 run <strong>保留可见轮次</strong>——「同一 run 同时有活摘要与可见原文行」从潜伏边（19v6-07 §5：手工 INSERT 才造得出）<strong>变成每个被 mid-run 折过的 run 的正常形态</strong>，这种 run 再被整体折入 时就是挂点，旧 INSERT 会撞 <code>UNIQUE(run_id, seq)</code>（死行不释放槽位）→ EndRun 整笔回滚、 run 白跑。</p>
+<p>处理：<strong>摘要写入从 INSERT 改为 UPSERT</strong>：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode sql"><code class="sourceCode sql"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">INSERT</span> <span class="kw">INTO</span> run_model_messages (<span class="kw">id</span>, session_id, run_id, seq, <span class="kw">role</span>, text, compacted, created_at)</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">VALUES</span> (?, ?, ?, <span class="dv">0</span>, <span class="st">&#39;user&#39;</span>, ?, <span class="kw">false</span>, now())</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">ON</span> CONFLICT (run_id, seq) DO <span class="kw">UPDATE</span> <span class="kw">SET</span> text <span class="op">=</span> EXCLUDED.text, compacted <span class="op">=</span> <span class="kw">false</span></span></code></pre></div>
+<p>撞槽的物理含义不是「换个 run 挂」，是**「这个 run 的摘要槽要换代」**——旧摘要的内容 已并入新摘要（renderFold 重压合并保证），槽位原样、内容焕新；<code>id</code> 不动（行还是那行， §13 验收断言 id 不变即据此）。mh 行本来就有 id 主键（<code>msg_&lt;ULID&gt;</code>）：不需要加列、 不需要占用查询、不需要退让或兜底。<code>UNIQUE(run_id, seq)</code> 继续做机器守卫——<strong>绝不能撤</strong>： 撤了撞槽就从响亮错误变成「同 run 两份 seq=0」的静默腐败；保留它 + UPSERT = 约束当 守卫、冲突即换代。</p>
+<p>代价登记：换代点的旧摘要<strong>逐字稿</strong>被覆盖（死摘要留档原则在换代点让位）；其内容不丢 （已并入新摘要），丢的只是上一代摘要的原文。纯 Run fold 路径下挂点槽恒空， UPSERT ≡ INSERT——既有行为逐字节不变。</p>
+<p><strong>没裁这条的具体事故</strong>：若坚持 run 中途落库，就得回答「中途这笔事务和闸/租约什么 关系、error 后回滚不回滚、kill -9 留下半截压缩态怎么办」——三个问题今天的答案全部 是「不存在」，因为唯一写点设计本来就避开了它们；为不存在的消费者建写点，纯负债。 若不做同槽换代，第二个被折季就是 UNIQUE 回滚季（上面的事故）。</p>
+<h2 id="6-d3-计数基数频率schema">§6 D3 计数：基数、频率、schema</h2>
+<p><strong>基数</strong>：<code>system + Σ(每行/每条消息 text) + Σ(tool_calls JSON 序列化文本)</code>。 tool_calls 进基数是<strong>补洞</strong>：今天 <code>write_file</code> 把整份文件内容写进参数，计数器全盲—— 工具环时代先瞎在这。Run fold 与 mid-run fold <strong>共用同一基数同一函数</strong>，不存在两套 长度。<strong>代价登记</strong>：工具密集会话的触发线会比现在灵敏（以前少算了参数），dev 旗标 时代校准，属修正而非回归。</p>
+<p><strong>schema 不计</strong>：厂商每次调用重发的工具声明清单不进触发。v6 当前目录小（11 个文件 工具 + 少量基础工具），计入只是把 limit 平移；WeKnora 战例（232 个 MCP schema ≈ 10 万 token）那是目录大潮时的重裁项，随 MCP 工具 loop 立项一并复议（19v6-07 §1 复审项原文 挂着，本条不提前消费）。讨论稿在 <code>doc/24-用量计数.md</code>（2026-10-15）：声明仍然不进触发； 场内滤掉思考重发；有账单时可用 Usage 基线加 delta，无账单仍全量 <code>countInput</code>。</p>
+<p><strong>频率</strong>：每轮全量（§4 的账）。实现可带「state 未变则跳过」短路，属优化不改裁定。</p>
+<p><strong>没裁基数的事故</strong>：<code>write_file</code> 这类把整份内容写进参数的调用在计数器里隐形 （<code>read_file</code> 的大头在结果、走 text 列，今天照数；参数侧才是真盲区），直到 provider 以「太长」拒收才现身——正是 19v6-09 溢出修复层要接的报错，本篇把它从触发面就堵住一半。</p>
+<h2 id="7-三件套不拆配对今天为什么免费mid-run-怎么把它守住">§7 三件套：「不拆配对」今天为什么免费、mid-run 怎么把它守住</h2>
+<p><strong>今天的免费午餐</strong>：「assistant(tool_calls) 行与其 tool 结果行相邻、同 run_id」 不靠任何检查——折叠单位是整个 run，run 边界天然就是工具往返的完整单位，切整个 run 永远切不坏配对；落库靠 EndRun 按轮序同一笔事务写，读回按同序重建。mid-run 在 run 中间下刀，亲手把这条免费保证撕掉，三个检查补上：</p>
+<p><strong>① 交换单位 = 下刀的最小单位</strong>。把当前 run 的轮次切成不可拆的单位： <code>assistant(tool_calls) + 它名下的全部 tool 行</code>（一次工具往返）/ <code>assistant 终稿行</code>。 <strong>user 行不是单位、永不被折</strong>——它是本轮问题的本体，折了模型不知道在答什么；user 行 恒在保留区首位（落库形态 = seq=0 摘要、seq=1 user、seq≥2 保留轮次，与 Run fold 的 老 run 形态同构）。老 run 仍整 run 切（路线 A 精神）；当前 run 内只允许切在交换单位 边界上，keep = user 行 + 最新若干交换单位的后缀，drop = 更老的前缀。这样 pairing 的 半边（drop 区里的 tool 行，其发起 assistant 比它更早，必同在被折前缀里）天然闭合， 剩另一半由 ② 守。</p>
+<p><strong>② role 回扩</strong>：保留的第一个交换单位不允许以 tool 行开头。若按 token 预算找切点时 落在了「assistant(tc) 已折、它的 tool 行要留」的位置，必须把保留区<strong>回退</strong>到发起它的 assistant(tc) 行（连带其 tool 行一起留）。没它 = 下一次模型调用 provider 直接 400， run 以 error 收场——而且这个错是折叠自造的，原文毫无问题。</p>
+<p><strong>③ 在途交换豁免</strong>：最新一轮 assistant(tool_calls) 与其还没回结果的工具调用，压不得 ——压掉发起方，结果回来即成孤儿。在后缀保留设计下<strong>天然成立</strong>：drop 只发生在前缀， 最新单位永远在被保留的后缀里；钩子的时机（每次模型调用前）又保证 state 尾部只可能是 两种完整形态：起手第一钩 = user 行，其后每钩 = 一组已回齐的工具结果。保留一条断言 （「保留后缀不得切断任何未完成交换」）防将来有人把保留策略改成非后缀（如「保留关键 轮」）。今天同步工具下它是摆设，异步工具 / HITL 行插入立项那天它变成真闸门——这正是 登记时把它列进三件套的前瞻价值。</p>
+<p><strong>三件套同拍的理由</strong>：三者守的是同一条 provider 铁律的三个破口，缺任何一个，另两个 的防护面就出现一个能穿进 400 的角。一次施工一起落，不留「下轮再补」的窗口。</p>
+<h2 id="8-折叠算法本身两个-fold-的对照共享与差异">§8 折叠算法本身：两个 fold 的对照、共享与差异</h2>
+<p><strong>共享的（同一函数同一语义，一行不改）</strong>——两个 fold 共用 C 系列已验收的整条链：</p>
+<ul>
+<li><strong>计数</strong>：countInput（cl100k）与同一个 limit（window − min(window/5, 16384)， 触发线/准入/摘要上限三处共用）；D3 的基数扩展（text + tool_calls JSON）写进这一个 函数，两个 fold 同步生效。 mid-run 侧的原料是 <code>[]*schema.Message</code>：<strong>转换层先行</strong>（切出 system 首条、其余行转 mh 行形状，见下「原料转换层」），再过同一个 countInput——函数签名不动，system 走 它已有的 system 形参。</li>
+<li><strong>转录</strong>：renderFold 四形态（<code>[User]</code> / <code>[Assistant]</code> / <code>[Assistant tool calls]</code> / <code>[Tool result &lt;name&gt;]</code>）+ 分级截断（工具结果 2000 / 参数每 value 400 字符）。</li>
+<li><strong>重压合并</strong>：旧摘要并入（「此前摘要，请合并进新的摘要」）、<strong>每次折叠把可见旧摘要 全并全翻死</strong>（准确不变量，§0；事件之间多份并存是正常态）、二级压缩不单做。</li>
+<li><strong>摘要调用</strong>：同一 ChatStream 直连（不经 ADK ⇒ 钩子里调它不递归触发钩子）、低温 0.3、 stall 超时、按失败原因分流的重试、三层验货（算术主检 + finish_reason 辅检 + 缺失处理）、 结构化六槽 + 预算上限 <code>S ≤ min(4096, limit/2)</code>。</li>
+<li><strong>fileOps 钉块</strong>：提取 / 继承 / 钉块 / 三档收口——mid-run 里被折的是当前 run 的 早段轮次，提取原料是同一批 tool_calls（write_file 路径不能随被折轮次消失）。</li>
+<li><strong>失败出口</strong>：errStillOver 哨兵 + 诊断参数格式 + 干净 A（error、零写入）。</li>
+<li><strong>落库</strong>：foldInput 纯函数出 staged → EndRun 唯一写点；放闸+定稿+压缩写同一笔事务； 幂等翻转（<code>UPDATE … WHERE compacted=false</code>）；<code>UNIQUE(run_id, seq)</code> 做机器守卫。</li>
+<li><strong>展示面</strong>：不动 runlog，四端点字节零变化（折叠不出帧）。</li>
+</ul>
+<p><strong>差异（逐项对照）</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Run fold（run 起手前）</th>
+<th>mid-run fold（run 中途）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>触发点</td>
+<td>prepareInput，每 run 一次</td>
+<td><code>BeforeModelRewriteState</code>，每轮模型调用前一次</td>
+</tr>
+<tr>
+<td>原料</td>
+<td>mh 可见行（全在库里）</td>
+<td>ADK 内存 state（当前 run 轮次未落库；「历史/当前 run」标签由 run 级容器携带，见下「worker 侧记账与传递机制」）</td>
+</tr>
+<tr>
+<td>可压对象</td>
+<td>已完成的老 run（下刀时当前 run 只有 user 一行，本来就压不到它）</td>
+<td>老 run + <strong>当前 run 的早段轮次</strong>——这才是本篇要的那部分</td>
+</tr>
+<tr>
+<td>下刀粒度</td>
+<td>整 run（run 边界 = 工具往返完整单位，「不拆配对」免费）</td>
+<td>老 run 整 run + 当前 run 内「交换单位」（消息粒度，三件套守门）</td>
+</tr>
+<tr>
+<td>keep 形态</td>
+<td>最近 n 个完整 run（n 从 20 降档）</td>
+<td>先 n 个老 run；仍超则当前 run「user 行钉死 + 交换单位后缀」（后缀预算 limit/3，user 行算进这份预算）</td>
+</tr>
+<tr>
+<td>当前 run 行</td>
+<td>原样跟尾、永不进 keep/drop</td>
+<td>user 行钉死；早段轮次可进 drop；被折轮次<strong>永不落库</strong></td>
+</tr>
+<tr>
+<td>挂点</td>
+<td>被折段时序最后的老 run（槽恒空，UPSERT ≡ INSERT）</td>
+<td>规则不变 = 时序最后的 run；槽被占 = 同槽换代（§5）</td>
+</tr>
+<tr>
+<td>staged 形态</td>
+<td>单个（prepareInput 最多一次）</td>
+<td>列表（Run fold + 若干次 mid-run fold；只落最后一份摘要 + DropRunIDs 并集翻转）</td>
+</tr>
+<tr>
+<td>EndRun 的 mh 写入源</td>
+<td>turn（折老 run 不动当前 run，turn ≡ state）</td>
+<td>折后 state（折了当前 run 轮次，turn ≠ state；runlog 仍写全量 turn，展示不塌）</td>
+</tr>
+<tr>
+<td>卡死形态</td>
+<td>起手前塞不下 → 干净 A，重投继续卡直到人工/换窗</td>
+<td>中途塞不下 → 干净 A，重投可能重演；逃生归 19v6-09 / trimToolResults</td>
+</tr>
+</tbody>
+</table></div>
+<p>一句话：<strong>共享的是「怎么压」（转录/摘要/验货/钉块/落库纪律），差异的是「压谁的哪一段、 什么时候看、以及折后怎么回写」</strong>。mid-run fold 没引入第二种压缩，是把同一条链的原料口 从「库里的旧 run」扩到「内存里的当前 run 轮次」。</p>
+<hr />
+<p><strong>新写</strong>（共享清单之外的全部增量）：</p>
+<ul>
+<li><strong>system 行钉首</strong>（复审补的承重事实）：<code>state.Messages[0]</code> 恒是 ADK 种入的 system 消息（chatmodel.go <code>defaultGenModelInput</code> 把它 prepend 进输入、react.go init 节点 原样种进 state），整个 run 期间都在。它对折叠链三处可见：<strong>切分</strong>时它不进交换单位、 不进 drop；<strong>重写</strong>时它原样留队首；<strong>回写</strong>时它不落 mh（mh 没有 system 行的位置， instruction 每 run 由 ADK 重建）。<strong>没这条的具体事故</strong>：按旧公式 <code>state.Messages = [摘要] + [保留区]</code> 逐字实现，system 行被静默丢掉——从折叠那一轮 起，这个 run 的所有后续模型调用都不带 instruction；调用照常 200、run 照常 complete，只是 agent 被摘了脑。不炸的 bug，正是最要防的那种。</li>
+<li><strong>原料转换层</strong>：state 切出 system 首条（其文本走 countInput 的 system 形参）后，其余 <code>[]*schema.Message</code> 机械转成 mh 行形状（RunID 按「历史/当前 run」标签填，tool 行的 名字经 tool_call_id 对回 tc 条目），然后喂进同一条 renderFold / foldInput 链—— 转换是唯一的新代码，链本身不动。</li>
+<li><strong>切点选择</strong>：下刀顺序固定——先老 run（整 run，最老先折，n 从 20 降档，同 Run fold 语义；<strong>首档即「只折老 run、当前 run 全留」</strong>，多数触发场景折几个老 run 就下去， 够不着当前 run）；老 run 全折仍超，再进当前 run：keep = user 行 + 交换单位后缀， <strong>后缀预算 = C5 的 tail 准入 <code>limit/3</code>，且 user 行算进这份预算</strong>（A1 已保证单条 user ≤ limit/3，所以预算恒非负；<code>S ≤ min(4096, limit/2)</code> + 后缀 ≤ limit/3 与 C5 同式恒有解 5/6·limit），收缩步长 = 一次吐一个最老单位，每档一次 summarize + 组装 计数，封顶约 20 次尝试，耗尽即 errStillOver（可达路径见 §9）。</li>
+<li><strong>state 重写</strong>：定案后 <code>state.Messages = [system 行原样] + [摘要(user 角色)] + [保留区]</code>，保留区恒含当前 run 的 user 行。</li>
+<li><strong>worker 侧记账与传递机制</strong>：run 级容器（比照 agentModelTable 的在职先例—— worker.Run 建、塞 ctx、middleware 读写、worker 读回，RWMutex 兜底并发）装三样： staged 列表（替代今天单个 stagedCompaction）、「历史/当前 run」标签（prepareInput 时填入，middleware 每次重写 state 后同步维护）、折后 state 快照。<strong>折后 state 的 取货口 = AfterAgent 钩子</strong>：它在成功终态触发、入参即含全部消息的最终 state （handler.go："the final conversation state"），middleware 在此把它存进容器； error / 取消 / 超迭代时 AfterAgent 不触发、容器为空、EndRun 自然零写入——干净 A 与钩子语义严丝合缝。eino 的 SetRunLocalValue 不可用：它只能在 middleware 执行 上下文内读写，EndRun 在 agent.Run 之外够不到。EndRun 的 mh 写入源切到容器里的折后 state：过滤 system 行、跳过已在库的 user 行（seq=1），保留轮次 seq 从 2 连续排； 终轮 assistant 取 state 末条（runlog 终稿取 <code>pending[""]</code>，即 Σ root turn 正文——两投影分离不动）。</li>
+</ul>
+<h2 id="9-失败出口与兄弟层关系">§9 失败出口与兄弟层关系</h2>
+<p><strong>mid-run errStillOver</strong>：先收窄它的可达路径——按 §8 的恒有解算术（S ≤ limit/2 + 后缀含 user 行 ≤ limit/3 ⇒ 合计 ≤ 5/6·limit &lt; limit），「老 run 全折 + 只剩 user 行 仍超」在既有守恒体内<strong>算术不可达</strong>；实际可达路径 = fileOps 钉块三档收口全失败 （C5-A7 既有分支原样复用）。出口形态不变：走 C2 已定的干净 A——run <code>status=error</code>、零写入、frames 只有 start+terminal{error}。理由：此刻即使硬发 模型调用也是 provider 拒收的同义词，早死干净；零写入让重投从原文重来，Run fold 至少能 折掉老 run 腾地方。诚实登记：重投可能重演同一中途超窗（§1 的卡死形态不变完全体）， <strong>真正的卡死逃生靠兄弟层</strong>——本篇不越俎：</p>
+<ul>
+<li><strong>溢出修复层（19v6-09）</strong>：provider 报「太长」后的强制压缩 + 一次重试，是撞墙后的 兜底；</li>
+<li><strong>trimToolResults</strong>（19v6-07 §5）：压缩已发生仍超时的工具结果瘦身（总预算 window/5， 还原文本从最新往回），是「既不 error 也能发出去」的最后手段。</li>
+</ul>
+<p>三者一并裁定的关系：<strong>mid-run fold 是撞墙前的主动下刀（本篇），溢出修复层是撞墙后的 兜底下刀，trimToolResults 是两者都失败后的瘦身出口</strong>。本篇施工期间若实测出现卡死会话， 按此顺序找责任人，不在本篇里塞后两层的料。</p>
+<p><strong>摘要调用失败</strong>（重试耗尽 / 验货拒收 / stall）：同样干净 A，失败分类进引擎日志 （C2 既有分流，不重裁）。</p>
+<h2 id="10-捎带裁定">§10 捎带裁定</h2>
+<ul>
+<li><strong>foldInput 潜伏边 → 本篇转正为正常态并已裁</strong>（19v6-07 §5 登记；2026-10-11 自查发现、 用户裁机制 = 同槽换代）：「同一 run 同时有活 seq=0 摘要行与可见原文行」在 Run fold 时代生产不可达（摘要只挂在被整体折死的 run 上）；mid-run fold 把摘要挂在当前 run 而 当前 run 保留可见轮次，该状态成为<strong>每个被 mid-run 折过的 run 的正常形态</strong>。它的事故 形态 = 后续折叠事件把这个 run 选作挂点 → <code>INSERT seq=0</code> 撞 <code>UNIQUE(run_id, seq)</code> → EndRun 整笔回滚、run 白跑。本篇用<strong>同槽换代</strong>裁掉（§5：摘要写入改 UPSERT，撞槽 = 换代非换 run）。登记从「待裁」改为「已裁」。</li>
+<li><strong>路线 A/B 兑现</strong>（19v6-07 §5「倾向先 A 后 B，B 留待用例逼出」）：B 已被本篇用例 逼出，裁其<strong>最小形</strong>——老 run 保持整 run 粒度（A），消息粒度只引进当前 run 内部。 将来若用例逼出「跨 run 消息级 keep」（如保留某轮关键工具往返多年），再扩。</li>
+<li><strong>子代理内部不压</strong>：compact middleware 只挂主 agent。子代理状态进程内即弃、回传 有 50KB 裁剪（19v6-05 §4），压它没有消费者；也避免子代理循环里多一条 summarize 链。主 run 视角里一次子代理调用 = 一次普通工具往返，随主 run 的折叠一起走。</li>
+<li><strong>POST 准入（A1）不动</strong>：单条消息 ≤ limit/3 的 413 在抢闸前，与本篇正交——且它是 「user 行 ≤ limit/3」的机器保证，后缀预算含 user 行的恒有解推导（§8）站在它上面。</li>
+<li><strong>keep 区活摘要 run 的翻转粒度</strong>（复审新裁）：「seq=0 必是该 run 唯一可见行」一死， 既有链的一个隐藏前提就暴露了——foldInput 把 oldSummaryRuns <strong>无条件</strong>并进 DropRunIDs，EndRun 按 run_id 把可见行整 run 翻死（<code>UPDATE … WHERE run_id IN …</code>）。 Run fold 时代这无害（这种 run 除摘要外没有别的可见行）；mid-run 时代，一个被折过的 run 若落在下一次折叠的 keep 区，它的<strong>保留轮次</strong>会被一并翻死——本轮模型刚看过这些 行、下一轮库里没了，静默丢失、无报错。裁定：<strong>翻转粒度细化</strong>——DropRunIDs 拆两半： drop 区的 run 照旧整 run 翻死；keep 区的旧摘要 run 只翻其 seq=0 行（其内容已并入 新摘要，保留行留活、与本 run 模型所见一致）。被否的替代：带活摘要的 run 强制进 drop——翻转不用改，但「keep = 最近 n 个 run」被摘要史污染（近期 run 只因被折过就 永远留不住原文尾段），与最小下刀相悖。</li>
+<li><strong>连续 user 行登记</strong>：折后 state 形状 = <code>[system, 摘要(user), user 行, …]</code>，第 2、3 位相邻同角色。OpenAI / Claude 均接受连续 user 消息（合并语义），现役两家扩展照走； §13 话本在真实 provider 下跑即覆盖。将来若接入拒绝相邻同角色的 provider，备选 = 摘要行 role 换 system 或并入 user 行——登记为已知依赖，不占本篇施工面。</li>
+</ul>
+<h2 id="11-反向登记weknora-三重防反复闸为什么不需要维持原裁">§11 反向登记：WeKnora 三重防反复闸为什么不需要（维持原裁）</h2>
+<p>WeKnora 的 ErrNothingToCompact / compactionExhaustedAt / minFreedFraction 三重闸， 前提是「摘要活在 turn 内存、被压历史跨轮还在」——会反复触发同段压缩。v6 里被压行 落库即不可见、每次重压的原文集合自然收缩（新 run + 一份活摘要），不存在同段反复触发； n 降档 + errStillOver 已覆盖。mid-run fold 落地不改变这个判断：fold 后的 state 同样 落库即不可见。登记维持，防将来拿 WeKnora 对拍时把不需要的抄回来。</p>
+<h2 id="12-明确不做">§12 明确不做</h2>
+<ul>
+<li>不抄 eino 内置 summarization middleware（四条否决：只钉 system 前缀、<strong>对话尾部无 保留区</strong>——刚回的工具结果随被压段一起进摘要 / 无终止防线 / chars/4 对中文低估 3–4 倍 / 纯内存态与 mh 落库冲突——19v6-07 §5 原文在案；v0.9.21 实源码复核四条全部 成立：其 finalizer 确实是 <code>append(systemMsgs, 摘要)</code> 一把换掉全部对话，默认计数就是 chars/4 估算）。</li>
+<li>不动 19v6-07 的既有裁定（触发线 ×4/5、结构化摘要、fileOps 块、干净 A 出口）。</li>
+<li>不在本篇塞溢出修复层 / trimToolResults 的料（§9 的关系裁定即可）。</li>
+<li>子代理内部压缩、异步工具 / HITL 的折叠语义：未立项，出现时另裁（三件套③的断言 已给那时的施工留了闸门位置）。</li>
+</ul>
+<h2 id="13-验收口径施工期-curl-话本供拆-todos-用">§13 验收口径（施工期 curl 话本，供拆 todos 用）</h2>
+<ul>
+<li><strong>压缩发生</strong>：dev 小窗旗标（<code>-compact-window</code> 逼出）+ 文件工具长 run；引擎日志出 「mid-run 输入 N tok &gt; limit M，进入折叠」→「压 k 单位（含当前 run m 轮），摘要 S tok」 → 模型继续、run 正常 complete。</li>
+<li><strong>暗号存活</strong>：被折段里先告诉模型暗号（如「蓝莓七号」），run 终稿答出（来源只能是 摘要）。</li>
+<li><strong>库形态（psql）</strong>：被折老 run 原文行 <code>compacted=t</code>；当前 run <code>seq=0</code> 摘要行 + <code>seq=1</code> user 行 + 保留轮次行齐全、被折轮次<strong>无行</strong>（从未落库）；runlog 完整含被折 轮次的 tool_call/tool_result 行。</li>
+<li><strong>配对不破</strong>：折叠后至 run 结束，模型每次调用不遭 provider 400（role 回扩生效的 活证据）；fixtures 单测钉「保留的第一个交换单位不以 tool 行开头」「切点全在单位边界」 「user 行恒在保留区首位」。</li>
+<li><strong>system 钉首</strong>：fixtures 断言重写后 <code>state.Messages[0]</code> 仍是 system 行（角色与原文 逐字节不变）；psql 断言 mh 无 system 行（折后落库的行全是 user/assistant/tool）。</li>
+<li><strong>同槽换代</strong>：同一 run 被 mid-run 折过之后，再被后续 run 的折叠整体折入（此时它已有 seq=0 行）→ EndRun UPSERT 正常提交、无 UNIQUE 回滚；psql 断言该 seq=0 行 <code>id</code> 不变、 <code>text</code> 已换代为新摘要、<code>compacted=f</code>（同 run 活摘要恒 ≤ 1）。</li>
+<li><strong>keep 区保留行存活</strong>：被 mid-run 折过的 run 在下一次折叠落 keep 区 → psql 断言其 保留轮次行仍 <code>compacted=f</code>、其 seq=0 行已翻死、旧摘要内容在新摘要里（§10 翻转粒度 裁定的活证据）。</li>
+<li><strong>零写入家族</strong>：mid-run fold 后 kill -9 ⇒ 库里与未压过同形；error 结局 ⇒ 零 compacted 写入；staged 列表只落最后一份摘要（psql：本次被并的旧摘要行全部 compacted=t，可见 seq=0 只剩新落的那份）。</li>
+<li><strong>四端点字节零变化</strong>：POST / session / frames / log 响应形状与压缩前逐字节同形 （折叠不出帧，承 19v6-90 三修原则）。</li>
+<li><strong>触发线灵敏</strong>：带巨大 <code>write_file</code> 参数的会话在旧口径下不触发、新口径下触发 （基数补洞的定向用例）。</li>
+</ul>
+<h2 id="14-施工面清单供拆-todos顺序即依赖序">§14 施工面清单（供拆 todos，顺序即依赖序）</h2>
+<ol type="1">
+<li><strong>countInput 基数扩展</strong>（text + tool_calls JSON）——独立可验，先落。</li>
+<li><strong>compact.go 泛化</strong>：foldInput 支持「老 run 整 run + 当前 run 单位后缀」的混合 drop、切点选择、keep 区构造（user 行钉死 + 后缀预算含 user 行）、<strong>摘要写入 UPSERT</strong> （同槽换代，SQL 见 §5）、<strong>翻转粒度细化</strong>（DropRunIDs 拆两半：drop 区整 run 翻死、 keep 区旧摘要 run 只翻其 seq=0 行，§10）、staged 列表产出；renderFold 吃 schema.Message 转换层。文件头与分组注释里「seq=0 必是该 run 唯一可见行」的已死 不变量同步改写。</li>
+<li><strong>middleware 新文件</strong>：<code>BeforeModelRewriteState</code> 里数长度（转换层切出 system 首条后 过同一 countInput）、调折叠链、重写 state（<strong>system 行钉首</strong>）；三件套断言（单位 边界 / 首个交换单位非 tool 开头 / 后缀不切在途）+ system 钉首断言；挂载排 agentlog 之前（§4）；<code>AfterAgent</code> 里把最终 state 存进 run 级容器。</li>
+<li><strong>worker/EndRun 改造</strong>：run 级容器建/塞 ctx（比照 agentModelTable 先例，§8）； staged 列表应用（并集翻转 + 只插最后摘要、挂点 = 最后那次的 AttachRun）；mh 写入源 切折后 state（过滤 system 行、跳过已在库的 user 行，保留轮次 seq 从 2 连续排）； runlog 保持全量 turn；prepareInput 往容器填历史/当前标签。</li>
+<li><strong>验收网</strong>：§13 话本 + fixtures + 四端点 baseline 重跑。</li>
+</ol>
+<p>每拍验收 = 对应话本的 curl + 期望字节/日志行；第一拍能 curl 到的是「带大参数 write_file 的会话触发线变化」（日志断言）。</p>
+<h2 id="验收回填2026-10-12">验收回填（2026-10-12）</h2>
+<p>五条施工面都已落在 <code>yk-tako-eino/internal/runengine</code>。第 1 条 <code>countInput</code> 把 <code>tool_calls</code> 的 JSON 算进长度。第 2 条 <code>foldInput</code> 能按老 run 整段和当前 run 的交换单位混合折叠，摘要撞上已有的 seq0 时走 UPSERT。第 3 条 <code>midfold.go</code> 在每次模型调用前计数并重写 state，system 行留在队首。第 4 条 <code>EndRun</code> 只在 <code>complete</code> 时把最后一份摘要写入挂点，并按 drop、merged 两套粒度翻转。第 5 条是第 13 节的十项验收，结果如下。证据在 <code>tmp/19-v6/evidence-midrun/</code>。</p>
+<ol type="1">
+<li>压缩发生、暗号存活、库形态沿用已落档的 <code>A5-01-*</code>、<code>A5-02-*</code>。本轮没有重跑。</li>
+<li>配对不破和 system 钉首的活体证据在上述原件里：折叠之后的模型调用没有 provider 400，<code>run_model_messages</code> 没有 system 行。单位边界、保留区不以 tool 行开头、user 行钉在保留区首位，以及重写后的 system 行逐字节不变，由 <code>TestFoldInput*</code> 钉住。</li>
+<li>同槽换代在新会话 <code>s_01M4PZ8SQJ046Y49XX5R8EYX8P</code> 上打成。<code>r_01M4PZ8SQJY4G954MDA5D9W5EV</code> 的 seq0 仍是 <code>msg_01M4PZ93VYBH9FWCBNEE2DQNGD</code>，<code>tlen</code> 从 405 换成 1220，<code>compacted=f</code>；seq1 到 seq6 变为 <code>compacted=t</code>。后一掷 <code>r_01M4PZGSV0SJE5HG02GPXGZTCE</code> 为 <code>complete</code>。日志是「压 1 单位（含当前 run 0 轮）」，挂点留在原来那个 run。原来那条会话里的 (b) 形 run 没有换代，原因见下面的偏离。</li>
+<li>keep 区保留行按第 13 节的原话本实跑造不出来。一个 (b) 形 run（seq0 和原文行并存）只能由它自己那次 mid-run 折叠产生。产生它的那一次折叠已经把更老的 raw run 折完，所以它自己就是最老的存活 raw。下一轮 phase 1 从最老开始丢，它进入 <code>DropRunIDs</code>，挂点又是它自己，走同槽换代，不会留在 keep 区、只把 seq0 翻死。<code>store_test</code> 里的合成行仍然覆盖这条代码路径。</li>
+<li>零写入有两处活体。<code>A4-m2-kill-*</code> 是 <code>kill -9</code>。error 结局只留下 <code>AcquireRun</code> 时写入的 user 行，折叠结果不落库。本轮第 10 项的 <code>r_01M4Q1WX2ZTW0QN5BC42WHBZ4R</code> 又复现了一次：某次摘要三次顶到 1024 之后 run 为 error，<code>run_model_messages</code> 只剩 <code>text_len=55</code> 的 user 行。</li>
+<li>四端点用 <code>m_d1</code> 复跑，会话 <code>s_01M4Q1W4ER7G0PFT4XDXYV9B78</code>，<code>complete</code>，日志没有折叠行。POST 返回 202，字段序是 <code>sessionId</code>、<code>runId</code>、<code>messageId</code>。session 是 <code>liveRunId=""</code>、<code>runlogOffset=2</code>。frames 是 start、39 条 delta、terminal <code>complete</code>，条数和基线一样。log 是 user 加 assistant 两行。相对 <code>tmp/19-v6/compact/evidence-a5/d1-*</code>，每一帧和每一行都多了 <code>model</code>。这是 T3-1b 把 <code>model</code> 定为恒在字段，结构体上没有 <code>omitempty</code>，不是折叠加上的。基线那次的 window 是 3000，这次是 4000。纯文本不触折叠，window 不改变这四个响应的形状。</li>
+<li>触发线用 <code>write_file</code> 把「上下文溢出测试」写入 <code>big.txt</code>。user 行只有 55 字。第一次写完，下一次进模型前的计数是 3801 tok，超过 3200，日志打出 <code>compact mid-run</code> 的「进入折叠」。后面几次写入的参数最大到 100386 字节，计数到过 52095 tok。对照是上面的纯文本会话，没有折叠行。过线的体积来自 <code>tool_calls</code>，不是正文。</li>
+</ol>
+<p>实施偏离：</p>
+<ul>
+<li>第 13 节第 7 项要求被 mid-run 折过的 run 落在 keep 区。上面第 4 点说明这条路径在实跑里走不到。代码路径用测试里的合成行保住。</li>
+<li>摘要器硬上限是 1024。输出顶到这个数就当截断拒收，三次拒收则整次折叠失败，run 变 error。原料是一份很长的旧摘要时，大约一半次数会顶到上限。第 10 项的 run 就是在后续某次折叠上这样结束的，库里因此没有留下那条巨大的 <code>tool_calls</code> 行。</li>
+<li>第 10 项话本原来的预期是：第一个 run 完整留下 seq2 的 <code>tool_calls</code>（至少 9k 字节），第二个 run 起手才折叠。现在每次模型调用前都会计数，巨大的 <code>write_file</code> 参数在第一个 run 内部就过线并被折掉。模型看不见已经写完，就继续写，直到某次摘要顶到上限，run 以 error 结束。「继续」没有发出去。workspace 是 <code>/tmp/midrun-b</code>，不是 A1 台账里的 <code>/tmp/midrun-a1</code>。<code>big.txt</code> 已经写在磁盘上，error 不回滚工具已经做成的文件。</li>
+<li>第 6 项没有打在 <code>s_01M4P28DHQD8F7Z50S9JAFZEWS</code> 上。那条会话里还活着的 user 行点名了别的文件，模型把它们和目标文件一起读，当前这一轮大到只丢掉最老的 run 也压不回 3200 以下。换成一个只有重复句的新会话之后，同槽换代的库断言成立。</li>
+</ul>
+<p>用户判定（2026-10-12）：A5 完成。上面四条偏离留档，不再作为未通过项。第 7 项不再要求活体造出 keep 区保留行。第 9 项不再要求和 <code>d1-*</code> 逐字节相同。第 10 项不再要求第一掷把巨大 <code>tool_calls</code> 留在库里、第二掷起手才折。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/19-v6/19v6-10-mid-run-fold.md"><code>doc/19-v6/19v6-10-mid-run-fold.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

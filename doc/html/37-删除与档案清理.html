@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>37 · 删除与档案清理（项目连带删会话 / 单场删除 / 子代理保留窗口） · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="37--删除与档案清理项目连带删会话--单场删除--子代理保留窗口">37 · 删除与档案清理（项目连带删会话 / 单场删除 / 子代理保留窗口）</h1>
+<blockquote>
+<p>性质：<strong>已落地</strong>（D1–D4、D-l）。2026-10-20 起草；2026-10-21 补拍 D3（单场删除，仅属主本人）与 D4（子代理逐字档案保留窗口 + 清扫器，与用户「把删除和 sub agent 状态结合在一起做」的决定合并）。D1、D2 随 <code>0fd15c5</code> 入库；D3、D4 于 2026-10-21 在 <code>127.0.0.1:8905</code> 用 curl 验收后随本篇入库。不表示版本号跳了一档。 <strong>D-l 的落地（2026-11-10，随 <a href="65-记忆两层方案.html">doc/65</a> 记忆改造）</strong>：<code>pipeline</code> 只物理删除该项目 <code>scope='workspace'</code> 的记忆行，<code>scope='user'</code> 的个人记忆跨项目保留；<code>markdown</code> 模式随项目目录删除 <code>MEMORY.md</code>，用户 <code>USER.md</code> 不动。代码落点 <code>pgstore.go</code> 的删除事务（memory_items 两类分 scope 删、memory_jobs 按项目删）、<code>memory_migrate.go</code>（markdown 的 MEMORY.md 按 workspace 清）；存储侧不变量由 <code>delete_cascade_test.go</code> 钉住，活体由 <code>scripts/acceptance/memory_project_delete_live.sh</code> 验收（9/9 通过）。 代码落点：<code>yk-tako-eino/internal/runengine/pgstore.go</code>、<code>product_api.go</code>、<code>session_access.go</code>、<code>store.go</code>、<code>server.go</code>（D3 路由、D4 探针）、<code>worker.go</code>（D4 清扫 ticker）、<code>archive_sweep.go</code>（清扫与探针）、<code>auth.go</code>（<code>114006</code>、<code>114007</code>）、<code>cmd/yktako/main.go</code>（<code>-archive-ttl</code>）。 验收结论（2026-10-21，引擎 <code>127.0.0.1:8905</code>，工作区 <code>tmp/ws-38</code>）：D3 打过五条。属主删除游离会话 <code>s_01M5DAHJZB42KR6Q8BX0M8VA8X</code> 回 200 <code>{"code":0,"message":"","data":{"status":"deleted"}}</code>，<code>deliverable.md</code> 还在，<code>.tako/</code> 没了；再删、取详情、<code>POST /api/runs</code> 都是旧体 404 <code>{"error":"session_not_found"}</code>；<code>runs</code>、<code>runlog_entries</code>、<code>sessions</code> 行数不变。属主删除挂载会话后，按项目列会话少一场，项目目录里的产出还在。活 run 期间删除回 409 <code>{"code":114007,"message":"这场会话正在运行，等它跑完再删","data":null}</code>，跑完再删是 200。成员删别人的私有会话是旧体 404；会话改成 <code>tenant</code> 之后是 403 <code>{"code":111204,"message":"只有本人能修改","data":null}</code>；租户 owner 删成员的会话同样 403，行没有软删。D4 的 <code>POST /api/dev/clean-sweep</code> 不带鉴权，成功体是 <code>{"swept":N,"watermark":"..."}</code>。空库第一次探针 <code>swept</code> 为 0，水印停在 <code>1970-01-01T00:00:00Z</code>，没有跳到截止时刻。compact 窗口默认 256000，curl 打不出真压缩，验收时用 SQL 往已结束的 run 插入行：<code>seq=0</code> 的摘要和 <code>compacted=false</code> 留下，清扫器删掉 <code>compacted=true</code> 且 <code>seq&lt;&gt;0</code> 的行。把软删会话的 <code>deleted_at</code> 拨到水印之后、窗口之外，探针清掉该会话全部 <code>run_model_messages</code>，<code>runlog_entries</code> 和会话行还在。两个引擎同时打探针，一个 <code>swept</code> 为 1、一个为 0，<code>cleaner_state</code> 租约仍是一行。<code>-archive-ttl 12h</code> 的启动日志是 <code>archive ttl 12h0m0s</code>：清扫器删掉 13 小时前的压缩行，11 小时前的留下。随后改回默认，日志是 <code>archive ttl 168h0m0s</code>，再探针 <code>swept</code> 为 0，11 小时那行还在。ticker 每分钟写一行 <code>clean-sweep:</code>，<code>swept</code> 为 0 也写。S1 那份 wire 的 SHA-256 仍是 <code>71a4d705d46ef01d212704b8d29f37cc036d06d1982bbd54b403055d79856455</code>。施工收尾时 <code>go test ./internal/runengine</code> 与 <code>go vet</code> 已通过，其后没有再改 Go。 <strong>2026-10-22 补记（doc/40 换信封后）</strong>：上面这段是 <strong>2026-10-21 当时的实测字节</strong>——其中「旧体 404 <code>{"error":"session_not_found"}</code>」与 clean-sweep 的旧成功体 <code>{"swept":N,"watermark":"…"}</code> <strong>现已换成信封</strong>（404 → <code>{"code":112001,"message":"找不到这场会话","data":null}</code>；clean-sweep → <code>{"code":0,"message":"","data":{…}}</code>），见 <a href="40-响应信封统一.html">doc/40</a>。本文正文里的期望字节已按新码改。 真源关系：项目目录真源是 <a href="35-项目目录.html">doc/35</a>。本篇改写它 A6 拍好的「删除只删空项目」语义（<a href="35-项目目录.html">doc/35</a> 第 0 节第 3 条「连带删会话另立拍」即本篇）。 后续修改方案：<a href="76-项目内容目录与运行资源容器.html">doc/76</a>（<strong>2026-11-13 已落地</strong>）已把项目磁盘删除边界改为整个“资源容器”：项目删除连本项目异步工作区与不可变结果一并清掉，容器删除失败回 <code>cleanup=pending</code> 由 <code>project_cleanups</code> 补偿；租户技能／工具、系统技能与用户记忆仍不在删除边界内。 不在本篇：已删会话的恢复入口、runlog_entries 的物理清除（两者同属 purge/restore 独立方案）、前端页面（删除按钮、确认弹窗 <strong>2026-10-23 已由 <a href="44-前端三处欠账.html">doc/44</a> 落地</strong>）、原子写 / 写路径清单 / scratch TTL（清理架构其余姊妹件，见 §9）。</p>
+</blockquote>
+<h2 id="0-本篇做什么">0. 本篇做什么</h2>
+<p>三件事，一条「保留窗口」主线贯穿：</p>
+<ol type="1">
+<li><strong>项目连带删</strong>（D1/D2）：<code>DELETE /api/workspaces/:id</code> 从「有会话就 409」改成连带软删挂载会话 + 清目录。</li>
+<li><strong>单场删除</strong>（D3）：新增 <code>DELETE /api/sessions/:id</code>，仅会话属主本人可删；文件按所有权分层清理（系统档案清、产出留）。</li>
+<li><strong>子代理逐字档案的保留窗口</strong>（D4）：被 compact 压掉的逐字原文行（<code>run_model_messages.compacted=true</code>，含子代理消息）今天<strong>只进不出、永久留库</strong>；本篇给它们一个保留窗口，到期由持 PG 租约的清扫器物理删除。窗口同时是删除会话后的档案宽限期——同一个数（D-k）。</li>
+</ol>
+<h2 id="1-背景与动机两个失败故事">1. 背景与动机：两个失败故事</h2>
+<p><strong>故事一（删除）：</strong> 用户「Q4 调研」项目下挂 12 场会话（自己 8 场、成员 4 场），按 doc/35 A6 想删项目得先逐场解绑——12 次操作劝退，项目越积越多，删除形同虚设。连带的问题是单场会话也删不掉：<code>DELETE /api/sessions/:id</code> 在 doc/28 权限表里只有一行设计，从没排期，代码里不存在（server.go 全部路由核实过）。</p>
+<p><strong>故事二（只进不出的档案）：</strong> 子代理每次委派跑完，逐字消息留在 <code>run_model_messages</code>——被 compact 压掉的原文行打 <code>compacted=true</code> 标记后<strong>永不删除</strong>（pgstore.go:85 注释明写「保留作审计，不进模型输入」）。会话长跑几轮，这张表只涨不清；<code>runlog_entries</code> 同样永久增长（server.go:1018 注释明说无上限）。借鉴 Kimi / dsh / opencode 梳理后的结论：tako 缺的是「会话生命周期 + 保留窗口 + 可租约的清扫任务」，三件不补，档案只进不出。</p>
+<p>本篇把故事一的生命周期（删项目 / 删会话）和故事二的保留窗口合成一套：<strong>删除动作软删留档（可恢复、审计不断），清扫器按窗口做物理清除（空间回收）</strong>——两个阶段、同一个窗口数。</p>
+<h2 id="2-名词">2. 名词</h2>
+<ul>
+<li><strong>软删</strong>：给 <code>sessions</code> 加一列 <code>deleted_at</code>（timestamptz，可空）。删会话 = 写上删除时刻；本篇之前这列不存在（pgstore.go:28-37 的 Session 结构体只有 8 列），会话从没有「被删除」状态。</li>
+<li><strong>活 run</strong>：<code>runs</code> 表里 <code>status='running' AND lease_until &gt; now()</code> 的行。lease 未过期 = 真有进程在跑；lease 已死的 running 行是待清扫僵尸，不算活。</li>
+<li><strong>逐字档案</strong>：<code>run_model_messages</code> 里 <code>compacted=true</code> 的行——被 compact 压掉的原文（含子代理的完整消息序列）。模型输入不读它，页面不读它，纯留档。</li>
+<li><strong>摘要行</strong>：<code>run_model_messages</code> 里 <code>seq=0</code> 的行（pgstore.go:80），compact 压出来的摘要，「发生过什么」的载体——<strong>永不删</strong>。</li>
+<li><strong>保留窗口</strong>：档案从「不再被使用」到「允许物理清除」的时长（D-h，推荐 7 天，启动参数 <code>-archive-ttl</code> 可配）。借鉴口径：保留窗口 = 恢复承诺，两者必须同一个数——所以它也是软删会话的可恢复期。</li>
+<li><strong>清扫器</strong>：按窗口物理删逐字档案的后台任务。多副本下用 PG 租约表互斥、删除幂等、进度用水印推进（D-j）。</li>
+<li><strong>属主</strong>：<code>sessions.user_id</code> 指向的用户。删单场会话的唯一门槛（§5.4）。</li>
+<li><strong>系统档案 / 产出</strong>：会话目录里系统生成的字节（<code>.tako/</code> 搜索落盘、<code>.media/</code>）/ agent 写的用户资产文件。删会话时前者清、后者留（D-g）。</li>
+</ul>
+<h2 id="3-现状代码事实">3. 现状（代码事实）</h2>
+<p><code>DELETE /api/workspaces/:id</code> 今天的完整路径：</p>
+<ol type="1">
+<li>handler <code>deleteWorkspace</code>（product_api.go:200-233）调 store，成功后<strong>事务提交之后</strong> <code>os.RemoveAll</code> 项目目录（删目录在事务外，避免库回滚了目录已经没了）。</li>
+<li>store <code>DeleteWorkspace</code>（pgstore.go:292-320）单事务三步：<code>lockOwnedWorkspace</code> 锁项目行（FOR UPDATE）→ 查 <code>is_default</code>（默认工作区回 <code>ErrWorkspaceDefault</code> → 409 <code>114005</code>）→ <code>SELECT COUNT(*) FROM sessions WHERE workspace_id = ?</code>（只有这一个条件）→ 大于 0 回 <code>ErrWorkspaceNotEmpty</code>（409 <code>114002</code>），等于 0 才 <code>DELETE FROM workspaces</code>。</li>
+</ol>
+<p>互斥现状有两层是现成的：删除事务锁 <code>workspaces</code> 行 ↔︎「新会话挂这个项目」的 <code>AcquireRun</code>（<code>lockVisibleWorkspace</code>）锁同一行；<code>one_live_run_per_workspace</code> 部分唯一索引（pgstore.go:428-432）保证同一项目同时最多一场活 run。没有的一层：删除与「已有挂载会话继续发消息」之间——那条路径锁 <code>sessions</code> 行（<code>AcquireRun</code> 的 <code>SELECT ... FOR UPDATE WHERE id = ?</code>），本篇软删会话的 <code>UPDATE sessions WHERE workspace_id = ?</code> 恰好也锁这些行，互斥顺带成立（§5.3）。</p>
+<p>档案侧的现状：compact 只打 <code>compacted=true</code> 标记，<strong>没有任何代码路径删这些行</strong>；全库无外键无级联；<code>runs.finished_at</code> 记 run 终态时刻——这就是 D4 清扫条件的全部输入，不需要新档案表（D-i）。</p>
+<h2 id="4-待拍决策与推荐">4. 待拍决策与推荐</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>决策点</th>
+<th>推荐</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>D-a</td>
+<td>会话删除语义：软删还是硬删</td>
+<td><strong>软删</strong>（新增 <code>deleted_at</code> 列）</td>
+<td>硬删要顺手清 5 张 <code>session_id</code> 关联表（全库无外键无级联），动作大且掐断审计线；软删 + D4 清扫器分两阶段，兼得可恢复与空间回收</td>
+</tr>
+<tr>
+<td>D-b</td>
+<td>连带删的范围</td>
+<td><strong>见下表</strong></td>
+<td>原则是：表行软删保审计、磁盘字节删掉、计费数据不动；<strong>记忆按 scope 处理</strong>，D-l 在 2026-11-09 定为项目 workspace 行随删、个人 user 行保留</td>
+</tr>
+<tr>
+<td>D-c</td>
+<td>删除时遇到活 run</td>
+<td><strong>拒绝</strong>，项目 409 <code>114006</code>、会话 409 <code>114007</code></td>
+<td>删除不可逆，活 run 说明正在用；等跑完再删比自动 stop 安全（不误杀、不收尸）</td>
+</tr>
+<tr>
+<td>D-d</td>
+<td>成员挂在项目下的会话（A7b）</td>
+<td><strong>无差别连带软删</strong></td>
+<td>项目 owner 对项目内容有处置权（A7c）；软删不是抹除，runlog 仍在库里</td>
+</tr>
+<tr>
+<td>D-e</td>
+<td><code>114002</code> 的去向</td>
+<td><strong>退役</strong>（本篇起 DELETE 项目不再返回它）</td>
+<td>新语义下「有会话」不是拒绝理由；想留会话先解绑再删（A5）</td>
+</tr>
+<tr>
+<td>D-f</td>
+<td>单场删除的门槛（10-21 拍）</td>
+<td><strong>仅会话属主本人</strong>；tenant owner/admin 不豁免</td>
+<td>doc/28 表格「owner/admin」口径作废。会话正文是私人对话；与 A5 同门槛同双轨错误</td>
+</tr>
+<tr>
+<td>D-g</td>
+<td>删会话时产出怎么办（10-21 拍）</td>
+<td><strong>产出保留，只清系统档案</strong></td>
+<td>所有权口径：系统档案（<code>.tako/</code>、<code>.media/</code>）随删清；agent 写的产出是用户资产，删对话记录不没收。删项目（D-b）是容器销毁，产出随之清——「只能由用户删或删项目」</td>
+</tr>
+<tr>
+<td>D-h</td>
+<td>保留窗口多长（10-21 拍）</td>
+<td><strong>7 天</strong>，启动参数 <code>-archive-ttl</code>（默认 168h）</td>
+<td>借鉴口径「保留窗口 = 恢复承诺」：窗口内误删可恢复（行还在），窗口外物理清除。子代理暂不能「接着做」，审计主要靠 runlog 展示帧，窗口偏短；做成参数是上线后不改代码可调</td>
+</tr>
+<tr>
+<td>D-i</td>
+<td>要不要新增 subagent_runs 档案表（10-21 拍）</td>
+<td><strong>不新增</strong></td>
+<td>逐字档案已在 <code>run_model_messages</code>（compacted 行），归属由 <code>run_id → runs.finished_at</code> 推导；委派无实例 id（delegationTool 一次性调起）。「新增表按父 run + 子代理 id 存」是 Kimi 独立 wire 文件的解法，tako 没有独立 wire，新表只是同一份数据的第二个真源</td>
+</tr>
+<tr>
+<td>D-j</td>
+<td>清扫器形态（10-21 拍）</td>
+<td>进程内 goroutine + ticker，<strong>互斥靠 PG 租约表 + 删除幂等 + 水印推进</strong></td>
+<td>借鉴材料明说不能用进程内定时器当互斥；多副本各跑各的 ticker，抢到租约才扫，DELETE 幂等，双跑只重复劳动不出错。闸在库（AGENTS.md 多副本纪律）</td>
+</tr>
+<tr>
+<td>D-k</td>
+<td>软删会话的档案何时物理清（10-21 拍）</td>
+<td><strong>与全局同一个窗口</strong>：<code>sessions.deleted_at + 窗口 &lt; now()</code> 才清</td>
+<td>「保留窗口 = 恢复承诺，同一个数」的推论：软删不是抹除，宽限期内行还在（未来恢复入口的余地），窗口外连同模型消息行一起清</td>
+</tr>
+<tr>
+<td>D-l</td>
+<td>记忆线跟不跟着项目一起删（11-07 拍；11-09 按 scope 修订）</td>
+<td><strong>项目记忆跟着删，个人记忆保留</strong>：<code>pipeline</code> 清 <code>scope='workspace'</code> 的 <code>memory_items</code> 与该项目 <code>memory_jobs</code>；<code>markdown</code> 清项目 <code>MEMORY.md</code>；两种模式都清 <code>dialogue_chunks</code>，都不动用户 <code>USER.md</code> / <code>scope='user'</code> 行</td>
+<td>项目是容器，但个人偏好跟人走，不能因来源项目删除而误删；项目常驻规矩与召回事实也不分层残留。租户归档不动记忆行：归档不是销毁</td>
+</tr>
+</tbody>
+</table></div>
+<p>连带删的范围明细（D-b）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>对象</th>
+<th>处置</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>workspaces</code> 行</td>
+<td>硬删（不变）</td>
+<td>项目是真删，doc/35 A6 已拍</td>
+</tr>
+<tr>
+<td>挂载的 <code>sessions</code> 行</td>
+<td><strong>软删</strong>：<code>deleted_at = now()</code></td>
+<td>过滤点见 §6</td>
+</tr>
+<tr>
+<td>项目目录 <code>tenants/&lt;tid&gt;/workspaces/&lt;wid&gt;/</code></td>
+<td><code>RemoveAll</code>（不变）</td>
+<td>含 <code>.media/</code> 附件与全部产出；<code>markdown</code> 模式的项目 <code>MEMORY.md</code> 随目录一起删</td>
+</tr>
+<tr>
+<td>各挂载会话目录 <code>tenants/&lt;tid&gt;/sessions/&lt;sid&gt;/</code></td>
+<td><code>RemoveAll</code>（新增）</td>
+<td>挂过又挪走的会话的游离期残留，容器销毁时一并清</td>
+</tr>
+<tr>
+<td><code>runs</code> / <code>run_model_messages</code> / <code>runlog_entries</code></td>
+<td>删除动作<strong>不动</strong>；物理清除归 D4</td>
+<td>审计线；D4 只清 compacted 行与过窗软删会话的模型消息行（§5.5），runlog 本篇永不清</td>
+</tr>
+<tr>
+<td><code>usage</code> / <code>tenant_usage_daily</code></td>
+<td>不动</td>
+<td>计费线</td>
+</tr>
+<tr>
+<td><code>memory_items</code>（<code>pipeline</code>，两层）</td>
+<td><strong>只删项目行</strong>：<code>DELETE FROM memory_items WHERE workspace = ? AND scope = 'workspace'</code></td>
+<td>不分 resident/recall；<code>scope='user'</code> 行跨项目保留</td>
+</tr>
+<tr>
+<td><code>USER.md</code> / <code>scope='user'</code> 行</td>
+<td><strong>不动</strong></td>
+<td>用户记忆跟人走；来源项目删除不等于个人偏好失效</td>
+</tr>
+<tr>
+<td><code>dialogue_chunks</code> / <code>memory_jobs</code></td>
+<td><strong>删</strong>：<code>DELETE … WHERE workspace = ?</code></td>
+<td>派生索引与该项目待办 job 一起走；<code>markdown</code> 没有 memory_jobs</td>
+</tr>
+<tr>
+<td>Redis 事件键（runlive/draft）</td>
+<td>不动</td>
+<td>只在活 run 期存在；活 run 已被 D-c 挡在删除之外</td>
+</tr>
+<tr>
+<td>默认工作区</td>
+<td>不受影响</td>
+<td>游离会话不挂默认工作区；409 <code>114005</code> 逻辑不变</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="5-新-delete-语义">5. 新 DELETE 语义</h2>
+<h3 id="51-项目删除的请求响应">5.1 项目删除的请求响应</h3>
+<p>路由、鉴权、成功响应全不变：<code>DELETE /api/workspaces/:id</code>，仅创建者，成功仍是 <code>200 {"code":0,"message":"","data":{"status":"deleted"}}</code>。失败分支变化：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>场景</th>
+<th>旧语义</th>
+<th>新语义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>项目下有会话</td>
+<td>409 <code>114002</code></td>
+<td><strong>200 <code>deleted</code>，会话连带软删</strong></td>
+</tr>
+<tr>
+<td>项目下有活 run</td>
+<td>（撞项目闸 409 <code>114004</code>，仅新建 run）</td>
+<td>409 <code>114006</code>「项目里有正在运行的会话，等它跑完再删」</td>
+</tr>
+<tr>
+<td>默认工作区</td>
+<td>409 <code>114005</code></td>
+<td>不变</td>
+</tr>
+<tr>
+<td>别人的/不存在的项目</td>
+<td>404 <code>114001</code></td>
+<td>不变</td>
+</tr>
+<tr>
+<td>未登录</td>
+<td>401 <code>111102</code></td>
+<td>不变</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="52-项目删除的事务时序store-层新方法-deleteworkspacecascade">5.2 项目删除的事务时序（store 层新方法 <code>DeleteWorkspaceCascade</code>）</h3>
+<pre class="text"><code>BEGIN
+  1. lockOwnedWorkspace(id, tenantID, userID)     -- FOR UPDATE 锁项目行；没有 → 114001
+  2. is_default? → ErrWorkspaceDefault            -- 114005（不变）
+  3. SELECT COUNT(*) FROM runs
+     WHERE workspace_id = :id AND status=&#39;running&#39; AND lease_until &gt; now()
+     → &gt; 0 回 ErrWorkspaceBusy（新错误 → 114006）
+  4. SELECT id FROM sessions WHERE workspace_id = :id
+     → 记下 id 列表（删目录用）
+  5. UPDATE sessions SET deleted_at = now()
+     WHERE workspace_id = :id                      -- 软删全部挂载会话
+  6. pipeline：取得与 writeMemory 相同的 workspace advisory lock
+     → 等已在写库的记忆任务收口，删除后旧 job 不得再写
+  7. DELETE FROM memory_items
+     WHERE workspace = :id AND scope = &#39;workspace&#39;  -- 两层都删；user 行保留
+  8. DELETE FROM dialogue_chunks WHERE workspace = :id
+  9. DELETE FROM memory_jobs WHERE workspace = :id  -- markdown 没有此表写入
+  10. DELETE FROM workspaces WHERE id = :id
+COMMIT</code></pre>
+<p>handler：拿到 store 返回的会话 id 列表后（沿用「事务外删目录」的现状结构）：先 <code>RemoveAll</code> 项目目录（现状；<code>markdown</code> 的项目 <code>MEMORY.md</code> 随之删除），再对列表逐个 <code>RemoveAll</code> 会话目录。目录删除失败照旧只记日志、不改响应。<strong>逐字档案表（<code>runs</code> / <code>run_model_messages</code> / <code>runlog_entries</code>）不动</strong>，物理清除由 §5.5 清扫器按窗口做；<strong>项目记忆线（步骤 6–9）在这笔事务里就删掉了，个人 user 记忆明确保留</strong>，不进清扫器的窗口流程——项目容器销毁与个人偏好跟人走是同一条 scope 规则的两边。</p>
+<h3 id="53-时序竞争为什么安全">5.3 时序竞争为什么安全</h3>
+<p>所有并发路径都在抢同两把锁中的一把，且活 run 检查在锁保护之内：</p>
+<ul>
+<li><strong>新会话挂这个项目</strong>（<code>AcquireRun</code> 的 <code>lockVisibleWorkspace</code>）锁项目行：删除事务持锁期间它等着；删除提交后行没了，预检回 114001，不建行。反之它先提交，删除的计数能看到新会话（步骤 4/5 照常软删它）。</li>
+<li><strong>已有挂载会话发消息</strong>（<code>AcquireRun</code> 锁 <code>sessions</code> 行）不锁项目行：步骤 5 的 <code>UPDATE sessions WHERE workspace_id = ?</code> 锁全部挂载会话行，两边互等。发消息方先提交 → 步骤 3 的活 run 检查看到 running 行 → 整笔回滚 114006；删除先提交 → 对方 <code>SELECT ... FOR UPDATE</code> 带软删过滤查无此行 → 旧体 404，不建行。</li>
+</ul>
+<p>不会出现「会话已删、run 还在跑」或「run 在跑、项目没了」的孤儿态。</p>
+<h3 id="54-单场删除delete-apisessionsidd3">5.4 单场删除：DELETE /api/sessions/:id（D3）</h3>
+<p>端点至今不存在（§1），本篇新增。软删基础设施由 D1 铺好，本端点增量 = 路由 + handler + store 一个方法。</p>
+<ul>
+<li><strong>路由</strong>：<code>DELETE /api/sessions/:id</code>，挂 <code>RequireAuth</code>。仓库里 sessions 相关路由只有 GET/PATCH（server.go:78-84），新增不冲突。</li>
+<li><strong>门槛</strong>：<code>sessions.user_id = 当前用户</code>，tenant owner/admin 不豁免（D-f）。错误双轨对齐 A5：看不见 → 404 <code>{"code":112001,"message":"找不到这场会话","data":null}</code>（不泄露存在性；2026-10-22 换信封，见 <a href="40-响应信封统一.html">doc/40</a>）；同租户 <code>visibility=tenant</code> 看得见但非本人 → 403 <code>{"code":111204,"message":"只有本人能修改","data":null}</code>。</li>
+<li><strong>活 run</strong>：拒绝，409 <code>114007</code>「这场会话正在运行，等它跑完再删」。</li>
+<li><strong>事务</strong>（store 新方法 <code>DeleteSession</code>）：<code>SELECT ... FROM sessions WHERE id = ? FOR UPDATE</code>（D1 的软删过滤生效：查无 → 404 <code>112001</code>）→ 属主校验（403）→ 活 run 检查 → <code>UPDATE sessions SET deleted_at = now()</code>。</li>
+<li><strong>文件清理</strong>（D-g，事务提交后，失败仅记日志）：<code>RemoveAll(&lt;会话目录&gt;/.tako/)</code>（搜索截断落盘）+ <code>RemoveAll(&lt;会话目录&gt;/.media/)</code>（旧媒体兜底），不存在算成功；<strong>产出保留</strong>，项目目录不动。</li>
+<li><strong>成功</strong>：<code>200 {"code":0,"message":"","data":{"status":"deleted"}}</code>；幂等：再删一次 → 404 <code>112001</code>。</li>
+<li><strong>并发</strong>：与 §5.3 同款——锁 <code>sessions</code> 行 ↔︎ <code>AcquireRun</code> 锁同一行互等；活 run 检查挡先发消息方，删除先提交则对方 404。</li>
+</ul>
+<h3 id="55-保留窗口与清扫器d4">5.5 保留窗口与清扫器（D4）</h3>
+<p><strong>清理对象（两类，都落在 <code>run_model_messages</code>）：</strong></p>
+<ol type="1">
+<li><strong>过窗 run 的逐字档案</strong>：<code>compacted=true</code> 的行，条件是所属 run 已终态且过窗： <code>DELETE FROM run_model_messages WHERE compacted=true AND run_id IN (SELECT id FROM runs WHERE finished_at IS NOT NULL AND finished_at &lt; now() - ttl)</code>。<code>seq=0</code> 摘要行与 <code>compacted=false</code> 的行（模型输入）<strong>不在这类里</strong>——前者是「发生过什么」永不删，后者还在被使用。</li>
+<li><strong>过窗软删会话的全部模型消息</strong>：软删会话没有了「继续跑」的可能，它的 <code>compacted=false</code> 行也失去用途（D-k）： <code>DELETE FROM run_model_messages WHERE session_id IN (SELECT id FROM sessions WHERE deleted_at IS NOT NULL AND deleted_at &lt; now() - ttl)</code>。</li>
+</ol>
+<p><strong>不清理</strong>：<code>runlog_entries</code>（页面展示线，本篇永不清）、<code>runs</code>、<code>usage</code>、摘要行。<strong>记忆线也不在清扫器的清理范围里</strong>——项目删除时只清 <code>scope='workspace'</code> 的记忆与该项目任务，<code>scope='user'</code> 行继续跟人走（D-l，§5.2 步骤 6–9），不进「宽限期 + 窗口」这套流程；清掉的是逐字档案，不是记忆。</p>
+<p><strong>单场会话删除（D3）不动记忆</strong>：项目记忆跨会话、用户记忆跨项目，删一场会话不等于记忆作废。pipeline 的 <code>memory_items</code> / <code>memory_jobs</code> 与 markdown 文件都不因单场删除而清；只有项目删除才按 D-l 的 scope 规则处理。</p>
+<p><strong>2026-10-27 补记（后加的两张会话级表）</strong>：<code>run_tasks</code>（doc/41）与 <code>run_questions</code>（doc/47）都带 <code>session_id</code>，语义上属于上面第 2 类，但<strong>今天不在任何 <code>DELETE</code> 里</strong>——run 结束、会话软删、过窗清扫都不动它们（全仓 <code>DELETE FROM</code> 实读，没有一条指向这两张表）。补法是同一拍各加一条按 <code>session_id IN (SELECT id FROM sessions WHERE deleted_at IS NOT NULL AND deleted_at &lt; now() - ttl)</code> 的删除 + 单测；未排期，不在别的方案里顺手改。</p>
+<p><strong>清扫器结构：</strong></p>
+<ul>
+<li>启动参数 <code>-archive-ttl</code>（默认 168h = 7 天，D-h）。</li>
+<li>新表 <code>cleaner_state(key text PK, owner text, expires_at timestamptz, watermark timestamptz)</code>，两行：<code>key='lease'</code>（抢租用）与 <code>key='archive'</code>（存本轮扫到的最大 <code>finished_at</code>/<code>deleted_at</code>，作下一轮的起点游标，避免每轮全表扫）。</li>
+<li>worker 进程内 goroutine + ticker（每分钟）；每轮：抢租约（<code>UPDATE cleaner_state SET owner=?, expires_at=now()+interval '5 min' WHERE key='lease' AND expires_at &lt; now()</code>，影响 0 行 = 别人持有，本轮跳过）→ 按游标删一批（每批 LIMIT，删完推进 watermark）→ 释放租约（expires_at = now()）。</li>
+<li>幂等与多副本：DELETE 本身幂等；两个副本同时持有过期租约的边缘情形只是重复删同一批，结果一致。闸在库，不是进程内互斥（D-j）。</li>
+<li><strong>dev 探针</strong>：<code>POST /api/dev/clean-sweep</code>（dev-only）手动触发一轮完整清扫，走同一租约与游标——验收靠它，生产靠 ticker。探针登记转正点：上线前 dev-only 门（<code>-dev</code>）挡住，未来如需手动触发再转正为 admin 端点。</li>
+</ul>
+<p><strong>与删除的联动</strong>：软删会话/删项目<strong>当时不动表</strong>（软删语义）；会话的模型消息（含子代理逐字）由清扫器在 <code>deleted_at + ttl</code> 后物理清（D-k）。想更快释放空间，调小 <code>-archive-ttl</code>。</p>
+<h2 id="6-软删对全站查询的影响">6. 软删对全站查询的影响</h2>
+<p>软删列一旦存在，所有按 <code>id</code> 或列表查会话的地方都要补 <code>deleted_at IS NULL</code>，否则已删会话照常收发消息。查询点（2026-10-20 实读）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>查询点</th>
+<th>位置</th>
+<th>不加的后果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SessionAccess</code>（按 id 取会话，一切会话读写的总闸）</td>
+<td>session_access.go:43-57</td>
+<td>已删会话的发消息 / 详情 / log / media 全放开——最大洞</td>
+</tr>
+<tr>
+<td><code>AcquireRun</code> 的 <code>SELECT ... FOR UPDATE</code></td>
+<td>store.go:146-148</td>
+<td>已删会话继续建 run</td>
+</tr>
+<tr>
+<td><code>ListSessions</code></td>
+<td>session_access.go:76-97</td>
+<td>列表里诈尸</td>
+</tr>
+<tr>
+<td><code>SetSessionVisibility</code> 的 FOR UPDATE</td>
+<td>session_access.go:106</td>
+<td>已删会话还能改可见性</td>
+</tr>
+<tr>
+<td><code>SetSessionWorkspace</code> 的 FOR UPDATE（A5）</td>
+<td>session_access.go:135</td>
+<td>已删会话还能挪挂</td>
+</tr>
+<tr>
+<td><code>Exists</code></td>
+<td>pgstore.go:448-454</td>
+<td>按调用点逐个核</td>
+</tr>
+<tr>
+<td><code>POST /api/runs/:runId/resume</code> 的鉴权路径</td>
+<td>server.go（resume handler）</td>
+<td>实现时核：已删会话的 run 不许复活</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>SessionStatus</code> 的 <code>EXISTS(SELECT 1 FROM sessions WHERE id=?)</code>（pgstore.go:492）<strong>不用改</strong>——只组装 <code>liveRunId</code>，拦人的是它前面的 <code>SessionAccess</code>。</p>
+<p>配套：部分索引 <code>CREATE INDEX ... ON sessions (tenant_id, user_id) WHERE deleted_at IS NULL</code>，对齐项目闸建法；D4 另给 <code>run_model_messages.compacted</code> 加 <code>(compacted, run_id)</code> 索引（或按查询计划定），让清扫批查不为全表扫。</p>
+<h2 id="7-错误码">7. 错误码</h2>
+<p><code>114</code> 段新增两格，doc/35 §10 的表随施工同步：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>code</th>
+<th>场景</th>
+<th>HTTP</th>
+<th>从哪拍开始用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>114006</code></td>
+<td>项目下有活 run，拒绝删除项目</td>
+<td>409</td>
+<td>D1</td>
+</tr>
+<tr>
+<td><code>114007</code></td>
+<td>会话下有活 run，拒绝删除会话</td>
+<td>409</td>
+<td>D3</td>
+</tr>
+<tr>
+<td><code>111204</code></td>
+<td>删除别人会话（看得见但非属主）</td>
+<td>403</td>
+<td>D3（复用 A5 的码）</td>
+</tr>
+<tr>
+<td><code>114002</code></td>
+<td><del>项目里还有会话，不能删</del></td>
+<td>409</td>
+<td><strong>本篇起退役，不再返回</strong>；码位留着不重用</td>
+</tr>
+</tbody>
+</table></div>
+<p>D4 无用户可见错误码（清扫器是后台任务；dev 探针 dev-only）。</p>
+<h2 id="8-分拍与验收">8. 分拍与验收</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>拍</th>
+<th>做什么</th>
+<th>怎么验收</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>D1</td>
+<td>§5.2 全链路：<code>sessions.deleted_at</code> 列 + <code>DeleteWorkspaceCascade</code> + <code>deleteWorkspace</code> 换用 + 114006 + 目录连带删 + §6 前三个过滤点</td>
+<td>curl 主链路</td>
+</tr>
+<tr>
+<td>D2</td>
+<td>§6 剩余过滤点（两个 SET、Exists、resume 核）+ sessions 软删部分索引 + 单测</td>
+<td>curl 边角 + <code>go test ./internal/runengine</code></td>
+</tr>
+<tr>
+<td>D3</td>
+<td>§5.4：<code>DELETE /api/sessions/:id</code>（路由 + handler + store <code>DeleteSession</code> + 114007 + 只清系统档案）</td>
+<td>curl 主链路</td>
+</tr>
+<tr>
+<td>D4</td>
+<td>§5.5：<code>-archive-ttl</code> 参数 + <code>cleaner_state</code> 表 + 清扫 goroutine/ticker + 两类清理 SQL + <code>POST /api/dev/clean-sweep</code> 探针</td>
+<td>curl 探针 + psql 断言</td>
+</tr>
+<tr>
+<td>D-l（11-07 拍，11-09 修订；11-10 落地）</td>
+<td>§5.2 步骤 6–9：<code>pipeline</code> 清该项目 <code>scope='workspace'</code> 的两层 <code>memory_items</code>、<code>dialogue_chunks</code> 与 <code>memory_jobs</code>，保留 <code>user</code> 行；<code>markdown</code> 由目录删除清 <code>MEMORY.md</code>，保留用户 <code>USER.md</code></td>
+<td>curl 删项目 + psql/真实文件断言：项目两类记忆都归零、个人记忆仍在、runs/runlog 不变</td>
+</tr>
+</tbody>
+</table></div>
+<p>D1 验收（用户 A、B，一个 <code>visibility=tenant</code> 共享项目）：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. 项目下挂两场会话（A 一场、B 挂上来一场），目录里各写得到文件</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. 有会话时删除：</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-X</span> DELETE <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$A_TOKEN</span><span class="st">&quot;</span> 127.0.0.1:8905/api/workspaces/<span class="va">$WS</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="co"># → 200 {&quot;code&quot;:0,&quot;message&quot;:&quot;&quot;,&quot;data&quot;:{&quot;status&quot;:&quot;deleted&quot;}}（旧语义是 409）</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. 项目没了：</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$A_TOKEN</span><span class="st">&quot;</span> <span class="st">&#39;127.0.0.1:8905/api/sessions?workspaceId=&#39;</span><span class="va">$WS</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="co"># → 404 {&quot;code&quot;:114001,&quot;message&quot;:&quot;找不到这个项目&quot;,&quot;data&quot;:null}</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. 已删会话按 id 取详情、发消息：</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$A_TOKEN</span><span class="st">&quot;</span> 127.0.0.1:8905/api/sessions/<span class="va">$SID_A</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="co"># → 404 {&quot;code&quot;:112001,&quot;message&quot;:&quot;找不到这场会话&quot;,&quot;data&quot;:null}</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-X</span> POST <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$B_TOKEN</span><span class="st">&quot;</span> <span class="at">-d</span> <span class="st">&#39;{&quot;text&quot;:&quot;hi&quot;,&quot;sessionId&quot;:&quot;&#39;</span><span class="va">$SID_B</span><span class="st">&#39;&quot;}&#39;</span> 127.0.0.1:8905/api/runs</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="co"># → 404 {&quot;code&quot;:112001,&quot;message&quot;:&quot;找不到这场会话&quot;,&quot;data&quot;:null}，runs 行数不增</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 5. 目录没了：项目目录、两场会话目录都不在盘上；游离会话目录不受影响</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 6. 审计线在（psql）：runs / runlog_entries / sessions 行数与删除前相同</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="co"># 7. 活 run 拒绝：挂一场会话、发长消息趁 running DELETE</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a><span class="co"># → 409 {&quot;code&quot;:114006,...}；项目行、会话行、目录都还在；run 跑完重发 → 200 deleted</span></span></code></pre></div>
+<p>D2 验收：对已删会话两个 PATCH → 均 404；<code>go test</code> + <code>go vet</code> 全绿。</p>
+<p>D3 验收（先造文件场景：游离会话里让 agent 写 <code>deliverable.md</code>，再触发一次搜索截断落盘造出 <code>.tako/search/</code>）：</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. 属主删自己的游离会话：</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-sS</span> <span class="at">-X</span> DELETE <span class="st">&quot;http://127.0.0.1:8905/api/sessions/</span><span class="va">$SID_FREE</span><span class="st">&quot;</span> <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$AT</span><span class="st">&quot;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co"># → 200 {&quot;code&quot;:0,&quot;message&quot;:&quot;&quot;,&quot;data&quot;:{&quot;status&quot;:&quot;deleted&quot;}}</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 分层验证（D-g）：会话目录还在；deliverable.md 原样保留；.tako/ 没了；.media/ 不存在算成功</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 再删一次 → 404 {&quot;code&quot;:112001,&quot;message&quot;:&quot;找不到这场会话&quot;,&quot;data&quot;:null}；详情/发消息 → 404</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. 属主删自己的挂载会话 → 200；项目下少一场；项目目录产出还在；该会话目录同样只清 .tako/.media</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. 活 run：发长消息趁 running 立刻 DELETE</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="co"># → 409 {&quot;code&quot;:114007,...}；行、目录、产出都在；run 跑完重发 → 200 deleted</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. 非属主：B DELETE A 的 tenant 可见会话 → 403 {&quot;code&quot;:111204,...}</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="co">#    A DELETE B 的会话 → 同样 403：tenant owner 不豁免</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 5. 看不见：B DELETE A 的私有会话 → 404 {&quot;code&quot;:112001,&quot;message&quot;:&quot;找不到这场会话&quot;,&quot;data&quot;:null}</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 6. psql：删除前后 runs / runlog_entries / sessions 行数不变</span></span></code></pre></div>
+<p>D4 验收（沿用 D1/D3 的库）：</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 0. 前置断言（psql）：SELECT COUNT(*) FROM run_model_messages WHERE compacted = true; → 记为 N</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. 窗口未到（run 刚终态）：POST /api/dev/clean-sweep → 200</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="co">#    psql 再数 → 仍 N（没清）</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. 把某场 run 的 finished_at 改到 8 天前：</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co">#    UPDATE runs SET finished_at = now() - interval &#39;8 days&#39; WHERE id = &#39;r_...&#39;;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="co">#    再探针 → psql：该 run 的 compacted 行没了；compacted=false 行还在；seq=0 摘要行还在</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. 软删会话的模型消息：D3 删一场会话 → UPDATE sessions SET deleted_at = now() - interval &#39;8 days&#39; WHERE id=&#39;s_...&#39;;</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="co">#    探针 → psql：该会话的 run_model_messages 全没（含 compacted=false）；runlog_entries 还在</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. 租约互斥：起两个引擎进程，同时打探针 → 只有一个真扫（cleaner_state 的 owner/expires_at 只有一份；</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="co">#    watermark 只推进一次；总行数断言与单跑一致）</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="co"># 5. 参数：-archive-ttl 12h 重启引擎 → 窗口按 12h 生效（finished_at 13 小时前的 run 被清）</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="co"># 6. go test + go vet 全绿</span></span></code></pre></div>
+<p>D-l 验收（沿用 D1/D3/D4 的库）：</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 0. 造数据：同一来源项目各写一条 scope=user 与 scope=workspace 的常驻行、召回行；</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co">#    再落 dialogue_chunks 与 memory_jobs。另开项目验证 user 行仍可见。</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="co"># 1. 删项目：</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-sS</span> <span class="at">-X</span> DELETE <span class="st">&quot;http://127.0.0.1:8905/api/workspaces/</span><span class="va">$WS</span><span class="st">&quot;</span> <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$AT</span><span class="st">&quot;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="co"># → 200 {&quot;code&quot;:0,&quot;message&quot;:&quot;&quot;,&quot;data&quot;:{&quot;status&quot;:&quot;deleted&quot;}}</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="co"># 2. psql 断言（$WS 是项目 id）：</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co">#    SELECT count(*) FROM memory_items WHERE workspace=&#39;$WS&#39; AND scope=&#39;workspace&#39;; → 0（不分 layer）</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="co">#    SELECT count(*) FROM memory_items WHERE workspace=&#39;$WS&#39; AND scope=&#39;user&#39;;      → 1（个人行保留）</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="co">#    SELECT count(*) FROM dialogue_chunks WHERE workspace=&#39;$WS&#39;;                  → 0</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="co">#    SELECT count(*) FROM memory_jobs   WHERE workspace=&#39;$WS&#39;;                     → 0</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="co">#    SELECT count(*) FROM runs          WHERE workspace_id=&#39;$WS&#39;;                 → 不变（审计线）</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="co">#    SELECT count(*) FROM runlog_entries WHERE ...                               → 不变</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="co"># 3. markdown 模式另跑：项目 MEMORY.md 随目录消失，用户 USER.md 字节不变。</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="co"># 4. go test + go vet 全绿</span></span></code></pre></div>
+<h2 id="9-不在本篇">9. 不在本篇</h2>
+<ul>
+<li><strong>已删会话的恢复入口</strong>：软删宽限期内行都在（D-k 保证清扫前可恢复），但恢复端点/页面是 purge/restore 独立方案。</li>
+<li><strong>runlog_entries 的物理清除</strong>：页面展示线，本篇永不清；何时清与恢复方案一起定。</li>
+<li><strong>前端</strong>：项目删除按钮、单场删除按钮、确认弹窗 <strong>2026-10-23 已由 <a href="44-前端三处欠账.html">doc/44</a> 落地</strong>（doc/35 前端另立 → 已收口）。</li>
+<li><strong>清理架构的其余姊妹件</strong>（借鉴梳理后另立）：write_file 原子写（临时文件 + rename）、每 run 写路径清单（崩后显式回退）、<code>.tako/scratch/&lt;runId&gt;/</code> + TTL。D4 已把其中「子代理逐字保留窗口」一件收进本篇；剩余三件独立成案。</li>
+<li><strong>逐字档案的「上限」</strong>（借鉴的"先设上限再谈清理"）：tako 现状已有回传裁剪 <code>-subagent-return-cap</code>（agents.go:16）、搜索截断落盘（doc/21）、溢出修复层（doc/19v6-09），单条工具输出已有界；本篇的窗口清理补上"旧"这一半，"坏"（半截文件）归原子写/清单件。</li>
+</ul>
+<h2 id="10-闭环">10. 闭环</h2>
+<p><strong>所以这解决了什么。</strong> 删除从「形同虚设」变成三个阶段各就各位：删除动作软删留档（可恢复、审计不断，D1/D3），文件按所有权分层（系统档案随删清、产出只随删项目清，D-g），档案按保留窗口物理回收（D4：过窗 run 的逐字行 + 过窗软删会话的模型消息，持 PG 租约的清扫器，多副本幂等）。子代理的逐字档案不再只进不出——压缩掉的原文行在窗口到期后真删，摘要行和 runlog 永留，「发生过什么」与「逐字过程」按价值分层保存。同一套软删语义和窗口数（D-k）把删除和清理焊成一个机制，而不是两个独立的垃圾来源。<strong>项目记忆跟着容器走，个人记忆跟着人走</strong>（D-l，2026-11-10 落地）：项目删除时，两层 <code>scope='workspace'</code> 行一起清，<code>scope='user'</code> 行仍能在其他项目出现；Markdown 的项目文件随目录清、用户文件不动。</p>
+<p><strong>仍不解决的：</strong> 恢复入口、runlog 物理清除、半截文件的自动处理、原子写/写清单/scratch——都在 §9 明说。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/37-%E5%88%A0%E9%99%A4%E4%B8%8E%E6%A1%A3%E6%A1%88%E6%B8%85%E7%90%86.md"><code>doc/37-删除与档案清理.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

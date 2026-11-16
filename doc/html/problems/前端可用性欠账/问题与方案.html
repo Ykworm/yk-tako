@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>前端可用性欠账：后端有契约、页面没入口，先补齐再谈观感 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="前端可用性欠账后端有契约页面没入口先补齐再谈观感">前端可用性欠账：后端有契约、页面没入口，先补齐再谈观感</h1>
+<blockquote>
+<p>模块：前端 · 页面与交互（doc/44 / doc/48 / doc/49 / doc/50）｜状态：<strong>已落地</strong>（doc/44/48/49 全部；doc/50 A1–A4 已落，<strong>A5 部分未做</strong>）｜证据：<code>doc/44-前端三处欠账.md</code>、<code>doc/48-前端可用性欠账.md</code>、<code>doc/49-走查缺陷修复.md</code>、<code>doc/50-侧栏项目树.md</code>、<code>yk-tako-eino/web/src/</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>后端每多一条契约，用户在页面上就多一个「知道它存在、却够不到」的动作。积到 2026-10-23，三件事已经能跑、页面却没有入口：</p>
+<p><strong>故事一（项目在终端里，不在眼前）。</strong> 用户在「验收项目」里跟 agent 做了两天活，想再建一个项目分开做。<code>POST /api/workspaces</code> 一早就能建，但页面上没有项目列表——只能在终端里建，建完看不到；项目越积越多，想删没用的那个也只能 curl。更糟的是，页面永远把新对话送进<strong>默认项目</strong>（<code>POST /api/runs</code> 从不带 <code>workspaceId</code>），用户建的项目里永远不会有对话落进去。</p>
+<p><strong>故事二（删除动作没有刹车）。</strong> <code>DELETE /api/sessions/:id</code>、<code>DELETE /api/workspaces/:id</code> 都在，页面没有删除按钮。删除不可逆，后端已经用 409 挡住「有活 run」和「默认项目」；页面如果自己猜一句「操作失败」，用户就不知道该去停 run 还是换项目。</p>
+<p><strong>故事三（子代理跑完就消失）。</strong> researcher 跑了十几分钟，折叠成三行摘要回到主对话。用户想追问「那个对比表的数据源是哪几个」，页面上看不到实例、也不知道 <code>sa_id</code>。档案在 <code>.tako/subagents/</code>，<code>GET /api/sessions/:id/subagents</code> 能列，<code>resume_subagent</code> 工具能接——两端都存在，中间没有入口。</p>
+<p>这三件事的共同点不是「界面丑」，而是<strong>功能欠账：后端有契约、页面没入口，功能等于不存在</strong>。它和观感欠账（字号、留白、气泡形状）是两笔不同的账，修的顺序也必须分开——先修「点不到」，再修「不好看」（doc/51 §0 的同一判据）。</p>
+<p>第三次走查（doc/49）还暴露了更重的一类：<strong>一个空格能拖垮整个租户</strong>。助手名 <code>qa 空格</code> 保存成功、列表正常，但名字同时是 AgentTool 的工具名；下一次任何 run 组装工具表时都撞上 <code>tools[25].function.name</code> 的 <code>^[a-zA-Z0-9_-]+$</code> 模式校验，整租户 400。名字合法性只在「模型调用那一刻」被第三方校验，创建时没人拦。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 只补「后端有、前端无」的入口</td>
+<td>按 doc/44 三处逐个加页面</td>
+<td>范围小、目标明确</td>
+<td>走查中发现的交互缺陷（markdown 卡、停止无反馈、窄屏挤爆）留到下次</td>
+</tr>
+<tr>
+<td>B 按现象清单全量修</td>
+<td>doc/48 的 17 条一次全上</td>
+<td>覆盖面大</td>
+<td>17 条里同一处代码/同一拍的被拆散，实施与验收都碎；观感与功能混在一批，返工</td>
+</tr>
+<tr>
+<td>C 先归并、按「功能伤 → 观感伤」排序（选定）</td>
+<td>17 条现象归并成 14 项修复、4 个 loop；每项标严重度；doc/49 第二轮 12 项再按 P0/P1/P2 排</td>
+<td>同一处代码一次改完；破坏性操作与观感各自成 loop；每批都能独立验收</td>
+<td>归并本身要读代码、做判断；严重度排错会让「能用」被观感抢先</td>
+</tr>
+<tr>
+<td>D 推倒重做前端</td>
+<td>换框架/重写页面</td>
+<td>干净</td>
+<td>后端契约与已验收交互全部要重新对一遍；与「用例驱动」节奏冲突</td>
+</tr>
+</tbody>
+</table></div>
+<p>选 C。归并后的节奏：<strong>Loop A 对话面 → Loop B 产出可达 → Loop C 破坏性操作与文案 → Loop D 观感</strong>；doc/49 再按 P0 / P1 / P2 排。</p>
+<h2 id="3-三处入口的裁量doc44">3. 三处入口的裁量（doc/44）</h2>
+<h3 id="31-项目页会话挂在项目下">3.1 项目页：会话挂在项目下</h3>
+<p>导航加第四页「项目」。数据只需两个现有端点：<code>GET /api/workspaces</code> + <code>GET /api/sessions?workspaceId=</code>。会话<strong>按需加载</strong>（展开项目才请求），首屏只打一次项目列表。</p>
+<p>「当前项目」只记在浏览器（<code>tako.workspaceId.&lt;tid&gt;</code>），服务端不保存「我正在看哪个项目」。新对话的 <code>POST /api/runs</code> <strong>只在没有 sessionId 时</strong>带 <code>workspaceId</code>：已有会话不带——服务端本来就不会改已有会话的项目，带了反而会让一个已删除项目的 id 把已有会话的投递挡在项目预检上。</p>
+<h3 id="32-删除独立确认弹窗不裸按钮">3.2 删除：独立确认弹窗，不裸按钮</h3>
+<p>删除项目和删除会话都走 <code>ConfirmDialog</code>（遮罩 + <code>role="dialog"</code> + <code>Esc</code> 取消 + 焦点落在取消按钮），不沿用成员页的两段式小按钮。弹窗把后果写全：</p>
+<ul>
+<li>删项目：「项目里的 N 场对话会一起删除，项目目录里的文件会清掉」；</li>
+<li>删会话：「只删会话档案；项目目录里的产出文件不受影响」。</li>
+</ul>
+<p>服务端拒绝时<strong>把信封的 <code>message</code> 原样显示</strong>，弹窗保持打开——不自造文案，也不替用户决定下一步。删项目前先拉一次该项目的会话列表拿 <code>sessionIds</code>，用于事后判断当前对话是否被连带删除。</p>
+<h3 id="33-子代理继续不在页面起-run">3.3 子代理「继续」：不在页面起 run</h3>
+<p>每行显示规格名、<code>sa_id</code>、状态（<code>complete</code> / <code>interrupted</code>）、创建时间。只有 <code>complete</code> 给「继续」；<code>interrupted</code> 是崩溃/中断的半成品，不给按钮。</p>
+<p>「继续」不是直接 POST 一个 resume 端点，而是<strong>把一句话追加到输入框并聚焦</strong>（不覆盖已有内容、不自动发送）：</p>
+<pre class="text"><code>请用 resume_subagent 继续子代理 sa_xxx（researcher）：接着它刚才的任务继续做下去，完成后把结果告诉我。</code></pre>
+<p>用户按 Enter，父 agent 在正常对话里调 <code>resume_subagent({id, instruction})</code>。<strong>为什么不做 HTTP 端点</strong>：resume 的 instruction 是对话语义的一部分；页面起一场 run 后「结果往哪写回父对话」没有答案，会多出第二套生命周期。这个选择保持 doc/39「resume 入口是模型侧工具」的裁定。</p>
+<h2 id="4-走查怎么变成修单doc48--doc49">4. 走查怎么变成修单（doc/48 / doc/49）</h2>
+<h3 id="41-doc4817-条现象--14-项修复">4.1 doc/48：17 条现象 → 14 项修复</h3>
+<p>2026-10-23 下午在真实浏览器里走四个页面 × 两种宽度（1015px / 1511px）：真发消息、真让模型调工具、真触发删除确认、真刷新验证恢复。17 条全部有当场证据。归并成 14 项，落到 4 个 loop：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Loop</th>
+<th>管什么</th>
+<th>代表项</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 对话面</td>
+<td>markdown 渲染与 XSS、最近会话、停止反馈、子代理条、工作区名</td>
+<td>点「停止」后页面无任何变化；用户不知道 run 停在哪儿</td>
+</tr>
+<tr>
+<td>B 产出可达</td>
+<td>新增 <code>GET /api/workspaces/:id/files</code>，让项目产出在页面上看得见</td>
+<td>后端写进项目目录，页面没有入口</td>
+</tr>
+<tr>
+<td>C 破坏性操作与文案</td>
+<td>默认项目标记、密钥格子的删除语义、保存按钮归属、成员页文案</td>
+<td>「清空密钥格子 = 删除」没有说清；一张卡保存连带提交别卡</td>
+</tr>
+<tr>
+<td>D 观感</td>
+<td>限宽、长文本、隐藏内部 id、窄屏</td>
+<td>宽屏内容贴左、内部 id 暴露给用户</td>
+</tr>
+</tbody>
+</table></div>
+<p>落地过程中又自审出 10 个问题（Vue 3 raw object、<code>.stage</code> 缺 <code>min-height</code>、空列表也滚到底、拆 form 后连带提交、<code>width</code> 对 flex item 不生效、markdown 每 token 重算、<code>.recent</code> 缺 <code>grid-area</code>、placeholder 被按钮挡住、Playwright 污染开发库、保存后全量重载冲掉别卡编辑）。每一条都补了回归网，理由见 <a href="../界面验收双轨/问题与方案.html">界面验收双轨</a>。</p>
+<h3 id="42-doc49第二轮-12-项p0-先修">4.2 doc/49：第二轮 12 项，P0 先修</h3>
+<p>2026-10-23 晚第二次全站走查（Playwright 逐页点击 + 真发消息 + 真停止 + 跨标签页 + 窄屏 + 引擎日志对读），12 项与 doc/48 不重叠：</p>
+<ul>
+<li><strong>1 项 P0</strong>：子代理名字含空格 → 整个租户的 run 全部 400（<code>tools[25].function.name</code>）。</li>
+<li><strong>5 项 P1</strong>：刷新丢结果、面板卡输入框、侧栏留死链、内置助手被静默清空、导入默认可见性与手工相反。</li>
+<li><strong>6 项 P2/P3</strong>：文案、反馈、边界与日志卫生。</li>
+</ul>
+<p>P0 的修法是把「名字合法」从<strong>模型调用那一刻</strong>提前到<strong>保存那一刻</strong>：<code>agentNamePattern = ^[A-Za-z0-9_-]{1,64}$</code> 在创建/改名时校验（<code>agents.go:66</code>）。这条也是「验证要放在最靠近输入的地方」的一个实例——放过非法名字，代价由整个租户的下一场 run 承担。</p>
+<h2 id="5-侧栏树的边界doc50">5. 侧栏树的边界（doc/50）</h2>
+<p>侧栏从「扁平 10 条最近会话」改成「项目 → 对话」二级树：</p>
+<ul>
+<li>数据零后端改动：一次 <code>GET /api/workspaces</code> + 一次 <code>GET /api/sessions</code>（不带 <code>workspaceId</code> = 本人全部会话，每行带 <code>workspaceId</code>）；</li>
+<li>项目顺序：默认项目第一（<code>isDefault</code>），其余按接口给的 <code>createdAt</code> 升序；<code>workspaceId = null</code> 的游离会话排最后（实测开发库有 4 条）；</li>
+<li>双层上限：整栏先取 10 条，每个项目再限 10 条；组内有被截住的才出「展示全部」，点开只放开这一个项目；有会话但全被截掉的项目<strong>不显示「还没有对话」</strong>；</li>
+<li>空项目显示一行灰字「还没有对话」；当前会话所属项目若收起，打开时自动展开；</li>
+<li>别的窗口改名/删项目：<code>workspace_renamed</code> / <code>workspace_deleted</code> 要重拉树——<strong>这两条已于 2026-11-15 落地</strong>（doc/50 A5，commit <code>cba0339</code>）；在此之前侧栏常驻项目名，改名后会一直显示旧名。新会话出现沿用现有重拉点，不新增 <code>session_created</code> 事件。</li>
+</ul>
+<h2 id="6-同族小裁定">6. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>欠账的修复顺序</td>
+<td><strong>功能伤 → 观感伤</strong></td>
+<td>先修点不到/没法用；观感另立 loop（doc/51）</td>
+</tr>
+<tr>
+<td>一轮走查的现象怎么进单</td>
+<td><strong>先归并成项、再分 loop</strong></td>
+<td>同一处代码的几条现象合成一项，否则实施与验收都碎</td>
+</tr>
+<tr>
+<td>破坏性操作的形式</td>
+<td><strong>独立确认弹窗</strong>，不复用两段式按钮</td>
+<td>删除不可逆，后果要完整写出来</td>
+</tr>
+<tr>
+<td>服务端拒绝的文案</td>
+<td><strong>原样显示信封 <code>message</code></strong></td>
+<td>不自造；用户需要知道是「有活 run」还是「默认项目」</td>
+</tr>
+<tr>
+<td>项目删除后的当前会话</td>
+<td>前端先拉 <code>sessionIds</code>，删完按集合清理</td>
+<td>否则对话页可能停在一条已不存在的会话上</td>
+</tr>
+<tr>
+<td>子代理「继续」</td>
+<td><strong>向输入框追加指令</strong>，由父 agent 调工具</td>
+<td>不在页面起第二场 run；保持 doc/39 的裁定</td>
+</tr>
+<tr>
+<td>助手名合法性</td>
+<td><strong>创建/改名时校验</strong>（<code>^[A-Za-z0-9_-]{1,64}$</code>）</td>
+<td>放到模型调用时校验，代价是全租户的下一场 run</td>
+</tr>
+<tr>
+<td>项目列表加载</td>
+<td><strong>按需</strong>（展开项目才拉会话）</td>
+<td>首屏只打一次；项目多时不拖慢页面</td>
+</tr>
+<tr>
+<td>「当前项目」存哪</td>
+<td><strong>浏览器（按租户）</strong>，服务端不存</td>
+<td>doc/35 的裁定；服务端不记「我在看哪个项目」</td>
+</tr>
+<tr>
+<td>侧栏翻页形态</td>
+<td><strong>列表内不放滚动条</strong>，用「展示更多」+10</td>
+<td>用户明确不要内部滚动条（全列全展开偏好）</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="7-证据">7. 证据</h2>
+<p><strong>方案</strong>：<code>doc/44-前端三处欠账.md</code>（三处入口、§2.4 为什么不做 resume 端点、§4 验收）；<code>doc/48-前端可用性欠账.md</code>（17→14、4 loop、§6 两层验收、落地自审 10 条）；<code>doc/49-走查缺陷修复.md</code>（第二轮 12 项、P0 故事、§14 四问）；<code>doc/50-侧栏项目树.md</code>（树结构与双层上限、A5 未做）。</p>
+<p><strong>台账</strong>：<code>tmp/44-前端三处欠账/</code>、<code>tmp/48-前端可用性欠账/</code>、<code>tmp/49-走查缺陷修复/</code>、<code>tmp/50-侧栏项目树/</code>（本地，不入库）。</p>
+<p><strong>代码符号</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>是什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yk-tako-eino/web/src/ProjectsView.vue</code></td>
+<td>项目页（列表 / 展开会话 / 开新对话 / 改名 / 删除）</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/web/src/ConfirmDialog.vue</code></td>
+<td>删除确认弹窗（遮罩、<code>Esc</code>、焦点）</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/web/src/chat.ts:343</code></td>
+<td>新对话才带 <code>workspaceId</code></td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/web/src/chat.ts:472-477</code></td>
+<td>发送那一刻定落点，事后切项目不覆盖</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/web/src/api.ts:356</code></td>
+<td><code>GET /api/sessions/:id/subagents</code></td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/runengine/agents.go:66-77</code></td>
+<td><code>agentNamePattern</code> 与 <code>validAgentName</code>（P0 修法）</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/runengine/product_store.go:42-44</code></td>
+<td><code>tenant_agent_name</code> 唯一索引（名字同时是标签与工具名）</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>复核命令</strong>：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;agentNamePattern\|validAgentName&quot;</span> internal/runengine/agents.go</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;workspaceId&quot;</span> web/src/chat.ts <span class="kw">|</span> <span class="fu">head</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;subagents&quot;</span> web/src/api.ts</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> web <span class="kw">&amp;&amp;</span> <span class="ex">npm</span> run typecheck <span class="kw">&amp;&amp;</span> <span class="ex">npm</span> test <span class="kw">&amp;&amp;</span> <span class="ex">npm</span> run test:e2e   <span class="co"># 需 ./scripts/dev.sh 起着</span></span></code></pre></div>
+<p><strong>活体验收</strong>：doc/44 浏览器 7 场全过（项目列表/新建/改名、项目内开新对话、历史恢复、项目与单场删除的取消与确认、默认项目 409 文案、级联删除与目录清理、子代理列出与「继续」）；doc/48 两层全绿（快闸 3、活体 27、单测 7、Playwright 11）；doc/49 在隔离引擎 8944 + 浏览器逐条手验 12 项；doc/50 A1–A4 浏览器验收，A5 未做。</p>
+<h2 id="8-现状">8. 现状</h2>
+<ul>
+<li><strong>仍有效</strong>：先功能伤后观感伤；破坏性操作必须确认弹窗 + 原样透传 409 文案；子代理「继续」走输入框指令；项目/会话的数据来源不新增后端契约；侧栏双层 10 条上限。</li>
+<li><strong>已落地（2026-11-15）</strong>：doc/50 A5——<code>workspace_renamed</code> / <code>workspace_deleted</code> 事件触发侧栏树重载（commit <code>cba0339</code>，Playwright <code>web/e2e/sidebar-events.spec.ts</code> 三条先红后绿）；「侧栏改名后显示旧名」这条真实缺陷已消。窄屏部分已由 doc/51 U6 覆盖，不再重复。</li>
+<li><strong>已翻转</strong>：单会话形态作废（doc/44 → doc/50 的二级树）；「后端有就能用」不再成立——没有页面入口的功能视为不存在。</li>
+<li><strong>同族问题</strong>：验收怎么断言 → <a href="../界面验收双轨/问题与方案.html">界面验收双轨</a>；项目目录与归属 → <a href="../项目目录归谁/问题与方案.html">项目目录归谁</a>；跨窗口失效靠什么事件 → <a href="../变更同步用事件通道/问题与方案.html">变更同步用事件通道</a>；子代理档案与 resume → <a href="../子代理档案放哪里/问题与方案.html">子代理档案放哪里</a>。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E5%89%8D%E7%AB%AF%E5%8F%AF%E7%94%A8%E6%80%A7%E6%AC%A0%E8%B4%A6/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/前端可用性欠账/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

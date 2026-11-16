@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Go 少见玩法辑录 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="go-少见玩法辑录">Go 少见玩法辑录</h1>
+<blockquote>
+<p>性质：<strong>非方案</strong>（代码阅读笔记），不作施工面。它回答「这个仓库里哪些 Go 写法不常见、为什么这么写、代价是什么」，不回答「下一步做什么」。 口径：只收<strong>不常见、有明确用途、不看注释容易看漏</strong>的写法；<code>if err != nil</code>、<code>go func</code>、<code>select</code>、<code>context.WithValue</code> 这类标准动作不收。 代码路径相对 <code>yk-tako-eino/</code>。最后核对：2026-10-31（<code>go.mod</code> = <code>go 1.27.0</code>）。 文中行号是核对时的位置；代码改了行号会漂，按函数名找。</p>
+</blockquote>
+<h2 id="0-速查表">0. 速查表</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>玩法</th>
+<th>版本 / 依赖点</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>不用第三方库的 <code>flock</code>：哈希桶 + 排序取锁 + 非阻塞轮询</td>
+<td><code>syscall.Flock</code></td>
+<td><code>internal/runengine/filefp.go</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Redis <code>INCR</code>/<code>EXPIRE</code> 当跨副本信号量</td>
+<td>Redis</td>
+<td><code>internal/runengine/scope.go</code></td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>sync.Map.CompareAndDelete</code> 按指针身份清理「上一代」</td>
+<td>Go 1.20+</td>
+<td><code>internal/runengine/worker.go</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td>手写流式 stall 检测：goroutine + done 通道 + timer 手动 Stop</td>
+<td><code>time.Timer</code></td>
+<td><code>internal/runengine/compact.go</code></td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>defer</code> LIFO 当收尾顺序契约（watchdog 必须死在 EndRun 之前）</td>
+<td>语言特性</td>
+<td><code>internal/runengine/worker.go</code></td>
+</tr>
+<tr>
+<td>6</td>
+<td>手写 SSE：<code>http.Flusher</code> + <code>Last-Event-ID</code> + 注释心跳帧</td>
+<td><code>net/http</code></td>
+<td><code>internal/runengine/events.go</code>、<code>server.go</code></td>
+</tr>
+<tr>
+<td>7</td>
+<td>Redis Stream <code>XREAD BLOCK</code> 当长轮询</td>
+<td>Redis Stream</td>
+<td><code>internal/runengine/events.go</code></td>
+</tr>
+<tr>
+<td>8</td>
+<td><code>io.Writer</code> 截断仍返回 <code>len(p)</code>；<code>exec.Cmd.WaitDelay</code> 收尸</td>
+<td><code>os/exec</code></td>
+<td><code>internal/runengine/bash.go</code></td>
+</tr>
+<tr>
+<td>9</td>
+<td>把 <code>PATH</code> 按真实路径过滤成安全边界</td>
+<td><code>filepath.EvalSymlinks</code></td>
+<td><code>internal/runengine/subprocesspath.go</code></td>
+</tr>
+<tr>
+<td>10</td>
+<td>编译期接口锚 + <strong>故意不嵌 Base</strong> 当「接口长新方法就编译失败」的绊线</td>
+<td>eino <code>adk</code></td>
+<td><code>internal/runengine/agentlog.go</code>、<code>guard.go</code></td>
+</tr>
+<tr>
+<td>11</td>
+<td>在 <code>BeforeAgent</code> 里替换 <code>Tools</code> 切片，用注册顺序拼装饰器栈</td>
+<td>eino <code>adk</code></td>
+<td><code>internal/runengine/plangate.go</code>、<code>journal.go</code></td>
+</tr>
+<tr>
+<td>12</td>
+<td><code>context</code> 当依赖注入容器 + <code>context.WithoutCancel</code> 做收尾写入</td>
+<td>Go 1.21+</td>
+<td><code>internal/runengine/plangate.go</code>、<code>worker.go</code>、<code>storage_reserve.go</code></td>
+</tr>
+<tr>
+<td>13</td>
+<td><code>//go:embed</code> + 包级 <code>var</code> 初始化时 <code>panic</code></td>
+<td>Go 1.16+</td>
+<td><code>internal/config/catalog.go</code></td>
+</tr>
+<tr>
+<td>14</td>
+<td><code>RowsAffected == 0</code> 当围栏；Redis Lua 脚本做多键原子 CAS</td>
+<td>PostgreSQL / Redis Lua</td>
+<td><code>internal/runengine/store.go</code>、<code>redisstore.go</code>、<code>plangate.go</code></td>
+</tr>
+<tr>
+<td>15</td>
+<td>ULID 当可排序主键（以及它<strong>不保证</strong>同毫秒单调）</td>
+<td><code>oklog/ulid</code></td>
+<td><code>internal/runengine/pgstore.go</code>、<code>notes.go</code></td>
+</tr>
+<tr>
+<td>16</td>
+<td>预留额度事务 + 延迟测量回调</td>
+<td>GORM / PG 行锁</td>
+<td><code>internal/runengine/storage_reserve.go</code></td>
+</tr>
+<tr>
+<td>17</td>
+<td>多版本 AES-GCM 封存 + 密钥轮换（<code>seal1:</code> / <code>seal2:</code>）</td>
+<td><code>crypto/aes</code></td>
+<td><code>internal/runengine/secretseal.go</code></td>
+</tr>
+<tr>
+<td>18</td>
+<td><code>sync.Once</code> <strong>真跑一次</strong>沙箱探测 + 手写 seatbelt S 表达式</td>
+<td>macOS <code>sandbox-exec</code></td>
+<td><code>internal/runengine/sandbox.go</code></td>
+</tr>
+<tr>
+<td>19</td>
+<td>struct 字段顺序 = JSON 字节序契约；<code>*bool</code> 区分「没传」与 <code>false</code></td>
+<td><code>encoding/json</code></td>
+<td><code>internal/runengine/auth.go</code>、<code>plangate.go</code></td>
+</tr>
+<tr>
+<td>20</td>
+<td>测试里的小把戏：唯一泛型、<code>reflect</code> 比函数指针、查字段是否存在</td>
+<td><code>reflect</code> / 泛型</td>
+<td><code>internal/runengine/*_test.go</code></td>
+</tr>
+</tbody>
+</table></div>
+<hr />
+<h2 id="1-并发与互斥">1. 并发与互斥</h2>
+<h3 id="11-不用第三方库的-flock哈希桶--排序取锁--非阻塞轮询">1.1 不用第三方库的 <code>flock</code>：哈希桶 + 排序取锁 + 非阻塞轮询</h3>
+<p><strong>病灶。</strong> 两个 agent 同时改同一个文件：A 读了 v1，B 也读了 v1；A 写 v2，B 基于 v1 算出内容写 v3——v2 被覆盖，两边都报成功。只在内存里放互斥量挡不住另一个进程/另一个副本；要对<strong>文件</strong>本身加排它锁。</p>
+<p><strong>写法</strong>（<code>filefp.go:191-280</code>）：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 锁文件按路径哈希分 256 桶，桶数恒定</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">const</span> lockBuckets <span class="op">=</span> <span class="dv">256</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> lockPathFor<span class="op">(</span>lockDir<span class="op">,</span> absPath <span class="dt">string</span><span class="op">)</span> <span class="dt">string</span> <span class="op">{</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    sum <span class="op">:=</span> sha256<span class="op">.</span>Sum256<span class="op">([]</span><span class="dt">byte</span><span class="op">(</span>absPath<span class="op">))</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> filepath<span class="op">.</span>Join<span class="op">(</span>lockDir<span class="op">,</span> fmt<span class="op">.</span>Sprintf<span class="op">(</span><span class="st">&quot;%02x.lock&quot;</span><span class="op">,</span> <span class="dt">int</span><span class="op">(</span>sum<span class="op">[</span><span class="dv">0</span><span class="op">])%</span>lockBuckets<span class="op">))</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>取锁的三条规则（缺一就死锁），对应 <code>lockPaths</code>：</p>
+<ol type="1">
+<li><strong>路径去重</strong>：<code>flock</code> 挂在 open file description 上，同一进程两次 <code>open</code> 同一文件是两个不同的 open file description，第二次会阻塞在<strong>自己</strong>的第一次上。</li>
+<li><strong>按字典序取</strong>：防 A 拿 L1→L2、B 拿 L2→L1 的 AB-BA 死锁。</li>
+<li><strong>逐把取，失败全释放</strong>：任一把失败就把已拿到的全部 <code>LOCK_UN</code>，再返回错误。</li>
+</ol>
+<p>等待方式不是阻塞式 <code>LOCK_EX</code>：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">{</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>    err <span class="op">=</span> syscall<span class="op">.</span>Flock<span class="op">(</span><span class="dt">int</span><span class="op">(</span>fd<span class="op">.</span>Fd<span class="op">()),</span> syscall<span class="op">.</span>LOCK_EX<span class="op">|</span>syscall<span class="op">.</span>LOCK_NB<span class="op">)</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">==</span> <span class="ot">nil</span> <span class="op">{</span> <span class="cf">break</span> <span class="op">}</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">!</span>errors<span class="op">.</span>Is<span class="op">(</span>err<span class="op">,</span> syscall<span class="op">.</span>EWOULDBLOCK<span class="op">)</span> <span class="op">{</span> <span class="op">...</span> <span class="op">}</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> time<span class="op">.</span>Now<span class="op">().</span>After<span class="op">(</span>deadline<span class="op">)</span> <span class="op">{</span> <span class="op">...</span> <span class="cf">return</span> <span class="ot">nil</span><span class="op">,</span> errLockTimeout <span class="op">}</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    time<span class="op">.</span>Sleep<span class="op">(</span>lockWaitInterval<span class="op">)</span> <span class="co">// 20ms 轮询，30s 上限</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>为什么不阻塞。</strong> 阻塞式 <code>flock</code> 会占住一个 OS 线程，而且没有内建超时；<code>LOCK_NB</code> + 轮询才能给调用方一个「30 秒拿不到就告诉模型稍后重试」的出口。</p>
+<p><strong>少见在哪。</strong> Go 标准库没有文件锁；大多数服务直接上 Redis/etcd 分布式锁，或者引第三方库。这里直接 <code>syscall.Flock</code>，并用「桶」把锁文件数量钉死在 256——否则一个项目写几千个文件，锁目录就堆几千个空文件，而<strong>清理锁文件本身又很危险</strong>：<code>unlink</code> 一个正被持有的锁文件，后来者会 <code>open</code> 到新 inode，两边同时以为自己独占。</p>
+<p><strong>代价 / 前提。</strong></p>
+<ul>
+<li><code>flock</code> 是 advisory 的：<code>bash</code> 里的 <code>rm</code>、<code>sed -i</code>、<code>&gt;</code> 重定向完全不守这把锁，由人审兜底。</li>
+<li>注释口径是「同机跨进程跨副本都串」，前提是这些副本看到的是<strong>同一个文件系统</strong>；本地磁盘上的 <code>flock</code> 不跨机器。</li>
+<li>不同路径可能撞同一桶（1/256），结果是「假串行」——多等一会儿，没有正确性问题。</li>
+</ul>
+<h3 id="12-redis-increxpire-当跨副本信号量">1.2 Redis <code>INCR</code>/<code>EXPIRE</code> 当跨副本信号量</h3>
+<p><strong>病灶。</strong> 委派子代理要限并发。用 Go 的 <code>chan struct{}</code> 信号量，只能限制<strong>本进程</strong>：A 副本占满自己的 8 个槽，B 副本即使租户总额度还有空，也会在本进程排队。额度属于租户，不属于进程。</p>
+<p><strong>写法</strong>（<code>scope.go:218-248</code>）：</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>key <span class="op">:=</span> <span class="st">&quot;tk:subagents:&quot;</span> <span class="op">+</span> p<span class="op">.</span>TenantID</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>n<span class="op">,</span> err <span class="op">:=</span> s<span class="op">.</span>rdb<span class="op">.</span>Incr<span class="op">(</span>ctx<span class="op">,</span> key<span class="op">).</span>Result<span class="op">()</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="op">...</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>_ <span class="op">=</span> s<span class="op">.</span>rdb<span class="op">.</span>Expire<span class="op">(</span>ctx<span class="op">,</span> key<span class="op">,</span> <span class="dv">30</span><span class="op">*</span>time<span class="op">.</span>Minute<span class="op">).</span>Err<span class="op">()</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="dt">int</span><span class="op">(</span>n<span class="op">)</span> <span class="op">&gt;</span> maxSub <span class="op">{</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    _ <span class="op">=</span> s<span class="op">.</span>rdb<span class="op">.</span>Decr<span class="op">(</span>ctx<span class="op">,</span> key<span class="op">).</span>Err<span class="op">()</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="ot">false</span><span class="op">,</span> <span class="ot">nil</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="cf">return</span> <span class="ot">true</span><span class="op">,</span> <span class="ot">nil</span></span></code></pre></div>
+<p>释放就是 <code>Decr</code>；调用方用 <code>defer store.releaseSubagentSlot(context.WithoutCancel(ctx))</code>。</p>
+<p><strong>少见在哪。</strong> 不是「Redis 计数」本身，而是<strong>没有 Redis 时自动退回进程内信号量</strong>：</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>useProcessSem <span class="op">:=</span> store <span class="op">==</span> <span class="ot">nil</span> <span class="op">||</span> store<span class="op">.</span>rdb <span class="op">==</span> <span class="ot">nil</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> store <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span> <span class="co">/* Redis 槽 */</span> <span class="op">}</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> useProcessSem <span class="op">{</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">select</span> <span class="op">{</span> <span class="cf">case</span> sem <span class="op">&lt;-</span> <span class="kw">struct</span><span class="op">{}{}:</span> <span class="op">...;</span> <span class="cf">case</span> <span class="op">&lt;-</span>ctx<span class="op">.</span>Done<span class="op">():</span> <span class="op">...</span> <span class="op">}</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>单测没有 Redis，仍然能测并发语义；生产有多副本，闸自然落到 Redis。</p>
+<p><strong>代价。</strong> <code>Incr</code> 与 <code>Expire</code> 是两条命令，不是原子的；进程恰好死在两者之间，会留下一个没有 TTL 的计数键。实现接受这个极小窗口，用 30 分钟的 TTL 兜底（但兜不住「EXPIRE 根本没执行」的那一次）。要绝对干净就得像下面的 Lua 脚本一样合并成一条。</p>
+<h3 id="13-syncmapcompareanddelete-按指针身份清理上一代">1.3 <code>sync.Map.CompareAndDelete</code> 按指针身份清理「上一代」</h3>
+<p><strong>病灶。</strong> 一场 run 的取消把柄放在进程内注册表 <code>runID → *runCancel</code>。崩溃续跑后，新执行者接管同一个 run，注册表里换成了新一代的值。旧 <code>Run</code> 的 <code>defer</code> 这时才退出——如果它按 key 直接 <code>Delete(runID)</code>，会把<strong>新执行者</strong>的取消把柄删掉，之后用户点停止就停不掉。</p>
+<p><strong>写法</strong>（<code>worker.go:145-150, 493-494</code>）：</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> runCancel <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>    epoch  <span class="dt">int64</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    cancel context<span class="op">.</span>CancelFunc</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>rc <span class="op">:=</span> <span class="op">&amp;</span>runCancel<span class="op">{</span>epoch<span class="op">:</span> epoch<span class="op">,</span> cancel<span class="op">:</span> cancelRun<span class="op">}</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>w<span class="op">.</span>runCancels<span class="op">.</span>Store<span class="op">(</span>runID<span class="op">,</span> rc<span class="op">)</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="cf">defer</span> w<span class="op">.</span>runCancels<span class="op">.</span>CompareAndDelete<span class="op">(</span>runID<span class="op">,</span> rc<span class="op">)</span></span></code></pre></div>
+<p><code>CompareAndDelete(key, value)</code> 比较的是值相等；这里是 <code>*runCancel</code> 指针，所以等于<strong>指针身份</strong>：只有注册表里还是我当时存进去的那个对象，才删得掉。watchdog 判死时也要再核对一次 epoch：</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> c<span class="op">,</span> hit <span class="op">:=</span> w<span class="op">.</span>runCancels<span class="op">.</span>Load<span class="op">(</span>runID<span class="op">);</span> hit <span class="op">{</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> rc <span class="op">:=</span> c<span class="op">.(*</span>runCancel<span class="op">);</span> rc<span class="op">.</span>epoch <span class="op">==</span> epoch <span class="op">{</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>        rc<span class="op">.</span>cancel<span class="op">()</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>少见在哪。</strong> <code>CompareAndDelete</code> 是 Go 1.20 才加的方法，日常代码里很少用；把「指针身份」当<strong>代际令牌</strong>用，比额外维护一个 <code>map[runID]epoch</code> 更省。</p>
+<h3 id="14-手写流式-stall-检测goroutine--done-通道--timer-手动-stop">1.4 手写流式 stall 检测：goroutine + done 通道 + timer 手动 Stop</h3>
+<p><strong>病灶。</strong> 摘要模型流式返回，provider 卡住时 <code>stream.Recv()</code> 会一直阻塞。<code>context</code> 的超时不一定能穿透第三方 SDK 的 <code>Recv</code>；需要的是「<strong>等不到下一帧</strong>就失败」，而不是「总时长超了」。</p>
+<p><strong>写法</strong>（<code>compact.go:1002-1060</code>）：</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a>ch <span class="op">:=</span> <span class="bu">make</span><span class="op">(</span><span class="kw">chan</span> recvResult<span class="op">,</span> <span class="dv">1</span><span class="op">)</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>done <span class="op">:=</span> <span class="bu">make</span><span class="op">(</span><span class="kw">chan</span> <span class="kw">struct</span><span class="op">{})</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="cf">defer</span> <span class="bu">close</span><span class="op">(</span>done<span class="op">)</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="cf">go</span> <span class="kw">func</span><span class="op">()</span> <span class="op">{</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> <span class="op">{</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>        chunk<span class="op">,</span> err <span class="op">:=</span> stream<span class="op">.</span>Recv<span class="op">()</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a>        <span class="cf">select</span> <span class="op">{</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> ch <span class="op">&lt;-</span> recvResult<span class="op">{</span>chunk<span class="op">:</span> chunk<span class="op">,</span> err<span class="op">:</span> err<span class="op">}:</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">case</span> <span class="op">&lt;-</span>done<span class="op">:</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="co">// 调用方已超时退出：带走 goroutine，不泄漏</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span> <span class="cf">return</span> <span class="op">}</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a><span class="op">}()</span></span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>timer <span class="op">:=</span> time<span class="op">.</span>NewTimer<span class="op">(</span>firstToken<span class="op">)</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a><span class="cf">defer</span> timer<span class="op">.</span>Stop<span class="op">()</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">{</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>    <span class="cf">select</span> <span class="op">{</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> r <span class="op">:=</span> <span class="op">&lt;-</span>ch<span class="op">:</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>        <span class="op">...</span></span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>        chunks <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>chunks<span class="op">,</span> r<span class="op">.</span>chunk<span class="op">)</span></span>
+<span id="cb7-23"><a href="#cb7-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> <span class="op">!</span>timer<span class="op">.</span>Stop<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb7-24"><a href="#cb7-24" aria-hidden="true" tabindex="-1"></a>            <span class="cf">select</span> <span class="op">{</span> <span class="cf">case</span> <span class="op">&lt;-</span>timer<span class="op">.</span>C<span class="op">:</span> <span class="cf">default</span><span class="op">:</span> <span class="op">}</span></span>
+<span id="cb7-25"><a href="#cb7-25" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb7-26"><a href="#cb7-26" aria-hidden="true" tabindex="-1"></a>        timer<span class="op">.</span>Reset<span class="op">(</span>chunkGap<span class="op">)</span></span>
+<span id="cb7-27"><a href="#cb7-27" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> <span class="op">&lt;-</span>timer<span class="op">.</span>C<span class="op">:</span></span>
+<span id="cb7-28"><a href="#cb7-28" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ot">nil</span><span class="op">,</span> errStall</span>
+<span id="cb7-29"><a href="#cb7-29" aria-hidden="true" tabindex="-1"></a>    <span class="cf">case</span> <span class="op">&lt;-</span>ctx<span class="op">.</span>Done<span class="op">():</span></span>
+<span id="cb7-30"><a href="#cb7-30" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ot">nil</span><span class="op">,</span> ctx<span class="op">.</span>Err<span class="op">()</span></span>
+<span id="cb7-31"><a href="#cb7-31" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-32"><a href="#cb7-32" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>少见在哪。</strong> <code>Timer.Stop</code> 之后要<strong>非阻塞地 drain</strong> <code>timer.C</code>，否则下一次 <code>Reset</code> 可能读到上一次的过期信号——这是 <code>time.Timer</code> 的经典坑，很多人只会 <code>Stop</code> 不会 drain。另一个细节是 <code>done</code> 通道：调用方一旦超时返回，接收 goroutine 必须能被收走，不能永远卡在 <code>ch &lt;-</code> 上。</p>
+<h3 id="15-defer-lifo-当收尾顺序契约">1.5 <code>defer</code> LIFO 当收尾顺序契约</h3>
+<p><strong>病灶。</strong> run 收尾有两件事必须按顺序：先停 watchdog（续租 goroutine），再 <code>EndRun</code> 放闸。反过来的话，watchdog 可能在 <code>EndRun</code> 把 <code>runlive</code> 的 TTL 设成 300s 之后又续回 30s，把已定稿的帧重新变成「可能还活着」。</p>
+<p><strong>写法</strong>（<code>worker.go:547-579</code>）：</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="cf">defer</span> <span class="kw">func</span><span class="op">()</span> <span class="op">{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    _<span class="op">,</span> _<span class="op">,</span> ok<span class="op">,</span> err <span class="op">:=</span> w<span class="op">.</span>store<span class="op">.</span>EndRun<span class="op">(</span>context<span class="op">.</span>WithoutCancel<span class="op">(</span>ctx<span class="op">),</span> <span class="op">...)</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="op">...</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="op">}()</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>leaseCtx<span class="op">,</span> cancelLease <span class="op">:=</span> context<span class="op">.</span>WithCancel<span class="op">(</span>ctx<span class="op">)</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="kw">var</span> wg sync<span class="op">.</span>WaitGroup</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>wg<span class="op">.</span>Add<span class="op">(</span><span class="dv">1</span><span class="op">)</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="cf">go</span> <span class="kw">func</span><span class="op">()</span> <span class="op">{</span> <span class="cf">defer</span> wg<span class="op">.</span>Done<span class="op">();</span> w<span class="op">.</span>watchdog<span class="op">(</span>leaseCtx<span class="op">,</span> sessionID<span class="op">,</span> runID<span class="op">,</span> epoch<span class="op">)</span> <span class="op">}()</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a><span class="cf">defer</span> <span class="kw">func</span><span class="op">()</span> <span class="op">{</span> cancelLease<span class="op">();</span> wg<span class="op">.</span>Wait<span class="op">()</span> <span class="op">}()</span></span></code></pre></div>
+<p><code>defer</code> 是 LIFO：后注册的先跑。<code>EndRun</code> 先注册，所以最后跑；停 watchdog 的 defer 后注册，所以先跑。<code>wg.Wait()</code> 再保证续租 goroutine <strong>完全退出</strong>，而不是「收到 cancel 但还没跑完」。</p>
+<p><strong>少见在哪。</strong> 用 <code>defer</code> 的注册顺序表达「收尾依赖图」，而不是写一个显式的 <code>shutdown()</code> 函数。代价是读代码时必须记住 LIFO——所以这里必须配注释，否则下一个人重排两行就破坏契约。</p>
+<hr />
+<h2 id="2-http-与子进程">2. HTTP 与子进程</h2>
+<h3 id="21-手写-ssehttpflusher--last-event-id--注释心跳帧">2.1 手写 SSE：<code>http.Flusher</code> + <code>Last-Event-ID</code> + 注释心跳帧</h3>
+<p><strong>病灶。</strong> 前端要边生成边显示，但拉模式（轮询 <code>frames</code>）有一拍延迟。SSE 是「同一帧面的第二种运输方式」：不新增帧形状，只换运输。</p>
+<p><strong>写法</strong>（<code>server.go:1112-1180</code>）：</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a>w<span class="op">.</span>Header<span class="op">().</span>Set<span class="op">(</span><span class="st">&quot;Content-Type&quot;</span><span class="op">,</span> <span class="st">&quot;text/event-stream&quot;</span><span class="op">)</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>w<span class="op">.</span>Header<span class="op">().</span>Set<span class="op">(</span><span class="st">&quot;Cache-Control&quot;</span><span class="op">,</span> <span class="st">&quot;no-cache&quot;</span><span class="op">)</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>write <span class="op">:=</span> <span class="kw">func</span><span class="op">(</span>block <span class="dt">string</span><span class="op">)</span> <span class="dt">bool</span> <span class="op">{</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> _<span class="op">,</span> err <span class="op">:=</span> w<span class="op">.</span>WriteString<span class="op">(</span>block<span class="op">);</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ot">false</span> <span class="co">// 客户端已断开，SSE 无错误语义，直接退出</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>    w<span class="op">.</span>Flush<span class="op">()</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="ot">true</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>write<span class="op">(</span>fmt<span class="op">.</span>Sprintf<span class="op">(</span><span class="st">&quot;id: %d</span><span class="ch">\n</span><span class="st">event: frame</span><span class="ch">\n</span><span class="st">data: %s</span><span class="ch">\n\n</span><span class="st">&quot;</span><span class="op">,</span> f<span class="op">.</span>EventOffset<span class="op">,</span> b<span class="op">))</span></span></code></pre></div>
+<ul>
+<li><code>id:</code> 就是轮询路的 <code>eventOffset</code>，断线重连带 <code>Last-Event-ID: N</code> 从 <code>N</code> 之后续读——<strong>不是流另认一套游标，是同一游标的第二种读法</strong>。</li>
+<li>静默期每 15 秒写一行 <code>: ping</code>。冒号开头是 SSE 注释帧，<code>EventSource</code> 自动忽略，但能防止中间层把空闲连接掐掉。</li>
+<li>run 结束发一条 <code>event: terminal</code> 后关闭；<code>runlive</code> 键不存在（从没存在或 TTL 过期，故意不区分）发一条 <code>event: gone</code> 后关闭。SSE 没有错误语义，客户端靠「断了且没收到 terminal」知道该重连。</li>
+</ul>
+<p><strong>少见在哪。</strong> 没有引 SSE 库，直接用 <code>w.WriteString</code> + <code>w.Flush</code> 拼帧；并且把「流」和「拉」的游标统一成同一个整数。另一个细节是心跳间隔用 <code>var</code> 而不是 <code>const</code>：</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="kw">var</span> <span class="op">(</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>    sseTailInterval      <span class="op">=</span> <span class="dv">150</span> <span class="op">*</span> time<span class="op">.</span>Millisecond</span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    sseHeartbeatInterval <span class="op">=</span> <span class="dv">15</span> <span class="op">*</span> time<span class="op">.</span>Second</span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="op">)</span></span></code></pre></div>
+<p>单测可以调小它验证心跳，生产值不动。</p>
+<p><strong>代价。</strong> <code>write</code> 一旦返回 <code>false</code> 就退出；但 SSE 无法告诉客户端「服务端内部错了」，只能断流。另外循环里 <code>time.After(sseTailInterval)</code> 每次分配一个 timer（见 §5.1）。</p>
+<h3 id="22-redis-stream-xread-block-当长轮询">2.2 Redis Stream <code>XREAD BLOCK</code> 当长轮询</h3>
+<p><strong>病灶。</strong> 变更事件（会话被删、工作区改名）要推给在线客户端。WebSocket 要额外协议和连接管理；纯轮询又浪费。</p>
+<p><strong>写法</strong>（<code>events.go:114-150</code>）：</p>
+<div class="sourceCode" id="cb11"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a>lastID <span class="op">:=</span> strings<span class="op">.</span>TrimSpace<span class="op">(</span>c<span class="op">.</span>GetHeader<span class="op">(</span><span class="st">&quot;Last-Event-ID&quot;</span><span class="op">))</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> lastID <span class="op">==</span> <span class="st">&quot;&quot;</span> <span class="op">{</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    lastID <span class="op">=</span> <span class="st">&quot;$&quot;</span> <span class="co">// 只推新事件</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> <span class="op">{</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>    res<span class="op">,</span> err <span class="op">:=</span> s<span class="op">.</span>store<span class="op">.</span>rdb<span class="op">.</span>XRead<span class="op">(</span>ctx<span class="op">,</span> <span class="op">&amp;</span>redis<span class="op">.</span>XReadArgs<span class="op">{</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>        Streams<span class="op">:</span> <span class="op">[]</span><span class="dt">string</span><span class="op">{</span>key<span class="op">,</span> lastID<span class="op">},</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>        Count<span class="op">:</span>   <span class="dv">100</span><span class="op">,</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>        Block<span class="op">:</span>   <span class="dv">10</span> <span class="op">*</span> time<span class="op">.</span>Second<span class="op">,</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}).</span>Result<span class="op">()</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> errors<span class="op">.</span>Is<span class="op">(</span>err<span class="op">,</span> context<span class="op">.</span>Canceled<span class="op">)</span> <span class="op">||</span> errors<span class="op">.</span>Is<span class="op">(</span>err<span class="op">,</span> context<span class="op">.</span>DeadlineExceeded<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a>            <span class="cf">return</span> <span class="co">// 客户端断开 / 请求收尾</span></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> errors<span class="op">.</span>Is<span class="op">(</span>err<span class="op">,</span> redis<span class="op">.</span>Nil<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a>            <span class="cf">continue</span> <span class="co">// BLOCK 超时：本轮无事件，继续挂读</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a>        <span class="op">...</span></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _<span class="op">,</span> msg <span class="op">:=</span> <span class="kw">range</span> res <span class="op">{</span></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a>        <span class="cf">for</span> _<span class="op">,</span> e <span class="op">:=</span> <span class="kw">range</span> msg<span class="op">.</span>Messages <span class="op">{</span></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a>            fmt<span class="op">.</span>Fprintf<span class="op">(</span>w<span class="op">,</span> <span class="st">&quot;id: %s</span><span class="ch">\n</span><span class="st">data: %s</span><span class="ch">\n\n</span><span class="st">&quot;</span><span class="op">,</span> e<span class="op">.</span>ID<span class="op">,</span> b<span class="op">)</span></span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a>            lastID <span class="op">=</span> e<span class="op">.</span>ID</span>
+<span id="cb11-24"><a href="#cb11-24" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb11-25"><a href="#cb11-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-26"><a href="#cb11-26" aria-hidden="true" tabindex="-1"></a>    flusher<span class="op">.</span>Flush<span class="op">()</span></span>
+<span id="cb11-27"><a href="#cb11-27" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><strong>少见在哪。</strong></p>
+<ul>
+<li>没有 <code>Last-Event-ID</code> 时用 Redis 的 <code>$</code> 游标——只收「从现在开始」的新事件，历史对刚 reconcile 完的客户端没有意义。</li>
+<li><code>XREAD BLOCK</code> 超时返回的是 <code>redis.Nil</code>，不是错误；把它当「继续挂读」。</li>
+<li>写入端用 <code>MaxLen: 1000, Approx: true</code> 做近似截断：流是有界的易失通知设施，不是真源；丢了就靠客户端全量重拉。</li>
+<li>多副本下任何副本写的事件，任何副本的连接都读得到，因为共享同一个 Redis。</li>
+</ul>
+<h3 id="23-iowriter-截断仍返回-lenpexeccmdwaitdelay-收尸">2.3 <code>io.Writer</code> 截断仍返回 <code>len(p)</code>；<code>exec.Cmd.WaitDelay</code> 收尸</h3>
+<p><strong>病灶一：管道写满/对端退出。</strong> <code>bash</code> 输出可能是几百 MB。如果直接把 <code>cmd.Stdout</code> 接到一个「超过 32KB 就返回 error」的 writer，<code>os/exec</code> 会关掉管道，子进程收到 <code>SIGPIPE</code> 提前死掉——我们只是想截断展示，不想杀命令。</p>
+<p><strong>写法</strong>（<code>bash.go:37-56</code>）：</p>
+<div class="sourceCode" id="cb12"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> <span class="op">(</span>w <span class="op">*</span>capWriter<span class="op">)</span> Write<span class="op">(</span>p <span class="op">[]</span><span class="dt">byte</span><span class="op">)</span> <span class="op">(</span><span class="dt">int</span><span class="op">,</span> <span class="dt">error</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> w<span class="op">.</span>buf<span class="op">.</span>Len<span class="op">()</span> <span class="op">&gt;=</span> w<span class="op">.</span><span class="bu">cap</span> <span class="op">{</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>        w<span class="op">.</span>truncated <span class="op">=</span> <span class="ot">true</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="bu">len</span><span class="op">(</span>p<span class="op">),</span> <span class="ot">nil</span> <span class="co">// 丢弃，但报告「全收」</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>    room <span class="op">:=</span> w<span class="op">.</span><span class="bu">cap</span> <span class="op">-</span> w<span class="op">.</span>buf<span class="op">.</span>Len<span class="op">()</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">len</span><span class="op">(</span>p<span class="op">)</span> <span class="op">&gt;</span> room <span class="op">{</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a>        w<span class="op">.</span>buf<span class="op">.</span>Write<span class="op">(</span>p<span class="op">[:</span>room<span class="op">])</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a>        w<span class="op">.</span>truncated <span class="op">=</span> <span class="ot">true</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="bu">len</span><span class="op">(</span>p<span class="op">),</span> <span class="ot">nil</span></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> w<span class="op">.</span>buf<span class="op">.</span>Write<span class="op">(</span>p<span class="op">)</span></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>超过上限子的字节丢掉、置 <code>truncated</code>，但 <code>Write</code> 返回 <code>len(p), nil</code>：对 <code>os/exec</code> 来说「写成功了」，管道继续流动，命令继续跑。最后在结果文本里补一句「超 32 KB 已截断，把内容写进文件再读」。</p>
+<p><strong>病灶二：孙进程占着 stdout。</strong> <code>exec.CommandContext</code> 在 context 取消后会 kill 直接子进程，但如果有孙进程继承了 stdout/stderr，<code>cmd.Wait()</code> 会一直等 I/O 管道关闭，迟迟不返回。</p>
+<p><strong>写法</strong>（<code>bash.go:104</code>）：</p>
+<div class="sourceCode" id="cb13"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a>cmd<span class="op">.</span>WaitDelay <span class="op">=</span> <span class="dv">3</span> <span class="op">*</span> time<span class="op">.</span>Second</span></code></pre></div>
+<p>Go 1.20 加的字段：context 取消后，等这么久还收不干净 I/O，就强制关闭管道并返回 <code>ErrWaitDelay</code>。</p>
+<p><strong>少见在哪。</strong> 两个都是「知道契约边界」的写法：<code>io.Writer</code> 的返回值语义、<code>os/exec</code> 的收尸语义。大多数代码只写 <code>capWriter</code> 的截断，不会处理 SIGPIPE；也不会用 <code>WaitDelay</code>。</p>
+<h3 id="24-把-path-按真实路径过滤成安全边界">2.4 把 <code>PATH</code> 按真实路径过滤成安全边界</h3>
+<p><strong>病灶。</strong> 引擎把宿主 <code>PATH</code> 原样传给 <code>bash</code>。宿主里有 <code>~/.pyenv/shims/python3</code>，<code>exec</code> 找得到，但 seatbelt 围栏不允许读 <code>~</code> → 执行时 <code>Operation not permitted</code>。模型会把它当成路径写错，换着路径重试，浪费一轮上下文。</p>
+<p><strong>写法</strong>（<code>subprocesspath.go:84-118</code>）：</p>
+<div class="sourceCode" id="cb14"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> _<span class="op">,</span> seg <span class="op">:=</span> <span class="kw">range</span> strings<span class="op">.</span>Split<span class="op">(</span>raw<span class="op">,</span> sep<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>    seg <span class="op">=</span> strings<span class="op">.</span>TrimSpace<span class="op">(</span>seg<span class="op">)</span></span>
+<span id="cb14-3"><a href="#cb14-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> seg <span class="op">==</span> <span class="st">&quot;&quot;</span> <span class="op">{</span> <span class="cf">continue</span> <span class="op">}</span></span>
+<span id="cb14-4"><a href="#cb14-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> _<span class="op">,</span> err <span class="op">:=</span> filepath<span class="op">.</span>EvalSymlinks<span class="op">(</span>seg<span class="op">);</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb14-5"><a href="#cb14-5" aria-hidden="true" tabindex="-1"></a>        <span class="cf">continue</span> <span class="co">// 目录不存在 / 悬空链接：它指向的可执行文件本来也跑不了</span></span>
+<span id="cb14-6"><a href="#cb14-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb14-7"><a href="#cb14-7" aria-hidden="true" tabindex="-1"></a>    <span class="bu">real</span> <span class="op">:=</span> sandboxRealPath<span class="op">(</span>seg<span class="op">)</span></span>
+<span id="cb14-8"><a href="#cb14-8" aria-hidden="true" tabindex="-1"></a>    allowed <span class="op">:=</span> <span class="ot">false</span></span>
+<span id="cb14-9"><a href="#cb14-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> _<span class="op">,</span> root <span class="op">:=</span> <span class="kw">range</span> realRoots <span class="op">{</span></span>
+<span id="cb14-10"><a href="#cb14-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> pathWithin<span class="op">(</span>root<span class="op">,</span> <span class="bu">real</span><span class="op">)</span> <span class="op">{</span> allowed <span class="op">=</span> <span class="ot">true</span><span class="op">;</span> <span class="cf">break</span> <span class="op">}</span></span>
+<span id="cb14-11"><a href="#cb14-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb14-12"><a href="#cb14-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">!</span>allowed <span class="op">||</span> seen<span class="op">[</span><span class="bu">real</span><span class="op">]</span> <span class="op">{</span> <span class="cf">continue</span> <span class="op">}</span></span>
+<span id="cb14-13"><a href="#cb14-13" aria-hidden="true" tabindex="-1"></a>    seen<span class="op">[</span><span class="bu">real</span><span class="op">]</span> <span class="op">=</span> <span class="ot">true</span></span>
+<span id="cb14-14"><a href="#cb14-14" aria-hidden="true" tabindex="-1"></a>    out <span class="op">=</span> <span class="bu">append</span><span class="op">(</span>out<span class="op">,</span> <span class="bu">real</span><span class="op">)</span></span>
+<span id="cb14-15"><a href="#cb14-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>同时把租户工具根 <code>&lt;tenant&gt;/tools/*/bin</code> 放在 <code>PATH</code> 最前面，让「租户装的东西」抢过宿主同名命令。围栏读根与 <code>PATH</code> 过滤<strong>共用同一份</strong> <code>sandboxReadRoots</code>——抄两份就会漂，漂回去又是「PATH 里有、围栏读不到」。</p>
+<p><strong>少见在哪。</strong> 大多数人把 <code>PATH</code> 当环境变量；这里把它当<strong>安全边界</strong>的一部分，且用真实路径（<code>EvalSymlinks</code>）对齐 seatbelt 的 <code>subpath</code> 匹配。<code>/bin</code> 在 macOS 上是指向 <code>/usr/bin</code> 的符号链接，两者都放行不会放宽权限，但去重时会被解析成同一段。</p>
+<hr />
+<h2 id="3-抽象与装配">3. 抽象与装配</h2>
+<h3 id="31-编译期接口锚--故意不嵌-base">3.1 编译期接口锚 + 故意不嵌 Base</h3>
+<p><strong>写法一：普通锚。</strong> 每个装饰器后面都有一行：</p>
+<div class="sourceCode" id="cb15"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="kw">var</span> _ adk<span class="op">.</span>ChatModelAgentMiddleware <span class="op">=</span> <span class="op">(*</span>overflowGuard<span class="op">)(</span><span class="ot">nil</span><span class="op">)</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="kw">var</span> _ model<span class="op">.</span>BaseChatModel <span class="op">=</span> <span class="op">(*</span>guardModel<span class="op">)(</span><span class="ot">nil</span><span class="op">)</span></span></code></pre></div>
+<p>接口一缺方法，编译不过。这是常见写法，真正少见的是<strong>故意不嵌 Base</strong>。</p>
+<p><strong>写法二：绊线</strong>（<code>agentlog.go:22-23</code>）：</p>
+<div class="sourceCode" id="cb16"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="co">// 编译期锚：接口九方法缺一不可。</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a><span class="kw">var</span> _ adk<span class="op">.</span>ChatModelAgentMiddleware <span class="op">=</span> <span class="op">(*</span>AgentLogHandler<span class="op">)(</span><span class="ot">nil</span><span class="op">)</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> AgentLogHandler <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a>    seq atomic<span class="op">.</span>Int64</span>
+<span id="cb16-6"><a href="#cb16-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><code>adk.ChatModelAgentMiddleware</code> 有一个 <code>*adk.BaseChatModelAgentMiddleware</code> 可以嵌入，嵌了就自动获得所有方法的空实现——将来接口加一个新方法，代码照样编译，新钩子被<strong>静默漏掉</strong>。这里九个方法全部手写、<strong>不嵌 Base</strong>：接口一长新方法，编译失败，逼人当场补观测。这是把「编译期锚」从「检查我实现了」变成「检查我没漏实现」——方向反过来。</p>
+<p><strong>代价。</strong> 接口每加一个方法，这个文件就要多一个样板方法（哪怕只打一行日志）。对一个观测架来说，这是有意用样板换「不漏」。</p>
+<h3 id="32-在-beforeagent-里替换-tools-切片用注册顺序拼装饰器栈">3.2 在 <code>BeforeAgent</code> 里替换 <code>Tools</code> 切片，用注册顺序拼装饰器栈</h3>
+<p><strong>病灶。</strong> 要在工具执行前后加账本、加计划模式拒绝、加错误回注、加 PII 打码，但不能改每个工具的实现，也不能漏掉运行时才追加的 MCP 工具和委派工具。</p>
+<p><strong>写法。</strong> 中间件在 <code>BeforeAgent</code> 里原地替换 <code>runCtx.Tools</code>：</p>
+<div class="sourceCode" id="cb17"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> <span class="op">(</span>h <span class="op">*</span>planGuardHandler<span class="op">)</span> BeforeAgent<span class="op">(</span>ctx context<span class="op">.</span>Context<span class="op">,</span> runCtx <span class="op">*</span>adk<span class="op">.</span>ChatModelAgentContext<span class="op">)</span> <span class="op">(</span>context<span class="op">.</span>Context<span class="op">,</span> <span class="op">*</span>adk<span class="op">.</span>ChatModelAgentContext<span class="op">,</span> <span class="dt">error</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb17-2"><a href="#cb17-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">for</span> i<span class="op">,</span> t <span class="op">:=</span> <span class="kw">range</span> runCtx<span class="op">.</span>Tools <span class="op">{</span></span>
+<span id="cb17-3"><a href="#cb17-3" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> inner<span class="op">,</span> ok <span class="op">:=</span> t<span class="op">.(</span>tool<span class="op">.</span>InvokableTool<span class="op">);</span> ok <span class="op">{</span></span>
+<span id="cb17-4"><a href="#cb17-4" aria-hidden="true" tabindex="-1"></a>            runCtx<span class="op">.</span>Tools<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="op">&amp;</span>planGuardTool<span class="op">{</span>inner<span class="op">:</span> inner<span class="op">}</span></span>
+<span id="cb17-5"><a href="#cb17-5" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb17-6"><a href="#cb17-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb17-7"><a href="#cb17-7" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> ctx<span class="op">,</span> runCtx<span class="op">,</span> <span class="ot">nil</span></span>
+<span id="cb17-8"><a href="#cb17-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><code>planGuardTool</code> 只覆写 <code>InvokableRun</code>，<code>Info</code> 透传。账本层同理：<code>journalTool</code> 把整个池换成记账壳。</p>
+<p><strong>顺序语义是最容易看漏的部分。</strong> eino 按注册顺序应用 <code>BeforeAgent</code>，<strong>后注册的包在更外层</strong>。所以：</p>
+<ul>
+<li><code>planGuardHandler</code> 必须 append 在 <code>journalWrapHandler</code> <strong>之后</strong> → 运行时是 <code>guard(journal(tool))</code>，拒绝发生在记账与执行之前（被拒的调用不该留 intent）。</li>
+<li><code>journalWrapHandler</code> 注册在链尾 → 它看到的 <code>runCtx.Tools</code> 已经包含一手池、MCP 工具、委派工具，一次遍历包全。</li>
+<li>子代理入口快照在更早的 handler 里做，拿到的是<strong>未包壳</strong>工具——子代理内部调用天然不记账；<code>callerNameFrom</code> 是第二道闸。</li>
+</ul>
+<p><strong>少见在哪。</strong> 不是「装饰器」本身，而是用<strong>注册顺序</strong>表达嵌套顺序，并用「谁必须在谁之后」的注释把这条隐含契约钉住。框架没有显式 <code>Use(outer, inner)</code> API 时，这是最省事的做法，也最容易在重构时被排错。</p>
+<h3 id="33-context-当依赖注入容器--contextwithoutcancel-做收尾写入">3.3 <code>context</code> 当依赖注入容器 + <code>context.WithoutCancel</code> 做收尾写入</h3>
+<p><strong>写法一：私有空 struct 当 key。</strong> 项目里有 22 处 <code>context.WithValue</code>，key 全是未导出的空 struct：</p>
+<div class="sourceCode" id="cb18"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> planGateKey <span class="kw">struct</span><span class="op">{}</span></span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> withPlanGate<span class="op">(</span>ctx context<span class="op">.</span>Context<span class="op">,</span> g <span class="op">*</span>planGate<span class="op">)</span> context<span class="op">.</span>Context <span class="op">{</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> context<span class="op">.</span>WithValue<span class="op">(</span>ctx<span class="op">,</span> planGateKey<span class="op">{},</span> g<span class="op">)</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb18-6"><a href="#cb18-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb18-7"><a href="#cb18-7" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> planGateFrom<span class="op">(</span>ctx context<span class="op">.</span>Context<span class="op">)</span> <span class="op">*</span>planGate <span class="op">{</span></span>
+<span id="cb18-8"><a href="#cb18-8" aria-hidden="true" tabindex="-1"></a>    g<span class="op">,</span> _ <span class="op">:=</span> ctx<span class="op">.</span>Value<span class="op">(</span>planGateKey<span class="op">{}).(*</span>planGate<span class="op">)</span></span>
+<span id="cb18-9"><a href="#cb18-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> g</span>
+<span id="cb18-10"><a href="#cb18-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>同样的还有 <code>journalTarget</code>、<code>fileBaseline</code>、<code>subagentWire</code>、<code>foldBox</code>、<code>skillBox</code>、<code>taskBox</code>、<code>noteBox</code>、<code>workspaceRef</code>。它们都是<strong>一场 run 的生命周期</strong>：run 起手塞进去，工具/中间件从 ctx 取，run 结束自然消失，不落库、不跨 run 共享、无清理负担。</p>
+<p><strong>写法二：<code>context.WithoutCancel</code>。</strong> 用户点停止后，run 的 ctx 被 cancel；但收尾还要写 PG/Redis——「已配对的工具行」不能因为取消而丢。于是：</p>
+<div class="sourceCode" id="cb19"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a>_<span class="op">,</span> _<span class="op">,</span> ok<span class="op">,</span> err <span class="op">:=</span> w<span class="op">.</span>store<span class="op">.</span>EndRun<span class="op">(</span>context<span class="op">.</span>WithoutCancel<span class="op">(</span>ctx<span class="op">),</span> sessionID<span class="op">,</span> runID<span class="op">,</span> epoch<span class="op">,</span> status<span class="op">,</span> <span class="op">...)</span></span></code></pre></div>
+<p><code>WithoutCancel</code> 保留 ctx 上的所有 value，但去掉 deadline 和 cancel 信号。项目里有 10 处，集中在收尾写入：<code>EndRun</code>、<code>AbandonClaim</code>、<code>releaseSubagentSlot</code>、预留额度释放。</p>
+<p><strong>少见在哪。</strong> <code>context.WithValue</code> 本身很常见；不常见的是<strong>把它当 run 级 DI 容器</strong>，塞的是可变对象（<code>foldBox</code>、<code>fileBaseline</code>、<code>noteBox</code>），不是只读配置。另一个是 <code>context.WithoutCancel</code>（Go 1.21 加）——很多人遇到「收尾写不进去」的第一反应是 <code>context.Background()</code>，那会丢掉 run 作用域里的所有值；<code>WithoutCancel</code> 才是正解。</p>
+<p><strong>代价。</strong> ctx 里的东西没有编译期类型检查，取不到就是 nil；所以每个 <code>xxxFrom</code> 都要处理 nil。ctx 也容易被当成「什么都能塞」的袋子，项目用私有 key + 成对的 <code>withXxx</code>/<code>xxxFrom</code> 把它约束住。</p>
+<h3 id="34-goembed--包级-var-初始化时-panic">3.4 <code>//go:embed</code> + 包级 <code>var</code> 初始化时 <code>panic</code></h3>
+<p><strong>写法</strong>（<code>internal/config/catalog.go:13-14, 86-96</code>）：</p>
+<div class="sourceCode" id="cb20"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="co">//go:embed provider-catalog.json</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="kw">var</span> catalogJSON <span class="op">[]</span><span class="dt">byte</span></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a><span class="kw">var</span> providerPresets <span class="op">=</span> mustPresets<span class="op">()</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> mustPresets<span class="op">()</span> <span class="op">[]</span>ProviderPreset <span class="op">{</span></span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a>    presets<span class="op">,</span> err <span class="op">:=</span> loadPresets<span class="op">()</span></span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a>        <span class="bu">panic</span><span class="op">(</span>err<span class="op">)</span> <span class="co">// 目录坏了直接 panic，不留到运行期</span></span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb20-11"><a href="#cb20-11" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> presets</span>
+<span id="cb20-12"><a href="#cb20-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>厂商目录在编译时打进二进制，运行时零文件依赖；包初始化时解析一次，失败就 <code>panic</code>，进程起不来。这和项目里 <code>log.Fatalf</code> 的 fail-fast 口径一致：配置手误应该在启动时炸，而不是等第一个请求才 500。</p>
+<p><strong>少见在哪。</strong> <code>go:embed</code> 本身不罕见；把它和「包级 <code>var</code> + 初始化 panic」组合成「编译期资产 + 启动期校验」的写法，在业务代码里不算多。注意这不适合会热更新的数据——热更新要走文件/DB，不能嵌。</p>
+<hr />
+<h2 id="4-存储与一致性">4. 存储与一致性</h2>
+<h3 id="41-rowsaffected--0-当围栏redis-lua-脚本做多键原子-cas">4.1 <code>RowsAffected == 0</code> 当围栏；Redis Lua 脚本做多键原子 CAS</h3>
+<p>这是全仓库最值得看的一组「多副本一致性」写法，核心思想一句话：<strong>闸放数据库/Redis，不放进程</strong>；进程内只留快照。</p>
+<h4 id="411-db-行的-update--where-epoch-就是-cas">4.1.1 DB 行的 <code>UPDATE ... WHERE epoch</code> 就是 CAS</h4>
+<p><strong>病灶。</strong> 多副本下，一场 run 同一时刻只能有一个执行者。用进程内互斥量只能管本进程；用「先 SELECT 再判断再 UPDATE」又有检查与写之间的缝。</p>
+<p><strong>写法</strong>（<code>plangate.go:157-166</code>）：</p>
+<div class="sourceCode" id="cb21"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a>res <span class="op">:=</span> s<span class="op">.</span>db<span class="op">.</span>WithContext<span class="op">(</span>ctx<span class="op">).</span>Exec<span class="op">(</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a>    <span class="st">`UPDATE runs SET plan_mode = ? WHERE id = ? AND lease_epoch = ?`</span><span class="op">,</span> on<span class="op">,</span> runID<span class="op">,</span> epoch<span class="op">)</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> res<span class="op">.</span>Error <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span> <span class="cf">return</span> res<span class="op">.</span>Error <span class="op">}</span></span>
+<span id="cb21-4"><a href="#cb21-4" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> res<span class="op">.</span>RowsAffected <span class="op">==</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb21-5"><a href="#cb21-5" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> errJournalGateLost <span class="co">// 本执行者已不是当前令牌持有者</span></span>
+<span id="cb21-6"><a href="#cb21-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb21-7"><a href="#cb21-7" aria-hidden="true" tabindex="-1"></a><span class="cf">return</span> <span class="ot">nil</span></span></code></pre></div>
+<p><code>RowsAffected == 0</code> 不是错误，是**「我这一代已经失效」**的信号。续约同理（<code>store.go:835-842</code>）：</p>
+<div class="sourceCode" id="cb22"><pre class="sourceCode sql"><code class="sourceCode sql"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> runs <span class="kw">SET</span> lease_until <span class="op">=</span> now() <span class="op">+</span> make_interval(secs <span class="op">=&gt;</span> ?)</span>
+<span id="cb22-2"><a href="#cb22-2" aria-hidden="true" tabindex="-1"></a> <span class="kw">WHERE</span> <span class="kw">id</span> <span class="op">=</span> ? <span class="kw">AND</span> session_id <span class="op">=</span> ? <span class="kw">AND</span> status <span class="op">=</span> <span class="st">&#39;running&#39;</span> <span class="kw">AND</span> lease_until <span class="op">&gt;</span> now()</span>
+<span id="cb22-3"><a href="#cb22-3" aria-hidden="true" tabindex="-1"></a>   <span class="kw">AND</span> lease_epoch <span class="op">=</span> ?</span></code></pre></div>
+<p>其中 <code>lease_until &gt; now()</code> 是「过期不可复活」：少了它，一个「已过期但还没被清扫」的 run 会被迟到的续约救活，旧执行者手里的 turn 会被定稿。</p>
+<p>接管（<code>ClaimResume</code>，<code>store.go:874</code>）在<strong>一笔事务</strong>里 <code>SELECT ... FOR UPDATE</code> → 四态判定 → <code>epoch+1</code> → 续租约 → 读账本。提交即「获得这一代令牌」。</p>
+<h4 id="412-redis-帧写口用-lua-脚本校验令牌">4.1.2 Redis 帧写口用 Lua 脚本校验令牌</h4>
+<p><strong>病灶。</strong> 帧写进 Redis list。旧执行者在被接管后如果还能 <code>RPUSH</code>，就会把上一代的 delta 混进新执行者的现场。</p>
+<p><strong>写法</strong>（<code>redisstore.go:66-72</code>）：</p>
+<div class="sourceCode" id="cb23"><pre class="sourceCode lua"><code class="sourceCode lua"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> <span class="va">redis</span><span class="op">.</span>call<span class="op">(</span><span class="st">&#39;GET&#39;</span><span class="op">,</span> <span class="cn">KEYS</span><span class="op">[</span><span class="dv">2</span><span class="op">])</span> <span class="op">~=</span> <span class="cn">ARGV</span><span class="op">[</span><span class="dv">2</span><span class="op">]</span> <span class="cf">then</span>  <span class="co">-- KEYS[2]=tk:runepoch，ARGV[2]=本执行者 epoch</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a>  <span class="cf">return</span> <span class="dv">0</span></span>
+<span id="cb23-3"><a href="#cb23-3" aria-hidden="true" tabindex="-1"></a><span class="cf">end</span></span>
+<span id="cb23-4"><a href="#cb23-4" aria-hidden="true" tabindex="-1"></a><span class="va">redis</span><span class="op">.</span>call<span class="op">(</span><span class="st">&#39;RPUSH&#39;</span><span class="op">,</span> <span class="cn">KEYS</span><span class="op">[</span><span class="dv">1</span><span class="op">],</span> <span class="cn">ARGV</span><span class="op">[</span><span class="dv">1</span><span class="op">])</span>          <span class="co">-- KEYS[1]=tk:runlive，ARGV[1]=帧 JSON</span></span>
+<span id="cb23-5"><a href="#cb23-5" aria-hidden="true" tabindex="-1"></a><span class="cf">return</span> <span class="va">redis</span><span class="op">.</span>call<span class="op">(</span><span class="st">&#39;LLEN&#39;</span><span class="op">,</span> <span class="cn">KEYS</span><span class="op">[</span><span class="dv">1</span><span class="op">])</span>             <span class="co">-- 返回新帧的 eventOffset</span></span></code></pre></div>
+<p>Go 侧：</p>
+<div class="sourceCode" id="cb24"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="kw">var</span> appendFrameScript <span class="op">=</span> redis<span class="op">.</span>NewScript<span class="op">(</span><span class="st">`...`</span><span class="op">)</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a>n<span class="op">,</span> err <span class="op">:=</span> appendFrameScript<span class="op">.</span>Run<span class="op">(</span>ctx<span class="op">,</span> s<span class="op">.</span>rdb<span class="op">,</span></span>
+<span id="cb24-4"><a href="#cb24-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">[]</span><span class="dt">string</span><span class="op">{</span>keyRunlive<span class="op">(</span>runID<span class="op">),</span> keyRunepoch<span class="op">(</span>runID<span class="op">)},</span> <span class="dt">string</span><span class="op">(</span>frameJSON<span class="op">),</span> epoch<span class="op">).</span>Int64<span class="op">()</span></span></code></pre></div>
+<p>四个脚本各管一段：<code>acquire</code>（建两键 + start 帧 + 出生令牌，一条 Lua = 原子，不会留半个键）、<code>renew</code>（先验令牌再 <code>PEXPIRE</code> 两键）、<code>appendFrame</code>（验令牌 + <code>RPUSH</code> + 返回 <code>LLEN</code> 当 offset）、<code>seedResume</code>（换新令牌 + 丢掉旧 runlive + 压 resume 帧）。</p>
+<p><strong>少见在哪。</strong> 两点：</p>
+<ol type="1">
+<li><strong><code>RowsAffected == 0</code> 当布尔 CAS 结果</strong>，而不是「先查再改」。这把「检查 + 写」压成一条 SQL，检查与写在同一个原子步骤里。</li>
+<li><strong>在 Go 代码里内嵌 Lua</strong>，把「多键一起改」变成原子操作；并且 Lua 脚本自己承担令牌校验——不是 Go 先 GET 再 RPUSH，那中间又有缝。</li>
+</ol>
+<p><strong>代价。</strong> 逻辑分散在 SQL / Lua / Go 三处，读代码必须同时看三边；<code>RowsAffected == 0</code> 的语义要靠命名（<code>errJournalGateLost</code>）和注释说清，否则下一个人会把它当「没找到行」处理。</p>
+<h3 id="42-ulid-当可排序主键以及它不保证同毫秒单调">4.2 ULID 当可排序主键（以及它不保证同毫秒单调）</h3>
+<p><strong>写法</strong>（<code>pgstore.go:565-566</code>）：</p>
+<div class="sourceCode" id="cb25"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> newRowID<span class="op">(</span>prefix <span class="dt">string</span><span class="op">)</span> <span class="op">(</span><span class="dt">string</span><span class="op">,</span> <span class="dt">error</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb25-2"><a href="#cb25-2" aria-hidden="true" tabindex="-1"></a>    id<span class="op">,</span> err <span class="op">:=</span> ulid<span class="op">.</span>New<span class="op">(</span>ulid<span class="op">.</span>Now<span class="op">(),</span> rand<span class="op">.</span>Reader<span class="op">)</span></span>
+<span id="cb25-3"><a href="#cb25-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span> <span class="cf">return</span> <span class="st">&quot;&quot;</span><span class="op">,</span> err <span class="op">}</span></span>
+<span id="cb25-4"><a href="#cb25-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> prefix <span class="op">+</span> id<span class="op">.</span>String<span class="op">(),</span> <span class="ot">nil</span></span>
+<span id="cb25-5"><a href="#cb25-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>主键形如 <code>s_01M5...</code>、<code>r_01M5...</code>、<code>m_01M5...</code>。ULID 前 48 位是毫秒时间戳，后 80 位是随机数，字符串字典序≈时间序。所以查询可以直接：</p>
+<div class="sourceCode" id="cb26"><pre class="sourceCode sql"><code class="sourceCode sql"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="kw">ORDER</span> <span class="kw">BY</span> run_id, seq</span></code></pre></div>
+<p>不用额外 <code>created_at</code> 列也能按时间排；<code>run_id</code> 是 ULID，字典序即 run 时序；<code>seq</code> 在同一 run 内再排序（<code>0</code> = 摘要行排最前）。笔记同理：<code>ORDER BY kind, id</code>——agent 笔记先于 user 笔记，各自按 ULID 创建序。</p>
+<p><strong>少见在哪。</strong> 用「字符串主键的字典序」承担时间排序，省一列索引；B-tree 插入也更局部（新 ID 总在末尾）。</p>
+<p><strong>必须注意的边界。</strong> 这里用的是 <code>ulid.New(ulid.Now(), rand.Reader)</code>，<strong>不是</strong> <code>ulid.Make()</code>。<code>ulid.Make()</code> 用带单调熵的全局源，同一毫秒内也严格递增；显式传 <code>rand.Reader</code> 的版本在同一毫秒内是<strong>随机序</strong>。所以：</p>
+<ul>
+<li>跨 run 的排序只保证<strong>毫秒级</strong>；同一毫秒创建的两个 run，先后是随机的。</li>
+<li>同一 run 内的行序靠 <code>seq</code>，不靠 <code>run_id</code> 的尾部随机位。</li>
+<li>如果哪天需要「同一毫秒内也严格有序」，要换 <code>ulid.Make()</code> 或加自增列——不要假设现在的主键有这个性质。</li>
+</ul>
+<h3 id="43-预留额度事务--延迟测量回调">4.3 预留额度事务 + 延迟测量回调</h3>
+<p><strong>病灶。</strong> 上传/写文件前要判租户存储配额。两个并发上传各自看到「目录还差 100MB」，都放行，结果一起超上限。而且「数目录大小」很贵，不能每次请求都walk 一遍。</p>
+<p><strong>写法</strong>（<code>storage_reserve.go:20-48</code>）：</p>
+<div class="sourceCode" id="cb27"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> <span class="op">(</span>s <span class="op">*</span>Store<span class="op">)</span> ReserveStorage<span class="op">(</span>ctx context<span class="op">.</span>Context<span class="op">,</span> tenantID <span class="dt">string</span><span class="op">,</span> adding<span class="op">,</span> maxBytes <span class="dt">int64</span><span class="op">,</span> used <span class="kw">func</span><span class="op">()</span> <span class="dt">int64</span><span class="op">)</span> <span class="op">(</span><span class="kw">func</span><span class="op">(),</span> <span class="dt">error</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a>    err <span class="op">:=</span> s<span class="op">.</span>db<span class="op">.</span>WithContext<span class="op">(</span>ctx<span class="op">).</span>Transaction<span class="op">(</span><span class="kw">func</span><span class="op">(</span>tx <span class="op">*</span>gorm<span class="op">.</span>DB<span class="op">)</span> <span class="dt">error</span> <span class="op">{</span></span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a>        tx<span class="op">.</span>Exec<span class="op">(</span><span class="st">`INSERT INTO tenant_storage (tenant_id, reserved) VALUES (?, 0) ON CONFLICT (tenant_id) DO NOTHING`</span><span class="op">,</span> tenantID<span class="op">)</span></span>
+<span id="cb27-4"><a href="#cb27-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-5"><a href="#cb27-5" aria-hidden="true" tabindex="-1"></a>        <span class="kw">var</span> reserved <span class="dt">int64</span></span>
+<span id="cb27-6"><a href="#cb27-6" aria-hidden="true" tabindex="-1"></a>        tx<span class="op">.</span>Raw<span class="op">(</span><span class="st">`SELECT reserved FROM tenant_storage WHERE tenant_id = ? FOR UPDATE`</span><span class="op">,</span> tenantID<span class="op">).</span>Scan<span class="op">(&amp;</span>reserved<span class="op">)</span></span>
+<span id="cb27-7"><a href="#cb27-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-8"><a href="#cb27-8" aria-hidden="true" tabindex="-1"></a>        <span class="kw">var</span> have <span class="dt">int64</span></span>
+<span id="cb27-9"><a href="#cb27-9" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> used <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span> have <span class="op">=</span> used<span class="op">()</span> <span class="op">}</span> <span class="co">// 在行锁内才数目录</span></span>
+<span id="cb27-10"><a href="#cb27-10" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> reserved<span class="op">+</span>adding<span class="op">+</span>have <span class="op">&gt;</span> maxBytes <span class="op">{</span> <span class="cf">return</span> errStorageQuota <span class="op">}</span></span>
+<span id="cb27-11"><a href="#cb27-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb27-12"><a href="#cb27-12" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> tx<span class="op">.</span>Exec<span class="op">(</span><span class="st">`UPDATE tenant_storage SET reserved = ? WHERE tenant_id = ?`</span><span class="op">,</span> reserved<span class="op">+</span>adding<span class="op">,</span> tenantID<span class="op">).</span>Error</span>
+<span id="cb27-13"><a href="#cb27-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">})</span></span>
+<span id="cb27-14"><a href="#cb27-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">...</span></span>
+<span id="cb27-15"><a href="#cb27-15" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">func</span><span class="op">()</span> <span class="op">{</span></span>
+<span id="cb27-16"><a href="#cb27-16" aria-hidden="true" tabindex="-1"></a>        _ <span class="op">=</span> s<span class="op">.</span>db<span class="op">.</span>WithContext<span class="op">(</span>context<span class="op">.</span>WithoutCancel<span class="op">(</span>ctx<span class="op">)).</span>Exec<span class="op">(</span></span>
+<span id="cb27-17"><a href="#cb27-17" aria-hidden="true" tabindex="-1"></a>            <span class="st">`UPDATE tenant_storage SET reserved = GREATEST(reserved - ?, 0) WHERE tenant_id = ?`</span><span class="op">,</span> adding<span class="op">,</span> tenantID<span class="op">).</span>Error</span>
+<span id="cb27-18"><a href="#cb27-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">},</span> <span class="ot">nil</span></span>
+<span id="cb27-19"><a href="#cb27-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>三个细节：</p>
+<ol type="1">
+<li><code>INSERT ... ON CONFLICT DO NOTHING</code> 先保证行存在，再 <code>SELECT ... FOR UPDATE</code> 拿行锁——否则第一次预留时没有行可锁。</li>
+<li><strong><code>used()</code> 在行锁内调用</strong>。数目录很贵，但必须和「读 reserved」在同一个临界区里，否则两次测量之间别人又写入了。</li>
+<li>释放用 <code>GREATEST(reserved - ?, 0)</code>，防止并发/重复释放把计数打成负数；并且用 <code>WithoutCancel</code>，保证 run 取消后预留也能放开。</li>
+</ol>
+<p><strong>少见在哪。</strong> 把「昂贵的外部测量」做成回调参数，延迟到锁内才执行——而不是在外面先算好再传进来（那会有一整段窗口）。同时用「预留 + 释放」两段式，把「还没落盘的字节」也算进配额。</p>
+<hr />
+<h2 id="5-安全与沙箱">5. 安全与沙箱</h2>
+<h3 id="51-多版本-aes-gcm-封存--密钥轮换">5.1 多版本 AES-GCM 封存 + 密钥轮换</h3>
+<p><strong>病灶。</strong> 租户的模型 API key 要落库，不能明文。用 <code>TAKO_JWT_SECRET</code> 派生密钥加密，听起来可以；但<strong>轮换登录密钥</strong>会把所有已存的租户密钥变成解不开的乱码。</p>
+<p><strong>写法</strong>（<code>secretseal.go</code>）：</p>
+<div class="sourceCode" id="cb28"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="kw">const</span> <span class="op">(</span></span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a>    seal1Prefix <span class="op">=</span> <span class="st">&quot;seal1:&quot;</span> <span class="co">// 用 TAKO_JWT_SECRET 派生</span></span>
+<span id="cb28-3"><a href="#cb28-3" aria-hidden="true" tabindex="-1"></a>    seal2Prefix <span class="op">=</span> <span class="st">&quot;seal2:&quot;</span> <span class="co">// 用独立的 TAKO_DATA_KEY 派生</span></span>
+<span id="cb28-4"><a href="#cb28-4" aria-hidden="true" tabindex="-1"></a><span class="op">)</span></span>
+<span id="cb28-5"><a href="#cb28-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-6"><a href="#cb28-6" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> keyFromEnv<span class="op">(</span>name <span class="dt">string</span><span class="op">)</span> <span class="op">([]</span><span class="dt">byte</span><span class="op">,</span> <span class="dt">bool</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb28-7"><a href="#cb28-7" aria-hidden="true" tabindex="-1"></a>    raw <span class="op">:=</span> os<span class="op">.</span>Getenv<span class="op">(</span>name<span class="op">)</span></span>
+<span id="cb28-8"><a href="#cb28-8" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> <span class="bu">len</span><span class="op">(</span>raw<span class="op">)</span> <span class="op">&lt;</span> <span class="dv">32</span> <span class="op">{</span> <span class="cf">return</span> <span class="ot">nil</span><span class="op">,</span> <span class="ot">false</span> <span class="op">}</span></span>
+<span id="cb28-9"><a href="#cb28-9" aria-hidden="true" tabindex="-1"></a>    sum <span class="op">:=</span> sha256<span class="op">.</span>Sum256<span class="op">([]</span><span class="dt">byte</span><span class="op">(</span>raw<span class="op">))</span></span>
+<span id="cb28-10"><a href="#cb28-10" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> sum<span class="op">[:],</span> <span class="ot">true</span> <span class="co">// AES-256 要 32 字节</span></span>
+<span id="cb28-11"><a href="#cb28-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb28-12"><a href="#cb28-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb28-13"><a href="#cb28-13" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> encryptSecret<span class="op">(</span>prefix <span class="dt">string</span><span class="op">,</span> key <span class="op">[]</span><span class="dt">byte</span><span class="op">,</span> plain <span class="dt">string</span><span class="op">)</span> <span class="op">(</span><span class="dt">string</span><span class="op">,</span> <span class="dt">error</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb28-14"><a href="#cb28-14" aria-hidden="true" tabindex="-1"></a>    block<span class="op">,</span> _ <span class="op">:=</span> aes<span class="op">.</span>NewCipher<span class="op">(</span>key<span class="op">)</span></span>
+<span id="cb28-15"><a href="#cb28-15" aria-hidden="true" tabindex="-1"></a>    gcm<span class="op">,</span> _ <span class="op">:=</span> cipher<span class="op">.</span>NewGCM<span class="op">(</span>block<span class="op">)</span></span>
+<span id="cb28-16"><a href="#cb28-16" aria-hidden="true" tabindex="-1"></a>    nonce <span class="op">:=</span> <span class="bu">make</span><span class="op">([]</span><span class="dt">byte</span><span class="op">,</span> gcm<span class="op">.</span>NonceSize<span class="op">())</span></span>
+<span id="cb28-17"><a href="#cb28-17" aria-hidden="true" tabindex="-1"></a>    io<span class="op">.</span>ReadFull<span class="op">(</span>rand<span class="op">.</span>Reader<span class="op">,</span> nonce<span class="op">)</span></span>
+<span id="cb28-18"><a href="#cb28-18" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> prefix <span class="op">+</span> base64<span class="op">.</span>RawStdEncoding<span class="op">.</span>EncodeToString<span class="op">(</span></span>
+<span id="cb28-19"><a href="#cb28-19" aria-hidden="true" tabindex="-1"></a>        gcm<span class="op">.</span>Seal<span class="op">(</span>nonce<span class="op">,</span> nonce<span class="op">,</span> <span class="op">[]</span><span class="dt">byte</span><span class="op">(</span>plain<span class="op">),</span> <span class="ot">nil</span><span class="op">)),</span> <span class="ot">nil</span></span>
+<span id="cb28-20"><a href="#cb28-20" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>解密按前缀选密钥族，再依次试当前密钥和 <code>*_PREVIOUS</code>：</p>
+<div class="sourceCode" id="cb29"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="cf">case</span> strings<span class="op">.</span>HasPrefix<span class="op">(</span>stored<span class="op">,</span> seal2Prefix<span class="op">):</span></span>
+<span id="cb29-2"><a href="#cb29-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> unsealWith<span class="op">(</span>stored<span class="op">,</span> seal2Prefix<span class="op">,</span> <span class="st">&quot;TAKO_DATA_KEY&quot;</span><span class="op">,</span> <span class="st">&quot;TAKO_DATA_KEY_PREVIOUS&quot;</span><span class="op">)</span></span>
+<span id="cb29-3"><a href="#cb29-3" aria-hidden="true" tabindex="-1"></a><span class="cf">case</span> strings<span class="op">.</span>HasPrefix<span class="op">(</span>stored<span class="op">,</span> seal1Prefix<span class="op">):</span></span>
+<span id="cb29-4"><a href="#cb29-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> unsealWith<span class="op">(</span>stored<span class="op">,</span> seal1Prefix<span class="op">,</span> <span class="st">&quot;TAKO_JWT_SECRET&quot;</span><span class="op">,</span> <span class="st">&quot;TAKO_JWT_SECRET_PREVIOUS&quot;</span><span class="op">)</span></span></code></pre></div>
+<p><strong>少见在哪。</strong></p>
+<ul>
+<li><strong>密文自带版本前缀</strong>：<code>seal2:</code> 告诉解密方「用 DATA_KEY 这一族」，而不是靠调用方记得这是哪一代密钥。轮换时只需要换 <code>TAKO_DATA_KEY</code>，旧的 <code>seal2:</code> 密文因为 <code>..._PREVIOUS</code> 还在，仍然打得开。</li>
+<li><strong><code>base64.RawStdEncoding</code></strong>（无 padding）而不是 <code>StdEncoding</code>：密文更短，且不会出现 <code>=</code> 在 URL/日志里被转义的问题。</li>
+<li><strong><code>nonce || ciphertext</code> 拼成一个串</strong>，取的时候按 <code>gcm.NonceSize()</code> 切开；没有单独的 nonce 列。</li>
+<li><strong>密钥是 <code>sha256(env)</code></strong>：允许运维填任意长度的口令，统一派生到 32 字节，不要求正好是 32 字节的十六进制。</li>
+</ul>
+<p><strong>代价。</strong> 没有 KMS/信封加密，密钥在进程环境里；能读进程环境的人能解密所有租户密钥。这是「开发期够用、上线要换 KMS」的形态。</p>
+<h3 id="52-synconce-真跑一次沙箱探测--手写-seatbelt-s-表达式">5.2 <code>sync.Once</code> 真跑一次沙箱探测 + 手写 seatbelt S 表达式</h3>
+<p><strong>病灶一：<code>LookPath</code> 成功 ≠ 沙箱可用。</strong> macOS 上 <code>sandbox-exec</code> 存在，但 seatbelt 可能拒绝 apply。这时命令会以普通非零退出结束，调用方却以为「已经隔离」——最危险的静默失败。</p>
+<p><strong>写法</strong>（<code>sandbox.go:23-39</code>）：</p>
+<div class="sourceCode" id="cb30"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> sandboxAvailable<span class="op">()</span> <span class="dt">bool</span> <span class="op">{</span></span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a>    sandboxProbe<span class="op">.</span>once<span class="op">.</span>Do<span class="op">(</span><span class="kw">func</span><span class="op">()</span> <span class="op">{</span></span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a>        path<span class="op">,</span> err <span class="op">:=</span> exec<span class="op">.</span>LookPath<span class="op">(</span><span class="st">&quot;sandbox-exec&quot;</span><span class="op">)</span></span>
+<span id="cb30-4"><a href="#cb30-4" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span> <span class="cf">return</span> <span class="op">}</span></span>
+<span id="cb30-5"><a href="#cb30-5" aria-hidden="true" tabindex="-1"></a>        cmd <span class="op">:=</span> exec<span class="op">.</span>Command<span class="op">(</span>path<span class="op">,</span> <span class="st">&quot;-p&quot;</span><span class="op">,</span> <span class="st">&quot;(version 1)(allow default)&quot;</span><span class="op">,</span> <span class="st">&quot;/bin/echo&quot;</span><span class="op">,</span> <span class="st">&quot;ok&quot;</span><span class="op">)</span></span>
+<span id="cb30-6"><a href="#cb30-6" aria-hidden="true" tabindex="-1"></a>        out<span class="op">,</span> err <span class="op">:=</span> cmd<span class="op">.</span>CombinedOutput<span class="op">()</span></span>
+<span id="cb30-7"><a href="#cb30-7" aria-hidden="true" tabindex="-1"></a>        sandboxProbe<span class="op">.</span>ok <span class="op">=</span> err <span class="op">==</span> <span class="ot">nil</span> <span class="op">&amp;&amp;</span> strings<span class="op">.</span>Contains<span class="op">(</span><span class="dt">string</span><span class="op">(</span>out<span class="op">),</span> <span class="st">&quot;ok&quot;</span><span class="op">)</span></span>
+<span id="cb30-8"><a href="#cb30-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">})</span></span>
+<span id="cb30-9"><a href="#cb30-9" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> sandboxProbe<span class="op">.</span>ok</span>
+<span id="cb30-10"><a href="#cb30-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>不是「看文件在不在」，而是<strong>真的 apply 一次</strong>一个最小 profile、跑 <code>/bin/echo ok</code>，看输出。<code>sync.Once</code> 保证只跑一次，结果缓存到进程退出。探测失败时，需要沙箱的调用方直接拒绝启动（fail closed），不退回裸 bash。</p>
+<p><strong>病灶二：围栏 profile 的路径匹配。</strong> seatbelt 的 <code>subpath</code> 走<strong>真实路径</strong>，而 macOS 的 <code>/tmp</code> 是指向 <code>/private/tmp</code> 的符号链接。如果围栏根写成 <code>/tmp/xxx</code>，<code>(subpath "/tmp/xxx")</code> 匹配不上真实路径，agent 会连自己项目里的文件都读不到。</p>
+<p><strong>写法</strong>（<code>sandbox.go:62-90</code>）：</p>
+<div class="sourceCode" id="cb31"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb31-1"><a href="#cb31-1" aria-hidden="true" tabindex="-1"></a>root <span class="op">=</span> sandboxRealPath<span class="op">(</span>root<span class="op">)</span> <span class="co">// EvalSymlinks + Abs</span></span>
+<span id="cb31-2"><a href="#cb31-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb31-3"><a href="#cb31-3" aria-hidden="true" tabindex="-1"></a><span class="cf">return</span> fmt<span class="op">.</span>Sprintf<span class="op">(</span><span class="st">`(version 1)</span></span>
+<span id="cb31-4"><a href="#cb31-4" aria-hidden="true" tabindex="-1"></a><span class="st">(deny default)</span></span>
+<span id="cb31-5"><a href="#cb31-5" aria-hidden="true" tabindex="-1"></a><span class="st">(allow process-exec)</span></span>
+<span id="cb31-6"><a href="#cb31-6" aria-hidden="true" tabindex="-1"></a><span class="st">(allow process-fork)</span></span>
+<span id="cb31-7"><a href="#cb31-7" aria-hidden="true" tabindex="-1"></a><span class="st">(allow signal (target same-sandbox))</span></span>
+<span id="cb31-8"><a href="#cb31-8" aria-hidden="true" tabindex="-1"></a><span class="st">(allow sysctl-read)</span></span>
+<span id="cb31-9"><a href="#cb31-9" aria-hidden="true" tabindex="-1"></a><span class="st">(allow mach-lookup)</span></span>
+<span id="cb31-10"><a href="#cb31-10" aria-hidden="true" tabindex="-1"></a><span class="st">(allow file-ioctl)</span></span>
+<span id="cb31-11"><a href="#cb31-11" aria-hidden="true" tabindex="-1"></a><span class="st">(allow file-read-metadata)</span></span>
+<span id="cb31-12"><a href="#cb31-12" aria-hidden="true" tabindex="-1"></a><span class="st">(allow network-outbound)</span></span>
+<span id="cb31-13"><a href="#cb31-13" aria-hidden="true" tabindex="-1"></a><span class="st">(allow file-read* (literal &quot;/&quot;))</span></span>
+<span id="cb31-14"><a href="#cb31-14" aria-hidden="true" tabindex="-1"></a><span class="st">(allow file-read*%s)</span></span>
+<span id="cb31-15"><a href="#cb31-15" aria-hidden="true" tabindex="-1"></a><span class="st">(allow file-read* (subpath &quot;/private/etc/ssl&quot;))</span></span>
+<span id="cb31-16"><a href="#cb31-16" aria-hidden="true" tabindex="-1"></a><span class="st">%s(allow file-read* file-write* (subpath %q))</span></span>
+<span id="cb31-17"><a href="#cb31-17" aria-hidden="true" tabindex="-1"></a><span class="st">(deny file-read-data (literal &quot;/etc/passwd&quot;) (literal &quot;/private/etc/passwd&quot;))</span></span>
+<span id="cb31-18"><a href="#cb31-18" aria-hidden="true" tabindex="-1"></a><span class="st">`</span><span class="op">,</span> system<span class="op">.</span>String<span class="op">(),</span> extra<span class="op">.</span>String<span class="op">(),</span> root<span class="op">)</span></span></code></pre></div>
+<p>读是「系统白名单 + 项目根 + 已 <code>use_skill</code> 的技能根」，写只在项目根；<code>/etc/passwd</code> 显式拒绝；出站网络开、入站不开。</p>
+<p><strong>少见在哪。</strong> 在 Go 里动态拼 macOS seatbelt 的 S 表达式，本身就是小众技能；更少见的是「探测要真跑」这条纪律——大多数 <code>LookPath</code> 式探测都会把「存在」当「可用」。</p>
+<p><strong>一个使用时序的坑。</strong> <code>sandboxWrap</code> 是重建命令：</p>
+<div class="sourceCode" id="cb32"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> sandboxWrap<span class="op">(</span>cmd <span class="op">*</span>exec<span class="op">.</span>Cmd<span class="op">,</span> root <span class="dt">string</span><span class="op">)</span> <span class="op">*</span>exec<span class="op">.</span>Cmd <span class="op">{</span></span>
+<span id="cb32-2"><a href="#cb32-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> root <span class="op">==</span> <span class="st">&quot;&quot;</span> <span class="op">{</span> <span class="cf">return</span> cmd <span class="op">}</span></span>
+<span id="cb32-3"><a href="#cb32-3" aria-hidden="true" tabindex="-1"></a>    args <span class="op">:=</span> <span class="bu">append</span><span class="op">([]</span><span class="dt">string</span><span class="op">{</span><span class="st">&quot;-p&quot;</span><span class="op">,</span> sandboxProfile<span class="op">(</span>root<span class="op">,</span> <span class="ot">nil</span><span class="op">)},</span> cmd<span class="op">.</span>Args<span class="op">...)</span></span>
+<span id="cb32-4"><a href="#cb32-4" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> exec<span class="op">.</span>Command<span class="op">(</span><span class="st">&quot;sandbox-exec&quot;</span><span class="op">,</span> args<span class="op">...)</span></span>
+<span id="cb32-5"><a href="#cb32-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>它只保留 <code>Args</code>；<code>Dir</code>、<code>Env</code>、<code>Stdin</code> 等都是新的空值。所以必须在 wrap <strong>之后</strong>再设 <code>cmd.Env</code>/<code>cmd.Dir</code>——项目里的 MCP 调用正是这么做的（<code>mcp.go:118</code> 之后才 <code>cmd.Env = ...</code>）。</p>
+<hr />
+<h2 id="6-契约与数据形状">6. 契约与数据形状</h2>
+<h3 id="61-struct-字段顺序--json-字节序契约">6.1 struct 字段顺序 = JSON 字节序契约</h3>
+<p><strong>写法</strong>（<code>auth.go:42-46</code>）：</p>
+<div class="sourceCode" id="cb33"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb33-1"><a href="#cb33-1" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> envelope <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb33-2"><a href="#cb33-2" aria-hidden="true" tabindex="-1"></a>    Code    <span class="dt">int</span>    <span class="st">`json:&quot;code&quot;`</span></span>
+<span id="cb33-3"><a href="#cb33-3" aria-hidden="true" tabindex="-1"></a>    Message <span class="dt">string</span> <span class="st">`json:&quot;message&quot;`</span></span>
+<span id="cb33-4"><a href="#cb33-4" aria-hidden="true" tabindex="-1"></a>    Data    <span class="dt">any</span>    <span class="st">`json:&quot;data&quot;`</span></span>
+<span id="cb33-5"><a href="#cb33-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><code>encoding/json</code> 按 struct 字段声明顺序输出，所以响应字节恒为 <code>{"code":...,"message":...,"data":...}</code>。这不是风格问题，是<strong>契约</strong>：前端拦截器、契约测试、验收脚本都按这个字节序断言。字段顺序一改，<code>contract_test.go</code> 和 <code>scripts/acceptance/expected.json</code> 会红。</p>
+<p>同样的写法出现在事件帧（<code>streamEvent</code> 的 <code>Seq/Type/ID/At</code>）、各种响应体里。项目把「字段顺序」写进 doc/40 和 19v6-01，再用测试钉住——<strong>隐式契约显式化</strong>。</p>
+<h3 id="62-bool-区分没传与-false">6.2 <code>*bool</code> 区分「没传」与 <code>false</code></h3>
+<p><strong>病灶。</strong> 一个 JSON 开关，客户端可能不传（用服务端默认）、也可能显式传 <code>false</code>。用 <code>bool</code> 接，两者都是 <code>false</code>，分不开。</p>
+<p><strong>写法</strong>（<code>plangate.go:174-185</code>）：</p>
+<div class="sourceCode" id="cb34"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a><span class="kw">var</span> req <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb34-2"><a href="#cb34-2" aria-hidden="true" tabindex="-1"></a>    Tool     <span class="dt">string</span> <span class="st">`json:&quot;tool&quot;`</span></span>
+<span id="cb34-3"><a href="#cb34-3" aria-hidden="true" tabindex="-1"></a>    PlanMode <span class="op">*</span><span class="dt">bool</span>  <span class="st">`json:&quot;planMode&quot;`</span></span>
+<span id="cb34-4"><a href="#cb34-4" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb34-5"><a href="#cb34-5" aria-hidden="true" tabindex="-1"></a><span class="op">...</span></span>
+<span id="cb34-6"><a href="#cb34-6" aria-hidden="true" tabindex="-1"></a>planMode <span class="op">:=</span> <span class="ot">true</span> <span class="co">// 缺省值</span></span>
+<span id="cb34-7"><a href="#cb34-7" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> req<span class="op">.</span>PlanMode <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb34-8"><a href="#cb34-8" aria-hidden="true" tabindex="-1"></a>    planMode <span class="op">=</span> <span class="op">*</span>req<span class="op">.</span>PlanMode</span>
+<span id="cb34-9"><a href="#cb34-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>指针为 <code>nil</code> = 字段没出现；非 <code>nil</code> = 客户端显式给了值（可能是 <code>false</code>）。这是 Go JSON 里表示「三态」最轻的做法；更重的做法是 <code>json.RawMessage</code> 或自定义 <code>UnmarshalJSON</code>。</p>
+<hr />
+<h2 id="7-测试里的小把戏">7. 测试里的小把戏</h2>
+<h3 id="71-全仓库唯一一处泛型">7.1 全仓库唯一一处泛型</h3>
+<div class="sourceCode" id="cb35"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb35-1"><a href="#cb35-1" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> mustSearchToolInfo<span class="op">[</span>T <span class="dt">any</span><span class="op">](</span>t <span class="op">*</span>testing<span class="op">.</span>T<span class="op">,</span> name<span class="op">,</span> desc <span class="dt">string</span><span class="op">)</span> <span class="op">*</span>schema<span class="op">.</span>ToolInfo <span class="op">{</span></span></code></pre></div>
+<p>在 4.8 万行非测试 + 测试代码里，这是唯一一个带类型参数的函数（<code>grep</code> 过 <code>func X[T ...]</code> 与 <code>type X[T ...]</code>）。它不是框架代码，是测试辅助：给不同输入类型造同一个 <code>*schema.ToolInfo</code>，省掉每个测试各写一遍。</p>
+<p>这说明一件事：<strong>这个项目基本不用泛型</strong>。业务代码靠接口 + <code>any</code> + 具体类型；泛型只在「测试工厂」这种纯重复劳动的地方出现。不是不能用，是没有非它不可的场景。</p>
+<h3 id="72-reflect-比函数指针查字段是否存在">7.2 <code>reflect</code> 比函数指针、查字段是否存在</h3>
+<p><strong>比函数身份</strong>（<code>agents_test.go:87, 513</code>）：</p>
+<div class="sourceCode" id="cb36"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb36-1"><a href="#cb36-1" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> reflect<span class="op">.</span>ValueOf<span class="op">(</span>inherit<span class="op">).</span>Pointer<span class="op">()</span> <span class="op">==</span> reflect<span class="op">.</span>ValueOf<span class="op">(</span>base<span class="op">).</span>Pointer<span class="op">()</span> <span class="op">{</span></span>
+<span id="cb36-2"><a href="#cb36-2" aria-hidden="true" tabindex="-1"></a>    t<span class="op">.</span>Fatal<span class="op">(</span><span class="st">&quot;...&quot;</span><span class="op">)</span></span>
+<span id="cb36-3"><a href="#cb36-3" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>用来断言「继承后的工具池不是同一个函数对象」——如果装配代码偷懒直接返回了 <code>base</code>，指针相同，测试红。比比较输出内容更直接。</p>
+<p><strong>查字段是否存在</strong>（<code>skills_test.go:210</code>）：</p>
+<div class="sourceCode" id="cb37"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb37-1"><a href="#cb37-1" aria-hidden="true" tabindex="-1"></a>field<span class="op">,</span> ok <span class="op">:=</span> reflect<span class="op">.</span>TypeOf<span class="op">(</span>SkillRow<span class="op">{}).</span>FieldByName<span class="op">(</span><span class="st">&quot;Valid&quot;</span><span class="op">)</span></span></code></pre></div>
+<p>用来断言某个字段<strong>已经被删掉</strong>。普通测试只能断言「值是多少」；要断言「这个字段不该存在」，就得靠反射查类型。</p>
+<p><strong>调小间隔的 <code>var</code></strong>（<code>server.go:1082-1084</code>）：</p>
+<div class="sourceCode" id="cb38"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb38-1"><a href="#cb38-1" aria-hidden="true" tabindex="-1"></a><span class="kw">var</span> <span class="op">(</span></span>
+<span id="cb38-2"><a href="#cb38-2" aria-hidden="true" tabindex="-1"></a>    sseTailInterval      <span class="op">=</span> <span class="dv">150</span> <span class="op">*</span> time<span class="op">.</span>Millisecond</span>
+<span id="cb38-3"><a href="#cb38-3" aria-hidden="true" tabindex="-1"></a>    sseHeartbeatInterval <span class="op">=</span> <span class="dv">15</span> <span class="op">*</span> time<span class="op">.</span>Second</span>
+<span id="cb38-4"><a href="#cb38-4" aria-hidden="true" tabindex="-1"></a><span class="op">)</span></span></code></pre></div>
+<p>不是 <code>const</code>，单测可以临时改小，验证心跳与 tail 行为。这是「给测试留缝」的常见做法，但值得记一笔：生产代码里出现非 <code>const</code> 的时间间隔，多半是为了可测性。</p>
+<hr />
+<h2 id="8-看着常见但这里用得很讲究的几处">8. 看着常见、但这里用得很讲究的几处</h2>
+<p>这几处不算「少见语法」，但用法值得对照：</p>
+<ul>
+<li><strong><code>min</code> 内建函数</strong>（Go 1.21）：<code>window - min(window/5, 16384)</code>（<code>compact.go:142</code>）。项目直接用它算压缩触发线，没有自己写 <code>if a &lt; b</code>。</li>
+<li><strong><code>strings.CutPrefix</code></strong>（Go 1.20）：<code>bearer()</code> 里解析 <code>Bearer </code> 前缀（<code>auth.go:655</code>）。比 <code>HasPrefix</code> + <code>TrimPrefix</code> 少一次扫描。</li>
+<li><strong><code>errors.Is</code> 哨兵错误跨层</strong>：<code>errJournalGateLost</code>、<code>errLockTimeout</code>、<code>ErrSessionNotFound</code>、<code>ErrSweepNotClaimed</code>。上层按哨兵分支，不拆错误字符串。</li>
+<li><strong><code>time.NewTicker</code> + <code>defer t.Stop()</code></strong>：watchdog（<code>worker.go:1067</code>）与清扫器（<code>archive_sweep.go:297</code>）都是这个形状。ticker 不能泄漏，<code>Stop</code> 必须在 defer。</li>
+<li><strong><code>exec.CommandContext</code> + <code>cmd.WaitDelay</code> + 输出上限</strong>：见 §2.3，三个一起才完整。</li>
+</ul>
+<h2 id="9-不建议照抄的三处">9. 不建议照抄的三处</h2>
+<p>这一节是「仓库里存在、但有代价」的写法。照抄前先看代价。</p>
+<h3 id="91-循环里的-timeafter">9.1 循环里的 <code>time.After</code></h3>
+<p><code>server.go:1167</code>：</p>
+<div class="sourceCode" id="cb39"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb39-1"><a href="#cb39-1" aria-hidden="true" tabindex="-1"></a><span class="cf">select</span> <span class="op">{</span></span>
+<span id="cb39-2"><a href="#cb39-2" aria-hidden="true" tabindex="-1"></a><span class="cf">case</span> <span class="op">&lt;-</span>ctx<span class="op">.</span>Done<span class="op">():</span></span>
+<span id="cb39-3"><a href="#cb39-3" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span></span>
+<span id="cb39-4"><a href="#cb39-4" aria-hidden="true" tabindex="-1"></a><span class="cf">case</span> <span class="op">&lt;-</span>time<span class="op">.</span>After<span class="op">(</span>sseTailInterval<span class="op">):</span></span>
+<span id="cb39-5"><a href="#cb39-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>每次循环分配一个 timer。Go 1.23 起未触发的 timer 可以被 GC，不再是经典意义的「泄漏到触发为止」，但仍有分配开销。150ms 的 tail 无所谓；如果间隔是分钟级、循环又高频，应该用 <code>time.NewTimer</code> + <code>Reset</code>，或者在外面复用一个 timer。</p>
+<h3 id="92-对第三方错误文本做字符串手术">9.2 对第三方错误文本做字符串手术</h3>
+<p><code>tools.go:69-83</code> 剥掉 eino 的外壳：</p>
+<div class="sourceCode" id="cb40"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb40-1"><a href="#cb40-1" aria-hidden="true" tabindex="-1"></a><span class="cf">for</span> _<span class="op">,</span> prefix <span class="op">:=</span> <span class="kw">range</span> <span class="op">[]</span><span class="dt">string</span><span class="op">{</span><span class="st">&quot;[LocalFunc] &quot;</span><span class="op">,</span> <span class="st">&quot;[EnhancedLocalFunc] &quot;</span><span class="op">}</span> <span class="op">{</span></span>
+<span id="cb40-2"><a href="#cb40-2" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> strings<span class="op">.</span>HasPrefix<span class="op">(</span>msg<span class="op">,</span> prefix<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb40-3"><a href="#cb40-3" aria-hidden="true" tabindex="-1"></a>        <span class="cf">if</span> i <span class="op">:=</span> strings<span class="op">.</span>Index<span class="op">(</span>msg<span class="op">,</span> <span class="st">&quot;, err=&quot;</span><span class="op">);</span> i <span class="op">&gt;=</span> <span class="dv">0</span> <span class="op">{</span></span>
+<span id="cb40-4"><a href="#cb40-4" aria-hidden="true" tabindex="-1"></a>            msg <span class="op">=</span> msg<span class="op">[</span>i<span class="op">+</span><span class="bu">len</span><span class="op">(</span><span class="st">&quot;, err=&quot;</span><span class="op">):]</span></span>
+<span id="cb40-5"><a href="#cb40-5" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb40-6"><a href="#cb40-6" aria-hidden="true" tabindex="-1"></a>        <span class="cf">break</span></span>
+<span id="cb40-7"><a href="#cb40-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb40-8"><a href="#cb40-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>它依赖 eino v0.9.21 的固定错误格式；库升级改了格式，皮就剥不掉。代码里有兜底（剥不出来原文照发，不误伤），也有 fixture 测试钉住。<strong>可以学「剥之前先想好剥不掉的兜底」，不要学「依赖库的错误字符串格式」</strong>——能改库就用结构化错误，改不了才做字符串手术。</p>
+<h3 id="93-sandboxwrap-重建命令会丢字段">9.3 <code>sandboxWrap</code> 重建命令会丢字段</h3>
+<p>见 §5.2 末尾。它只保留 <code>Args</code>，<code>Env</code>/<code>Dir</code>/<code>Stdin</code> 都不继承。当前调用方在 wrap 之后才设 <code>Env</code>，所以没事；如果哪天有人在 wrap 之前设了 <code>Dir</code>，会静默丢失。用这种「重建 <code>exec.Cmd</code>」的包装时，要么显式拷贝所有字段，要么在注释里钉死「wrap 后设」。</p>
+<hr />
+<h2 id="10-一句话收口">10. 一句话收口</h2>
+<p>这份仓库的 Go 风格不是「炫技型」，而是<strong>约束型</strong>：能用标准库就不引库（<code>flock</code>、SSE、AES-GCM、ULID），能用数据库原子性就不靠进程内状态（<code>RowsAffected</code>、Lua 脚本、行锁），能用编译期检查就不靠人记（接口锚、<code>go:embed</code> + 启动 panic），能用真实路径就不靠字符串前缀（seatbelt、<code>PATH</code> 过滤）。</p>
+<p>所以「少见」的不是语法，而是这些约束被写成了<strong>可执行的检查</strong>：编译失败、测试红、启动 panic、<code>RowsAffected == 0</code>、<code>sync.Once</code> 探测失败——每一种都把「下一个人可能忘」变成了「机器不会忘」。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/55-Go-%E5%B0%91%E8%A7%81%E7%8E%A9%E6%B3%95%E8%BE%91%E5%BD%95.md"><code>doc/55-Go-少见玩法辑录.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

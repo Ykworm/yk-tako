@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Handoff · 多租户运行时，2026-10-19 全改之后 · tako 文档</title>
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="handoff--多租户运行时2026-10-19-全改之后">Handoff · 多租户运行时，2026-10-19 全改之后</h1>
+<blockquote>
+<p>性质：<strong>现状交接</strong>。给下一场会话读，让它不用翻这场对话就能知道代码停在哪、哪些 curl 已经打过、哪些口还开着。 触发：用户问「现在是还有什么问题吗」，接着说「写个 handoff」。 状态：媒体两处 P0 和当时列开的 P1 已落地，并在 <code>127.0.0.1:8903</code> 打过。<code>model_ref</code>、<code>tools</code>、worker 按租户配置装模型和 MCP、A7 信封，都还没做。 <strong>这份文件不是开工令。</strong> 下一场要改上面还开着的口，先等用户点头。不要自行宣布版本号。不要 commit，除非用户明确说留。 取信：下面的字节和文件名是 2026-10-19 当日实读、实打。台账 <code>tmp/28-多租户/</code> 被 gitignore，换机器就没了，以本文件和 <code>doc/28-多租户.md</code>、<code>doc/32-media-offload.md</code> 为准。 前置阅读：<code>doc/28-多租户.md</code>（方案，头注仍不标「已验收」）→ <code>doc/32-media-offload.md</code>（占位行；2026-10-19 那一段写了登录后的路径）→ 本文件。<code>AGENTS.md</code> 的协作顺序仍然有效：契约、curl、再改代码。</p>
+</blockquote>
+<h2 id="1-接手时仓库在哪">1. 接手时仓库在哪</h2>
+<p>HEAD 是 <code>29f9d18</code>，提交说明是长期记忆与对话召回。多租户从 A0 到今天的全改，全部在这颗提交之上，<strong>没有 commit</strong>。<code>git status</code> 会看到 <code>yk-tako-eino/internal/runengine/</code> 里一大片修改，以及未跟踪的 <code>auth.go</code>、<code>identity_store.go</code>、<code>product_api.go</code>、<code>product_store.go</code>、<code>sandbox.go</code>、<code>scope.go</code>、<code>secretseal.go</code>、<code>session_access.go</code>、<code>tenant_api.go</code> 和对应测试。<code>doc/28-多租户.md</code>、<code>doc/32-media-offload.md</code>、<code>AGENTS.md</code> 也是脏的。</p>
+<p>施工面只有 <code>yk-tako-eino/</code>。<code>yk-tako-eino-backup/</code> 是旧实现的冻结存档，不要改。v1/v2 的 run 级协议、用 409 表示「会话忙」的旧语义、旧单页前端，都不作论据。</p>
+<p>真源划分没变：方案在 <code>doc/</code>，执行台账在 <code>tmp/28-多租户/planning.md</code> 和 <code>todos.md</code>。台账第 12 节记了 8903 的 curl 字节。doc/28 第 4 节的表已改成和 Go 结构体一致，头注仍写着「不标已验收」。</p>
+<h2 id="2-这场对话收掉了什么">2. 这场对话收掉了什么</h2>
+<p>用户要的是多租户 agent 运行时。2026-10-18 把 A0 到 A6 的 API 写进了工作区。2026-10-19 的检查认为台账不能当成验收通过：上传的图和后来读取不在同一目录，<code>getMedia</code> 能借 <code>..</code> 读到兄弟会话，另外还有邀请、密钥、沙箱、配额四条 P1。用户先让把团队助手的 <code>spec</code> 接进这场 run，再让「全改」把媒体和这些 P1 做完。助手预检那一段没有再改。</p>
+<h3 id="21-上传取图模型读图走同一条路径">2.1 上传、取图、模型读图走同一条路径</h3>
+<p>一个人上传一张图时，<code>postRuns</code> 先铸好 <code>sessionId</code>，再把字节写进 <code>&lt;workspace&gt;/tenants/&lt;tid&gt;/sessions/&lt;sid&gt;/.media/&lt;sha 前 16 位&gt;.&lt;扩展名&gt;</code>。user 行里的占位 path 是 <code>sessions/&lt;sid&gt;/.media/&lt;sha16&gt;.ext</code>。<code>GET /api/media?path=</code> 和 <code>read_media_file</code> 用这同一条字符串。<code>read_media_file</code> 只在路径以本会话的 <code>sessions/&lt;sid&gt;/</code> 开头时剥掉这段前缀，再在会话目录里解析。文件工具的根仍是这场会话的目录，没有放宽到租户根，所以 <code>write_file</code> 到不了兄弟会话。</p>
+<p>没做这步时的失败是：占位写着 <code>.media/...</code>，页面按登录身份去租户根找，模型按会话根找，三处对不上，本人打开自己刚传的图也是 404。</p>
+<p>2026-10-19 在 <code>127.0.0.1:8903</code> 打过。8 字节小图 <code>POST /api/runs</code> 返回 202，<code>sessionId</code> 是 <code>s_01M5812GVTAVEDX5PFMKV1DGBA</code>。占位 path 是 <code>sessions/s_01M5812GVTAVEDX5PFMKV1DGBA/.media/26807183f40c3844.png</code>。本人 GET 是 200，响应体就是那 8 个字节。另一个用户用同一条 path 是 <code>404 {"error":"not_found"}</code>。带登录身份去取不带 <code>sessions/&lt;sid&gt;/</code> 的 <code>.media/26807183f40c3844.png</code>，也是这个 404。盘上文件在会话目录的 <code>.media/</code> 里。</p>
+<p>抢闸之前如果后面 400、413 或 409，会话目录里可能留下内容寻址文件。落库面仍然是空的。这是接受的残留，不是再开一条清理拍。</p>
+<h3 id="22-getmedia-先-clean再查清完的会话">2.2 <code>getMedia</code> 先 Clean，再查清完的会话</h3>
+<p>同租户的 member 能看一场 <code>visibility=tenant</code> 的会话。他把 path 写成 <code>sessions/&lt;这场看得见的&gt;/../&lt;别人的 private 会话&gt;/.media/secret.png</code>。旧代码只把第一段会话 id 交给 <code>SessionAccess</code>，<code>Clean</code> 之后路径仍在租户根里，于是读到别人的文件。</p>
+<p>现在 <code>parseSessionMediaPath</code> 先 <code>Clean</code>。上面那条会变成别人的会话 id。访问检查用清完的 id。看不见就是旧体 <code>404 {"error":"not_found"}</code>，不是 400。没有登录身份时，<code>getMedia</code> 仍相对 <code>mediaRoot</code>，单测 <code>TestGetMediaEndpoint</code> 走这条：越界 400，缺文件 404。</p>
+<p>8903 上，member 用穿越 path 得到 <code>404 {"error":"not_found"}</code>。owner 用清完之后的真实 path 是 200，字节相同。</p>
+<h3 id="23-团队助手的-prompt-已经进这场-run">2.3 团队助手的 prompt 已经进这场 run</h3>
+<p><code>tenant_agents.spec</code> 是 prompt 正文，不是模型名，也不是工具名单。<code>postRuns</code> 在 <code>AcquireRun</code> 之前决定这场用哪个助手：请求里的 <code>agentId</code> 优先，没带就用 <code>sessions.agent_id</code>。然后 <code>VisibleAgent</code>。看不见则 <code>404 {"code":112003,"message":"找不到这个助手","data":null}</code>，不建 run。角色门槛只卡「这次请求新带了 <code>agentId</code>」。抢闸成功之后，只有请求里带了 <code>agentId</code> 才 <code>UPDATE sessions.agent_id</code>。</p>
+<p>worker 的 <code>resolveRunInstruction</code> 读这一列，把 <code>spec</code> 放进 ctx，<code>newRunAgent</code> 的 <code>Instruction</code> 用它。折叠和笔记快照重写走同一段。空 spec 是合法值。没绑助手时仍用进程启动时的系统提示。助手若在预检之后才消失，worker 把这场 run 收成 error，不用全局提示顶上。这条 error 不能拿来论证「POST 没做预检」。</p>
+<p>2026-10-19 更早一场 curl（同一天、引擎后来停了）：<code>spec</code> 要求回复恰好是 <code>SPEC-OK3</code>。带 <code>agentId</code> 的 POST 是 202，log 里 assistant 的 <code>text</code> 是 <code>SPEC-OK3</code>。同一会话下一条不带 <code>agentId</code>，回复仍是 <code>SPEC-OK3</code>。<code>sessions.agent_id</code> 是 <code>ag_01M57X42WYP1RQ02GF01YK26M0</code>。未知 id <code>ag_does_not_exist</code> 是上面的 404。</p>
+<p><code>newRunAgent</code> 的 <code>Model</code> 仍是 <code>w.chat</code>，<code>Tools</code> 仍是 <code>w.tools</code>。子代理仍 <code>LoadAgentSpecs("agents")</code> 读磁盘上的 <code>agents/*.md</code>，不读 <code>tenant_agents</code>。</p>
+<h3 id="24-过期邀请在注册之前拒绝">2.4 过期邀请在注册之前拒绝</h3>
+<p><code>register-by-invite</code> 若先 <code>Signup</code> 再发现邀请过期，库里会多一个用户和他的个人 tenant，团队成员关系却没写成。现在在 bcrypt 和 <code>Signup</code> 之前就看邀请仍是 <code>pending</code> 且 <code>ExpiresAt</code> 未过。过期则 <code>404 {"code":111405,"message":"邀请无效或已过期","data":null}</code>。</p>
+<p>8903：先把 <code>tenant_invitations.expires_at</code> 改到一小时前，再注册。响应就是这条 404。<code>users</code> 里这个邮箱前后都是 0 行。<code>LookupInvitation</code> 仍只按 <code>token_hash</code> 查，公开预览还要能看到状态，所以过期判断放在注册入口，没有放进 <code>LookupInvitation</code>。</p>
+<p>邀请若在这次检查和后面的 <code>AcceptInvitation</code> 之间那一下才过期，仍可能先建出用户。curl 没打到这个缝。</p>
+<h3 id="25-runtime-secret-不再明文落库">2.5 runtime secret 不再明文落库</h3>
+<p>admin PUT <code>/api/tenants/:id/runtime-config</code> 时，<code>PutRuntimeConfig</code> 先读旧配置，再 <code>sealSecrets</code>。密钥是 <code>TAKO_JWT_SECRET</code> 的 SHA-256，算法是 AES-GCM，库存前缀是 <code>seal1:</code>。空串和已经带这个前缀的值原样通过。GET 经 <code>maskSecrets</code> 把非空 secret 显示成「••••」。客户端把这四个点 PUT 回去，或整段不带 <code>secrets</code>，都沿用库里的密文。存量明文在下一次 GET、且环境变量够长时，会顺手封存回库。</p>
+<p>8903：PUT <code>secrets.apiKey=sk-live-plain</code> 之后，<code>tenant_settings.config</code> 含 <code>seal1:</code>，不含这串明文。GET 的 <code>apiKey</code> 是「••••」。再 PUT 掩码，以及再 PUT 一次不带 <code>secrets</code>，三次读出的 <code>config</code> 相同。</p>
+<p>worker 装配 MCP 的地方仍是 <code>mcpToolHandler</code>，<code>confPath</code> 是 <code>defaultMcpConfPath</code>（<code>mcp.json</code>）。<code>newRunAgent</code> 不用 <code>tenant_settings.config</code> 里的 <code>modelRef</code>。落库和掩码已经成立。这场 run 换了模型或 MCP，还没有成立。</p>
+<h3 id="26-沙箱要真的-apply-成功才算隔离">2.6 沙箱要真的 apply 成功才算隔离</h3>
+<p><code>sandboxAvailable</code> 不只 <code>LookPath("sandbox-exec")</code>。它会跑一次 <code>sandbox-exec -p "(version 1)(allow default)" /bin/echo ok</code>，退出码是 0 且输出含 <code>ok</code> 才算可用。结果用 <code>sync.Once</code> 缓存在这个进程里。<code>requireSandbox</code> 为真而探测失败时，<code>startBash</code> 直接返回「这台机器的 sandbox-exec 不能 apply，不能把工作目录当成隔离」，<code>sandboxed</code> 是 false，不跑裸 bash。dev 探针 <code>POST /api/dev/workspace/bash</code> 的 <code>sandboxed</code> 字段跟着这次探测走。</p>
+<p>这次在这台 Mac 上 apply 成功。dev bash 的 body 是 <code>{"code":0,"message":"","data":{"output":"退出码：0\nstdout:\nok\n","sessionId":"s_01M5812HYJQZ66J96FG0E2H3JZ","sandboxed":true}}</code>。<code>TestBashTimeoutMessage</code> 也过了，大约 1 秒。同一台机器上 apply 曾经被拒绝，所以这一条不能单独当稳定门禁。探测失败时测试会 <code>t.Skip</code>。Linux 上通常没有 <code>sandbox-exec</code>，生产 bash 同样拒绝。doc/28 第 2.3 节和第 9.4 节写了这件事。</p>
+<h3 id="27-子代理槽和存储帽按租户算">2.7 子代理槽和存储帽按租户算</h3>
+<p>有 Redis 时，<code>delegationTool.InvokableRun</code> 只走 <code>trySubagentSlot</code>（键 <code>tk:subagents:&lt;tenant&gt;</code>）。进程级 <code>sem</code> 只在 <code>store</code> 为空或 <code>rdb</code> 为空时使用，单测 <code>TestDelegationToolForwardsOptsAndGates</code> 仍靠它证明「满闸时取消不会调用内层」。<code>TestDelegationRedisSkipsProcessSem</code> 把进程 sem 填满，内层工具仍然被调用。没有另打「两个租户同时让模型委派」的 curl。</p>
+<p>存储帽数 <code>&lt;workspace&gt;/tenants/&lt;tid&gt;/</code> 整棵目录，上限 0 表示不限制。<code>write_file</code> 经 <code>rejectStorage</code>。入口图在 <code>ingestImagesAt</code> 里、抢闸之前数已用字节加本张大小。超帽则 <code>429 {"code":113001,"message":"这个工作区的额度用完了","data":null}</code>，不建 run。dev 写文件探针不走这道帽。</p>
+<p>8903：团队目录里已经有那张 8 字节的图，把 <code>max_storage_bytes</code> 改成 1，再对一场新会话 POST 另一张图。响应是上面的 429。这个租户的 <code>runs</code> 行数前后都是 2。两个人同时上传，都可能在写入前看到「还没超」，然后都写进去。这是目录计数的缝，不是单次超帽还能建 run。</p>
+<h3 id="28-表和文档对齐过的地方">2.8 表和文档对齐过的地方</h3>
+<p>doc/28 第 4 节现在写的是代码里的样子：<code>tenant_settings</code> 只有一列 <code>config</code> JSON；表名是 <code>tenant_agents</code>，id 前缀 <code>ag_</code>；邀请 id 前缀 <code>in_</code>，没有 <code>accepted_at</code>，状态含 <code>declined</code>；<code>refresh_tokens</code> 有 <code>tenant_id</code>；<code>notes.user_id</code> 是 <code>not null default ''</code>，<code>scope=tenant</code> 写入的是创建者，不是 NULL。<code>tenants</code> 上有 <code>max_concurrent_runs</code>、<code>max_subagents</code>、<code>daily_tokens</code>、<code>max_storage_bytes</code>，后两列 0 表示不限制。</p>
+<h2 id="3-还开着的口">3. 还开着的口</h2>
+<p>这三块是产品上还没接上的能力。下一场不要把「列已经在库里」或「GET 能读到」写成「这场 run 已经按它跑」。</p>
+<h3 id="31-助手的模型和工具名单">3.1 助手的模型和工具名单</h3>
+<p>owner 给团队助手填了 <code>model_ref</code> 和 <code>tools</code>，member 用这个 <code>agentId</code> 发消息。现在会 202，prompt 换成 <code>spec</code>，模型和工具仍是进程启动时的那一套。用户以为选了这个助手就换了模型，实际仍打到 <code>TAKO_MODEL</code> 配的那个模型，工具也仍是全局池。子代理更是读 <code>agents/*.md</code>，和库里的 <code>tenant_agents</code> 无关。</p>
+<p>要接的话，改的是 <code>newRunAgent</code> 的 <code>Model</code> 和 <code>Tools</code>，以及子代理装载。预检逻辑（请求或已存的 <code>agent_id</code>，<code>VisibleAgent</code>，看不见就 404 且不建 run）保持不动。空 <code>model_ref</code> 应该是什么、工具名单和磁盘规格怎么合成，用户还没拍，不要在交接里自己定死。</p>
+<h3 id="32-租户的模型和-mcp-还没进-worker">3.2 租户的模型和 MCP 还没进 worker</h3>
+<p>admin 把模型和 MCP 写进 <code>tenant_settings.config</code>。member 打开设置页能看到掩码后的 secret。下一场 run 启动时，<code>mcpToolHandler</code> 仍打开 <code>mcp.json</code>，<code>w.chat</code> 仍是启动参数里的模型。A 租户配的 key 不会被 B 租户的 run 用到，也没有被 A 自己的 run 用到。<code>unsealSecret</code> 已经写好，worker 还没调用它。</p>
+<p>把配置接进 worker 时，不要把 <code>seal1:</code> 密文当成明文去连 MCP。GET 的「••••」也不能写回库。</p>
+<h3 id="33-旧接口的成功体">3.3 旧接口的成功体</h3>
+<p>新的产品错误用信封 <code>{code,message,data}</code>，字段顺序是 code、message、data，失败时 <code>data</code> 为 null 但键在。旧的 runs、sessions、log、frames、mcp、media、memory 成功体仍是原来的 JSON。media 和会话找不到时仍是 <code>{"error":"not_found"}</code> 或 <code>{"error":"session_not_found"}</code>。内部故障仍是 <code>{"error":"internal"}</code>。整包换成信封是 A7，这轮明确不做。团队前端是独立 loop，不在这份交接里开工。</p>
+<p>常用码：<code>111405</code> 邀请无效，<code>112003</code> 找不到助手，<code>113001</code> 这个工作区的额度用完了，<code>111204</code> 没有权限做这件事（写和 stop 的 owner 门槛；有的路径文案是「只有本人能修改」）。</p>
+<h2 id="4-下一场不要动的东西">4. 下一场不要动的东西</h2>
+<ul>
+<li><code>postRuns</code> 里助手预检的顺序：先决定 <code>agentID</code>，新带的 <code>agentId</code> 才查角色，<code>VisibleAgent</code> 失败就在 <code>AcquireRun</code> 之前返回。不要改成「先 202，等 worker 再报错」。</li>
+<li>别人留着的引擎。2026-10-19 验收结束时，<code>8914</code>（pid 27195）、<code>8090</code>（pid 8687）、<code>8766</code>（pid 3469）还在听。端口被占就换一个，用 <code>lsof</code> 确认是谁。只杀自己这次起的进程。</li>
+<li><code>yk-tako-eino-backup/</code>，以及用单进程内存闸当设计理由。闸在数据库的部分唯一索引上。</li>
+<li>doc/28 的头注。可以改和代码不一致的句子，不要把它标成用户已验收。</li>
+<li>沙箱超时那条测试的绿，不能单独当「生产隔离已经稳定」的证据。</li>
+</ul>
+<h2 id="5-环境与复验">5. 环境与复验</h2>
+<p>Go 不在 PATH。在 <code>yk-tako-eino/</code> 下：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">PATH</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$HOME</span><span class="st">/sdk/go1.27.0/bin:</span><span class="va">$PATH</span><span class="st">&quot;</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">TAKO_JWT_SECRET</span><span class="op">=</span><span class="st">&#39;dev-only-jwt-secret-change-me-32bytes&#39;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">TAKO_ACCESS_TTL</span><span class="op">=</span>15m</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="bu">export</span> <span class="va">TAKO_MODEL</span><span class="op">=</span>deepseek/deepseek-v4-flash</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> run ./cmd/yktako <span class="at">-engine</span> 127.0.0.1:8903 <span class="dt">\</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">-redis</span> 127.0.0.1:6390 <span class="dt">\</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">-pg</span> <span class="st">&quot;host=127.0.0.1 port=5433 dbname=tako sslmode=disable&quot;</span> <span class="dt">\</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">-workspace</span> <span class="st">&quot;</span><span class="va">$PWD</span><span class="st">/tmp/ws-p0&quot;</span></span></code></pre></div>
+<p><code>TAKO_JWT_SECRET</code> 至少 32 字节，否则封存 secret 会失败。<code>.env</code> 会被 godotenv 加载，但盖不过已经导出的变量。Postgres 是 <code>127.0.0.1:5433</code>，库名 <code>tako</code>。psql 在 <code>$HOME/dev/ykcode/learn-golang/otel-ch-native/bin/postgres/bin/psql</code>。Redis 是 <code>127.0.0.1:6390</code>。不要动 6379 和 5432，那是另一套活实例。</p>
+<p>单测打真实例，不要 skip：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> test ./internal/runengine/ <span class="at">-count</span><span class="op">=</span>1 <span class="at">-timeout</span> 240s</span></code></pre></div>
+<p>2026-10-19 全改之后这一条通过，<code>internal/runengine</code> 22.429s。注册用 <code>POST /api/auth/signup</code>，密码至少 8 个字符，响应在 <code>data.accessToken</code> 和 <code>data.tenant.id</code>。要管别的工作区，先 <code>POST /api/auth/switch-tenant</code>，URL 上的 tenant 必须等于 token 里的 active tenant。</p>
+<h2 id="6-代码落点">6. 代码落点</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>事情</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>铸会话 id、落图、超帽 429、助手预检</td>
+<td><code>server.go</code> 的 <code>postRuns</code></td>
+</tr>
+<tr>
+<td>占位 path、<code>parseSessionMediaPath</code></td>
+<td><code>media.go</code> 的 <code>ingestImagesAt</code></td>
+</tr>
+<tr>
+<td>登录后的取图</td>
+<td><code>server.go</code> 的 <code>getMedia</code></td>
+</tr>
+<tr>
+<td>模型读占位 path</td>
+<td><code>filetools.go</code> 的 <code>sessionRelativeMediaPath</code>，只包了 <code>read_media_file</code></td>
+</tr>
+<tr>
+<td>会话目录和租户目录字节</td>
+<td><code>scope.go</code> 的 <code>sessionWorkspace</code>、<code>tenantStorageRoot</code>、<code>directoryBytes</code></td>
+</tr>
+<tr>
+<td>这场 run 的 prompt</td>
+<td><code>worker.go</code> 的 <code>resolveRunInstruction</code>、<code>newRunAgent</code></td>
+</tr>
+<tr>
+<td>MCP 仍读 <code>mcp.json</code></td>
+<td><code>worker.go</code> 里 <code>mcpToolHandler</code> 的 <code>defaultMcpConfPath</code></td>
+</tr>
+<tr>
+<td>邀请过期</td>
+<td><code>product_api.go</code> 的 <code>registerByInvite</code></td>
+</tr>
+<tr>
+<td>封存 secret</td>
+<td><code>secretseal.go</code>；<code>product_store.go</code> 的 <code>GetRuntimeConfig</code>、<code>PutRuntimeConfig</code>、<code>maskSecrets</code></td>
+</tr>
+<tr>
+<td>沙箱探测</td>
+<td><code>sandbox.go</code> 的 <code>sandboxAvailable</code>、<code>startBash</code></td>
+</tr>
+<tr>
+<td>子代理闸</td>
+<td><code>agents.go</code> 的 <code>delegationTool.InvokableRun</code>；<code>scope.go</code> 的 <code>trySubagentSlot</code></td>
+</tr>
+<tr>
+<td>助手表</td>
+<td><code>product_store.go</code> 的 <code>TenantAgent</code>，表名 <code>tenant_agents</code></td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="7-所以这份交接解决了什么">7. 所以这份交接解决了什么</h2>
+<p>下一场不用从对话里重建「哪些口已经 curl 过、哪些列在库里却还没进 worker」。媒体、邀请过期、secret 密文、沙箱探测、租户存储帽和 Redis 子代理槽，按第 2 节的字节已经收掉。助手的 <code>model_ref</code> 和 <code>tools</code>、租户 MCP 与模型进 worker、旧接口的信封，按第 3 节仍开着。用户点头之前，不要把第 3 节写成下一行代码。</p>
+<blockquote>
+<p>2026-10-19 后续：团队 agent / 子代理 md / 租户 model key / 系统与自定义 MCP 的运行时装配，另见 <a href="../34-租户运行时装配.html">doc/34-租户运行时装配.md</a>。本文件只记录到当前交接时点。</p>
+</blockquote>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/log/2026-10-19-%E5%A4%9A%E7%A7%9F%E6%88%B7-handoff.md"><code>doc/log/2026-10-19-多租户-handoff.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

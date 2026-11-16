@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>笔记按什么分区 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="笔记按什么分区">笔记按什么分区</h1>
+<blockquote>
+<p>模块：记忆 / 笔记（<code>internal/runengine/notes.go</code>）｜ 状态：已落地｜ 证据：<code>doc/17-后续计划-代码子代理与记忆.md</code> §7、<code>tmp/17-笔记/planning.md</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>笔记（<code>notes</code> 表）是模型用 <code>memory</code> 工具显式写下的长期事实：用户说「不要重建」，模型记一笔；查清了部署路径，模型记一笔。下一场会话起手时，这些笔记排进系统提示，模型不用再问一遍。</p>
+<p>「按什么分区」决定这个功能有没有意义：</p>
+<ul>
+<li><strong>按会话分</strong>：新会话读不到旧笔记。而笔记最核心的用例就是「跨会话记住上一场查到的路径」——按会话分等于没有记忆。</li>
+<li><strong>按用户分</strong>：今天没有独立的用户表（身份挂在租户与 membership 上），要新造一层。</li>
+<li><strong>按 workspace 绝对路径分</strong>：物理工作区就是边界；同一项目的多场会话共享一份笔记；跨项目天然隔离。代价是同一 workspace 的多个人共享一份。</li>
+</ul>
+<p>围绕这个分区，还有一串必须一起定的细节：字数上限的原子性、快照什么时候读、改口时旧原话留不留、注入检查拦什么、写失败怎么收场。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>候选</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>分区键</td>
+<td>A 按 session</td>
+<td>隔离强</td>
+<td>跨会话不可见，等于没记忆</td>
+</tr>
+<tr>
+<td></td>
+<td>B 按 workspace 绝对路径（定案）</td>
+<td>物理工作区即边界，零新表</td>
+<td>同 workspace 多用户共享一份</td>
+</tr>
+<tr>
+<td></td>
+<td>C 加 <code>user_id</code></td>
+<td>语义最准</td>
+<td>现在没有用户表，要先造身份层</td>
+</tr>
+<tr>
+<td>字数上限检查放哪</td>
+<td>A 进程内 mutex</td>
+<td>便宜</td>
+<td>多副本失效，等于没锁</td>
+</tr>
+<tr>
+<td></td>
+<td>B 先算合计再插入、不锁</td>
+<td>简单</td>
+<td>两个会话各自看见「没超」，合计超上限</td>
+</tr>
+<tr>
+<td></td>
+<td>C 同一 PG 事务里 advisory xact lock → 算合计 → 插入（定案）</td>
+<td>跨进程正确</td>
+<td>每写一次加锁，吞吐下降</td>
+</tr>
+<tr>
+<td>快照何时读</td>
+<td>A 每次模型调用重读</td>
+<td>即时</td>
+<td>场内系统提示会变，折叠长度基线漂移；模型看见自己刚写的笔记，自我强化</td>
+</tr>
+<tr>
+<td></td>
+<td>B 每场 run 起手读一次、run 内冻结（定案）</td>
+<td>稳定、可解释</td>
+<td>本场新写的笔记本场不可见</td>
+</tr>
+<tr>
+<td>改口怎么留痕</td>
+<td>A 原地 UPDATE content</td>
+<td>表小</td>
+<td>历史不可对质，旧原话被覆盖</td>
+</tr>
+<tr>
+<td></td>
+<td>B 新插一行、旧行只填 <code>superseded_by</code>（定案）</td>
+<td>旧原话、quote、runlog 位置完整保留</td>
+<td>行数增长，所有读侧要过滤未替代</td>
+</tr>
+<tr>
+<td>注入检查拦什么</td>
+<td>A 句式词表</td>
+<td>能表达「不许做什么」</td>
+<td>拦不住语义；纯中文写法一条不命中，清单列不尽</td>
+</tr>
+<tr>
+<td></td>
+<td>B 只拦隐形字符（17 码点）（定案）</td>
+<td>有限、可枚举尽、与语言无关，拦的是「能不能藏」</td>
+<td>挡不住明文字面注入</td>
+</tr>
+<tr>
+<td>写失败出口</td>
+<td>A Go error 上抛</td>
+<td>失败显眼</td>
+<td>一次记笔记失败把整场 run 打成 error</td>
+</tr>
+<tr>
+<td></td>
+<td>B 工具结果错误文本 + 连续 3 次后劝停（定案）</td>
+<td>模型可改参数重试，run 照常</td>
+<td>模型可能反复试，需要劝停</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>裁定：B / C / B / B / B / B。</strong></p>
+<h2 id="3-同族小裁定">3. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>折叠时用户规矩留原句吗？</td>
+<td>折叠提示词加一句「用户明确说过的规矩按原句留在摘要里」</td>
+<td>摘要略变长，但明确规矩不会随机丢失</td>
+</tr>
+<tr>
+<td>从摘要自动往笔记表插行吗？</td>
+<td>不插</td>
+<td>自动生成的是模型二手概括，不是用户原话，会污染「显式记忆」契约</td>
+</tr>
+<tr>
+<td>子代理继承主线程模型历史吗？</td>
+<td>不继承，只给任务说明与工具池</td>
+<td>40 份日志与搜索原文留在子代理，隔离才成立</td>
+</tr>
+<tr>
+<td>团队笔记谁写？</td>
+<td><code>scope=tenant</code> 行 <code>user_id</code> 记创建者，全租户可读，仅 owner/admin 可写，模型默认不能写</td>
+<td>模型一次误写不会污染全团队；快照要合并 user + tenant 两份</td>
+</tr>
+<tr>
+<td>存量毒行怎么办？</td>
+<td>渲染时换占位文字</td>
+<td>不删除历史，但下一场不会被注入</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-证据">4. 证据</h2>
+<ul>
+<li>方案：<code>doc/17-后续计划-代码子代理与记忆.md</code> §7（库、四件、不建的东西、不共享的东西）；<code>doc/28-多租户.md</code> §4.4（notes 加 tenant_id + scope）。</li>
+<li>台账：<code>tmp/17-笔记/planning.md</code> §1 拍定的事、§2 用例。</li>
+<li>代码：<code>notes.go</code> 的 <code>writeNote</code>（advisory lock + 算上限 + 插入）、<code>BeforeAgent</code>（读快照）、<code>superseded_by</code> 更新、<code>noteInvisibleRunes</code>、<code>newMemoryTool</code> / <code>memoryStopAdvice</code>；<code>product_store.go</code> 读侧 <code>superseded_by IS NULL</code>。</li>
+<li>复核命令：<code>grep -n "pg_advisory_xact_lock\|superseded_by\|noteInvisibleRunes" yk-tako-eino/internal/runengine/notes.go</code>。</li>
+</ul>
+<h2 id="5-现状">5. 现状</h2>
+<p>仍有效。句式词表已于 2026-10-15 裁除，只保留隐形字符一档。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E7%AC%94%E8%AE%B0%E6%8C%89%E4%BB%80%E4%B9%88%E5%88%86%E5%8C%BA/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/笔记按什么分区/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

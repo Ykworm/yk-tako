@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>66 · 诉求对照：场景应用与生产就绪 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="66--诉求对照场景应用与生产就绪">66 · 诉求对照：场景应用与生产就绪</h1>
+<blockquote>
+<p>性质：<strong>非方案</strong>（对照记录）。状态：✅ 2026-11-07 按代码核对。 日期：2026-11-07。 代码落点：正文各节点名文件与行号；本文不新增代码。 用途：把两组外部诉求——应用侧五句与平台工程十项——逐条对到 tako 的现状与缺口上。<strong>不作施工真源</strong>：任何一条要落地，须另立方案篇（<code>doc/NN</code>），并按「契约 → 存储 → 实现」的 loop 走。 合并记录：原 <code>doc/66</code>（应用侧）与 <code>doc/67</code>（平台侧）于 2026-11-07 合并为本篇；重叠项只写一次，平台侧对 Trace / Replay / 灰度 / 成本只补平台增量。</p>
+</blockquote>
+<h2 id="0-两组诉求与总结论">0. 两组诉求与总结论</h2>
+<h3 id="01-应用侧五句">0.1 应用侧五句</h3>
+<ol type="1">
+<li>如何展示 Trace、Replay、灰度与成本治理；</li>
+<li>不允许人工审核的资金、医疗、法律决策；</li>
+<li>建立证据链：记录引用来源、工具调用、分析过程和执行 Trace，保证结果可追溯、可审计；</li>
+<li>任务编排：完成信息搜集、交叉验证、结构化分析、报告生成；</li>
+<li>可追溯与审计：记录数据来源、引用依据、工具调用和执行 Trace。</li>
+</ol>
+<h3 id="02-平台工程十项">0.2 平台工程十项</h3>
+<ul>
+<li>Docker Compose 部署方案；</li>
+<li>Model Gateway 模型网关；</li>
+<li>Redis、PostgreSQL、VectorDB 基础设施；</li>
+<li>Trace、Metrics、Monitoring 可观测性；</li>
+<li>Replay 回放调试；</li>
+<li>Prompt / Model / RAG / Tool 版本管理；</li>
+<li>Feature Flag 功能开关；</li>
+<li>灰度发布与回滚；</li>
+<li>成本治理；</li>
+<li>上线 Runbook。</li>
+</ul>
+<h3 id="03-总结论">0.3 总结论</h3>
+<p>应用侧：<strong>证据链（第 3、5 句）是 tako 的地基</strong>，数据已经落库，缺的是拼成一份能交付的审计面；展示与治理（第 1 句）成熟度参差——Trace 与用量账本已有、Replay 只有崩溃续跑那一层、灰度是零；决策边界（第 2 句）与编排语义（第 4 句）是两条产品线，前者只能靠「工具面里没有那个能力」来保证，后者缺任务图。第 3 与第 5 句内容高度重叠，本文合成一节讲。</p>
+<p>平台侧：<strong>有 3 项、半有 3 项、无 4 项。</strong> 有：Trace、用量账本、PG / Redis 底座；半有：模型目录（不是网关）、版本号（只有一个自增字段）、Replay 的过程数据（没有回放工具）；无：Docker Compose、Metrics / 健康检查 / 告警、运行时 Feature Flag、灰度与回滚、上线 Runbook（成本治理是「有账本、无金额」）。</p>
+<p>这十五项不是并列 checklist，依赖顺序是：<strong>部署与健康面 → 运行配置快照 → 开关 / 灰度 / 回滚 → 成本报表与 Runbook</strong>。Runbook 是前面几层的结果，不是最后一个独立任务。</p>
+<h2 id="1-应用侧">1. 应用侧</h2>
+<h3 id="11-trace--replay--灰度--成本治理">1.1 Trace / Replay / 灰度 / 成本治理</h3>
+<p>这四个词常被并成一句，但成熟度完全不同，必须拆开说。</p>
+<h4 id="trace已落地缺展示入口">Trace：已落地，缺展示入口</h4>
+<p>引擎按 OTel GenAI 语义发 run 根 span、每枪模型调用的 <code>chat</code> 子 span、每次工具执行的 <code>execute_tool</code> 子 span（<code>internal/runengine/journal.go:104</code>），以及召回、折叠、准入、定稿等内部步骤 span，传输走 OTLP，可双发 CozeLoop / Langfuse。机制与字段清单见 <a href="54-运行级OTel追踪.html">doc/54</a>。</p>
+<p><strong>缺的是给人看的入口</strong>：<code>web/src</code> 里没有任何 trace 相关代码；今天要看 trace，只能去外部观测平台，或者拉 frames / runlog 自己按 <code>eventOffset</code> 拼时间线。要「展示」，不需要新建采集——把已有 span 或 runlog 投影成一个 <code>GET /api/runs/:id/trace</code> 就够。</p>
+<p>一个前提：模型入参出参这类内容属性由环境开关控制，未设时默认不写（<code>internal/observability/trace.go:163</code> 的 <code>parseCapture</code>）。审计要看「模型当时看到了什么」，必须把这个开关打开；开发库的 <code>.env</code> 已设。</p>
+<h4 id="replay必须拆成两层否则会承诺做不到的事">Replay：必须拆成两层，否则会承诺做不到的事</h4>
+<p><strong>第一层是崩溃续跑的真重放。</strong> <code>run_journal</code> 是这场 run 的崩溃账本；进程死后续跑时，<code>replayJournal</code>（<code>internal/runengine/journal.go:171</code>）把已完成轮次规范重放成模型输入、turn 与定稿原料。但账本终态即删（<code>internal/runengine/pgstore.go:718</code>），所以它只服务「在途恢复现场」，不是历史回放。</p>
+<p><strong>第二层是历史复现。</strong> 靠 <code>runlog_entries</code> 的全序记录（user / assistant / tool_call / tool_result）重建「当时看到了什么、调了什么、回了什么」。这层能回答「过程可复原」，但不能承诺「重跑得到同一答案」——doc/56 §4.9 的实测里，同一 harness、同一批题隔一小时重跑，逐题分歧率 28%，比两臂之间的差异还大。产品话术应写「可复原过程」，不写「可重放结果」。</p>
+<p>平台视角再补一句：没有单独的「失败 run 快照」留存，也没有一键回放工具。课程里「保存输入 / 上下文 / 工具结果 / Agent 状态」四项，前三项有过程记录，第四项（可重入的 Agent 状态）本来就不存在——tako 的挂起靠 <code>run_questions</code> 行与 journal 重放，不靠可达的 checkpoint。</p>
+<h4 id="灰度代码里是零">灰度：代码里是零</h4>
+<p><code>internal/</code> 与 <code>web/</code> 里查不到 canary、feature flag、按比例放量这类机制。今天能借的轴只有租户粒度：</p>
+<ul>
+<li>租户自己的模型 ref 与密钥，按 <code>tenant + ref + 配置版本</code> 解析（<code>internal/runengine/tenantmodel.go:29</code>）；</li>
+<li>租户 agent 规格：<code>tenant_agents</code> 行里带 <code>Spec</code>（提示词）、<code>ModelRef</code>、<code>ToolPolicy</code>、<code>SkillPolicy</code>（<code>internal/runengine/product_api.go:1360</code> 一带）。</li>
+</ul>
+<p>所以真要做，最小形态是「按租户 / 按 agent 切模型或提示词版本」，不是按流量百分比。前提是先把「配置版本」从缓存键哈希升级成有历史、可回滚的一等对象——现在 <code>configVersion</code> 只算哈希，没有版本记录，也没有回滚动作。按比例灰度今天没有落点。</p>
+<h4 id="成本治理有账本与日封顶没有金额与预算语义">成本治理：有账本与日封顶，没有金额与预算语义</h4>
+<p>已有的：</p>
+<ul>
+<li>每枪模型调用发一条 <code>usage</code> 帧，页面据此显示 token 用量（<a href="27-用量可见.html">doc/27</a>）；</li>
+<li><code>tenant_usage_daily</code> 按租户按天累计 token（<code>internal/runengine/scope.go:202</code>）；</li>
+<li>租户有 <code>daily_tokens</code>、并发 run 数、子代理数、存储字节四个上限（<code>internal/runengine/scope.go:178</code> 一带）；</li>
+<li>日 token 配额在 run 起手拦一次，超了把这场 run 直接收成 <code>error</code>（<code>internal/runengine/worker.go:567</code> 一带）。</li>
+</ul>
+<p>没有的：</p>
+<ul>
+<li>价格表——token 没有换算成钱，也没有「这次 run 花了多少」的归因；</li>
+<li>按 run / 按会话的预算与告警；</li>
+<li>超配额的明确语义：现在是 run 起手一次判断，中途不会停，用户也拿不到「哪一步超了、还剩多少」的解释。</li>
+</ul>
+<p>平台侧再补一句：<code>tenant_usage_daily</code> 是全局唯一账本，没有环境维度、没有供应商 / 模型维度。所以「成本报表」即使做了页面，也只能按租户按天给一个 token 数——换算成钱还缺价格表，按模型归因还缺「每枪用哪家」的汇总。</p>
+<p>结论：能做「用量看板 + 粗粒度日封顶」，做不了「成本归因 / 预算告警」。</p>
+<h3 id="12-不允许人工审核的资金医疗法律决策">1.2 不允许人工审核的资金、医疗、法律决策</h3>
+<p>这句话有两种读法，答案相反，必须先拆开。</p>
+<p><strong>读法一：这类决策必须有人复核。</strong> tako 只有「模型主动问人」：<code>ask_user</code> 追问与 <code>submit_plan</code> 方案审批，都先落 <code>run_questions</code> 一行再等人答，崩溃后续跑能接回现场（<a href="47-Plan审核与追问澄清.html">doc/47</a>）。但没有「框架强制审批」：进计划模式是模型自己判断后调 <code>enter_plan_mode</code>（<code>internal/runengine/plangate.go:1</code> 的注释），框架拦截式审批已在 2026-10-23 拍为不做（<a href="16-能力复刻总规划.html">doc/16</a> 第 53 行的「不在欠账里」段）。所以<strong>做不到「这类决策一定过人」的硬保证</strong>。</p>
+<p>要真保证，只能让工具面里不存在那个能力：不接支付、下单、开具、签章这类有外部副作用的工具，只给只读凭证。提示词保证不了——doc/16 同一段也写了这条边界：越界靠沙箱与围栏硬挡，不靠模型自觉。</p>
+<p><strong>读法二：这类决策不允许人审，要全自动。</strong> 那就要关掉 plan gate，并接受没有任何硬保证；这与 tako 当前的设计方向相反，不建议。</p>
+<p>对这类场景，tako 现实的位置是：<strong>取证、出草案、留证据，执行那一步交给人或外部系统。</strong></p>
+<h3 id="13-证据链与可追溯审计对应第-35-句">1.3 证据链与可追溯审计（对应第 3、5 句）</h3>
+<p><strong>已经有的：</strong></p>
+<ul>
+<li><strong>工具调用与结果</strong>：runlog 按 seq 全序记 user / assistant / tool_call / tool_result，帧与历史按 <code>toolCallId</code> 配对（<a href="59-工具调用可见性.html">doc/59</a>），子代理行带 agent 归属。这是「谁在什么时候、拿什么参数、调了什么、得到什么」的原始记录。</li>
+<li><strong>数据来源</strong>：<code>web_search</code> 的结果全文落 <code>&lt;workspace&gt;/.tako/search/&lt;runId&gt;_&lt;n&gt;.md</code>，工具回执只给来源、条数、路径与 token 数（<code>internal/runengine/websearch.go:5</code>）；<code>web_fetch</code> 全文落 <code>.tako/fetch/</code>（<a href="57-网络抓取.html">doc/57</a>）；<code>read_file</code> 与 <code>bash</code> 的输出按 <a href="58-读分页与输出留存.html">doc/58</a> 留档。</li>
+<li><strong>执行过程</strong>：实时帧流（Redis <code>runlive</code>）+ trace span（跨 run 可检索）+ <code>run_tasks</code> 看板（模型自己的计划与状态，<a href="41-任务看板与人工审批.html">doc/41</a>）。</li>
+<li><strong>审计表</strong>：<code>audit_log</code> 记成员、角色与平台管理员变更（<code>internal/runengine/members_store.go:13</code>）。</li>
+</ul>
+<p><strong>缺的三条：</strong></p>
+<ol type="1">
+<li><strong>没有「结论 → 来源」的绑定。</strong> 来源是工具记录，不是回复里的脚注；模型在正文写不写 URL、写不写「未能查证」，靠 <code>web_search</code> 描述段里的提示词，程序不代贴。结果能「可查」，但不能「每条断言自动指回一个来源字节」。</li>
+<li><strong>PII 脱敏与审计保真打架。</strong> 工具回执在统一出口先打码再返回（<code>internal/runengine/pii.go:195</code>），所以落 runlog 的是打码版；用户原话落库是原文，只在进模型输入时打码（<code>toSchemaMessages</code> 一路）。也就是说：<strong>工具侧原始值不留存，用户侧原文留存</strong>。这是设计选择，不是 bug；但资金 / 医疗 / 法律审计需要「哪些字段必须保真、保真存在哪、谁能看」的分层，现在没有。</li>
+<li><strong>没有导出面。</strong> 审计导出已随商业化那一档拍为不做（<a href="28-多租户.html">doc/28</a> §15）。今天只能在库里或页面上看，交不出一个可交付的审计包。</li>
+</ol>
+<p>这三条里，1 和 3 是工程量，2 是必须由你拍板的取舍。</p>
+<h3 id="14-任务编排搜集--交叉验证--结构化分析--报告">1.4 任务编排：搜集 → 交叉验证 → 结构化分析 → 报告</h3>
+<p>积木齐了，编排语义没齐：</p>
+<ul>
+<li><strong>信息搜集</strong>：<code>web_search</code> / <code>web_fetch</code> / <code>read_file</code> / <code>bash</code>，加上 researcher 子代理（<code>agents/researcher.md</code>，工具护栏见 <a href="26-researcher工具护栏.html">doc/26</a>）。</li>
+<li><strong>交叉验证</strong>：没有专门机制。靠模型多调几次工具、自己在正文里比对；看板能记步骤，不会替你判断「两个来源冲突」。</li>
+<li><strong>结构化分析 / 报告生成</strong>：<code>run_tasks</code> 四把工具（<code>internal/runengine/tasktools.go</code>）+ coder 子代理（<a href="23-coder规格.html">doc/23</a>）+ 文件工具写产物，终稿落 runlog。</li>
+<li><strong>缺的是任务图</strong>：现在是一条主链 + 进程内派子代理，没有分支、汇合、依赖、失败重试，也没有 A2A / agent card。要做，最小改动是把 <code>run_tasks</code> 从「清单」升级成「带依赖的任务」，而不是引入一个编排框架——这和 <a href="41-任务看板与人工审批.html">doc/41</a> 的既有形态是同一条线。</li>
+</ul>
+<h2 id="2-平台工程侧">2. 平台工程侧</h2>
+<h3 id="21-部署与基础设施">2.1 部署与基础设施</h3>
+<h4 id="docker-compose没有">Docker Compose：没有</h4>
+<p>仓库里没有 <code>Dockerfile</code>、<code>docker-compose.yml</code>、CI workflow。今天的启动方式是 <code>scripts/dev.sh</code>（本地起 PG / Redis / 引擎 / Vite）或 <code>go run ./cmd/yktako</code>。生产部署的计划（git tag + GitHub Actions + SSH + 1Panel / OpenResty）只记在本地部署笔记与 <code>secrets/</code> 里，不在 <code>doc/</code>，也不在仓库脚本里。</p>
+<p>要凑出一个 Compose，进程清单其实很短：引擎二进制 + <code>web/dist</code> 静态文件 + PG + Redis，共四项。但有三个坑不能漏：</p>
+<ol type="1">
+<li><strong>workspace 必须是共享卷</strong>：<code>cmd/yktako/main.go:225</code> 一带的启动检查会在检测到上次使用主机不同时打警告——多副本不共享盘，文件就各读各的。</li>
+<li><strong>引擎不托管前端</strong>：<code>server.go</code> 里没有静态文件路由，<code>web/dist</code> 要由 Web 服务器（Nginx / OpenResty）另挂。</li>
+<li><strong>PG 不是裸 PG</strong>：开 RAG 时要求 <code>pg_search</code> 扩展、<code>shared_preload_libraries</code> 预加载和 <code>vector</code> 依赖；缺一个引擎就 fail fast 退出（见 <code>internal/runengine/dialogue.go:56</code> 一带的报错文案）。</li>
+</ol>
+<h4 id="model-gateway有目录--客户端工厂没有网关服务">Model Gateway：有「目录 + 客户端工厂」，没有网关服务</h4>
+<p>已经有的三层：</p>
+<ul>
+<li><code>internal/config/provider-catalog.json</code>：厂商目录（id / 协议 / baseURL / 模型清单 / vision 标记）；</li>
+<li><code>internal/config/resolve.go</code>：把 <code>TAKO_MODEL</code>、<code>TAKO_PROVIDER_&lt;NAME&gt;_API_KEY</code>、<code>TAKO_PROVIDER_&lt;NAME&gt;_BASE_URL</code> 解析成厂商 + 模型 + 密钥；</li>
+<li><code>internal/runengine/tenantmodel.go</code>：按 <code>tenant + ref + 配置版本</code> 建并缓存客户端；租户密钥用 <code>seal2</code>（<code>TAKO_DATA_KEY</code>）加密落库，平台进程里的 <code>*_API_KEY</code> 会被从租户环境里剔掉。</li>
+</ul>
+<p>它解决的是「用谁家的 key、走哪个模型」，属于<strong>客户端工厂</strong>，不是网关：没有统一入口、没有路由 / fallback / 限流 / 熔断 / 重试策略，也没有按模型累计成本与延迟的汇总面。<code>GET /api/dev/model/resolve</code> 只是把解析结果打出来给人看。</p>
+<p>要往「网关」靠，最小增量不在部署一个代理进程，而在现有调用包装层上补 fallback 与预算；前提是先把「这一枪用的模型 ref、参数、供应商」记成可汇总的运行事实。</p>
+<h4 id="redis--postgresql--vectordb两个半">Redis / PostgreSQL / VectorDB：两个半</h4>
+<ul>
+<li><strong>PostgreSQL 是唯一真源</strong>：会话、run、模型消息、runlog、看板、提问、技能、用量、审计都在 PG。建表走 <code>AutoMigrate</code>（<code>internal/runengine/pgstore.go:499</code> 注释写明「dev 迁移方式，无迁移文件」）。</li>
+<li><strong>Redis 只存两个键</strong>：<code>tk:runlive</code>（帧列表）与 <code>tk:runepoch</code>（接管令牌），见 <code>internal/runengine/redisstore.go</code>。它<strong>不是队列</strong>：<code>go.mod</code> 里没有 asynq，worker 是进程内 goroutine，run 的并发靠 PG 上的部分唯一索引与租约。</li>
+<li><strong>VectorDB 没有独立组件</strong>：召回线用 <code>pg_search</code> 的 BM25（<code>internal/runengine/dialogue.go:187</code>），<code>vector</code> 扩展只是安装 <code>pg_search</code> 时的依赖；代码里没有 embedding 生成，也没有向量相似度查询。</li>
+</ul>
+<p>所以依赖清单应如实写成：<strong>PG（含 pg_search / vector 扩展）+ Redis（临时态）+ 共享 workspace</strong>，不是课程里默认的「Redis + PG + 独立 VectorDB」三件套。</p>
+<h3 id="22-可观测性trace-有metrics--monitoring-是零">2.2 可观测性：Trace 有，Metrics / Monitoring 是零</h3>
+<p>Trace 见 §1.1：run 根 span、每枪 <code>chat</code>、每次 <code>execute_tool</code>、内部步骤 span 都已落地，OTLP 双发；内容属性默认不写，靠 <code>OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT</code> 打开（<code>internal/observability/trace.go:163</code>）。</p>
+<p><strong>Metrics 与监控面是零</strong>：没有 <code>/metrics</code>、没有 Prometheus 客户端、没有健康检查端点、没有告警规则；日志是 stdout 的 <code>log.Printf</code>，靠外部收集。课程列的业务指标、模型指标、Agent 指标、安全指标，今天没有一条有现成读数。</p>
+<p>最小形态是两层，不要和 trace 重复采集：</p>
+<ol type="1">
+<li>健康面：<code>/healthz</code>（PG / Redis 探活）+ 版本 / 构建信息；</li>
+<li>指标面：进行中 run 数、失败率、P95 延迟、token 消耗、工具失败率、配额命中次数。数据大多已在 PG / 用量账本里，缺的是暴露口径。</li>
+</ol>
+<h3 id="23-版本开关灰度与回滚">2.3 版本、开关、灰度与回滚</h3>
+<h4 id="版本对象碎片化且缺运行配置快照">版本对象：碎片化，且缺「运行配置快照」</h4>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>对象</th>
+<th>今天在哪</th>
+<th>有没有版本</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>系统提示词</td>
+<td>代码常量（<code>internal/config/model.go:18</code>）</td>
+<td>跟二进制走</td>
+</tr>
+<tr>
+<td>计划模式提示词</td>
+<td>代码常量（<code>internal/runengine/plangate.go</code>）</td>
+<td>跟二进制走</td>
+</tr>
+<tr>
+<td>Agent 规格</td>
+<td><code>agent_defaults</code> / <code>tenant_agents</code> 行</td>
+<td><code>agent_defaults.Version</code> 自增；<code>tenant_agents</code> 无版本列</td>
+</tr>
+<tr>
+<td>模型</td>
+<td>模型 ref + 厂商目录文件</td>
+<td>无版本对象</td>
+</tr>
+<tr>
+<td>工具</td>
+<td>二进制里的注册代码</td>
+<td>无版本元数据</td>
+</tr>
+<tr>
+<td>技能</td>
+<td><code>skill_rows</code></td>
+<td>无版本列</td>
+</tr>
+<tr>
+<td>RAG</td>
+<td>派生索引 <code>dialogue_chunks</code></td>
+<td>无策略版本；可 <code>--rebuild-dialogue</code> 重建</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>agent_defaults.Version</code> 只在导入时自增（<code>internal/runengine/product_store.go:238</code> / <code>:251</code>），<strong>只增不留旧值</strong>，没有历史表，也没有回滚动作。</p>
+<p>更关键的是：<code>runs</code> 行不存模型 ref，也不存提示词 / 工具集 / 技能集的版本（<code>internal/runengine/pgstore.go:46</code> 的字段清单）。模型 ref 只散落在 runlog 的 <code>assistant</code> / <code>tool</code> 行的 <code>Model</code> 列（<code>pgstore.go:109</code>）。<strong>一场 run 结束后，无法从 run 本身回答「当时用的是哪版提示词、哪些工具、哪个模型参数」</strong>。这是版本管理与回滚共同的缺口——没有快照，回滚就没有对象。</p>
+<h4 id="feature-flag只有启动期环境开关">Feature Flag：只有启动期环境开关</h4>
+<p>全仓没有运行时 flag。能改的只有启动期环境变量：<code>TAKO_MODEL</code>、<code>TAKO_MEMORY_EXTRACT</code> / <code>TAKO_MEMORY_RECALL</code> / <code>TAKO_RAG</code>、OTel 内容开关、各类 TTL 与配额默认值。改一个要重启进程；没有按租户 / 用户 / 比例 / 风险等级的开关，也没有管理面。</p>
+<p>注意别把「env 开关」改名叫 flag 就算完成：真 flag 要能不重启生效、有归属、有变更记录，还要能回答「这个租户现在拿到的是哪一档」。</p>
+<h4 id="灰度发布与回滚没有且有一个硬缺口">灰度发布与回滚：没有，且有一个硬缺口</h4>
+<p>没有 canary、按比例放量、A/B 观察。唯一可用轴是租户粒度配置（<code>tenant_settings</code> 的模型配置、<code>tenant_agents</code> 的规格），但改了就生效，没有观察窗口，也没有回滚点。</p>
+<p><code>agent_defaults.Version</code> 只增不留旧值，回滚等于手抄旧内容；部署回滚等于换二进制 tag。</p>
+<p><strong>最硬的一处不是配置回滚，而是在途 run</strong>：全仓没有 <code>signal.Notify</code> / 优雅停机逻辑，重启会直接把在途 run 打断。接回依赖租约过期后的显式 <code>POST /api/runs/:id/resume</code>，没有启动扫描自动接管。所以「可回滚」必须先回答：回滚那几分钟里正在跑的 run 怎么办——是等在途跑完、拒绝新 run（drain），还是允许被打断后由人手动 resume。今天没有答案。</p>
+<p>最小形态：先把配置写入改成「新增版本行 + 切换指针」，再做按租户 / agent 的开关；停机先补 drain 语义，再谈灰度。</p>
+<h3 id="24-上线-runbook没有">2.4 上线 Runbook：没有</h3>
+<p>仓库里最接近的是 <code>scripts/dev.sh</code> 与 <code>scripts/acceptance/README.md</code> 的「怎么起一个隔离引擎」。真正的上线手册是零：依赖版本与安装、必填密钥、模型密钥、数据库迁移语义、构建与发布、健康检查、回滚步骤、故障处置、备份策略，都不在仓库。</p>
+<p>Runbook 不是单独写一篇文档就完，它依赖两层前置：</p>
+<ul>
+<li>健康面（§2.2）：没有探活，Runbook 的「确认服务起来了」只能靠手 curl；</li>
+<li>停机语义（§2.3）：没有 drain，Runbook 的「发布 / 回滚」写不出安全步骤。</li>
+</ul>
+<h2 id="3-依赖顺序只标顺序不是方案">3. 依赖顺序（只标顺序，不是方案）</h2>
+<ol type="1">
+<li><strong>部署与健康面</strong>：Compose 四件、共享 workspace、PG 扩展与密钥准备、<code>/healthz</code> 与基础指标。</li>
+<li><strong>运行配置快照</strong>：每场 run 记住当时的提示词 / 模型 / 工具集 / 技能集版本——版本管理与回滚的对象。</li>
+<li><strong>运行时开关与灰度</strong>：flag 能不改进程生效，再按租户 / agent 放量，才有「回滚到上一版」可言。</li>
+<li><strong>成本报表与 Runbook</strong>：前两层落地后，报表才有归因维度，Runbook 才有可写的确认与回退步骤。</li>
+</ol>
+<h2 id="4-收尾真正要补的五件事">4. 收尾：真正要补的五件事</h2>
+<ol type="1">
+<li>把已有账本投影成展示面：trace / 成本 / 审计的页面或接口，读现成的 span、runlog、<code>tenant_usage_daily</code>，不新增采集。</li>
+<li>把配置版本做成可回滚的对象：这是灰度与版本管理唯一的前置，也是今天最实的缺口。</li>
+<li>给 PII 与审计保真分层：哪些字段必须保真、保真存在哪、谁能看、保留多久——这是取舍，不是工程量。</li>
+<li>补部署与健康面：Compose、共享 workspace、<code>/healthz</code> 与基础指标，让「服务是否起来」有机器答案。</li>
+<li>补停机与回滚语义：先有 drain，Runbook 才能写「发布 / 回滚」的安全步骤。</li>
+</ol>
+<p>五件事里，前两件是「把已有数据摆上桌」，第三件需要单独拍板，后两件是平台工程的入场券。都不在本文施工；要动哪条，先立方案篇、写 todos、过契约拍。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/66-%E8%AF%89%E6%B1%82%E5%AF%B9%E7%85%A7-%E5%9C%BA%E6%99%AF%E5%BA%94%E7%94%A8%E4%B8%8E%E7%94%9F%E4%BA%A7%E5%B0%B1%E7%BB%AA.md"><code>doc/66-诉求对照-场景应用与生产就绪.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

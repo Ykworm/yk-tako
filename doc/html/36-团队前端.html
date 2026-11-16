@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>36 · 团队前端（切换器 / 成员与邀请 / 邀请落地页） · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="36--团队前端切换器--成员与邀请--邀请落地页">36 · 团队前端（切换器 / 成员与邀请 / 邀请落地页）</h1>
+<blockquote>
+<p>性质：<strong>已落地</strong>。2026-10-20 起草，2026-10-21 随 <code>0fd15c5</code> 入库：G1/G3（邀请预览三字段、归档团队过滤）与 F1/F2/F3（工作区切换器、成员页、邀请落地页与待处理邀请）同批完成。收尾（2026-10-21）<code>npm run build</code>（Node 22.23.2）、<code>go test ./internal/runengine</code>、<code>go vet ./internal/runengine</code> 全绿。不表示版本号跳了一档。 代码落点：<code>yk-tako-eino/web/src/App.vue</code>（切换器 / 创建工作区 / 邀请路由分发）、<code>MembersView.vue</code>、<code>InviteLanding.vue</code>、<code>PendingInvites.vue</code>、<code>Configure.vue</code>（设置|成员子导航）、<code>auth.ts</code>（<code>switchTenant</code> / <code>tenantState</code>）；<code>yk-tako-eino/internal/runengine/product_api.go</code>、<code>product_store.go</code>（G1/G3 两处小改）。 真源关系：团队后端 API 全量在 <a href="28-多租户.html">doc/28</a> A6（已落地并 curl 过）；Agent 页与 Team 设置页已在 <a href="34-租户运行时装配.html">doc/34</a> U1 落地；本篇只做<strong>团队管理</strong>的前端：工作区切换、成员与邀请、邀请落地。 不在本篇：项目目录前端（doc/35 明确另立）、助手/Agent 页（doc/34 U1 已做）、团队计费 / SSO / API key（doc/28 A7 以后）、归档团队的管理（见 §8）。</p>
+</blockquote>
+<h2 id="0-本篇做什么">0. 本篇做什么</h2>
+<p>给 doc/28 A6 已落地的团队后端补上用户能点的页面。三件事：</p>
+<ol type="1">
+<li><strong>顶栏工作区切换器</strong>：登录用户名下拉，列出我加入的所有工作区（个人 + 团队），点击切换 active tenant，底部有「创建工作区」。</li>
+<li><strong>「团队」tab 加成员管理子页</strong>：成员列表、邀请列表；owner 能创建邀请（生成链接）、撤销、移除成员、改角色、转移所有者、归档；任何人能离开。</li>
+<li><strong>邀请落地页 <code>/invite/&lt;token&gt;</code></strong>：打开邀请链接的人看到团队名和自己的角色；已登录点「接受」直接进群，未注册走「通过邀请注册」再登录。</li>
+</ol>
+<h2 id="1-背景与动机三个失败故事">1. 背景与动机：三个失败故事</h2>
+<p>后端 API 在 2026-10-18 就全部能跑了，但页面上没有入口，团队功能等于不存在。</p>
+<p><strong>故事一：owner 邀请 Bob，只能开终端。</strong> Alice 在页面上把自己的团队配得好好的（Team 设置页能配模型 key），想把 Bob 拉进来。页面上没有任何按钮，她只能 <code>curl -X POST /api/tenants/:id/invitations</code> 拿到 <code>inviteToken</code>，再手动拼一条链接发给 Bob。她用浏览器打开自己发的链接——404，前端没有这个路由。</p>
+<p><strong>故事二：Bob 收到链接，流程断在半截。</strong> Bob 没注册过。他打开链接，即便前端有路由，预览页只告诉他「某团队邀请你」；他要注册，但注册页在哪、注册完怎么回来接受邀请，都没有指引。后端 <code>register-by-invite</code> 能把注册 + 建个人租户 + 加入团队一次做完，但<strong>成功响应只回 <code>{userId, status:"accepted"}</code>，不发 token</strong>——Bob 注册完还得自己去登录页再登一次，登完也不知道自己已经在团队里了（memberships 里有，但页面上没人告诉他）。</p>
+<p><strong>故事三：Alice 有两个工作区，切不过去。</strong> Alice 被拉进了前东家的团队，token 里的 active tenant 还是自己注册时的个人租户。页面上没有切换入口，她要 <code>curl -X POST /api/auth/switch-tenant</code>，拿到新 token 对，手动替换 sessionStorage 里的旧 token，再刷新页面。普通用户做不到。</p>
+<p>所以这解决了什么：团队后端（邀请、成员、角色、切换）从「只能 curl」变成页面上可完成的完整流程，且注册 → 加入 → 登录 → 切到新团队的链路中间不断线。</p>
+<h2 id="2-现状盘点">2. 现状盘点</h2>
+<p>页面上已有什么（doc/34 U1，2026-10-19 浏览器验收）：</p>
+<ul>
+<li><code>App.vue</code> 顶栏三个 tab：对话 / 助手 / 团队；顶栏右侧显示当前工作区名和角色（<code>tenant.name</code> + <code>roleLabel</code>，App.vue:31-32）。</li>
+<li>「助手」tab = Agent 页（Root/Subagent，默认/覆盖/自定义）；「团队」tab = Team 设置页（默认 modelRef、租户 model key、系统 MCP 状态、自定义 MCP 增删改 + 测试连接）。</li>
+<li>登录态统一在 <code>auth.ts</code>：<code>authFetch</code> 带 Bearer、401 自动刷新（并发 401 共用一次刷新）；<strong>只有服务端明确拒绝续期（HTTP 401 且响应是引擎信封）才回登录表单</strong>，5xx 与代理错误是暂时性故障、保留登录态等下一拍（<code>doc/81</code>）；对话页和配置页共享 sessionStorage 里的 token 对——一边登录另一边算登录。</li>
+<li>未登录时对话页渲染登录表单（邮箱 + 密码）。</li>
+</ul>
+<p>页面上没有什么（本篇要做的）：</p>
+<ul>
+<li>没有切换 active tenant 的入口（<code>POST /api/auth/switch-tenant</code> 后端在，前端没调过）。</li>
+<li>没有创建团队的入口（<code>POST /api/tenants</code> 后端在）。</li>
+<li>「团队」tab 只有运行时设置，没有成员列表、邀请管理、角色操作（成员/邀请 API 后端全在）。</li>
+<li>没有 <code>/invite/&lt;token&gt;</code> 路由（<code>GET /api/invitations/:token</code> 是公开端点，前端没有对应页面）。</li>
+<li>没有「我的邀请」入口（<code>GET /api/me/invitations</code> 后端在）。</li>
+</ul>
+<h2 id="3-名词">3. 名词</h2>
+<ul>
+<li><strong>active tenant</strong>：access token 里的 <code>tid</code>，决定这次请求落在哪个工作区。切换走 <code>POST /api/auth/switch-tenant</code>，成功返回新 token 对，旧 refresh 撤销。</li>
+<li><strong>memberships / 工作区列表</strong>：我加入的 tenant 列表。两个来源：登录/切换响应里的 <code>memberships</code>（每项 <code>{tenantId, tenantName, role}</code>）和 <code>GET /api/tenants</code>（每项 <code>{id, name, kind, role, status}</code>，多 <code>kind</code> 字段）。切换器用后者（要区分个人/团队）。</li>
+<li><strong>邀请 token</strong>：<code>POST /api/tenants/:id/invitations</code> 成功时一次性回显的 <code>inviteToken</code>（base64url 32 字节随机串），库里只存它的 SHA-256。邀请链接 = <code>&lt;origin&gt;/invite/&lt;inviteToken&gt;</code>，7 天过期。</li>
+<li><strong>邀请 id</strong>：<code>in_</code> 前缀的表行 id。接受/拒绝邀请的端点按它寻址（<code>POST /api/me/invitations/:id/accept</code>），不按 token。</li>
+<li><strong>角色</strong>：<code>owner &gt; admin &gt; member &gt; viewer</code>（members_store.go 的 <code>roleRank</code>）。能通过邀请/直接添加指派的只有 <code>admin/member/viewer</code>；owner 只能由「转移所有者」产生。</li>
+</ul>
+<h2 id="4-页面与链路">4. 页面与链路</h2>
+<h3 id="41-顶栏工作区切换器">4.1 顶栏工作区切换器</h3>
+<p><strong>现在</strong>：顶栏右侧一块死文字（工作区名 + 角色）。<strong>改成</strong>：可点下拉。</p>
+<ul>
+<li>收起态：当前工作区名 + 角色 + 下拉箭头。角色按现有 <code>roleLabel</code> 映射（所有者/管理员/成员）。</li>
+<li>展开态列出 <code>GET /api/tenants</code> 的 <code>tenants</code> 数组，每项一行：名称、kind 标签（<code>个人</code> / <code>团队</code>）、我的角色。当前 active tenant 高亮。已归档（<code>status=archived</code>）的不显示（§6-G0 后端对齐后天然解决）。</li>
+<li>底部固定一行「+ 创建工作区」。</li>
+</ul>
+<p><strong>切换动作</strong>：点击某行 → <code>POST /api/auth/switch-tenant</code>，body <code>{"tenantId":"t_...","refreshToken":"&lt;sessionStorage 里的 refreshToken&gt;"}</code>（refreshToken 必填，缺了 400 <code>111001</code>）。成功响应和登录同形（新 token 对 + <code>user</code> + <code>activeTenant</code> + <code>memberships</code>）：<code>auth.ts</code> 里新增 <code>switchTenant(tenantId)</code>，把新 token 对写回 sessionStorage，然后整页刷新数据——对话列表、当前 tab 内容都重新拉。失败按信封弹 <code>message</code>（403 <code>111201</code>「你不是这个工作区的成员」、401 <code>111105</code> 登录失效回登录表单）。</p>
+<p><strong>创建动作</strong>：点「创建工作区」→ 弹小窗输名称 → <code>POST /api/tenants</code> body <code>{"name":"…"}</code> → 201 拿到 <code>{tenant, membership}</code> → 紧接着自动对新 tenant 跑一次 <code>switch-tenant</code> 切过去。名字空白回 400 <code>111003</code>「请填写工作区名称」，弹窗内联显示。</p>
+<p><strong>没它会怎样</strong>：Bob 加入两个团队后永远停在注册时的个人租户里，除非会 curl。</p>
+<h3 id="42-团队tab-加成员子页">4.2 「团队」tab 加「成员」子页</h3>
+<p>Team 设置页（model key、MCP）是「团队」tab 现状。顶部加子导航：<strong>设置 | 成员</strong>。「设置」= 现状不动；「成员」= 本篇新增。</p>
+<ul>
+<li><code>active tenant</code> 是 <code>kind=personal</code> 时：「成员」子页显示一句「个人工作区没有成员」，不发起成员请求（personal tenant 只有 owner 自己）。</li>
+<li><code>kind=team</code> 时，「成员」子页三块：
+<ol type="1">
+<li><strong>成员列表</strong>（<code>GET /api/tenants/:id/members</code>，viewer 即可）：每行 邮箱 + 角色下拉（owner 可改，其余只读文字）。owner 的行额外有「转移所有者」按钮；非 owner 成员在自己行有「离开团队」。</li>
+<li><strong>邀请</strong>（viewer 可看列表，owner 可操作）：「邀请成员」表单（邮箱 + 角色下拉 admin/member/viewer）→ <code>POST /api/tenants/:id/invitations</code> → 成功后把 <code>inviteToken</code> 拼成 <code>&lt;origin&gt;/invite/&lt;token&gt;</code> 显示出来并一键复制。下方列表 <code>GET /api/tenants/:id/invitations</code>：邮箱、角色、状态（待处理/已接受/已拒绝/已撤销）、过期时间；<code>pending</code> 行有「撤销」（<code>DELETE …/invitations/:inv_id</code>，204 无 body）。</li>
+<li><strong>危险区</strong>（仅 owner）：「归档这个工作区」→ 确认弹窗 → <code>DELETE /api/tenants/:id</code> → 200 <code>{status:"archived"}</code> → 前端自动切回个人工作区。个人 tenant 调这个端点会 403 <code>111203</code>，但前端本来就不给个人 tenant 显示这个按钮。</li>
+</ol></li>
+</ul>
+<p><strong>角色操作的错误分支</strong>（按 code 弹 message）：邀请 owner → 400 <code>111407</code>「不能邀请所有者」；邀请已注册成员 → 409 <code>111406</code>「已经是这个工作区的成员」；直接添加时邮箱未注册 → 404 <code>111201</code>（message 是成员文案，语义错位，见 §6-G2）；降/删/退最后一个 owner → 409 <code>111403</code>「至少要留一个所有者」。</p>
+<p><strong>没它会怎样</strong>：Alice 邀请 Bob 要开终端；Bob 被拉进来了没人能把他移除或改角色（除了 curl）。</p>
+<h3 id="43-邀请落地页-invitetoken">4.3 邀请落地页 <code>/invite/&lt;token&gt;</code></h3>
+<p>公开路由，未登录也能打开（<code>GET /api/invitations/:token</code> 本身就是无 auth 端点）。Vue 项目目前没有 vue-router，做法：<code>App.vue</code> 挂载时看 <code>location.pathname</code> 是否 <code>/invite/</code>，是则渲染本组件、隐藏三 tab 主界面；token 从 path 取。</p>
+<p>页面三种状态：</p>
+<ol type="1">
+<li><strong>预览正常</strong>（200，且 <code>status=pending</code> 且未过期——过期前端用 <code>expiresAt</code> 判断，预览响应带 <code>expiresAt</code>，见 §6-G1）：显示「<strong>{tenantName}</strong> 邀请你成为{角色}，{到期时间}前有效」。下面按登录态分两种：
+<ul>
+<li><strong>已登录且当前账号邮箱匹配邀请邮箱</strong>：「接受邀请」按钮 → <code>POST /api/me/invitations/:id/accept</code>（id 从预览响应拿，见 §6-G1）→ 200 <code>{status:"accepted"}</code> → 弹「已加入」→ 问「切换到 {tenantName}？」→ 是则 <code>switch-tenant</code> 切过去。</li>
+<li><strong>已登录但邮箱不匹配</strong>：提示「这个邀请不属于当前账号（{预览里的邮箱}）」，给「退出并换账号」和「用邀请邮箱注册」两个入口。</li>
+<li><strong>未登录</strong>：内联注册表单（邮箱预填邀请邮箱 + 密码 ≥8 位）→ <code>POST /api/auth/register-by-invite</code> body <code>{token, email, password}</code> → 201 <code>{userId, status:"accepted"}</code> → 显示「已加入 {tenantName}，请登录」→ 登录表单 → 登录成功（响应 <code>memberships</code> 里已含新团队）→ 回到预览页或自动切过去。</li>
+</ul></li>
+<li><strong>预览异常</strong>：<code>404 code=111405</code>「邀请无效或已过期」→ 页面显示这句话 + 「去登录/注册」链接。<code>status=accepted/revoked/declined</code> 同理按状态显示对应文案。</li>
+<li><strong>已接受过、现在又打开链接且当前账号已是成员</strong>：accept 会回 409 <code>111406</code>，页面显示「你已经是这个工作区的成员」+ 「切换过去」按钮。</li>
+</ol>
+<p><strong>register-by-invite 成功不发 token</strong>（后端现状）：注册完必须再走一次登录。前端把这个断点显示成一句明确的「注册成功，请登录」，不让用户干等。</p>
+<p><strong>没它会怎样</strong>：邀请链接发出去是 404 页面，整个邀请流程在后端空转。</p>
+<h3 id="44-我的邀请入口">4.4 我的邀请入口</h3>
+<p>登录用户可能同时躺在好几封邀请里（被多个团队邀请，但还没接受）。入口放在切换器下拉顶部：「待处理邀请（N）」一行（N&gt;0 时高亮），点击展开内联列表（<code>GET /api/me/invitations</code>，只回 pending 且未过期的）：每条显示团队名、角色、过期时间，「接受」「拒绝」两个按钮（<code>POST /api/me/invitations/:id/accept|decline</code>）。接受后同 §4.3：问是否切过去。</p>
+<p><strong>没它会怎样</strong>：不接受邀请就永远看不到邀请的存在（没有邮件、没有通知），被邀请的人不知道自己被邀请了。</p>
+<h2 id="5-角色显隐矩阵">5. 角色显隐矩阵</h2>
+<p>原则（doc/28 已定）：前端只按角色隐藏按钮，<strong>后端每个路由仍自己查角色</strong>，前端藏按钮不是权限。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>界面元素</th>
+<th>owner</th>
+<th>admin</th>
+<th>member</th>
+<th>viewer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>切换器、创建工作区</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+</tr>
+<tr>
+<td>设置子页：保存（<code>PUT runtime-config</code>）</td>
+<td>✓</td>
+<td>✓</td>
+<td>只读</td>
+<td>只读</td>
+</tr>
+<tr>
+<td>成员列表 / 邀请列表（看）</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+</tr>
+<tr>
+<td>邀请成员 / 撤销邀请</td>
+<td>✓</td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>移除成员 / 改角色 / 转移所有者</td>
+<td>✓</td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>归档工作区</td>
+<td>✓</td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>离开团队</td>
+<td>✓（受最后 owner 限制）</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="6-写方案时挖到的缺口与补齐拍g0">6. 写方案时挖到的缺口与补齐拍（G0）</h2>
+<p>前端流程里有三处现状会让页面做不下去或行为怪异。G1/G3 是几行的后端 diff，按 AGENTS.md 的契约纪律各算一个带 curl 验收的小拍，排在 F1/F3 之前；G2 纯前端特判，并入 F3。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>缺口</th>
+<th>现状</th>
+<th>建议</th>
+<th>影响拍</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>G1</td>
+<td>预览响应不够落地页用</td>
+<td><code>GET /api/invitations/:token</code> 只回 <code>{tenantName, role, status}</code>；accept 端点按邀请 <strong>id</strong> 寻址，前端从 token 拿不到 id；预览也不回 <code>email</code>，未登录注册页没法预填，已登录也没法判断「这个邀请是不是给当前账号的」</td>
+<td>预览响应加 <code>invitationId</code>、<code>email</code>、<code>expiresAt</code> 三个字段（邀请 id 非秘密，accept 仍要登录 + 邮箱匹配，无安全问题）</td>
+<td>F3 前置</td>
+</tr>
+<tr>
+<td>G2</td>
+<td>邀请已注册成员的提示错位</td>
+<td><code>POST /api/me/invitations/:id/accept</code> 在「已是成员」时回 409 <code>111406</code>（文案对）；但 <code>register-by-invite</code> 的「邮箱已注册」回 409 <code>111401</code>「这个邮箱已经注册」——受邀的已注册用户会被引导去注册而不是登录</td>
+<td>前端在落地页对 <code>111401</code> 特判：显示「该邮箱已注册，请直接登录后再接受邀请」</td>
+<td>F3（纯前端，不改后端）</td>
+</tr>
+<tr>
+<td>G3</td>
+<td><code>GET /api/tenants</code> 不归档过滤</td>
+<td>该列表只筛 <code>tenant_members.status='active'</code>，<strong>不筛 <code>tenants.status</code></strong>；而 Login/Me 的 memberships 两边都筛（<code>identity_store.go:180-190</code>）。归档团队会在切换器里诈尸</td>
+<td><code>ListTenants</code> 的 SQL 补上 <code>AND tenants.status='active'</code>（对齐 Login/Me），切换器不再显示已归档团队</td>
+<td>F1 前置</td>
+</tr>
+</tbody>
+</table></div>
+<p>G1/G3 各是几行的后端 diff，但按 AGENTS.md 的契约纪律不混进前端拍：各算一个带 curl 验收的小拍，排在 F1/F3 之前。</p>
+<h2 id="7-分拍">7. 分拍</h2>
+<p>每个 F 做完停下浏览器验收，不自动 commit。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>拍</th>
+<th>做什么</th>
+<th>验收</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>G1</td>
+<td><code>lookupInvitation</code> 加 <code>invitationId</code>/<code>email</code>/<code>expiresAt</code>；curl：合法 token 的预览含三个新字段，无效 token 仍 404 <code>111405</code></td>
+<td>curl + 期望字节</td>
+</tr>
+<tr>
+<td>G3</td>
+<td><code>ListTenants</code> SQL 补 <code>tenants.status='active'</code>；curl：归档团队从列表消失，login 的 memberships 行为不变</td>
+<td>curl + 期望字节</td>
+</tr>
+<tr>
+<td>F1</td>
+<td>顶栏切换器（数据源 <code>GET /api/tenants</code>，切 <code>switch-tenant</code>，建 <code>POST /api/tenants</code> + 自动切过去）</td>
+<td>浏览器：注册两个用户、B 邀请 A（curl 建邀请先）、A 登录能看到两个工作区，点一下切过去，对话列表跟着变；Network 里 <code>switch-tenant</code> 200、新 token 已写入</td>
+</tr>
+<tr>
+<td>F2</td>
+<td>「团队」tab「成员」子页（成员列表、角色下拉、移除、离开、转移 owner、归档危险区）</td>
+<td>浏览器：owner 视角看到全部操作；member 视角只读列表且只能看到自己行的「离开」；降最后 owner 弹「至少要留一个所有者」</td>
+</tr>
+<tr>
+<td>F3</td>
+<td>邀请落地页 <code>/invite/&lt;token&gt;</code> + 切换器里「我的邀请」入口</td>
+<td>浏览器全流程：owner 建邀请复制链接 → 退出登录 → 新邮箱打开链接 → 注册 → 登录 → memberships 里有新团队 → 切过去 → 成员列表里出现新人</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="8-不在本篇">8. 不在本篇</h2>
+<ul>
+<li><strong>项目目录前端</strong>（doc/35 的项目列表、按项目筛选会话、删项目按钮）：doc/35 明确「前端页面不在本篇」，属独立 loop。</li>
+<li><strong>归档团队的管理</strong>：归档不可逆（<code>DELETE /api/tenants/:id</code> 只翻 status），本篇只做「归档并切回个人」；解归档没有后端端点。</li>
+<li><strong>审计日志 / 用量页</strong>（<code>GET /api/tenants/:id/audit-log</code>、<code>/usage</code>，admin）：后端在，页面以后有需要再做。</li>
+<li><strong>直接添加成员</strong>（<code>POST /api/tenants/:id/members</code>，只能拉已注册用户）不做入口：邀请流已覆盖「拉人」场景，直接添加对未注册邮箱报成员文案（<code>111201</code>）语义错位，入口做出来也是误导。owner 真要用，curl 可用。</li>
+<li><strong>邀请邮件发送</strong>：邀请链接生成后靠 owner 自己复制发出去（粘贴到微信/邮件都行）。服务端发信需要邮件设施，以后再说。</li>
+</ul>
+<h2 id="9-闭环">9. 闭环</h2>
+<p><strong>所以这解决了什么。</strong> doc/28 A6 的团队后端（创建、邀请、成员/角色、切换）在页面上可用了：任何人能建团队、拉人、被拉的人从一条链接走完注册→加入→登录→切换，多团队用户在顶栏一点就换工作区。后端契约一行不改语义（G1 只加字段、G3 只对齐过滤），路由、角色门槛、错误码全沿用 doc/28 已 curl 过的字节。</p>
+<p><strong>仍不解决的：</strong> 项目目录前端、归档恢复、审计/用量页、邮件送达。这些都在 §8 明说，不靠本篇顺带。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/36-%E5%9B%A2%E9%98%9F%E5%89%8D%E7%AB%AF.md"><code>doc/36-团队前端.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

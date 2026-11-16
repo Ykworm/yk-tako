@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>团队前端的边界 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="团队前端的边界">团队前端的边界</h1>
+<blockquote>
+<p>模块：前端 / 团队与邀请（<code>web/src/MembersView.vue</code> 等 + <code>product_api.go</code>）｜ 状态：已落地｜ 证据：<code>doc/36-团队前端.md</code>、<code>tmp/36-团队前端/planning.md</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>团队页面要处理四个真实动作：拉人、发邀请、按角色显隐按钮、被邀请人落地注册。</p>
+<p>四个地方各自有一个「看起来更顺」的做法，但都会把语义弄坏：</p>
+<ol type="1">
+<li><strong>直接添加成员</strong>：填邮箱点「添加」。后端对未注册邮箱回 404 <code>111201</code>，文案却是成员语义，页面显示成「成员不存在」——用户以为系统坏了。</li>
+<li><strong>服务端发邀请邮件</strong>：要引入发信设施、退信、垃圾箱、域名信誉。在还没有邮件基础设施时，邀请链接会卡在「怎么发出去」。</li>
+<li><strong>前端藏按钮当权限</strong>：viewer 看不到「移除成员」按钮，但可以直接调 API。任何会用 devtools 的人都能越权。</li>
+<li><strong>注册成功直接发 token</strong>：把注册与登录流程耦合，安全面扩大；而后端成功体本来只有 <code>{userId, status:"accepted"}</code>，前端若假装登录，与真实会话状态不一致。</li>
+</ol>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>候选</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>拉人入口</td>
+<td>A 做「直接添加成员」</td>
+<td>少一步</td>
+<td>未注册邮箱文案错位、误导</td>
+</tr>
+<tr>
+<td></td>
+<td>B 不做入口，只走邀请流（定案）</td>
+<td>语义一致</td>
+<td>拉未注册者要发链接。接口保留给 curl/运维</td>
+</tr>
+<tr>
+<td>邀请怎么送达</td>
+<td>A 服务端发邮件</td>
+<td>体验完整</td>
+<td>邮件设施与运维</td>
+</tr>
+<tr>
+<td></td>
+<td>B owner 复制 <code>&lt;origin&gt;/invite/&lt;token&gt;</code> 自己转发，7 天过期（定案）</td>
+<td>零设施</td>
+<td>手动转发</td>
+</tr>
+<tr>
+<td>前端显隐算不算权限</td>
+<td>A 是</td>
+<td>省后端</td>
+<td>可绕过；矩阵与后端漂移</td>
+</tr>
+<tr>
+<td></td>
+<td>B 只做显隐，后端每个路由自己查角色（定案）</td>
+<td>安全边界在后端</td>
+<td>两处维护矩阵</td>
+</tr>
+<tr>
+<td>邀请注册后</td>
+<td>A 直接发 token 进团队</td>
+<td>顺滑</td>
+<td>注册与登录耦合、安全面扩大</td>
+</tr>
+<tr>
+<td></td>
+<td>B 不发 token，前端明示「注册成功，请登录」（定案）</td>
+<td>流程诚实</td>
+<td>多一步</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>裁定：B / B / B / B。</strong></p>
+<h2 id="3-同族小裁定">3. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>角色矩阵写在哪？</td>
+<td>后端 <code>RequireTenantRole</code> 是唯一判定；前端只按角色藏按钮</td>
+<td>前端的矩阵是「体验」，不是「权限」</td>
+</tr>
+<tr>
+<td>邀请 token 过期多久？</td>
+<td>7 天</td>
+<td>过期由服务端判，前端只在落地页显示错误</td>
+</tr>
+<tr>
+<td>待处理邀请在哪儿处理？</td>
+<td>顶栏 <code>PendingInvites</code> 展开；落地页 <code>InviteLanding</code> 负责未注册/已注册两条路</td>
+<td>两条路都不自动切换身份</td>
+</tr>
+<tr>
+<td>租户切换怎么做？</td>
+<td><code>auth.ts</code> 存 active tenant，切换后重拉全部列表</td>
+<td>token 带 <code>tid</code>，切换要换 token</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-证据">4. 证据</h2>
+<ul>
+<li>方案：<code>doc/36-团队前端.md</code> §4.3（invite landing）、§5（角色显隐矩阵）、§8（不在本篇）。</li>
+<li>台账：<code>tmp/36-团队前端/planning.md</code> §0 已拍、§1 F1–F3 / G1 / G3。</li>
+<li>代码：<code>MembersView.vue</code>（无直接添加入口）、<code>PendingInvites.vue</code>、<code>InviteLanding.vue</code>；<code>product_api.go</code> 的 <code>inviteBodyOf</code>、<code>registerByInvite</code>；<code>product_store.go</code> 的 <code>RegisterByInvite</code>；<code>auth.go</code> 的 <code>RequireTenantRole</code>。</li>
+<li>复核命令：<code>grep -n "inviteBodyOf\|func registerByInvite" yk-tako-eino/internal/runengine/product_api.go</code>。</li>
+</ul>
+<h2 id="5-现状">5. 现状</h2>
+<p>仍有效。项目共享退役后，「团队成员」与「项目协作」彻底分开，见 <code>doc/problems/共享项目整条退役</code>。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E5%9B%A2%E9%98%9F%E5%89%8D%E7%AB%AF%E7%9A%84%E8%BE%B9%E7%95%8C/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/团队前端的边界/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

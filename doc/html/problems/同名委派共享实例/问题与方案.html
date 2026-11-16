@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>同名委派共享实例 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="同名委派共享实例">同名委派共享实例</h1>
+<blockquote>
+<p>模块：子代理（<code>internal/runengine/agents.go</code>）｜ 状态：委派路径已翻案落地（<code>496d54d</code>，2026-10-23）；主 run 实例仍共用（未决）｜ 证据：<code>doc/25-子代理折叠.md</code> §6–§7、<code>doc/28-多租户.md</code> §10.3、<code>tmp/17-子代理折叠/planning.md</code> §3</p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>模型在一条 assistant 消息里同时发两个同名 <code>researcher</code> 委派。eino 的 ToolsNode 默认并行执行，两个 goroutine 进入同一个 <code>ChatModelAgent</code> 实例。</p>
+<p>上游 eino issue #1177 的问题是：<code>msgConf.cancelCtx</code> 是<strong>实例级可写字段</strong>。当前接线没有启用 <code>adk.WithCancel</code>，所以绝大多数时候写的是 nil，带 <code>-race</code> 跑也不报功能错误——这是一个<strong>潜伏的串线</strong>：一旦将来启用 WithCancel，一个委派的 stop 会取消另一个委派；多租户下更严重，从「同一个人开两个标签页」升级成「两个租户互相污染」。</p>
+<p>同一个根因还有第二层：如果子代理的 handler 或装配里存了任何 per-delegation 状态（base 行、上一轮计数、上一份摘要），同名并行就会互相串。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A per-name 互斥</td>
+<td>同名委派串行，异名仍并行</td>
+<td>不动上游，能治委派路径</td>
+<td>同名串行；主 run 的实例没有名字可分，治不到</td>
+</tr>
+<tr>
+<td>B 强制重建绷带</td>
+<td>每次委派都重建实例绕开共享</td>
+<td>绕开共享</td>
+<td>贵、非治根；<code>returnDirectly</code> 为空也不构成重建理由</td>
+</tr>
+<tr>
+<td>C per-delegation 全量重装</td>
+<td>装载时点整体挪到每次委派</td>
+<td>彻底无共享</td>
+<td>丢掉 run 级观测面与拒载时机；2026-10-16 判「不做」</td>
+</tr>
+<tr>
+<td>D 壳化</td>
+<td>装载输入与观测面维持 run 级，只有 eino 实例推迟到每次委派、新建即弃</td>
+<td>既无共享，又保住 run 级观测与预检</td>
+<td>多一层壳；实例创建成本摊到每次委派</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>裁定：先采纳 A，B 不做，C 于 2026-10-23 翻案为 D。</strong> 「per-delegation 重装不做」这个中间态已作废——翻案的是「装载时点全挪走」，不是「实例必须共享」。</p>
+<h2 id="3-同族小裁定">3. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>子代理 handler 可以有状态吗？</td>
+<td>不可以，全部走参数与 <code>state</code></td>
+<td>同名并行共享实例，字段必串；这是无状态写法的直接原因</td>
+</tr>
+<tr>
+<td>主 run 的实例共享怎么办？</td>
+<td>仍共用；doc/28 §10.3 明示「启用 <code>adk.WithCancel</code> 前必须按四条决策处理」</td>
+<td>目前无 WithCancel，风险潜伏；这是全库唯一「裁定不完整」的条目</td>
+</tr>
+<tr>
+<td>壳化之后还要 per-name 互斥吗？</td>
+<td>原 #1177 动机被壳化吸收；是否另有动机未重拍</td>
+<td>现状：异名并行、同名各自新实例，互不共享</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-证据">4. 证据</h2>
+<ul>
+<li>方案：<code>doc/25-子代理折叠.md</code> §6（eino #1177）、§7（处置表与头注翻案）；<code>doc/28-多租户.md</code> §10.3（多租户下的同一 race）。</li>
+<li>台账：<code>tmp/17-子代理折叠/planning.md</code> §3「新事实一」（实例竞态）。</li>
+<li>代码：<code>agents.go</code> 的 <code>subagentShell</code>（注释写明「实例推迟到每次委派」）与委派时的内层装配；<code>agents_test.go</code> 断言内层是 <code>*subagentShell</code>。</li>
+<li>复核命令：<code>grep -n "subagentShell" yk-tako-eino/internal/runengine/agents.go</code>。</li>
+</ul>
+<h2 id="5-现状">5. 现状</h2>
+<p>委派路径已壳化（<code>496d54d</code>）。主 run 的 <code>ChatModelAgent</code> 实例仍按 run 共用——<strong>在启用 <code>adk.WithCancel</code> 之前这是安全的，但它是挂账，不是已解决</strong>。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E5%90%8C%E5%90%8D%E5%A7%94%E6%B4%BE%E5%85%B1%E4%BA%AB%E5%AE%9E%E4%BE%8B/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/同名委派共享实例/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

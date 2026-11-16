@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>doc/log/ 记录索引 · tako 文档</title>
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="doclog-记录索引">doc/log/ 记录索引</h1>
+<blockquote>
+<p>性质：<strong>某一时刻的记录</strong>，不是方案，也不是施工真源。 回答「当时为什么这么做、做到哪一步」，不回答「现在该怎么做」；与 <code>doc/NN</code> 冲突时以 <code>doc/NN</code> 为准。 文件名带日期。时间推移不搬家——状态只在这里或正文头注里改。</p>
+</blockquote>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>日期</th>
+<th>文档</th>
+<th>类型</th>
+<th>一句话</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2026-09-30</td>
+<td><a href="2026-09-30-uncommitted-review-handoff.html">未提交改动审查交接</a></td>
+<td>交接</td>
+<td>旧线末期未清问题（media_offload 五问等）</td>
+</tr>
+<tr>
+<td>2026-10-07</td>
+<td><a href="2026-10-07-v6-gap-handoff.html">v6 现状与能力差距</a></td>
+<td>交接</td>
+<td>v6 现状快照与 pi／WeKnora 差距</td>
+</tr>
+<tr>
+<td>2026-10-08</td>
+<td><a href="2026-10-08-pre-t3-handoff.html">pre-T3 落地</a></td>
+<td>执行交接</td>
+<td>T3 之前的 lease／T1／T2</td>
+</tr>
+<tr>
+<td>2026-10-08</td>
+<td><a href="2026-10-08-subagent-design-handoff.html">子代理设计素材</a></td>
+<td>素材盘点</td>
+<td>子代理设计的已核实素材</td>
+</tr>
+<tr>
+<td>2026-10-09</td>
+<td><a href="2026-10-09-deferred-loading.html">Deferred loading：把工具 schema 移出前缀</a></td>
+<td>文章</td>
+<td>前缀缓存与工具 schema</td>
+</tr>
+<tr>
+<td>2026-10-12</td>
+<td><a href="2026-10-12-overflow-handoff.html">溢出修复层一期落地</a></td>
+<td>执行交接</td>
+<td>检出／救援链／截断检出</td>
+</tr>
+<tr>
+<td>2026-10-16</td>
+<td><a href="2026-10-16-overflow-b2b3-handoff.html">溢出修复层二期 B2/B3</a></td>
+<td>执行交接</td>
+<td>guard 救援链＋槽位落库</td>
+</tr>
+<tr>
+<td>2026-10-19</td>
+<td><a href="2026-10-19-多租户-handoff.html">多租户运行时现状交接</a></td>
+<td>现状交接</td>
+<td>多租户全改后代码停在哪</td>
+</tr>
+<tr>
+<td>2026-11-02</td>
+<td><a href="2026-11-02-gaia-k5-两臂可靠性对照.html">GAIA k=5：一个模型，两个 harness</a></td>
+<td>文章</td>
+<td>tako／dsh 两臂 k=5 可靠性对照</td>
+</tr>
+<tr>
+<td>2026-11-09</td>
+<td><a href="2026-11-09-记忆两层方案演进.html">记忆两层方案演进</a></td>
+<td>演进记录</td>
+<td>2026-11-07～08 的改稿过程；现行双模式方案以 doc/65 为准，本文不作施工真源</td>
+</tr>
+<tr>
+<td>2026-11-14</td>
+<td><a href="2026-11-14-异步委派与DAG讨论.html">异步委派、子代理与 DAG 讨论笔记</a></td>
+<td>讨论记录</td>
+<td>Todo／子代理／持久 Task／DAG 的概念分层与 Claude 对照；未形成改造拍板</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="子目录">子目录</h2>
+<p>带执行台账的变更记录放 <code>doc/log/&lt;YYYY-MM-DD&gt;-&lt;方案名&gt;/</code>：<code>README.md</code> 是该次变更的结论提炼，<code>tasks.md</code> 是冻结的执行记录（原 <code>tmp/&lt;方案名&gt;/todos.md</code>）。</p>
+<ul>
+<li><a href="2026-11-03-文档归属重构/README.html">2026-11-03-文档归属重构</a>：<code>docs/</code> 并入 <code>doc/</code>、旧线归档与 <code>scripts/check-doc-layout.sh</code> 的落地记录。</li>
+<li><a href="2026-11-06-看板结果列/README.html">2026-11-06-看板结果列</a>：看板加 <code>result</code> 列 + 「标完成必须带结果」的拒写闸与三个读者（doc/41 §5.1）。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/log/README.md"><code>doc/log/README.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

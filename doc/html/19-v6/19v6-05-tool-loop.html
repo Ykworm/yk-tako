@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>19v6-05 · tool loop（T 系列） · tako 文档</title>
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="19v6-05--tool-loopt-系列">19v6-05 · tool loop（T 系列）</h1>
+<blockquote>
+<p>本篇是 doc/19-v6 文档集的 <strong>tool loop 篇</strong>：Eino ADK 底座、工具消息的两个投影、sub agent（AgentTool）、 工具目录与 tool_search、观测 Handler 脚手架。 <strong>契约字节真源仍是 19v6-01</strong>——本篇涉及的帧新 kind 与 <code>agent</code> 字段<strong>已随 T2（2026-10-08，七修）落 19v6-01</strong>； <code>model</code> 字段（2026-10-10 纠偏，帧/行同带）<strong>已补 19v6-01，随 T3-1b/T3-2 落地</strong>； 本篇是 tool loop 的<strong>机制裁定真源</strong>。 立项：2026-10-08（用户拍板：循环走 Eino ADK）；执行台账 = <code>tmp/19-v6/planning.md</code> §11 + todos「T 系列」。 <strong>T4/T5 已落地（2026-10-20）</strong>：工具分级（direct/deferred）+ <code>tool_search</code>（BM25 首版）A1–A4 四拍完成—— A1 <code>ad1ab6b</code>（<code>toolsearch.go</code>：分词/BM25/检索/run-local box + 单测）、A2 <code>a190f4d</code>（子代理保留名与 显式挂载）、A3 纯验收（激活集只活一场 run）、A4 回归与收口（单测补网、A1/A2 话本重跑、四个 API 字节零变化）。落地细节与验收实录见 §5 尾条与 <code>tmp/19-v6/todos.md</code>。</p>
+</blockquote>
+<h2 id="0-术语2026-10-08-用户裁2026-10-10-补-3-条模型侧术语">0. 术语（2026-10-08 用户裁；2026-10-10 补 3 条模型侧术语）</h2>
+<p>先看「观测 / 存储」侧三个词，三种形状 / 住处 / 消费者，勿混：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>词</th>
+<th>形状</th>
+<th>住处</th>
+<th>消费者</th>
+<th>粒度</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Model message</strong></td>
+<td>OpenAI messages（role/content/tool_calls）</td>
+<td>主线程 → <code>run_model_messages</code> 表；子代理 → <strong>只在进程内</strong>（AgentTool runner state）</td>
+<td>worker 组装模型输入</td>
+<td>消息</td>
+</tr>
+<tr>
+<td><strong>runlive</strong></td>
+<td>帧（<code>kind</code> + <code>agent</code> + <code>model</code> + 负载）</td>
+<td>Redis <code>tk:runlive:{runId}</code> LIST（TTL 300s）</td>
+<td>frames API（客户端轮询）</td>
+<td>帧</td>
+</tr>
+<tr>
+<td><strong>runlog</strong></td>
+<td>活动行（<code>role</code>/<code>agent</code>/<code>model</code>/<code>text</code>/<code>payload</code>）</td>
+<td>PG <code>runlog_entries</code></td>
+<td>log API</td>
+<td>消息</td>
+</tr>
+</tbody>
+</table></div>
+<p>再看「模型选型 / 客户端」侧三个词（§4 开始大量用，先钉死定义）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>词</th>
+<th>形状（正向定义）</th>
+<th>住处</th>
+<th>消费者</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>ref</strong></td>
+<td>字符串，格式 = <code>厂商ID / 模型ID</code>。唯一身份：带厂商命名空间，避免同名模型撞车。</td>
+<td>不单独存：从环境变量 <code>TAKO_MODEL</code> 读、或从子代理 md 的 <code>model:</code> 行读</td>
+<td><code>ResolveModel</code> 解析它、ModelRegistry 拿它当缓存 key、帧/行里的 <code>model</code> 字段存它</td>
+<td><code>deepseek/deepseek-v4-flash</code>、<code>anthropic/claude-sonnet-4</code>、<code>ollama/qwen2.5-coder:14b</code></td>
+</tr>
+<tr>
+<td><strong>ChatModel 实例</strong></td>
+<td>一个具体的 HTTP 客户端：里面装好了 baseURL、API Key、协议（openai/anthropic）、模型 ID。<strong>无状态，不记任何对话</strong>。</td>
+<td>进程内存（Go struct）</td>
+<td>ChatModelAgent / AgentTool 的 loop 用它发 LLM 请求</td>
+<td>主 worker 启动时 <code>config.Open()</code> 返回的那一个；子代理按 ref 新建的那些</td>
+</tr>
+<tr>
+<td><strong>ModelRegistry</strong></td>
+<td>一张进程内的<strong>懒加载缓存表</strong>：<code>map[ref]ChatModel实例</code>。懒加载 = 进程启动时是空的，<strong>第一次用到某个 ref 才解析并建客户端</strong>，之后同样的 ref 直接复用。</td>
+<td>进程内存（Go struct，带读写锁防并发重复建）</td>
+<td>装配层（BeforeAgent）把子代理规格转成 ChatModelAgent 时用它取实例</td>
+<td>一条规格写了 <code>model: anthropic/claude-sonnet-4</code>，第一次遇到时 ModelRegistry 去解析环境变量、建 claude 客户端、存进 map；下一条同样写了这个 ref 的规格直接拿 map 里的，不再重复解析</td>
+</tr>
+</tbody>
+</table></div>
+<p>index 概念表对 runlive/runlog 的定义不变；本篇钉死的是「模型输入侧叫 Model message、观测侧叫帧/runlive」， 以及两者<strong>永不混写</strong>：子代理的 Model message 不进 mh、帧不进 mh。</p>
+<h2 id="1-底座eino-adk">1. 底座：Eino ADK</h2>
+<ul>
+<li><code>ChatModelAgent</code> 进程内 loop 嵌进 worker（旧线 <code>adkrun</code> 先例）；watchdog / endRun / 闸路径不动。</li>
+<li><strong>铁判据 = 四个 API 契约字节零变化</strong>（同 A7/D1 内部改造拍的判据）——底座更换不出契约面。</li>
+<li>worker 的手写 Stream 循环与 claude/openai/eino 三 translator 由「ADK 事件流 → 归一层 → v6 帧」重写： ADK 的 <code>TypedAgentEvent</code> 迭代器是<strong>引擎内部物</strong>，v6 帧是<strong>契约物</strong>，归一层是两者唯一接缝。</li>
+<li><strong>观测 Handler 脚手架</strong>（用户指令，2026-10-08）：<code>ChatModelAgentMiddleware</code> 全套钩子 （BeforeAgent / AfterAgent / BeforeModelRewriteState / AfterModelRewriteState / WrapModel / WrapInvokableToolCall / WrapStreamableToolCall / WrapEnhancedInvokableToolCall / WrapEnhancedStreamableToolCall ——v0.9.21 实读的九方法全集，T1 勘误） 每处打终端日志 <code>[adk][序号] 钩子名｜功能一句话｜进/出</code>。转正点 = T6（收成旗标或拆，登记 planning §4）。</li>
+</ul>
+<h2 id="2-工具消息的两个投影">2. 工具消息的两个投影</h2>
+<p>同一次工具调用，两个投影各自成形状（种类由 <code>role</code> 取值承载，2026-10-07 已裁）：</p>
+<ul>
+<li><strong>mh（Model message，模型输入）</strong>：OpenAI messages 形状。assistant 行 <code>text</code> = 纯正文不夹带； 新增 <code>tool_calls</code> / <code>tool_call_id</code> 两列（§6）；tool 行 text = 工具结果。 多轮时<strong>逐轮一行</strong>：工具轮的前导语在自己那行（与 tool_calls 同行），不并进终稿行——终稿行只放最后一轮正文。</li>
+<li><strong>runlog（展示与历史）</strong>：消息粒度活动行——assistant 正文行 + 扩展行 （role=<code>tool_call</code> / <code>tool_result</code>，<code>payload</code> 列存 name/args/output 等结构化负载）。 assistant 行 text = 全 run delta 累计（所见即所得，收口替换的锚）。</li>
+<li><strong>runlive（实时观测）</strong>：帧粒度——<code>tool_call</code> / <code>tool_result</code> 帧 + 流式 <code>delta</code> 帧。</li>
+</ul>
+<h2 id="3-帧契约扩展已落-19v6-01-22026-10-08-七修">3. 帧契约扩展（已落 19v6-01 §2，2026-10-08 七修）</h2>
+<ul>
+<li><strong>新 kind</strong>：<code>tool_call{name,args}</code> / <code>tool_result{name,output}</code>（字段名已钉，见 19v6-01 §2； <code>args</code> = 模型原始 JSON 字符串，原样透传不重编码）。</li>
+<li><strong>每帧带 <code>agent</code> 字段</strong>：空 = root，含 start/terminal（2026-10-08 用户裁「任何帧都带 agent 是必然」）。 命名取 <code>agent</code> 不取 <code>role</code>——帧 <code>kind</code> 与 runlog 行 <code>role</code> 已是同位语义，再引 role 两义。</li>
+<li><strong>每帧带 <code>model</code> 字段</strong>（2026-10-10 纠偏）：生效 ref（<code>厂商/模型</code>）——契约已补 19v6-01 §2，随 T3-1b 落地； 行侧 <code>model</code> 列随 T3-2（§6 已登记，PG 落库）。</li>
+<li>runlive 帧无 seq：LIST 顺序 = 下标 → frames 响应的 <code>nextOffset</code> 游标；<code>agent</code> 与之并列携带。</li>
+</ul>
+<h2 id="4-sub-agentagenttool-自组装">4. sub agent：AgentTool 自组装</h2>
+<ul>
+<li><p><strong>裁定</strong>：<code>adk.NewAgentTool</code> 每规格一包挂主 agent（tool as agent，Octop「tool 变子代理」同构）； <strong>不采用 <code>adk/prebuilt/deep</code> 整包</strong>——捆绑 write_todos/文件系统/Shell 与自带 prompt 哲学， 工具集按「没有用例逼出的不进契约」由用例逐个逼出。</p></li>
+<li><p><strong>规格形态 = 文件式（2026-10-09 裁）</strong>：<code>yk-tako-eino/agents/</code> 单目录，<strong>md + YAML frontmatter</strong>、 正文 = system prompt；<strong>装载 = run 起手扫盘</strong>（改文件 → 下一条消息生效、run 中途不变；run 内工具集固定、 子代理 runner 不重扫盘）。理由链：每规格一包 AgentTool ⇒ 工具清单 = 规格名单 ⇒ Eino 工具 schema 定稿于装配点 （<code>once.Do</code>、首次 Run 前冻结）⇒ 要新鲜只能重装配 ⇒ 装载点 = 重装配点 = run 起手。 实现取 <code>BeforeAgent</code> 换本次工具列表（T3-1 源码实读 + 真栈落地）；随仓 seed 一条 tako 自写规格。</p></li>
+<li><p><strong>字段表（2026-10-09 裁）</strong>：<code>name</code>（单字段身份 = AgentTool 工具名 = runlog <code>agent</code> 值；文件名不参与语义； 撞名 → 拒该条 + 显式报错）/ <code>description</code>（必填，缺 → 拒该条报错）/ <code>tools</code>（2026-10-09 三态、 2026-10-16 加 <code>exclude_tools</code> 成四态，见下与 <code>doc/26</code> §3）/ <code>model</code>（写值分<strong>三种写法穷举</strong>，不漏不重，实现落 T3-1b，链路与例子见下）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>写法编号</th>
+<th>在 agents/*.md 里怎么写 <code>model:</code></th>
+<th>含义</th>
+<th>行为</th>
+<th>YAML 例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>写法一</td>
+<td><strong>根本不写</strong> <code>model:</code> 这一行</td>
+<td>隐式继承主 worker 的模型</td>
+<td>直接拿主 worker 启动时建好的那个 ChatModel 实例用，不查 ModelRegistry、不新建</td>
+<td>（不写这行）</td>
+</tr>
+<tr>
+<td>写法二</td>
+<td>写了且去前后空格后（大小写不敏感）<strong>正好等于</strong>三者之一：<code>default</code> / <code>inherit</code> / <code>继承</code></td>
+<td>显式声明「用主 worker 的模型」</td>
+<td>与写法一<strong>完全同义</strong>，拿同一个主实例，不进 ModelRegistry、不新建</td>
+<td><code>model: inherit</code></td>
+</tr>
+<tr>
+<td>写法三</td>
+<td>除了写法一、写法二以外的<strong>任何字符串</strong>（排中律：不是前两种就一定是这种）</td>
+<td>明确指定要用哪个模型</td>
+<td>字符串必须是 <code>厂商/模型</code> 格式（与 <code>TAKO_MODEL</code> 完全相同的写法，例：<code>deepseek/deepseek-v4-flash</code>）。调用 <code>ModelRegistry.Get(ctx, ref)</code>（进程内懒加载缓存表，见下）拿到该 ref 对应的 ChatModel 实例：<br>• 缓存里已有 → 直接复用<br>• 缓存里没有 → 走与 <code>TAKO_MODEL</code> 相同的 <code>ResolveModel</code> 链（扫环境变量找 Key → 查厂商目录 → 定 baseURL 和协议 → <code>build</code> 建客户端），建好后塞进缓存，下次再用<br>• 解析失败（没配这家厂商的 Key、厂商不在目录、格式不对缺模型名等）→ <strong>这条规格不装载</strong>，进程启动日志打一行明确报错，其余规格照常装载</td>
+<td><code>model: anthropic/claude-sonnet-4</code></td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>不加展示字段</strong>（emoji/color 等）。<strong>不设信任门</strong>（T3：规格 = 部署态只读产物；运行时写 = 挂账，真做前先裁真源）； 管理面（dashboard/API = 文件操作可视壳：列/读/写/删，装 = 复制、卸 = 删）后置独立小拍。</p></li>
+<li><p><strong><code>model</code> 解析链路（T3-1b 落地；用具体规格走一遍，比抽象箭头易懂）</strong>：</p>
+<p>前置说明（分阶段职责，别混）：</p>
+<ul>
+<li><strong>写规格的人</strong>：在 <code>agents/*.md</code> 的 YAML frontmatter 里写 <code>model:</code></li>
+<li><strong>parse 层（<code>parseAgentSpec</code>）</strong>：只管拆 YAML 语法，把 <code>model:</code> 那一行的字符串<strong>原样拿出来</strong>，<strong>不在这里判断是写法一/二/三</strong>——判断留到装配层做，理由是 parse 只该认语法、不该懂语义</li>
+<li><strong>装配层（BeforeAgent）</strong>：同一个钩子函数里拿刚才原样带出的字符串，按上面三种写法的穷举表<strong>分流</strong>——写法一/二合并走「继承」路，写法三走「查 ModelRegistry」路</li>
+</ul>
+<p>用三条具体规格跑一遍全链路（主 worker 启动时 <code>TAKO_MODEL=deepseek/deepseek-v4-flash</code>，主实例已经建好。下图里 ① 的「什么都没写」<strong>只指 <code>model:</code> 那一行</strong>——<code>researcher.md</code> 自 2026-10-16 起写了 <code>exclude_tools</code> 工具排除名单，<code>model:</code> 仍不写，见 <code>doc/26</code>）：</p></li>
+</ul>
+<pre class="text"><code>┌─ 三条具体规格（agents/*.md） ───────────────────────────────────────────────┐
+│                                                                           │
+│  ① researcher.md  ：什么都没写（写法一·隐式继承）                            │
+│  ② writer.md      ：model: inherit（写法二·显式继承）                       │
+│  ③ code-review.md ：model: anthropic/claude-sonnet-4（写法三·指定 ref）    │
+│                                                                           │
+└───────────────────────────────┬───────────────────────────────────────────┘
+                                │
+                                ▼
+             run 起手扫盘（BeforeAgent → LoadAgentSpecs → parseAgentSpec）
+                                │
+                                ▼
+                   parse 只拆语法：model 字符串原样带出
+                   （不判断是继承还是 ref，判断留到下一步）
+                                │
+                                ▼
+              ┌──────── 装配层分流（同一次 BeforeAgent） ────────┐
+              │                                                 │
+              │  ① researcher.md  → 没写 model 这行            │
+              │  ② writer.md      → &quot;inherit&quot;                  │
+              │        │                                         │
+              │        └──► 走「继承分支」                      │
+              │              直接用主 worker 已有的那个         │
+              │              deepseek/deepseek-v4-flash 实例    │
+              │              （不查 ModelRegistry、不新建）           │
+              │                                                 │
+              │  ③ code-review.md → &quot;anthropic/claude-sonnet-4&quot;│
+              │        │                                         │
+              │        └──► 走「指定模型分支」                  │
+              │              调 ModelRegistry.Get(ctx, ref)     │
+              │              ref = &quot;anthropic/claude-sonnet-4&quot; │
+              │                    │                            │
+              │                    ├─ 缓存命中（之前有别的      │
+              │                    │    规格也写了这个 ref）    │
+              │                    │    └─► 直接拿 map 里的     │
+              │                    │         ChatModel 实例用   │
+              │                    │                            │
+              │                    └─ 缓存未命中（第一次用）   │
+              │                         │                        │
+              │                         └─► 与 TAKO_MODEL       │
+              │                              走完全相同的链：    │
+              │                              ResolveModel +     │
+              │                              build 建客户端     │
+              │                              → 成功：塞进缓存    │
+              │                                         返回    │
+              │                              → 失败：没配 Key / │
+              │                                         厂商不  │
+              │                                         存在等  │
+              │                                         └─► 这  │
+              │                                             条  │
+              │                                             规  │
+              │                                             格  │
+              │                                             不  │
+              │                                             装  │
+              │                                             载  │
+              │                                             +   │
+              │                                             log │
+              │                                             一  │
+              │                                             行  │
+              └─────────────────────────────────────────────────┘
+                                │
+                                ▼
+              每条成功装载的规格 → ChatModelAgent{Model: 它拿到的实例}
+                                │
+                                ▼
+                         包成 AgentTool → 挂进 runCtx.Tools
+                         （本 run 的工具列表就齐了）
+                                │
+                                ▼
+              同时产出一张「agent 名 → 生效 ref」的小表
+              （例：researcher→deepseek/x，code-review→anthropic/s4）
+              写帧、写 runlog 时，按 agent 名查出 ref，填进 `model` 字段
+              （契约见 19v6-01 §2/§3）</code></pre>
+<p><strong>ModelRegistry.Get 到底在做什么？（最小伪代码，30 行以内讲明白）</strong>：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">// ModelRegistry 就是进程内一张带懒加载的缓存表。</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co">// 注意：这是解释性伪代码，不是产品代码。产品代码细节（double-check、锁粒度等）落地时再抠。</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> ModelRegistry <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    mu    sync<span class="op">.</span>RWMutex</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    cache <span class="kw">map</span><span class="op">[</span><span class="dt">string</span><span class="op">]*</span>ChatModel <span class="co">// key = ref，value = 已经建好的 HTTP 客户端</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    env   Env                   <span class="co">// 进程启动时的环境变量快照（Key/BaseURL 都从这里读）</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> <span class="op">(</span>r <span class="op">*</span>ModelRegistry<span class="op">)</span> Get<span class="op">(</span>ctx context<span class="op">.</span>Context<span class="op">,</span> ref <span class="dt">string</span><span class="op">)</span> <span class="op">(*</span>ChatModel<span class="op">,</span> <span class="dt">error</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 1. 先查缓存：之前有人用过这个 ref → 直接返回</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    r<span class="op">.</span>mu<span class="op">.</span>RLock<span class="op">()</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> m<span class="op">,</span> ok <span class="op">:=</span> r<span class="op">.</span>cache<span class="op">[</span>ref<span class="op">];</span> ok <span class="op">{</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>        r<span class="op">.</span>mu<span class="op">.</span>RUnlock<span class="op">()</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> m<span class="op">,</span> <span class="ot">nil</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    r<span class="op">.</span>mu<span class="op">.</span>RUnlock<span class="op">()</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 2. 缓存空 = 第一次用到这个 ref。走与 TAKO_MODEL 完全相同的解析链：</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    <span class="co">//    ResolveModelWithRef(r.env, ref) → 查出厂商、Key、baseURL、协议</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    <span class="co">//    build(ctx, resolved)            → 按协议建对应的 HTTP 客户端（openai / claude）</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>    resolved<span class="op">,</span> err <span class="op">:=</span> ResolveModelWithRef<span class="op">(</span>r<span class="op">.</span>env<span class="op">,</span> ref<span class="op">)</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ot">nil</span><span class="op">,</span> err <span class="co">// 没配这家的 Key / 厂商不在目录 / ref 格式错 → 上层拒载该规格</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>    chatModel<span class="op">,</span> err <span class="op">:=</span> build<span class="op">(</span>ctx<span class="op">,</span> resolved<span class="op">)</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> err <span class="op">!=</span> <span class="ot">nil</span> <span class="op">{</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> <span class="ot">nil</span><span class="op">,</span> err</span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>    <span class="co">// 3. 塞进缓存。下次同样的 ref 就不用再走解析 + 建客户端了。</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>    r<span class="op">.</span>mu<span class="op">.</span>Lock<span class="op">()</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>    <span class="cf">defer</span> r<span class="op">.</span>mu<span class="op">.</span>Unlock<span class="op">()</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>    <span class="cf">if</span> m<span class="op">,</span> ok <span class="op">:=</span> r<span class="op">.</span>cache<span class="op">[</span>ref<span class="op">];</span> ok <span class="op">{</span> <span class="co">// double-check：并发下可能别人刚好塞了</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>        <span class="cf">return</span> m<span class="op">,</span> <span class="ot">nil</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>    r<span class="op">.</span>cache<span class="op">[</span>ref<span class="op">]</span> <span class="op">=</span> <span class="op">&amp;</span>ChatModel<span class="op">{</span>Chat<span class="op">:</span> chatModel<span class="op">,</span> Protocol<span class="op">:</span> resolved<span class="op">.</span>Provider<span class="op">.</span>Protocol<span class="op">,</span> Ref<span class="op">:</span> resolved<span class="op">.</span>Ref<span class="op">}</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a>    <span class="cf">return</span> r<span class="op">.</span>cache<span class="op">[</span>ref<span class="op">],</span> <span class="ot">nil</span></span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>几个<strong>有意这样设计</strong>、不按直觉改的点（别看到进程内就想搬去共享存储）：</p>
+<ul>
+<li><p>「多实例」= 同一张缓存表里可以同时有 deepseek 客户端、claude 客户端、ollama 客户端——只要你在规格里写了不同 ref，第一次用到时就各建各的，互不干扰。</p></li>
+<li><p>「晚解析」= 进程启动时 ModelRegistry.cache 是空的。你写了 20 条子代理规格，但只有 3 个被真正装载用到 → 只建 3 个客户端。剩下 17 个永远不会浪费内存去建。</p></li>
+<li><p><strong>解析链同源</strong>：写法三里那个「ResolveModel + build」和主 worker 启动时 <code>config.Open()</code> 调的是<strong>同两个函数</strong>（只是 <code>ResolveModel</code> 会抽一个通用版 <code>ResolveModelWithRef</code>，主 worker 的 <code>TAKO_MODEL</code> 也是拿这个通用版喂环境变量），保证 <code>TAKO_MODEL=deepseek/x</code> 和 md 里 <code>model: deepseek/x</code> 行为 100% 一致——不会出现「主 worker 能调通、子代理调不通」这种同一个 ref 两种行为的诡异 bug。</p></li>
+<li><p><strong>为什么 ModelRegistry 放「进程内存」，不放 PG/Redis 共享存储？（一张表说清楚判断依据）</strong></p>
+<p>判断原则来自仓库级硬规则 <a href="https://github.com/Ykworm/yk-tako/blob/main/AGENTS.md">AGENTS.md</a>：「凡是要长期存在的状态，先问『多副本下它在哪』」——但不是所有东西都叫「长期状态」。四种东西对比一下：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>东西</th>
+<th>本质是什么</th>
+<th>需要跨副本一致吗？</th>
+<th>放哪里（v6 现状）</th>
+<th>为什么这么放</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>会话「单 run 跑着」的闸</td>
+<td>互斥锁：两副本同时抢同一会话会出两份 run、写乱帧序</td>
+<td>✅ 必须全集群唯一</td>
+<td>PG <code>runs</code> 表部分唯一索引（插入失败本身就是 409）</td>
+<td>共享可变状态 = 必须放共享存储。进程内 <code>chan</code> 或 mutex 一上多副本就废</td>
+</tr>
+<tr>
+<td>runlive 帧流</td>
+<td>生成中帧的实时队列：客户端不管打哪个副本的 frames API 都得看到同一批帧、同一顺序</td>
+<td>✅ 必须全集群同序</td>
+<td>Redis <code>tk:runlive:{runId}</code> LIST（TTL 300s）</td>
+<td>时序队列 = 必须放共享。各副本各写各的，客户端轮询就丢帧乱序了</td>
+</tr>
+<tr>
+<td>runlog 历史行</td>
+<td>会话的定稿历史：用户关了浏览器再开，历史必须还在</td>
+<td>✅ 必须持久、不丢</td>
+<td>PG <code>runlog_entries</code> 表</td>
+<td>持久化数据 = 必须放共享。进程内存里一重启就没了</td>
+</tr>
+<tr>
+<td><strong>ChatModel 客户端实例</strong></td>
+<td>一个无状态的 HTTP 请求发件器：装着 URL + Key + 协议 + 模型 ID，<strong>不记任何对话</strong>，同样的 ref 建 100 个和建 1 个行为字节级一样</td>
+<td>❌ <strong>不需要一致</strong></td>
+<td><strong>进程内存（本进程的 ModelRegistry）</strong></td>
+<td>它是「连接句柄」，不是「数据」：<br>1. 跨进程传不了 HTTP client（里面有连接池、goroutine 私域），物理上就没法塞 Redis<br>2. 多副本各建一份成本可以忽略：扫几十条环境变量（μs 级）+ 分配几个 struct，真金白银的成本是后面几百 ms 的 LLM 请求本身<br>3. 同 ref 解析结果必然一致：所有副本读的同一套环境变量 + 同一套厂商目录，不存在「A 副本解析成功、B 副本解析失败」的可能（除非滚动部署时半更新，那是部署纪律的锅）<br>4. 缓存丢了也没关系：进程一重启、ModelRegistry 空了，下次 <code>Get</code> 再建就行，不丢任何业务数据——缓存只是「省一次解析」，不是真源</td>
+</tr>
+</tbody>
+</table></div>
+<p>总结成一句话：<strong>数据（要持久、要跨副本一致的）放共享存储；连接句柄（用了就扔、重建成本极低的）放进程内。</strong> ChatModel 客户端是连接句柄，不是数据。</p></li>
+<li><p><strong>Model message = 进程内</strong>：AgentTool 每次调用起独立 runner（独立 compose state），跑完即弃， 只有最终文本作为 tool result 回主 run。崩溃即丢，符合「run 死、会话活」语义。</p></li>
+<li><p><strong>runlog 落消息粒度行</strong>：委派 tool_call / 子代理动作行 / 子代理终稿，<code>agent</code> 列非空、<code>model</code> 列 = 该 agent 生效 ref（PG 落库随 T3-2）； 历史组装按 root 过滤（<code>event.AgentName == root</code>——不过滤会把子代理内部 tool 消息混进主历史）。</p></li>
+<li><p><strong>runlive 帧流</strong>：子代理帧与主 agent 帧进同一归一层、同一 LIST，每帧带 <code>agent</code> 与 <code>model</code>（生效 ref）。</p></li>
+<li><p><strong>粒度裁定（2026-10-08）</strong>：runlog 记消息粒度、不记帧——主 agent 的 delta 本就不落历史表， 子代理同构：<strong>delta 帧只进 runlive，不落 runlog</strong>。</p></li>
+<li><p><strong>并行</strong>：同一 run 内多 goroutine 各跑独立 state，帧事件全经主 run 的单一 writer（归一层）落库， seq 串行分配——<strong>并行不改表</strong>，无共享可变状态。</p></li>
+<li><p><strong>嵌套</strong>：默认禁止（子代理规格不挂委派工具，pi 同款）；开放时 max=1 且深度持久化防 resume 绕过 （dsh 默认）——随用例再立。</p></li>
+<li><p><strong>规格的工具面字段（<code>tools</code> 2026-10-09 定为三态；2026-10-16 加 <code>exclude_tools</code> 成四态，<code>doc/26</code>）</strong>： <strong>不写 → 继承父池</strong>（父池已摘掉委派工具 = 禁嵌套；pi/harness 同款）/ <strong>白名单</strong>（按名从父池映射）/ <strong><code>[]</code> 空集</strong>（「不写 vs 写空」用 nil / 空 slice 分开表达）/ <strong><code>exclude_tools: [名字…]</code> → 继承父池减去列出的名字</strong>（新字段，与 <code>tools:</code> <strong>互斥</strong>：同写整条拒载； 排除一个父池没有的名字也拒载；<code>exclude_tools: []</code> 视同不写。结果序是池序、元素是父池同一批对象。 四态表与操作定义只在 <code>doc/26</code> §3 一份，这里不复述）。 「+search」= 保留名 <strong><code>tool_search</code></strong> 显式进列表才挂（用户 2026-10-08 裁「子代理挂 search，当然要」； 2026-10-20 已拍：继承档——不写 / <code>exclude_tools</code>——不自动加，搜索面是能力面，不悄悄多一把工具）—— 搜索范围 = <strong>自己的池</strong>（统一规则见 §5）。分级落地后子代理池同样分 direct/deferred，池内工具不再全声明。</p></li>
+<li><p><strong>预算面（2026-10-09 三裁）</strong>——<strong>取消是控制面的事（abort 级联），不是时间面的事</strong>（用户裁，并指 Google ADK 同立场）：</p>
+<ul>
+<li><strong>并发</strong>：上限 = <strong>配置项（默认 8）</strong>（选择归 human 写配置、代码只做机械件）；pi 为硬编码常量（单批 8 / 同时 4），tako 无「单批」概念，只设「同时」一个旋钮。</li>
+<li><strong>超时</strong>：<strong>不设总时限</strong>、不另立计时器；要掐走将来的「取消」面（abort 级联；与 T1 遗留「abandon 不断流」是同一个待做面）。pi 实读（2026-10-09）：两套子代理实现均无计时器，唯一 kill 路径都是 abort 传播；时间上限只加在有界操作上（per-request / 单条命令）。</li>
+<li><strong>回传裁剪</strong>：终稿回传超 <strong>50 KB 字节</strong>即截（UTF-8 安全 + omitted 提示，照 pi）；全量在子代理自己的 runlog 行（tako 无 pi 的 tool details 通道）。</li>
+</ul></li>
+<li><p><strong>T3 落地实施口径（2026-10-11 落地；验收脚本 = 19v6-04 用例 7）</strong>：</p>
+<ul>
+<li><strong>子代理终稿行（runlog assistant 行）</strong>= 该 agent <strong>全部轮次正文累计</strong>（工具轮前导语 + 末轮正文）——遇它无 <code>tool_calls</code> 的末轮落一行（agent=名、model=其生效 ref）并清空暂存（同 agent 二次委派不串轮）；root 终稿 = Σ root turn 正文（收口锚不变）。</li>
+<li><strong>回传给父 run 的文本</strong> = AgentTool 的返回值 = 子代理<strong>末轮消息正文</strong>（多轮时为其末段：不含工具轮前导语）；<strong>先裁后落</strong>——mh tool 行 / runlog 委派 <code>tool_result</code> 行 / 帧侧 <code>tool_result.output</code> 三处是同一份<strong>已裁剪文本</strong>（逐字节相等）；全量只在子代理终稿行。</li>
+<li><strong>截断尾缀原文</strong>（delegationTool，代码 <code>agents.go</code>；照 pi）： <code>[Output truncated: %d bytes omitted. Full output preserved in subagent runlog.]</code>，N = 总字节 − 保留字节； 截点回退到 UTF-8 rune 边界（绝不劈开多字节字符，保留段最多比上限少 3 字节）；<code>cap ≤ 0</code> = 不裁剪。 尾缀里的「subagent runlog」= 同一 log 端点上该 agent 的行（无新端点；客户端按行内 <code>agent</code> 字段跳转）。</li>
+<li><strong>两个旋钮（main 旗标；选择归 human 写配置）</strong>：<code>-subagent-concurrency</code>（默认 8；进程级信号量、全部规格共享；&lt;1 = 启动即拒——0 = 所有委派永久等闸）+ <code>-subagent-return-cap</code>（默认 51200 B）；启动日志 <code>subagents: concurrency N, return cap M B</code>。</li>
+<li><strong>随仓 seed 规格</strong> <code>yk-tako-eino/agents/researcher.md</code>（开箱可跑 + 格式参照）：不写 <code>model</code> = 继承主实例那一档的活样例。<code>tools</code> 那一档自 2026-10-16 起改写成 <code>exclude_tools</code> 排除名单（<code>doc/26</code>：排除 <code>bash</code> 与写类四把，有效名单 11 项），不再是「什么都不写」的样例——<strong>「两行都不写 = 整份继承父池」这一档今天没有出厂规格在用</strong>，它仍是合法写法（<code>resolveToolPool</code> 第一态），但 <code>agents_test.go</code> 的 <code>TestShippedAgentSpecToolGuards</code> 要求出厂规格写 <code>tools:</code> / <code>exclude_tools:</code> 之一，有意继承要在测试的 <code>inheritOK</code> 里显式表态。</li>
+</ul></li>
+<li><p>挂账：continuable/后台子代理（dsh send_message/jobs）、出进程 provider（acp/codex/claude-code）、 <strong>子代理目录的运行时安装</strong>（Octop catalog/install）、<strong>子代理运行中途改自己的工具集</strong> （Eino <code>BeforeAgent</code> 可改、用例未逼出）——后两条 2026-10-08 用户裁「先别搞，记下来」。</p></li>
+</ul>
+<h2 id="5-工具目录与-tool_search">5. 工具目录与 tool_search</h2>
+<ul>
+<li><strong>施工状态（2026-10-09 裁触发式；2026-10-20 开工并当日落地）</strong>：原裁「等 MCP 工具 loop 进来（工具多到 撑上下文）或子代理库长到几十条再动工」；MCP client（doc/33）已落地、工具规模信号成立，用户 2026-10-20 裁「<strong>一步到位把 T5 也做了</strong>」——T4（分级 + tool_search）与 T5（BM25 排序）<strong>同批施工</strong>， <strong>BM25 是首版排序器，不先做名称/描述直出再替换</strong>。分离原则不变： 「<strong>可执行集合 ⊇ 声明集合 ⊇ 可检索集合</strong>」；T3 期「一个源、一个装载点、一个声明状态（全声明）」到此让位给分级。 施工与验收结论见本节尾条。</li>
+<li><strong>分级 = 启用工具全注册 + 声明过滤</strong>：装配时决定放不放进池——<strong>不放 = 禁用</strong>，不进 tools node， 既不可执行也不可检索；放进池的工具全部注册进 tools node。每轮模型调用前， <code>BeforeModelRewriteState</code> 用本 run 保存的<strong>完整目录</strong>重建 <code>state.ToolInfos</code> 决定模型看见什么—— <strong>direct</strong> = 常声明 / <strong>deferred</strong> = 目录层，整条 ToolInfo（名字、描述、参数 schema）都不进声明面， <code>tool_search</code> 激活后才声明。不能对当前 <code>state.ToolInfos</code> 做减法： 首轮过滤后 deferred 项已不在其中，减法的源会丢；完整目录必须另存（run-local）。 <strong>不设 hidden 档（2026-10-20 裁）</strong>：tako 的池每 run 重建，禁用就是装配时不 append，不存在 pi 「注册表撤不掉、只能重注册成 hidden」的问题。把 hidden 定义成「永不声明」也不成立——工具仍在 node 里，而 Eino tools node 按全量工具表按名分发（名字不在节点才报 <code>tool X not found</code>，v0.9.21 <code>compose/tool_node.go</code> 实读），执行面并没有关，模型猜中名字仍可能调起。今日没有「只给代码调、 不给模型调」的消费者（三条来源都在装配时不放；子代理池从入口快照按名收窄、只减不增，§4）， 所以不留这一档；将来真出现该需求，按新需求重新立档并同时设执行闸。</li>
+<li><strong>tool_search（T4/T5 合批，2026-10-20 用户裁）</strong>：模型检索目录、BM25 排序、命中即激活（<strong>同一 run</strong> 的 下一次模型调用即声明）。首版就是 pi 的 Go 移植——camelCase 分词 + 朴素词干 + 停用词；Okapi BM25 （k1=1.2、b=0.75）；文档 = 名字 + 下划线拆词 + 描述 + 参数 schema 的描述与属性名（MCP 工具再加 server 短名）；<code>query</code> 必填、<code>limit</code> 缺省 8、空 query / 非正整数 limit 当场报错；无命中回 <code>No matching tools found.</code>。<strong>直出版不落地</strong>。</li>
+<li><strong>mh 与激活集分家（2026-10-20 定）</strong>：mh 只记 tool_search 的 assistant 调用行与 tool 结果文本 （<code>Loaded N tools...</code>），<strong>不记工具 schema、不记「已激活」</strong>。激活集是 run 状态；每轮模型看见哪些工具 由 <code>BeforeModelRewriteState</code> 用完整目录按「direct + 激活集」<strong>重建</strong> <code>state.ToolInfos</code> 决定， 同一 run 内由 run-local 状态延续。新 run 读回 的历史里只有那句结果文本，没有声明——<strong>「记录了」不等于「模型这一轮看得见」</strong>。</li>
+<li><strong>激活集寿命（2026-10-20 已拍：只活一场 run）</strong>：新 run 从零激活（tool_search 本身是 direct，模型可重检）； 崩溃续跑同一场 run 时同样从零激活（doc/30 账本不存激活集），模型凭历史里上次的回执与调用参数重检。 回执固定写 <code>Loaded N tools for this run...</code>——不照抄 pi 的 <code>available from your next call</code>（跨 run 读回 历史时会变成半句假话）。若产品将来要「加载过就一直可用」，必须把激活集结构化持久化（多副本不能靠 进程内状态），从 mh 文本重放会被折叠折走、不可靠——那是另立方案。</li>
+<li><strong>首版分级来源（2026-10-20 已拍：按来源的机械规则）</strong>：<code>mcp__</code> 前缀 = deferred（工具规模增长源）； 一手工具 + 子代理 = direct。不新增配置面；单个 MCP 工具若将来要固定 direct，再加 server 级覆盖。</li>
+<li><strong>落地与验收（2026-10-20）</strong>：A1 <code>ad1ab6b</code>（<code>toolsearch.go</code>：分词/BM25/<code>tool_search</code>/run-local box， worker 每 run 挂载）；A2 <code>a190f4d</code>（子代理保留名不进池、只有显式 <code>tools:</code> 才挂自己的 handler， 租户 <code>checkSubagentBounds</code> 预检给保留名开例外）。A3 纯验收：同会话第二场 run <code>declared=21 active=[]</code>、 崩溃续跑同样从零激活（账本无 schema），回执「for this run」与真实寿命一致。A4 回归： 单测补 schema 文本入文档、同分稳定序与 limit 截断、缺省 8 与越界报错、已激活不重复返回； 活体重跑 A1（<code>catalog=35 deferred=14</code>，<code>declared</code> 21→29）、A2 正/负路径（子代理 <code>catalog=2</code>、 继承档名单无 <code>tool_search</code>）、无 mcp.json（<code>catalog=19 deferred=0</code>，<code>tool_search</code> 回 <code>No matching tools found.</code>）；<code>server.go</code>/<code>types.go</code>/<code>redisstore.go</code> 自 <code>ad60e49</code> 到 <code>a190f4d</code> 零 diff，四个 API 字节不变。</li>
+<li><strong>红线</strong>（pi/dsh 同款收敛）：模型只能<strong>装配目录内工具</strong>，不能改 harness 本身。</li>
+<li><strong>统一搜索规则（2026-10-08）</strong>：任何 agent（主或子）的 tool_search 只搜<strong>自己 tools node 里注册的 deferred 项</strong>——搜索范围 = 可执行范围的子集，越界激活物理上不存在；主 agent 的 node 不含子代理 专属工具，互相不可见。一条规则覆盖主从（子代理挂 search 见 §4 规格字段）。</li>
+<li>Eino 原生 <code>WithDeferredTools</code> + <code>WithToolSearchTool</code>（provider 托管的 hosted mode）—— <strong>支持度已查证（2026-10-08，矩阵与机制见 19v6-06 §4–5）</strong>：eino-ext claude 组件 ✅ / openai 组件 ❌； Anthropic·OpenAI·DeepSeek·Kimi 各形态 ✅，Gemini/Qwen/豆包/GLM ❌。 <strong>2026-10-21 用户裁定：client 过滤（本条）为终态底座，hosted mode 不接</strong>（理由三条见 <code>19v6-06</code> §6： 覆盖面对不上 / 缓存损失有界 / 对 provider 零要求）。<code>19v6-06</code> 降为纯背景篇，不作施工面、不进待办。</li>
+</ul>
+<h2 id="6-表新增汇总">6. 表新增汇总</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>表</th>
+<th>新增</th>
+<th>落地拍</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>run_model_messages</code></td>
+<td><code>tool_calls</code> TEXT、<code>tool_call_id</code> TEXT</td>
+<td>T2 ✅</td>
+<td>OpenAI assistant/tool 形状；§8.2 已预告</td>
+</tr>
+<tr>
+<td><code>runlog_entries</code></td>
+<td><code>agent</code> TEXT（空=root）、<code>payload</code> TEXT（JSON）</td>
+<td>T2 ✅（两列，2026-10-08）/ T3（agent 非空）</td>
+<td>payload 单列 TEXT：结构化字段种类差异大、稀疏列展不开 tool_calls 数组；「零 JSONB」原裁针对消息表（§8.6 收口）</td>
+</tr>
+<tr>
+<td><code>runlog_entries</code></td>
+<td><code>model</code> TEXT（空 = 非模型产物）</td>
+<td>T3-2（2026-10-10 登记）</td>
+<td>与帧同义的生效 ref（<code>厂商/模型</code>）：<code>user</code> 行空 / root 行 = 主 ref / 子代理行 = 该规格生效 ref——md 改 <code>model</code> 的持久验证面（帧是 TTL 的实时视图，本列是永久真源）</td>
+</tr>
+<tr>
+<td><code>sessions</code> / <code>runs</code></td>
+<td>不动</td>
+<td>—</td>
+<td>fork 的 <code>forked_from</code> 列随 T2 树状会话 loop 再加（§7）</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="7-挂账本-loop-不做">7. 挂账（本 loop 不做）</h2>
+<ul>
+<li><strong>fork（pi 会话树）</strong>：用户裁「后面再做」（2026-10-08）。策略已备 = <strong>copy-on-write</strong>：新 session 物化源分支投影视图（只带已完成 run 边界，runs 表的 complete 闸天然切点）； 真树（parent 链共享历史）撞「worker 热读单表无 JOIN」已裁约束，不取。</li>
+<li><strong>guard middleware</strong>（allow/deny per agent、拒绝归一为 isError 结果、HITL ask 走 interrupt）： 本 loop 只在 Handler 链留口，独立小拍。</li>
+<li><strong>「压 run 中间」</strong>（C 系列 10.3-3 遗留）：run 内多段调用落地后回 C 系列议。</li>
+<li><del>Eino 原生 deferred tools 的 provider 支持度查证</del> <strong>已查证（2026-10-08）</strong>， 矩阵与机制见 <code>19v6-06</code> §4–5；默认底座维持 client 过滤。</li>
+</ul>
+<h2 id="8-与既有篇的关系">8. 与既有篇的关系</h2>
+<ul>
+<li><strong>19v6-01</strong>：四个端点字节真源。本篇 §3 的帧扩展在 T2 同拍修订它（先改 doc 再动码）。</li>
+<li><strong>19v6-03</strong>：存储形态真源。本篇 §6 的表新增是它的增量。</li>
+<li><strong>index 注意事项全部继续适用</strong>：纯拉模型、拉取有界、闸在共享存储、runlog 只增不删—— tool loop 不引入任何例外。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/19-v6/19v6-05-tool-loop.md"><code>doc/19-v6/19v6-05-tool-loop.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

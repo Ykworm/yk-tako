@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>23 · coder 规格 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="23--coder-规格">23 · coder 规格</h1>
+<blockquote>
+<p>性质：讨论稿，未定案。2026-10-12。</p>
+<p>点头之前不写 <code>tmp/</code> 台账、不改代码。本篇不加端点、不加帧 kind、不加表。</p>
+<p>定案前不改 <code>doc/16</code> 的索引。</p>
+<p><strong>前提修订（2026-10-15）</strong>：§1「<code>researcher.md</code> 写上不含 <code>bash</code> 的白名单之后」与 §6 同款表述，前提已作废——doc/17 §3.1 于 2026-10-12 用户拍定 researcher 不写名单、纯继承父池，bash 进池后 researcher 也会拿到命令执行。本篇产物（§2 全文、§3 白名单、§6 验收）不受影响：coder 的隔离价值改为两条——显式白名单挡掉 <code>search_history</code>（纯继承的 researcher 挡不住这条），description 把批量代码活与调研分工钉开。原文保留备查。</p>
+<p><strong>再修订（2026-10-16，<code>doc/26</code>）</strong>：researcher 重新没有 <code>bash</code>，也没有写类四把——形状不是白名单而是新加的第四态 <code>exclude_tools</code>（继承父池减去列出的名字），有效名单 = <code>get_time</code> + 读类文件工具 + <code>memory</code> + <code>search_history</code> + <code>web_search</code>。§1 的分工论证因此恢复成立，且比原文更强：原文说 researcher「能 <code>write_file</code> 写出 <code>agg.py</code>，跑不了」，现在它连 <code>agg.py</code> 都写不出来——「自己的上下文里能跑命令、交回主线程的只有路径和结论」这个角色只剩 coder 担。上面那条「隔离价值改为两条」收回一半：白名单挡掉 <code>search_history</code> 仍是 coder 独有的（researcher 有它），但「researcher 挡不住 bash」不再是 coder 立项的理由。本篇 §2 全文、§3 名单、§6 验收仍不受影响，<code>coder.md</code> 一个字没改。</p>
+<p><strong>再再修订（2026-10-18，<code>doc/26</code> 头注）</strong>：写类四把归还 researcher（排除清单只剩 <code>- bash</code>）——上一段「连 <code>agg.py</code> 都写不出来」「没有写类四把」随之过期，分工论证回到 §1 原文的强度：researcher 能写出 <code>agg.py</code> 但<strong>跑不了</strong>，「能跑命令的帮手」仍然只有 coder。<code>coder.md</code> 依旧一个字不改。</p>
+<p><code>doc/17</code> 第 3.1 节把 <code>agents/coder.md</code> 写成 bash 之后的新文件，并给过一份名单。本篇取代那份。施工仍排在 bash 已经进父池之后。</p>
+<p><strong>再修订（2026-11-05，终稿要求）</strong>：§2 的 <code>description</code> 与「终稿只写路径和结论」那一条已被改写。原句把终稿压成「路径 + 一句结论」，父代理收不到「改了什么、怎么验的、还剩什么」。今天的正文（<code>yk-tako-eino/agents/coder.md</code>）要求终稿自足四项：改了什么与为什么、动过每个文件的路径、怎么验证的（跑了哪条命令、结果是什么）、还剩什么或值得跟进；<code>description</code> 同步写明父代理只收这份交接，让主代理在派活前就知道能拿回什么。这是提示词层的改动，无程序侧抽取、无信封，§2 代码块保留 2026-10-15 原文备查。零 Go 改动。</p>
+<p><strong>施工状态（2026-10-15）：已落地</strong>。§2 全文逐字落盘（<code>yk-tako-eino/agents/coder.md</code>，tools 照 §3）+ §6 剧本一、剧本二活体全过（台账 <code>tmp/23-coder规格/</code>）：frames 出 <code>agent=coder</code> 的 write_file/bash、终稿只交路径与结论、无 search_history/web_search；笔记面——<code>agent system coder:</code> 行含 <code>output/agg.txt</code>、write_file 参数即该路径、无第二条结果文件。零 Go 改动（仅 filetools_test 的注册表断言随 bash 进池增补一行）。</p>
+</blockquote>
+<h2 id="1-要解决的那一次委派">1. 要解决的那一次委派</h2>
+<p>用户把 workspace 里 40 个日志交给 tako：聚合成出现最多的 10 种错误，脚本留在 workspace，回复里给路径和前 10 名。</p>
+<p>bash 进父池、并且 <code>researcher.md</code> 写上不含 <code>bash</code> 的白名单之后，这条链是断的。主代理自己拿得到 <code>bash</code>。它若把 40 个文件读进主线程再跑，日志正文留在主线程的 <code>tool_result</code> 里，后面每一轮都还在主上下文里。<code>researcher</code> 拿不到 <code>bash</code>。它能 <code>write_file</code> 写出 <code>agg.py</code>，跑不了。终稿里只能写「脚本已写好、没执行」。没有第三个角色同时满足两件事：自己的上下文里能跑命令，交回主线程的只有路径和结论。</p>
+<p><code>coder</code> 就是这个角色。它是 <code>agents/coder.md</code> 装出来的子代理，主线程把它当一个工具来调。工具名是 frontmatter 的 <code>name</code>，也就是 <code>coder</code>。主线程收到的是终稿，超过 50 KB 仍按现有委派上限截断。40 个日志的正文留在它自己的消息里。</p>
+<p>链路：</p>
+<pre><code>用户要求聚合 40 个日志
+  → 主代理调用 coder（任务文字只描述要什么，不把 40 份正文抄进参数）
+  → coder 用 list_directory / search_files 找到日志
+  → write_file 写下 agg.py
+  → bash 在 workspace 根执行
+  → 终稿只写脚本路径、结果路径、前 10 名
+  → 主线程的 tool_result 是这份终稿</code></pre>
+<p>本篇插在「主代理决定委派给谁」这一环。上游是用户的这条消息。下游是主线程拿到终稿。中间缺的是一个拿得到 <code>bash</code>、并且被正文约束成「不要把过程交回来」的子代理。</p>
+<h2 id="2-文件">2. 文件</h2>
+<p>只新增 <code>yk-tako-eino/agents/coder.md</code>。装载代码不改。今天 <code>BeforeAgent</code> 每场 run 起手扫 <code>agents/*.md</code>，按文件名排序。<code>coder.md</code> 和 <code>researcher.md</code> 各装一条。<code>name</code> 撞车时，文件名排序在后的那份拒载，所以 <code>name</code> 用 <code>coder</code>，不复用 <code>researcher</code>。</p>
+<p><code>model</code> 这一行不写。缺席等于继承主模型，和 <code>researcher.md</code> 今天一样。不给 coder 单独配一家模型。</p>
+<p><code>tools</code> 必须写。这一行缺席是空指针，子代理拿到父池的一份拷贝。父池里现在有 <code>search_history</code> 的真查询。<code>doc/21</code> 第 3.4 节的拒绝壳还没落地（台账 H3 未做），壳又写在「整池拷贝」那条路上。白名单按名字从父池把工具对象挑出来，挑到的是同一个对象。名单里一旦写上 <code>search_history</code>，coder 就能读主会话已经折掉的全文，再写进终稿，主线程的隔离就破了。所以这份规格不能靠继承，也不能把这个名字写进去。</p>
+<p>全文如下。点头后按这版落盘，不在施工时再改措辞。</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode markdown"><code class="sourceCode markdown"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="an">name:</span><span class="co"> coder</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="an">description:</span><span class="co"> 把一段要在 workspace 里改文件、写脚本、跑命令才能完成的活整包交给它。给一段任务描述，它在自己的上下文里做完，最后带回路径和结论。主线程只收这份终稿。适合批量处理、生成物、要跑一遍才知道结果的任务。查资料、写报告不要交给它。</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="co">---</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>你是 tako 的子代理「coder」：接受一段要在 workspace 里动手的任务，独立做完，回传一份终稿。</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>工作方式：</span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>批量活先写成脚本，再用 bash 跑。不要把几十个文件逐个读进上下文里数。</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>脚本和结果用 write_file 或 edit_file 写进 workspace。不要用 bash 的 heredoc 或 python 在命令字符串里直接写文件。</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>终稿只写路径和结论。主线程的上下文里只会出现这份终稿，不会出现你的命令输出和文件正文。命令输出很长时，把要留下的内容写进文件，终稿里给路径。</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>系统提示末尾的笔记是已经生效的规矩。那里写了只改某个文件、不要新建，就去改那个文件。</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>手里没有联网检索，也不能查本会话更早的历史原文。任务需要外部事实或更早一轮的原句、而终稿里写不清时，写明「未能查证」或「原文不在本轮」，不要编。</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>边界：只做委派任务本身。命令在 workspace 根下执行。超时、输出被截断，都照实写进终稿，不要把截断说成已经跑完。</span></code></pre></div>
+<p><code>description</code> 是主代理决定委不委派的那一段。它写明「查资料、写报告不要交给它」，把 <code>researcher</code> 的活留在 <code>researcher</code>。本篇不改 <code>researcher.md</code> 的 description，也不改它的正文。</p>
+<h2 id="3-白名单">3. 白名单</h2>
+<p>名字按父池里工具声明的 <code>Name</code> 写，不是文件名。顺序不参与装载。有一个名字父池里没有，整条规格拒载，日志一行，这场 run 照常跑，只是没有 <code>coder</code> 这个工具。<code>researcher</code> 不受影响。</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">tools</span><span class="kw">:</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> write_file</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> read_text_file</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> edit_file</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> list_directory</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> search_files</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> memory</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> bash</span></span></code></pre></div>
+<p>这份名单相对 <code>doc/17</code> 第 3.1 节那份，改了两处：读工具用 <code>read_text_file</code>，不加 <code>read_file</code>；加上 <code>memory</code>。</p>
+<p><code>read_file</code> 和 <code>read_text_file</code> 是同一个函数的两个名字，参数和行为相同，超过 200 KB 且不带 <code>head</code> 或 <code>tail</code> 都会拒绝。两把都挂上，模型会各试一次，多一轮往返，读到的是同一份正文。名单只留标准名 <code>read_text_file</code>。<code>read_file</code> 仍在父池里，主代理和将来写了它的规格还能用。</p>
+<p><code>memory</code> 不决定它看不看得到笔记。装载时系统提示已经是「规格正文 + 空行 + 起手快照」，和工具名单无关。名单里没有 <code>memory</code>，coder 仍然读得到「deck 只改这个文件、不要新建」。它写不回新规矩：这一场发现该记的一句，终稿里可以写，<code>notes</code> 表没有新行，下一场两边的快照里没有。<code>doc/17</code> 第 7.1 节说新规格的白名单要写上 <code>memory</code> 才看得见，看得见的是这把工具。本篇把它放进名单。</p>
+<p>每一把在那次聚合里干什么：</p>
+<ul>
+<li><code>list_directory</code>、<code>search_files</code>：找出 40 个日志在哪。不给这两把，coder 只能 <code>bash ls</code>。<code>bash</code> 的单路输出上限把大目录截断之后，后半个目录它看不见，聚合会缺文件。</li>
+<li><code>read_text_file</code>：改已经存在的脚本或结果文件之前先看见原文。不读就 <code>edit_file</code>，<code>old_text</code> 对不上，工具返回错误。</li>
+<li><code>write_file</code>：把 <code>agg.py</code> 和结果文件写进 workspace。用 <code>bash</code> 的 heredoc 或 <code>python -c</code> 在脚本里 <code>open</code> 出来的路径，折叠时的 command 扫描看不见。扫不到的路径不会出现在摘要末尾那段程序拼上去的路径清单里，下一场模型会以为文件不存在、再写一份。<code>write_file</code> 的 <code>file_effect</code> 是 <code>write</code>，路径会进这段清单。</li>
+<li><code>edit_file</code>：笔记要求只改已有文件时，换其中一段，而不是整文件覆盖。覆盖同一路径不算「新建」，但没读全的后半段会丢。</li>
+<li><code>bash</code>：跑 <code>python3 agg.py</code>。没有它，规格就退回「写得出、跑不了」。</li>
+<li><code>memory</code>：上一节说的写回。</li>
+</ul>
+<p>明确不放的，以及放进去会怎样：</p>
+<ul>
+<li><code>search_history</code>：不放。理由在第 2 节。缺的原文让它写进终稿，主代理自己查。</li>
+<li><code>web_search</code>：不放。<code>doc/22</code> 要求 coder 没有搜索。父池以后加上这个名字，白名单不写就拿不到。需要公开网页的活交给 <code>researcher</code>。</li>
+<li><code>get_time</code>、<code>move_file</code>、<code>create_directory</code>、<code>directory_tree</code>、<code>get_file_info</code>、<code>read_media_file</code>、<code>read_file</code>：不放。建目录、改名可以用 <code>bash</code>，而且 <code>mkdir</code>、<code>mv</code> 在 command 扫描的写命令表里，路径仍能钉上。读图、看目录树不是这次聚合要的动作。多一把，模型就多一条可以试的旁路。</li>
+</ul>
+<p><code>bash</code> 还不在父池时，这份文件一装上去就会因未知名 <code>bash</code> 整条拒载。所以本篇不和 bash 那一拍绑在同一次改动里验收。bash 那一拍负责把工具放进父池，并给 <code>researcher</code> 写上没有 <code>bash</code> 的白名单。本篇只在那之后加这一个文件。</p>
+<h2 id="4-和已经落地的几处怎么接">4. 和已经落地的几处怎么接</h2>
+<p>快照。不新写读法。<code>coder</code> 和 <code>researcher</code> 共用装载时读到的那一份。同一场里 coder 调用 <code>memory</code> 写下的新行，主代理这场的快照看不见，下一场才进入两边。这是笔记层已经定下的时点，本篇不改。</p>
+<p>委派上限。终稿超过 50 KB 仍截断。正文要求只交路径和结论，就是为了终稿本身不要顶到这道上限。上限的数字本篇不动。</p>
+<p>子代理自己的窗口。连着读、连着跑，正文堆在 coder 自己的消息里，终稿还没交出来窗口也可能满。那是 <code>doc/17</code> 第 6 节的事。本篇不给子代理挂折叠。<code>bash</code> 单路输出有上限，一次调用的结果有界；很多轮叠在一起仍会满。正文让它把长输出写进文件，是在折叠落地之前少往窗口里堆，不是折叠的替代。</p>
+<p>四个 API 的路径和字节不变。调用走现有的 <code>tool_call</code> / <code>tool_result</code>。子代理内部那几轮的帧带 <code>agent=coder</code>，和今天 <code>researcher</code> 的帧一样。</p>
+<h2 id="5-本篇不做">5. 本篇不做</h2>
+<p>不改 <code>researcher.md</code>。不改父池的装配顺序。不实现 <code>bash</code>，不实现手动停止，不实现 <code>web_search</code>，不实现子代理折叠。</p>
+<p>不写危险命令规则表，不补符号链接逃出 workspace，不禁止 <code>bash</code> 访问网络。这三件 <code>doc/17</code> 第 3 节已经登记在 bash 那一拍之外。</p>
+<p>不新增第二种回传格式。主线程看见的仍是一段终稿文本。</p>
+<p>不把 <code>coder</code> 设成默认承接一切多步任务的角色。<code>description</code> 把调研留在 <code>researcher</code>。主代理把聚合脚本委派给 <code>researcher</code> 时，<code>researcher</code> 没有 <code>bash</code>，终稿会写做不了。验收不靠模型自己猜该找谁，任务文字写明 <code>coder</code>。</p>
+<h2 id="6-验收">6. 验收</h2>
+<p>引擎按现有方式启动。先 <code>lsof</code> 看端口，被占就换，不杀别人的进程。Redis 与 PostgreSQL 用开发库现端口。这一拍开始时，父池里已经有 <code>bash</code>，<code>researcher.md</code> 的白名单里没有 <code>bash</code>。</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-sS</span> <span class="at">-X</span> POST localhost:<span class="op">&lt;</span>port<span class="op">&gt;</span>/api/runs <span class="dt">\</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;content-type: application/json&#39;</span> <span class="dt">\</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;messageId&quot;:&quot;m_coder&quot;,&quot;text&quot;:&quot;请委派 coder 完成这件事，不要自己做：在 workspace 里用 write_file 写 agg.py，内容是 print(424242)。然后用 bash 执行 python3 agg.py。终稿只写脚本路径和输出里的数字。&quot;}&#39;</span></span></code></pre></div>
+<p>frames 里有主线程的 <code>tool_call</code>，<code>name</code> 为 <code>coder</code>。随后有 <code>agent</code> 为 <code>coder</code> 的帧：一条 <code>name</code> 为 <code>write_file</code>，一条 <code>name</code> 为 <code>bash</code>。<code>bash</code> 那条 <code>tool_result</code> 含 <code>424242</code> 和退出码 0。主线程 <code>name=coder</code> 的 <code>tool_result</code> 含 <code>agg.py</code> 和 <code>424242</code>，并且不是 <code>agg.py</code> 的源码全文。<code>terminal</code> 的 <code>status</code> 是 <code>complete</code>。同一场 frames 里，<code>agent</code> 为 <code>coder</code> 的工具名里没有 <code>search_history</code>，也没有 <code>web_search</code>。</p>
+<p>笔记面。先在一场 run 里用 <code>memory</code> 记下「结果只写到 output/agg.txt，不要新建别的结果文件」，<code>quote</code> 用用户原句。下一场任务文字不出现这条路径，并写明委派 <code>coder</code> 去跑上一场留下的 <code>agg.py</code>，把数字写进笔记指定的那个文件。引擎日志 <code>agent system coder:</code> 那一行含 <code>output/agg.txt</code>。<code>agent</code> 为 <code>coder</code> 的 <code>write_file</code> 或 <code>edit_file</code>，参数里的路径是 <code>output/agg.txt</code>。没有另一条结果文件的 <code>write_file</code>。</p>
+<p>四端点的路径和字段面与这一拍之前同形。<code>go test ./internal/runengine/ -count=1</code> 全绿。本篇不改 Go，这组测试是为了证明没有旁路改动。</p>
+<p><code>bash</code> 未进父池时的拒载，不另开活体。<code>resolveToolPool</code> 对未知名已经有测试。本篇的文件在那个前提下会整条拒载，日志含 <code>bash</code>。</p>
+<h2 id="7-所以这解决了什么">7. 所以这解决了什么</h2>
+<p>40 个日志的聚合有一个子代理能写脚本、能执行、并把路径和结论交回主线程。日志正文和命令的长输出留在这个子代理的消息里。<code>researcher</code> 仍然没有 <code>bash</code>。coder 读得到笔记快照，也能把新规矩写回去。它查不到本会话更早的历史原文，也没有联网检索。</p>
+<p><code>doc/17</code> 第 3.1 节原来的名单是 <code>write_file</code>、<code>edit_file</code>、<code>read_file</code>、<code>list_directory</code>、<code>search_files</code>、<code>bash</code>。本篇改成第 3 节这份。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/23-coder%E8%A7%84%E6%A0%BC.md"><code>doc/23-coder规格.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

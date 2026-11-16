@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Web UI 流式枢纽 Implementation Plan · tako 文档</title>
+<link rel="stylesheet" href="../../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../../assets/tako-architecture.html">架构总览</a><a href="../../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="web-ui-流式枢纽-implementation-plan">Web UI 流式枢纽 Implementation Plan</h1>
+<blockquote>
+<p><strong>For agentic workers:</strong> 按本计划逐任务实现。步骤用 checkbox（<code>- [x]</code>）跟踪。 定案：<code>docs/superpowers/specs/2026-09-28-webui-stream-hub-design.md</code>（v3）。本计划不重新打开已拍板项。</p>
+</blockquote>
+<p><strong>Goal:</strong> 把 Web UI 从「连接即 run」改成「会话拥有 run、日志承接事件、连接只是读者」：事件先落 SQLite，按 <code>(run, from)</code> 续传，断线不取消 run，停止走 <code>POST /api/stop</code>。</p>
+<p><strong>Architecture:</strong> <code>adkrun.Event</code> 只补工具参数，序号在 Web 落盘时分配。<code>internal/webui</code> 持有 SQLite（<code>event_log</code> + <code>run_archive</code>）。T1 仍用请求上下文跑一轮，但事件先写库，开跑先写 <code>start</code>，退出写唯一终局并与 <code>is_completed</code> 同一事务。T2 用轮询换掉请求私有通道，并给出 <code>GET /api/chat/stream</code>。T3 把 run 的上下文从请求上摘下来，<code>liveRun</code> 做 409 与停止。REPL 不打开这个库。</p>
+<p><strong>Tech Stack:</strong> Go 1.25、标准库 <code>database/sql</code> + <code>net/http</code>、<code>modernc.org/sqlite</code>（纯 Go，无 cgo）、eino v0.9.21。上游：设计稿 v3 第 3–8 节。</p>
+<p><strong>执行说明：</strong></p>
+<ol type="1">
+<li>不新建 worktree。提交沿用仓库习惯：中文短句、不加 <code>feat:</code> 前缀，一个任务一笔。用户没点名要求提交时，代码先留在工作区。</li>
+<li>注释按 <code>AGENTS.md</code>：中文，文件头与函数头齐全；行为变了，注释一起改。</li>
+<li>范围以设计稿第 1 节为准：不做鉴权、WS、token delta、steer、保留策略、重启后恢复模型上下文、审批空闲超时。</li>
+<li>验收命令在 <code>yk-tako-eino/</code>：<code>gofmt -l .</code> 为空，<code>go test -race ./...</code> 全绿。</li>
+</ol>
+<hr />
+<h2 id="file-structure">File Structure</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文件</th>
+<th>动作</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yk-tako-eino/internal/adkrun/event.go</code></td>
+<td>修改</td>
+<td><code>ToolCall{Name,Args}</code> 替换 <code>ToolNames</code>；<code>eventFrom</code> 保留原始参数字符串</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/adkrun/event_test.go</code></td>
+<td>修改</td>
+<td>参数断言</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/cmd/yktako/sink.go</code></td>
+<td>修改</td>
+<td>终端打印前 <code>repl.Clip(args, 120)</code>；无参数时仍只打名字</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/cmd/yktako/sink_test.go</code></td>
+<td>修改</td>
+<td>格式锁定：无参数的旧句子保持，有参数与超长另加用例</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/webui/logdb.go</code></td>
+<td>新建</td>
+<td>打开库、建表、启动对账、<code>BeginRun</code> / <code>Append</code> / <code>Finish</code> / <code>ReadAfter</code></td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/webui/logdb_test.go</code></td>
+<td>新建</td>
+<td>seq、并发 run、<code>from</code> 边界、终局事务、对账</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/webui/sse.go</code></td>
+<td>修改</td>
+<td>信封带 <code>run</code> / <code>seq</code> / <code>ts</code> / <code>toolCalls</code>；映射只填呈现字段，序号留给落盘</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/webui/session.go</code></td>
+<td>修改</td>
+<td><code>active</code> 换成 <code>liveRun</code>；先落盘再送通道；终局与历史规则按设计稿 D7</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/webui/server.go</code></td>
+<td>修改</td>
+<td><code>New</code> 打开库并对账；T2 轮询与 <code>stream</code>；T3 <code>stop</code> 与 <code>GET /api/session</code></td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/webui/server_test.go</code></td>
+<td>修改</td>
+<td>序列含 <code>start</code> / 终局；参数断言；续传、断线、停止、409</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/webui/static/index.html</code></td>
+<td>修改</td>
+<td><code>toolCalls</code> 展示并折叠参数；T2 记 <code>lastSeq</code>；T3 停止改 POST</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/cmd/yktako/main.go</code></td>
+<td>修改</td>
+<td><code>-web-db</code>，默认 <code>yktako-webui.db</code>；只在 <code>-web</code> 时打开</td>
+</tr>
+<tr>
+<td><code>.gitignore</code></td>
+<td>修改</td>
+<td>忽略 <code>yktako-webui.db</code> 及其 <code>-wal</code> / <code>-shm</code></td>
+</tr>
+<tr>
+<td><code>doc/10</code>、<code>doc/11</code>、<code>doc/05</code>、两份 README</td>
+<td>修改</td>
+<td>任务 5，设计稿第 10 节</td>
+</tr>
+</tbody>
+</table></div>
+<p>不改：<code>internal/repl</code> 的 <code>Clip</code> 实现、<code>internal/guard</code> 的 resume 值、<code>internal/taskboard</code>、REPL 的审批问答。<code>adkrun.Event</code> 不加 seq。</p>
+<hr />
+<h2 id="任务与设计稿的对应">任务与设计稿的对应</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>本计划</th>
+<th>设计稿</th>
+<th>做完时用户能看见的行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>任务 1</td>
+<td>T1 契约 + 落盘</td>
+<td>刷新仍会取消这一轮，但库里已有 <code>start</code>、过程与一条 <code>error</code> 终局；<code>tool_call</code> 带原始参数</td>
+</tr>
+<tr>
+<td>任务 2</td>
+<td>T2 按游标读</td>
+<td>断线后用最后一帧的 seq 重连，行不重不漏；run 仍可能已被断线取消</td>
+</tr>
+<tr>
+<td>任务 3</td>
+<td>T3 连接解耦</td>
+<td>断线不取消 run；停止按钮 POST；第二标签页用 <code>GET /api/session</code> 跟上</td>
+</tr>
+<tr>
+<td>任务 4</td>
+<td>T4 验收里尚未被前三任务盖住的缺口</td>
+<td>机器验收 8 条有归宿</td>
+</tr>
+<tr>
+<td>任务 5</td>
+<td>T5 文档</td>
+<td>《10》《11》《05》与 README 跟新语义一致</td>
+</tr>
+</tbody>
+</table></div>
+<hr />
+<h2 id="任务-1契约与落盘设计稿-t1">任务 1：契约与落盘（设计稿 T1）</h2>
+<p><strong>Files：</strong> 上表里除「任务 2/3 才碰的路由与前端续传」之外的代码。</p>
+<h3 id="契约">契约</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 1: <code>ToolNames</code> 改为 <code>ToolCalls</code></strong></label></li>
+</ul>
+<p><code>adkrun.ToolCall</code> 两个字段：<code>Name</code>、<code>Args</code>。<code>eventFrom</code> 在 <code>len(msg.ToolCalls) &gt; 0</code> 时逐条拷贝 <code>Function.Name</code> 与 <code>Function.Arguments</code>，不截断、不解析 JSON。调用 id 不进入事件。</p>
+<p><code>event_test.go</code> 里带参数的用例要断言 <code>Args</code> 与构造消息时的字符串相同。<code>consume</code> 的序列断言改读 <code>ToolCalls</code>。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 2: REPL 格式</strong></label></li>
+</ul>
+<p>一条调用的终端片段：</p>
+<ul>
+<li><code>Args</code> 为空：只写名字；</li>
+<li>否则：<code>名字 + 空格 + repl.Clip(Args, 120)</code>。</li>
+</ul>
+<p>多个调用仍用 <code>", "</code> 连接，整行模板不动：<code>  → 🔧 %s调用: %s\n</code>。无参数的现有锁定句保持逐字符不变。另加一条带参数、一条参数超过 120 个 rune 的用例。</p>
+<h3 id="库">库</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 3: <code>logdb.go</code></strong></label></li>
+</ul>
+<p>驱动 <code>modernc.org/sqlite</code>。<code>sql.Open</code> 的 DSN 带 <code>_txlock=immediate</code> 与 <code>busy_timeout</code>。<code>MaxOpenConns = 1</code>。空 <code>DBPath</code> 用内存库，只给测试；生产路径由 <code>-web-db</code> 传入。</p>
+<p>表结构用设计稿第 4 节环 3 的 DDL。<code>Open</code> 之后 <code>CREATE TABLE IF NOT EXISTS</code>。<code>Reconcile</code> 把 <code>status='running'</code> 改成 <code>failed</code>，<code>is_completed</code> 保持 0，事件行不动。</p>
+<p>写入全走 <code>LogDB</code> 上的互斥锁加一条事务，<code>UNIQUE</code> 冲突整笔重试一次：</p>
+<ul>
+<li><code>BeginRun(runID, sessionID, userMessage)</code>：插入档案行（<code>running</code> / <code>is_completed=0</code>）并写入 <code>kind=start</code> 的信封，<code>seq=1</code>，<code>text</code> 为用户消息。同一事务。</li>
+<li><code>Append(ev)</code>：<code>ev.Run</code> 必须指向仍为 <code>running</code> 的行；<code>seq</code> 由 <code>MAX(seq)+1</code> 分配；列与 payload 里的 <code>seq</code> 是同一个整数。<code>ts</code> 空则填 RFC3339 UTC。</li>
+<li><code>Finish(runID, kind, text, producedJSON)</code>：再分配一帧终局，并把档案更新为 <code>completed</code> / <code>is_completed=1</code>。<code>kind</code> 只允许 <code>complete</code>、<code>error</code>、<code>stop</code>。只有 <code>complete</code> 写入 <code>produced_json</code>。<code>WHERE status='running'</code> 影响行数不是 1 则回滚。一场 run 因此只有一条终局。</li>
+<li><code>ReadAfter(runID, from, limit)</code>：<code>seq &gt; from ORDER BY seq LIMIT limit</code>。<code>from&lt;=0</code> 视为从头。超过最大 seq 返回空切片，不是错误。未知 run 同样是空切片。</li>
+</ul>
+<p><code>run_id</code> 用 <code>crypto/rand</code> 的 4 字节，格式 <code>r_</code> 加 8 位十六进制。不用 <code>session.turn</code>。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 4: <code>logdb_test.go</code> 先写后实现，覆盖设计稿第 8 节第 1、4 条里属于库的部分</strong></label></li>
+</ul>
+<ol type="1">
+<li>同一 run：<code>start</code> 的 seq 是 1，其后单调、无洞；列 seq 与 payload 内 seq 相等。</li>
+<li>多个 run 并发 <code>Append</code>（<code>-race</code>）：各 run 自己的序号空间不串。</li>
+<li><code>ReadAfter</code>：空表、<code>from=0</code>、<code>from</code> 等于最后一帧、<code>from</code> 大于最大 seq。</li>
+<li><code>Finish(complete)</code> 后档案为 <code>completed</code> / <code>1</code>，且终局帧与更新同时可见（中途杀进程的窗口用「事务回滚后两边都不在」来测：构造第二次 <code>Finish</code> 必须失败，库里仍只有一条终局）。</li>
+<li><code>Finish(error)</code> 与 <code>Finish(stop)</code> 也是 <code>completed</code> / <code>1</code>，<code>produced_json</code> 为空。</li>
+<li>未 <code>Finish</code> 就 <code>Reconcile</code>：<code>failed</code> / <code>0</code>，已写入的事件仍能按 <code>from</code> 读出。</li>
+</ol>
+<h3 id="接到-web此阶段仍用请求-ctx">接到 Web（此阶段仍用请求 ctx）</h3>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 5: 信封与会话</strong></label></li>
+</ul>
+<p><code>sseEvent</code> 增加 <code>Run</code>、<code>Seq</code>、<code>Ts</code>，<code>ToolNames</code> 改为 <code>ToolCalls</code>。<code>approval_result</code> 复用 <code>sseApproval</code>，只填 <code>id</code> 与 <code>decision</code>。</p>
+<p><code>session.active</code> 改为 <code>liveRun *liveRun</code>（本任务只放 <code>id</code>）。<code>beginTurn</code> 在已有 <code>liveRun</code> 时失败，供 409 使用。</p>
+<p><code>handleChat</code> 顺序：</p>
+<ol type="1">
+<li>校验请求体；</li>
+<li><code>beginTurn</code> 失败则 409，此时还没有 <code>text/event-stream</code>；</li>
+<li><code>BeginRun</code>。失败则清掉 <code>liveRun</code>（不追加历史），500，同样还没有 SSE 响应头；</li>
+<li>写 SSE 响应头，起 goroutine：先把已经落盘的 <code>start</code> 送进通道，再 <code>runTurn(r.Context(), ...)</code>；</li>
+<li>sink 与 ask 里每条呈现事件、每条 <code>approval</code>：先 <code>Append</code>（用进程 ctx，不用请求 ctx），成功才送进通道。写失败则取消本次 run 并让 <code>runTurn</code> 返回该错误，不把没落盘的帧送出去；</li>
+<li>ask 收到决定后、返回给 <code>adkrun</code> 之前，<code>Append</code> 一帧 <code>approval_result</code>；</li>
+<li>goroutine 收尾调用 <code>Finish</code>：<code>err == nil</code> 为 <code>complete</code> 并把产出 JSON 写入档案，同时 <code>finishTurn</code> 追加历史；任何 <code>err != nil</code>（含请求取消）为 <code>error</code>，不追加历史。终局帧落盘后再送进通道。<code>Finish</code> 失败则只清 <code>liveRun</code>，不另造一帧未落盘的 error。</li>
+</ol>
+<p>模型调用必须发生在 <code>BeginRun</code> 提交之后。用临时库文件做一条测试：假模型在 <code>Generate</code> 里打开同一文件，断言已有 <code>kind=start</code> 且 <code>text</code> 等于本轮用户消息。</p>
+<p>现有 SSE 测试改为期望：<code>start</code>、过程事件、<code>complete</code>。审批用例在 <code>approval</code> 与后续 <code>tool_result</code> 之间多一帧 <code>approval_result</code>，流以 <code>complete</code> 结束。<code>tool_call</code> 的 <code>args</code> 等于剧本里的原始参数字符串。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 6: 静态页只改呈现</strong></label></li>
+</ul>
+<p><code>renderEvent</code> 的 <code>tool_call</code> 读 <code>ev.toolCalls</code>。每个调用：名字用 chip，参数非空时用现有 <code>.out</code> 折叠。<code>start</code>、<code>complete</code>、<code>approval_result</code> 本任务不另画一行（用户消息本地已经画过；批准/拒绝的说明仍由 POST 成功路径写）。停止按钮此任务仍是 <code>abort()</code>。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 7: 入口与忽略规则</strong></label></li>
+</ul>
+<p><code>-web-db</code> 默认 <code>yktako-webui.db</code>，仅 <code>-web</code> 非空时传给 <code>webui.New</code>。<code>New</code> 返回 <code>(*Server, error)</code>，打开失败或对账失败则返回错误。<code>.gitignore</code> 加上库文件与 WAL 伴随文件。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 8: 跑通</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">gofmt</span> <span class="at">-l</span> .</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="ex">go</span> test <span class="at">-race</span> ./internal/adkrun ./internal/webui ./cmd/yktako</span></code></pre></div>
+<p>预期：无 gofmt 差异，包测试通过。</p>
+<hr />
+<h2 id="任务-2按游标读设计稿-t2">任务 2：按游标读（设计稿 T2）</h2>
+<p><strong>Files：</strong> <code>server.go</code>、<code>server_test.go</code>、<code>static/index.html</code>。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 1: 轮询替换请求私有通道</strong></label></li>
+</ul>
+<p><code>POST /api/chat</code> 仍负责 <code>beginTurn</code> + <code>BeginRun</code> + 起 run goroutine。goroutine 只写库，不再持有 <code>chan sseEvent</code>。HTTP 处理函数从 <code>from=0</code> 轮询 <code>ReadAfter</code>：一批满 <code>limit</code>（50）就立刻再查，不足才睡眠 100ms。写出失败（客户端断开）只结束这个读者。此任务 run 仍绑 <code>r.Context()</code>，所以断开仍会取消 run，终局仍是 <code>error</code>。见到终局 kind 后读者正常收流。</p>
+<p>run goroutine 与轮询之间不需要内存订阅。<code>start</code> 已在轮询开始前提交。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 2: <code>GET /api/chat/stream?run=&amp;from=</code></strong></label></li>
+</ul>
+<p><code>from</code> 缺省与 <code>0</code> 都是从头（<code>seq &gt; 0</code>）。run 在档案里不存在则 404。存在则按同一轮询写 SSE，直到终局或客户端断开。不在这里创建会话，也不取消 run。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 3: 前端游标</strong></label></li>
+</ul>
+<p>每帧记下 <code>ev.seq</code> 与 <code>start</code> 里的 <code>run</code>。非 <code>AbortError</code> 的读中断：若已有 run id，再请求一次 <code>GET /api/chat/stream?run&amp;from=lastSeq</code>。相邻 seq 相差大于 1 时在日志里插一行说明，并从最后连续的 seq 再请求一次。用户点停止仍走 abort，不触发这次续传。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 4: 测试</strong></label></li>
+</ul>
+<p><code>httptest</code>：读到至少一帧后断开请求体，再 <code>GET .../stream?run=&amp;from=&lt;最后 seq&gt;</code>，拼起来的 seq 严格递增、无重复、无空洞，且最后一帧是终局。<code>from</code> 大于最大 seq 时响应体没有 <code>data:</code> 行且连接在见到「没有更多且已终局」后结束（终局已在 <code>from</code> 之前，立即结束）。</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino <span class="kw">&amp;&amp;</span> <span class="ex">go</span> test <span class="at">-race</span> ./internal/webui</span></code></pre></div>
+<hr />
+<h2 id="任务-3连接解耦设计稿-t3">任务 3：连接解耦（设计稿 T3）</h2>
+<p><strong>Files：</strong> <code>session.go</code>、<code>server.go</code>、<code>server_test.go</code>、<code>static/index.html</code>。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 1: run 上下文脱离请求</strong></label></li>
+</ul>
+<p><code>liveRun</code> 增加 <code>cancel context.CancelFunc</code>。<code>beginTurn</code> 成功时 <code>context.WithCancel(进程 ctx)</code>，run 使用这个上下文，不使用 <code>r.Context()</code>。读者用请求 ctx 轮询；请求结束只离开 <code>ReadAfter</code> 循环。<code>finishTurn</code> 在 run goroutine 里调用，并 <code>cancel</code> 防泄漏，然后把 <code>liveRun</code> 置空。</p>
+<p>退出分类（进程 ctx 只有停止会取消它）：</p>
+<ul>
+<li><code>err == nil</code> → <code>complete</code>，追加历史；</li>
+<li><code>errors.Is(err, context.Canceled)</code> → <code>stop</code>，不追加历史；</li>
+<li>其它错误，或落盘失败 → <code>error</code>，不追加历史。</li>
+</ul>
+<p>落盘失败若通过 <code>cancel</code> 打断 run，必须先认出落盘错误，不能把它写成 <code>stop</code>。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 2: 停止与查询</strong></label></li>
+</ul>
+<p><code>POST /api/stop</code>，JSON <code>{sessionId, run}</code>。<code>liveRun.id</code> 一致则 <code>cancel()</code> 并 200；否则 404。处理函数不写事件。</p>
+<p><code>GET /api/session?id=</code>：<code>id</code> 空则 400；否则 200 <code>{"sessionId","liveRun"}</code>。没有会话或没有在跑的轮次时 <code>liveRun</code> 为 <code>""</code>，不创建会话。</p>
+<p>409 仍在写 SSE 响应头之前，判定改看 <code>liveRun != nil</code>。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 3: 前端停止</strong></label></li>
+</ul>
+<p>停止按钮 <code>POST /api/stop</code>，带上当前 <code>run</code>。不再 <code>abort()</code> 当前聊天请求当作停止。abort 只留给「换新会话」这条明确要丢掉本地读者的路径；换会话时若有 live run，同样 POST stop。断线续传逻辑保留。审批卡片在断线后仍可 POST <code>/api/approval</code>（服务端 ask 还挂在 run 的 ctx 上）。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><strong>Step 4: 测试</strong></label></li>
+</ul>
+<ol type="1">
+<li>起流后取消 HTTP 请求，假模型仍能跑完；档案 <code>completed</code>，终局恰好一条 <code>complete</code>。</li>
+<li><code>POST /api/stop</code> 匹配时 200，终局恰好一条 <code>stop</code>，历史长度不变。不匹配 404。</li>
+<li>两个 <code>httptest</code> 连接：第二个先 <code>GET /api/session</code> 拿到 run，再 <code>stream?from=0</code>，两边 seq 序列一致。</li>
+<li>liveRun 存在时第二个 <code>POST /api/chat</code> 为 409，且 <code>Content-Type</code> 不是 <code>text/event-stream</code>。</li>
+<li>REPL 包测试不打开数据库（<code>cmd/yktako</code> 的 sink 测试不依赖 <code>webui</code>）。</li>
+</ol>
+<div class="sourceCode" id="cb3"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino <span class="kw">&amp;&amp;</span> <span class="ex">go</span> test <span class="at">-race</span> ./...</span></code></pre></div>
+<hr />
+<h2 id="任务-4验收缺口">任务 4：验收缺口</h2>
+<p>设计稿第 8 节 8 条应分别落在任务 1–3 的测试里。本任务只补还红的那几条，不新开行为。人工用例（浏览器里断网、停止、双标签、REPL）记在 <code>docs/superpowers/plans/</code> 下另起一页，仿 <code>2026-09-27-t2-人工验收用例.md</code> 的密度，不在本任务写自动化。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />对照第 8 节逐条点名现有 <code>Test*</code>；缺的补上。</label></li>
+</ul>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>设计稿第 8 节</th>
+<th>测试</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1 seq / from / 终局事务 / 对账</td>
+<td><code>TestLogDBSeqMatchesPayload</code>、<code>TestLogDBReadAfterBounds</code>、<code>TestLogDBFinishOnce</code>、<code>TestLogDBReconcileFailed</code>、<code>TestLogDBConcurrentRuns</code></td>
+</tr>
+<tr>
+<td>2 断线不杀 run</td>
+<td><code>TestDisconnectDoesNotCancelRun</code></td>
+</tr>
+<tr>
+<td>3 续传不重不漏</td>
+<td>同上，<code>from</code> 为最后一帧</td>
+</tr>
+<tr>
+<td>4 重启对账</td>
+<td><code>TestLogDBReconcileFailed</code>（关库再开由 <code>Reconcile</code> 覆盖；不拉起第二个进程）</td>
+</tr>
+<tr>
+<td>5 双读者</td>
+<td><code>TestTwoReaders</code></td>
+</tr>
+<tr>
+<td>6 stop</td>
+<td><code>TestStopOneTerminal</code>；REPL 不引用 <code>webui</code>，<code>go test ./cmd/yktako</code> 不打开库</td>
+</tr>
+<tr>
+<td>7 409</td>
+<td><code>TestChatConflict409</code></td>
+</tr>
+<tr>
+<td>8 契约与 start 先于模型</td>
+<td><code>TestChatSSESequence</code>、<code>TestStartPersistedBeforeModel</code>、<code>TestREPLSinkFormat</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>人工用例在 <code>2026-09-29-webui-stream-hub-manual.md</code>，留给人手勾。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" /><code>go test -race ./...</code> 全绿。</label></li>
+</ul>
+<hr />
+<h2 id="任务-5文档回填设计稿-t5">任务 5：文档回填（设计稿 T5）</h2>
+<ul class="task-list">
+<li><label><input type="checkbox" checked="" />《10》第 4.2 节：<code>tool_call</code> 载荷改为名字加原始参数；补 <code>start</code> / <code>approval_result</code> / 终局；写明 seq 与 run 是 Web 信封，不在 <code>adkrun.Event</code> 上。</label></li>
+<li><label><input type="checkbox" checked="" />《10》第 4.4 节：按设计稿第 6 节改断线、停止、多读者、409、档案。写明 T1 曾短暂保留「断线取消」，T3 起不再取消。</label></li>
+<li><label><input type="checkbox" checked="" />《11》状态表：为流式枢纽加一行，指向本计划与设计稿，避免和当年的 sink T1、HTTP T2 编号混淆。</label></li>
+<li><label><input type="checkbox" checked="" />《05》第 4 节路线 #7 / #8：事件可回放已落盘；在途轮次崩溃续跑仍未做。</label></li>
+<li><label><input type="checkbox" checked="" />两份 README：<code>-web</code> 与 <code>-web-db</code>、停止、续传、第二标签页。单用户仍只绑本机。</label></li>
+</ul>
+<hr />
+<h2 id="自检写完计划时">自检（写完计划时）</h2>
+<ul>
+<li>设计稿 D1：客户端传最后收到的 seq，服务端 <code>seq &gt; from</code>。任务 2 的重连测试按这个配对，不使用 <code>lastSeq+1</code>。</li>
+<li>设计稿 D5：seq 每场 run 从 1 计。任务 1 的并发测试是不同 run，不是同一 run 的三个写入者。</li>
+<li>设计稿 D7：开跑插入档案行；终局与 <code>is_completed</code> 同一事务。崩溃只来自对账，成功 / 失败 / 停止都是 <code>completed</code>。</li>
+<li>设计稿 D8：停止 HTTP 不写行。终局由 run 退出路径写。</li>
+<li>REPL 不 import <code>webui</code>，也不打开 <code>-web-db</code>。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/archive/old-line/plans/2026-09-29-webui-stream-hub.md"><code>doc/archive/old-line/plans/2026-09-29-webui-stream-hub.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

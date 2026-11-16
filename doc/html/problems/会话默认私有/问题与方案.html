@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>会话默认私有 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="会话默认私有">会话默认私有</h1>
+<blockquote>
+<p>模块：多租户可见性 / 会话 API（<code>internal/runengine/session_access.go</code>）｜ 状态：已落地｜ 证据：<code>doc/28-多租户.md</code> §7.1、<code>doc/37-删除与档案清理.md</code> D-f、<code>tmp/28-多租户/planning.md</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>团队租户里，Bob 和 Alice 在同一个 workspace 下工作。Bob 想看看 Alice 的会话列表和对话正文——毕竟「我们是一个团队」。</p>
+<p>两种默认都会出事：</p>
+<ul>
+<li><strong>默认租户内可见</strong>：新成员一进团队就看到全员的聊天记录与文件；有人把私人对话、客户材料、密钥片段留在会话里，全部裸奔。</li>
+<li><strong>一刀切 404</strong>：把「同租户可读」的合理协作诉求也堵死，团队功能名存实亡。</li>
+</ul>
+<p>还有一条更隐蔽的：<strong>可见性传导</strong>。如果「会话可读」自动让「会话里的附件、帧流、历史」都可读，那么私有会话分享出去时，附件也跟着泄露；如果分享只读，但写/停止不校验，成员能改别人的对话。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 默认 tenant 可见</td>
+<td>同租户成员都能读</td>
+<td>协作零操作</td>
+<td>隐私裸奔；没有「私人会话」这个选项</td>
+</tr>
+<tr>
+<td>B 默认 private，owner 显式改 tenant；tenant-visible 只读</td>
+<td>默认安全，协作可开</td>
+<td>分享多一步操作</td>
+<td>要维护 owner/read 两种访问语义；前端要有可见性开关</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>裁定：B。</strong> 四条配套规则：</p>
+<ol type="1">
+<li>默认 <code>private</code>；owner 显式改成 <code>tenant</code> 后才对同租户可见。</li>
+<li><strong>可见即可读，写/停仍 owner</strong>：tenant-visible 的会话，别人能看帧与历史，不能发消息、不能 stop、不能删。</li>
+<li><strong>无权访问的 frames 回 200 + <code>gone</code></strong>，不回 403——不泄露「这个 id 存在」。</li>
+<li>附件跟着容器（workspace）走，不跟着会话可见性传导。</li>
+</ol>
+<h2 id="3-同族小裁定">3. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>谁能删会话？</td>
+<td><strong>仅属主本人</strong>；tenant owner/admin 不豁免</td>
+<td>doc/28 原表写的「owner/admin 可代删」与「会话默认私有」自相矛盾，doc/37 D-f 作废旧口径。代价是离职清理要本人操作</td>
+</tr>
+<tr>
+<td>看不见的会话回 404 还是 403？</td>
+<td>404</td>
+<td>403 等于确认「这个 id 存在」；软删会话同样视同不存在</td>
+</tr>
+<tr>
+<td>可见性字段存在哪？</td>
+<td><code>sessions.visibility</code>（private/tenant）</td>
+<td>读侧统一走 <code>SessionAccess</code>；前端开关调 <code>PATCH /api/sessions/:id/visibility</code></td>
+</tr>
+<tr>
+<td>分享后历史帧、运行中帧都能看吗？</td>
+<td>能看，但写操作仍校验 owner</td>
+<td>读与写用两个不同判据，不能用一个 <code>owner</code> 位糊过去</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-证据">4. 证据</h2>
+<ul>
+<li>方案：<code>doc/28-多租户.md</code> §7.1（会话 API 的访问规则：owner；tenant-visible 可读；其他 404）；<code>doc/37-删除与档案清理.md</code> §4 D-f（仅属主可删）。</li>
+<li>台账：<code>tmp/28-多租户/planning.md</code> §0 已明确；<code>tmp/37-删除连带删/planning.md</code> §0 D-f。</li>
+<li>代码：<code>session_access.go</code> 的 <code>SessionAccess</code>（返回 owner/read 种类）；<code>server.go</code> 的 <code>patchSessionVisibility</code>、<code>getSession</code>；<code>pgstore.go</code> 的删除权限判定（非属主 <code>ErrSessionForbidden</code>，不可见 <code>ErrSessionNotFound</code>）。</li>
+<li>复核命令：<code>grep -n "func SessionAccess" yk-tako-eino/internal/runengine/session_access.go</code>；<code>grep -n "patchSessionVisibility\|patchSessionWorkspace" yk-tako-eino/internal/runengine/server.go</code>。</li>
+</ul>
+<h2 id="5-现状">5. 现状</h2>
+<p>仍有效。项目（workspace）的可见性后来整条退役，见 <code>doc/problems/共享项目整条退役</code>；会话可见性不受影响。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E4%BC%9A%E8%AF%9D%E9%BB%98%E8%AE%A4%E7%A7%81%E6%9C%89/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/会话默认私有/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

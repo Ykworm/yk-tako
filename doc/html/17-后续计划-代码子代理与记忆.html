@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>17 · 后续计划：本版只做笔记 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="17--后续计划本版只做笔记">17 · 后续计划：本版只做笔记</h1>
+<blockquote>
+<p>性质：<strong>讨论稿，第四稿，未定案</strong>。2026-10-12。前三稿讨论过执行、搜索、子代理折叠、手动停止、笔记。跨度太大。本版只做笔记，并且按 Hermes 内置笔记的形状来做，使以后能接上它的外挂召回和事后检查，而不必改表、改工具名。</p>
+<p><strong>施工状态（2026-10-12 回填）：已定案并落地。</strong> §7（笔记）全落地、M1–M6 六拍验收全过（台账 <code>tmp/17-笔记/</code>，验收后清理）：<code>memory</code> 工具（add/replace/remove）进父池、<code>notes</code> 表（PG 第五张表）、主代理与子代理同一份起手快照、写入四件（工具结果清单+已用行 / 三次记数+第 4 次劝停 / 写入拒隐形字符+存量毒行占位 / workspace 级 advisory xact 锁与插入同事务）、折叠提示词「规矩按原句保留」一句。§7.1 接缝表逐条兑现——检索函数、第二个写入函数、第二个检查模型、向量表均未建。§3–§6 当时均未施工（§3/§4 已于 2026-10-15 落地，见下条补记；§5 已于 2026-10-15 落地，真源改在 <code>doc/22</code>；§6 已于 2026-10-17 落地）。2026-10-15 补：四件之 3 的句式词表裁除、写入检查只留隐形字符一档（见 <code>19v6-90</code> 十七次修订）。</p>
+<p><strong>施工状态补记（2026-10-15）：§3、§4 已落地</strong>（台账 <code>tmp/17-bash执行工具/</code>、<code>tmp/17-手动停止/</code>，验收后清理）。bash 进池（stdout·stderr 各 32 KB 上限 / env 白名单五项；<strong>无自动超时，2026-10-15 用户裁</strong>——手动停止就是它的逃生口）+ coder.md 落地（<code>doc/23</code>）；stop 端点 + 进程内取消注册表 + 看门狗 CAS 0 行 cancel + EndRun stopped 分支 + 页面「已停止」收口全过验收。施工中另抓到并修复一个真卡死：多段命令 fork 的孙进程持有 stdout/stderr 管道写端，kill 只杀 bash，<code>cmd.Run</code> 卡死在等管道 EOF——以 <code>cmd.WaitDelay</code> 收口。§5（web_search）已于 2026-10-15 落地，真源改在 <code>doc/22</code>；§6（子代理折叠）已于 2026-10-17 落地，见 §6 标题下施工状态。</p>
+<p><strong>施工状态补记（2026-10-16）：§6 的设计正文已按当天两项裁定回填</strong>（三步一起做 = 估长度→折→滤思考；厂商「上下文超长」拒收也转错误文本），并补上两条当天核出来的事实：折叠 middleware 必须无状态（同一场 run 里主代理能并行发两次同名委派，eino ToolsNode 默认并行），以及摘要行拿不到 mh 坐标导致的「摘要套摘要」代价。验收剧本从 <code>web_search</code> 换成 <code>bash</code> 长输出。台账 <code>tmp/17-子代理折叠/</code>，<strong>2026-10-17 三拍（A1/A2/A3）全部落地</strong>，施工状态与实录勘误见 §6 标题下补记。同日又核出第三件事实并写进 §6「实例竞态」段：eino <code>ChatModelAgent</code> 实例体内有 ADK 自己的共享可写字段（<code>msgConf.cancelCtx</code>，上游 <a href="https://github.com/cloudwego/eino/issues/1177">#1177</a>，v0.9.21 未修），middleware 无状态管不到它；「主 run 柄恒 nil、子代理柄非 nil」的原因与该竞态的两个触发路径（同场同名并行委派会咬人、跨会话主 run 只报 race）均已记录，处置（per-name 互斥 / 登记 / 给上游供 repro）待拍。同日再回填一轮讨论：per-run 可变维度在 eino 的承载方式对照表（模型走 <code>WrapModel</code> 换、槽位不可写）、tako 换模型挂点已在（<code>AgentLogHandler.WrapModel</code> + <code>agentModelTable</code>）、<code>rebuildGraph</code> 当场重建 msgConf 的窄条件、「强制重建」作为等 #1177 的临时绷带候选（成立依据 + 三条 hack 理由 + 三条件），以及待坐实/待拍清单——均见 §6 新增各段。</p>
+<p>点头之前不写 <code>tmp/</code> 台账、不改代码。本版不加端点、不加帧 kind。</p>
+<p>第 3 节到第 6 节是已经讨论过的后话，本版不施工。</p>
+</blockquote>
+<h2 id="1-本版做什么">1. 本版做什么</h2>
+<p>本版只在现有的一场 run 上加笔记。</p>
+<p>用户说过「deck 放在 <code>output/deck.html</code>，以后改这个文件，不要重建」→ 模型在同一次请求里看见 <code>memory</code> 工具和它的说明 → 调用 <code>add</code>，带上整理句和用户原句 → 程序写入 PostgreSQL → 下一场 run 起手把还有效的行渲染成快照，接进主代理的系统提示，也接进子代理的规格正文后面。</p>
+<p>四个 API 的路径和字节不变。<code>memory</code> 的调用走现有的 <code>tool_call</code> / <code>tool_result</code>。</p>
+<p>本版不做：执行工具、网络搜索、子代理内部折叠、手动停止、按当轮消息去检索旧笔记、另开一个模型检查要不要记、技能包。这些以后接的时候，笔记的表和工具名保持不动。接法写在第 7.1 节。</p>
+<h2 id="11-以前排过的五件事本版不施工">1.1 以前排过的五件事（本版不施工）</h2>
+<p>现在一场委派的链路是：</p>
+<p>用户发消息 → 主代理调用 <code>agents/*.md</code> 装出来的工具 → 子代理在自己的进程内消息里调父池里的工具 → 主线程只收到终稿（超过 50 KB 截断）→ 这场 run 占着会话闸，直到它自己结束。</p>
+<p>前四件本版不做。第五件就是本版。五件事当时分别接在这些环上。</p>
+<ol type="1">
+<li><strong>执行工具。</strong> 子代理能 <code>write_file</code>，没有工具跑 <code>python3 agg.py</code>。40 个日志的聚合做不完。</li>
+<li><strong>网络搜索。</strong> <code>researcher.md</code> 的正文写着没有联网检索。父池里也没有搜索工具。要外部事实时，它只能在终稿里写「未能查证」。</li>
+<li><strong>子代理自己的折叠。</strong> 压缩只挂在主代理上。子代理连着搜、连着读，正文堆在它自己的窗口里，终稿还没交出来窗口就满了。50 KB 回传上限管的是主线程看见多少，不管子代理自己装得下多少。</li>
+<li><strong>手动停止。</strong> 没有取消端点。搜索或脚本不返回，这场 run 一直占闸，同一会话的下一条消息一直 409。租约到期只会让看门狗停止续约，代码里写明它不主动掐模型流。</li>
+<li><strong>两边读同一份笔记。</strong> 子代理看不见主线程的历史和摘要。主代理若没把「不要重建 deck」写进任务文字，子代理就当没有这句。要两边自己都读得到，库里得先有这份笔记。</li>
+</ol>
+<h2 id="2-以后再做的顺序">2. 以后再做的顺序</h2>
+<p>笔记本版做完之后，若继续，顺序仍是：执行工具 <code>bash</code>（同一改动里给 <code>researcher</code> 写白名单）→ 手动停止 → <code>web_search</code> → 子代理进程内折叠。细节在第 3 节到第 6 节，本版不拆台账。（这条顺序四步都已落地；括注里「同一改动里写白名单」翻了两次——2026-10-12 作废白名单改成纯继承，2026-10-16 再翻成 <code>exclude_tools</code> 排除名单，见 §3.1 头注与 <code>doc/26</code>。）</p>
+<h2 id="3-执行工具本版不做">3. 执行工具（本版不做）</h2>
+<blockquote>
+<p><strong>施工状态（2026-10-15）：已落地</strong>（台账 <code>tmp/17-bash执行工具/</code>）。本节设计与实装一致，<strong>除超时刀一处翻案（2026-10-15 用户裁）：不设自动超时</strong>——手动停止（§4）先落地正是为取消这把刀：跑多久的裁定权在人手里，stop 随时掐、watchdog 判死也掐；自动 60 秒会误杀本来就合法的长命令（构建、装依赖）。32 KB 上限照装（管输出不管时间）。<code>cmd.WaitDelay = 3s</code> 照留：手动停止的 cancel 路径同样撞孙进程持管道的卡死（<code>cmd.Run</code> 卡在等 EOF，deadline 只杀直接子进程救不了，见头注补记）。<strong>记录面补角（同日用户裁「Qoder 的标准」）</strong>：记录制（命令+最终输出落 runlog、执行中不逐块流）在非正常死亡时不缺角——被终止的 bash 把死前已收输出拼进错误文本（「bash 被终止，死前输出：…＋原因」），卡死的命令事后可查「做到哪」。流式帧（tool_progress）登记不施工。</p>
+</blockquote>
+<p>池子里增加 <code>bash</code>。参数字段 <code>command</code>。工作目录是 workspace 根，用 <code>bash -c</code> 执行，不走登录 shell。</p>
+<p><code>fileops.go</code> 已经按 <code>command</code> 字段扫描重定向和 <code>cp</code> / <code>mv</code> 这类写路径。工具的 <code>file_effect</code> 必须是 <code>write</code>。登记成 <code>none</code> 或留空时，分类函数直接返回，<code>command</code> 不会被扫，折叠就钉不上这些路径。纯 <code>ls</code> 扫不出写路径，不产生记录。<code>python3 agg.py</code> 在脚本内部 <code>open</code> 出来的文件，扫描看不见，19v6-07 已登记为不追完备。</p>
+<p>成功和失败都是工具结果文本，带退出码、stdout、stderr，run 不因此变成 <code>error</code>。</p>
+<p><del>单次必须超时。推荐 60 秒，待拍。</del> <strong>（2026-10-15 翻案：不设自动超时，见本节头注）</strong> 没有超时刀，一条 <code>sleep</code> 会占住闸——占住由人收：手动停止随时掐，watchdog 判死也掐。子代理仍然没有总时限。</p>
+<p>stdout、stderr 各有字节上限。推荐单路 32 KB，超出截断，并写明「把需要的内容写进文件」。第一拍不另做溢出落盘。</p>
+<p>子进程环境只留 <code>PATH</code>、<code>HOME</code>、<code>TMPDIR</code>、<code>LANG</code>、<code>LC_ALL</code>。否则 <code>env</code> 会把模型密钥打进永久 runlog。</p>
+<p>符号链接逃出 workspace、以及 <code>bash</code> 仍能访问网络，和 19v6-08 对文件工具的登记相同，这一拍不补。危险命令规则表也不在这一拍。</p>
+<p>验收打在跑着的引擎上：投一条消息让它执行 <code>python3 -c "print(424242)"</code>，frames 里有 <code>name=bash</code> 的 <code>tool_call</code> 和 <code>tool_result</code>，结果文本含 <code>424242</code> 和退出码 0。</p>
+<h3 id="31-researcher-的白名单和-bash-进池同一改动">3.1 <code>researcher</code> 的白名单：和 <code>bash</code> 进池同一改动</h3>
+<blockquote>
+<p><strong>本节作废（2026-10-12 用户拍），2026-10-16 翻案：护栏真源改在 <code>doc/26</code>，形状是 <code>exclude_tools</code> 排除名单，不是下文这份白名单。</strong> 原裁定：不再给 researcher 写 <code>tools:</code> 白名单；researcher 长期保持不写这一行、纯继承父池。<code>bash</code> 进池后 researcher 自动获得命令执行能力，安全面改收在 bash 工具自身的超时 / 截断 / env 白名单。<code>tmp/17-bash执行工具/planning.md</code> D4 的名单步骤随之作废，该拍施工前按新决定重写。下文保留原文备查；第 5 节里「researcher 已经不是继承」的表述一并作废。</p>
+</blockquote>
+<p>翻案的具体内容（2026-10-17 落地）：</p>
+<ul>
+<li><strong>形状</strong>：frontmatter 新字段 <code>exclude_tools</code>（= 继承父池减去列出的名字），<code>resolveToolPool</code> 由三态变四态，操作定义见 <code>doc/26</code> §3。下文的白名单方案不再施工，但下文对「同一改动里封口 + 进池」的论证仍然成立——只是封口那一半从「写全名单」换成「写排除项」。</li>
+<li><strong>名单</strong>：researcher 今天的有效名单 = 父池去掉 <code>bash</code>（2026-10-18 <code>doc/26</code> 头注翻案后排除清单只剩 <code>- bash</code>，写类四把归还；10-16–10-18 之间曾是「父池去掉 <code>bash</code> 与写类四把」，另加 <code>search_history</code>、<code>web_search</code>——写下文时这两把都还不存在）。每场 run 打在 <code>agent tools researcher:</code> 日志行里（<code>doc/26</code> §6）。</li>
+<li><strong>「安全面改收在 bash 工具自身」同日失效</strong>：无自动超时已在 2026-10-15 拍定；截断与 env 白名单只影响回给模型的文本，不挡 <code>doc/26</code> §1 那条 <code>cat ../.env</code>。所以护栏只能收在「谁能拿到 bash」这一层。</li>
+<li><strong>护栏兑成检查</strong>：出厂配置与 <code>doc/26</code> 的一致性由 <code>agents_test.go</code> 的 <code>TestShippedAgentSpecToolGuards</code> 钉住——删掉排除项里的 <code>bash</code>、把 <code>web_search</code> 写进排除项、往父池加一把新工具，三种都会红。</li>
+</ul>
+<p><code>researcher.md</code> 今天没有 <code>tools</code> 这一行。装载时这一行缺席是空指针，子代理拿到父池的一份拷贝，父池加什么它就有什么。<code>bash</code> 若先单独进池，下一场 run 的调研规格就能跑命令。所以封口和进池写在同一次改动里，不能先发布工具、过几天再改文件。</p>
+<p>装载不新写。每场 run 起手，<code>BeforeAgent</code> 先拿走父池快照，这时子代理工具还没挂上，快照里只有 <code>NewWorker</code> 装进池子的那些工具。然后读 <code>agents/*.md</code>。<code>tools</code> 只有三种字节，代码里没有「继承但去掉某一个」（<strong>2026-10-17 起有了</strong>：第四态 <code>exclude_tools</code> = 继承父池减去列出的名字。四态表只在 <code>doc/26</code> §3 有一份，这里不复制——同一机制不留两处真源。下面三条是当时的原文，仍逐条成立）：</p>
+<ul>
+<li>不写这行：继承整份父池。</li>
+<li><code>tools: []</code>：一个工具都没有。</li>
+<li><code>tools: [名字, …]</code>：按名字从父池快照里把工具对象挑出来。名字对的是工具声明里的 <code>Name</code>，不是文件名。有一个名字父池里没有，整条规格拒载，日志一行，这场 run 照常跑，只是没有这个子代理。</li>
+</ul>
+<p>子代理拿到的是父池里的同一个工具对象。路径闸和「错误变成工具结果」不用再包一层。</p>
+<p><code>bash</code> 这一次改动做两件事。第一件，<code>NewWorker</code> 的池子在现有文件工具后面加上 <code>bash</code>，仍然排在拍快照之前，白名单才挑得到它。第二件，<code>researcher.md</code> 写成下面这份名单，里面没有 <code>bash</code>。名单按 <code>worker.go</code> 里的构造顺序写，末尾保留 <code>memory</code>——它在本版（第 7 节）已经先进父池，这里漏掉就等于 researcher 静默丢掉笔记，正是本节要防的事故：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">tools</span><span class="kw">:</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> get_time</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> write_file</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> read_text_file</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> read_file</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> edit_file</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> move_file</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> create_directory</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> list_directory</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> directory_tree</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> get_file_info</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> search_files</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> read_media_file</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a><span class="at">  </span><span class="kw">-</span><span class="at"> memory</span></span></code></pre></div>
+<p>只做了第一件、文件还是旧的：下一场 run，<code>researcher</code> 继承到 <code>bash</code>。名单里写了 <code>bash</code>、池子里还没有：这条规格拒载，主代理暂时不能委派调研，run 本身不失败。</p>
+<p>这一拍不改 <code>researcher</code> 的正文。正文里「手里有 <code>get_time</code>」和它实际已能读写文件，是改名单之前就有的不一致。搜索那一拍改正文时一起改掉。</p>
+<p><code>agents/coder.md</code> 是后一拍的新文件，不靠继承。规格全文、白名单和验收在 <code>doc/23-coder规格.md</code>（讨论稿，未点头）。那篇把原先那份名单改成 <code>write_file</code>、<code>read_text_file</code>、<code>edit_file</code>、<code>list_directory</code>、<code>search_files</code>、<code>memory</code>、<code>bash</code>。点头前以那篇为准，本段不再单独当施工依据。它必须等 <code>bash</code> 已经在父池里，否则按上面的规则整条拒载。</p>
+<h2 id="4-手动停止本版不做">4. 手动停止（本版不做）</h2>
+<blockquote>
+<p><strong>施工状态（2026-10-15）：已落地</strong>（台账 <code>tmp/17-手动停止/</code>）。本节设计与实装一致；额外落地一处行为变更：看门狗续约 CAS 0 行时 cancel 本场 run（跨副本 stop 的传播路径，同时改掉「租约自然过期不掐流」的现状，用户拍「掐」）。</p>
+</blockquote>
+<p>用户看见搜索或脚本停不下来，要能自己停。</p>
+<p><strong>做什么。</strong> 新增 <code>POST /api/runs/{runId}/stop</code>。库里把这场 run 从 <code>running</code> 改成 <code>stopped</code> 的更新带条件 <code>status='running'</code>。更新到 1 行，才算这次停止赢得了和正常收尾的竞态。更新到 0 行，说明已经是 <code>complete</code> 或 <code>error</code>，读出当前状态返回，不改写。19v6-90 四修裁掉取消端点，缺的就是这场竞态和半截 draft 的去留，这里把它们定下来。</p>
+<p><strong>闸。</strong> <code>stopped</code> 和 <code>complete</code>、<code>error</code> 一样放闸、给 runlive 设 TTL、删 draft。同一会话的下一条消息不再 409。</p>
+<p><strong>流要真的断。</strong> 只改数据库不够。看门狗在续约失败时只停止续约，不掐模型流（<code>worker.go</code> 的注释写的就是这条）。持有这场 run 的进程要把 <code>Run</code> 的 context 取消掉。子代理的调用已经在 <code>ctx.Done()</code> 上返回。<code>bash</code> 用同一个 context 起进程，取消时杀掉进程。请求若打到没跑这场 run 的副本，那一副本改完库就返回；跑着的副本在下一次续约（dev 默认约 10 秒）看见 <code>stopped</code> 再取消 context。本进程能对上 run 时不等这 10 秒。</p>
+<p><strong>历史里留什么。</strong> 不写一条假装说完的 assistant 行，和 <code>error</code> 一样。已经完成的 <code>tool_call</code> / <code>tool_result</code> 写入 runlog，<code>agent</code> 列照旧。不写的话，停之前花掉的搜索在刷新之后看不见，下一场模型也不知道做到哪。半截还没返回的工具调用不补一条假结果。用户那一行在开跑时已经落库，保留。</p>
+<p><strong>页面收口。</strong> 现有 <code>web/src/chat.ts</code> 只认两种结局。<code>terminal</code> 的 <code>status</code> 是 <code>error</code> 时，气泡转错误，不拉 log。否则去 log 里找这条 run 的 assistant 行来替换半截气泡；找不到就也转错误。<code>stopped</code> 不写 assistant 行，不改页面的话，人看见的是失败。停止这一拍改这一处：<code>status</code> 为 <code>stopped</code> 时，保留已经流出来的文字，标成停止，不去找终稿，也不转错误。页面上不加按钮。人要停，这一拍用 curl。</p>
+<p><strong>历史形状。</strong> 工具行今天是整场结束时从内存里一次写入的，不是边跑边落。<code>stopped</code> 的收尾走同一条写入，只写已经配对的 <code>tool_call</code> / <code>tool_result</code>，不写 assistant。下一条用户消息会和上一条用户消息挨在一起。现有折叠按两家模型都接受连续 user 消息来做，这里不加占位回复。</p>
+<p>打到正在跑这场 run 的进程，立刻取消 context。打到别的副本时，跑着的那侧最坏等一个续约间隔（dev 默认 10 秒）才看见 <code>stopped</code> 再取消。这一拍不为了更短再做通知。</p>
+<p><strong>这一拍不做什么。</strong> 不单独停子代理而让主线程继续。停的是整场 run。主线程还想接着说，是后面的用例。</p>
+<p><strong>验收。</strong> 投一条会调用 <code>bash</code>、命令是 <code>sleep 120</code> 的消息。随即 <code>POST /api/runs/{runId}/stop</code>。frames 的 <code>terminal</code> 里 <code>status</code> 为 <code>stopped</code>。<code>GET /api/sessions/{sessionId}</code> 的 <code>liveRunId</code> 为空。再投一条普通消息，得到 202，不是 409。log 里有停之前已经返回的工具行，没有这条 run 的 assistant 行。</p>
+<h2 id="5-网络搜索本版不做">5. 网络搜索（本版不做）</h2>
+<p>当前方案在 <code>doc/22</code>（讨论稿，未定案）。下面几段是原先的 Moonshot <code>POST /v1/tools/search</code> 建议，不再作为施工依据。施工顺序不变：仍排在执行工具和手动停止之后。</p>
+<p>Kimi 这边要分开三样东西。</p>
+<ul>
+<li><code>$web_search</code> 是 Kimi 对话接口里的内置工具。模型发出参数，Kimi 的服务器执行搜索，调用方把参数原样回传即可。它只在对话模型走 Kimi 时成立。开放平台写明预计 2026-10-20 下线。tako 的模型是按 ref 换的，不能把搜索绑死在一家对话模型上。</li>
+<li>替代品是 Moonshot 的独立接口：<code>POST /v1/tools/search</code>、<code>POST /v1/tools/search_pro</code>、<code>POST /v1/tools/fetch</code>，以及 Formula <code>moonshot/web-search:latest</code>。这是收费的托管服务，按次计价。聊天用哪家模型都可以，搜索单独拿 <code>MOONSHOT_API_KEY</code> 去调。</li>
+<li>kimi-code 开源仓库里的 <code>WebSearch</code>、<code>FetchURL</code> 是工具壳：参数是 <code>query</code> 或 <code>url</code>。文档写明搜索实现由宿主注入，没注入就不出现在工具列表里。仓库里没有可以搬进来的搜索引擎。</li>
+</ul>
+<p><strong>建议。</strong> tako 的工具名 <code>web_search</code>，参数 <code>query</code>。执行时调用 Moonshot 的 <code>POST /v1/tools/search</code>（要更全的结果再换 <code>search_pro</code>，待拍）。返回给模型的是标题、链接、摘要，单次有字节上限，推荐 8 KB。上限超出时截断并写明条数，不把原始网页灌进上下文。<code>fetch_url</code> 不在这一拍：抓整页是折叠之前最容易撑满窗口的动作。</p>
+<p>没配密钥时，工具结果是明确的错误文本，run 继续。搜索这一次改动同样绑在一起，原因在第 3.1 节：<code>researcher</code> 已经不是继承。只把 <code>web_search</code> 放进父池，它的白名单里没有这个名字，调研规格看不见搜索，也不会因此拒载。同一改动里做三件事：父池加上 <code>web_search</code>；<code>researcher.md</code> 的名单末尾加上 <code>web_search</code>；正文删掉「没有联网检索」，改成可以搜索，查不到就写未能查证并带上错误文本，并写明它能读文件、不能跑命令。<code>coder.md</code> 的白名单不加 <code>web_search</code>。</p>
+<p>结果超上限时按整条丢掉后面的条目，不从一条链接的中间切开。</p>
+<p><code>file_effect</code> 登记 <code>none</code>。它不碰 workspace 里的路径。</p>
+<blockquote>
+<p><strong>上两段已过期（2026-10-18 二稿，<code>doc/22</code> §3）</strong>：web_search 切到 DeepSeek <code>/v1/tools/search</code> 并改「始终落盘」——结果全文写 <code>.tako/search/&lt;runId&gt;_&lt;n&gt;.md</code>（沿本文件 §3.3 search_history 的 spill 机制），工具返回只有描述段（条数/token/路径），8192 上限与「整条丢」不再适用； <code>file_effect</code> 登记 <code>write</code>（程序命名新文件、一次一写，理由同 search_history）。本节其余 文字作 2026-10-12 拍板时点留档。</p>
+</blockquote>
+<p><strong>验收。</strong> 配好密钥后投「用 web_search 查一句今天的公开事实，回答里带一条来源链接」。frames 里有 <code>name=web_search</code>，<code>tool_result</code> 里有 <code>http</code>。没配密钥的那次，结果文本以「错误：」开头，terminal 仍是 <code>complete</code>。</p>
+<h2 id="6-子代理的折叠">6. 子代理的折叠</h2>
+<blockquote>
+<p><strong>施工状态（2026-10-17）：已落地</strong>（台账 <code>tmp/17-子代理折叠/</code>，A1/A2/A3 三拍验收全过）。A1 = <code>agentFoldHandler</code> 挂进子代理装配点（只折子代理自己的 state，root 的 foldBox 只读不写；与折叠同拍补齐 doc/24 的滤思考 + Usage 账单触发）。A2 = 失败路径：折叠链错误（文本哨兵判定，ADK graph 的 <code>[NodeRunError]</code> 包裹层不吃 Go 错误链）与厂商溢出拒收（<code>IsOverflowError</code>）都转成委派的错误文本结果、父 run 保持 complete，手动停止维持裸上抛。A3 = bash 写路径经 command 扫描钉进子代理摘要端到端。实测（12000 窗 / limit 9600 / 小窗档摘要上限 1024 tok）：researcher 连续四折 <code>21881→1683 tok</code>，四行 <code>agent fold</code> 全部 <code>钉 1 路径: markers.txt</code>（第二折起路径继承自上一折摘要里的 file-ops 块）；失败路径活体 = 摘要验货拒收 0/3 → 错误文本进主线程 → 父 run complete。三条实录勘误：① root 与子代理的用量基线都含工具 schema（vendor prompt ~3.4k tok 起），压测窗口必须给 root 全场用量留余量；② root 拿到错误文本后重试是合法行为，重试把长输出拉进主线程再撞<strong>主线程</strong>折叠墙仍是 run error（主线程行为不变）；③ 上限 1024 下验货拒收随机（同材料一场一次过一场 0/3），A2 是失败兜底不是失败必现开关。 <strong>更正指向（2026-10-23）：本节「实例竞态」段中「子代理路径下每个委派派生各自非 nil 的取消柄」的推导已过期</strong>——对着 eino v0.9.21 逐行复核：<code>deriveCheckpointAwareSubAgentCancelContext</code> 在父作用域为 nil 时返回 nil（tako 不用 <code>adk.WithCancel</code>、ctx 不挂 eino 作用域），子代理路径与主 run 同为 nil 写 nil。现行结论、处置与施工真源在 doc/25 §6/§7（壳化装配 2026-10-23 已落地：子代理实例每次委派新建，本段 race 的触发路径一消除；触发路径二——主 run 实例跨会话共享——仍登记）。本节该段及以下时间线推演保留作历史诊断，不作施工依据。</p>
+</blockquote>
+<p>19v6-10 第 10 节当时不压子代理，理由是它的状态跑完即弃、回传有上限、摘要没有下一个读者，主线程把这次委派当成一次普通工具往返，随主 run 一起折叠。</p>
+<p>多轮搜索把这个理由里的「没有读者」打破了。读者是子代理自己的下一次模型调用。它在交终稿之前就要把前几轮搜索结果挤出去，否则终稿出不来，主线程的折叠没有东西可折。</p>
+<p><strong>压在哪。</strong> 只压子代理进程里的那份消息列表。不往 <code>run_model_messages</code> 插行，不占用主 run 的 <code>seq=0</code>。runlog 里已经写下的工具行不动。主线程拿到的仍只是终稿。</p>
+<p><strong>登记的代价（不补救）。</strong> 摘要行因此拿不到 mh 坐标——<code>RunID</code> / <code>Seq</code> 是落库时才发的身份——它只以消息形状留在子代理进程里。于是第二次折叠时，上一次的摘要在它眼里就是一条普通历史消息，会被连同新料再摘一次：摘要套摘要。主 run 没有这个问题，因为它的摘要落在 <code>seq=0</code>、下一次折叠从库里读回、认得出那是摘要。子代理跑完即弃，多套一层只影响终稿的措辞密度，不值得为它单开一条落库路径。</p>
+<p><strong>挂在谁身上。</strong> 折叠挂在 ADK 的 middleware 上（子代理装配处今天已经有一个 <code>callerStampMiddleware</code>，新挂件追加进同一个 Handlers 列表）。这个 middleware 实例在一次装配里只有一份，而<strong>同一场 run 里，主代理可以在一条消息里并行发两次同名委派</strong>——eino 的 ToolsNode 默认并行执行同一条 assistant 消息里的多个 tool_call，tako 从没把它改成串行——两个 goroutine 于是同时进同一个实例。所以它不许在字段里存任何一次调用专属的东西（计数器、上一份摘要、上一次估出的长度）；一次调用的状态只走它自己的参数和 ADK 交给它的那份 <code>state</code>。跨 run、跨 session 不共享实例（子代理是每场 run 起手装配的），那不是这条禁令的依据。</p>
+<p><strong>实例竞态（eino 侧，2026-10-16 核实）。</strong> 上面那句「一次调用的状态只走它自己的参数和 ADK 交给它的那份 <code>state</code>」就 state 而言成立，但不充分：<code>ChatModelAgent</code> 实例体内还有一层 ADK 自己的共享可写字段，middleware 无状态管不到它。以下两段把这件事讲透（事实均已对着 eino v0.9.21 源码逐行核实）。</p>
+<p><strong>舞台与角色。</strong> 期待的多租户用法（上游 <a href="https://github.com/cloudwego/eino/issues/1177">issue #1177</a> 的 Production scenario 原文）：进程启动时建一个 <code>ChatModelAgent</code> 实例——tako 里就是 <code>NewWorker</code> 造出的主代理实例（<code>worker.go:207</code>）。之后每个用户的每条消息，都是往这同一个实例发一次 <code>Run(ctx, ...)</code>：甲的请求开 run A（goroutine A），乙的请求开 run B（goroutine B）。会话闸只保证「甲自己同时最多一场」，甲和乙之间没有任何互斥——这是合法用法，上游也认为这是该支持的。</p>
+<p>两个道具的真身：</p>
+<ul>
+<li><code>msgConf</code>：实例级<strong>唯一</strong>的配置对象（<code>reactConfig</code>）。实例第一次 Run 时 <code>once.Do</code> 建出它、被缓存的闭包捕获——全场只有一份。它有个字段 <code>cancelCtx</code>。</li>
+<li><code>cancelCtx</code>（取消柄）：这场 run 自己的停止开关。图建起来时被交给图里几个安全检查点（每次模型调用前后、工具调用前后），检查点每轮问一句「这柄被 cancel 了吗」，是就优雅收尸。手动停止端点掐的就是它。</li>
+</ul>
+<p>每个 goroutine 进闭包后做的三件事（eino v0.9.21 <code>adk/chatmodel.go:1145-1148</code> 源码真身）：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a>cancelCtx <span class="op">:=</span> mp<span class="op">.</span>cancelCtx              <span class="co">// ① 取本场自己的柄</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>msgConf<span class="op">.</span>cancelCtx <span class="op">=</span> cancelCtx          <span class="co">// ② 写进【共享的】msgConf</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>msgConf<span class="op">.</span>modelWrapperConf<span class="op">.</span>cancelContext <span class="op">=</span> cancelCtx</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>g<span class="op">,</span> err <span class="op">:=</span> newReact<span class="op">(</span>ctx<span class="op">,</span> msgConf<span class="op">)</span>       <span class="co">// ③ 读 msgConf，建本场的图</span></span></code></pre></div>
+<p>注意②③的配合：<strong>先写后读</strong>。单跑时这就是「把本场的柄装进本场的图」，完全正确——顺序复用的对照实验（A 跑完再跑 B）race detector 是干净的。</p>
+<p>出事的时间线——两个 goroutine 各自做①②③，调度随便穿插，最坏的一种：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>时刻</th>
+<th>goroutine A（甲的 run）</th>
+<th>goroutine B（乙的 run）</th>
+<th>msgConf.cancelCtx 的值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>t1</td>
+<td>①取到甲的柄</td>
+<td></td>
+<td>—</td>
+</tr>
+<tr>
+<td>t2</td>
+<td>②写入甲的柄</td>
+<td></td>
+<td><strong>甲的柄</strong></td>
+</tr>
+<tr>
+<td>t3</td>
+<td></td>
+<td>①取到乙的柄</td>
+<td>甲的柄</td>
+</tr>
+<tr>
+<td>t4</td>
+<td></td>
+<td>②写入乙的柄</td>
+<td><strong>乙的柄</strong></td>
+</tr>
+<tr>
+<td>t5</td>
+<td>③读 msgConf → <strong>把乙的柄装进甲的图</strong></td>
+<td></td>
+<td>乙的柄</td>
+</tr>
+<tr>
+<td>t6</td>
+<td></td>
+<td>③读 msgConf → <strong>把甲的柄装进乙的图</strong></td>
+<td>甲的柄</td>
+</tr>
+</tbody>
+</table></div>
+<p>t5 是病灶：<strong>A 读的瞬间，字段里躺的是 B 刚写的值</strong>。两个柄互换装机完毕。</p>
+<p>后果分两个版本：</p>
+<ul>
+<li><strong>有功能危害（同一场 run 内同名并行委派）。</strong> 主代理在一条消息里对 researcher 发两个 tool_call，eino 默认并行 → 两个 goroutine 进同一个 researcher 实例。子代理路径下每个委派派生各自<strong>非 nil</strong> 的取消柄。上演上面的时间线后：甲点停止 → 程序 cancel 甲的柄 → 但甲的 researcher 图里装的是乙的柄 → 安全检查点问「乙的柄 canceled 了吗」→ 没 → <strong>甲停不下来</strong>；乙什么都没点 → 但乙的图里装的是甲的柄 → 甲一 stop，乙的 run 被掐断。stop 一个、杀错一个，双双反了。</li>
+<li><strong>无功能危害（跨会话主 run）。</strong> 主 run 路径的 <code>mp.cancelCtx</code> <strong>恒为 nil</strong>（原因见下一段）：写的读的都是 nil，没有非 nil 的柄可供串线，挂图中断的整段分支从不启用。唯一发生的实质事件是两个 goroutine 无锁写了同一个字——<code>-race</code> 必报，但谁也掐不动谁。所以 stop A 杀不到 B。</li>
+</ul>
+<p>端到端链路，病灶标在哪一环：</p>
+<pre><code>甲点停止 → POST /runs/A/stop → CAS 翻库(只翻A行)
+  → runCancels 按 runId 取 A 的 CancelFunc → cancel 甲的柄
+    → 【病灶环】甲的图从共享 msgConf 读到的柄
+      → 同名并行委派：读到乙的柄 → 甲停不下，乙被误杀
+      → 跨会话主 run：读到 nil → 无事发生，race detector 报警</code></pre>
+<p>病灶精确位置：「cancel 甲的柄」到「甲的图真正响应停止」之间，隔着一个被并发写坏的共享读源。库、闸、context 传递每一环都按 run 隔离，全对；错的是 eino 实例体内这一份没上锁的共享配置。</p>
+<p>上游实锤：<a href="https://github.com/cloudwego/eino/issues/1177">issue #1177</a>（2026-08-05）与本节逐字同发现——共享 <code>reactConfig.cancelCtx</code> 在并发 <code>Run</code> 复用同一实例时 data race；<a href="https://github.com/cloudwego/eino/pull/775">#775</a>（并发 Compile race）已修，#1177 仍开着，v0.9.21 本地亲读源码确认未修（issue 记载 v0.10 alpha 亦未修）；<a href="https://github.com/cloudwego/eino/issues/1170">#1170</a>（callback handler slice race）也开着。官方示例（eino-examples/adk）全是单会话控制台脚本，没有任何多租户共享实例的演示；框架对 run <strong>内</strong>并发（同名工具并发调用）是显式支持的，run <strong>间</strong>并发没有防护。eino 处于「想让一个实例能被多租户并发复用、但还没走到」的灰色地带——两个极都不能假设。修法提案（#1177 里的 repro + 每调用浅拷贝 <code>msgConf</code> + 验证清单）与本节推的「<code>msgConf</code> 每调用一份」一致；其 repro 测试可直接借用为本拍验收剧本的底座（两个会话并发 + stop 其一）。</p>
+<p><strong>为什么主 run 的柄恒 nil、子代理的柄非 nil。</strong> 这个分界不是「主/子」身份决定的，是「谁给可选参数、ctx 里有没有现成作用域」决定的。</p>
+<p>主路径：<code>Run</code> 入口调用 <code>resolveRunCancelContext</code>（<code>chatmodel.go:484-507</code>）——<code>o.cancelCtx</code>（Run 的可选参数）为空，且主 run 的 ctx 里没人塞过 eino 作用域（tako 的 ctx 是 worker 自造的纯 Go context）→ 返回 nil。可以没有的原因：eino 图执行器每个节点边界都查 <code>ctx.Done()</code>，「整 run 掐死」靠 Go context 就够——tako 的手动停止正是这么实现的（<code>runCancels</code> 存的就是 Go <code>CancelFunc</code>）。<code>cancelContext</code> 这层是选配的高级能力：安全点停止（模型调用完再收）、业务中断（HITL 审批）、checkpoint/断点续跑、abort-only 递归中止。tako 全都没用，字段就是 nil。</p>
+<p>子路径：非 nil 不是选配，是 eino 每次调用自己造的。<code>typedAgentTool.InvokableRun</code> 每次走 <code>extractAndDeriveAgentToolCancelCtx</code>（<code>agent_tool.go:325-330</code>）→ 每场委派派生一个全新的子作用域。原因：子代理是寄居在父 run 里的执行体，eino 必须握着一个每场委派独立的取消作用域才能管理它的生命周期——父 run 被 stop 时信号怎么传进子代理的图、按安全点收尸还是立即打断，都挂在这上面。</p>
+<p>非 nil 的到底是什么：eino 自造的「取消作用域」对象（<code>cancelContext</code>，<code>cancel.go:355-400</code>）——不是 Go context，是一组信号通道 + 父子链 + 图中断挂钩 + 安全点配置：<code>cancelChan</code>（普通停止，下一个安全点收）、<code>immediateChan</code>（立即打断图）、<code>doneChan</code>、<code>recursiveChan</code>（父死子死）、<code>parent</code> 指针、<code>root</code> 标记，外加 <code>setGraphInterruptFunc</code> 与 <code>CancelAfterChatModel</code>/<code>CancelAfterToolCalls</code> 安全点配置。派生时还会起两个传播 goroutine 盯着父作用域的两类信号（源码注释警告：结束不调 <code>markDone()</code> 这两个 goroutine 会泄漏）。所以每个委派的 cancelContext 是<strong>一场调用一份的私有物</strong>，还带着自己的看护 goroutine。</p>
+<p>收拢：主路径 nil = 图里没装 eino 取消层，停止全靠 Go ctx（跨 run 天然隔离）→ 竞态只是「写 nil 读 nil」的内存模型违规，不咬人；子路径非 nil 且每场委派各一份 = 图里装的是<strong>有内容的私有柄</strong>，被交错后 A 的图真可能拿着 B 的柄 → stop 串线，咬人。共享 msgConf 的问题恰在于：它把本该各归各的私人物品放在公共黑板上写。</p>
+<p><strong>对本拍的处置（2026-10-16 登记，待拍）。</strong> 在 eino 修好（#1177 合入后升级）之前，「同一实例别被两个 goroutine 同时进」是唯一可靠的安全绳：同名并行委派用 per-name 互斥（异名并行不受影响）；跨会话主 run 的 nil 竞态可只登记不处理（功能无害，eino 升级时跟进）；或给上游供 repro/PR 走治根路；若本拍排期早于 eino 修版、又不想带「同名并行委派 + stop 串线」上线，还有第四条过渡路——强制重建绷带（见下）。</p>
+<p><strong>per-run 可变的维度与 eino 的承载方式（2026-10-16 讨论回填）。</strong> once/frozen 架构对「跨 run 变化」只友好两种回答：<strong>ctx 驱动的间接层</strong>或<strong>per-run 装配</strong>；凡 per-run 要变的维度都该走这两条路，写字段是违例。按维度对表（eino v0.9.21，行号均已核实）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>per-run 可变?</th>
+<th>eino 的承载</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>模型（每次调用生效哪个）</td>
+<td>产品可选</td>
+<td><code>WrapModel</code> 包装链（<code>handler.go:254</code>，<code>wrappers.go:1049/1137</code> 每调用执行）；<code>ModelFailoverConfig</code>；或槽位里放「路由器模型」按 ctx 分发</td>
+</tr>
+<tr>
+<td>消息/指令</td>
+<td>tako 需要</td>
+<td><code>BeforeModelRewriteState</code>（<code>handler.go:171</code>）改写 state；或构造时自定义 <code>GenModelInput</code></td>
+</tr>
+<tr>
+<td>工具清单</td>
+<td>可能</td>
+<td><code>BeforeAgent</code> 改 <code>ChatModelAgentContext</code> 副本（<code>handler.go:90-127</code>），<code>toolUpdated</code> 走 <code>WithToolList</code> + 每 run 重采 toolInfos</td>
+</tr>
+<tr>
+<td>工具拓扑（空→非空）</td>
+<td>—</td>
+<td>触发 <code>rebuildGraph</code>，当场重建 run func = 全新 msgConf（见下两段）</td>
+</tr>
+<tr>
+<td>cancelCtx</td>
+<td>必须</td>
+<td><strong>无通道</strong> → 写在共享 msgConf 上 = #1177</td>
+</tr>
+<tr>
+<td>maxIterations / 模型槽位 / agentName</td>
+<td>—</td>
+<td>不在 <code>ChatModelAgentContext</code> 可改字段内，只有新实例</td>
+</tr>
+</tbody>
+</table></div>
+<p>cancelCtx 是唯一「必须 per-run 变」却没有间接层的维度——这就是 #1177 的全部实质。</p>
+<p><strong>模型：可以「换」，挂点已在 tako（立项为后话）。</strong> 「每个 session 选不同模型」不需要动实例：<code>msgConf.model</code> 槽位 once 冻死、永远不该写；每次模型调用前的包装链给 middleware 留了 <code>WrapModel</code> 钩子，在包装里读 ctx 决定委托给哪个真客户端即可，槽位里那个只是默认值。tako 侧两个前提件已有：<code>AgentLogHandler.WrapModel</code>（<code>agentlog.go:65</code>）已在主代理链上，其注释明写此位点用途为「重试 / 换模型 / 改造输出流」；<code>agentModelTable</code>（<code>agents.go:180-225</code>）已按 run 携带「agent 名 → 模型身份」表（主代理为空串条目，BeforeAgent 写入）。主代理 per-session 模型的最小落地形状：Run 起手按 session 偏好定 rootRef 填表 → 一个 WrapModel middleware 查表委托。子代理规格的 per-spec 模型（frontmatter <code>model:</code> 字段）今天已走「每场 run 装配各自实例」实现。红线：<strong>换模型走包装，写字段是 #1177 同款坑</strong>。</p>
+<p><strong>拦截点全景与 rebuildGraph（钩子能不能「不用 default msgConf」）。</strong> middleware 接口 <code>TypedChatModelAgentMiddleware</code>（<code>handler.go:115</code> 起）的 per-call 钩子：<code>BeforeAgent</code>（每 run 前，可改 Instruction/Tools/ReturnDirectly/ToolSearchTool 的副本）、<code>BeforeModelRewriteState</code>（每次模型调用前改写 state）、<code>WrapModel</code>、<code>WrapToolCall</code>、<code>AfterAgent</code>；另有构造期的 <code>GenModelInput</code>。「不用 default msgConf」的最强形态存在：<code>rebuildGraph=true</code> 时 <code>getRunFunc</code> 当场 <code>buildReActRunFunc(ctx, runtimeBC)</code>（<code>chatmodel.go:1426-1443</code>）——新造 msgConf，连嵌套 <code>modelWrapperConf</code> 都是新的。但触发条件是窄启发式（<code>chatmodel.go:837</code>）：仅「工具 0→非 0」或「returnDirectly 0→非 0」为真；改指令、增删工具大多不重建，复用缓存闭包 + 每 run 新 toolInfos。</p>
+<p><strong>强制重建：等 #1177 的临时绷带（候选，待拍）。</strong> 机制上成立：重建路径上 msgConf 每调用新分配、共享那份无人写，#1177 的写字竞态对两条触发路径（同场同名委派、跨会话主 run）都消失；代价≈一次结构体分配（重活两路本来每跑都付：<code>genToolInfos</code>、<code>newReact</code>、<code>chain.Compile</code>）。逼法：middleware 在 <code>BeforeAgent</code> 往 <code>runCtx.ReturnDirectly</code> 塞一项，使 rebuildGraph 恒真（前提：该代理 once 的 returnDirectly 为空——主代理装配处未配此字段，<code>worker.go:209-214</code>，待坐实）。认定为 hack 而非修法的三条理由：①扳机是框架内部启发式、非公共 API，且 ReturnDirectly 有真实行为含义（该工具被调用即直接返回），塞假名是语义污染；②<strong>升级脆性最要命</strong>——eino 将来若加「无实质变化不重建」的短路，并发安全被静默拆除、race 悄悄回归，比不防更糟（虚假安全感）；③只盖住 msgConf 一层，middleware 实例共享的纪律（本节前文）不因它改变。若采纳须带三条件：<code>-race</code> 实测坐实（#1177 的 repro 稍改即是）；注释写明依赖 eino v0.9.21 <code>chatmodel.go:837</code> 的行为、eino 每次升级必重验；台账标明 #1177 合入即拆。</p>
+<p><strong>待坐实 / 待拍清单（2026-10-16）。</strong> ① 主代理与各子代理实例 once 的 <code>returnDirectly</code> 是否均为空（决定绷带扳手对全部代理可用，还是只对部分可用）；② 本拍处置四选如何拍：per-name 互斥 / per-run 装配 / 给上游供 repro / 强制重建绷带（可组合）；③ 主代理 WrapModel 按 agentModelTable 换模型，立项为后话；④ 上一轮文档审查的 4 处过期引用（§3.1 说 doc/23 未点头、§2 残留 researcher 白名单句、19v6-08 网络登记错挂、§5 说 doc/22 未定案）与台账同步（实例竞态登记为已知风险、验收剧本借 #1177 repro）均待点头。</p>
+<p><strong>怎么压。</strong> 用主 run 同一条摘要链，也用同一把 <code>-compact-window</code>，不另设旗标。「同一条链」在 <code>doc/24</code> 落地之后是三件事，顺序固定：<strong>先按账单估长度，再决定折不折，放行前把上一枪的思考滤掉</strong>。</p>
+<ul>
+<li><strong>估长度</strong>走 <code>doc/24</code> 第 5、6 节那两条路：子代理自己的上一条 assistant 消息带着厂商账单（<code>PromptTokens</code> / <code>CompletionTokens</code>）时，长度 = 账单基线 + 那一枪的可见输出 + 之后新增的行；没有账单（本场首呼、账单字段全为 0）时退回全量分词自测。</li>
+<li><strong>折</strong>只在超限时发生，留下最近一轮工具往返。摘要失败就不调用子代理的主模型，把错误文本当作这次委派的工具结果交回去，父 run 保持 <code>complete</code>。厂商直接以「上下文超长」拒收同样算这一类（2026-10-16 裁定）：它和摘要失败是一回事——终稿出不来——所以转成同一形状的错误文本，不让一次委派把整场 run 打回 <code>error</code>；其他错误仍原样上抛。</li>
+<li><strong>滤思考</strong>是 <code>doc/24</code> 第 3 节那条规矩在子代理侧的补课：今天只有主代理在放行前清空 <code>ReasoningContent</code>，子代理没有，于是它每多一轮就把上一枪的思考原文再发一遍。滤必须排在估之后——估算的减项要读那段思考原文，先滤掉就只能把减项估成 0。</li>
+</ul>
+<p>顺序之外的部分不变：子代理工具调用里的写路径，用现有的 <code>extractFileOps</code> 钉在它自己的摘要末尾。摘要模型沿用主 run 的那个，不因为子代理换了 <code>model</code> 就再开一家。</p>
+<p><strong>不做的后果。</strong> <code>researcher</code> 搜四五次，窗口满，委派以上下文错误结束。用户看到的是失败，不是报告。</p>
+<p><strong>验收。</strong> 把折叠窗口调小，让子代理连着产生两份长结果。第二次模型调用之前，子代理侧的输入里前一次的长结果已经被摘要替换；主线程的 <code>run_model_messages</code> 不出现子代理的摘要行；终稿仍回到主线程，且两份结果各自的关键信息都还在终稿里。</p>
+<p>「子代理侧的输入」今天没有任何观测面（主 run 有 midfold 那两行日志，子代理一行都没有），所以这一拍同时加两行 dev 日志，格式钉死：<code>agent fold &lt;名字&gt;: &lt;前&gt;→&lt;后&gt; tok; 钉 &lt;n&gt; 路径: &lt;逗号连接&gt;</code> 与 <code>agent usage &lt;名字&gt;: 基线 … + 可见输出 … + 新增 … = … tok，limit …</code>。验收读的就是它们。</p>
+<p>长结果用 <code>bash</code> 造（<code>python3 -c 'import secrets;print(secrets.token_hex(15000))'</code>，约 30000 字符高熵 ≈ 8–9k tok），不用 <code>web_search</code>：搜索要外部厂商，<code>cf2bde3</code> 的验收窗口里 searchfree 就宕过一次（<code>doc/22</code> 第 9 节的预案），真源里的验收剧本得能自己复现。<code>web_search</code> 降级为旁证——配好密钥时另投一次，看同样出现 <code>agent fold</code> 行。</p>
+<p>这一拍不改 19v6-10 里主 run 的折叠，也不改 <code>doc/24</code> 的公式、旗标与提示词。翻掉的是两句边界：19v6-10 的「子代理内部不压」，和 <code>doc/24</code> 第 8 节的「不给子代理新挂折叠」。</p>
+<h2 id="7-笔记以及两边怎么共享">7. 笔记，以及两边怎么共享</h2>
+<p>持久共享要先有记忆层。这一层做的时候就把读路径接到两边，不另立「共享」项目。</p>
+<p><strong>库。</strong> PostgreSQL 一张表，按 workspace 绝对路径分开。现在没有用户表，不加 <code>user_id</code>。一行含 <code>kind</code>（<code>agent</code> 或 <code>user</code>）、<code>content</code>、<code>quote</code>、<code>source_run_id</code>、<code>source_seq</code>、<code>superseded_by</code>。替代是新插一行，旧行的 <code>content</code> 不改，只填指针。未替代的 <code>content</code> 合计：<code>agent</code> 2200 字，<code>user</code> 1375 字，超出拒绝新增。<code>quote</code> 超过 200 字拒绝，不截断。</p>
+<p><strong>模型怎么会去调用。</strong> 程序不读用户那句话，也不判断它是不是规矩。没有另一个模型事后检查「要不要记」。模型只会使用这次请求里列出来的工具。它看不看 <code>memory</code>，取决于这次请求里有没有这个工具，以及说明里写了什么时候该用。</p>
+<p>用户消息是：</p>
+<pre class="text"><code>deck 放在 output/deck.html，以后改这个文件，不要重建。</code></pre>
+<p>这一轮发给模型的请求里，除了这句话，还有两样东西。</p>
+<p>第一样在工具表里，和其他工具并列。<code>memory</code> 的说明固定写成：</p>
+<pre class="text"><code>把以后每一场 run 都要遵守的事实写进笔记。笔记会进以后每一场的系统提示，所以只写短句。
+action=add 是新的一条，必须带 quote，quote 是用户原句。
+action=replace 是用户改了口，用快照里那条 content 全文定位旧行，并带上新的 quote。
+不写：任务进度、刚做完的步骤、从文件里能再读到的内容。</code></pre>
+<p>没有这段说明，模型只看见一个名字，不知道该在用户说完规矩的这一轮使用它。</p>
+<p>第二样在系统提示末尾。第一次是：</p>
+<pre class="text"><code>笔记：（空）</code></pre>
+<p>模型把用户消息、这段说明和这份空快照放在同一次请求里看，自己决定这一轮要不要调用。它调用时，参数是：</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;action&quot;</span><span class="fu">:</span><span class="st">&quot;add&quot;</span><span class="fu">,</span><span class="dt">&quot;kind&quot;</span><span class="fu">:</span><span class="st">&quot;agent&quot;</span><span class="fu">,</span><span class="dt">&quot;content&quot;</span><span class="fu">:</span><span class="st">&quot;deck 在 output/deck.html，以后只改这个文件，不要新建。&quot;</span><span class="fu">,</span><span class="dt">&quot;quote&quot;</span><span class="fu">:</span><span class="st">&quot;deck 放在 output/deck.html，以后改这个文件，不要重建。&quot;</span><span class="fu">}</span></span></code></pre></div>
+<p><code>content</code> 是它整理后的句子，措辞可以和用户不一样。<code>quote</code> 是它从用户消息里抄下来的原句。程序看到 <code>quote</code> 非空且不超过 200 字，才插入一行，并自己填上这场 run 的 id 和这条消息在 runlog 里的位置。它也可以先干活、稍后再调用。没调用，表里没有新行。</p>
+<p>同一会话里如果它忘了调用，折叠提示词仍要求把规矩的原句留在摘要里，这场会话的后几轮还可能看见。新开的会话没有这场摘要，规矩就丢了。</p>
+<p>模型若漏了 <code>quote</code>：</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;action&quot;</span><span class="fu">:</span><span class="st">&quot;add&quot;</span><span class="fu">,</span><span class="dt">&quot;kind&quot;</span><span class="fu">:</span><span class="st">&quot;agent&quot;</span><span class="fu">,</span><span class="dt">&quot;content&quot;</span><span class="fu">:</span><span class="st">&quot;deck 在 output/deck.html，以后只改这个文件，不要新建。&quot;</span><span class="fu">}</span></span></code></pre></div>
+<p>工具结果是错误文本，表里没有新行。它可以再调一次，把原句补上。<code>add</code> 和 <code>replace</code> 一律要非空 <code>quote</code>，因为这次调用的参数里没有别的字段能表示「这句要不要留原话」。<code>remove</code> 不带 <code>quote</code>。搜索、折叠、委派都不检查 <code>quote</code>。</p>
+<p>过了一周，用户改口，消息是「deck 可以重建了」。这次请求的系统提示末尾已经不是空的，而是上次写下的那条：</p>
+<pre class="text"><code>笔记（本场开始时读取，本场中途的写入要到下一场才进入这里）：
+- deck 在 output/deck.html，以后只改这个文件，不要新建。
+  原话：「deck 放在 output/deck.html，以后改这个文件，不要重建。」</code></pre>
+<p>模型看见旧的 <code>content</code> 还在，说明里又写了改口用 <code>replace</code>，才会发出：</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;action&quot;</span><span class="fu">:</span><span class="st">&quot;replace&quot;</span><span class="fu">,</span><span class="dt">&quot;kind&quot;</span><span class="fu">:</span><span class="st">&quot;agent&quot;</span><span class="fu">,</span><span class="dt">&quot;content&quot;</span><span class="fu">:</span><span class="st">&quot;deck 可以重建。&quot;</span><span class="fu">,</span><span class="dt">&quot;quote&quot;</span><span class="fu">:</span><span class="st">&quot;deck 可以重建了。&quot;</span><span class="fu">,</span><span class="dt">&quot;old_content&quot;</span><span class="fu">:</span><span class="st">&quot;deck 在 output/deck.html，以后只改这个文件，不要新建。&quot;</span><span class="fu">}</span></span></code></pre></div>
+<p><code>old_content</code> 必须和快照里那条 <code>content</code> 全文一致。程序新插一行，旧行的 <code>content</code> 和 <code>quote</code> 保持「不要重建」那句不动，只把 <code>superseded_by</code> 指向新行。快照只读新行。快照里没有旧句时，它不知道该定位哪一行。旧原话留在库里，两周后用户问「我说过不要重建吗」，对质打开的是旧行的 <code>quote</code> 和 runlog 位置，不是后来改写过的 <code>content</code>。</p>
+<p><strong>工具。</strong> <code>memory</code>，<code>action</code> 为 <code>add</code> / <code>replace</code> / <code>remove</code>。<code>replace</code> 和 <code>remove</code> 用参数 <code>old_content</code> 定位，它必须等于未替代行的 <code>content</code> 全文。定位不到或多行命中就返回错误文本。本版只把 <code>memory</code> 放进父池。<code>researcher.md</code> 没有 <code>tools</code> 行，会继承到它。以后若给它写白名单，名单里要保留 <code>memory</code>，否则它失去笔记——这个「以后」已由 <code>doc/26</code> 兑现（2026-10-16）：researcher 走的是 <code>exclude_tools</code> 排除路（2026-10-18 翻案后排除清单只剩 <code>bash</code>），<code>memory</code> 不在排除项里，仍在有效名单中，并由 <code>agents_test.go</code> 的 <code>TestShippedAgentSpecToolGuards</code> 逐名钉住。<code>coder.md</code> 本版不建。</p>
+<p><strong>本版必须一起做的四件，否则形状接不上 Hermes。</strong></p>
+<ol type="1">
+<li>成功和因超上限被拒绝的工具结果，都带回这个 workspace 里还有效的条目，以及已用字数，例如 <code>agent 40/2200</code>。快照在本场开始时定死，同一场里的下一次 <code>replace</code> 只能拿工具结果里的 <code>content</code> 全文当 <code>old_content</code>。</li>
+<li>同一场 run 里，超上限、定位失败、原话为空这类写入失败记到 3 次。第 4 次的结果写明：停止再调 <code>memory</code>，先回复用户。否则笔记满了的时候，模型会一直重试，用户等不到回复。</li>
+<li><code>content</code> 和 <code>quote</code> 在写入时检查：含有零宽、bidi 控制符这类人眼不可见的字符（17 码点，清单 = <code>notes.go</code> 的 <code>noteInvisibleRunes</code>）就拒绝，不插入。已经在库里的行，渲染快照时换成占位文字，写明用 <code>remove</code> 删掉；库里的原文留着。不做的话，一句夹带不可见字符的话，从下一场起就排在系统提示里，人审时却看不见那些字符。<strong>句式词表 2026-10-15 裁除</strong>：句式拦不住语义——纯中文写法（「禁用 system prompt」）一条不命中，把锚词换成中文、写全角都能绕，清单列不尽；隐形字符清单有限、能枚举尽、与语言无关，拦的是「能不能藏」不是「说了什么」。裁定与实测见 <code>19v6-90</code> 十七次修订。</li>
+<li>检查剩余字数和插入新行在同一笔数据库事务里，锁住这个 workspace 的笔记。笔记不按会话分。两个会话同时各写一笔，会同时以为没超上限。一个会话里「同时只有一场 run」管不到这件事。</li>
+</ol>
+<p><strong>快照只放还有效的行，不放按当轮消息检索出来的文字。</strong> 以后若要做 Hermes 那种「这一轮才想起的内容」，那段文字接在当轮用户消息末尾，并标明不是新的用户输入，不进系统提示。本版没有这段检索，函数也不留。留一个永远返回空串的函数，没有调用方。</p>
+<p><strong>写入只走一个函数。</strong> 工具是它现在的调用方。以后的事后检查若要写笔记，调用同一个函数，从而经过同一道字数上限、原话检查和隐形字符检查。本版不建第二个写入入口，也不建第二张表。</p>
+<p><strong>快照。</strong> 每场 run 起手读一次未替代的行，渲染成一段文字。根代理的 <code>Instruction</code> 在 <code>NewWorker</code> 时已经写成 <code>SystemPrompt()</code>，不能靠改那个启动字符串。快照和这句拼成这一场的系统提示，本场后续调用都用这份，工具写库不回写它。子代理装配时，规格正文后面接同一份快照。</p>
+<p>不接的后果：根代理记得不要重建，<code>coder</code> 的正文里没有这句，它仍会新建文件。</p>
+<p>同一场里子代理写进库的新行，主代理的这份快照看不见，主代理也看不见子代理的那次工具调用。主代理这一场只看得到终稿。新行从下一场 run 起进入两边的快照。这够用在「下一会话还记得」。若要求同一场后半段就看见，系统提示的字节会在一场里变掉。</p>
+<p><strong>不共享的东西。</strong> 不把主线程的模型历史复制给子代理。隔离就是为了让那 40 份日志和搜索原文留在子代理里。</p>
+<p>折叠提示词加一句：被折掉的原文里，用户明确说过的规矩按原句留在摘要里。不从摘要自动往笔记表插行。</p>
+<p><strong>验收。</strong> 一场 run 里用 <code>memory</code> 记下 deck 的路径和原话。新会话问 deck 在哪，回复含路径，且没有 <code>write_file</code> 去新建。deck 那句不写进交给 <code>researcher</code> 的任务文字，只靠规格正文后接的快照：装载时打出的子代理 system 日志行（M5 引入的 dev 观测面）里能读到这句。库里 <code>replace</code> 之后旧行 <code>content</code> 不变。</p>
+<p>行数被上限住，全部进快照。本版不建检索口、向量表、T-Mem，也不建外挂提供者。</p>
+<h3 id="71-怎样才算接得上以后的-hermes">7.1 怎样才算接得上以后的 Hermes</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>以后要接的</th>
+<th>本版留出的缝</th>
+<th>本版不建的</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>当轮才想起的旧笔记，接在用户消息末尾</td>
+<td>系统提示里只有起手快照，没有按这句话检索出来的文字</td>
+<td>检索函数、向量表</td>
+</tr>
+<tr>
+<td>事后另一个模型检查要不要记</td>
+<td>写入只有一个函数，字数上限和隐形字符检查在函数里面</td>
+<td>第二个模型、第二张表</td>
+</tr>
+<tr>
+<td>压缩前把即将丢掉的消息交出去提取</td>
+<td>摘要提示词里多一句「规矩按原句留下」。提取若要入库，仍走那个写入函数</td>
+<td>压缩前再调一次模型</td>
+</tr>
+<tr>
+<td>多用户</td>
+<td>表按 workspace 分。以后要按人分，加列，不换表</td>
+<td><code>user_id</code></td>
+</tr>
+<tr>
+<td><code>coder</code> 这类新规格</td>
+<td>工具在父池里。新规格的白名单要显式写上 <code>memory</code> 才看得见</td>
+<td><code>coder.md</code></td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="8-本版不再问的数">8. 本版不再问的数</h2>
+<p>笔记字数上限用 <code>agent</code> 2200、<code>user</code> 1375。同一场写入失败记到 3 次，第 4 次让模型停止再调 <code>memory</code>。这两处用 Hermes 内置笔记的默认，本版不再单独立项。</p>
+<p>执行、搜索、停止的数字仍在第 3 节到第 5 节，本版不施工，也不再问。</p>
+<h2 id="9-所以这解决了什么">9. 所以这解决了什么</h2>
+<p>本版之后，新会话的系统提示里能读到上次写下的原话和路径。主代理和子代理读的是同一份快照。表和工具名按 Hermes 内置笔记的用法留着：以后要加当轮检索或事后检查，调用方增加，存储不用换。执行、搜索、子代理折叠、手动停止仍按第 3 节到第 6 节，不在本版。</p>
+<h2 id="10-点头之后才做的事">10. 点头之后才做的事</h2>
+<p>台账的第一拍是跑着的引擎上调用 <code>memory</code>。验收：投一条消息要求记下 deck 那句原话，frames 里有 <code>name=memory</code> 的 <code>tool_result</code>，文本含 <code>agent</code> 的已用字数；新开会话再问 deck 在哪，回复含 <code>output/deck.html</code>。四个 API 的路径不变。一拍做完停下。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/17-%E5%90%8E%E7%BB%AD%E8%AE%A1%E5%88%92-%E4%BB%A3%E7%A0%81%E5%AD%90%E4%BB%A3%E7%90%86%E4%B8%8E%E8%AE%B0%E5%BF%86.md"><code>doc/17-后续计划-代码子代理与记忆.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

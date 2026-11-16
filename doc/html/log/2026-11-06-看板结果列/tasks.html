@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>todos · 看板结果列（B 档） · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="todos--看板结果列b-档">todos · 看板结果列（B 档）</h1>
+<blockquote>
+<p><strong>性质：执行记录（冻结）</strong>。状态以 <code>doc/41</code> 与代码为准；本文件只回答「当时怎么走的」。 <strong>结果（2026-11-06）</strong>：A1–A4 全部施工并验收（单测 + 隔离引擎 8943 活体），未 commit（粒度由用户定）。 <strong>未做/登记</strong>：真模型「拒写后当场补写 result」的行为断言未入 <code>expected.json</code>（模型行为不稳，不进判红集合）；活体中另观察到 <code>TaskCreate</code> 并发同名任务号的唯一索引冲突（既有缺陷，不在本方案范围）。 以下正文为原 <code>tmp/64-看板结果列/todos.md</code> 原样搬入。</p>
+</blockquote>
+<blockquote>
+<p>交审稿。点头后按 A1 → A2 → A3 → A4 逐拍施工，每拍做完停下等验收，不自动 commit。 待拍项见 <code>planning.md §6</code>（P0–P6），默认按推荐写；要改直接在这份上划。</p>
+</blockquote>
+<hr />
+<h2 id="a1--闸的契约与纯函数不碰库">A1 · 闸的契约与纯函数（不碰库）</h2>
+<p><strong>改什么</strong></p>
+<ul>
+<li><code>tasktools.go</code>：新增 <code>taskResultGate(status, result string) (allowed bool, reason string)</code>； <code>taskUpdateInput</code> 加 <code>Result</code> 字段（schema 文案见 planning §2.2）；<code>TaskUpdate</code> 工具描述加一句。</li>
+<li><code>server.go</code>：dev 块加 <code>POST /api/dev/task-check</code>（<code>authn</code>），只调上函数， 回 <code>{"code":0,"message":"","data":{"allowed":bool,"text":"…"}}</code>。</li>
+<li>单测 <code>TestTaskResultGate</code> 三条金样。</li>
+</ul>
+<p><strong>为什么</strong></p>
+<ul>
+<li>模型唯一能看见的信号就是「这次调用被拒了 + 那句错误文本」，这句话必须在写库之前定死； 存储层与工具层共用同一个判定函数，避免两边各写一份。</li>
+</ul>
+<p><strong>怎么验收</strong></p>
+<ol type="1">
+<li>起隔离引擎，登录拿 <code>TOKEN</code>（起法与账号见 <code>scripts/acceptance/README.md</code>、<code>yk-tako-eino/.env</code>）：
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="at">-X</span> POST <span class="st">&quot;</span><span class="va">$TAKO_BASE</span><span class="st">/api/dev/task-check&quot;</span> <span class="dt">\</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$TOKEN</span><span class="st">&quot;</span> <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;status&quot;:&quot;completed&quot;,&quot;result&quot;:&quot;&quot;}&#39;</span></span></code></pre></div>
+期望：<code>{"code":0,"message":"","data":{"allowed":false,"text":"错误：标 completed 必须带 result——写这一步的产出（关键数字、结论、产物路径、跑过的命令），不是「已完成」「已修复」。"}}</code></li>
+<li><code>-d '{"status":"completed","result":"p95=1.8s，scripts/bench.py"}'</code> → <code>allowed:true</code>、<code>text:""</code>。</li>
+<li><code>-d '{"status":"in_progress","result":""}'</code> → <code>allowed:true</code>。</li>
+<li><code>cd yk-tako-eino &amp;&amp; go test ./internal/runengine</code>。</li>
+</ol>
+<p><strong>这一拍回答什么</strong>：闸的判定边界与给模型看的措辞钉死了吗？</p>
+<hr />
+<h2 id="a2--存储列与真写入路径探针扩写">A2 · 存储列与真写入路径（探针扩写）</h2>
+<p><strong>改什么</strong></p>
+<ul>
+<li><code>RunTask</code> 加 <code>Result string</code>（AutoMigrate 自动加列）。</li>
+<li><code>UpdateTask</code> 加 <code>result</code> 参数：事务内先查行 → <code>effective = in.Result || row.Result</code> → 调 A1 的闸；拒绝返回哨兵 <code>ErrTaskResultRequired</code>（状态与 result 都不写）； 通过则 <code>truncateRunes(result, 300)</code> 后落库。</li>
+<li><code>TaskUpdate</code> handler 把哨兵转成错误文本（<code>toolErrorText</code> 不会重复加「错误：」）。</li>
+<li>探针扩成 <code>action=create / update / list</code>（真写库，租户取登录身份，<code>run_id</code> 由调用方给）。</li>
+<li>单测 <code>TestUpdateTaskRequiresResultOnComplete</code>：拒绝后行仍 <code>in_progress</code> 且 result 空； 通过后两列一起写；350 字截断标记。</li>
+</ul>
+<p><strong>为什么</strong></p>
+<ul>
+<li>闸必须落在唯一写路径上（工具与探针共用），否则模型可以绕过； 列不落库，下一场 <code>TaskList</code> 读不到，整个方案无意义。</li>
+</ul>
+<p><strong>怎么验收</strong></p>
+<ol type="1">
+<li><div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="at">-X</span> POST <span class="st">&quot;</span><span class="va">$TAKO_BASE</span><span class="st">/api/dev/task-check&quot;</span> <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$TOKEN</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;action&quot;:&quot;create&quot;,&quot;run_id&quot;:&quot;r_probe_a&quot;,&quot;subject&quot;:&quot;探针任务&quot;}&#39;</span></span></code></pre></div>
+期望：<code>data = {"taskId":1,"status":"pending"}</code>。</li>
+<li>拒绝路径：
+<div class="sourceCode" id="cb3"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> … <span class="at">-d</span> <span class="st">&#39;{&quot;action&quot;:&quot;update&quot;,&quot;run_id&quot;:&quot;r_probe_a&quot;,&quot;task_id&quot;:1,&quot;status&quot;:&quot;completed&quot;}&#39;</span></span></code></pre></div>
+期望 <code>allowed:false</code> + planning §2.2 的错误文本；随后 <code>action=list</code> 期望 <code>status:"pending"</code>、<code>result:""</code>。</li>
+<li>通过路径：<code>… "status":"completed","result":"p95=1.8s"</code> → <code>allowed:true</code>；再 <code>list</code> 期望 <code>{"taskNo":1,"status":"completed","subject":"探针任务","result":"p95=1.8s"}</code>。</li>
+<li>超长：<code>result</code> 塞 350 字 → <code>list</code> 里 <code>result</code> 尾部是 <code>…〔截断：原 350 字符〕</code>。</li>
+<li><code>go test ./internal/runengine</code>（既有 5 处 <code>UpdateTask</code> 调用同步改签名）。</li>
+</ol>
+<p><strong>这一拍回答什么</strong>：闸在真写入路径生效吗？拒绝会不会留下半截状态？下一场读得到吗？</p>
+<blockquote>
+<p>diff 预估 ~110 行（超 80 目标，报备）：探针扩写占大头，可拆「create/list」与「update」两小拍。</p>
+</blockquote>
+<hr />
+<h2 id="a3--读者tasklist--taskget--提示词">A3 · 读者：TaskList / TaskGet / 提示词</h2>
+<p><strong>改什么</strong></p>
+<ul>
+<li><code>TaskList</code> 用新的 <code>taskListView(rows)</code>：<code>taskBoardView</code> 原样保留给写回执与 <code>kind=task</code> 帧； 新视图在 completed 且有 result 的行尾加 <code>\n  结果：&lt;前 100 字&gt;</code>。</li>
+<li><code>TaskGet</code> 多一行 <code>结果：&lt;全文&gt;</code>（仅非空时）。</li>
+<li><code>taskBoardPrompt</code> 加 planning §2.2 那一条。</li>
+<li>上一场段按 P1 拍板：推荐加「已完成结果」子段（一条一行前 100 字）。</li>
+<li>探针 <code>action=list</code> 的返回加 <code>view</code> 字段（与 TaskList 同源），让视图字节可 curl。</li>
+<li>单测：视图金样（含截断、空结果不渲染、上一场段形态）。</li>
+</ul>
+<p><strong>为什么</strong></p>
+<ul>
+<li>写了没人读等于没写；写回执不带是为了不让每张回执重付所有历史结果（doc/52 D34 同款取舍）。</li>
+</ul>
+<p><strong>怎么验收</strong></p>
+<ol type="1">
+<li><div class="sourceCode" id="cb4"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="at">-X</span> POST <span class="st">&quot;</span><span class="va">$TAKO_BASE</span><span class="st">/api/dev/task-check&quot;</span> <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$TOKEN</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="at">-d</span> <span class="st">&#39;{&quot;action&quot;:&quot;list&quot;,&quot;run_id&quot;:&quot;r_probe_a&quot;}&#39;</span></span></code></pre></div>
+期望 <code>data.rows[0].view</code> 包含两行： <code>#1 [completed] 探针任务</code> / <code>  结果：p95=1.8s</code>。</li>
+<li>活体：按 <code>doc/19-v6/19v6-04-验收-curl.md</code> 用例 1 起一场 run，然后 <code>curl -s "$TAKO_BASE/api/runs/$RUN/frames?after=0" -H "Authorization: Bearer $TOKEN"</code> → <code>TaskList</code> 的 <code>tool_result</code> 帧文本里能看到 <code>结果：</code>。</li>
+<li><code>go test ./internal/runengine</code>。</li>
+</ol>
+<p><strong>这一拍回答什么</strong>：本场折叠后、以及下一场的看板读口，都能把结果拿回模型眼前吗？写回执有没有被撑胖？</p>
+<hr />
+<h2 id="a4--放行口--活体--收口">A4 · 放行口 + 活体 + 收口</h2>
+<p><strong>改什么</strong></p>
+<ul>
+<li><code>taskBox</code> 加拒写计数（同 noteBox 先例，随 run 死）：同 run 第 3 次拒写起放行， status 落 <code>completed</code>，result 落固定串 <code>（未记录：连续 3 次没写结果）</code>；回执不追加任何催促。</li>
+<li>探针转正：删 <code>create</code> / <code>update</code> 两个写动作，只留 <code>action=list</code>（转正点，见 planning §4）。</li>
+<li><code>doc/41</code> 追加段（字段、闸、放行、渲染口径、日期）；<code>doc/README.md</code> 状态不变（仍 ✅）。</li>
+<li>台账留档：<code>todos.md</code> 原样进 <code>doc/log/&lt;落地日&gt;-看板结果列/tasks.md</code>，<code>planning.md</code> 提炼进同目录 <code>README.md</code>，删 <code>tmp/64-看板结果列/</code>。</li>
+</ul>
+<p><strong>为什么</strong></p>
+<ul>
+<li>没有放行口，模型如果固执会在这个调用上无限撞墙（memory 工具踩过，最后加了劝停）； 脚手架不登记转正点会永久留在代码里。</li>
+</ul>
+<p><strong>怎么验收</strong></p>
+<ol type="1">
+<li>活体（隔离实例）：起 run，提示「建两条任务，把第一条标 completed，不要写 result」→ <code>curl "$TAKO_BASE/api/runs/$RUN/frames?after=0"</code> 期望先看到 <code>tool_result</code> 文本以 <code>错误：标 completed 必须带 result</code> 开头，同一 run 后续出现带 <code>"result"</code> 的 <code>TaskUpdate</code> 调用。模型没补写时记入 <code>declared_not_asserted</code>（行为不稳），不判红。</li>
+<li>转正生效：旧的 <code>action":"create"</code> 命令回 HTTP 400（拒绝信封，字节以实跑为准）。</li>
+<li><code>go test ./internal/runengine</code> + <code>go vet ./internal/runengine</code>；前端未动。</li>
+<li><code>bash scripts/check-master-plan.sh</code> + <code>bash scripts/check-doc-layout.sh</code>。</li>
+</ol>
+<p><strong>这一拍回答什么</strong>：闸不会把 run 卡死吗？下一场真能靠这条结果续上吗？</p>
+<hr />
+<h2 id="收尾清单a4-内">收尾清单（A4 内）</h2>
+<ul class="task-list">
+<li><label><input type="checkbox" />探针写动作已删；<code>r_probe_</code> 行已清</label></li>
+<li><label><input type="checkbox" />doc/41 追加段与代码一致；台账已留档</label></li>
+<li><label><input type="checkbox" />未 commit（等用户定粒度）</label></li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/log/2026-11-06-%E7%9C%8B%E6%9D%BF%E7%BB%93%E6%9E%9C%E5%88%97/tasks.md"><code>doc/log/2026-11-06-看板结果列/tasks.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

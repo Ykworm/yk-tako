@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>问题与方案库（doc/problems/） · tako 文档</title>
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="问题与方案库docproblems">问题与方案库（doc/problems/）</h1>
+<blockquote>
+<p>性质：<strong>决策档案</strong>，不是方案真源。每条回答「当时遇到了什么问题、桌上有哪些候选、为什么选这个、代价是什么、今天还成不成立」。 收录判据：<strong>只收设计选择题</strong>——有备选、有代价、有裁定。纯 bug 修复只在它暴露设计问题时顺带收。 素材口径：<code>doc/</code>（定了什么）+ <code>tmp/</code> 台账（当时怎么想）+ <code>git</code>/代码（真做了什么）。三者冲突时以代码与用户原话为准。 最后核对：2026-10-31，共 43 条。模块划分与代码落点见 <a href="../53-模块地图.html">doc/53-模块地图.md</a>。</p>
+</blockquote>
+<hr />
+<h2 id="0-怎么用">0. 怎么用</h2>
+<ul>
+<li><strong>想找「为什么是这个设计」</strong>：先按模块下表找到问题，再读那条的 §2「候选与代价」与 §5/§4「同族小裁定」。</li>
+<li><strong>想复核某条裁定今天是否仍成立</strong>：每条 §6/§4「证据」给了代码符号与复核命令；§7/§6「现状」写明「仍有效 / 已翻转 / 未落地」。</li>
+<li><strong>想新增一条</strong>：在 <code>doc/problems/&lt;问题名&gt;/问题与方案.md</code> 落文件，问题名用一句中文问句（不带编号）；写完回到本表登记一行，并在对应模块的 <a href="../53-模块地图.html">doc/53</a> 小模块后加反链。词表：<code>已落地</code> / <code>部分落地</code> / <code>方案已定·未施工</code> / <code>已翻转</code> / <code>待拍</code>（有候选、没裁定，只记现状与代价）。</li>
+</ul>
+<p>每篇固定六到七节：<code>1 场景与病灶</code>（讲一个会真实发生的失败故事）→ <code>2 候选与代价</code>（表）→ 中间按需拆真身 → <code>同族小裁定</code>（表）→ <code>证据</code>（方案 § / 台账 § / 代码符号 / 复核命令 / 活体验收）→ <code>现状</code>（仍有效 / 已翻转 / 未落地 + 同族链接）。</p>
+<h2 id="1-技术路线">1. 技术路线</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>一句话</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="选Eino不选LangGraph/问题与方案.html">选Eino不选LangGraph</a></td>
+<td>Agent 框架选 LangGraph.js（TS）还是 Eino（Go）？</td>
+<td>已定案（2026-09-24）</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="2-运行时装配与多租户">2. 运行时装配与多租户</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>一句话</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="租户从第一天就在/问题与方案.html">租户从第一天就在</a></td>
+<td>多租户建模从第一天做，还是上线前再补？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="租户运行时怎么装配/问题与方案.html">租户运行时怎么装配</a></td>
+<td>每场 run 怎么把租户的模型/密钥/MCP/工具装配成运行时？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="会话默认私有/问题与方案.html">会话默认私有</a></td>
+<td>新建会话默认谁能看见？可见性怎么判？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="共享项目整条退役/问题与方案.html">共享项目整条退役</a></td>
+<td>共享项目这条产品线留着还是整条删？</td>
+<td>已裁（10-22）</td>
+</tr>
+<tr>
+<td><a href="项目目录归谁/问题与方案.html">项目目录归谁</a></td>
+<td>项目目录归项目、会话还是租户？文件落在哪？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="团队前端的边界/问题与方案.html">团队前端的边界</a></td>
+<td>团队/邀请做到页面哪一步，哪些明确不做？</td>
+<td>已落地</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="3-运行生命周期与崩溃">3. 运行生命周期与崩溃</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>一句话</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="租户并发闸放进数据库/问题与方案.html">租户并发闸放进数据库</a></td>
+<td>租户并发上限的闸放进程内还是 PG？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="崩溃前那半句要不要存/问题与方案.html">崩溃前那半句要不要存</a></td>
+<td>崩溃前未完成的那半句助手回复要不要落库？</td>
+<td>已落地（draft 已删）</td>
+</tr>
+<tr>
+<td><a href="崩溃后这场run算什么状态/问题与方案.html">崩溃后这场run算什么状态</a></td>
+<td>崩溃后 run 算什么状态、谁能续、怎么续？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="失败轮要不要留痕/问题与方案.html">失败轮要不要留痕</a></td>
+<td>失败/停止的 run 要不要留历史、留什么？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="删除会话是软删/问题与方案.html">删除会话是软删</a></td>
+<td>删除是真删还是软删？连带删什么、留多久？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="并行度由谁裁/问题与方案.html">并行度由谁裁</a></td>
+<td>子代理/工具的并行度由进程 sem、租户槽还是跨 pod 池裁？</td>
+<td>待拍</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-上下文工具与安全">4. 上下文、工具与安全</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>一句话</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="折叠线用什么数/问题与方案.html">折叠线用什么数</a></td>
+<td>上下文折叠的触发阈值按什么数算？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="搜索怎么接厂商/问题与方案.html">搜索怎么接厂商</a></td>
+<td><code>web_search</code> 怎么接不同厂商，结果放哪？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="同项目并发写文件怎么防/问题与方案.html">同项目并发写文件怎么防</a></td>
+<td>多 run 同项目并发写文件怎么互斥？</td>
+<td>已落地（项目闸退役）</td>
+</tr>
+<tr>
+<td><a href="没有沙箱的系统怎么办/问题与方案.html">没有沙箱的系统怎么办</a></td>
+<td>Linux 没有 <code>sandbox-exec</code> 时 bash 怎么办？</td>
+<td>已落地 2026-11-03（Debian 活体待跑）</td>
+</tr>
+<tr>
+<td><a href="工具三态守卫与审批回路/问题与方案.html">工具三态守卫与审批回路</a></td>
+<td>工具调用要不要三态闸 + 人工审批？</td>
+<td>整条不做（沙箱硬挡）</td>
+</tr>
+<tr>
+<td><a href="MCP进程进不进围栏/问题与方案.html">MCP进程进不进围栏</a></td>
+<td>MCP 服务进程要不要和 bash 进同一个沙箱围栏？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="PII打码挂哪层/问题与方案.html">PII打码挂哪层</a></td>
+<td>PII 打码挂工具出口、模型输入口还是记忆入库前？</td>
+<td>已落地</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="5-子代理">5. 子代理</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>一句话</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="同名委派共享实例/问题与方案.html">同名委派共享实例</a></td>
+<td>同名子代理多次委派共享一个实例还是每次新建？</td>
+<td>部分落地</td>
+</tr>
+<tr>
+<td><a href="子代理窗口谁来压/问题与方案.html">子代理窗口谁来压</a></td>
+<td>子代理上下文谁压、什么时候压？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="子代理规格与工具边界/问题与方案.html">子代理规格与工具边界</a></td>
+<td>子代理能拿哪些工具、规格怎么生效？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="子代理档案放哪里/问题与方案.html">子代理档案放哪里</a></td>
+<td>子代理过程档案存文件还是 PG 表？半截救不救？</td>
+<td>已落地</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="6-技能看板与等人">6. 技能、看板与等人</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>一句话</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="技能谁读谁执行/问题与方案.html">技能谁读谁执行</a></td>
+<td>技能正文由谁读、谁执行，子代理看不看得到？</td>
+<td>部分落地（B1–B4）</td>
+</tr>
+<tr>
+<td><a href="看板正本放哪里/问题与方案.html">看板正本放哪里</a></td>
+<td>任务看板的正本放进程内存还是 PG？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="等人现场放哪里/问题与方案.html">等人现场放哪里</a></td>
+<td><code>ask_user</code> 挂起时现场放内存还是 DB？</td>
+<td>已落地</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="7-记忆与媒体">7. 记忆与媒体</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>一句话</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="记忆要不要上向量/问题与方案.html">记忆要不要上向量</a></td>
+<td>长期记忆要不要用向量检索，用什么索引？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="历史查找用什么索引/问题与方案.html">历史查找用什么索引</a></td>
+<td>会话历史检索用什么索引？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="召回块放哪一层/问题与方案.html">召回块放哪一层</a></td>
+<td>召回块拼在 history 还是本轮输入？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="笔记按什么分区/问题与方案.html">笔记按什么分区</a></td>
+<td>笔记按什么维度分区、谁读得到？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="对话只存路径/问题与方案.html">对话只存路径</a></td>
+<td>对话里图片存字节还是存路径？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="图片只发一次/问题与方案.html">图片只发一次</a></td>
+<td>图片在什么时机回填进模型请求，发几次？</td>
+<td>已落地</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="8-api-与前端">8. API 与前端</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>一句话</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="响应信封统一/问题与方案.html">响应信封统一</a></td>
+<td>JSON 接口成功/失败统一回什么形状？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="前端拉帧还是切流/问题与方案.html">前端拉帧还是切流</a></td>
+<td>集成方拉帧还是吃 SSE？前端要不要切？</td>
+<td>端点已落地·前端不切</td>
+</tr>
+<tr>
+<td><a href="变更同步用事件通道/问题与方案.html">变更同步用事件通道</a></td>
+<td>多窗口数据失效靠轮询、WebSocket 还是事件流？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="用量怎么让用户看见/问题与方案.html">用量怎么让用户看见</a></td>
+<td>token 用量怎么让用户看见？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="前端可用性欠账/问题与方案.html">前端可用性欠账</a></td>
+<td>后端有契约、页面没入口，欠账怎么排先修谁？</td>
+<td>已落地（A5 未做）</td>
+</tr>
+<tr>
+<td><a href="界面验收双轨/问题与方案.html">界面验收双轨</a></td>
+<td>界面改动怎么验收，观感怎么断言？</td>
+<td>双轨已落地·Eval 未施工</td>
+</tr>
+<tr>
+<td><a href="品牌只落Logo/问题与方案.html">品牌只落Logo</a></td>
+<td>品牌资产放哪、接哪几处、要不要连带换主题？</td>
+<td>方案已定·未施工</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="9-验收与仓库治理">9. 验收与仓库治理</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>一句话</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="验收机器化/问题与方案.html">验收机器化</a></td>
+<td>验收脚本放 tmp 还是入库？期望字节真源在哪？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="仓库治理的机械闸/问题与方案.html">仓库治理的机械闸</a></td>
+<td>双远端怎么保证 GitHub 不领先？文档门面怎么不脱节？</td>
+<td>已落地</td>
+</tr>
+<tr>
+<td><a href="术语先大白话后学名/问题与方案.html">术语先大白话后学名</a></td>
+<td>文档术语第一次出现怎么写才读得懂？</td>
+<td>已落地</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="10-统计">10. 统计</h2>
+<ul>
+<li><strong>43 条</strong>：已落地 33、部分落地 2（同名委派、技能）、端点已落地但刻意不切 1（拉帧/切流）、双轨已落地但 Eval 未施工 1（界面验收）、方案已定未施工 2（品牌、Linux 沙箱）、整条不做 1（工具三态/审批回路）、已定案 1（Eino）、已裁 1（共享项目退役）、待拍 1（并行度）。</li>
+<li><strong>未落地的两条</strong>（品牌、Linux 沙箱）不是「以后再说」：前者素材只在 <code>tmp/</code>、随时会丢；后者是 Linux 上 bash/租户 MCP fail closed 的真实功能缺口。</li>
+<li><strong>待拍的一条</strong>（并行度）只记现状与候选，没有裁定：先留着，等单机两级闸还是跨 pod 执行池的方向定了再动。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/README.md"><code>doc/problems/README.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

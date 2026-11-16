@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>持久 Task 方案：把子代理调用变成独立工作 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="持久-task-方案把子代理调用变成独立工作">持久 Task 方案：把子代理调用变成独立工作</h1>
+<blockquote>
+<p>性质：<strong>方案初稿（已被取代）</strong>；保留推导过程，不再作为方案或施工真源。 状态：⬜ 未施工；由 <a href="../03-第一版方案.html">第一版方案：持久 Task 与固定 DAG 编排</a> 取代。 日期：2026-11-09。 代码落点：—（未施工；预计涉及 <code>yk-tako-eino/internal/runengine/</code>、<code>cmd/yktako/</code>、<code>web/</code>，点头后按契约拍细化）。 调研来源：<a href="01-Comma持久Task调研.html">Comma 持久 Task 调研</a>。任务依赖与多 Agent 调度不在本篇，见上级 <code>02-多Agent编排/</code>。 现行边界：子代理委派见 doc/25、档案见 doc/39；现有看板见 doc/41；run 恢复见 doc/30。</p>
+</blockquote>
+<h2 id="1-背景现在的委派为什么还不是-task">1. 背景：现在的“委派”为什么还不是 Task</h2>
+<p>用户让 tako 做一份需要二十分钟调研的报告。主 Agent 调 researcher 后，当前委派仍附着在一次工具调用上：子代理有独立上下文和持久 wire 档案，但“这项工作本身”没有独立于父 run 的任务身份、状态和收件通知。</p>
+<p>这会留下三个具体断点：</p>
+<ol type="1">
+<li>父 run 正在等待时，用户只能看到一次工具调用，不能把这件工作当作独立对象继续查看和管理；</li>
+<li>子代理中途崩溃时，doc/39 的现行口径是半成品 wire 不续跑；父 Agent 只能重新委派，不能对一件持久工作做一次有边界的恢复；</li>
+<li>将来两个调研工作完成后要自动唤醒汇总工作时，没有持久通知可消费，只能让主 Agent 一直等或下次碰巧再查。</li>
+</ol>
+<p>现有 <code>run_tasks</code> 不解决这件事。它是某次 run 内由模型维护的看板记录，回答“这轮计划做哪几步”；它不是“引擎应该把哪件工作交给哪个 Agent”的执行任务。<strong>看板行不会因为存在就自动获得 worker、模型、运行环境和结果。</strong></p>
+<h2 id="2-目标与非目标">2. 目标与非目标</h2>
+<h3 id="目标">目标</h3>
+<p>先做一个小闭环：</p>
+<blockquote>
+<p>用户或主 Agent 交出一件自包含工作 → 引擎持久化 Task → 独立执行者完成任务 → 结果持久化并通知来源会话 → 用户能查看、停止和在明确边界内恢复。</p>
+</blockquote>
+<h3 id="本期不做">本期不做</h3>
+<ul>
+<li>任务依赖图、自动分叉／汇合；</li>
+<li>Agent 之间自由群聊；</li>
+<li>动态创建新的 Agent 规格；</li>
+<li>把现有 <code>run_tasks</code> 改成调度队列；</li>
+<li>自动重放结果未知的外部副作用；</li>
+<li>常驻后台子代理的无限生命周期；Task 必须有终态与归档出口。</li>
+</ul>
+<p>这些不是永远不做，而是先证明一件 Task 的生命可靠，再由多 Agent 方案增加依赖关系。</p>
+<h2 id="3-四个对象各自负责什么">3. 四个对象各自负责什么</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>对象</th>
+<th>真身与职责</th>
+<th>不负责什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Task</strong></td>
+<td>一行持久工作记录：目标、输入、归属、执行者规格、模型选择、状态、最终结果</td>
+<td>不保存每次模型调用的完整上下文</td>
+</tr>
+<tr>
+<td><strong>Task 执行 run</strong></td>
+<td>复用现有 run 的执行机制：租约、执行代次、工具账本、模型输入和 trace</td>
+<td>不是 Task 的业务状态正本</td>
+</tr>
+<tr>
+<td><strong>子代理档案 wire</strong></td>
+<td>记录某次子代理执行过程，供诊断与完整档案 resume</td>
+<td>不等于可调度 Task</td>
+</tr>
+<tr>
+<td><strong><code>run_tasks</code> 看板行</strong></td>
+<td>给模型和用户展示一轮工作的步骤与结果</td>
+<td>不触发执行，不承担调度</td>
+</tr>
+</tbody>
+</table></div>
+<p>推荐复用现有 run 作为 Task 的一次执行尝试，而不是另写一套 Agent 循环。这样工具权限、沙箱、上下文折叠、用量与 trace 继续只有一份实现。Task 执行需要独立的内部 session／会话归属，避免多个 Task 被现有“同一聊天 session 同时只允许一个活 run”的限制串行化；具体复用形状是施工前第一项契约决策。</p>
+<h2 id="4-端到端链路">4. 端到端链路</h2>
+<pre class="text"><code>用户发出目标
+  → 主 Agent 判断需要独立委派
+  → 调 delegate_task，给出自包含 content、执行者规格和可选模型
+  → 服务端校验租户／项目／执行者权限
+  → 一笔事务写 Task＋首条 command，并生成执行 run
+  → 工具立即返回 {taskId,status}，不把长时间执行塞在这次调用里
+  → Task worker 领取既有执行 run，按现有 Agent 循环干活
+  → 每次执行结果与产物路径按现有账本落库
+  → 成功时写 Task.result＋终态，并写一条持久通知到来源 session inbox
+  → 来源 session 空闲时，引擎用通知起一场恢复／汇总 run
+  → 主 Agent 读取 Task 结果并向用户交付</code></pre>
+<p>这条链里上一步的输出分别是下一步的输入：</p>
+<ul>
+<li><code>delegate_task</code> 的自包含 <code>content</code> 是 Task 的首条 command；没有它，独立执行者看不到父会话，无法猜任务背景；</li>
+<li>Task 的 <code>current_run_id</code> 把业务工作连接到执行账本；没有它，崩溃后无法判断该恢复哪次执行；</li>
+<li>最终结果与产物路径进入 session inbox；没有它，父 Agent 不知道何时该汇总；</li>
+<li>inbox 的消费位置决定通知是否还需要再投递；没有它，重启只能靠内存记忆。</li>
+</ul>
+<h2 id="5-最小契约草案">5. 最小契约草案</h2>
+<p>以下是讨论用形状，<strong>不是已验收字节</strong>。点头后的第一拍必须先跑 API 契约，再反推表与前端。</p>
+<h3 id="51-模型工具">5.1 模型工具</h3>
+<p>新增 <code>delegate_task</code>，与看板工具 <code>TaskCreate</code> 明确分开：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;content&quot;</span><span class="fu">:</span> <span class="st">&quot;调研 A 市场，给出三个可核实的来源，并把报告写入 research-a.md&quot;</span><span class="fu">,</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;agent&quot;</span><span class="fu">:</span> <span class="st">&quot;researcher&quot;</span><span class="fu">,</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;modelRef&quot;</span><span class="fu">:</span> <span class="st">&quot;可选；缺省继承该执行者配置&quot;</span><span class="fu">,</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;workspaceId&quot;</span><span class="fu">:</span> <span class="st">&quot;可选；缺省使用当前项目&quot;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>成功立即返回：</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;taskId&quot;</span><span class="fu">:</span><span class="st">&quot;at_…&quot;</span><span class="fu">,</span><span class="dt">&quot;status&quot;</span><span class="fu">:</span><span class="st">&quot;pending&quot;</span><span class="fu">,</span><span class="dt">&quot;runId&quot;</span><span class="fu">:</span><span class="st">&quot;r_…&quot;</span><span class="fu">}</span></span></code></pre></div>
+<p><code>content</code> 必须自包含；引擎不把父会话全部聊天记录隐式塞给执行者。执行者规格只能来自当前租户可用清单，工具权限仍受父池与规格共同约束。</p>
+<h3 id="52-产品-api">5.2 产品 API</h3>
+<ul>
+<li><code>POST /api/tasks</code>：用同一套规则手工创建 Task，供契约拍与页面使用；</li>
+<li><code>GET /api/tasks/:id</code>：读取目标、状态、当前 run、结果与错误；</li>
+<li><code>GET /api/workspaces/:id/tasks</code>：按项目列出 Task；</li>
+<li><code>POST /api/tasks/:id/stop</code>：停止当前执行，Task 记为 cancelled；不撤销已经发生的副作用；</li>
+<li><code>POST /api/tasks/:id/resume</code>：只对租约过期且可恢复的执行开放，复用 doc/30 的接管语义。</li>
+</ul>
+<p>成功与失败使用现行 <code>{code,message,data}</code> 信封；模型工具错误仍是可供模型修正的文字结果，不把 HTTP 栈暴露给它。真实业务码与响应字段顺序在契约拍实跑后登记，不在初稿手写期望字节。</p>
+<h2 id="6-状态与存储">6. 状态与存储</h2>
+<h3 id="61-task-状态">6.1 Task 状态</h3>
+<pre class="text"><code>pending → running → succeeded
+                  → failed
+                  → cancelled
+running + 执行租约过期 → 读侧 interrupted → 显式 resume → running</code></pre>
+<ul>
+<li><code>pending</code>：工作已持久化，执行尚未开始；</li>
+<li><code>running</code>：存在当前执行 run；</li>
+<li><code>succeeded</code>：结果已写入；不代表人类已审核内容质量；</li>
+<li><code>failed</code>：执行有确定失败结果；</li>
+<li><code>interrupted</code>：与现有 run 一样，是“仍在 running，但执行租约已过期”的读侧派生，不是假装执行正常；</li>
+<li><code>cancelled</code>：用户或协调者明确停止，不回滚外部动作。</li>
+</ul>
+<h3 id="62-最小持久事实">6.2 最小持久事实</h3>
+<p>建议新增 <code>agent_tasks</code>，字段至少覆盖：</p>
+<ul>
+<li>身份与归属：<code>id</code>、<code>tenant_id</code>、<code>workspace_id</code>、<code>source_session_id</code>；</li>
+<li>工作命令：<code>content</code>、<code>agent_name</code>、<code>model_ref</code>；</li>
+<li>执行指针：<code>current_run_id</code>；</li>
+<li>状态与结果：<code>status</code>、<code>result</code>、<code>error</code>；</li>
+<li>创建去重：<code>idempotency_key</code> 与命令摘要；</li>
+<li>生命周期：<code>created_at</code>、<code>started_at</code>、<code>finished_at</code>、<code>updated_at</code>。</li>
+</ul>
+<p>另设持久 <code>task_inbox</code>（或等价的 session inbox 表）：一行包含来源 session、Task、通知类型、投递状态与去重键。Task 完成与通知写入必须在同一笔 PG 事务里；否则“任务已成功但父会话永远收不到”的窗口会一直存在。Redis 只能作叫醒优化，真相仍在 PG。</p>
+<p>具体表名和字段是否复用现有表，施工前先按实际 run／session 存储契约复核，不在初稿假定可无改造复用。</p>
+<h2 id="7-崩溃与重复执行边界">7. 崩溃与重复执行边界</h2>
+<ol type="1">
+<li>执行前先按现有 journal 记录工具意图，执行后记录结果；Task 不另造第二份工具账本。</li>
+<li>worker 死亡后租约过期，Task 读侧显示 <code>interrupted</code>；不会因为进程消失就自动写成 succeeded。</li>
+<li>显式 resume 时先取得新执行代次，再恢复已有结果；缺结果的工具仍按“结果未知、引擎不自动重跑”处理。</li>
+<li>Task 创建重试只认同一幂等键与同一命令摘要；同键不同内容必须冲突，不能覆盖原工作。</li>
+<li>完成写入与 inbox 通知一笔提交；通知重复投递由消费去重处理，不承诺外部副作用 exactly-once。</li>
+</ol>
+<p>这解决的是“执行状态可判定、结果有去处、旧执行者不能覆盖新执行者”，不是“任何任务都能无损自动重做”。</p>
+<h2 id="8-监控与页面最小入口">8. 监控与页面最小入口</h2>
+<ul>
+<li>每次 Task 创建、状态翻转和停止按 doc/46 发变更事件；页面收事件后重拉，PG 仍是真相；</li>
+<li>Task 详情展示目标、执行者、模型、当前状态、结果和产物链接；</li>
+<li>trace 以 Task ID 关联来源 run 与执行 run，能够从用户请求跳到执行者，再跳回汇总；</li>
+<li>watcher 第一阶段只处理“执行中断未通知”和“结果已落库但来源通知未消费”，不做复杂 stall 评分。</li>
+</ul>
+<p>页面不是任务生命周期的持有者；关掉页面不会停止 Task。</p>
+<h2 id="9-验收场景">9. 验收场景</h2>
+<p>第一用例是“一件工作独立跑完”，不是直接演示多 Agent：</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-i</span> <span class="at">-X</span> POST <span class="st">&quot;</span><span class="va">$BASE</span><span class="st">/api/tasks&quot;</span> <span class="dt">\</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$TOKEN</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-H</span> <span class="st">&#39;Content-Type: application/json&#39;</span> <span class="dt">\</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;workspaceId&quot;:&quot;ws_…&quot;,&quot;agent&quot;:&quot;researcher&quot;,&quot;content&quot;:&quot;只回复 task-ready&quot;,&quot;idempotencyKey&quot;:&quot;task-demo-001&quot;}&#39;</span></span></code></pre></div>
+<p>期望在契约拍中实跑钉死：HTTP 202，业务信封成功，<code>data</code> 中有同一个 <code>taskId</code>、<code>runId</code> 和 <code>status</code>。随后：</p>
+<ol type="1">
+<li>用同一请求体重打，仍返回原 Task，不产生第二个执行 run；</li>
+<li>同幂等键换 <code>content</code>，返回冲突；</li>
+<li><code>GET /api/tasks/:id</code> 最终读到 succeeded 与真实结果；</li>
+<li>执行中终止自己启动的隔离引擎，重启后读到 interrupted，显式 resume 后完成；</li>
+<li>来源会话只消费一次完成通知；重复通知不产生重复汇总；</li>
+<li>另一租户用同一 Task ID 读取，仍按现行不可见规则拒绝；</li>
+<li>停止后工具副作用不被宣称已回滚。</li>
+</ol>
+<p>详细 curl、期望字节和机器断言必须在对应契约拍同步进入 <code>scripts/acceptance/expected.json</code> 与 doc/19-v6-04，不能只留在本篇。</p>
+<h2 id="10-施工前必须点头的决策">10. 施工前必须点头的决策</h2>
+<ol type="1">
+<li>Task 执行 run 使用什么内部 session 形状，怎样绕开“同一聊天 session 串行”而不破坏现有限流；</li>
+<li>是否采用 <code>agent_tasks＋task_inbox</code> 两张新表，以及既有 run／session 表的复用边界；</li>
+<li>中断后第一期是否坚持显式 resume；本初稿推荐坚持，不做自动重放；</li>
+<li>Task 完成后是否允许主 Agent 自动起汇总 run，以及该动作消耗的租户额度如何展示；</li>
+<li>对 doc/39“常驻后台子代理不做”的翻案范围：本方案只新增有终态的 Task 执行，不让既有子代理无限常驻。</li>
+</ol>
+<h2 id="11-所以这解决什么">11. 所以这解决什么</h2>
+<p>它把“子代理正在被调用”变成“一件工作有独立身份、输入、执行、结果和通知”。只有这层成立后，多 Agent 编排里的 A、B、C 才有可调度的对象；否则任务依赖图只是另一张不会执行的看板。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/70-%E5%A4%9AAgent%E7%BC%96%E6%8E%92%E4%B8%8ETask/01-Task/02-%E6%8C%81%E4%B9%85Task%E6%96%B9%E6%A1%88.md"><code>doc/70-多Agent编排与Task/01-Task/02-持久Task方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

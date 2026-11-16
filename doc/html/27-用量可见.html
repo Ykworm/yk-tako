@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>27 · 用量可见化（doc/16 #4c 的「可见/可决策」半边） · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="27--用量可见化doc16-4c-的可见可决策半边">27 · 用量可见化（doc/16 #4c 的「可见/可决策」半边）</h1>
+<blockquote>
+<p>性质：<strong>施工真源</strong>。方案经 Yk 点头（2026-10-16），A1–A3 三拍已全部施工并活体验收完（2026-10-17，未含pi 任何外推项）。 分工：doc/24 做的是引擎内的半边——计数（<code>usageEstimate</code>）和折叠触发，用户看不见。 本篇做引擎外的半边——把用量送进帧、API 和页面，让用户<strong>看得见、据此做决定</strong>。 doc/24 §8 写的「不把 Usage 写入四个 API / 帧 / 表」是那一拍的不做，不是永久禁令；本篇就是来开这道门的。</p>
+<p><strong>施工状态（2026-10-17）</strong>：</p>
+<ul>
+<li><strong>A1（帧契约）✅</strong>：worker.go <code>usageBill</code>/<code>usageFrame</code>（提取负路径三件：无 ResponseMeta / 无 Usage / 三数全 0 不发帧）+ 发帧点在每枪 drain 合并后（root 与子代理同点，帧 agent 区分）。curl 验收：usage 帧在 delta 与 terminal 之间，promptTokens 3311 与 doc/24 基线 ~3.4k 同量级。</li>
+<li><strong>A2（前端渲染）✅</strong>：api.ts Frame 扩 usage；chat.ts Bubble.usage/usageUnknown（多枪取最后一帧、子代理帧跳过、亲历收尾无帧标「用量 ?」）；App.vue pi 式小字 <code>↑3.3k ↓32 · 3.3k/256k (1%)</code> + &gt;70% 橙 / &gt;90% 红。浏览器验收：金路径、多枪、刷新 reconcile、橙色阈值（-compact-window 4400 实测 75% 变橙）全过；&gt;90% 红与「用量 ?」未活体（同分支/负路径，单测盖）。</li>
+<li><strong>A3（落库 + 历史行）✅</strong>：<code>UsageBill</code> 共形状（帧与 payload 列）；TurnEntry.Usage 随 assistant 条目进 turn，EndRun 两处定稿行（root 取最后一枪 / 子代理本枪）落 payload 列，账单缺失不写列；ReadLog assistant 行解出注入 <code>usage</code>、原文不透出，tool 行 payload 照旧；前端 rowBubble/loadOlder/closeOut 三路带 usage。curl 验收：assistant 行带 usage、user/tool 行无、assistant 行无 payload 原文；工具 run 的 promptTokens 3398 = 第二枪账单（「最后一枪」真值对）；浏览器刷新历史小字在。stopped/error 分支零改动（无 assistant 行 = 无账单行）。</li>
+<li>单测：TestUsageFrame（负三件+正形+字节面）、TestEndRunLandsUsagePayload（root 末枪/子代理含 reasoning/无账单 payload NULL）。go test runengine 全量绿 + vet 干净；vue-tsc + build 过。</li>
+</ul>
+</blockquote>
+<h2 id="1-背景与病灶故事先行">1. 背景与病灶（故事先行）</h2>
+<p>tako 的会话会越聊越长。今天用户对「上下文还剩多少」<strong>零可见</strong>，后果是一场真实的失败戏：</p>
+<p>用户跟 tako 聊了一下午，读了几个大文件、跑了几次 bash。上下文悄悄逼近窗口上限。 折叠层按 doc/24 在 200k 附近自动压了一轮——用户什么都没看到，只觉得 tako 突然 「忘了」前半小时讨论过的文件路径，又花几轮重新铺垫。最后用户发一个大文件， POST /api/runs 返回 413 <code>message_too_large</code>——<strong>这是今天唯一一个把 token 数透给用户的时刻</strong>， 而且只在死后说话：墙已经撞上了才告诉用户墙在哪。用户既不能提前开新会话， 也不知道 413 之前的会话已经压过几轮、还剩多少余量。</p>
+<p>「可决策」指的是：用户看到用量，自己决定<strong>继续聊 / 停下来 / 开新会话</strong>。 不自动做任何事——压缩照旧由引擎按 doc/24 的线自动判，决定权在人这边只多不少。</p>
+<h2 id="2-现状盘点代码事实2026-10-16-核对">2. 现状盘点（代码事实，2026-10-16 核对）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>事实</th>
+<th>位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>账单真身 <code>schema.TokenUsage</code>（PromptTokens / CompletionTokens / ReasoningTokens 等），粘在 state assistant 消息的 <code>ResponseMeta.Usage</code> 上，内存态、不落库、跨场读不回</td>
+<td>eino v0.9.21 <code>schema/message.go</code> L448/L535；读取点 <code>midfold.go</code> L310–344（doc/24 落地）</td>
+</tr>
+<tr>
+<td><code>usageEstimate</code> 四读数（baseline/visible/delta/total）今天只喂折叠触发判定和 stdout 日志行 <code>compact usage …</code></td>
+<td><code>midfold.go</code> L298–405</td>
+</tr>
+<tr>
+<td>帧五种 kind（start/delta/tool_call/tool_result/terminal），只进 Redis <code>tk:runlive:&lt;runID&gt;</code>，随 lease TTL 消亡；<strong>没有任何帧带 token 信息</strong></td>
+<td><code>types.go</code> L31–42、<code>redisstore.go</code></td>
+</tr>
+<tr>
+<td>定稿历史 = PG <code>runlog_entries</code>（user / assistant / tool_call / tool_result 行），<strong><code>payload</code> 列已存在</strong>（今天只有工具扩展行用）</td>
+<td><code>pgstore.go</code> L82–96</td>
+</tr>
+<tr>
+<td>窗口 = CLI 旗标 <code>compact-window</code>（默认 256000），limit = <code>window − min(window/5, 16384)</code></td>
+<td><code>cmd/yktako/main.go</code> L47/L93、<code>compact.go</code> L138–143</td>
+</tr>
+<tr>
+<td>前端只认 start/delta/terminal 三种帧，零用量展示</td>
+<td><code>web/src/chat.ts</code> L186–187、<code>web/src/api.ts</code></td>
+</tr>
+<tr>
+<td>token 进 HTTP 的唯一先例：413 响应体 <code>{error:"message_too_large", limit, tokens}</code></td>
+<td><code>server.go</code> L104、<code>worker.go</code> L622–634</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="3-参考形态与取舍抄谁不抄谁">3. 参考形态与取舍（抄谁、不抄谁）</h2>
+<ul>
+<li><strong>pi</strong>（footer 状态行）：<code>↑输入 ↓输出 R缓存读 CH命中率% 34.5%/200k</code>，&gt;70% 变警告色、&gt;90% 变错误色； 压缩后无新响应前显示 <code>?/200k</code>。数据 = provider 真实 usage。<strong>抄这个形态</strong>——轻量、每轮更新、阈值变色。</li>
+<li><strong>Octop</strong>（<code>context_usage.py</code> + REST breakdown）：按 system_prompt/tool_definitions/conversation 等 7 段估算， 挂内存快照 + 盖章消息，弹层画环形图。<strong>segments 明细本篇不抄</strong>——tako 的 <code>countInput</code> 基数拆分 是 doc/24 §8 明令不动的东西，且第一版用户要的是一个数，不是一张饼图。</li>
+<li><strong>codex / hermes</strong>：同为「provider 真值 + 状态行 <code>used/max (percent%)</code> + 阈值」，佐证 pi 形态是业界惯用法。</li>
+</ul>
+<h2 id="4-契约先写-api帧curl-手打不从-ui-起手">4. 契约（先写 API/帧，curl 手打，不从 UI 起手）</h2>
+<h3 id="4a-新帧-kindusage">4a. 新帧 kind=<code>usage</code></h3>
+<p>每枪模型回执处理完（doc/24 读 <code>ResponseMeta.Usage</code> 的同一点）后发一帧，进 runlive 帧流：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;eventOffset&quot;</span><span class="fu">:</span><span class="dv">7</span><span class="fu">,</span><span class="dt">&quot;kind&quot;</span><span class="fu">:</span><span class="st">&quot;usage&quot;</span><span class="fu">,</span><span class="dt">&quot;agent&quot;</span><span class="fu">:</span><span class="st">&quot;&quot;</span><span class="fu">,</span><span class="dt">&quot;model&quot;</span><span class="fu">:</span><span class="st">&quot;deepseek/deepseek-flash&quot;</span><span class="fu">,</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;promptTokens&quot;</span><span class="fu">:</span><span class="dv">2910</span><span class="fu">,</span><span class="dt">&quot;completionTokens&quot;</span><span class="fu">:</span><span class="dv">63</span><span class="fu">,</span><span class="dt">&quot;reasoningTokens&quot;</span><span class="fu">:</span><span class="dv">61</span><span class="fu">,</span><span class="dt">&quot;totalTokens&quot;</span><span class="fu">:</span><span class="dv">3034</span><span class="fu">,</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;window&quot;</span><span class="fu">:</span><span class="dv">256000</span><span class="fu">}</span></span></code></pre></div>
+<ul>
+<li>字段蛇形改驼峰，与 Frame 既有 <code>eventOffset</code> 同风格；<code>reasoningTokens</code> 缺省省略（厂商明细可有可无，doc/24 同款）。</li>
+<li><strong><code>promptTokens</code> 就是上下文占用真值</strong>：它是「这一枪实际发出去的输入大小」，天然含 system、工具声明、 全部历史。不另设 <code>contextUsed</code> 字段重复它——语义在文档钉死，不在字段上叠床架屋。</li>
+<li><strong>window 是配置值不是模型真值</strong>（来自 <code>compact-window</code> 旗标）。模型级窗口真值校准仍归溢出层 （<code>extractWindow</code>），本篇不碰。percent 由前端 <code>promptTokens/window</code> 现算，不传冗余字段。</li>
+<li><strong>账单缺失（厂商不报 Usage）→ 不发 usage 帧</strong>。不发 0、不发假数；前端对「没有 usage 帧」显示 <code>?</code>，与 pi 压缩后无新响应前的 <code>?/200k</code> 同款。</li>
+<li><strong>子代理同款</strong>：帧 <code>agent</code> 字段非空即子代理枪，形状不变。前端第一版只渲染 root 帧（agent===""）， 子代理用量在场内可见（frames 里翻得到）、历史归置跟 doc/17 §6 子代理折叠的行投影一起裁，本篇不展开。</li>
+<li>一场 run 工具循环多枪 → 多帧 usage，前端<strong>每条 assistant 回复取最后一帧</strong>显示（= 下一枪的基线）。</li>
+</ul>
+<h3 id="4b-历史行扩展阶段二">4b. 历史行扩展（阶段二）</h3>
+<p>assistant 定稿行在 <code>runlog_entries</code> 复用 <code>payload</code> 列存同款 JSON。GET /api/sessions/:id/log 的 assistant 行随之多一个 <code>usage</code> 字段（后端从 payload 解出注入，无 payload 则不写该字段）：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;runlogOffset&quot;</span><span class="fu">:</span><span class="dv">5</span><span class="fu">,</span><span class="dt">&quot;runId&quot;</span><span class="fu">:</span><span class="st">&quot;r_2&quot;</span><span class="fu">,</span><span class="dt">&quot;role&quot;</span><span class="fu">:</span><span class="st">&quot;assistant&quot;</span><span class="fu">,</span><span class="dt">&quot;agent&quot;</span><span class="fu">:</span><span class="st">&quot;&quot;</span><span class="fu">,</span><span class="dt">&quot;model&quot;</span><span class="fu">:</span><span class="st">&quot;deepseek/deepseek-flash&quot;</span><span class="fu">,</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a> <span class="dt">&quot;text&quot;</span><span class="fu">:</span><span class="st">&quot;……&quot;</span><span class="fu">,</span><span class="dt">&quot;usage&quot;</span><span class="fu">:{</span><span class="dt">&quot;promptTokens&quot;</span><span class="fu">:</span><span class="dv">2910</span><span class="fu">,</span><span class="dt">&quot;completionTokens&quot;</span><span class="fu">:</span><span class="dv">63</span><span class="fu">,</span><span class="dt">&quot;reasoningTokens&quot;</span><span class="fu">:</span><span class="dv">61</span><span class="fu">,</span><span class="dt">&quot;totalTokens&quot;</span><span class="fu">:</span><span class="dv">3034</span><span class="fu">,</span><span class="dt">&quot;window&quot;</span><span class="fu">:</span><span class="dv">256000</span><span class="fu">}}</span></span></code></pre></div>
+<p><code>payload</code> 列注释「只有工具扩展行有」随之放宽为「扩展行与 assistant 行（usage）有」——同一列， 语义按 role 分派，与既有读侧按 role 分派的惯例一致。</p>
+<h3 id="4c-验收命令契约拍期望字节">4c. 验收命令（契约拍期望字节）</h3>
+<div class="sourceCode" id="cb3"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 阶段一：发一条消息，等流结束</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="at">-XPOST</span> localhost:8080/api/runs <span class="at">-d</span> <span class="st">&#39;{&quot;sessionId&quot;:&quot;s_01&quot;,&quot;text&quot;:&quot;你好&quot;}&#39;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="st">&quot;localhost:8080/api/runs/&lt;runId&gt;/frames?offset=0&quot;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co"># 期望帧序列里 terminal 之前出现一帧：</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="co"># {&quot;eventOffset&quot;:N,&quot;kind&quot;:&quot;usage&quot;,&quot;agent&quot;:&quot;&quot;,&quot;model&quot;:&quot;deepseek/...&quot;,&quot;promptTokens&quot;:&lt;正整数&gt;,</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="co">#  &quot;completionTokens&quot;:&lt;正整数&gt;,&quot;totalTokens&quot;:&lt;两数之和或更多&gt;,&quot;window&quot;:256000}</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="co"># 阶段二：同一会话事后拉历史</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="st">&quot;localhost:8080/api/sessions/s_01/log?runlogOffset=0&quot;</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 期望 assistant 行多 &quot;usage&quot;:{...}，user 行 / tool 行无此字段</span></span></code></pre></div>
+<h2 id="5-数据链路谁--谁--谁机制挂在哪一环">5. 数据链路（谁 → 谁 → 谁，机制挂在哪一环）</h2>
+<pre><code>用户发消息 → 引擎发枪 → provider 回执（ResponseMeta.Usage，doc/24 既有读取点）
+  → [新增] 同点压 kind=usage 帧进 runlive → SSE / GET frames → 前端气泡小字（阈值变色）
+  → run 收尾 → [阶段二新增] assistant 定稿行 payload 带同款 JSON → GET log → 前端历史渲染</code></pre>
+<ul>
+<li>上游：doc/24 的读取点触发它（无它则账单根本拿不到）；溢出层在极端偏差时兜底，不改本篇形状。</li>
+<li>下游：前端消费帧；未来的「手动压缩」按钮（若做）也读同一份数字，本篇不预埋。</li>
+</ul>
+<p><strong>每个新件没它会怎样</strong>：不压 usage 帧 → 场内永久黑箱，用户只剩 413 死后报数；不落 payload → run 结束 TTL 一到，历史轮的用量全部蒸发，「这会话聊了多少」无法回看，可见半边只活一场； 不显示 percent → 用户还得自己拿 promptTokens 除以 window，决策成本回升，等于没做可决策。</p>
+<h2 id="6-分阶段与-todos-草案点头后建-tmp-台账开拍">6. 分阶段与 todos 草案（点头后建 tmp 台账开拍）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>Action</th>
+<th>改什么</th>
+<th>怎么验收（第一行打跑着的东西）</th>
+<th>预估 diff</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A1（契约拍）</td>
+<td>worker 回执点压 <code>usage</code> 帧进 runlive；frames 端点零改动自然透出；无账单不发帧</td>
+<td>4c 的 curl 两条：frames 期望含 usage 帧；伪造无账单厂商路径见帧缺席</td>
+<td>~40 行</td>
+</tr>
+<tr>
+<td>A2</td>
+<td><code>web/src/api.ts</code> Frame 类型扩 usage；<code>chat.ts</code> 渲染气泡小字 <code>↑2.9k ↓63 · 2910/256k (1%)</code>，&gt;70% 橙、&gt;90% 红</td>
+<td>两个窗口：发消息看小字，深聊到高占比看变色</td>
+<td>~60 行</td>
+</tr>
+<tr>
+<td>A3（阶段二）</td>
+<td>EndRun 定稿时 assistant 行 payload 带 usage JSON；log 端点解出注入；前端历史行同款渲染</td>
+<td>4c 阶段二 curl + 两个窗口回看历史</td>
+<td>~60 行</td>
+</tr>
+</tbody>
+</table></div>
+<p>阶段二启动条件 = 阶段一两拍验收过。A3 动 <code>payload</code> 列语义，属存储面，单独一拍交审。</p>
+<h2 id="7-本篇不做">7. 本篇不做</h2>
+<ul>
+<li><strong>segments 分段明细</strong>（Octop 式 breakdown）——countInput 基数是 doc/24 §8 不动项</li>
+<li><strong>费用估算</strong>（pi 的 <code>$0.412</code>）——无单价配置面，等真需要再说</li>
+<li><strong>缓存命中/缓存读写展示</strong>——<code>PromptTokenDetails</code> 今天没被消费，不为其扩帧</li>
+<li><strong>模型级窗口配置</strong>——window 保持 CLI 旗标；真值校准归溢出层</li>
+<li><strong>自动动作</strong>（自动压缩按钮、自动开新会话建议）——压缩线仍由 doc/24 引擎侧独裁</li>
+<li><strong>图表化</strong>（环形图/饼图）——一行小字是 pi 验证过的形态，先到先停</li>
+<li>不动 <code>run_model_messages</code>（模型投影，历史展示永不读它——真源划分不变）</li>
+</ul>
+<h2 id="8-闭环">8. 闭环</h2>
+<p>所以这解决了什么：用户第一次在<strong>撞墙之前</strong>知道墙在哪——上下文占用、每枪花销变成 气泡旁的一行小字和历史里的一条记录；doc/16 #4c 的「可见/可决策」半边闭环， tako 与 Octop/pi 在这项能力上对齐（轻量形态、真值来源、阈值变色三处业界惯例全部落到）。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/27-%E7%94%A8%E9%87%8F%E5%8F%AF%E8%A7%81.md"><code>doc/27-用量可见.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

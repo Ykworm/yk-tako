@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>并行度由谁裁：租户槽、进程 sem，还是跨 pod 的执行池 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="并行度由谁裁租户槽进程-sem还是跨-pod-的执行池">并行度由谁裁：租户槽、进程 sem，还是跨 pod 的执行池</h1>
+<blockquote>
+<p>模块：运行引擎 · 并行执行（<code>scope.go</code> 子代理槽、<code>agents.go</code> 委派闸、<code>store.go</code> run 闸）｜ 状态：<strong>待拍</strong>（2026-10-31 记录，尚未裁定）｜ 证据：<code>internal/runengine/{scope.go,agents.go,store.go,journal.go}</code>、<code>cmd/yktako/main.go</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>一个租户在跑一场长任务，主代理在一条 assistant 消息里同时发出三个 <code>coder</code> 委派和几个 <code>bash</code>。同一时刻另一个租户也在跑。所有请求落在同一个 pod 上。</p>
+<p>第一个问题：<strong>普通工具调用没有并行闸。</strong> 委派工具有租户槽和进程 sem，<code>bash</code>/文件工具没有——一条消息里来十个 <code>bash</code>，就是十个 goroutine。容器的 CPU limit 是硬上限，超了不会报错，只会 CFS throttling：所有 run 一起变慢，包括没超额的租户。</p>
+<p>第二个问题：<strong>槽只回答「能不能进」，不回答「进哪个进程」。</strong> 子代理槽是租户级的一个 Redis 计数，多副本下八个槽可以全落同一个 pod，另一个 pod 空转。放行器和放置器是两件事，今天只有放行器。</p>
+<p>第三个问题：<strong>槽是带 TTL 的计数，不是租约。</strong> 占槽时把键续到 30 分钟，没有心跳。pod 被 kill → <code>DECR</code> 没跑 → 槽泄漏最多 30 分钟；反过来子代理跑超过 30 分钟 → 键过期、计数归零 → 后面的委派超额放行，闸自己消失。</p>
+<p>第四个问题：<strong>「agent 在另一个 pod」今天没有物理前提。</strong> 子代理是同进程的 ADK agent，帧靠 <code>opts</code> 里的 event generator 同进程转发，子代理内部调用刻意不记账。不是某个开关没打开，是执行器形态还没长出来。</p>
+<h2 id="2-今天实际的三层">2. 今天实际的三层</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>层</th>
+<th>落点</th>
+<th>上限从哪来</th>
+<th>跨副本？</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>run 闸</td>
+<td>PG 部分唯一索引 <code>lockTenantGate</code>（<code>store.go:300</code>、<code>:322</code>）</td>
+<td><code>tenants.max_concurrent_runs</code>，缺省 8</td>
+<td>是</td>
+</tr>
+<tr>
+<td>子代理槽</td>
+<td>Redis <code>INCR tk:subagents:&lt;tenant&gt;</code>（<code>scope.go:218-247</code>）</td>
+<td><code>tenants.max_subagents</code>，缺省 8</td>
+<td>是，多副本共用一个计数</td>
+</tr>
+<tr>
+<td>进程内 sem</td>
+<td>委派工具包壳（<code>agents.go:430-451</code>）</td>
+<td><code>-subagent-concurrency</code>，缺省 8（<code>main.go:118</code>）</td>
+<td>只在没有 Redis 时启用（单测回退）</td>
+</tr>
+</tbody>
+</table></div>
+<p>代码专门写了为什么有 Redis 就不用进程 sem：进程 sem 会让 A 占满本进程后，B 明明自己还有额度也要等（<code>agents.go:431-432</code>）。</p>
+<h2 id="3-候选与代价">3. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 保持现状（进程 sem 回退 + 租户计数）</td>
+<td>委派有槽，普通工具无闸</td>
+<td>零改动</td>
+<td>多副本下槽全落一个 pod；TTL 计数有泄漏/超卖窗口；CPU limit 无人管</td>
+</tr>
+<tr>
+<td>B 只保留租户计数</td>
+<td>删掉进程 sem 回退</td>
+<td>机制更单一</td>
+<td>单测与无 Redis 部署失去闸；租户内单 pod 仍可能被打爆</td>
+</tr>
+<tr>
+<td>C 两级容量：全局租约 + 每 pod 本地 sem</td>
+<td>槽升级为带 owner/心跳的租约；每 pod 再按 CPU/内存配额定本地 sem；普通工具也过本地 sem</td>
+<td>单机与多副本同一套机制（pod 数 = 1 的特例）；CPU 与租户额度分开裁</td>
+<td>要改槽的存储形态；要给工具环加闸；要定义续租与回收</td>
+</tr>
+<tr>
+<td>D 远程执行池</td>
+<td>子代理/工具可被派到另一个 pod 执行</td>
+<td>真正横向扩容；慢工具不占父 pod</td>
+<td>帧转发、stop 跨 pod、journal 记账、结果回传都要重做；今天没有执行器入口</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-同族小裁定">4. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>现状</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>子代理槽上限</td>
+<td><code>tenants.max_subagents</code>，缺省 8</td>
+<td>与 <code>max_concurrent_runs</code> 缺省值相同，但两者不是同一个数</td>
+</tr>
+<tr>
+<td>槽的过期</td>
+<td>TTL 30 分钟，无心跳（<code>scope.go:233</code>）</td>
+<td>死 pod 泄漏上限 30 分钟；长任务跑过 30 分钟会丢闸</td>
+</tr>
+<tr>
+<td>普通工具并行</td>
+<td>无闸，eino ToolsNode 默认并行（<code>midfold.go:654</code>）</td>
+<td>一次消息 N 个 tool_call = N 个 goroutine</td>
+</tr>
+<tr>
+<td>进程 sem 的角色</td>
+<td>无 Redis 时的回退</td>
+<td>有 Redis 时不启用，避免跨租户串行</td>
+</tr>
+<tr>
+<td>CPU 配额</td>
+<td>未建模</td>
+<td>容器 CPU limit 只体现在 throttling，不在任何闸里</td>
+</tr>
+<tr>
+<td>子代理进 journal</td>
+<td>不进（<code>journal.go:54</code>、<code>:93</code>）</td>
+<td>跨 pod 执行前必须先决定这笔调用怎么记账</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="5-证据">5. 证据</h2>
+<p><strong>代码符号</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>是什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>internal/runengine/store.go:300</code></td>
+<td><code>lockTenantGate</code> 注释：租户并发闸，闸在 PG 不在进程</td>
+</tr>
+<tr>
+<td><code>internal/runengine/store.go:322</code></td>
+<td><code>lockTenantGate</code> 实现：事务内抢租户闸</td>
+</tr>
+<tr>
+<td><code>internal/runengine/scope.go:218</code></td>
+<td><code>trySubagentSlot</code>：按租户占子代理槽</td>
+</tr>
+<tr>
+<td><code>internal/runengine/scope.go:233</code></td>
+<td>槽键 <code>Expire</code> 30 分钟</td>
+</tr>
+<tr>
+<td><code>internal/runengine/scope.go:241</code></td>
+<td><code>releaseSubagentSlot</code>：释放槽</td>
+</tr>
+<tr>
+<td><code>internal/runengine/agents.go:430</code></td>
+<td><code>runSubagentGuarded</code>：占槽 / 进程 sem / 调用 / 释放</td>
+</tr>
+<tr>
+<td><code>internal/runengine/agents.go:394</code></td>
+<td><code>delegationTool</code> 注释：帧靠 <code>opts</code> 里的 event generator 同进程转发</td>
+</tr>
+<tr>
+<td><code>internal/runengine/journal.go:54</code></td>
+<td>子代理内部调用天然不记账</td>
+</tr>
+<tr>
+<td><code>internal/runengine/midfold.go:654</code></td>
+<td>注释：eino ToolsNode 默认并行，tako 未设 <code>ExecuteSequentially</code></td>
+</tr>
+<tr>
+<td><code>cmd/yktako/main.go:118</code></td>
+<td><code>-subagent-concurrency</code> 缺省 8</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>复核命令</strong>：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;trySubagentSlot\|releaseSubagentSlot\|Expire(ctx, key&quot;</span> internal/runengine/scope.go</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;useProcessSem\|sem &lt;- struct&quot;</span> internal/runengine/agents.go</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;subagent-concurrency&quot;</span> cmd/yktako/main.go</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-rn</span> <span class="st">&quot;ExecuteSequentially&quot;</span> internal/runengine/        <span class="co"># 应为空</span></span></code></pre></div>
+<h2 id="6-现状">6. 现状</h2>
+<ul>
+<li><strong>未裁定</strong>。今天的运行行为等于候选 A：委派有租户槽（跨副本）与进程 sem 回退，普通工具无闸，没有 CPU 感知，没有跨 pod 放置。</li>
+<li><strong>待拍三件</strong>：① 普通工具调用要不要加并行闸；② 子代理槽是否从 TTL 计数升级为带心跳的租约；③ 「跨 pod 执行池」是本轮方向还是单独立项。</li>
+<li><strong>同族</strong>：委派实例的并发安全 → <a href="../同名委派共享实例/问题与方案.html">同名委派共享实例</a>；租户级并发闸 → <a href="../租户并发闸放进数据库/问题与方案.html">租户并发闸放进数据库</a>；子代理档案与恢复 → <a href="../子代理档案放哪里/问题与方案.html">子代理档案放哪里</a>。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E5%B9%B6%E8%A1%8C%E5%BA%A6%E7%94%B1%E8%B0%81%E8%A3%81/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/并行度由谁裁/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

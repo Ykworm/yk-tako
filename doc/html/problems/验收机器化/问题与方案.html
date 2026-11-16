@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>验收机器化：期望字节要有能自己判红的真源 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="验收机器化期望字节要有能自己判红的真源">验收机器化：期望字节要有能自己判红的真源</h1>
+<blockquote>
+<p>模块：验收面 · 契约（AGENTS.md「两台机器」，doc/19-v6/19v6-04）｜状态：<strong>已落地</strong>（2026-10-22 L1–L4）｜证据：<code>tmp/验收机器化/{planning,todos}.md</code>、<code>scripts/acceptance/</code>、<code>yk-tako-eino/internal/runengine/contract_test.go</code>、<code>AGENTS.md</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>下一轮有人改契约字节——比如给 <code>GET /api/sessions/:id</code> 的 <code>data</code> 加一个字段，或把某个业务码从 <code>112001</code> 改成 <code>112011</code>。</p>
+<p><code>doc/19-v6/19v6-04</code> 头注的规矩写着「改契约字节必须同步改本篇期望并重跑」。<strong>但「重跑」这两个字在人脑里没有可执行的动作</strong>。篇子里写的是散文：</p>
+<pre><code>curl &#39;localhost:8080/api/runs/r_1/frames?eventOffset=999&#39; …
+→ {&quot;code&quot;:0,&quot;message&quot;:&quot;&quot;,&quot;data&quot;:{&quot;frames&quot;:[],&quot;nextOffset&quot;:999,&quot;status&quot;:&quot;generating&quot;}}</code></pre>
+<p>谁还记得去 <code>tmp/</code> 里翻出 <code>matrix.py</code> 和 <code>spotcheck.sh</code>？大概率是照着散文再手打一遍三十条 curl，然后<strong>肉眼</strong>比一次。散文的期望字节<strong>跑歪了不会红</strong>——唯一的防线是「改契约的那个人当时在不在场、记不记得手打」。人在，就绿；人不在，歪了也绿。</p>
+<p><strong>能力其实早就有。</strong> <code>tmp/matrix.py</code>（用例矩阵实跑、逐字节打印）与 <code>tmp/spotcheck.sh</code>（带 <code>ok/no</code> 计数的活体抽验）证明「可机器重跑的验收」完全可行：就是断言跑一遍、失败打 ❌。缺的不是能力，是<strong>让它活下来的地方</strong>。</p>
+<p>三条断链，性质不同：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>断链</th>
+<th>后果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>C1</td>
+<td>脚本躺在 <code>tmp/</code>（<code>.gitignore</code> 排除）</td>
+<td>换个 clone 就没有；下一轮没人翻得到</td>
+</tr>
+<tr>
+<td>C2</td>
+<td>脚本写死本机绝对路径与端口（<code>/Users/…/.env</code>、<code>127.0.0.1:8943</code>）</td>
+<td>换机器/换端口就跑不了，仍是一次性脚本</td>
+</tr>
+<tr>
+<td>C3</td>
+<td>期望字节只在散文与 shell 里，没有机器可断言的形式</td>
+<td><strong>跑了也不算数</strong>：契约漂了脚本可能照样绿</td>
+</tr>
+</tbody>
+</table></div>
+<p>C3 最要命：C1/C2 让脚本「找不到、跑不了」，C3 让它「跑了也不算」。三样都得修。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 维持散文（现状）</td>
+<td>人手打 curl、肉眼比</td>
+<td>零成本、新人可读</td>
+<td>不可重跑；漂了不红；依赖「那个人在场」</td>
+</tr>
+<tr>
+<td>B 只把脚本搬进仓库</td>
+<td>文件原样搬，不改写死值</td>
+<td>找得到</td>
+<td>换机器仍跑不了（C2）；仍不断言（C3），搬了个不判红的脚本</td>
+</tr>
+<tr>
+<td>C 搬入 + 参数化 + 机器真源 + 快闸（选定）</td>
+<td><code>scripts/acceptance/</code> + <code>expected.json</code> + <code>contract_test.go</code>；散文保留为人读版，比对脚本守用例号集合</td>
+<td>重跑是一句命令；漂了自己红；不依赖人</td>
+<td>多一份文件要同批改；隔离引擎要手工起</td>
+</tr>
+<tr>
+<td>D 让脚本解析散文里的 <code>→ 202 {...}</code></td>
+<td>单一真源、零重复</td>
+<td>理论上最省同步</td>
+<td>散文体例一改解析器就脆；大量描述性期望（「frames: [start,delta,delta]」）要特判，比维护清单更贵</td>
+</tr>
+<tr>
+<td>E 用场景级 Eval 取代</td>
+<td>每件事写成场景</td>
+<td>更贴近真实</td>
+<td>它管「活干完没有」，管不了「字节对不对」；今天还没建（doc/45）</td>
+</tr>
+</tbody>
+</table></div>
+<p>选 C，并且分两层落地，因为两类东西的成本完全不同：</p>
+<ul>
+<li><strong>能在 Go 里断言的骨架</strong>（信封字段顺序、data 键序、帧 kind 词表、业务码值）→ 进快闸 <code>go test</code>，不打模型、不依赖 PG/Redis，每拍收尾顺带跑；</li>
+<li><strong>必须起引擎/模型的活体</strong>（真跑一轮、工具循环、跨租户可见性）→ 进 <code>scripts/acceptance/</code>，参数化到 <code>TAKO_BASE</code> / <code>TAKO_ENV</code> / <code>TAKO_PG_DSN</code>。</li>
+</ul>
+<h2 id="3-机器真源长什么样">3. 机器真源长什么样</h2>
+<p><code>scripts/acceptance/expected.json</code> 是契约字节的<strong>机器真源</strong>。每条 = 用例号 + 请求 + 期望 HTTP 码 / 业务码 / 文案 / <code>data</code> 字段序与值。今天它是 <strong>26 条 <code>cases</code>（断言）+ 15 条 <code>declared_not_asserted</code>（登记不断言的原因）</strong>。</p>
+<p>人读版仍是 <code>doc/19-v6/19v6-04</code>。两份同批改，<code>check-expected.sh</code> 守「散文里的用例号集合 == 清单里的用例号集合」——单边漂即非零退出。规则是：<strong>散文不删</strong>（新会话要读它知道端点长什么样），但它不再是唯一真源。</p>
+<p><code>assert_contract.py</code> 逐条打引擎、比对字节，失败打 ❌、退出码非零。<strong>阴性对照是这条链的验收本身</strong>：故意把 <code>expected.json</code> 一条 <code>message</code> 改成「故意写错」，必须 <code>FAIL 1</code>、退出码非 0；改回再回到全绿。不会红的断言器等于没建。</p>
+<p>快闸 <code>contract_test.go</code> 断的骨架（<code>TestContract*</code>）：信封三字段顺序与失败体、<code>GET /api/sessions/:id</code> 的 <code>data</code> 键序（<code>liveRunId → runlogOffset → lastRunStatus → lastRunId → workspaceId</code>）、帧 kind 词表、关键业务码值、流事件的字节形状、新增端点的字节（文件清单、项目对象的 <code>isDefault</code>）。<strong>断言里的字节不许手写</strong>：先 curl 实跑一次，把真实字节抄进测试——手写的期望只是把手写散文换了个文件名。</p>
+<h2 id="4-落地时撞到的事实">4. 落地时撞到的事实</h2>
+<p>这一轮最硬的一条不是设计出来的，是跑出来的：</p>
+<ul>
+<li><strong>旧脚本已经烂了</strong>。<code>tmp/matrix.py</code> / <code>tmp/spotcheck.sh</code> 早于 doc/40 的信封切换，还在顶层取 <code>sessionId</code>（现行是 <code>data.sessionId</code>）——直接 KeyError。它们不是「放在 tmp/ 里没人维护」，是<strong>已经坏了，只是没人跑到过</strong>。这反过来加强 C1：不入库的东西不只是找不到，它是无声腐烂的。</li>
+<li><strong><code>0-signup</code> 的 data 键序漏了 <code>accessToken</code></strong>（在 <code>tokenType</code> 之前）——机器清单第一次跑就红。人读散文时这一处很容易滑过去。</li>
+<li><strong>terminal 帧比 PG 翻终态早一拍</strong> → 「定稿后立刻读 session」必假失败 → 断言器加 <code>wait_settled</code> 等<strong>会话落定</strong>，不是靠 sleep 猜。</li>
+<li><strong><code>0-runtime-config</code> 把字面量 <code>$key</code> 当密钥 PUT 进了共享账号</strong>，把后面所有 model 用例的租户密钥改成垃圾 → 全线 401。修法：占位符真替换 + 该用例自带账号。验收脚本自己也会互相污染，隔离比「小心点」可靠。</li>
+<li><strong>启动配方两处错</strong>：Redis db 索引要 URL 形式 <code>redis://127.0.0.1:6390/7</code>；隔离库要先 <code>CREATE EXTENSION pg_search CASCADE</code>，否则引擎 fail fast 起不来。</li>
+</ul>
+<h2 id="5-同族小裁定">5. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>机器真源放哪</td>
+<td><strong>独立 <code>expected.json</code></strong>，不写进脚本、不解析散文</td>
+<td>多一份文件同批改，由 <code>check-expected.sh</code> 守集合</td>
+</tr>
+<tr>
+<td>散文删不删</td>
+<td><strong>不删</strong>，降级为人读版</td>
+<td>新会话需要「端点该长什么样」的可读说明</td>
+</tr>
+<tr>
+<td>骨架断在哪</td>
+<td><strong>Go 快闸</strong>（<code>contract_test.go</code>）</td>
+<td>不依赖引擎/模型，每拍顺带跑</td>
+</tr>
+<tr>
+<td>活体放哪</td>
+<td><strong><code>scripts/acceptance/</code></strong>（python + bash）</td>
+<td>参数化 <code>TAKO_BASE</code> / <code>TAKO_ENV</code> / <code>TAKO_PG_DSN</code></td>
+</tr>
+<tr>
+<td>断言的字节从哪来</td>
+<td><strong>先 curl 实跑、抄真实字节</strong></td>
+<td>手写期望等于换文件名的散文</td>
+</tr>
+<tr>
+<td>暂不断言的用例怎么处理</td>
+<td><strong><code>declared_not_asserted</code> 登记原因</strong></td>
+<td>例：模型行为不稳、要特殊起引擎；今天 15 条</td>
+</tr>
+<tr>
+<td>旧 <code>tmp/</code> 脚本</td>
+<td><strong>被取代后删除/移回收站</strong>，台账记一句</td>
+<td>已坏在信封切换前，保留只会误导</td>
+</tr>
+<tr>
+<td>「重跑」命令</td>
+<td><code>assert_contract.py</code> + <code>check-expected.sh</code>（+ 各专项 shell）</td>
+<td>方案原写 <code>run.sh</code>，落地拆成按用途的脚本；README 是入口</td>
+</tr>
+<tr>
+<td>隔离靶子</td>
+<td><strong>独立 PG 库 + 独立 Redis db + 独立 workspace</strong></td>
+<td>别拿开发库当靶子：脚本会注册账号、建项目、删默认工作区</td>
+</tr>
+<tr>
+<td><code>DELETE /api/dev/reset</code></td>
+<td><strong>禁止用来清测试数据</strong></td>
+<td>全库 TRUNCATE 15 张表 + <code>SCAN tk:*</code>，2026-10-21 真出过一次</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="6-证据">6. 证据</h2>
+<p><strong>方案 / 台账</strong>：<code>tmp/验收机器化/planning.md</code>（三条断链、L1–L4、§6 三选一 → 用户选「甲」；§7 施工后补记、四处实测问题）、<code>todos.md</code>（每拍 curl + 期望输出 + 阴性对照）、<code>tmp/验收机器化/</code> 验收后清理；规则落 <code>AGENTS.md</code>「验收：两台机器」。</p>
+<p><strong>代码符号</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>是什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>scripts/acceptance/expected.json</code></td>
+<td>机器真源：26 条 cases + 15 条 declared_not_asserted</td>
+</tr>
+<tr>
+<td><code>scripts/acceptance/assert_contract.py</code></td>
+<td>逐条打引擎比对，失败非零退出</td>
+</tr>
+<tr>
+<td><code>scripts/acceptance/check-expected.sh</code></td>
+<td>散文用例号集合 ↔︎ 清单用例号集合一致</td>
+</tr>
+<tr>
+<td><code>scripts/acceptance/README.md</code></td>
+<td>隔离引擎起法（建库 + <code>pg_search</code> + 独立 Redis db / workspace）</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/runengine/contract_test.go:35</code></td>
+<td><code>TestContractEnvelopeBytes</code> 信封字节</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/runengine/contract_test.go:53</code></td>
+<td><code>TestContractSessionResponseBytes</code> data 键序</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/runengine/contract_test.go:121</code></td>
+<td><code>TestContractBusinessCodes</code></td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/runengine/contract_test.go:161</code></td>
+<td><code>TestContractFrameKindVocabulary</code></td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/internal/runengine/contract_test.go:199</code></td>
+<td><code>TestContractToolTiering</code> 分档现状</td>
+</tr>
+<tr>
+<td><code>doc/19-v6/19v6-04-验收-curl.md:6-15</code></td>
+<td>头注：人读版 / 机器版 / 重跑命令</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>复核命令</strong>：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 快闸（不用引擎、不用模型）</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino <span class="kw">&amp;&amp;</span> <span class="va">PATH</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$HOME</span><span class="st">/sdk/go1.27.0/bin:</span><span class="va">$PATH</span><span class="st">&quot;</span> <span class="ex">go</span> test ./internal/runengine</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="va">PATH</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$HOME</span><span class="st">/sdk/go1.27.0/bin:</span><span class="va">$PATH</span><span class="st">&quot;</span> <span class="ex">go</span> vet ./internal/runengine</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 活体（先按 README 起隔离引擎）</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="va">TAKO_BASE</span><span class="op">=</span>http://127.0.0.1:8943 <span class="va">TAKO_ENV</span><span class="op">=</span>yk-tako-eino/.env <span class="dt">\</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>  <span class="ex">python3</span> scripts/acceptance/assert_contract.py     <span class="co"># 红 → 退出码非零</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="fu">bash</span> scripts/acceptance/check-expected.sh           <span class="co"># 用例号集合一致</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="co"># 阴性对照：故意写错一条 → 必须红</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-</span> <span class="op">&lt;&lt;&#39;PY&#39;</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="st">import json,pathlib</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a><span class="st">p=pathlib.Path(&quot;scripts/acceptance/expected.json&quot;); d=json.loads(p.read_text())</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="st">d[&quot;cases&quot;][0][&quot;message&quot;]=&quot;故意写错&quot;; p.write_text(json.dumps(d,ensure_ascii=False,indent=2))</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="op">PY</span></span></code></pre></div>
+<p><strong>活体验收</strong>：2026-10-22 全拍完成后 <code>go test</code> / <code>go vet</code> 绿；<code>assert_contract.py</code> 全绿且阴性对照判红；<code>check-expected.sh</code> 一致；<code>check-master-plan.sh</code> OK。doc/48 之后新增的端点在快闸与清单里继续同批登记（如 <code>TestContractWorkspaceFilesBytes</code> / <code>TestContractStreamEventBytes</code>）。</p>
+<h2 id="7-现状">7. 现状</h2>
+<ul>
+<li><strong>仍有效</strong>：散文 + 机器真源双份同批改；骨架进 Go 快闸、活体进 <code>scripts/acceptance/</code>；期望字节先实跑再抄；<code>declared_not_asserted</code> 必须写原因；隔离靶子参数化。</li>
+<li><strong>已翻转</strong>：<code>tmp/</code> 里的验收脚本不再算资产（旧两份已坏在信封切换前，被取代）；「重跑」从一段散文变成一句命令。</li>
+<li><strong>未做</strong>：<code>doc/45</code> 场景级 Eval——它能回答「活干完没有」，但今天没有建成，不属于这一层。</li>
+<li><strong>同族问题</strong>：界面验收怎么分层 → <a href="../界面验收双轨/问题与方案.html">界面验收双轨</a>；契约字节里的信封形状 → <a href="../响应信封统一/问题与方案.html">响应信封统一</a>；帧与 runlog 的状态语义 → <a href="../崩溃后这场run算什么状态/问题与方案.html">崩溃后这场 run 算什么状态</a>。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E9%AA%8C%E6%94%B6%E6%9C%BA%E5%99%A8%E5%8C%96/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/验收机器化/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

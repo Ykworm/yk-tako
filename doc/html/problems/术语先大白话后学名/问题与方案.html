@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>术语先大白话后学名：第一次出现就要能落脚 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="术语先大白话后学名第一次出现就要能落脚">术语先大白话后学名：第一次出现就要能落脚</h1>
+<blockquote>
+<p>模块：文档纪律 · 架构篇可读性（tmp/doc-clarify-plain，落点 doc/19-v6/19v6-05）｜状态：<strong>已落地</strong>（2026-10-10）｜证据：<code>tmp/doc-clarify-plain/{planning,todos}.md</code>、<code>doc/19-v6/19v6-05-tool-loop.md</code>、<code>doc/19-v6/19v6-90-演进记录.md</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>一篇架构文档要讲「模型怎么按规格解析」。作者写下这句：</p>
+<pre><code>Registry.Get(ctx, ref)（进程内注册表 =「多实例 + 晚解析」的机械件）</code></pre>
+<p>在这句话里，读者至少撞上四个没落脚的词：<code>Registry</code> 是什么形状、<code>ref</code> 从哪来、**「机械件」<strong>指什么、</strong>「晚解析」**又是什么。后文还有「继承档 / ref 档」这种自造缩写。</p>
+<p>2026-10-10，用户连续追问三轮——「Registry 是什么」「ref 是什么」「其他实例怎么办」——三轮之后仍然没看懂。<strong>这不是读者的问题，是文档没有给出可落脚的定义。</strong> 三个月后重读同一段，问题一模一样：文档没变，只是当时那个人不在了。</p>
+<p>具体的失败有两条：</p>
+<ul>
+<li><strong>按错误的心智模型做设计</strong>：读者把「进程内注册表」想成跨副本共享的注册中心，于是自然问「其他实例怎么办」。文档没有一句话回答「它为什么在进程内、多副本下为什么不需要共享」，读者只能自己猜，猜错就把后续讨论建立在错误前提上。</li>
+<li><strong>术语表救不了正文</strong>：即便文末列了词表，读者在 §4 读到第 37 行时不会先翻到附录。定义必须出现在<strong>第一次使用之前或当场</strong>，否则等于没有。</li>
+</ul>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 保持行话</td>
+<td>行业词 + 自造缩写照写</td>
+<td>作者省事；熟手读得快</td>
+<td>新人/三个月后的自己读不懂；追问三轮仍在原地；错误心智模型会传染进设计讨论</td>
+</tr>
+<tr>
+<td>B 全部换成大白话，不用学名</td>
+<td>把 Registry 叫「缓存表」、ref 叫「模型名」</td>
+<td>第一遍最好懂</td>
+<td>代码里叫 <code>ModelRegistry</code> / <code>ref</code>，文档与代码对不上，grep 不到；后续讨论失去精确指称，同一概念会出现多个说法</td>
+</tr>
+<tr>
+<td>C 第一次出现「大白话 + 括号学名」，后文用学名（选定）</td>
+<td>「进程内的懒加载缓存表（学名 ModelRegistry）」</td>
+<td>第一遍能落脚；后文仍精确、可 grep</td>
+<td>首次出现处要多写半句；作者要判断「哪个词对读者是新的」</td>
+</tr>
+<tr>
+<td>D 只在文末加术语表</td>
+<td>正文照旧，附录统一解释</td>
+<td>改动最小</td>
+<td>读者在正文中途不会翻附录；定义与使用相隔几十行，等于没有</td>
+</tr>
+</tbody>
+</table></div>
+<p>选 C。关键区分不是「术语好还是不好」，而是<strong>第一次出现时读者心里有没有东西</strong>：</p>
+<ul>
+<li>有具体形状（<code>map[ref]ChatModel</code>、进程内存、带读写锁）→ 读者能继续读；</li>
+<li>只有一个抽象名词（「机械件」「晚解析」）→ 读者停下来，后面的推理全部悬空。</li>
+</ul>
+<p>学名不能删，因为它是<strong>代码与讨论的指称</strong>：删了就没法 grep、没法在评审里精确说「这里查的是 ModelRegistry 不是缓存」；但学名必须<strong>跟在真身后面</strong>，不能反过来让读者先背名字再猜意思。</p>
+<h2 id="3-改法五处具体动作">3. 改法：五处具体动作</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>动作</th>
+<th>做法</th>
+<th>没它会怎样</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>① 术语表钉在 §0</td>
+<td>新增 <code>ref</code>、<code>ChatModel 实例</code>、<code>ModelRegistry</code> 三条，每条五列：形状（正向定义）/ 住处 / 消费者 / 例子</td>
+<td>读者到 §4 才发现自己不知道 <code>ref</code> 是什么，只能往回翻或放弃</td>
+</tr>
+<tr>
+<td>② 三档表改名</td>
+<td>「继承档 / ref 档」→「写法一：根本不写 / 写法二：写 inherit / 写法三：指定 ref」；表头「档」→「写法」</td>
+<td>自造缩写让读者先学一套私有词汇，再学机制；两层负担</td>
+</tr>
+<tr>
+<td>③ 链路图换成具体值</td>
+<td>主 worker 用 <code>deepseek/x</code>、子代理 A 写 <code>inherit</code>、子代理 B 写 <code>anthropic/claude-sonnet-4</code>；至少走一条继承分支、一条指定分支</td>
+<td>抽象变量名（A/B/C）的箭头图看起来完整，实际无法验证读者是否理解分流</td>
+</tr>
+<tr>
+<td>④ 补「为什么在进程内」</td>
+<td>用表格列出判断依据：实例无状态、按 ref 懒建、多副本各自建一份不冲突、缓存丢了只是重建</td>
+<td>读者按「跨副本注册中心」的模型理解，会设计出不必要的共享层</td>
+</tr>
+<tr>
+<td>⑤ 补最小伪代码</td>
+<td><code>ModelRegistry.Get</code> 约 30 行：先查 map → 未命中走 <code>ResolveModelWithRef</code> → 双检后写入</td>
+<td>「懒加载」四个字仍然要读者自己翻译成代码；伪代码把「懒」落到操作上</td>
+</tr>
+</tbody>
+</table></div>
+<p>原则一句：<strong>每个术语第一次出现，必须三选一</strong>——贴真身（真实格式、示例值、<code>map[ref]ChatModel</code>）、给操作定义（谁、从哪、拿什么、做什么、得到什么）、或指回前文已给出的同等定义。三样都给不出，就换成人话或删掉。</p>
+<h2 id="4-同族小裁定">4. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>术语删不删</td>
+<td><strong>不删</strong>，保留学名供 grep 与讨论</td>
+<td>但必须跟在真身后面，不能裸用</td>
+</tr>
+<tr>
+<td>定义放哪</td>
+<td><strong>第一次出现处 / §0</strong>，不放文末附录</td>
+<td>读者不会中途翻附录</td>
+</tr>
+<tr>
+<td>自造缩写（「档」「机械件」「晚解析」）</td>
+<td><strong>改成人话</strong></td>
+<td>它们不是代码里的名字，没有精确性收益</td>
+</tr>
+<tr>
+<td>链路图怎么写</td>
+<td><strong>用具体值走完整分流</strong>，不用抽象变量</td>
+<td>抽象图无法暴露「读者是否真懂」</td>
+</tr>
+<tr>
+<td>「为什么这样设计」要不要写</td>
+<td><strong>要，且列判断依据</strong></td>
+<td>只写「因为它是缓存」等于把问题推回去</td>
+</tr>
+<tr>
+<td>改哪些文档</td>
+<td>只改 <code>19v6-05</code> §0/§4 与 <code>19v6-90</code> 十修段</td>
+<td>契约真源 <code>19v6-01</code>、存储真源 <code>19v6-03</code> 不动</td>
+</tr>
+<tr>
+<td>历史记录能不能改措辞</td>
+<td><strong>可以换掉黑话，不改结论</strong></td>
+<td>「只追加不改结论」的规则不禁止把句子写得更可读</td>
+</tr>
+<tr>
+<td>代码要不要改</td>
+<td><strong>零改动</strong></td>
+<td>这是纯文档拍；术语指的是已存在的代码符号</td>
+</tr>
+<tr>
+<td>文档拍的验收</td>
+<td><strong>三个自问</strong>：术语首次出现前 3 段内有定义？图是否用具体值走两条分支？「为什么」是否有依据表？</td>
+<td>没有 curl 可打；判据是可读性，不是字节</td>
+</tr>
+<tr>
+<td>同类规则放哪</td>
+<td>升格进 <code>AGENTS.md</code>「解释与汇报的及格线」</td>
+<td>名词准入、故事先行、黑话翻译令——与本拍同一条纪律</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="5-证据">5. 证据</h2>
+<p><strong>台账</strong>：<code>tmp/doc-clarify-plain/planning.md</code>（为什么要改、改哪些、措辞原则、验收三问、无脚手架）、<code>todos.md</code>。本地台账，验收后清理。</p>
+<p><strong>落点</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>是什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>doc/19-v6/19v6-05-tool-loop.md</code> §0</td>
+<td>术语表补 <code>ref</code> / <code>ChatModel 实例</code> / <code>ModelRegistry</code> 三条，含形状、住处、消费者、例子</td>
+</tr>
+<tr>
+<td><code>doc/19-v6/19v6-05-tool-loop.md</code> §4</td>
+<td>三档穷举表改为「写法一/二/三」；链路图用具体 ref 走继承与指定两条分支；补 <code>ModelRegistry.Get</code> 最小伪代码</td>
+</tr>
+<tr>
+<td><code>doc/19-v6/19v6-05-tool-loop.md:28</code></td>
+<td><code>ref</code> 的正向定义与示例值</td>
+</tr>
+<tr>
+<td><code>doc/19-v6/19v6-05-tool-loop.md:30</code></td>
+<td><code>ModelRegistry</code> = 进程内懒加载缓存表 <code>map[ref]ChatModel实例</code></td>
+</tr>
+<tr>
+<td><code>doc/19-v6/19v6-90-演进记录.md</code> 十修段</td>
+<td>同一批黑话替换为直白说法，结论不变</td>
+</tr>
+<tr>
+<td><code>AGENTS.md</code>「解释与汇报的及格线」</td>
+<td>名词准入 / 故事先行 / 黑话翻译令（同一条纪律的升格）</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>复核命令</strong>：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;懒加载\|ref\b\|ModelRegistry&quot;</span> doc/19-v6/19v6-05-tool-loop.md <span class="kw">|</span> <span class="fu">head</span> <span class="at">-20</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;继承档\|ref 档\|机械件\|晚解析&quot;</span> doc/19-v6/19v6-05-tool-loop.md   <span class="co"># 期望：无命中</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fu">sed</span> <span class="at">-n</span> <span class="st">&#39;/## 0\./,/## 1\./p&#39;</span> doc/19-v6/19v6-05-tool-loop.md               <span class="co"># 术语表五列齐全</span></span></code></pre></div>
+<p><strong>验收（文档拍）</strong>：逐个 section 读改后内容，三个自问——① 第一次出现的术语是否在之前 3 段内有正向定义；② 链路图是否用具体值走了至少一条「继承」和一条「指定 ref」分支；③ 「为什么 Registry 放进程内」是否有判断依据列表而非一句「因为是缓存」。</p>
+<h2 id="6-现状">6. 现状</h2>
+<ul>
+<li><strong>仍有效</strong>：「大白话 + 括号学名」的首次出现格式；术语表在 §0 而非文末；链路图用具体值；「为什么」要列依据；纯文档拍不改代码。</li>
+<li><strong>已翻转</strong>：<code>Registry.Get(ctx, ref)（…「机械件」…）</code> 这类裸学名写法作废；「继承档 / ref 档」这类自造缩写不再使用。</li>
+<li><strong>延伸</strong>：同一纪律后来升格为 <code>AGENTS.md</code> 的「解释与汇报的及格线」（名词准入、故事先行、每步四问、黑话翻译令）——本拍是它在<strong>文档</strong>上的第一次落地，之后的方案/台账/复盘都按同一标准写。</li>
+<li><strong>同族问题</strong>：方案文档真源怎么组织 → <a href="../仓库治理的机械闸/问题与方案.html">仓库治理的机械闸</a>；架构里模型/工具的可读分层 → <a href="../子代理规格与工具边界/问题与方案.html">子代理规格与工具边界</a>。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E6%9C%AF%E8%AF%AD%E5%85%88%E5%A4%A7%E7%99%BD%E8%AF%9D%E5%90%8E%E5%AD%A6%E5%90%8D/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/术语先大白话后学名/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

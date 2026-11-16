@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>39 · 子代理持久化与 resume · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="39--子代理持久化与-resume">39 · 子代理持久化与 resume</h1>
+<blockquote>
+<p>性质：<strong>已落地</strong>。2026-10-21。v2：持久化形态改为「每实例一份追加式 wire 文件」（借鉴 Kimi wire.jsonl 的形态，消息粒度）；v3：砍 PG 目录表，约定定位（目录布局 + metadata + terminal 行）；<strong>v4：砍半截重接（S-i 反转）</strong>——崩溃在半途的实例 = 失败，对齐 doc/30「放弃半截、client 重发」的 run 级语义，resume 只认完整档案。S1 随 <code>e476749</code> 入库；S2、S3 于 2026-10-21 在 <code>127.0.0.1:8905</code> 用 curl 验收后随本篇入库。不表示版本号跳了一档。 验收结论（2026-10-21，工作区 <code>tmp/ws-38</code>）：会话 <code>s_01M5D7XEPP9ZC4QMG1V58X0SS6</code> 的实例 <code>sa_01M5D7XFPTZYDEBTCYHTCRYE1G</code>，wire 的 SHA-256 在其后的重启和清扫里仍是 <code>71a4d705d46ef01d212704b8d29f37cc036d06d1982bbd54b403055d79856455</code>。续跑 run <code>r_01M5D94WR1NK5R96CKRN1T5B6B</code> 完成，新实例 <code>sa_01M5D94XYAGRZX720Q1T4Z74C0</code>，父工具结果以「（本次委派实例：sa_01M5D94XYAGRZX720Q1T4Z74C0）」收尾。半截副本回「该实例未完成或已中断，请重新委派」；过窗副本回「档案已过期」；不存在的 id 回「找不到该子代理档案，请重新委派」。S3 挂在 doc/37 同一轮清扫上，只删文件：探针删掉过窗且有 terminal 的副本，以及 <code>created_at</code> 过窗的半截副本；窗口内的完整档案和窗口内的半截都留下。<code>sa_01M5D7PAST000000000000000AA.jsonl</code> 的 <code>finished_at</code> 早于默认 168h，第一轮 ticker 收走了它；<code>sa_01M5D7PART00000000000000AA.jsonl</code> 还在盘上。单测 <code>TestLocate</code> 用同一份 <code>archiveTTL</code> 证明：窗口收成 12h 时，过窗档案拒绝续跑。活体没有把 S1 原件拨老。 代码落点：<code>yk-tako-eino/internal/runengine/agents.go</code>（wire 写入 + resume 工具）、<code>worker.go</code>（注入与装配）、doc/37 的清扫器（第三类清理，只删文件）。 真源关系：委派与折叠机制是 <a href="25-子代理折叠.html">doc/25</a>、运行时装配是 <a href="34-租户运行时装配.html">doc/34</a>、崩溃语义对齐 <a href="30-崩溃续跑.html">doc/30</a>（放弃半截、不自动重跑）；档案的保留窗口与清扫器继承 <a href="37-删除与档案清理.html">doc/37</a> §5.5。<strong>定位：本篇从清理架构看是 doc/37 的一员</strong>——wire 是会话生命周期内的系统档案（<code>.tako/</code>），resume 只是它在保留窗口内的价值形态；窗口与清扫的真源唯一在 doc/37，本篇不另立（同一份文件，ttl 读数前叫劳动力、读数后叫垃圾，同一个数）。Kimi wire 参考：ref-agent/kimi-code wire-manifest.d.ts（事件溯源协议，<strong>只取形态不取协议</strong>，见 §3.1）。 不在本篇：用户页面入口（子代理列表/「继续」按钮 <strong>2026-10-23 已由 <a href="44-前端三处欠账.html">doc/44</a> 落地</strong>）、跨会话 resume、事件溯源级别的 replay 引擎（§3.1）、跨会话子代理用量统计（S-a 的「要认的损失」）、<strong>崩溃半截重接</strong>（v4 明确不做，见 §9）、常驻后台子代理。</p>
+</blockquote>
+<h2 id="0-本篇做什么">0. 本篇做什么</h2>
+<p>给每次委派一个<strong>持久实例档案</strong>，跑的过程中<strong>每轮追加</strong>记录；<strong>完整跑完</strong>的实例在窗口内可以「接着继续做」（resume）。两件事：</p>
+<ol type="1">
+<li><strong>wire 文件</strong>：每次委派一个 <code>sa_</code> 实例一份 JSONL（<code>&lt;会话目录&gt;/.tako/subagents/&lt;sa_id&gt;.jsonl</code>），每轮模型往返追加一条消息，终态追加 terminal 行。<strong>没有 PG 表</strong>——实例身份、定位、过期判断全由约定（§5）从文件推导；</li>
+<li><strong><code>resume_subagent</code> 工具</strong>：父 agent 在对话里发起「让刚才那个调研子代理补充一下 xx」，引擎按约定找到完整档案、注入历史、重建子代理继续跑，产出<strong>新实例</strong>（<code>resumed_from</code> 成链）；档案过期由 doc/37 D4 的清扫器回收（第三类，只删文件）。</li>
+</ol>
+<p><strong>不做什么（v4 拍死）：</strong> 子代理跑到一半被 close / 崩了 / 出 error —— <strong>放弃</strong>，这就是一次失败的委派，语义对齐 doc/30 的 run 级兜底（「引擎不会自动重跑这次调用，需要的话请重新发起」）。想继续 = client 重发、父 agent 重新委派（新实例），或 resume 一个<strong>之前完整跑完</strong>的档案。不做从断点重接：半截现场的工具副作用已部分发生，续跑要处理幂等，比干净重跑更不可靠，收益配不上复杂度。</p>
+<h2 id="1-背景与动机">1. 背景与动机</h2>
+<p><strong>主故事（想追问，没了）：</strong> researcher 子代理跑两小时、十几个工具调用，折叠成三行摘要回主对话。用户想追问「那个对比表的数据源是哪几个？」——父 agent 没有：子代理的现场在跑完那一刻<strong>即弃</strong>（doc/25 §4 原话：「无 AfterAgent：子代理 state 跑完即弃，没有取货口」）。只能从头交代背景重跑。</p>
+<p><strong>副故事（过程是黑箱）：</strong> 子代理在跑的时候，人只能等 Redis 帧流推给页面的片段；想看完整过程记录，库里没有按实例组织的持久化档案（<code>runlog_entries</code> 按 run 混排，无父子配对结构）。崩死的委派连"死在哪"都要翻混排日志。</p>
+<p>两个故事同根：<strong>完整跑完的子代理价值在过程里，而过程只活在内存</strong>——追问接不上、过程查不了。持久化的正确姿势是<strong>跑的过程中按实例追加</strong>（文件里永远有跑到哪算哪的记录，过程可查、<code>tail -f</code> 可见），并让<strong>完整档案</strong>在窗口内可续。</p>
+<p><strong>半截（v4 的明确边界）：</strong> 崩在半途的子代理不救。追加写留下的半成品 wire 有两样残余价值：人可以用它<strong>诊断死在哪</strong>（读到文件末尾即可），清扫器会在 orphans TTL 后收走它。它是事故现场的笔录，不是复活仓。</p>
+<h2 id="2-名词">2. 名词</h2>
+<ul>
+<li><strong>委派实例</strong>：一次工具调用把某个规格的子代理跑完的全过程。<strong>sa_id</strong> 是这次实例的 id（<code>sa_&lt;ULID&gt;</code>，文件名主键；规格 coder/researcher 可反复委派，每次一个新 sa_id）。</li>
+<li><strong>wire 文件</strong>：<code>&lt;会话目录&gt;/.tako/subagents/&lt;sa_id&gt;.jsonl</code>。第一行 <code>metadata</code>；随后每轮模型往返<strong>追加</strong>一条消息行；<strong>最后一行 <code>terminal</code>（status + 完成时间 + 终稿）——完整档案的标志，resume 和清扫都只认它</strong>。粒度是消息，不是事件（§3.1）。</li>
+<li><strong>完整档案 / 半成品</strong>：有 terminal 行 / 无 terminal 行。resume 只认完整档案；半成品是诊断材料 + 孤儿垃圾（§5 清扫分支二）。</li>
+<li><strong>约定</strong>：定位实例的三件事全在文件上——目录布局、metadata 字段、terminal 行。没有数据库索引，文件系统本身就是索引。</li>
+<li><strong>resume</strong>：以完整档案的消息序列作为历史、追加一条新指令继续跑。产出是<strong>新实例</strong>（新 wire，<code>resumed_from</code> 指回原 sa_id）——档案只追加成链，原现场不可变。</li>
+<li><strong>保留窗口</strong>：terminal 行的 <code>finished_at + archive_ttl</code>（doc/37 的 <code>-archive-ttl</code>，默认 7 天）。窗口内可 resume，窗口外文件被清扫。</li>
+<li><strong>orphans TTL</strong>：无 terminal 行的半成品文件按 <code>created_at + archive_ttl</code> 清扫——正在跑的（created_at 新）自然豁免，死透的（created_at 旧）被收走，无需 lease 区分死活。</li>
+</ul>
+<h2 id="3-现状机制代码事实2026-10-21-实读">3. 现状机制（代码事实，2026-10-21 实读）</h2>
+<ul>
+<li><strong>装配</strong>：<code>agentSpecHandler</code> 每 Run 把规格装配成 <code>adk.NewAgentTool</code> 包进 <code>delegationTool</code>（并发闸 + 回传裁剪），追加进父 run 工具池（agents.go:430-509）。模型按「显式 ref &gt; 租户 profile &gt; 继承主实例」三级定；工具池「名单独立、实例共享」（agents.go:590）。</li>
+<li><strong>消息落点</strong>：子代理的完整 ReAct 消息序列<strong>不进 <code>run_model_messages</code></strong>（root-only，midfold.go:394）。持久化的是 <code>runlog_entries</code>（按 run 混排的文本流水）和 Redis 帧流——展示有余、按实例重建不足。</li>
+<li><strong>折叠</strong>：<code>agentFoldHandler</code> 挂在子代理 middleware 链，每轮模型调用前对<strong>子代理全量 <code>state.Messages</code></strong> 估/折/滤（midfold.go:673-721）——折前原文拿得到，但跑完即弃、不落库。</li>
+<li><strong>工作目录</strong>：子代理跑在父 run 的同一个 ctx 里（delegationTool 原样透传），作业根 = 父 run 的会话或项目目录（worker.go:468-480）。子代理写的文件就是父容器里的文件，resume 后天然可见——文件副作用不需要恢复，这半边成本为零。</li>
+<li><strong>注入路径</strong>：eino v0.9.21 <code>ChatModelAgentConfig</code> 无「初始历史」字段，但 <code>GenModelInput</code> 回调可在装配时构造喂给模型的消息序列（已查证签名）。</li>
+<li><strong>run 级 resume 的语义（v4 对齐它）</strong>：<code>POST /api/runs/:runId/resume</code> 的 journal 是 root-only（journal.go:281、:93-96），重放时对中断的工具调用回固定文本「<strong>引擎不会自动重跑这次调用，需要的话请重新发起</strong>」——放弃半截、重发重跑。子代理沿用同一产品语义。</li>
+</ul>
+<h3 id="31-与-kimi-wire-的关系取形态不取协议">3.1 与 Kimi wire 的关系：取形态，不取协议</h3>
+<p>Kimi 的 <code>wire.jsonl</code> 是<strong>事件溯源 journal</strong>：每行一条事件、64 种 record type、protocol 迁到 1.5，状态靠重放事件折出，支撑它的是 DI 引擎 + replay + vis 一整套。<strong>本篇不取这套协议</strong>：tako 的 resume 单元是<strong>消息序列</strong>（喂给模型接着跑），不需要事件级粒度；再造一个事件 journal 会与 Redis 帧流 / runlog 形成第二个真源；事件溯源 = 引擎级改造，超出本篇。取它的<strong>形态</strong>：每实例一份、追加写、metadata 首行 + terminal 尾行、版本号防格式漂移、按会话目录组织随删会话回收。</p>
+<h2 id="4-待拍决策与推荐">4. 待拍决策与推荐</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>决策点</th>
+<th>推荐</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>S-a</td>
+<td>档案存哪</td>
+<td><strong>纯 wire 文件，无 PG 表</strong></td>
+<td>约定即索引：目录布局定位文件、metadata 定身份、terminal 行定过期——查询/权限/清扫都从文件推导（§5）。少一张表、少一类清扫、少一层一致性缝。要认的损失：跨会话 SQL 聚合审计没了，真有需求时从 metadata 反向同步出表</td>
+</tr>
+<tr>
+<td>S-b</td>
+<td>resume 的入口</td>
+<td><strong>模型侧工具 <code>resume_subagent</code></strong>，两种寻址：<code>{id}</code> 或 <code>{agent}</code>（默认该规格最近一次完整档案）</td>
+<td>模型不必记 ULID——回传文本带实例 id，模型的记忆就是对话内容；不带 id 就按规格名 glob 取 created_at 最新。<strong>只列/只认有 terminal 行的档案</strong>（v4）</td>
+</tr>
+<tr>
+<td>S-c</td>
+<td>resume 的可见范围</td>
+<td><strong>先限同会话</strong></td>
+<td>文件挂在会话目录下，SessionAccess 拦会话即拦文件；跨会话等有真实需求再开</td>
+</tr>
+<tr>
+<td>S-d</td>
+<td>wire 的行格式</td>
+<td><strong>消息粒度 JSONL</strong>：metadata 首行、schema.Message JSON 消息行、terminal 尾行</td>
+<td>消息是 resume 的最小充分单元；eino 原生序列化形态，反序列化直接可用</td>
+</tr>
+<tr>
+<td>S-e</td>
+<td>resume 产出放哪</td>
+<td><strong>新实例</strong>：新 wire，<code>resumed_from</code> 写进新 metadata</td>
+<td>档案只追加成链：原现场不可变，新跑的可追溯</td>
+</tr>
+<tr>
+<td>S-f</td>
+<td>运行环境跟谁</td>
+<td><strong>跟随发起 resume 的当前 run</strong>：作业根用当前 run 的（文件天然可见），模型/工具池按当前租户 profile 重新装配</td>
+<td>档案只带「知识和上下文」，不带「目录/模型绑定」——租户换过模型时 resume 用新配置，不绕过 doc/34 装配预检</td>
+</tr>
+<tr>
+<td>S-g</td>
+<td>窗口与清扫</td>
+<td><strong>继承 doc/37：<code>-archive-ttl</code> 同一个数；清扫器第三类 = 只删文件</strong>，两个分支：① 有 terminal 且 <code>finished_at + ttl &lt; now</code> → 删（正常过期）；② <strong>无 terminal 且 <code>created_at + ttl &lt; now</code> → 删（死透的半成品孤儿）</strong></td>
+<td>terminal 行自带 finished_at，过期现场算；分支二让崩死的半成品也有出口——正在跑的（created_at 新）自然豁免，无需 lease 区分死活（v4 的关键简化）</td>
+</tr>
+<tr>
+<td>S-h</td>
+<td>档案过期/缺失/损坏/不完整</td>
+<td><strong>拒绝，错误文本回给模型</strong>（「已过期 / 找不到 / 损坏」）；<strong>无 terminal 行 = 「该实例未完成/已中断，请重新委派」</strong></td>
+<td>对齐 doc/25 错误形状（工具失败不打断父 run）与 doc/30 语义（不自动重跑中断的调用）</td>
+</tr>
+<tr>
+<td>S-i</td>
+<td>崩溃在半途的实例（<strong>v4 反转</strong>）</td>
+<td><strong>不重接</strong>。半成品 wire 保留到清扫（可诊断死在哪），resume 一律拒绝；想继续 = 重新委派或 resume 别的完整档案</td>
+<td>半截现场的工具副作用已部分发生，续跑要处理幂等，比干净重跑更不可靠；与 doc/30「放弃半截、client 重发」语义对齐；省掉 running lease / 尾轮重试一整层复杂度</td>
+</tr>
+<tr>
+<td>S-j</td>
+<td>写入时机与性能</td>
+<td><strong>每轮模型往返后追加</strong>（子代理 middleware 链，与折叠同链相邻）；写失败仅记日志、不影响跑</td>
+<td>追加 O(1)、摊销成本；档案是增强不是正确性依赖。并发同名委派各写各的文件，无写冲突</td>
+</tr>
+<tr>
+<td>S-k</td>
+<td>实例 id 的生成</td>
+<td><strong>sa_ + ULID</strong>，创建 wire 时铸</td>
+<td>ULID 免并发撞号；id 在 metadata、回传文本、resume 参数三处一致</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="5-约定本方案的真身全部在这">5. 约定（本方案的"真身"，全部在这）</h2>
+<p><strong>目录布局</strong>：<code>&lt;workspace&gt;/tenants/&lt;tid&gt;/sessions/&lt;sid&gt;/.tako/subagents/&lt;sa_id&gt;.jsonl</code>。挂载项目的会话也统一放<strong>会话目录</strong>（不在项目目录）——删会话（doc/37 D3 的 <code>.tako/</code> 级联清）天然回收。</p>
+<p><strong>wire 文件（JSONL）</strong>：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode jsonl"><code class="sourceCode json"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;metadata&quot;</span><span class="fu">,</span><span class="dt">&quot;sa_id&quot;</span><span class="fu">:</span><span class="st">&quot;sa_…&quot;</span><span class="fu">,</span><span class="dt">&quot;agent_name&quot;</span><span class="fu">:</span><span class="st">&quot;researcher&quot;</span><span class="fu">,</span><span class="dt">&quot;model_ref&quot;</span><span class="fu">:</span><span class="st">&quot;deepseek/…&quot;</span><span class="fu">,</span><span class="dt">&quot;run_id&quot;</span><span class="fu">:</span><span class="st">&quot;r_…&quot;</span><span class="fu">,</span><span class="dt">&quot;resumed_from&quot;</span><span class="fu">:</span><span class="st">&quot;sa_…或空&quot;</span><span class="fu">,</span><span class="dt">&quot;protocol&quot;</span><span class="fu">:</span><span class="dv">1</span><span class="fu">,</span><span class="dt">&quot;created_at&quot;</span><span class="fu">:</span><span class="st">&quot;…&quot;</span><span class="fu">}</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;message&quot;</span><span class="fu">,</span><span class="dt">&quot;msg&quot;</span><span class="fu">:{</span> <span class="er">…assistant，含</span> <span class="er">tool_calls…</span> <span class="fu">}}</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;message&quot;</span><span class="fu">,</span><span class="dt">&quot;msg&quot;</span><span class="fu">:{</span> <span class="er">…tool</span> <span class="er">结果…</span> <span class="fu">}}</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;terminal&quot;</span><span class="fu">,</span><span class="dt">&quot;status&quot;</span><span class="fu">:</span><span class="st">&quot;complete&quot;</span><span class="fu">,</span><span class="dt">&quot;result&quot;</span><span class="fu">:</span><span class="st">&quot;…回传终稿…&quot;</span><span class="fu">,</span><span class="dt">&quot;finished_at&quot;</span><span class="fu">:</span><span class="st">&quot;…&quot;</span><span class="fu">}</span></span></code></pre></div>
+<p><strong>四个消费方各怎么动作</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>消费方</th>
+<th>动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>委派工具</td>
+<td>铸 <code>sa_id</code> → MkdirAll + 写 metadata 行；每轮追加消息行；<strong>终态（含失败）追加 terminal 行（status=complete/error 均可被 resume——error 档案 resume 时模型自己会看到上轮怎么死的）</strong>；回传文本带「本次委派实例：sa_…」。<strong>中断（无终态）不留 terminal</strong>——文件保持半成品，交清扫分支二</td>
+</tr>
+<tr>
+<td>resume 工具</td>
+<td><code>{id}</code> 拼路径 / <code>{agent}</code> glob 取该规格最新 <strong>terminal 行</strong>的实例 → 校验：terminal 存在？<code>finished_at + ttl</code> 未过期？消息行逐条可解析（丢最后一条半截解析失败的行——读完整性处置，不为重接）→ 反序列化 → <code>GenModelInput</code> 注入</td>
+</tr>
+<tr>
+<td>清扫器</td>
+<td>glob 各租户 <code>sessions/*/.tako/subagents/*.jsonl</code> → 读末行：有 terminal 且过窗 → 删；无 terminal 且 <code>created_at</code> 过窗 → 删（孤儿）；其余跳过</td>
+</tr>
+<tr>
+<td>查询端点</td>
+<td><code>GET /api/sessions/:id/subagents</code> → glob + 读 metadata/末行组装 JSON（标注 <code>complete</code> / <code>interrupted</code>），权限同 SessionAccess</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="6-端到端链路">6. 端到端链路</h2>
+<p><strong>正常委派（改造后）：</strong> 用户发任务 → 父 agent 调委派工具 → 铸 <code>sa_id</code>、开 wire 写 metadata → 子代理跑（折叠照常）→ 每轮追加消息行（S-j）→ 终态：追加 terminal 行，回传终稿（带实例 id）→ 父对话。<strong>原链路每一步不变，只多一个文件。</strong></p>
+<p><strong>resume：</strong> 用户说「让那个调研子代理再看看 Y」→ 父 agent 调 <code>resume_subagent({agent:"researcher"})</code> → 按 §5 定位<strong>完整档案</strong> → 校验（S-h）→ 装配新子代理：<code>GenModelInput</code> 返回 <code>[wire 消息…, 新 user(instruction)]</code>，配置按当前租户 profile → 跑（每轮追加到<strong>新 wire</strong>，<code>resumed_from</code> 指回原实例）→ 新终稿回传。</p>
+<p><strong>中断（v4 语义）：</strong> 进程死在子代理半途 → 无 terminal 行 → 父对话由 doc/30 journal 兜底（「引擎不会自动重跑这次调用，需要的话请重新发起」）→ 用户重发，父 agent <strong>重新委派</strong>（新实例）；半成品 wire 留着给人诊断（<code>tail</code> 看死在哪），清扫分支二到期收走。拿半成品 id 来 resume → 「该实例未完成/已中断，请重新委派」（S-h）。</p>
+<p><strong>过期：</strong> terminal.finished_at 过窗 → 清扫删文件 → 再 resume 回「已过期」。</p>
+<p><strong>删会话：</strong> D3 把 <code>.tako/</code> 整个 RemoveAll → wire 随系统档案清；清扫器 glob 不到即一致（没有 PG 行要补删）。</p>
+<h2 id="7-分拍点头后拆进-tmp-台账">7. 分拍（点头后拆进 tmp 台账）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>拍</th>
+<th>做什么</th>
+<th>验收形态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>S1</td>
+<td>wire 写入（铸实例、metadata、每轮 append、terminal 行、回传带 id）+ <code>GET /api/sessions/:id/subagents</code>（glob 组装，标 complete/interrupted，权限同 SessionAccess）</td>
+<td>curl：固定行为规格委派一场（先例 doc/34 SPEC-OK 手法）→ 查端点字段齐；盘上 wire 三行齐；<code>tail -f</code> 可见追加；<strong>原链路不变</strong>（折叠、runlog 照常）</td>
+</tr>
+<tr>
+<td>S2</td>
+<td><code>resume_subagent</code> 工具（§5 两种寻址、只认 terminal 行、过期/缺失/损坏/未完成四拒绝分支、<code>GenModelInput</code> 注入、新实例 <code>resumed_from</code> 成链）</td>
+<td>curl：会话内按 <code>{agent}</code> resume（固定行为规格）→ 新实例行为可预期、metadata 链正确；<strong>手工截掉 terminal 行造半成品 → resume 回「未完成/已中断」</strong>；跨会话/过期/缺失各打一遍</td>
+</tr>
+<tr>
+<td>S3</td>
+<td>清扫挂接（第三类：glob + 末行判断两分支——过窗 terminal / 过窗无 terminal 孤儿，只删文件）+ 单测全量</td>
+<td>curl：dev 探针（doc/37 D4 的 <code>clean-sweep</code>）→ terminal.finished_at 改 8 天前 → 文件没了；<strong>无 terminal 的文件 created_at 改 8 天前 → 也没了</strong>；新跑的（两种都新）不动；<code>go test</code> + <code>go vet</code> 绿</td>
+</tr>
+</tbody>
+</table></div>
+<p>S1 是第一个 action（curl 可打）。S2 依赖 S1；S3 依赖 doc/37 D4（清扫器先存在）——<strong>施工顺序本篇排在 doc/37 D4 之后</strong>。</p>
+<h2 id="8-与-doc37-的接口双向">8. 与 doc/37 的接口（双向）</h2>
+<ul>
+<li>继承 doc/37 的 <code>-archive-ttl</code>、<code>cleaner_state</code> 租约/水印、<code>POST /api/dev/clean-sweep</code> 探针；</li>
+<li>wire 在会话目录 <code>.tako/subagents/</code> 下 = <strong>系统档案</strong>：doc/37 D3 删会话随 <code>.tako/</code> 级联清；清扫器第三类删文件，没有 PG 行要补删；</li>
+<li>doc/37 的清扫器在 D4 施工时<strong>不用预留第三类</strong>——本篇 S3 自己加；</li>
+<li>一致性缝只剩一条：会话目录被 D3 清掉后，模型拿旧 id 来 resume → 「找不到」（S-h）。</li>
+</ul>
+<h2 id="9-明确不做的">9. 明确不做的</h2>
+<ul>
+<li><strong>崩溃半截重接（v4 拍死）：</strong> 中断的委派 = 失败，client 重发、重新委派；半成品只作诊断 + 孤儿清扫。理由见 §0 / S-i：与 doc/30 语义一致、避开副作用幂等坑、省 running lease 一层。</li>
+<li><strong>事件溯源协议</strong>：不引入 Kimi 式事件类型体系与 replay 引擎（§3.1）。</li>
+<li><strong>跨会话 resume</strong>：S-c 已拍先限同会话。</li>
+<li><strong>前台入口</strong>：子代理列表与「继续」按钮 <strong>2026-10-23 已由 <a href="44-前端三处欠账.html">doc/44</a> 落地</strong>；wire 查看页仍不做（<code>tail -f</code> 已给本机调试一条活路）。</li>
+<li><strong>档案编辑/删除的用户入口</strong>：档案由窗口管理，用户不直接碰。</li>
+<li><strong>跨会话用量统计的 SQL 聚合</strong>：S-a 已认损失；需要时从 metadata 反向同步出表。</li>
+<li><strong>runlog_entries 按实例重组</strong>：流水投影不动，实例档案由 wire 承担。</li>
+</ul>
+<h2 id="10-闭环">10. 闭环</h2>
+<p><strong>所以这解决了什么。</strong> 完整跑完的子代理从「一次性用品」变成「窗口内可召回的劳动力」：追问能续（wire 注入历史，接着做不从头做）、过程可查（<code>tail -f</code> 一个 JSONL）；崩溃的委派有明确而不暧昧的语义——<strong>放弃、重发、重跑</strong>（对齐 doc/30），半成品 wire 是事故笔录（人可诊断死在哪）而不是复活仓，且孤儿文件由清扫分支二按同一窗口收走，无泄漏。档案生命周期完全复用 doc/37 的窗口与清扫器——恢复承诺和空间回收同一个数、同一套机制；约定（目录布局 + metadata + terminal 行）取代数据库索引，文件系统本身就是索引。</p>
+<p><strong>仍不解决的：</strong> 跨会话召回、wire 查看页、事件级 replay、跨会话用量统计、半截复活——§9 明说。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/39-%E5%AD%90%E4%BB%A3%E7%90%86%E6%8C%81%E4%B9%85%E5%8C%96%E4%B8%8Eresume.md"><code>doc/39-子代理持久化与resume.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Handoff · pre-T3 落地（lease 小拍 → T1 → T2）（2026-10-08） · tako 文档</title>
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="handoff--pre-t3-落地lease-小拍--t1--t22026-10-08">Handoff · pre-T3 落地（lease 小拍 → T1 → T2）（2026-10-08）</h1>
+<blockquote>
+<p>性质：<strong>执行 handoff</strong>——供接手会话直接开工。范围 = <strong>T3 之前的三个任务</strong>（lease 小拍 → T1 → T2）； <strong>T3 本体不在内</strong>，停线 = T3 动工前必拍三项（§4）。 触发：用户 2026-10-08「我在另一个会话去落地 t3 之前的任务」；随本文件同批落了两处台账补登—— todos「T 系列」节（lease 小拍四要素 + T3 动工前必拍三项）与 planning §2/§11 镜像。 取信口径：全部为 2026-10-08 当日实读（代码坐标在文内）；机制结论均带源坐标、可直接复查。 <strong>前置阅读（按序）</strong>：<code>doc/19-v6/19v6-05-tool-loop.md</code>（机制裁定真源）→ <code>tmp/19-v6/planning.md</code> §11（施工规格） → <code>tmp/19-v6/todos.md</code>「T 系列」节（四要素权威原文——<strong>冲突以台账为准</strong>；本文件是导览 + 操作要点）。</p>
+</blockquote>
+<h2 id="0-一句话现状">0. 一句话现状</h2>
+<ul>
+<li>master @ <code>4904d39</code>；D1/C1 已验收、已 commit（<code>f09deb6</code>）；A 系列全销账。</li>
+<li><strong>未 commit = T 立项 doc 批次</strong>：<code>doc/19-v6/19v6-05-tool-loop.md</code> + <code>19v6-06-deferred-tools与缓存机制.md</code>（新增）
+<ul>
+<li>index 修订；2026-10-08 晚另新增本 handoff（<code>docs/</code>）。<strong>commit 粒度归用户——不自动 commit。</strong></li>
+</ul></li>
+<li>2026-10-08 用户裁：T 系列立项无修改意见；<strong>pre-T3 三项转本会话落地</strong>，逐拍停下交审。</li>
+<li>施工顺序：<strong>lease 小拍（前置）→ T1（ADK 接入 + 观测架）→ T2（get_time）→ 停</strong>（T3 动工前必拍三项见 §4）。</li>
+</ul>
+<h2 id="1-硬约束与环境动手前先过一遍">1. 硬约束与环境（动手前先过一遍）</h2>
+<ul>
+<li>硬闸门（AGENTS.md）：四要素已登记、<strong>逐 action 停下交审</strong>、不自动 commit；验收第一行必须是 curl/psql 打跑着的东西。</li>
+<li>Go 不在 PATH：<code>export PATH="$HOME/sdk/go1.27.0/bin:$PATH"</code>；代码在 <code>yk-tako-eino/</code>。</li>
+<li>起栈：<code>./scripts/dev.sh</code>（前台；自举 Redis 6390 + PG 5433 + 前端 vite；<code>restart</code>/<code>stop</code>/<code>status</code> 只动自己的 pidfile）。 单起引擎：<code>go run ./cmd/yktako -engine 127.0.0.1:&lt;E&gt;</code>（缺省 redis 6390 / pg 5433；<code>.env</code> 在 <code>yk-tako-eino/</code>，查找链 <code>.env</code> → <code>../.env</code>）。</li>
+<li><strong>危险区</strong>：6379 Redis 与 5432 PG 是 otel-ch-native 的活实例——全程不动；端口被占先 <code>lsof</code> 查是谁，换端口，不杀别人的进程。</li>
+<li>测试网 = 真实例：<code>go test ./internal/runengine/ -count=1</code>（需 PG 5433 + Redis 6390 已起；独立 db1 + 临时库，不碰 dev 数据；环境不在会大声失败）。</li>
+<li>历史实测值（租约 30s / 续约 5s）在 A4-1/A7 记录里是当时事实，<strong>不改</strong>——新默认落 main.go 后以代码为准。</li>
+</ul>
+<h2 id="2-三个-action权威四要素见-todost-系列节这里只给导览--已勘察的接线">2. 三个 action（权威四要素见 todos「T 系列」节；这里只给导览 + 已勘察的接线）</h2>
+<h3 id="21-前置小拍--lease-参数5s10s--env-化">2.1 前置小拍 · lease 参数（5s→10s + <code>.env</code> 化）</h3>
+<ul>
+<li>改：<code>defaultLeaseRenew</code> 5s→10s；<code>-lease-ttl</code>/<code>-lease-renew</code> 默认值读 <code>.env</code> 的 <code>TAKO_LEASE_TTL</code>/<code>TAKO_LEASE_RENEW</code>（未设置回落 30s/10s；显式旗标压 .env）。</li>
+<li><strong>接线已勘察</strong>：<code>LoadDotEnv()</code> 现在在 <code>config.Open()</code> 里调，而 <code>flag.Parse()</code> 在 main L42、<code>config.MustOpen</code> 在 L47—— 要把 <code>config.LoadDotEnv()</code> 提到 <code>flag.Parse()</code> <strong>之前</strong>先调一次；解析函数放 config 包还是 main 随动工定（引擎参数入 config 首例）。</li>
+<li><strong>连带</strong>：main.go L20 注释「30s/5s = 连续 6 次续约…」算数改 3 次；「renew ≥ ttl 是否 fail fast」动工时裁（.env 手误是新引入的面）。</li>
+<li>验收六步（启动日志 / psql <code>lease_until</code> / 续约现场 / kill -9 自愈 / 旗标压 .env / 单测）见 todos； 续约现场用「写数百字」类请求造十余秒生成窗口，<code>-lease-ttl 60s -lease-renew 5s</code> 显式压时间轴。</li>
+</ul>
+<h3 id="22-t1--adk-接入--handler-观测架">2.2 T1 · ADK 接入 + Handler 观测架</h3>
+<ul>
+<li>改：worker 手写 Stream 循环 → <code>adk.NewChatModelAgent</code>（零工具，复用 config 的 ChatModel）； ADK 事件流 → v6 帧的翻译进归一层；挂全套中间件钩子终端日志 <code>[adk][序号] 钩子名｜功能一句话｜进/出</code>。 watchdog/endRun/闸路径不动；<strong>铁判据 = 四 API 契约字节零变化</strong>。</li>
+<li>现循环坐标：<code>internal/runengine/worker.go</code>（TranslatorFor L35、NewWorker L88）。</li>
+<li>Eino 坐标：<code>~/go/pkg/mod/github.com/cloudwego/eino@v0.9.21/adk/</code>（<code>chatmodel.go</code> 的 ChatModelAgent、 <code>middlewares/</code> 钩子、<code>agent_tool.go</code> 留 T3）。</li>
+<li>验收：钩子日志按序七类全覆盖 / curl 主链与 D1 baseline 同形（202 字段序、frames 序列、收口、log 两行）/ <code>go test</code> 全绿。</li>
+<li>D1 baseline 证据：todos「D 系列」节末 + <code>tmp/19-v6/evidence-d1/</code>。</li>
+</ul>
+<h3 id="23-t2--get_time帧契约--mh-两列--runlog-两列">2.3 T2 · get_time（帧契约 + mh 两列 + runlog 两列）</h3>
+<ul>
+<li>改（<strong>先改 doc 再动码</strong>）：19v6-01 增 tool 帧 kind（建议 <code>tool_call</code>/<code>tool_result</code>，字段名 T2 前排定）； mh 加 <code>tool_calls</code>/<code>tool_call_id</code>（AutoMigrate）；runlog 加 <code>agent</code>（本拍恒空）+ <code>payload</code>； worker 注册 <code>get_time</code>（无副作用、可 curl 造）；归一层补 tool 帧翻译。</li>
+<li>doc 同批落点四处（已补登 T2 节）：19v6-01 / 19v6-04（加 tool 帧用例与期望字节）/ 19v6-90 / index 引用处如有。</li>
+<li>验收：curl「现在几点」→ frames 含 tool 帧序；psql mh 两行（assistant.tool_calls + tool.tool_call_id 回指）； log 扩展行（payload 非空、agent 空）；<strong>同会话追投「我刚才问的几点」→ 模型凭 tool 结果答出</strong>。</li>
+</ul>
+<h2 id="3-已裁承重裁定防重开论战出处--19v6-05--planning-111--todos-2026-10-08-已裁块">3. 已裁承重裁定（防重开论战；出处 = 19v6-05 / planning §11.1 / todos 2026-10-08 已裁块）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>裁定</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>底座</td>
+<td>循环走 <strong>Eino ADK</strong>（用户拍板）</td>
+</tr>
+<tr>
+<td>sub agent 落地</td>
+<td><strong><code>adk.NewAgentTool</code> 自组装</strong>，不用 <code>prebuilt/deep</code> 整包（捆绑 write_todos/FS/Shell + prompt 哲学）</td>
+</tr>
+<tr>
+<td>观测</td>
+<td>Handler 全套钩子终端日志（脚手架，转正点 T6）</td>
+</tr>
+<tr>
+<td>工具分级</td>
+<td>node 全注册 + <code>BeforeModelRewriteState</code> 声明过滤（direct/deferred/hidden）</td>
+</tr>
+<tr>
+<td>tool_search</td>
+<td>T4 直出 / <strong>T5 BM25 = 独立 task</strong>；任何 agent 只搜自己池的 deferred 项</td>
+</tr>
+<tr>
+<td>子代理</td>
+<td>Model message 进程内、跑完即弃；帧带 <code>agent</code>；runlog 消息粒度；并行不改表</td>
+</tr>
+<tr>
+<td>规格 tools</td>
+<td>两态：白名单 / 白名单+search（用户裁「当然要」）</td>
+</tr>
+<tr>
+<td>fork</td>
+<td>后面再做（copy-on-write 策略已备，§11.4）</td>
+</tr>
+<tr>
+<td>挂账（用户裁「先别搞」）</td>
+<td>子代理目录运行时安装、运行中途改工具集</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-停线t3-动工前必拍三项已写进-todos-t3-节">4. 停线：T3 动工前必拍三项（已写进 todos T3 节）</h2>
+<p>① <strong>规格字段表</strong>（name/description/tools/model 最小集；<strong>model 继承 or 覆盖未落笔</strong>）； ② <strong>预算面明账</strong>（并发上限 / 超时 / 回传裁剪；pi 参考 8 任务 / 4 并发 / 并行回传裁 50KB）； ③ <strong>规格库 loop（候选）</strong>（文件式规格 / 发现时机 / 信任门）——已登记 planning §2「前方未开工登记项」。</p>
+<p>到 T3 动工前先把三项拍掉；<strong>T3 本体不在本 handoff 范围</strong>。</p>
+<h2 id="5-素材坐标索引">5. 素材坐标索引</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>素材</th>
+<th>位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>机制裁定真源</td>
+<td><code>doc/19-v6/19v6-05-tool-loop.md</code>；<code>19v6-06-deferred-tools与缓存机制.md</code>（缓存 / 延迟工具）</td>
+</tr>
+<tr>
+<td>契约真源</td>
+<td><code>doc/19-v6/19v6-01-契约-四个API.md</code>（帧 / 端点字节）、<code>19v6-04-验收-curl.md</code>（期望字节）</td>
+</tr>
+<tr>
+<td>施工规格</td>
+<td><code>tmp/19-v6/planning.md</code> §11</td>
+</tr>
+<tr>
+<td>四要素权威</td>
+<td><code>tmp/19-v6/todos.md</code>「T 系列」节（lease 小拍 + T1–T6）</td>
+</tr>
+<tr>
+<td>Eino</td>
+<td><code>~/go/pkg/mod/github.com/cloudwego/eino@v0.9.21/adk/</code>（chatmodel.go / middlewares/ / agent_tool.go）</td>
+</tr>
+<tr>
+<td>现引擎代码</td>
+<td><code>yk-tako-eino/internal/runengine/worker.go</code>（循环 / translator）；<code>yk-tako-eino/cmd/yktako/main.go</code>（旗标 / 租约注释）</td>
+</tr>
+<tr>
+<td>环境</td>
+<td><code>scripts/dev.sh</code>；<code>yk-tako-eino/.env</code>；<code>internal/runengine/store_test.go</code>（真实例网）</td>
+</tr>
+<tr>
+<td>D1 证据</td>
+<td><code>tmp/19-v6/evidence-d1/</code>；todos「D 系列」节末</td>
+</tr>
+<tr>
+<td>参考实现</td>
+<td><code>ref-agent/pi</code>（subagent 扩展示例 + <code>src/experimental/durable/</code>）、<code>ref-agent/deepseek-harness</code></td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="6-纪律提醒给接手会话">6. 纪律提醒（给接手会话）</h2>
+<ul>
+<li>本文件是导览不是裁定：机制级事实都有源坐标；<strong>冲突以 doc / 台账原文为准</strong>。</li>
+<li>承重论断先验前提（AGENTS.md）：文档注释、记忆、印象、已废代码都不是证据，证据只有代码、配置和用户原话。</li>
+<li>每个 action 停下汇报等验收；diff 目标 ≤80 行；不自动 commit。</li>
+<li><code>tmp/</code> 台账不入 git；<code>doc/19-v6/</code> 与 <code>docs/</code> 的未 commit 批次，commit 粒度归用户。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/log/2026-10-08-pre-t3-handoff.md"><code>doc/log/2026-10-08-pre-t3-handoff.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

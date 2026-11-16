@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>搜索怎么接厂商：一个工具名，还是每家有每家的工具 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="搜索怎么接厂商一个工具名还是每家有每家的工具">搜索怎么接厂商：一个工具名，还是每家有每家的工具</h1>
+<blockquote>
+<p>模块：运行引擎 · 工具（doc/22 + <code>tmp/22-网络搜索-切新api</code>）｜状态：<strong>已落地</strong>（2026-10-15 首版，2026-10-18 二稿换接口并改始终落盘）｜证据：<code>doc/22-网络搜索.md</code>、<code>internal/runengine/websearch.go</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>用户让 tako 查一句今天才能知道的公开事实，并在回答里给出处链接。</p>
+<p>链路走到 researcher 就断了：<code>agents/researcher.md</code> 写着「当前没有联网检索能力」，父池里也没有搜索工具。它只能在终稿里写「未能查证」。公开网页上那句话，这次回答里不会出现。</p>
+<p>要补的一环很小：researcher 在自己的消息里调用一个普通函数，程序去搜，把标题、链接、摘要写进这次 <code>tool_result</code>。researcher 据此写报告。主线程的上下文里仍然只有这份报告，不出现搜索原文。</p>
+<p>真正难的不是「发一个 HTTP」，而是<strong>一个工具名怎么覆盖多家厂商</strong>：tako 的模型可以按租户、按子代理换成不同的 ref（<code>deepseek/deepseek-flash</code>、<code>tencent-token-plan/deepseek-v4-flash</code>……）。搜索如果不能跟着这次对话实际打到的厂商走，换个模型搜索就坏。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 厂商工具类型挂在聊天请求上</td>
+<td>请求 <code>tools</code> 里写 <code>{"type":"web_search"}</code>，厂商服务器自己搜</td>
+<td>零本地实现</td>
+<td>DeepSeek 的 Responses API 文档把这个类型标成忽略：请求能发出去、搜索不发生、模型仍可能用记忆回答。而且 tako 的验收要看 <code>name=web_search</code> 的帧——厂商在服务器里搜完写进回复时，这对帧不会出现</td>
+</tr>
+<tr>
+<td>B 一律打 Moonshot <code>POST /v1/tools/search</code>（doc/17 §5 原建议）</td>
+<td>不论聊天模型是谁，都打同一家按次接口</td>
+<td>与当轮模型无关，换 ref 不会把搜索弄丢</td>
+<td>把搜索绑死在一家身上；后来的决定是各家模型自己的搜索都放进同一个工具，不先绑死</td>
+</tr>
+<tr>
+<td>C 两个工具名让模型挑</td>
+<td><code>searchfree_search</code> 和「DeepSeek 搜索」都注册</td>
+<td>听起来灵活</td>
+<td>两个名字都在时，模型会两个都调，或者挑听起来更强的那个；对方忽略内置搜索时，它还会用记忆写一份看起来查过的报告</td>
+</tr>
+<tr>
+<td>D 单一工具名 + 内部按厂商选实现（选定）</td>
+<td>工具名只有 <code>web_search</code>、参数只有 <code>query</code>；各家的搜索是函数内部的一行实现</td>
+<td>模型看不见「厂商差异」，不会挑错；换 ref 时搜索跟着走</td>
+<td>各家实现要分别手打验证；每次加一家要加一个函数</td>
+</tr>
+</tbody>
+</table></div>
+<p>选 D。判断键是这次对话<strong>实际打到的厂商 id</strong>——生效 ref 里斜线前面那一段。</p>
+<h2 id="3-厂商-id-从哪来不要读-adk-内部状态">3. 厂商 id 从哪来（不要读 ADK 内部状态）</h2>
+<p>工具执行时要知道「谁在调用」。父池这一份函数主代理和 researcher 共用；researcher 的规格若写了 <code>model:</code>，两边的 ref 不同。用装配时写死的主 ref 会搜错端点。</p>
+<p>候选：读 eino 的 react state <code>AgentName</code>。不能用——它对主代理的值是 <code>"yktako"</code> 而不是空字符串（空串 = 主代理只是帧事件层的约定），且那是 compose 图执行期的内部结构，eino 只为准出兼容性导出，工具读了就是焊死在别人的内部表示上。</p>
+<p>改法是一个只干一件事的小 middleware：<code>BeforeAgent</code> 返回 <code>context.WithValue(ctx, key, 名字)</code>——eino 把这个 ctx 流进该 agent 的整张图执行，所以它触发的工具调用都读得到。主代理挂写 <code>""</code> 的，子代理在装配处挂写规格名的。</p>
+<p>工具执行时读标记：</p>
+<ul>
+<li>标记缺失 → 不猜主 ref，Go error「<code>web_search 不知道当前模型</code>」。猜主 ref 的后果是子代理换了模型仍去打主模型的搜索端点，失败了还像是那一家的搜索坏了。</li>
+<li>标记在 → 用本 run 已放在 ctx 里的 <code>agentModelTable</code> 按名取生效 ref，<strong>严格读</strong>（不走查不到回落 root 的退路——回落只会在表坏时把子代理的搜索静默打去主模型厂商）。</li>
+</ul>
+<h2 id="4-deepseek-那一行两次翻转">4. DeepSeek 那一行：两次翻转</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>版本</th>
+<th>做法</th>
+<th>为什么被换</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>一稿（2026-10-15）</td>
+<td>Anthropic 兼容端点 + 服务端 <code>web_search_20250305</code> + 模型按 citations 写 JSON 摘要</td>
+<td>活体发现 10/10 全是「无摘要」：DeepSeek 的兼容层把 <code>citations</code> 标记为 <strong>Ignored</strong>，原始响应里连该键都没有。同日用户拍「先 fix 现在的」「不是换哦」——在现有 Messages 路上让模型搜完只回 <code>[{"url","summary"}]</code> JSON</td>
+</tr>
+<tr>
+<td>二稿（2026-10-18 晚）</td>
+<td>直打 <code>POST https://api.deepseek.com/v1/tools/search</code>，不经过模型</td>
+<td>用户翻案「换成 DeepSeek 新 search api」——同日「不是换哦」裁定作废。新接口每条自带 <code>summary</code>（页面原文抽取），实测 0.43s（旧路 5.15s）、$0.75/千次、5 QPS。旧 Messages 路<strong>删除不兼容</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p>关键差别：摘要从「模型转述」（依赖模型行为和 <code>citations</code>）换成「页面原文自带」——不依赖任何模型行为，快 10 倍，代价是摘要可读性从均匀成段的「读书笔记」变成极差 38 倍的「复印片段」（65–2492 字）。</p>
+<p>请求细节：<code>{"query":"&lt;query&gt;","need_content":false}</code>；只取 <code>title</code>/<code>url</code>/<code>summary</code>；无 url 的项丢掉、url 去重；<code>results</code> 空或去重后无 url → 这次搜索失败，走兜底。60 秒上限只兜「ctx 没被取消但厂商不回」；run ctx 取消时 HTTP 自动一起停。</p>
+<h2 id="5-结果放哪结果全文落盘只回一段描述">5. 结果放哪：结果全文落盘，只回一段描述</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 结果内联进 tool_result</td>
+<td>把 10 条标题+摘要全文返回</td>
+<td>一次调用就够</td>
+<td>一次搜索几千 token 灌进上下文；摘要越长越糟</td>
+</tr>
+<tr>
+<td>B 超上限才落盘（一稿）</td>
+<td>字节上限内内联，超了才写文件</td>
+<td>小结果不走盘</td>
+<td>模型看到两种形状；记忆/折叠链要处理两套</td>
+</tr>
+<tr>
+<td>C 始终落盘 + 只回描述（选定，2026-10-18）</td>
+<td>全文写 <code>&lt;workspace&gt;/.tako/search/&lt;runId&gt;_&lt;n&gt;.md</code>，工具返回条数、路径、token 数</td>
+<td>形状恒定；上下文零负担；8192/800 的上限不再需要</td>
+<td>模型要多一步 <code>read_file</code> 才能看内容</td>
+</tr>
+</tbody>
+</table></div>
+<p>选 C。<code>file_effect</code> 从 <code>none</code> 改成 <code>write</code>——文件名是程序命名的、一次一写、永不覆盖，与 <code>search_history</code> 截断落盘同性质（提取程序只扫调用参数，参数里只有 <code>query</code> 没有 path，不靠猜 query 字符串记账）。</p>
+<p>描述段每个成分都有用途：<strong>条数</strong>让模型判断有没有命中；<strong>token 数</strong>给「读不读」提供代价感（数字来自引擎折叠链的同一份 <code>TokenCounter</code>，两本账不打架；counter 为 nil 时不报，宁缺不发明「字节÷4」）；<strong>路径</strong>指到落盘文件。</p>
+<p>落盘写失败或旁路调用没有 noteBox 时，降级为「结果仅本次可见（未能写入文件）」——模型必须知道内容去哪了。</p>
+<h2 id="6-同族小裁定">6. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>工具名</td>
+<td>只有 <code>web_search</code>，参数只有必填 <code>query</code></td>
+<td>不加第二个名字；以后加一家只是表里加一个函数</td>
+</tr>
+<tr>
+<td>查询上限</td>
+<td>超 128 字截到 128，不报错</td>
+<td>接口收 1–128 字、超了整次 400；检索词截断无信息损失争议，报错只会白烧一次兜底</td>
+</tr>
+<tr>
+<td>空查询</td>
+<td>不发 HTTP，Go error「查询是空的」</td>
+<td>由 <code>wrapToolErrors</code> 包成「错误：」开头</td>
+</tr>
+<tr>
+<td>兜底 searchfree</td>
+<td>没有厂商实现 / 密钥缺失 / 厂商失败时打 <code>https://searchfree.site/api/search</code></td>
+<td>它是脚手架；转正不在本篇。查询原文会发到这个站点，站点不稳定（2026-10-18 探针 <code>RemoteDisconnected</code>）</td>
+</tr>
+<tr>
+<td>两处都失败</td>
+<td>Go error 串联两句原因，模型看见「错误：」，run 仍 complete</td>
+<td>不把半截响应当结果</td>
+</tr>
+<tr>
+<td>失败原因写法</td>
+<td>只有 HTTP 状态或一句短错误</td>
+<td>不贴响应正文、不贴密钥</td>
+</tr>
+<tr>
+<td>结果为空</td>
+<td>成功但去重后一条链接都没有 = 失败</td>
+<td>不把空结果交给模型</td>
+</tr>
+<tr>
+<td>researcher 怎么拿到它</td>
+<td>进父池；researcher 用 <code>exclude_tools</code>（只排 <code>bash</code>）继承，有效名单含 <code>web_search</code></td>
+<td><code>TestShippedAgentSpecToolGuards</code> 金样钉住——有人把 <code>web_search</code> 写进排除项，<code>go test</code> 就红</td>
+</tr>
+<tr>
+<td>要不要再包成子代理</td>
+<td><strong>不包</strong></td>
+<td>包成子代理的话主线程收到的是搜索器写的综述，综述把标题和链接吞掉，帧上的 <code>name</code> 也不再是 <code>web_search</code></td>
+</tr>
+<tr>
+<td><code>fetch_url</code></td>
+<td>本篇不做</td>
+<td>抓整页是折叠之前最容易撑满窗口的动作</td>
+</tr>
+<tr>
+<td>不接的厂商</td>
+<td>Moonshot、智谱、Brave、Tavily、Google</td>
+<td>以后加一家：表里加函数，先用那家密钥手打一次，响应里要有 <code>http</code>；打不通的不登记</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="7-证据">7. 证据</h2>
+<p><strong>方案</strong>：<code>doc/22-网络搜索.md</code> §2（三种接法对照）§3（工具契约 + 始终落盘装配）§4（按厂商选择 + ctx 标记）§5（deepseek 行，2026-10-18 晚整节重写）§6（searchfree 兜底）§7（researcher 规格）§8（不做清单）。</p>
+<p><strong>台账</strong>：<code>tmp/22-网络搜索/</code>（首版）、<code>tmp/22-网络搜索-切新api/</code>（二稿）。旧 Messages 路的台账 <code>tmp/22-网络搜索-摘要修复/</code> 已于 2026-10-21 清理。</p>
+<p><strong>代码符号</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>是什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>internal/runengine/websearch.go:29</code></td>
+<td><code>callerNameKey</code>：ctx 标记键</td>
+</tr>
+<tr>
+<td><code>internal/runengine/websearch.go:43</code></td>
+<td><code>callerStampMiddleware</code>：<code>BeforeAgent</code> 写调用方名字</td>
+</tr>
+<tr>
+<td><code>internal/runengine/websearch.go:54</code></td>
+<td><code>webSearchDesc</code>：工具 schema 说明</td>
+</tr>
+<tr>
+<td><code>internal/runengine/websearch.go:67</code></td>
+<td><code>newWebSearchTool</code></td>
+</tr>
+<tr>
+<td><code>internal/runengine/websearch.go:73</code></td>
+<td><code>webSearchFn</code>：按厂商选实现 + 兜底链</td>
+</tr>
+<tr>
+<td><code>internal/runengine/websearch.go:151</code></td>
+<td><code>deepseekSearch</code>：直打 <code>/v1/tools/search</code></td>
+</tr>
+<tr>
+<td><code>internal/runengine/websearch.go:193</code></td>
+<td><code>searchfreeSearch</code>：兜底</td>
+</tr>
+<tr>
+<td><code>internal/runengine/websearch.go:264</code></td>
+<td><code>renderSearchFile</code>：落盘文件格式</td>
+</tr>
+<tr>
+<td><code>internal/runengine/websearch.go:281</code></td>
+<td><code>describeSearchResult</code>：描述段</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>复核命令</strong>：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;tools/search\|searchfree.site\|callerStampMiddleware&quot;</span> internal/runengine/websearch.go</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;web_search&quot;</span> internal/runengine/agents_test.go</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;web_search&quot;</span> agents/researcher.md</span></code></pre></div>
+<p><strong>活体验收（2026-10-15 首版，2026-10-18 二稿）</strong>：A1 手打两家端点（DeepSeek <code>web_search_tool_result</code> 10 条含 http）；二稿手打 <code>/v1/tools/search</code> <code>count=10</code> 0.43 秒返回 10 条、每条带 <code>snippet</code>/<code>summary</code>；同 query 摘要 619–796 字节、<code>terminal complete</code>。</p>
+<h2 id="8-现状">8. 现状</h2>
+<ul>
+<li><strong>仍有效</strong>：单一工具名 + 厂商 id 选择；ctx 标记而非 ADK 内部状态；deepseek 直打按次接口；始终落盘 + 描述段；searchfree 兜底；researcher 继承。</li>
+<li><strong>已翻转</strong>：一稿的「Messages + 服务端 web_search + 模型写 JSON 摘要」整条删除（2026-10-18 晚）；「超上限才落盘」被「始终落盘」取代；8192 与 800 字上限对 <code>web_search</code> 作废。</li>
+<li><strong>已知缺陷</strong>：searchfree 兜底仍是脚手架、未转正；2026-10-18 探针该站不可用。</li>
+<li><strong>同族问题</strong>：researcher 的工具边界 → <a href="../子代理规格与工具边界/问题与方案.html">子代理规格与工具边界</a>；落盘文件怎么被记住 → <a href="../折叠线用什么数/问题与方案.html">折叠线用什么数</a>；会话内原文检索 → <a href="../历史查找用什么索引/问题与方案.html">历史查找用什么索引</a>。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E6%90%9C%E7%B4%A2%E6%80%8E%E4%B9%88%E6%8E%A5%E5%8E%82%E5%95%86/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/搜索怎么接厂商/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

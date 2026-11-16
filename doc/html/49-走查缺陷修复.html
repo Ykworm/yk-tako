@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>49 · 走查缺陷修复（12 项） · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="49--走查缺陷修复12-项">49 · 走查缺陷修复（12 项）</h1>
+<blockquote>
+<p>性质：<strong>已落地（2026-10-23）</strong>。 状态：✅ 12 项全部施工并验收（§15）。四问按推荐值落地（§14），用户仍可翻转任一项。台账 <code>tmp/49-走查缺陷修复/</code>（不入库）。 验收面：<code>go test ./internal/runengine</code> / <code>go vet ./internal/runengine</code> / <code>npm run typecheck</code> / <code>npm test</code> 全绿；端到端在隔离引擎（8944，<code>tako_acc</code> + Redis db8）与浏览器（5173 + 8901）逐条手验。 来源：2026-10-23 晚的<strong>第二次</strong>全站走查（Playwright 逐页点击 + 真发消息 + 真停止 + 跨标签页 + 窄屏 + 引擎日志对读）。与 <a href="48-前端可用性欠账.html">doc/48</a> 的 17 条不重叠——doc/48 已全部落地，本篇是落地后发现的新问题。 真源关系：助手规格与工具名是 <a href="26-researcher工具护栏.html">doc/26</a>/<a href="39-子代理持久化与resume.html">doc/39</a>；等人机器是 <a href="47-Plan审核与追问澄清.html">doc/47</a>；事件通道是 <a href="46-变更同步与事件通道.html">doc/46</a>；信封与业务码是 <a href="40-响应信封统一.html">doc/40</a>、<a href="28-多租户.html">doc/28</a>。 不改任何既有契约字节；新增的错误响应复用 <code>111002</code>（入参不合法），不新增业务码。</p>
+</blockquote>
+<hr />
+<h2 id="0-背景这轮怎么发现它们的">0. 背景：这轮怎么发现它们的</h2>
+<p>2026-10-23 晚，在真实浏览器里按人的路径走：登录/输错密码/刷新/退出 → 发消息、停止、刷新 → 项目增删改 → 助手新建/导入/改工具 → 团队页 → 700px 与 380px 两档 → 另开一个同源页面验证跨客户端同步。<strong>每一条都有当场证据</strong>（截图、引擎日志原文、接口响应字节），不是读代码推测。</p>
+<p>12 项里：</p>
+<ul>
+<li><strong>1 项 P0</strong>：一个空格就能让整个租户的对话全部失败。</li>
+<li><strong>5 项 P1</strong>：刷新丢结果、面板卡输入框、侧栏留死链、内置助手被静默清空、导入默认可见性与手工相反。</li>
+<li><strong>6 项 P2/P3</strong>：文案、反馈、边界与日志卫生。</li>
+</ul>
+<h2 id="1-p0子代理名字不合法会拖垮整个租户的-run">1. P0：子代理名字不合法会拖垮整个租户的 run</h2>
+<p><strong>病灶故事</strong>：运营在「助手 → 子代理 → 新建」里建了一个叫 <code>qa 空格</code> 的助手，保存成功、列表正常。此后再发任何消息——哪怕是「只回复 ok」——页面都只显示「失败，没有写进历史」。引擎日志里是：</p>
+<pre><code>agents: 3 spec(s): coder, qa 空格, researcher
+[NodeRunError] status code: 400 ... Invalid &#39;tools[25].function.name&#39;: string does not
+match pattern. Expected a string that matches the pattern &#39;^[a-zA-Z0-9_-]+$&#39;</code></pre>
+<p><strong>为什么会这样</strong>：助手名字同时是三样东西——AgentTool 的工具名、runlog 里的 <code>agent</code> 值、厂商请求里 <code>tools[i].function.name</code>。最后一项有硬约束（<code>^[a-zA-Z0-9_-]+$</code>），而我们在<strong>保存、导入、落盘解析</strong>三个入口都没校验。</p>
+<p><strong>不修的后果</strong>：用户不知道是自己建的东西坏了，只会认为「这个产品今天不好用」；而且坏配置会一直留在租户里，重启引擎也不会好。</p>
+<p><strong>怎么修</strong>：一个规则 <code>^[A-Za-z0-9_-]{1,64}$</code>，三处都拦：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>入口</th>
+<th>今天</th>
+<th>改后</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST/PUT /api/tenants/:id/agents</code></td>
+<td>只 trim + 非空</td>
+<td>400 <code>111002</code>「助手名字只能用字母、数字、下划线、连字符（1–64 个字符）」</td>
+</tr>
+<tr>
+<td><code>POST /api/tenants/:id/agents/import</code></td>
+<td>只查重名</td>
+<td>同一句话 400，整批不落库</td>
+</tr>
+<tr>
+<td>工作区 <code>.md</code> 规格（<code>parseAgentSpec</code>）</td>
+<td>只查 frontmatter 形状</td>
+<td>这条拒载并打日志；其余规格照载，run 不受影响</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>验收</strong>：三个入口各打一次（curl 见台账），外加 <code>agents_test.go</code> 两条单测。</p>
+<h2 id="2-p1刷新会把停止失败这一轮抹掉">2. P1：刷新会把「停止/失败」这一轮抹掉</h2>
+<p><strong>病灶故事</strong>：用户让模型数 1 到 5000，发现不对，点停止。屏幕上立刻出现「已停止，没有写进历史」——然后他刷新了一下页面，这句话和气泡一起消失，只剩自己那条消息。他会以为消息没发出去。</p>
+<p><strong>为什么</strong>：停止与失败在 runlog 里都没有 assistant 定稿行。实时路径靠 <code>closeOut()</code> 查状态补上这句提示；刷新走 <code>reconcile()</code>，那里只认「有活 run」和「崩溃可续（interrupted）」两种，<code>stopped</code> / <code>error</code> 没有分支。</p>
+<p><strong>怎么修</strong>：<code>reconcile()</code> 补一条分支，用 <code>lastRunStatus</code> + <code>lastRunId</code> 重建一条空的 assistant 气泡，<code>state</code> 分别置 <code>stopped</code> / <code>error</code>——渲染复用现有 note 文案，不加新组件。</p>
+<p><strong>验收</strong>：发长任务 → 停止 → 刷新 → 提示还在；再发一条历史顺序不乱。</p>
+<h2 id="3-p1等人面板把输入框永久顶掉">3. P1：等人面板把输入框永久顶掉</h2>
+<p><strong>两副面孔</strong>：</p>
+<ol type="1">
+<li><strong>幽灵面板</strong>：run 停在 ask_user 时，从另一个客户端把它停掉。引擎已是 <code>stopped</code>，本页面板 6 秒后还挂着「需要你确认 / 待回答」，composer 回不来。原因是 <code>pendingAsks</code> 只看 <code>q.status === 'pending'</code>，不看所属气泡是否已经收口。</li>
+<li><strong>没有出口</strong>：等待期间整个 composer 被面板替换，而「停止」按钮长在 composer 里——用户除了回答问题，没有任何叫停手段；服务端也没有提问超时。</li>
+</ol>
+<p><strong>怎么修</strong>：<code>pendingAsks</code> 只认「这一轮还没收口」的气泡（<code>streaming</code> / <code>offline</code>）；面板头加「停止」，调已有的 <code>stopCurrent()</code>（端点早就幂等）。</p>
+<p><strong>验收</strong>：面板里点停止 → 面板消失、输入框回来、气泡显示已停止；另开客户端停 → 本窗口 ≤3 秒弹回输入框。</p>
+<h2 id="4-p1删掉的会话会留在侧栏">4. P1：删掉的会话会留在侧栏</h2>
+<p><strong>病灶故事</strong>：桌面端删掉一场会话，手机端（或另一个标签页）的侧栏还留着它；点进去是空白的「从一句话开始」，没有任何解释，条目也还在。</p>
+<p><strong>为什么</strong>：<code>session_deleted</code> 事件只做了「如果当前正打开它，就退回新对话」，没有把这条从 <code>recentSessions</code> 里摘掉；侧栏只在切会话/收尾时重拉。</p>
+<p><strong>怎么修</strong>：收到事件时顺手 filter 掉；不做全量重拉（重拉会把滚动位置和顺序打乱）。</p>
+<p><strong>验收</strong>：curl 删一条 → ≤3 秒侧栏消失；删当前会话 → 内容区和侧栏同时回到空态。</p>
+<h2 id="5-p1新建同名内置助手会把内置配置清空">5. P1：新建同名内置助手会把内置配置清空</h2>
+<p><strong>病灶故事</strong>：用户在「新建」里填了 <code>coder</code>（可能想改它的说明），保存成功——然后发现「coder」的说明、规格、工具策略全没了。实际上系统建了一条 override，并且用请求里的空串覆盖了从内置复制过来的值。</p>
+<p><strong>为什么</strong>：服务端「同名默认助手 → 建 override」是给<strong>编辑内置</strong>这条路用的（前端选中默认条目后走同一个 POST）；「新建」也走这条，于是空表单成了「清空」。</p>
+<p><strong>怎么修</strong>：前端在 <code>creating</code> 状态下先查两侧（root + subagent）的现有名字（含默认），撞名就<strong>不发请求</strong>，提示「要改它请在左侧选中后编辑」。服务端的 override 能力保留——编辑内置照旧。</p>
+<p><strong>验收</strong>：新建 <code>coder</code> → 横幅提示、override 条数不变；选中内置改说明 → 保存后是新写的那句。</p>
+<h2 id="6-p1导入与新建的默认可见性相反">6. P1：导入与新建的默认可见性相反</h2>
+<p><strong>病灶故事</strong>：同一页面，手工新建的助手默认「仅自己」，导入的默认「团队可见」。导入的人通常以为只是自己多了一份，结果团队成员的助手列表里都出现了。</p>
+<p><strong>为什么</strong>：<code>importAgents</code> 里自定义行写死 <code>Visibility: "tenant"</code>，而前端新建写死 <code>private</code>。</p>
+<p><strong>怎么修</strong>：按拍板 Q2 统一（推荐「仅自己」），导入完成的提示里写明当前可见性。</p>
+<p><strong>验收</strong>：导入后 GET 的 <code>visibility</code> 是 <code>private</code>；改成团队可见后变 <code>tenant</code>。</p>
+<h2 id="7-p2报错把网关语义塞给用户被登出没有说明">7. P2：报错把网关语义塞给用户；被登出没有说明</h2>
+<p><strong>现象</strong>：助手页导入重名显示 <code>409：这个名字已经有一份配置</code>；输错密码显示 <code>401：邮箱或密码不正确</code>；refresh token 失效时人直接被踢回登录页，屏幕上没有任何一句话。</p>
+<p><strong>怎么修</strong>：<code>show()</code> / <code>login()</code> 只显示 <code>message</code>；<code>clearAuth(reason)</code> 带上 <code>expired</code> 原因，登录表单据此显示「登录已过期，请重新登录」（主动退出不显示，登录成功即清除）。</p>
+<p><strong>验收</strong>：四处点一遍，文案里不含三位状态码；伪造 refresh token 后刷新 → 出现过期提示。</p>
+<h2 id="8-p2四个小口径">8. P2：四个小口径</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>现象</th>
+<th>改法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>邀请落地页账号不匹配时，括号里印的是<strong>邀请目标</strong>邮箱</td>
+<td>改印当前登录账号（<code>myEmail</code>）</td>
+</tr>
+<tr>
+<td>剪贴板被拒时「复制」完全无反馈</td>
+<td>按钮显示「复制失败」1.4 秒 + <code>aria-live</code></td>
+</tr>
+<tr>
+<td>密钥行名字留空会被静默丢弃，但横幅说「已保存」</td>
+<td>保存前校验，横幅「密钥名不能为空」，不发请求</td>
+</tr>
+<tr>
+<td>灯箱只能点背景关、小图不放大</td>
+<td>加「关闭」按钮；点图片在适应窗口/原始大小间切换</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="9-p2名字没有边">9. P2：名字没有边</h2>
+<p>项目名、助手名都没有长度上限：接口接受 100 字（前端也没有 <code>maxlength</code>），200 字也不拒。今天靠 CSS 兜住了布局，但会话标题、邀请页、审计导出都会用到这个名字。</p>
+<p><strong>怎么修</strong>：项目名 ≤100、助手名 ≤64（与 A1 同一条规则），服务端 400 <code>111002</code>，两处输入框 <code>maxlength</code>。</p>
+<h2 id="10-p3自动链接吞掉中文标点">10. P3：自动链接吞掉中文标点</h2>
+<p><strong>现象</strong>：模型输出 <code>https://example.com/a，后面</code>，链接把 <code>，</code> 编码进 href，点开是坏地址。</p>
+<p><strong>怎么修</strong>：<code>markdown.ts</code> 用 marked 的 <code>walkTokens</code>，自动链接末尾的全角标点（<code>，。、；：！？）》」』】</code>）从 href 与显示文本里剥掉；补一条 <code>npm test</code> 断言。</p>
+<h2 id="11-p3项目页两句话与行为对不上">11. P3：项目页两句话与行为对不上</h2>
+<ul>
+<li>已经在默认项目里，仍显示「回到默认项目」，点了没反应 → 用已有 <code>isDefault</code> 控制显隐。</li>
+<li>「新对话默认进入」读起来像一个可配置的默认值，实际是「上次在哪个项目」→ 按 Q3 改文案（推荐）或做成真设置。</li>
+</ul>
+<h2 id="12-p3访问日志里有完整-access_token">12. P3：访问日志里有完整 access_token</h2>
+<p><strong>现象</strong>：SSE 只能用查询串传 token（<code>EventSource</code> 没有自定义头），而 <code>gin.Default()</code> 的访问日志原样打印整条 URL——日志里躺着可用的凭证（有效期 15 分钟）。日志一旦进采集系统就等于外送。</p>
+<p><strong>怎么修</strong>：换成自定义 <code>LoggerWithFormatter</code>，把 <code>access_token=…</code> 打成 <code>***</code>，其余格式不变。<strong>不改传参形态</strong>（这是 EventSource 的唯一解）。</p>
+<h2 id="13-明确不做">13. 明确不做</h2>
+<ul>
+<li><strong>SSE 改用请求头</strong>：EventSource 不支持；要用请求头就得换 fetch 流式实现，属于另一个方案。</li>
+<li><strong>静止标签页的 401 重连</strong>：doc/48 已加「重连前先刷新 token」；页面静止时没有调用者仍是机制性限制。</li>
+<li><strong>ask_user 超时</strong>：产品拍板项（多久算放弃、超时后 run 怎么收），本篇只补「人能停」。</li>
+<li><strong>新建同名内置助手在后端直接拒绝</strong>：后端无法区分「编辑内置」与「新建撞名」（同一个 POST、同一形状），所以拦在前端。</li>
+</ul>
+<h2 id="14-四问的落地取值">14. 四问的落地取值</h2>
+<p>本轮按推荐值直接落地；四问都还没有用户点头，任何一项都可以翻（翻的成本写在括号里）。</p>
+<ol type="1">
+<li><strong>Q1 助手名字规则</strong>：落地 <code>^[A-Za-z0-9_-]{1,64}$</code>。中文名在保存/导入时 400 <code>111002</code>，提示「助手名字只能用字母、数字、下划线、连字符（1–64 个字符）」。装配期对历史上已经落库的坏行<strong>跳过并打日志</strong>（<code>agents: %q: 拒载</code>），不再拖垮整个租户。（翻成「允许中文 + 派生安全工具名」要加字段、改三处装配，工作量翻倍。）</li>
+<li><strong>Q2 导入默认可见性</strong>：落地<strong>仅自己</strong>，与手工新建一致。（翻回团队可见只改一行。）</li>
+<li><strong>Q3「新对话默认进入」</strong>：落地<strong>改文案</strong>为「新对话进入」，并在已在默认项目时隐藏「回到默认项目」按钮。（做成真默认项目偏好要新增存储与端点。）</li>
+<li><strong>Q4 灯箱</strong>：落地<strong>关闭按钮 + 点击放大/还原</strong>，背景可点关闭，<code>safe center</code> 处理超高图。</li>
+</ol>
+<hr />
+<h2 id="15-落地与验收记录2026-10-23">15. 落地与验收记录（2026-10-23）</h2>
+<p>代码落点：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>项</th>
+<th>改动</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>agents.go</code> 名字规则 + <code>parseAgentSpec</code> 拒载 + <code>BeforeAgent</code> 跳过坏行；<code>product_api.go</code> 的建/改/导入三入口共用同一句提示；<code>agents_test.go</code> 覆盖空格名、合法名、64/65 字符边界</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>chat.ts</code> <code>reconcile()</code>：<code>lastRunStatus ∈ {stopped,error}</code> 且日志里没有对应 assistant 行时补一条占位气泡</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>App.vue</code>：<code>pendingAsks</code> 只认 <code>streaming/offline</code> 气泡；输入区与面板各有一个停止入口</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>App.vue</code> <code>onMutation</code>：<code>session_deleted</code> 时把该会话从最近列表摘掉</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>Configure.vue</code>：新建时撞内置/已有名字先弹提示，不发空 override</td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>product_api.go</code> 导入的自定义行 <code>Visibility: private</code></td>
+</tr>
+<tr>
+<td>7</td>
+<td>前端不再给 <code>message</code> 加 HTTP 状态码前缀；<code>auth.ts</code> 增加 <code>authExpired</code>，登录页显示「登录已过期，请重新登录」</td>
+</tr>
+<tr>
+<td>8</td>
+<td>邀请页印<strong>当前账号</strong>邮箱；复制失败按钮显示「复制失败」；密钥空名行前端拦截；灯箱见第 4 问</td>
+</tr>
+<tr>
+<td>9</td>
+<td><code>workspaceNameFrom</code> 按 rune 限 100 字（400 <code>111002</code>）；项目页两个输入框 <code>maxlength=100</code></td>
+</tr>
+<tr>
+<td>10</td>
+<td><code>markdown.ts</code> 自定义 <code>url</code> tokenizer：在首个中文标点处截断，再剥尾部 ASCII 标点；<code>markdown.test.ts</code> 三条断言</td>
+</tr>
+<tr>
+<td>11</td>
+<td><code>ProjectsView.vue</code>：文案改「新对话进入」；已在默认项目时隐藏「回到默认项目」</td>
+</tr>
+<tr>
+<td>12</td>
+<td><code>server.go</code> 换 <code>gin.New()</code> + <code>LoggerWithFormatter</code>，<code>access_token=…</code> 打成 <code>***</code>；<code>accesslog_test.go</code> 守三种形态</td>
+</tr>
+</tbody>
+</table></div>
+<p>验收摘要：</p>
+<ul>
+<li><strong>A1（P0）</strong>：curl 建 <code>qa 空格</code> → 400 <code>111002</code> + 那句提示；<code>qa_ok</code>/<code>qa-ok</code>/64 字符通过、65 字符拒绝；导入含坏名整批 400 不落库；库里已有坏行时装配日志出现 <code>拒载</code>，其余 run 正常。</li>
+<li><strong>A2</strong>：真停一轮 → 「已停止，没有写进历史」；刷新后重开同一会话，占位气泡仍在（<code>lastRunStatus=stopped</code>）。</li>
+<li><strong>A3</strong>：ask_user 挂起时面板有「停止」；点它 → run <code>stopped</code>、面板收起；外部 <code>POST /api/runs/{id}/stop</code> 后页面 <strong>≈0.5 s</strong> 内收起（观测窗 3 s 内）。</li>
+<li><strong>A4</strong>：外部 <code>DELETE /api/sessions/{id}</code> 后侧栏该条 <strong>9 ms</strong> 消失，正开着的对话同时清空。</li>
+<li><strong>A5</strong>：新建同名内置助手 → 提示「已经是内置或已有助手」，服务端助手表仍是 <code>coder/default</code>、<code>researcher/default</code>。</li>
+<li><strong>A6</strong>：导入后该行 <code>visibility</code> 为 <code>private</code>。</li>
+<li><strong>A7</strong>：过期后登录页出现「登录已过期，请重新登录」，重新登录后消失；各页报错不再带 <code>400：</code>/<code>401：</code> 前缀。</li>
+<li><strong>A8</strong>：邀请页印当前账号邮箱；<code>writeText</code> 被替成 reject 后按钮变「复制失败」；密钥空名点保存被拦；灯箱可开、点击放大、× 关闭。</li>
+<li><strong>A9</strong>：101 个汉字项目名 → 400「项目名最多 100 个字符」；100 个通过并建出项目。</li>
+<li><strong>A12</strong>：隔离引擎日志里 <code>access_token=***</code>，全日志 grep 探针串 <strong>0 命中</strong>。</li>
+</ul>
+<h2 id="16-落地后补记2026-10-24">16. 落地后补记（2026-10-24）</h2>
+<h3 id="13-用户气泡里的行内代码白字白底等于隐形">#13 用户气泡里的行内代码白字白底，等于隐形</h3>
+<p><strong>现象</strong>：用户发一条带反引号的消息（例：<code>第一行写 `## 标题`（两个井号）</code>），用户气泡（深色底）里那两个代码片段只剩一个米色圆角块，字完全看不见；同一段消息里的围栏代码块、表格、引用和链接是同一类问题，只是这条消息先暴露了行内代码。</p>
+<p><strong>实测</strong>（5173 页面，2026-10-24）：</p>
+<pre><code>CODE text=&quot;## 标题&quot;
+  color: rgb(246, 241, 231)   ← 继承 .bubble.user .bubble-main（App.vue:2531-2533）
+  bg:    rgb(243, 240, 232)   ← .bubble-text :deep(code) 写死的 var(--bg)（App.vue:2581）</code></pre>
+<p>对比度 ≈1.0。根因是整套 markdown 排版（doc/48 A1）只按浅色助手气泡设计，用户气泡反过来是深底浅字。</p>
+<p><strong>修复</strong>：新增一组 <code>.bubble.user .bubble-text :deep(...)</code> 覆盖（code / pre / th / td / blockquote / a / hr），只把「浅底深字」的几项在深色气泡里翻过来；助手气泡不动。修复后实测行内代码 <code>fg=rgb(246,241,231)</code> / 合成底 <code>rgb(63,60,56)</code>，对比度 <strong>9.8:1</strong>。</p>
+<p><strong>同类风险</strong>：新配色（<a href="51-UI视觉重做.html">doc/51</a>）会把用户气泡改到中性深墨，这组覆盖仍然成立；以后任何「深底气泡」都要先检查这七类元素。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/49-%E8%B5%B0%E6%9F%A5%E7%BC%BA%E9%99%B7%E4%BF%AE%E5%A4%8D.md"><code>doc/49-走查缺陷修复.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>流式枢纽人工验收 · tako 文档</title>
+<link rel="stylesheet" href="../../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../../assets/tako-architecture.html">架构总览</a><a href="../../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="流式枢纽人工验收">流式枢纽人工验收</h1>
+<p>设计稿第 8 节的浏览器部分。机器用例已经在 <code>go test -race ./...</code> 里，这里只记人手要看的四条。 服务：<code>cd yk-tako-eino &amp;&amp; go run ./cmd/yktako -web 127.0.0.1:8765</code>。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>断网或刷新</strong>：一轮进行中刷新页面。刷新前已经出现的内容还在，后面新出现的帧接在后面，不从头重复刷一遍。</label></li>
+<li><label><input type="checkbox" /><strong>停止</strong>：点停止。这一轮停住，日志里只有一次「已停止」。接着再发一句话，能开新的一轮。</label></li>
+<li><label><input type="checkbox" /><strong>两个标签页</strong>：一轮进行中打开第二个标签，会话 id 相同（localStorage）。第二个标签能看到同一场 run 的后续帧。</label></li>
+<li><label><input type="checkbox" /><strong>REPL</strong>：不带 <code>-web</code> 再跑一次多步任务。终端格式与以前一致；有参数的工具调用在名字后带截断后的参数。当前目录不出现被 REPL 写过的 <code>yktako-webui.db</code>。</label></li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/archive/old-line/plans/2026-09-29-webui-stream-hub-manual.md"><code>doc/archive/old-line/plans/2026-09-29-webui-stream-hub-manual.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

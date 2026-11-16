@@ -1,0 +1,1344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>28 · 多租户运行时（个人 tenant 先行，团队 tenant 后开） · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="28--多租户运行时个人-tenant-先行团队-tenant-后开">28 · 多租户运行时（个人 tenant 先行，团队 tenant 后开）</h1>
+<blockquote>
+<p>性质：<strong>已落地</strong>（2026-10-21 收口）。A0–A6 共 30 拍全部落地并 curl 验收过，随 <code>9c21b66</code> 入库（2026-10-19）。 <strong>验收结论（2026-10-21 活体抽验，引擎 <code>127.0.0.1:8942</code>、独立库、Redis db 8，本篇 18 项断言全过）</strong>： 注册即建个人 tenant 且 role=owner；两个用户落在不同 tenant；跨租户读会话 log 回 404、读 run frames 回 200 且 <code>status:"gone"</code>（19v6-01 的 gone 契约，不是 404）；建团队 → 切租户 → 邀成员 → 对方用邀请注册 → 切进团队拿到 role=member；member 再邀人回 403；owner 读成员列表 code=0。 施工期的逐拍实测实录在 <code>tmp/28-多租户/</code>（30 拍各自的 curl 与期望字节）与 <code>doc/log/2026-10-19-多租户-handoff.md</code>。 <strong>这一批明确没做的（是边界，不是待办）</strong>：① 团队 <code>model_ref</code> / <code>tools</code> 未接，worker 仍用进程启动时的全局模型与全局 <code>mcp.json</code>， 不按 <code>tenant_settings</code> 装——<strong>「配置已落库」不等于「这场 run 换了模型」</strong>；② 团队前端页面（独立 loop， 见 <a href="36-团队前端.html">doc/36</a>，2026-10-21 已落地）。 <strong>A7 那一档的进度（2026-10-22）</strong>：旧 runs/sessions/mcp/media/memory 成功体换 <code>{code,message,data}</code> 信封 <strong>已落地</strong>（见 <a href="40-响应信封统一.html">doc/40</a>）；A7 剩下的计费／API key／SSO／组织共享 <strong>2026-10-22 已拍不做</strong>——与运行时关系不大的商业化、合规项，从路线图移除。 <strong>2026-10-18 已拍三条（A0 施工前）</strong>：① A0-1/A0-2 先用静态 dev 用户脚手架——可以； ② A0-3/A0-4/A0-5 预计 90–100 行、略超 80 目标——接受；③ A0 期间现有业务端点仍裸奔——正常，A1 补门。 本篇替换 2026-10-18 之前的 doc/28 草稿：<code>X-Tako-Tenant</code> 声明式方案不再作为施工面。 范围：身份、租户、成员、角色、会话归属、notes、workspace、配额、后台管理、团队（A6 后端）。 不在本篇：团队前端页面、组织/跨租户共享、API key、SSO、账单。 关联：doc/16 #9、doc/17:362、doc/10:193、doc/03 多副本目标、doc/34（租户运行时装配）、 doc/36（团队前端）、doc/37（删除连带删）。</p>
+</blockquote>
+<p><strong>这版相对旧稿改了什么。</strong></p>
+<ul>
+<li>身份：<code>X-Tako-Tenant</code> 声明式头 → JWT access + opaque refresh；role 每次从 <code>tenant_members</code> 查，不写进 token。</li>
+<li>租户：单层 <code>tenant_id</code> → <code>tenant + user + membership</code>；个人 tenant 先行，团队 = 多成员 tenant。</li>
+<li>会话：<code>session</code> 只加 tenant → <code>tenant_id + user_id + visibility</code>；默认 private。</li>
+<li>记忆：notes 只加 tenant → <code>tenant_id + scope(user/tenant)</code>；个人记忆 / 团队记忆分开。</li>
+<li>权限：只有 404 → 401/403/404/409 + 平台/租户/资源三层守卫。</li>
+<li>新增：per-tenant workspace/files、per-tenant 配额、eino 并发决策、后台管理、A0-A7 阶段。</li>
+</ul>
+<h2 id="0-大白话版">0. 大白话版</h2>
+<p><strong>tako 要做的是什么。</strong> 不是“单机聊天工具”，是<strong>多租户 agent 运行时 + 会话</strong>：一个部署里有很多租户，每个租户有自己的用户、会话、agent、记忆、文件和配额；租户之间不能互相看见。</p>
+<p><strong>四层关系，一句话：</strong></p>
+<pre><code>平台（platform）
+  └─ 租户 tenant（隔离 + 计费 + 配额）
+       ├─ 成员 tenant_members（user + role + status）
+       ├─ 会话 sessions（tenant_id + user_id + visibility）
+       │    └─ run（一次执行）
+       ├─ agent（租户级资源，creator + visibility）
+       ├─ notes（tenant 共享 / user 私有）
+       └─ workspace / files / sandbox（租户级隔离）</code></pre>
+<p><strong>团队功能已拍支持，怎么做。</strong> 每个用户注册时自动得到一个<strong>个人 tenant</strong>（单成员）；团队是<strong>多成员 tenant</strong>。 A6 做团队后端 API（创建、邀请、成员/角色、团队 agent/notes）；团队前端页面是独立 loop，但 A6 契约要够前端直接用。 用户可以在多个 tenant 之间切换，个人数据不搬家。</p>
+<p><strong>Alice 的一天。</strong></p>
+<pre><code>Alice 注册
+  → 自动建 personal tenant t_alice，Alice 是 owner
+Alice 建 session s1（private）
+  → s1.tenant_id=t_alice, s1.user_id=alice
+Bob 和 Alice 在同一个团队 Acme（另一个 tenant）
+  → Bob GET s1：404（private，不是他的）
+Carol 在另一个 tenant
+  → Carol GET s1：404（跨租户）
+Alice 加入 Acme
+  → 只多一条 tenant_members(t_acme, alice, member)
+  → 她切到 Acme，看到 Acme 的 agent/notes；s1 仍在个人 tenant
+Acme owner 邀请 Bob
+  → Bob 接受后成为 member；团队共享 agent/notes，但 session 仍默认私有</code></pre>
+<p><strong>五个关键决定。</strong></p>
+<ol type="1">
+<li><strong>tenant 是一等公民</strong>：所有资源带 <code>tenant_id</code>；不搞“个人资源 + 可空 team_id”的双路径。</li>
+<li><strong>个人 tenant 先行，团队 tenant A6 后端落地</strong>：个人 tenant 现在就能用；团队后端 A6 做，团队前端页面独立 loop；表结构、token、切租户 API 从 A0 起按多租户做。</li>
+<li><strong>session 默认私有</strong>：同租户普通成员也读不到别人的会话；团队共享要显式 <code>visibility=tenant</code>。</li>
+<li><strong>notes 分 scope</strong>：<code>user</code> 私有、<code>tenant</code> 共享；模型默认只写个人记忆，团队记忆由 owner/admin 管。</li>
+<li><strong>文件/沙箱/配额是 P0</strong>：多租户 agent 运行时不能共用一个全局 workspace，也不能让一个租户占满所有并发。</li>
+</ol>
+<p><strong>分几步走。</strong></p>
+<ul>
+<li><strong>A0 身份与个人 tenant</strong>：users/tenants/members、注册登录、refresh、切租户、system admin；个人 tenant 自动建。</li>
+<li><strong>A1 会话归属</strong>：<code>sessions.tenant_id/user_id/visibility</code>；建/读/停/拉 log/frames 全部按身份校验；store 层同事务守。</li>
+<li><strong>A2 角色与后台</strong>：owner/admin/member/viewer、成员管理、最后一个 owner、system admin 路由、审计。</li>
+<li><strong>A3 记忆</strong>：notes 的 <code>tenant/user</code> scope；快照、写入、定位、删除全部按 scope；个人记忆不串。</li>
+<li><strong>A4 工作区与文件</strong>：每 tenant 一个 workspace 根；file tools/bash 按 tenant 解析；多副本共享存储。</li>
+<li><strong>A5 并发与配额</strong>：按租户限并发/子代理/token/存储；eino #1177 的决策；两租户并发验收。</li>
+<li><strong>A6 团队</strong>：创建团队、邀请、角色、切换、团队 agent/notes；session 仍默认私有。</li>
+<li><strong>A7 以后</strong>：API key、组织/跨租户共享、SSO、账单。</li>
+</ul>
+<p><strong>故意不做。</strong> 不做公开注册以外的账号体系；不做 OIDC/SSO；不做组织/跨租户共享；不做 API key capability；不做计费；不做团队嵌套/部门树；不做“管理员默认读所有会话”。这些都留了缝，但不在本方案施工。</p>
+<p><strong>所以这解决了什么。</strong> tako 从“谁有 sessionId 谁就是主人”变成“tenant + user + role + 会话归属”四重边界；个人用户今天就能用，团队以后只是多一条 membership，不用搬 session/notes/files；后台管理有平台管理员和租户角色两条轴，不会把“空间管理员”和“平台管理员”混成一个 role。</p>
+<h2 id="1-背景与病灶">1. 背景与病灶</h2>
+<h3 id="11-代码现状2026-10-18-核对">1.1 代码现状（2026-10-18 核对）</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>事实</th>
+<th>出处</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HTTP 面不止四个：<code>/api/runs</code>（POST/stop/resume）、<code>/api/runs/:id</code>（status）、<code>frames</code>、<code>stream</code>、<code>/api/sessions/:id</code>（status/log）、<code>/api/mcp/servers</code>、<code>/api/media</code>、<code>/api/memory/*</code>；全部无鉴权</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/server.go#L61-L90">server.go:61-90</a></td>
+</tr>
+<tr>
+<td><code>sessions</code> 只有 <code>ID/Title/CreatedAt</code>，没有 tenant/user</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/pgstore.go#L26">pgstore.go:26</a></td>
+</tr>
+<tr>
+<td>POST 带 sessionId 只查“存在吗”，不查“是谁的”</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/server.go#L187">server.go:187</a></td>
+</tr>
+<tr>
+<td><code>AcquireRun</code> 无条件 <code>INSERT sessions ... ON CONFLICT DO NOTHING</code>，不看 tenant/user</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/store.go#L136">store.go:136</a></td>
+</tr>
+<tr>
+<td><code>SessionStatus</code>/<code>ReadLog</code>/<code>StopRun</code> 只按 sessionId/runId</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/pgstore.go#L179">pgstore.go:179</a>、<a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/pgstore.go#L348">pgstore.go:348</a>、<a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/store.go#L571">store.go:571</a></td>
+</tr>
+<tr>
+<td><code>ReadFrames</code> 只按 runId 读 Redis，不查归属</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/redisstore.go#L169">redisstore.go:169</a></td>
+</tr>
+<tr>
+<td>notes 按全局 workspace 分区，与 session/user 无关</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/notes.go#L106">notes.go:106</a></td>
+</tr>
+<tr>
+<td>notes 的快照/定位/写入都只看 workspace</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/notes.go#L336">notes.go:336</a>、<a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/notes.go#L350">notes.go:350</a>、<a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/notes.go#L614">notes.go:614</a></td>
+</tr>
+<tr>
+<td>file tools/bash/memory 在 <code>NewWorker</code> 启动时捕获一个全局 workspace</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/worker.go#L163">worker.go:163</a>、<a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/worker.go#L179">worker.go:179</a>、<a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/worker.go#L191">worker.go:191</a></td>
+</tr>
+<tr>
+<td>子代理并发闸是进程级 channel，全部租户共享</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/agents.go#L258">agents.go:258</a></td>
+</tr>
+<tr>
+<td><code>-dev</code> 默认 true，dev/reset 全局清库</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/cmd/yktako/main.go#L95">main.go:95</a></td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="12-病灶四个具体的失败故事">1.2 病灶：四个具体的失败故事</h3>
+<p><strong>故事一：跨租户读会话。</strong> Alice 在 tenant A 建了 session <code>s_1</code>，把链接贴给 Bob。Bob 在 tenant B，直接 <code>GET /api/sessions/s_1</code>。今天服务端只问“s_1 存在吗”，存在就返回 200；Bob 读到 Alice 和 agent 的整场对话，还能 <code>POST /api/runs</code> 往会话里投消息、<code>POST /stop</code> 停掉 Alice 的 run。</p>
+<p><strong>故事二：笔记暗道。</strong> Alice 让 agent 记下“deck 在 output/deck.html，不要重建”。Bob 在 tenant B 开自己的 run，agent 起手读 notes 快照——notes 按全局 workspace 分区，Bob 读到的是 Alice 的记忆，并在回答里把路径说出来。API 全守住了，记忆这条暗道照旧全通。</p>
+<p><strong>故事三：文件暗道。</strong> 文件工具和 bash 共用一个 <code>-workspace</code> 根。Bob 不需要碰 Alice 的 session：自己开一个 run，让 agent <code>cat</code> 共享目录里的文件，就能读到 Alice 的方案、代码、上传的文档。</p>
+<p><strong>故事四：配额与并发。</strong> tenant A 开了 50 个会话、每会话一个 run，把模型配额和子代理的 8 个槽位占满；tenant B 的 run 排队等不到子代理。更糟的是，所有租户共用同一个 eino agent 实例，doc/17 的 #1177 共享实例并发 race 从“同一个人多标签页”升级成“两个租户并发可能互相取消/串状态”。</p>
+<p><strong>四个故事同根：系统里没有“tenant/user/role”这三个概念。</strong> 只加一个 <code>tenant_id</code> 列不够：session 还需要 owner，notes 需要 scope，文件需要租户根，后台需要角色，并发需要配额。这是数据模型变更，不是加一个 middleware。</p>
+<h3 id="13-为什么先不做团队以后加-team_id会返工">1.3 为什么“先不做团队，以后加 team_id”会返工</h3>
+<p>如果今天做成“资源归 user，<code>team_id</code> 可空”，以后加团队会遇到：</p>
+<ul>
+<li>每个查询都要分“个人资源”和“团队资源”两条路径；</li>
+<li>session/notes/files/usage 从个人转团队，要改 owner、改路径、改审计；</li>
+<li>“分享”是改 <code>team_id</code>，“取消分享”是改回去，权限和配额都跟着抖；</li>
+<li>团队里“这个 session 是谁的”和“这个 session 属于哪个团队”两套语义。</li>
+</ul>
+<p><strong>本方案选：tenant 从第一天就在；个人只是单成员 tenant。</strong> 以后加团队，只是 <code>tenant_members</code> 多一行，资源不搬家。</p>
+<h3 id="14-weknora-的可借鉴与不可借鉴">1.4 WeKnora 的可借鉴与不可借鉴</h3>
+<p>WeKnora 的权限模型值得看，但它是“多租户知识库 + 跨租户共享”，tako 是“agent 运行时 + 会话”，不能照抄。</p>
+<p>可借鉴：</p>
+<ul>
+<li>平台 <code>is_system_admin</code> 与租户角色分离；tenant_member.go</li>
+<li><code>tenant_members.role</code> 是角色唯一真源，不放在 <code>users.role</code>；</li>
+<li><code>RequireRole</code> / <code>RequireOwnershipOrRole</code> / <code>RequireSystemAdmin</code> 三层守卫；rbac.go</li>
+<li>ownership 判定顺序：role 够就不查库，不够才查 creator；查不到让 handler 404，查库故障 503；ownership.go</li>
+<li><code>Caller</code>（授权身份）与 <code>WithExecutionTenant</code>（数据作用域）分离；</li>
+<li>最后一个 owner / 最后一个 system admin 保护；</li>
+<li>审计：角色变更、管理员操作、拒绝尝试。</li>
+</ul>
+<p>不照抄：</p>
+<ul>
+<li>组织/跨租户共享的三维取最小 <code>min(share, org role, tenant cap)</code>——等有跨团队共享再做；</li>
+<li>API key capability 矩阵——等有程序化接入再做；</li>
+<li>24h access token + token 原文落库——tako 用短 access + refresh hash；</li>
+<li>RBAC 的 fail-open rollout 开关——多租户默认全开。</li>
+</ul>
+<h2 id="2-目标与非目标">2. 目标与非目标</h2>
+<h3 id="21-目标">2.1 目标</h3>
+<ol type="1">
+<li><strong>tenant 隔离</strong>：session/run/log/frames/notes/files/usage/audit 不跨租户。</li>
+<li><strong>个人 tenant 先行</strong>：注册即用；不需要先建团队。</li>
+<li><strong>团队功能</strong>：团队 = 多成员 tenant；A6 做创建/邀请/成员/角色/团队 agent/notes 后端；用户可属于多个 tenant；切租户不搬数据。</li>
+<li><strong>角色与后台</strong>：平台 system admin + 租户 owner/admin/member/viewer；成员管理、审计、最后一个 owner 保护。</li>
+<li><strong>会话隐私</strong>：默认 private；团队共享显式开启；管理员默认不看内容。</li>
+<li><strong>记忆分 scope</strong>：个人记忆 / 团队记忆分开，写入和快照都不串。</li>
+<li><strong>文件隔离</strong>：每 tenant 一个 workspace 根；多副本共享存储。</li>
+<li><strong>配额与公平</strong>：按租户限并发、子代理、token、存储；不被一个租户拖垮。</li>
+<li><strong>多副本</strong>：身份、角色、refresh、配额都不放进程内。</li>
+</ol>
+<h3 id="22-非目标--后续-loop">2.2 非目标 / 后续 loop</h3>
+<ul>
+<li>团队前端页面（创建/邀请/成员页的交互）——独立 frontend loop；A6 后端 API 在本篇，契约要够前端直接用；</li>
+<li>组织/跨租户共享（共享 agent、共享 KB）——以后；</li>
+<li>API key capability / 机器 principal——以后；</li>
+<li>OIDC/SSO、账单/席位、审计导出——以后；</li>
+<li>团队嵌套/部门树——明确不做，用扁平 tenant + project 代替；</li>
+<li>管理员默认读所有会话——不做；support access 单独设计。</li>
+</ul>
+<h3 id="23-信任模型与上线闸门">2.3 信任模型与上线闸门</h3>
+<p><strong>假设租户里的 agent 会跑 bash、写文件，默认按“不可信代码”设计。</strong> 只做路径隔离不够：<code>bash</code> 可以 <code>cat /etc/passwd</code>、读别的租户的绝对路径、访问网络。真正的隔离需要 per-tenant 沙箱（容器/命名空间/受限命令集 + 资源限制）。</p>
+<p>因此设两道闸：</p>
+<ul>
+<li><strong>A4 完成前</strong>：只允许个人 tenant、单用户/本地开发；不开放多租户。文件工具仍用全局 workspace，但部署只绑 loopback。</li>
+<li><strong>A5 完成前</strong>：不开放外部团队；A4 的 per-tenant workspace 必须已完成，A5 还要有配额 + eino 并发决策；如果租户不可信，还要有沙箱。</li>
+</ul>
+<p>这一版的沙箱不是容器，也不是「把工作目录当成牢笼」。本机的 <code>sandbox-exec</code> 要真正 apply 成功，生产 run 里的 bash 和 <code>-dev</code> 探针才套同一份配置：默认拒绝，只允许读写当前会话目录，并显式拒绝读 <code>/etc/passwd</code> 和 <code>/private/etc/passwd</code>。命令的 cwd 只决定它启动时站在哪个目录，挡不住绝对路径。binary 不在，或者系统拒绝 apply 时，bash 直接拒绝，不退回去跑一条裸命令，dev 探针也不报 <code>sandboxed: true</code>。时长上限到点后，工具结果写成「bash 超时」，父 run 不因此失败。2026-10-18 在这台 Mac 上打过：<code>cat /etc/passwd</code> 得到 Operation not permitted，<code>pwd</code> 和写会话根里的文件仍然成功。那次 apply 是被允许的。后来同一台机器上 apply 会被拒绝，这种时候不能把「退出码」当成已经隔离。</p>
+<h2 id="3-核心模型与不变量">3. 核心模型与不变量</h2>
+<h3 id="31-名词">3.1 名词</h3>
+<ul>
+<li><strong>platform</strong>：整个部署。平台管理员 <code>is_system_admin</code> 管全局设置、所有租户、平台审计，不等于任何租户的 owner。</li>
+<li><strong>tenant</strong>：隔离、计费、配额的单位。<code>kind=personal</code>（单成员）或 <code>team</code>（多成员）。个人 tenant 在注册时自动创建；团队 tenant 由用户创建/邀请加入。</li>
+<li><strong>user</strong>：全局身份。一个 user 可以属于多个 tenant；角色在每个 tenant 不同。</li>
+<li><strong>membership</strong>：<code>tenant_members(tenant_id, user_id, role, status)</code>。这是角色唯一真源；<code>active</code> 才参与鉴权。</li>
+<li><strong>session</strong>：tenant 内的会话资源；<code>tenant_id</code> 必填，<code>user_id</code> 是 owner，<code>visibility=private|tenant</code>。</li>
+<li><strong>run</strong>：session 的一次执行。<code>runs.session_id</code> 指向 session；tenant/user 经 session 派生。</li>
+<li><strong>agent</strong>：tenant 级 agent 定义；<code>created_by</code>、<code>visibility</code>、<code>is_builtin</code>。</li>
+<li><strong>note</strong>：tenant 级记忆；<code>scope=user|tenant</code>。两档都写 <code>user_id</code>。<code>scope=tenant</code> 写的是创建者，列是 <code>not null default ''</code>，不是 NULL。</li>
+<li><strong>workspace</strong>：tenant 的文件根；<code>&lt;root&gt;/tenants/&lt;tenant_id&gt;/...</code>。</li>
+<li><strong>api key</strong>：机器身份，后续 loop；不混入人类角色。</li>
+</ul>
+<h3 id="32-不变量">3.2 不变量</h3>
+<ol type="1">
+<li><strong>每个资源都有 <code>tenant_id</code></strong>：session/agent/note/file/usage/audit 直接有；run/message/runlog 经 session 回查。</li>
+<li><strong>角色只从 <code>tenant_members</code> 来</strong>；JWT 里不带 role，降级立即生效。</li>
+<li><strong>session 默认 private</strong>；同 tenant 非 owner 也 404；<code>visibility=tenant</code> 才可读，写/stop 仍归 owner。</li>
+<li><strong>notes 的 scope 写入时定死</strong>；个人记忆不会因为加入团队变成团队可见。</li>
+<li><strong>归属校验在 store 的同一笔事务里</strong>，不只在 handler；handler 的 404 是快路径，不是唯一防线。</li>
+<li><strong>不跨 tenant 引用</strong>：session 不能引用别的 tenant 的 agent；agent 不能引用别的 tenant 的 model/MCP；要共享就复制/导入，不做跨租户指针。</li>
+<li><strong>身份/角色/refresh/配额不放进程内</strong>；多副本共享 PG/Redis。</li>
+<li><strong>个人 tenant 自动建；团队是另一个 tenant</strong>；资源不搬家。</li>
+<li><strong>平台管理员与租户角色正交</strong>；平台管理员不自动是 tenant owner。</li>
+<li><strong>认证失败 401，授权失败 403，资源不可见 404</strong>；不用 403 泄露存在性。</li>
+</ol>
+<h2 id="4-数据模型">4. 数据模型</h2>
+<h3 id="41-表">4.1 表</h3>
+<blockquote>
+<p>ID 沿用现有 <code>s_</code>/<code>r_</code> 前缀风格：<code>u_</code>/<code>t_</code>/<code>a_</code>/<code>n_</code> + ULID。所有表在 PG；dev 清库重来，不做旧数据兼容。</p>
+</blockquote>
+<div class="sourceCode" id="cb3"><pre class="sourceCode sql"><code class="sourceCode sql"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>users(</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  <span class="kw">id</span>            text <span class="kw">primary</span> <span class="kw">key</span>,          <span class="co">-- u_&lt;ULID&gt;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  email         text <span class="kw">not</span> <span class="kw">null</span> <span class="kw">unique</span>,</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  password_hash text <span class="kw">not</span> <span class="kw">null</span>,             <span class="co">-- bcrypt/argon2id</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>  is_system_admin <span class="dt">boolean</span> <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="kw">false</span>,</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>  disabled      <span class="dt">boolean</span> <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="kw">false</span>,</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>  token_version <span class="dt">int</span> <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="dv">0</span>,    <span class="co">-- 改密/禁用时递增，旧 AT 失效</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>  default_tenant_id text,                  <span class="co">-- UX 偏好，不是授权真源</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>  created_at    timestamptz <span class="kw">not</span> <span class="kw">null</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>tenants(</span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>  <span class="kw">id</span>         text <span class="kw">primary</span> <span class="kw">key</span>,             <span class="co">-- t_&lt;ULID&gt;</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>  kind       text <span class="kw">not</span> <span class="kw">null</span>,                <span class="co">-- personal | team</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>  name       text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>  status     text <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="st">&#39;active&#39;</span>, <span class="co">-- active | suspended | deleted</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>  <span class="kw">plan</span>       text <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="st">&#39;free&#39;</span>,</span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>  created_by text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>  created_at timestamptz <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>  max_concurrent_runs <span class="dt">int</span> <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="dv">8</span>,</span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>  max_subagents       <span class="dt">int</span> <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="dv">8</span>,</span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>  daily_tokens        bigint <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="dv">0</span>, <span class="co">-- 0 = 不限制</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>  max_storage_bytes   bigint <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="dv">0</span>  <span class="co">-- 0 = 不限制</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>tenant_members(</span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>  tenant_id  text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>  user_id    text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>  <span class="kw">role</span>       text <span class="kw">not</span> <span class="kw">null</span>,                <span class="co">-- owner | admin | member | viewer</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>  status     text <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="st">&#39;active&#39;</span>, <span class="co">-- active | invited | suspended</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>  invited_by text,</span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>  joined_at  timestamptz,</span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>  <span class="kw">primary</span> <span class="kw">key</span> (tenant_id, user_id)</span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>tenant_settings(</span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>  tenant_id  text <span class="kw">primary</span> <span class="kw">key</span>,</span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>  config     text <span class="kw">not</span> <span class="kw">null</span>,                <span class="co">-- JSON：modelRef / mcp / sandbox / secrets</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>  updated_by text <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="st">&#39;&#39;</span>,</span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a>  updated_at timestamptz <span class="kw">not</span> <span class="kw">null</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>tenant_invitations(</span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>  <span class="kw">id</span>         text <span class="kw">primary</span> <span class="kw">key</span>,             <span class="co">-- in_&lt;ULID&gt;</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>  tenant_id  text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a>  email      text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a>  <span class="kw">role</span>       text <span class="kw">not</span> <span class="kw">null</span>,                <span class="co">-- admin | member | viewer（owner 只走转移）</span></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a>  token_hash text <span class="kw">not</span> <span class="kw">null</span> <span class="kw">unique</span>,         <span class="co">-- 邀请链接 token 的 SHA-256</span></span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a>  status     text <span class="kw">not</span> <span class="kw">null</span>,                <span class="co">-- pending | accepted | revoked | declined</span></span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a>  expires_at timestamptz <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a>  created_by text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a>  created_at timestamptz <span class="kw">not</span> <span class="kw">null</span></span>
+<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb3-54"><a href="#cb3-54" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-55"><a href="#cb3-55" aria-hidden="true" tabindex="-1"></a>sessions(</span>
+<span id="cb3-56"><a href="#cb3-56" aria-hidden="true" tabindex="-1"></a>  <span class="kw">id</span>         text <span class="kw">primary</span> <span class="kw">key</span>,             <span class="co">-- s_&lt;ULID&gt;</span></span>
+<span id="cb3-57"><a href="#cb3-57" aria-hidden="true" tabindex="-1"></a>  tenant_id  text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-58"><a href="#cb3-58" aria-hidden="true" tabindex="-1"></a>  user_id    text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-59"><a href="#cb3-59" aria-hidden="true" tabindex="-1"></a>  agent_id   text <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="st">&#39;&#39;</span>,     <span class="co">-- 空 = 还没绑定助手</span></span>
+<span id="cb3-60"><a href="#cb3-60" aria-hidden="true" tabindex="-1"></a>  visibility text <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="st">&#39;private&#39;</span>, <span class="co">-- private | tenant</span></span>
+<span id="cb3-61"><a href="#cb3-61" aria-hidden="true" tabindex="-1"></a>  title      text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-62"><a href="#cb3-62" aria-hidden="true" tabindex="-1"></a>  created_at timestamptz <span class="kw">not</span> <span class="kw">null</span></span>
+<span id="cb3-63"><a href="#cb3-63" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb3-64"><a href="#cb3-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-65"><a href="#cb3-65" aria-hidden="true" tabindex="-1"></a>runs(</span>
+<span id="cb3-66"><a href="#cb3-66" aria-hidden="true" tabindex="-1"></a>  <span class="kw">id</span>          text <span class="kw">primary</span> <span class="kw">key</span>,            <span class="co">-- 现有 r_&lt;ULID&gt;</span></span>
+<span id="cb3-67"><a href="#cb3-67" aria-hidden="true" tabindex="-1"></a>  session_id  text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-68"><a href="#cb3-68" aria-hidden="true" tabindex="-1"></a>  status      text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-69"><a href="#cb3-69" aria-hidden="true" tabindex="-1"></a>  lease_until timestamptz,</span>
+<span id="cb3-70"><a href="#cb3-70" aria-hidden="true" tabindex="-1"></a>  created_at  timestamptz <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-71"><a href="#cb3-71" aria-hidden="true" tabindex="-1"></a>  finished_at timestamptz</span>
+<span id="cb3-72"><a href="#cb3-72" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb3-73"><a href="#cb3-73" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-74"><a href="#cb3-74" aria-hidden="true" tabindex="-1"></a>run_model_messages(<span class="op">..</span>.)  <span class="co">-- 现有，session_id/run_id 不变</span></span>
+<span id="cb3-75"><a href="#cb3-75" aria-hidden="true" tabindex="-1"></a>runlog_entries(<span class="op">..</span>.)      <span class="co">-- 现有，session_id/run_id 不变</span></span>
+<span id="cb3-76"><a href="#cb3-76" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-77"><a href="#cb3-77" aria-hidden="true" tabindex="-1"></a>tenant_agents(</span>
+<span id="cb3-78"><a href="#cb3-78" aria-hidden="true" tabindex="-1"></a>  <span class="kw">id</span>         text <span class="kw">primary</span> <span class="kw">key</span>,             <span class="co">-- ag_&lt;ULID&gt;</span></span>
+<span id="cb3-79"><a href="#cb3-79" aria-hidden="true" tabindex="-1"></a>  tenant_id  text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-80"><a href="#cb3-80" aria-hidden="true" tabindex="-1"></a>  name       text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-81"><a href="#cb3-81" aria-hidden="true" tabindex="-1"></a>  spec       text <span class="kw">not</span> <span class="kw">null</span>,                <span class="co">-- 这场 run 的 prompt 正文</span></span>
+<span id="cb3-82"><a href="#cb3-82" aria-hidden="true" tabindex="-1"></a>  model_ref  text <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="st">&#39;&#39;</span>,     <span class="co">-- 已落库；worker 这一版还不换模型</span></span>
+<span id="cb3-83"><a href="#cb3-83" aria-hidden="true" tabindex="-1"></a>  tools      text <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="st">&#39;&#39;</span>,</span>
+<span id="cb3-84"><a href="#cb3-84" aria-hidden="true" tabindex="-1"></a>  visibility text <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="st">&#39;private&#39;</span>, <span class="co">-- private | tenant</span></span>
+<span id="cb3-85"><a href="#cb3-85" aria-hidden="true" tabindex="-1"></a>  is_builtin <span class="dt">boolean</span> <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="kw">false</span>,</span>
+<span id="cb3-86"><a href="#cb3-86" aria-hidden="true" tabindex="-1"></a>  created_by text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-87"><a href="#cb3-87" aria-hidden="true" tabindex="-1"></a>  created_at timestamptz <span class="kw">not</span> <span class="kw">null</span></span>
+<span id="cb3-88"><a href="#cb3-88" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb3-89"><a href="#cb3-89" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-90"><a href="#cb3-90" aria-hidden="true" tabindex="-1"></a>notes(</span>
+<span id="cb3-91"><a href="#cb3-91" aria-hidden="true" tabindex="-1"></a>  <span class="kw">id</span>            text <span class="kw">primary</span> <span class="kw">key</span>,          <span class="co">-- n_&lt;ULID&gt;</span></span>
+<span id="cb3-92"><a href="#cb3-92" aria-hidden="true" tabindex="-1"></a>  tenant_id     text <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="st">&#39;&#39;</span>,</span>
+<span id="cb3-93"><a href="#cb3-93" aria-hidden="true" tabindex="-1"></a>  user_id       text <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="st">&#39;&#39;</span>,  <span class="co">-- scope=tenant 也写创建者，不写 NULL</span></span>
+<span id="cb3-94"><a href="#cb3-94" aria-hidden="true" tabindex="-1"></a>  <span class="kw">scope</span>         text <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="st">&#39;user&#39;</span>, <span class="co">-- user | tenant</span></span>
+<span id="cb3-95"><a href="#cb3-95" aria-hidden="true" tabindex="-1"></a>  workspace     text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-96"><a href="#cb3-96" aria-hidden="true" tabindex="-1"></a>  kind          text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-97"><a href="#cb3-97" aria-hidden="true" tabindex="-1"></a>  content       text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-98"><a href="#cb3-98" aria-hidden="true" tabindex="-1"></a>  quote         text,</span>
+<span id="cb3-99"><a href="#cb3-99" aria-hidden="true" tabindex="-1"></a>  source_run_id text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-100"><a href="#cb3-100" aria-hidden="true" tabindex="-1"></a>  source_seq    bigint <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-101"><a href="#cb3-101" aria-hidden="true" tabindex="-1"></a>  superseded_by text,</span>
+<span id="cb3-102"><a href="#cb3-102" aria-hidden="true" tabindex="-1"></a>  created_at    timestamptz <span class="kw">not</span> <span class="kw">null</span></span>
+<span id="cb3-103"><a href="#cb3-103" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb3-104"><a href="#cb3-104" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-105"><a href="#cb3-105" aria-hidden="true" tabindex="-1"></a>refresh_tokens(</span>
+<span id="cb3-106"><a href="#cb3-106" aria-hidden="true" tabindex="-1"></a>  <span class="kw">id</span>          text <span class="kw">primary</span> <span class="kw">key</span>,</span>
+<span id="cb3-107"><a href="#cb3-107" aria-hidden="true" tabindex="-1"></a>  user_id     text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-108"><a href="#cb3-108" aria-hidden="true" tabindex="-1"></a>  tenant_id   text <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="st">&#39;&#39;</span>,</span>
+<span id="cb3-109"><a href="#cb3-109" aria-hidden="true" tabindex="-1"></a>  token_hash  text <span class="kw">not</span> <span class="kw">null</span> <span class="kw">unique</span>,        <span class="co">-- SHA-256，不存原文</span></span>
+<span id="cb3-110"><a href="#cb3-110" aria-hidden="true" tabindex="-1"></a>  family_id   text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-111"><a href="#cb3-111" aria-hidden="true" tabindex="-1"></a>  expires_at  timestamptz <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-112"><a href="#cb3-112" aria-hidden="true" tabindex="-1"></a>  revoked_at  timestamptz,</span>
+<span id="cb3-113"><a href="#cb3-113" aria-hidden="true" tabindex="-1"></a>  replaced_by text,</span>
+<span id="cb3-114"><a href="#cb3-114" aria-hidden="true" tabindex="-1"></a>  created_at  timestamptz <span class="kw">not</span> <span class="kw">null</span></span>
+<span id="cb3-115"><a href="#cb3-115" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb3-116"><a href="#cb3-116" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-117"><a href="#cb3-117" aria-hidden="true" tabindex="-1"></a><span class="kw">usage</span>(</span>
+<span id="cb3-118"><a href="#cb3-118" aria-hidden="true" tabindex="-1"></a>  <span class="kw">id</span>          text <span class="kw">primary</span> <span class="kw">key</span>,</span>
+<span id="cb3-119"><a href="#cb3-119" aria-hidden="true" tabindex="-1"></a>  tenant_id   text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-120"><a href="#cb3-120" aria-hidden="true" tabindex="-1"></a>  session_id  text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-121"><a href="#cb3-121" aria-hidden="true" tabindex="-1"></a>  run_id      text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-122"><a href="#cb3-122" aria-hidden="true" tabindex="-1"></a>  user_id     text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-123"><a href="#cb3-123" aria-hidden="true" tabindex="-1"></a>  model       text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-124"><a href="#cb3-124" aria-hidden="true" tabindex="-1"></a>  input_tokens  <span class="dt">int</span> <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="dv">0</span>,</span>
+<span id="cb3-125"><a href="#cb3-125" aria-hidden="true" tabindex="-1"></a>  output_tokens <span class="dt">int</span> <span class="kw">not</span> <span class="kw">null</span> <span class="kw">default</span> <span class="dv">0</span>,</span>
+<span id="cb3-126"><a href="#cb3-126" aria-hidden="true" tabindex="-1"></a>  created_at  timestamptz <span class="kw">not</span> <span class="kw">null</span></span>
+<span id="cb3-127"><a href="#cb3-127" aria-hidden="true" tabindex="-1"></a>)</span>
+<span id="cb3-128"><a href="#cb3-128" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-129"><a href="#cb3-129" aria-hidden="true" tabindex="-1"></a>audit_log(</span>
+<span id="cb3-130"><a href="#cb3-130" aria-hidden="true" tabindex="-1"></a>  <span class="kw">id</span>            text <span class="kw">primary</span> <span class="kw">key</span>,</span>
+<span id="cb3-131"><a href="#cb3-131" aria-hidden="true" tabindex="-1"></a>  tenant_id     text,                      <span class="co">-- system 事件可为 NULL</span></span>
+<span id="cb3-132"><a href="#cb3-132" aria-hidden="true" tabindex="-1"></a>  actor_user_id text,</span>
+<span id="cb3-133"><a href="#cb3-133" aria-hidden="true" tabindex="-1"></a>  actor_role    text,</span>
+<span id="cb3-134"><a href="#cb3-134" aria-hidden="true" tabindex="-1"></a>  action        text <span class="kw">not</span> <span class="kw">null</span>,</span>
+<span id="cb3-135"><a href="#cb3-135" aria-hidden="true" tabindex="-1"></a>  target_type   text,</span>
+<span id="cb3-136"><a href="#cb3-136" aria-hidden="true" tabindex="-1"></a>  target_id     text,</span>
+<span id="cb3-137"><a href="#cb3-137" aria-hidden="true" tabindex="-1"></a>  outcome       text <span class="kw">not</span> <span class="kw">null</span>,             <span class="co">-- success | denied</span></span>
+<span id="cb3-138"><a href="#cb3-138" aria-hidden="true" tabindex="-1"></a>  details       jsonb,</span>
+<span id="cb3-139"><a href="#cb3-139" aria-hidden="true" tabindex="-1"></a>  created_at    timestamptz <span class="kw">not</span> <span class="kw">null</span></span>
+<span id="cb3-140"><a href="#cb3-140" aria-hidden="true" tabindex="-1"></a>)</span></code></pre></div>
+<h3 id="42-索引">4.2 索引</h3>
+<div class="sourceCode" id="cb4"><pre class="sourceCode sql"><code class="sourceCode sql"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">create</span> <span class="kw">unique</span> <span class="kw">index</span> <span class="kw">on</span> tenant_members(tenant_id, user_id);</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">create</span> <span class="kw">index</span> <span class="kw">on</span> tenant_members(user_id);</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="kw">create</span> <span class="kw">index</span> <span class="kw">on</span> tenant_members(tenant_id, <span class="kw">role</span>);</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="kw">create</span> <span class="kw">index</span> <span class="kw">on</span> sessions(tenant_id, user_id, created_at <span class="kw">desc</span>);</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="kw">create</span> <span class="kw">index</span> <span class="kw">on</span> sessions(tenant_id, visibility, created_at <span class="kw">desc</span>);</span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="kw">create</span> <span class="kw">index</span> <span class="kw">on</span> runs(session_id, status, lease_until);</span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="kw">create</span> <span class="kw">index</span> <span class="kw">on</span> tenant_agents(tenant_id, visibility);</span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="kw">create</span> <span class="kw">index</span> <span class="kw">on</span> notes(tenant_id, <span class="kw">scope</span>, user_id, workspace);</span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="kw">create</span> <span class="kw">index</span> <span class="kw">on</span> notes(tenant_id, workspace, superseded_by);</span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="kw">create</span> <span class="kw">index</span> <span class="kw">on</span> <span class="kw">usage</span>(tenant_id, created_at);</span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="kw">create</span> <span class="kw">index</span> <span class="kw">on</span> audit_log(tenant_id, created_at <span class="kw">desc</span>);</span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="kw">create</span> <span class="kw">index</span> <span class="kw">on</span> refresh_tokens(user_id, expires_at);</span></code></pre></div>
+<h3 id="43-为什么-runmessagerunlog-不加-tenant_id">4.3 为什么 run/message/runlog 不加 tenant_id</h3>
+<p>读它们本来就从 session/run 进；<code>tenant_id</code> 只在 session 上，回查一次就够。每表加 tenant_id 会造多个事实源，写入路径漏一次就串。<strong>但 store 层的每个入口必须在同一笔事务里回查 session 的 tenant/user/visibility</strong>；不能只在 handler 查。</p>
+<h3 id="44-为什么-notes-必须加-tenant_id--scope">4.4 为什么 notes 必须加 tenant_id + scope</h3>
+<p>notes 按 workspace 分区、与 session 无关；不加 tenant_id 堵不住“Bob 的 run 读 Alice 记忆”。<code>scope</code> 决定它是个人记忆还是团队记忆：</p>
+<ul>
+<li><code>scope=user</code>：<code>user_id</code> 是本人，只有本人读写；</li>
+<li><code>scope=tenant</code>：<code>user_id</code> 写创建者，不是 NULL。全租户可读，只有 owner/admin 能写（模型默认不能写）。</li>
+</ul>
+<p>快照读取 <code>tenant</code> 共享 + 本人 <code>user</code> 私有；上限子和 advisory lock 按 <code>(tenant_id, scope, user_id, workspace)</code> 分开。</p>
+<h3 id="45-迁移与存量">4.5 迁移与存量</h3>
+<ul>
+<li>当前未上线：<strong>dev 库直接 wipe</strong>，不做旧数据兼容；<code>dev/reset</code> 仍是 dev-only 全局归零。</li>
+<li>如果一定要保留 dev 数据：建一个 bootstrap tenant + bootstrap user，把旧 session/notes 归到它；<strong>不要</strong>造一个公开的 <code>default</code> tenant。</li>
+<li><code>sessions.tenant_id/user_id</code>、<code>notes.tenant_id/scope/user_id</code> 都 <code>NOT NULL</code>。<code>notes.user_id</code> 默认空串；<code>scope=tenant</code> 仍写入创建者，不写 NULL。</li>
+<li><code>agentsDir</code> 现在全局；A0-A3 <strong>不落 agents 表</strong>，继续用全局内置 agent（<code>sessions.agent_id=NULL</code> 表示默认）；A6 起每个 tenant seed built-in agent，再开放租户自定义 agent，<code>agents.tenant_id</code> 才非空。</li>
+<li><code>-workspace</code> 现在全局；A4 改成 <code>-workspace-root</code> + per-tenant 根；A4 完成前不开放多用户。</li>
+</ul>
+<h2 id="5-身份登录与租户上下文">5. 身份、登录与租户上下文</h2>
+<h3 id="51-token">5.1 Token</h3>
+<ul>
+<li><strong>Access token</strong>：JWT，15 分钟；claims：<code>sub</code>（user_id）、<code>tid</code>（active tenant_id）、<code>jti</code>、<code>ver</code>、<code>iat</code>、<code>exp</code>、<code>iss</code>、<code>aud</code>。</li>
+<li><strong>Refresh token</strong>：随机 256-bit opaque，30 天；PG 只存 SHA-256；刷新时旋转（旧 token revoked，新 token 同 family）；旧 token 再用 → 撤销 family。</li>
+<li><strong>不在 JWT 里放 role</strong>：角色每次从 <code>tenant_members</code> 解析；降级/移除立即生效。</li>
+<li>签名密钥从环境变量加载；启动缺失 fail fast；多副本共享；校验算法白名单。</li>
+<li>改密/禁用/移除成员：递增 <code>users.token_version</code> 或撤销 refresh + 校验 membership；旧 AT 最多活 15 分钟，必要时加 denylist。</li>
+</ul>
+<h3 id="52-注册登录刷新切租户登出">5.2 注册、登录、刷新、切租户、登出</h3>
+<pre><code>POST /api/auth/signup    {email,password}
+  → 201 {user, activeTenant, memberships, accessToken, refreshToken}
+  → 同一笔事务：users + tenants(personal) + tenant_members(owner)
+
+POST /api/auth/login     {identifier,password}
+  → 200 同上
+  → identifier 带 @ 按邮箱查，否则按用户名查（users.username，可空；非空全局唯一，大小写不敏感）
+
+POST /api/auth/refresh   {refreshToken}
+  → 200 {accessToken, refreshToken}
+  → 旧 refresh 旋转/撤销；active tenant 按最后一次选择/默认 personal 重新解析
+
+POST /api/auth/switch-tenant {tenantId, refreshToken?}
+  → 200 新 token 对，active tenant 切换
+  → 必须是 active membership；旧 refresh 撤销；更新 last active
+
+POST /api/auth/logout
+  → 204；撤销当前 refresh（或该用户全部 refresh，按产品选择）
+
+GET  /api/auth/me
+  → 200 {user, activeTenant, role, memberships}</code></pre>
+<p>登录响应里的 <code>memberships</code>（tenant_id、name、role）是给前端工作区切换器/按钮显隐用的；<strong>后端每个路由仍自己查角色</strong>，不信前端。</p>
+<h3 id="53-中间件与租户上下文">5.3 中间件与租户上下文</h3>
+<pre><code>请求 → Auth middleware
+  → 白名单（signup/login/refresh/健康检查）放行
+  → Bearer AT：验签/exp/ver → user（disabled？）
+  → 取 tid；查 tenant_members(tenant_id=tid,user_id=sub,status=active)
+      ├─ 没有：403 tenant_forbidden（token 有效，但已不属于该 tenant）
+      ├─ 有：Identity{UserID, TenantID, Role, SystemAdmin}
+      └─ tenant 路由且 tid 为空：409 TENANT_REQUIRED
+  → 注入 request.Context</code></pre>
+<ul>
+<li><code>Identity</code> 里的 <code>Role</code> 来自 membership，缺失/非法时默认 <code>viewer</code>（fail-closed）。</li>
+<li><code>SystemAdmin</code> 来自 <code>users.is_system_admin</code>，与 tenant role 正交。</li>
+<li><code>Caller</code>（授权身份）与 <code>execution tenant</code>（数据作用域）分开；如果以后做共享资源，切换执行 tenant 不能改 Caller。</li>
+<li>不再使用 <code>X-Tako-Tenant</code>；active tenant 在 token 里，切租户走 <code>/auth/switch-tenant</code>。API key 以后单独绑 tenant。</li>
+</ul>
+<h3 id="54-错误语义">5.4 错误语义</h3>
+<p><code>/api/auth</code> 的成功和失败用同一套信封，字段顺序 <code>code</code> → <code>message</code> → <code>data</code>：</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;code&quot;</span><span class="fu">:</span><span class="dv">0</span><span class="fu">,</span><span class="dt">&quot;message&quot;</span><span class="fu">:</span><span class="st">&quot;&quot;</span><span class="fu">,</span><span class="dt">&quot;data&quot;</span><span class="fu">:{</span><span class="dt">&quot;accessToken&quot;</span><span class="fu">:</span><span class="st">&quot;…&quot;</span><span class="fu">,</span><span class="dt">&quot;tokenType&quot;</span><span class="fu">:</span><span class="st">&quot;Bearer&quot;</span><span class="fu">,</span><span class="dt">&quot;expiresIn&quot;</span><span class="fu">:</span><span class="dv">900</span><span class="fu">}}</span></span></code></pre></div>
+<div class="sourceCode" id="cb8"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;code&quot;</span><span class="fu">:</span><span class="dv">111101</span><span class="fu">,</span><span class="dt">&quot;message&quot;</span><span class="fu">:</span><span class="st">&quot;账号或密码不正确&quot;</span><span class="fu">,</span><span class="dt">&quot;data&quot;</span><span class="fu">:</span><span class="kw">null</span><span class="fu">}</span></span></code></pre></div>
+<p>前端拦截器只认这一套。<code>code</code> 是业务码，数字，<code>0</code> 表示成功。<code>message</code> 是弹窗文案，成功时为空字符串，前端只在 <code>code</code> 不是 <code>0</code> 时弹出。<code>data</code> 是具体内容：成功时放原来的业务体，失败且没有额外细节时为 <code>null</code>。你记得的 <code>body</code> 就是这个位置，现在常见的字段名是 <code>data</code>。</p>
+<p>HTTP 状态照旧返回 400/401/403/404/409/429/500，不把所有失败都收成 HTTP 200。状态告诉网关这一类请求怎么样，业务码告诉页面具体哪一种。</p>
+<p>业务码 6 位。前两位是模块：<code>11</code> 身份，<code>12</code> 会话与运行，<code>13</code> 配额。身份模块里 <code>1110xx</code> 是参数，<code>1111xx</code> 是登录与 token，<code>1112xx</code> 是权限，<code>1114xx</code> 是冲突，<code>1119xx</code> 是这一模块里的内部失败。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>情况</th>
+<th>HTTP</th>
+<th>code</th>
+<th>message</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>成功</td>
+<td>200/201</td>
+<td><code>0</code></td>
+<td>空。204 没有 body</td>
+</tr>
+<tr>
+<td>请求体不是合法 JSON</td>
+<td>400</td>
+<td><code>111001</code></td>
+<td>请求格式不对</td>
+</tr>
+<tr>
+<td>邮箱或密码不符合要求</td>
+<td>400</td>
+<td><code>111002</code></td>
+<td>邮箱或密码不符合要求</td>
+</tr>
+<tr>
+<td>工作区名称是空的</td>
+<td>400</td>
+<td><code>111003</code></td>
+<td>请填写工作区名称</td>
+</tr>
+<tr>
+<td>登录失败（含账号停用，不透露哪一个错）</td>
+<td>401</td>
+<td><code>111101</code></td>
+<td>账号或密码不正确</td>
+</tr>
+<tr>
+<td>没带 token</td>
+<td>401</td>
+<td><code>111102</code></td>
+<td>请先登录</td>
+</tr>
+<tr>
+<td>token 签名错或被改过</td>
+<td>401</td>
+<td><code>111103</code></td>
+<td>登录已失效，请重新登录</td>
+</tr>
+<tr>
+<td>access token 过期</td>
+<td>401</td>
+<td><code>111104</code></td>
+<td>登录已过期，请重新登录</td>
+</tr>
+<tr>
+<td>refresh 不存在、过期或已撤销</td>
+<td>401</td>
+<td><code>111105</code></td>
+<td>登录已失效，请重新登录</td>
+</tr>
+<tr>
+<td>不是该工作区的有效成员</td>
+<td>403</td>
+<td><code>111201</code></td>
+<td>你不是这个工作区的成员</td>
+</tr>
+<tr>
+<td>角色不够</td>
+<td>403</td>
+<td><code>111203</code></td>
+<td>没有权限做这件事</td>
+</tr>
+<tr>
+<td>看得到会话但不是本人，尝试写或停止</td>
+<td>403</td>
+<td><code>111204</code></td>
+<td>只有本人能修改</td>
+</tr>
+<tr>
+<td>邮箱已注册</td>
+<td>409</td>
+<td><code>111401</code></td>
+<td>这个邮箱已经注册</td>
+</tr>
+<tr>
+<td>邀请无效/过期/已撤销</td>
+<td>404</td>
+<td><code>111405</code></td>
+<td>邀请无效或已过期</td>
+</tr>
+<tr>
+<td>已经是该工作区成员</td>
+<td>409</td>
+<td><code>111406</code></td>
+<td>已经是这个工作区的成员</td>
+</tr>
+<tr>
+<td>邀请不能授予 owner</td>
+<td>400</td>
+<td><code>111407</code></td>
+<td>邀请不能授予所有者</td>
+</tr>
+<tr>
+<td>模型未配置，或 ref 解析失败</td>
+<td>409</td>
+<td><code>111408</code></td>
+<td>这个工作区的模型还不可用</td>
+</tr>
+<tr>
+<td>工具名不在池里，或租户子代理的 allow 超出根助手</td>
+<td>400</td>
+<td><code>111409</code></td>
+<td>工具策略里有不认识的工具；子代理越权时是「子代理不能使用根助手没有的工具」</td>
+</tr>
+<tr>
+<td>MCP 密钥没配，或环境里直接放了密文</td>
+<td>400</td>
+<td><code>111410</code></td>
+<td>有一项 MCP 密钥还没配；密文直放时是「MCP 环境不能直接放密文」</td>
+</tr>
+<tr>
+<td>自定义 MCP 连不上</td>
+<td>503</td>
+<td><code>111411</code></td>
+<td>自定义 MCP 连不上</td>
+</tr>
+<tr>
+<td>同名助手已经有租户配置</td>
+<td>409</td>
+<td><code>111412</code></td>
+<td>这个名字已经有一份配置</td>
+</tr>
+<tr>
+<td>需要工作区但 token 里没有</td>
+<td>409</td>
+<td><code>111402</code></td>
+<td>请先选择工作区</td>
+</tr>
+<tr>
+<td>会变成最后一个 owner</td>
+<td>409</td>
+<td><code>111403</code></td>
+<td>至少要留一个所有者</td>
+</tr>
+<tr>
+<td>会变成最后一个平台管理员</td>
+<td>409</td>
+<td><code>111404</code></td>
+<td>至少要留一个平台管理员</td>
+</tr>
+<tr>
+<td>会话不可见</td>
+<td>404</td>
+<td><code>112001</code></td>
+<td>找不到这场会话</td>
+</tr>
+<tr>
+<td>run 不可见</td>
+<td>404</td>
+<td><code>112002</code></td>
+<td>找不到这次运行</td>
+</tr>
+<tr>
+<td>agent 不可见</td>
+<td>404</td>
+<td><code>112003</code></td>
+<td>找不到这个 agent</td>
+</tr>
+<tr>
+<td>配额超限</td>
+<td>429</td>
+<td><code>113001</code></td>
+<td>这个工作区的额度用完了</td>
+</tr>
+<tr>
+<td>登录或刷新太频繁</td>
+<td>429</td>
+<td><code>113002</code></td>
+<td>操作太频繁，请稍后再试</td>
+</tr>
+<tr>
+<td>身份模块内部失败</td>
+<td>500</td>
+<td><code>111901</code></td>
+<td>服务暂时不可用，请再试一次</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>2026-10-22 起全部换信封（doc/40 已落地）</strong>：上面这张表起初只覆盖 auth 与租户管理那批新接口； runs／sessions／mcp／media／memory 这五组旧接口的成功体与原有 404／409／413 当时仍是旧体 （如 <code>{"error":"session_not_found"}</code>）。<strong>A7 那一档已把它换完</strong>：现在<strong>所有 JSON 接口一律 <code>{code,message,data}</code></strong>，业务体进 <code>data</code>，失败是数字业务码 + 弹窗文案。 本表是<strong>码表的真源</strong>（新码也在 doc/40 §4 登记），端点逐条对照见 <a href="40-响应信封统一.html">doc/40</a>。 两样不进信封：<code>GET /api/media</code> 的成功体是图片字节、SSE 帧面（doc/31）。</p>
+<h2 id="6-角色与权限">6. 角色与权限</h2>
+<h3 id="61-平台管理员">6.1 平台管理员</h3>
+<p><code>users.is_system_admin</code>：</p>
+<ul>
+<li>管全局模型/provider、系统设置、所有租户（列表/暂停/配额）、平台审计、runtime 队列；</li>
+<li><code>/api/system/admin/*</code> 全部 <code>RequireSystemAdmin</code>；这些路由是 <strong>tenant-optional</strong>：只校验 <code>is_system_admin</code>，不要求 active tenant，平台管理员可以是无 tenant 的账号；</li>
+<li>不能自动读租户会话内容；需要 support access 时单独走审计；</li>
+<li>最后一个 system admin 不能撤销；</li>
+<li>与 tenant role 无关：平台管理员在某个 tenant 里可能只是 viewer。</li>
+</ul>
+<h3 id="62-租户角色">6.2 租户角色</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>角色</th>
+<th>能做什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>owner</strong></td>
+<td>租户生命周期、成员、所有权转移、配额/账单、租户 API key、删除租户</td>
+</tr>
+<tr>
+<td><strong>admin</strong></td>
+<td>模型/provider、MCP、沙箱、工具、agent 配置、成员日常管理；不能删租户/改 owner</td>
+</tr>
+<tr>
+<td><strong>member</strong></td>
+<td>建/跑自己的 session，建自己的 agent，上传文件；用团队共享 agent；只看自己的 session</td>
+</tr>
+<tr>
+<td><strong>viewer</strong></td>
+<td>只读团队共享的 agent/资源；不能跑、不能建</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>tenant_members.role</code> 是唯一角色源；一个 user 可以在 A 是 owner、在 B 是 member。</p>
+<h3 id="63-资源可见性">6.3 资源可见性</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>资源</th>
+<th>读</th>
+<th>写/管理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>session private</strong></td>
+<td>owner</td>
+<td>owner</td>
+</tr>
+<tr>
+<td><strong>session tenant-visible</strong></td>
+<td>同 tenant 所有 active member</td>
+<td>owner（多人协作以后再加 <code>session_members</code>）</td>
+</tr>
+<tr>
+<td><strong>session metadata（列表/用量）</strong></td>
+<td>owner；tenant admin 可看元数据</td>
+<td>不改内容</td>
+</tr>
+<tr>
+<td><strong>agent private</strong></td>
+<td>creator</td>
+<td>creator</td>
+</tr>
+<tr>
+<td><strong>agent tenant-visible</strong></td>
+<td>同 tenant member</td>
+<td>creator/admin</td>
+</tr>
+<tr>
+<td><strong>agent builtin</strong></td>
+<td>同 tenant member</td>
+<td>tenant admin</td>
+</tr>
+<tr>
+<td><strong>notes user</strong></td>
+<td>本人</td>
+<td>本人</td>
+</tr>
+<tr>
+<td><strong>notes tenant</strong></td>
+<td>同 tenant member</td>
+<td>owner/admin（模型默认不能写）</td>
+</tr>
+<tr>
+<td><strong>workspace/files</strong></td>
+<td>tenant 内按 session/agent 规则</td>
+<td>tenant 内按角色</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>管理员默认不看会话内容。</strong> 需要支持排查时，走 <code>support_access</code>：填原因、限时、审计、通知用户；不要用 <code>role &gt;= admin</code> 直接放开。</p>
+<h3 id="64-守卫原语与判定顺序">6.4 守卫原语与判定顺序</h3>
+<ul>
+<li><code>RequireSystemAdmin</code>：平台管理员；始终生效。</li>
+<li><code>RequireTenantRole(min)</code>：owner/admin/member/viewer 阶梯；tenant role 来自 membership。</li>
+<li><code>RequireOwnershipOrRole(min, lookup)</code>：资源 creator 或 min 角色；用于 agent 等有 creator 的资源。</li>
+<li><code>RequireSessionAccess(action, lookup)</code>：owner / tenant-visible / admin metadata；session 专用。</li>
+<li><code>RequireTenantMatch</code>：URL 里的 tenant id 必须等于 active tenant（如果 URL 有 tenant）。</li>
+<li><code>APIKeyGate</code>：以后；机器身份单独 default-deny。</li>
+</ul>
+<p>Ownership 判定顺序（照 WeKnora 的教训）：</p>
+<ol type="1">
+<li>role &gt;= min → 放行，<strong>不查库</strong>；</li>
+<li>不够 → 查资源归属；</li>
+<li>资源不存在/不可见 → 交给 handler 出 404；</li>
+<li>查库故障 → 503，不伪装 403；</li>
+<li>creator 匹配 → 放行；</li>
+<li>其他 → 403。</li>
+</ol>
+<h3 id="65-最后一个-owner--最后一个-system-admin">6.5 最后一个 owner / 最后一个 system admin</h3>
+<ul>
+<li>降级/移除 owner 必须在事务里锁住该 tenant 的其他 active owner；若会是最后一个 → <code>409 last_owner</code>；不能靠“先 count 再 update”。</li>
+<li>撤销 system admin 同理：最后一个 → <code>409 last_system_admin</code>。</li>
+<li>移除成员时撤销该成员在该 tenant 的 refresh/token（不是他在其他 tenant 的登录）。</li>
+<li>所有成员/角色变更写 <code>audit_log</code>。</li>
+</ul>
+<h3 id="66-后台管理端点草案">6.6 后台管理端点（草案）</h3>
+<pre><code>/api/system/admin/tenants                 GET/POST   system admin
+/api/system/admin/users                   GET/POST   system admin
+/api/system/admin/audit-log               GET        system admin
+/api/system/admin/settings                GET/PUT    system admin
+
+/api/tenants/:id/members                  GET        viewer+
+/api/tenants/:id/members                  POST/PUT/DELETE  owner
+/api/tenants/:id/invitations              GET        viewer+；POST/DELETE owner
+/api/tenants/:id/audit-log                GET        admin+
+/api/tenants/:id/usage                    GET        admin+
+/api/tenants/:id/agents                   GET        member+；写 creator/admin
+/api/tenants/:id/models                   GET        admin+；写 admin
+/api/tenants/:id/mcp                      GET        admin+；写 admin
+/api/tenants/:id/api-keys                 GET/POST   owner（以后）</code></pre>
+<p>前端只根据 <code>memberships</code>/role 隐藏按钮；后端每个路由仍然校验。</p>
+<h2 id="7-会话与运行">7. 会话与运行</h2>
+<h3 id="71-会话-api-的访问规则">7.1 会话 API 的访问规则</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>端点</th>
+<th>规则</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST /api/runs</code> 不带 sessionId</td>
+<td>在 active tenant 建 private session，owner=当前 user</td>
+</tr>
+<tr>
+<td><code>GET /api/sessions</code></td>
+<td>只列自己的；tenant admin 的“元数据列表”另开，不含正文</td>
+</tr>
+<tr>
+<td><code>GET /api/sessions/:id</code></td>
+<td>owner；tenant-visible 可读；其他 404</td>
+</tr>
+<tr>
+<td><code>GET /api/sessions/:id/log</code></td>
+<td>同上</td>
+</tr>
+<tr>
+<td><code>GET /api/runs/:id/frames</code></td>
+<td>run→session→同上；无权 200 <code>gone</code>，不泄露</td>
+</tr>
+<tr>
+<td><code>POST /api/runs</code> 带 sessionId</td>
+<td>owner 才能投；tenant-visible 非 owner 403；跨 tenant 404</td>
+</tr>
+<tr>
+<td><code>POST /api/runs/:id/stop</code></td>
+<td>owner；tenant-visible 非 owner 403；跨 tenant 404</td>
+</tr>
+<tr>
+<td><code>PATCH /api/sessions/:id</code> visibility</td>
+<td>owner；改成 tenant 需 owner/admin 确认（产品）</td>
+</tr>
+<tr>
+<td><code>DELETE /api/sessions/:id</code></td>
+<td>owner/admin；软删；保留审计</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>现有端点不止四个。</strong> A1 不是“只守 runs/sessions”，而是给下面这张表的每一行定归属；没有归属模型的端点先保守收紧，不能默认放行：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>端点</th>
+<th>数据</th>
+<th>A1 先怎么守</th>
+<th>什么时候开</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/api/runs</code> POST/stop/resume、<code>/api/runs/:id</code>、<code>frames</code>、<code>stream</code></td>
+<td>session/run</td>
+<td>按 session owner/visibility；跨 tenant 404；无权 frames/stream 200 gone</td>
+<td>A1</td>
+</tr>
+<tr>
+<td><code>/api/sessions/:id</code>、<code>/log</code></td>
+<td>session</td>
+<td>按 session owner/visibility</td>
+<td>A1</td>
+</tr>
+<tr>
+<td><code>/api/mcp/servers</code></td>
+<td>全局 <code>mcp.json</code></td>
+<td>先只允许 <code>system_admin</code>；普通用户 403</td>
+<td>A6 改成租户级 MCP 配置后再开 admin/member</td>
+</tr>
+<tr>
+<td><code>/api/media</code></td>
+<td>全局 media 根</td>
+<td>先只允许 <code>system_admin</code>（或 dev-only）；没有 owner 元数据前不对普通用户开</td>
+<td>A4 按 tenant/session 路径落盘后再开</td>
+</tr>
+<tr>
+<td><code>/api/memory/items</code>、<code>jobs</code>、<code>dialogue</code>、<code>recall</code></td>
+<td>全局 memory</td>
+<td>先只允许 <code>system_admin</code>；recall 也不对普通用户开</td>
+<td>A3 按 tenant/user scope 后再开</td>
+</tr>
+<tr>
+<td><code>/api/dev/*</code></td>
+<td>dev 全局</td>
+<td>保持 dev-only；<code>-dev=false</code> 不注册；只绑 loopback</td>
+<td>—</td>
+</tr>
+</tbody>
+</table></div>
+<p>“先只允许 system_admin”不是最终产品语义，是<strong>没有归属模型时的保守闸</strong>；A3/A4/A6 把它们各自做正。<strong>不允许</strong>“先加 auth 中间件、这些端点先放所有人”——那等于把全局 media/memory/mcp 暴露给任意登录用户。</p>
+<h3 id="72-store-层守卫">7.2 store 层守卫</h3>
+<p><code>AcquireRun</code> 改成带身份：</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> Identity <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>    UserID      <span class="dt">string</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>    TenantID    <span class="dt">string</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>    Role        TenantRole</span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>    SystemAdmin <span class="dt">bool</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb10-7"><a href="#cb10-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb10-8"><a href="#cb10-8" aria-hidden="true" tabindex="-1"></a><span class="kw">func</span> <span class="op">(</span>s <span class="op">*</span>Store<span class="op">)</span> AcquireRun<span class="op">(</span>ctx context<span class="op">.</span>Context<span class="op">,</span> id Identity<span class="op">,</span> sessionID SessionID<span class="op">,</span> runID RunID<span class="op">,</span> user Row<span class="op">)</span> <span class="op">(</span><span class="dt">bool</span><span class="op">,</span> <span class="dt">error</span><span class="op">)</span></span></code></pre></div>
+<p>事务内：</p>
+<ol type="1">
+<li><code>sessionID == ""</code>：<code>INSERT sessions(tenant_id,user_id,visibility='private')</code> + <code>INSERT runs</code>。</li>
+<li><code>sessionID != ""</code>：<code>SELECT tenant_id,user_id,visibility FROM sessions WHERE id=? FOR UPDATE</code>；
+<ul>
+<li>无行 / tenant 不符 → not found（handler 404）；</li>
+<li><code>visibility=private</code> 且 user 不符 → not found；</li>
+<li><code>visibility=tenant</code> 且 user 不符 → forbidden（handler 403，因为可见已不泄露）；</li>
+<li>通过 → <code>INSERT runs</code>。</li>
+</ul></li>
+<li>抢闸失败 → 409 <code>session_busy</code>；整笔回滚。</li>
+</ol>
+<p>其他读/写入口同理：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>方法</th>
+<th>现在</th>
+<th>改成</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Exists</code></td>
+<td>id only</td>
+<td>保留内部存在性；新增 <code>SessionVisibleTo(id, identity)</code></td>
+</tr>
+<tr>
+<td><code>SessionStatus</code></td>
+<td>id only</td>
+<td>查 session 的 tenant/user/visibility；无权 404</td>
+</tr>
+<tr>
+<td><code>ReadLog</code></td>
+<td><code>Exists(id)</code></td>
+<td><code>SessionVisibleTo</code>；无权 404</td>
+</tr>
+<tr>
+<td><code>ReadFrames</code></td>
+<td>runId only</td>
+<td>先 <code>RunSession(runID)</code>，再 <code>SessionVisibleTo</code>；无权 200 gone</td>
+</tr>
+<tr>
+<td><code>StopRun</code></td>
+<td>runId only</td>
+<td>先 <code>RunSession</code>，owner 校验；无权 404/403</td>
+</tr>
+<tr>
+<td><code>writeNote</code></td>
+<td>workspace</td>
+<td><code>identity + scope</code>；user scope owner，tenant scope admin</td>
+</tr>
+<tr>
+<td><code>listLiveNotes</code></td>
+<td>workspace</td>
+<td><code>tenant + scope + user</code></td>
+</tr>
+<tr>
+<td><code>Reset</code></td>
+<td>全局</td>
+<td>保持 dev-only 全局</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>预检顺序</strong>：<code>postRuns</code> 的 tenant/owner 检查必须在 <code>AdmitText</code> 之前；<code>stopRun</code> 的 owner 检查必须在 <code>StopRun</code> 之前。否则 bob 用超长 text 打 alice 的 session 会拿到 413、或者 404 是在 run 已被停掉之后才返回——响应绿了，副作用已经发生。验收必须验“404 之后 alice 的 run 仍在跑 / 没有新 run 行”。</p>
+<h3 id="73-run-ctx-与-worker">7.3 run ctx 与 worker</h3>
+<ul>
+<li><code>postRuns</code> 把 <code>Identity</code> 放进 <code>worker.Run</code> 的 ctx（<strong>不是</strong> <code>c.Request.Context()</code>，run 生命周期不属于请求）。</li>
+<li>worker 从 ctx 取 <code>tenant_id/user_id</code>，传给 notes 快照、memory 工具、workspace 解析、usage 记录。</li>
+<li><code>runCancels</code> 仍是进程内注册表；跨副本 stop 靠 lease watchdog 收敛（现有机制，不新增跨副本语义）。</li>
+<li><code>one_live_run_per_session</code> 闸不变：session_id 全局唯一，tenancy 不改变它。</li>
+</ul>
+<h3 id="74-共享会话以后">7.4 共享会话（以后）</h3>
+<p><code>visibility=tenant</code> 第一版只读共享：同 tenant member 可读 log/frames；写/stop 仍归 owner。多人协作（多写、评论、协同停止）以后用 <code>session_members</code> 表，不用角色硬套。</p>
+<h2 id="8-记忆notes">8. 记忆（notes）</h2>
+<h3 id="81-scope-语义">8.1 scope 语义</h3>
+<ul>
+<li><code>scope=user</code>：个人记忆；<code>user_id</code> 是本人；只有本人读写；快照里只出现本人的。</li>
+<li><code>scope=tenant</code>：团队记忆；<code>user_id</code> 写创建者，列不是 NULL。全 tenant 可读；只有 owner/admin 能写；模型默认不能写（防止一个 member 的 agent 污染团队记忆）。</li>
+<li>快照每一场 run 起手读：<code>tenant</code> 共享 + 本人 <code>user</code> 私有；渲染时分两段标清楚（“团队记忆”/“个人记忆”），避免模型把两者混为一谈。</li>
+</ul>
+<h3 id="82-写入定位删除的-sql-点位">8.2 写入、定位、删除的 SQL 点位</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>点位</th>
+<th>现状</th>
+<th>要改</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>writeNote</code> 起手读</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/notes.go#L206">notes.go:206</a></td>
+<td>带 tenant/scope/user</td>
+</tr>
+<tr>
+<td><code>locateLiveNote</code></td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/notes.go#L336">notes.go:336</a></td>
+<td>带 tenant/scope/user；否则 Bob 可按 content 删 Alice 的笔记</td>
+</tr>
+<tr>
+<td><code>DELETE</code> / <code>UPDATE superseded_by</code></td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/notes.go#L238">notes.go:238</a>、<a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/notes.go#L267">notes.go:267</a></td>
+<td><code>WHERE id=? AND tenant_id=?</code>（scope 已由 locate 限定）</td>
+</tr>
+<tr>
+<td>两条 INSERT</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/notes.go#L261">notes.go:261</a>、<a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/notes.go#L280">notes.go:280</a></td>
+<td>带 tenant/user/scope</td>
+</tr>
+<tr>
+<td>写后重读</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/notes.go#L288">notes.go:288</a></td>
+<td>带 tenant/scope/user</td>
+</tr>
+<tr>
+<td>主快照</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/notes.go#L614">notes.go:614</a></td>
+<td>读 tenant + user</td>
+</tr>
+<tr>
+<td>子代理快照</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/agents.go#L397">agents.go:397</a></td>
+<td>同上</td>
+</tr>
+<tr>
+<td><code>notes_live</code> 索引</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/notes.go#L108">notes.go:108</a></td>
+<td><code>(tenant_id, scope, user_id, workspace)</code></td>
+</tr>
+<tr>
+<td>上限子 / advisory lock</td>
+<td><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/notes.go#L202">notes.go:202</a></td>
+<td>上限按 scope；锁 key 至少含 tenant+scope</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="83-写入入口">8.3 写入入口</h3>
+<ul>
+<li><code>memory</code> 工具（模型调用）在 A3 只写 <code>scope=user</code>；它从 ctx 的 <code>Identity</code> 取 tenant/user。</li>
+<li>团队记忆 <code>scope=tenant</code> 只通过 owner/admin 的后台 API/UI 写入；以后若要让 agent 写团队记忆，单独加 <code>scope</code> 参数 + 角色校验 + 审计。</li>
+<li>所有写入仍走 <code>writeNote</code> 一个函数，经过同一套上限/原话/隐形字符检查。</li>
+</ul>
+<h3 id="84-验收必须能-curl">8.4 验收（必须能 curl）</h3>
+<p>A3 需要 dev-only notes 探针端点（登记转正点；A6 后台 notes 管理上线后删）：</p>
+<div class="sourceCode" id="cb11"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="co"># alice 写个人记忆</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-X</span> POST .../api/dev/notes <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$ALICE_AT</span><span class="st">&quot;</span> <span class="dt">\</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-d</span> <span class="st">&#39;{&quot;scope&quot;:&quot;user&quot;,&quot;workspace&quot;:&quot;w1&quot;,&quot;content&quot;:&quot;N&quot;,&quot;quote&quot;:&quot;...&quot;}&#39;</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a><span class="co"># alice 读得到；bob 读不到</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="co"># bob 用 N 的 content 调 memory remove → 失败；alice 的 N 仍在</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="co"># bob 的 run 快照日志没有 N；alice 的快照有 N</span></span></code></pre></div>
+<p>只验“alice 的行 tenant_id=alice”不够，必须验“bob 读不到 + bob 删不掉”。</p>
+<h2 id="9-工作区文件与沙箱">9. 工作区、文件与沙箱</h2>
+<h3 id="91-路径">9.1 路径</h3>
+<pre><code>&lt;workspace-root&gt;/
+  tenants/&lt;tenant_id&gt;/
+    shared/                  # 团队共享文件
+    sessions/&lt;session_id&gt;/   # 会话文件
+    agents/&lt;agent_id&gt;/       # agent 文件
+    .tako/search/            # 检索落盘</code></pre>
+<ul>
+<li>个人 tenant 也是这个结构，只是只有一个成员。</li>
+<li>这一版真正建出来的目录是 <code>&lt;workspace&gt;/tenants/&lt;tenant_id&gt;/sessions/&lt;session_id&gt;/</code>。图里的 <code>shared/</code> 和 <code>agents/&lt;agent_id&gt;/</code> 还没有单独创建。</li>
+<li>文件工具和 bash 每次从 ctx 里的 <code>WorkspaceRef</code> 取会话根。没有身份的单测才回落到启动时捕获的根。</li>
+<li><code>bash</code> 的 cwd 是这个会话根；环境白名单保留。cwd 不是安全边界，读宿主文件靠第 9.4 节的沙箱拒绝。</li>
+</ul>
+<h3 id="92-工具改造">9.2 工具改造</h3>
+<p><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/worker.go#L163">worker.go:163</a> 现在把 <code>workspace</code> 传进 <code>NewWorker</code>，<a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/worker.go#L179">worker.go:179</a> 的文件工具和 <a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/worker.go#L191">worker.go:191</a> 的 bash 都捕获它。改成：</p>
+<ul>
+<li>构造工具时不再吃固定路径；工具执行时从 ctx 取 <code>WorkspaceRef</code>；</li>
+<li><code>worker.Run</code> 在 ctx 里放 <code>Identity</code> + <code>WorkspaceRef</code>；</li>
+<li><code>memory</code>/<code>search_history</code> 的落盘也用同一个解析器；</li>
+<li>所有路径 <code>resolveInWorkspace</code> 后再检查是否仍在 tenant 根内；防 <code>..</code>/symlink。</li>
+</ul>
+<h3 id="93-多副本存储">9.3 多副本存储</h3>
+<p>本地磁盘的 workspace 在多副本下不共享。A4 必须选：</p>
+<ul>
+<li>共享 POSIX 卷（NFS/EFS）挂到同一路径；或</li>
+<li>对象存储 + 文件服务适配层；或</li>
+<li>按 tenant/session 粘到某个副本（不推荐，复杂度高）。</li>
+</ul>
+<p>第一版建议共享卷；对象存储以后再说。否则多副本部署后，A 副本写的文件 B 副本读不到。</p>
+<h3 id="94-bashsandbox">9.4 bash/sandbox</h3>
+<p>路径隔离挡不住 <code>cat /etc/passwd</code>、绝对路径、网络访问。多租户 agent 运行时默认按不可信代码设计：</p>
+<ul>
+<li>A4 做的是 per-tenant 根和路径检查，包括 <code>..</code> 和符号链接。这不是安全边界。</li>
+<li>A5 在 macOS 上用 <code>sandbox-exec</code>：默认拒绝，会话目录可读写，显式拒绝 <code>/etc/passwd</code> 和 <code>/private/etc/passwd</code>。binary 不在，或者 <code>sandbox_apply</code> 被拒绝，都拒绝执行，不把 cwd 当成隔离，也不把失败写成普通退出码。</li>
+<li><strong>2026-11-03 补 Linux 后端</strong>：Debian 12 用 <code>bwrap</code>（bubblewrap）。逐个卸 user/pid/ipc/uts/cgroup，<strong>不卸 net</strong>（D37 的出站网络要通）；<code>/usr</code> 只读、<code>/etc</code> 只白名单文件、只 bind 会话根可写，绝不 <code>--ro-bind / /</code>。启动时真跑探针，失败仍拒绝执行（不退回裸 bash）；启动日志写 <code>bash sandbox: seatbelt|bwrap|none（原因）</code>。租户 MCP 走同一个后端。</li>
+<li>外部团队仍然不要只凭这条沙箱就放开。它挡的是本机绝对路径和默认网络，不是一套完整的多租户运行时隔离。</li>
+</ul>
+<h3 id="95-验收">9.5 验收</h3>
+<p>A4 加 dev-only workspace 探针（读文件/列目录），否则无法用 curl 证明隔离：</p>
+<div class="sourceCode" id="cb13"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="co"># alice 写 /tenants/t_alice/shared/a.txt</span></span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="co"># bob（t_bob）读同路径 → 404</span></span>
+<span id="cb13-3"><a href="#cb13-3" aria-hidden="true" tabindex="-1"></a><span class="co"># alice 读 → 200</span></span>
+<span id="cb13-4"><a href="#cb13-4" aria-hidden="true" tabindex="-1"></a><span class="co"># bob 的 bash `cat /tenants/t_alice/shared/a.txt` → 拒绝/不可见</span></span></code></pre></div>
+<h2 id="10-并发与配额">10. 并发与配额</h2>
+<h3 id="101-每租户限额">10.1 每租户限额</h3>
+<p><code>tenants</code> 或 <code>tenant_quotas</code> 加：</p>
+<ul>
+<li><code>max_concurrent_runs</code>（默认 4/8）</li>
+<li><code>max_subagents</code>（默认 2/4）</li>
+<li><code>daily_tokens</code>（默认按 plan）</li>
+<li><code>max_storage_bytes</code></li>
+<li><code>max_sessions</code></li>
+</ul>
+<p>执行点：</p>
+<ul>
+<li><code>POST /api/runs</code>：查该 tenant 正在跑的 run 数；超 → 429 <code>tenant_quota_exceeded</code>。</li>
+<li>子代理委派：按 tenant 计数；超 → 工具结果返回“配额不足”，父 run 不崩。</li>
+<li>模型调用后：<code>usage</code> 落库 + Redis 日计数；超预算 → 后续调用拒绝。</li>
+<li>文件写入：按 tenant 存储配额。</li>
+<li>管理后台：owner/admin 看用量；platform admin 改配额。</li>
+</ul>
+<h3 id="102-当前进程级信号量的问题">10.2 当前进程级信号量的问题</h3>
+<p><a href="https://github.com/Ykworm/yk-tako/blob/main/yk-tako-eino/internal/runengine/agents.go#L258">agents.go:258</a> 的 <code>sem</code> 是进程内 channel，容量 8，所有租户共享：</p>
+<ul>
+<li>一个租户可以占满 8 个槽，别的租户饿死；</li>
+<li>多副本下每个副本各自 8 个，配额不可控；</li>
+<li>进程重启丢状态。</li>
+</ul>
+<p>改成 per-tenant 配额 + 全局公平队列；计数放 Redis/DB，不用进程内 channel。</p>
+<h3 id="103-eino-1177">10.3 eino #1177</h3>
+<p>所有 run 共用 <code>w.agent</code> 一个 eino 实例；doc/17:217 的共享实例并发 race 在多租户下是跨租户风险（互相取消/串状态）。A5 必须做决策：</p>
+<ol type="1">
+<li>修上游 #1177；</li>
+<li>每 run 一个 agent 实例（安全但贵）；</li>
+<li>每 tenant 一个实例 + 修 race（仍解决不了同 tenant 并发）；</li>
+<li>暂时串行（影响吞吐，不能作为长期）。</li>
+</ol>
+<blockquote>
+<p><strong>跟进（2026-10-23）：委派路径已壳化</strong>（doc/25 §7 翻案，agents.go <code>subagentShell</code>）——子代理委派不再共享实例，本节 race 故事对委派路径失效。仍共用的是主 run 实例（<code>w.agent</code>，跨租户共享）：当前接线 nil 写 nil（doc/25 §6），启用 <code>adk.WithCancel</code> 前必须按上面四条决策。</p>
+</blockquote>
+<p>在决策前，验收不能只跑“两租户串行”；必须加两租户并发用例。</p>
+<h2 id="11-后台管理">11. 后台管理</h2>
+<h3 id="111-平台后台">11.1 平台后台</h3>
+<ul>
+<li>租户列表/暂停/配额；</li>
+<li>用户列表/创建/禁用/重置密码；</li>
+<li>全局模型/provider、系统设置；</li>
+<li>platform 审计、runtime 队列。</li>
+</ul>
+<h3 id="112-租户后台">11.2 租户后台</h3>
+<ul>
+<li>成员/角色/邀请（owner）；</li>
+<li>审计日志（admin）；</li>
+<li>用量/配额（admin）；</li>
+<li>agent 配置（admin/creator）；</li>
+<li>模型 provider/MCP/沙箱（admin）；</li>
+<li>API key（owner，以后）。</li>
+</ul>
+<h3 id="113-前端">11.3 前端</h3>
+<ul>
+<li>登录响应带 <code>memberships</code> + <code>activeTenant</code> + role；</li>
+<li>工作区切换器；团队设置页；成员管理页；</li>
+<li>只根据角色隐藏按钮；后端每个路由仍校验；</li>
+<li>session 列表只显示自己的；团队共享 session 单独标识。</li>
+</ul>
+<h2 id="12-分阶段与验收">12. 分阶段与验收</h2>
+<blockquote>
+<p>每个 action 的详细四要素在点头后写进 <code>tmp/28-多租户/planning.md</code> + <code>todos.md</code>；这里只定阶段和闸门。 <strong>2026-10-21 收口</strong>：A0–A6 共 30 拍全部落地并 curl 验收过，随 <code>9c21b66</code> 入库。下面各拍的「验收」是该拍当时的 判据，已全部打过。<strong>A7 的信封那一档已于 2026-10-22 落地</strong>（见 <a href="40-响应信封统一.html">doc/40</a>）； A7 剩下的（计费／API key／SSO／组织共享）<strong>2026-10-22 已拍不做</strong>——与运行时关系不大的商业化、合规项，移出路线图（清单见 §15 与头注）。</p>
+</blockquote>
+<h3 id="a0-身份与个人-tenant">A0 身份与个人 tenant</h3>
+<ul>
+<li>建 <code>users/tenants/tenant_members/refresh_tokens</code>；注册自动建 personal tenant + owner membership；登录/刷新/登出/切租户；<code>is_system_admin</code>；auth middleware；错误语义。</li>
+<li>验收：signup/login/me/refresh/switch；401/403/409；旧 refresh 复用失败。</li>
+<li><strong>第一个 action = signup 或 login，curl 可打。</strong></li>
+<li>已拍（2026-10-18）：A0 期间现有业务端点保持裸奔，只在本机 dev 验收，A1 补门；A0-1/A0-2 静态 dev 用户可；A0-3/A0-4/A0-5 90–100 行接受。</li>
+</ul>
+<h3 id="a1-会话归属">A1 会话归属</h3>
+<ul>
+<li><code>sessions.tenant_id/user_id/visibility</code>；建/读/列表/log/frames/stream/stop/post/resume/status 全部按 <code>Identity</code>；store 层守卫；<code>run</code> 经 session。</li>
+<li>所有非 dev 端点先挂 auth；<code>mcp/media/memory</code> 这三类还没有归属模型的端点先收紧到 <code>system_admin</code>（见第 7.1 节的表），A3/A4/A6 再各自开。</li>
+<li>验收：同 tenant 私有 404；跨 tenant 404；owner 200；tenant-visible 可读不可写；bob stop 404 且 alice 的 run 仍在跑；无 token 401。</li>
+<li>闸门：本阶段只做会话归属；文件/配额仍未隔离，按第 2.3 节的上线闸门，A4 前不开放多用户。</li>
+</ul>
+<h3 id="a2-角色与后台">A2 角色与后台</h3>
+<ul>
+<li>owner/admin/member/viewer；成员增删改；邀请（可先不做 UI，做 API）；最后一个 owner；system admin 路由；审计。</li>
+<li>验收：owner 邀请/升降级；member 403；last owner 409；普通用户访问 system admin 403。</li>
+</ul>
+<h3 id="a3-记忆">A3 记忆</h3>
+<ul>
+<li><code>notes.tenant_id/user_id/scope</code>；所有 SQL 点位；快照；上限/锁；memory 工具只写 user scope；dev notes 探针。</li>
+<li><code>/api/memory/items|jobs|dialogue|recall</code> 从“system admin only”改成按 tenant/user scope；recall 只能召回本 tenant/本人的记忆。</li>
+<li>验收：个人记忆不串；团队记忆可读不可被模型写；bob 删不掉 alice 的；bob 的 recall 不返回 alice 的内容。</li>
+</ul>
+<h3 id="a4-工作区与文件">A4 工作区与文件</h3>
+<ul>
+<li><code>-workspace-root</code>；per-tenant 路径；file tools/bash 从 ctx 解析；多副本共享卷；dev workspace 探针。</li>
+<li><code>/api/media</code> 从“system admin only”改成按 tenant/session 路径校验。登录后的入口图落在 <code>&lt;workspace&gt;/tenants/&lt;tid&gt;/sessions/&lt;sid&gt;/.media/</code>。占位 path、<code>GET /api/media</code> 和 <code>read_media_file</code> 共用 <code>sessions/&lt;sid&gt;/.media/&lt;sha&gt;.ext</code>。<code>sessions/&lt;可见&gt;/../&lt;别人&gt;/...</code> 先 Clean，再按清完的会话做访问检查；不带会话的 <code>.media/...</code> 直接 404。</li>
+<li>验收：A 租户文件 B 读不到；<code>..</code>/symlink 拒绝；多副本读同一文件；B 的 <code>/api/media?path=...</code> 读不到 A 的图。</li>
+<li>闸门：A4 完成前不开放多用户。</li>
+</ul>
+<h3 id="a5-并发与配额">A5 并发与配额</h3>
+<ul>
+<li>per-tenant 配额；有 Redis 时子代理只走租户槽 <code>tk:subagents:&lt;tenant&gt;</code>，进程级 sem 只留给没有 Redis 的单测；两租户并发；429；用量落库。存储上限管整棵 <code>&lt;workspace&gt;/tenants/&lt;tid&gt;/</code>，入口图超上限在抢闸前 429，不建 run。</li>
+<li>验收：A 超额 429，B 仍 202；两租户并发无串状态；重启/多副本计数不丢。</li>
+<li>闸门：A5 + 沙箱（如果租户不可信）完成前不开放外部团队。</li>
+</ul>
+<h3 id="a6-团队">A6 团队</h3>
+<ul>
+<li>正式创建 team tenant（<code>POST /api/tenants</code>，替代 <code>POST /api/dev/tenants</code>）；列表/切换/设置/归档。</li>
+<li>邀请：<code>tenant_invitations</code>（email + 链接 token，待接受/撤销/过期）；接受后写 active membership。</li>
+<li>成员/角色：owner/admin/member/viewer；离开、移除、转移 owner；最后一个 owner 保护；移除成员撤销该 tenant 的 refresh。</li>
+<li>团队 agent：<code>tenant_agents</code> 按 tenant 落库，id 前缀 <code>ag_</code>，creator/visibility；团队 notes 用 A3 的 <code>scope=tenant</code>。</li>
+<li>团队运行时配置：model / MCP / 沙箱按 tenant 存进 <code>tenant_settings.config</code> 这一列 JSON；admin 写、member 读。非空 secret 落库前封成 <code>seal1:</code>（AES-GCM，密钥是 <code>TAKO_JWT_SECRET</code> 的 SHA-256）。GET 把非空 secret 显示成「••••」。客户端把这四个点原样 PUT 回去，或整段 <code>secrets</code> 不带，都沿用库里的密文。平台全局配置仍 system admin。读写接口已落地。worker 这一版仍用进程启动时的全局 <code>mcp.json</code>，还没有按 <code>tenant_settings</code> 去装模型和 MCP。不要把「配置已落库」说成「这场 run 已经换了模型」。</li>
+<li>session 仍默认 private；<code>visibility=tenant</code> 只读共享，写/stop 仍归 owner。</li>
+<li>验收：create/invite/accept/switch；团队 agent 可运行、不可被普通 member 改；个人 session 不搬；移除成员后其 token 在该 tenant 失效；最后 owner 409。</li>
+<li>闸门：A4/A5 已完成；团队前端页面独立 loop。</li>
+</ul>
+<h3 id="a7-以后">A7 以后</h3>
+<p>API key、组织/跨租户共享、SSO、账单、审计导出——<strong>这一批 2026-10-22 已拍不做</strong>（与运行时关系不大的商业化、合规项，移出路线图）。</p>
+<p><strong>A7 里已落地的那一笔</strong>：旧 runs/sessions/mcp/media/memory 响应体整体换 <code>{code,message,data}</code> 信封 （2026-10-22，见 <a href="40-响应信封统一.html">doc/40</a>；码表在 §5.4，端点对照在 doc/40 §5）。</p>
+<blockquote>
+<p>团队 agent 的 <code>model_ref</code> / <code>tool_policy</code>、子代理 md、租户 model key、系统/自定义 MCP 的运行时装配， 见 <a href="34-租户运行时装配.html">doc/34</a>。本文不重复那层的装配细节。</p>
+</blockquote>
+<h2 id="13-验收原则">13. 验收原则</h2>
+<ol type="1">
+<li><strong>curl + 期望字节</strong>，不写“页面上看到 X”。</li>
+<li>每个否定用例都要验<strong>无副作用</strong>：bob 的 404 之后，alice 的 run 仍在、runlogOffset 不变；bob 的删除失败后，alice 的笔记仍在。</li>
+<li>401/403/404 按第 5.4 节；跨 tenant/private 一律 404。</li>
+<li>角色：owner/admin/member/viewer 各跑一遍正向 + 反向。</li>
+<li>最后 owner / 最后 system admin：409。</li>
+<li>配额：A 429 时 B 202。</li>
+<li>并发：两租户同时跑，不串 session、不互相取消。</li>
+<li><code>kill -9</code>：run 租约到期后 session 解锁；配额/refresh 不丢。</li>
+<li>多副本：至少手动起两个进程，验证共享 PG/Redis/workspace。</li>
+<li>dev-only 探针（notes/workspace）登记转正点，A6 后删。</li>
+</ol>
+<h2 id="14-迁移与部署">14. 迁移与部署</h2>
+<ul>
+<li><strong>未上线</strong>：dev 库 wipe；不写旧数据迁移；<code>dev/reset</code> 仍是 dev-only。</li>
+<li><strong>生产</strong>：<code>-dev=false</code>；<code>-engine</code> 按部署；<code>-workspace-root</code> 共享卷；JWT/refresh 密钥从环境变量；TLS。</li>
+<li><strong>数据库迁移</strong>：显式 DDL（<code>NOT NULL</code>、索引、唯一约束）；不依赖 AutoMigrate 改已有索引；在有数据的库上验 <code>tenant_id IS NULL</code> 为 0。</li>
+<li><strong>多副本</strong>：PG 存 users/tenants/members/sessions/notes/refresh/usage/audit；Redis 存限流/并发计数/runlive；workspace 共享卷；进程内只留 runCancels（现有）。</li>
+<li><strong>可观测</strong>：日志带 <code>tenant_id/user_id/session_id/run_id</code>；审计表；指标：租户并发、429、token 用量、存储、run 失败率。</li>
+<li><strong>回滚</strong>：A0-A1 可回滚到旧库（wipe）；A4 文件路径变更后回滚要保留旧路径；A6 团队上线前先备份。</li>
+</ul>
+<h2 id="15-待-yk-拍的决定">15. 待 Yk 拍的决定</h2>
+<p><strong>已拍（2026-10-18）</strong>：支持团队功能；A6 做团队后端 API，团队前端页面独立 loop。 <strong>2026-10-21 收口核对</strong>：下表「推荐」列的取值已在 A0–A6 里按推荐落地——access TTL 15min 且 refresh 旋转、 <code>kind=personal</code> / <code>kind=team</code> 两者都有（个人先行）、session 默认 private 且显式 <code>visibility=tenant</code>、 团队记忆 user 默认（tenant 由 owner/admin 管）、任何登录用户可建团队、租户默认不可信（A5 沙箱）、 多副本 workspace 走共享 POSIX 卷、团队邀请走邮箱+链接。标「不做 / 以后」的那几行是<strong>终态裁定，不是待办</strong>。 <strong>A7 剩下的那些已整批拍掉</strong>：团队计费、API key、SSO、账单、组织共享 2026-10-22 用户裁不做——与运行时关系不大的商业化、合规项，移出路线图（旧成功体换信封那一笔 已由 <a href="40-响应信封统一.html">doc/40</a> 在 2026-10-22 落地，与本批无关）。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>决定</th>
+<th>推荐</th>
+<th>影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>团队功能</td>
+<td><strong>已拍支持；A6 后端、前端独立 loop</strong></td>
+<td>A6 范围</td>
+</tr>
+<tr>
+<td>tenant 是团队空间还是个人空间</td>
+<td><strong>两者都要：<code>kind=personal</code> / <code>kind=team</code>；个人先行</strong></td>
+<td>表结构/注册流程</td>
+</tr>
+<tr>
+<td>session 默认可见性</td>
+<td><strong>private；显式 <code>visibility=tenant</code></strong></td>
+<td>访问规则/前端</td>
+</tr>
+<tr>
+<td>团队记忆</td>
+<td><strong>user 默认；tenant 由 owner/admin 管</strong></td>
+<td>notes scope/模型工具</td>
+</tr>
+<tr>
+<td>团队创建权限</td>
+<td>任何登录用户可建；平台管理员可禁用</td>
+<td>滥用/配额</td>
+</tr>
+<tr>
+<td>租户是否可信</td>
+<td><strong>默认不可信；A5 沙箱</strong></td>
+<td>A4/A5 闸门</td>
+</tr>
+<tr>
+<td>多副本 workspace</td>
+<td>共享 POSIX 卷；以后对象存储</td>
+<td>部署/成本</td>
+</tr>
+<tr>
+<td>access/refresh TTL</td>
+<td>15min / 30d；refresh 旋转</td>
+<td>安全/体验</td>
+</tr>
+<tr>
+<td>团队邀请方式</td>
+<td>邮箱 + 链接；A6</td>
+<td>产品流程</td>
+</tr>
+<tr>
+<td>团队计费</td>
+<td><strong>不做</strong>（2026-10-22 裁，2026-10-23 复核维持）——原推荐「按 tenant；A7」作废</td>
+<td>商业化（不做了）</td>
+</tr>
+<tr>
+<td>API key</td>
+<td><strong>不做</strong>（同上）——原推荐「以后；独立 principal」作废；真要对外卖再翻案</td>
+<td>集成（不做了）</td>
+</tr>
+<tr>
+<td>管理员读会话</td>
+<td>不做；support access 审计</td>
+<td>隐私</td>
+</tr>
+<tr>
+<td>个人 tenant 删除</td>
+<td>不删；可归档</td>
+<td>数据保留</td>
+</tr>
+<tr>
+<td>跨 tenant 移动资源</td>
+<td>不做；复制/导入</td>
+<td>权限简化</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="16-闭环">16. 闭环</h2>
+<p><strong>所以这解决了什么。</strong> tako 从“sessionId 是钥匙”变成“tenant + user + role + 资源归属”四重边界：</p>
+<ul>
+<li>现在：每个用户有个人 tenant，session 私有，notes 个人，文件/配额/后台按租户；</li>
+<li>A6：团队只是多成员 tenant，用户切租户，团队 agent/notes 共享，个人数据不搬；</li>
+<li>平台管理员与租户角色分开，最后一个 owner/system admin 有保护，拒绝和角色变更可审计。</li>
+</ul>
+<p><strong>仍然不解决的（明说）：</strong></p>
+<ul>
+<li>团队前端页面/计费/SSO/API key——前端或后续 loop；团队后端 A6 在本篇；</li>
+<li>组织/跨租户共享——后续；</li>
+<li>不可信租户的完整沙箱——A5 的硬闸门；</li>
+<li>eino #1177 的并发 race——A5 必须决策；</li>
+<li>文件/笔记的“管理员默认读内容”——不做，走 support access。</li>
+</ul>
+<p><strong>收口（2026-10-21）。</strong> A0–A6 全部落地并 curl 验收过，随 <code>9c21b66</code> 入库；活体抽验结论见头注。 <strong><del>下一批是 A7 剩下的：团队计费、API key、SSO、账单、组织共享</del> 2026-10-22 已拍不做</strong>：与运行时关系不大的商业化、合规项，从路线图移除；本篇收口，没有登记的下一批。 <strong>2026-10-23 复核，维持不做</strong>（用户 2026-10-23 复核确认）：这一档<strong>整批</strong>（含<strong>审计导出</strong>）仍然不做。复核时把两样讲清楚了，留个底以便将来翻案时不重复讨论：</p>
+<ul>
+<li><strong>API key</strong> = 给程序用的独立身份（今天每个认证调用方都是人，机器接不进来）；<strong>SSO</strong> = 用公司已有账号登录（今天账号自建，与 IT 那套无联动，离职不联动、密码策略与 MFA 失效）。</li>
+<li>两者都是**"对外卖 / 进公司大门"的门，不是运行时的门**；真要卖再翻案，底座不差：本地账号 + membership + <code>audit_log</code> 表都在，<code>tenant_usage_daily</code> 已按租户按天记用量，缺的是定价/席位/账单与机器主体那几层。</li>
+<li>doc/16 §5.1 曾把这一档挂在「第 1 项待做」上——那是一处<strong>旧账</strong>（与本篇 10-22 的拍板打架），已于 2026-10-23 同批删掉，改记进 doc/16 的「已拍不做」清单。 A7 里的<strong>旧 runs/sessions/mcp/media/memory 成功体换 <code>{code,message,data}</code> 信封</strong>已由 <a href="40-响应信封统一.html">doc/40</a> 单独落地（2026-10-22，A7-1…A7-8）。 团队前端页面已由 <a href="36-团队前端.html">doc/36</a> 单独落地（2026-10-21）。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/28-%E5%A4%9A%E7%A7%9F%E6%88%B7.md"><code>doc/28-多租户.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

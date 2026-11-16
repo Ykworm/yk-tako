@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>59 · 对话里的工具调用可见性 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="59--对话里的工具调用可见性">59 · 对话里的工具调用可见性</h1>
+<blockquote>
+<p>性质：<strong>实现真源</strong>（2026-11-01 立项并落地）。 状态：<strong>✅ 已落地（2026-11-01，A1–A2）</strong>。对话页把<strong>每一次</strong>工具调用画成一张工具卡（帧与 runlog 两条路径），不再按工具名筛。 代码落点：<code>yk-tako-eino/web/src/{chat.ts,App.vue,api.ts}</code>（<strong>后端零改动</strong>）。 验收：浏览器打开历史会话（21 次工具调用全上屏、2 张失败卡、刷新后仍在）+ 活体一轮 <code>echo hello</code>（运行中即出卡、回执到后同卡合并）+ <code>npm run typecheck</code> / <code>npm run build</code> 绿。 上游：<a href="52-技能.html">doc/52</a> C5（技能三件的工具卡）——本篇<strong>翻掉它的窄口</strong>：卡片机制保留，筛选去掉。 2026-11-03 补记：等人工具边界开始把正文切段（§5.4），问答块可按真实先后排开；普通工具仍不分段（§6 第 2 条）。 台账：<code>tmp/59-工具调用可见性/</code>（不入库）。</p>
+</blockquote>
+<hr />
+<h2 id="0-一句话结论">0. 一句话结论</h2>
+<p>工具调用一直在数据里：帧（<code>tool_call</code> / <code>tool_result</code>）和 runlog 账本行都带 <code>name</code> / <code>args</code> / <code>output</code> / <code>toolCallId</code> / <code>agent</code>。 <strong>丢的是前端</strong>：<code>chat.ts</code> 里有一张「只认技能三件」的名字白名单，其余工具帧和账本行被静默返回 <code>null</code>。 本篇把白名单换成通用映射——所有工具进气泡，一行摘要、点开看参数与回执，失败标「失败」，刷新与翻页都不丢。</p>
+<h2 id="1-病灶一场-21-次工具调用的-run界面上一次都看不到">1. 病灶：一场 21 次工具调用的 run，界面上一次都看不到</h2>
+<p><strong>故事</strong>（2026-11-01 用户实测）：问 「What writer is quoted by Merriam-Webster for the Word of the Day from June 27, 2022?」。 模型 <code>web_search</code> 找了 5 轮、<code>web_fetch</code> 抓了 2 次 Merriam-Webster（都被站点挡回 404）、<code>bash</code> 自己 curl 与 grep 了 6 次、<code>read_file</code> 读了 5 个落盘文件——<strong>共 21 次工具调用，run 跑了 303 秒</strong>。</p>
+<p>用户在页面上看到的：一个气泡，先空着，最后只落一行答案。中间那 21 次调用、两处 404、沙箱拒绝 <code>/dev/null</code> 的报错，一个都看不见。 用户换到 CozeLoop 的 trace 树才看到那一长串 <code>chat</code> ↔︎ <code>execute_tool</code>，于是问：「为什么前端看不到里面这么多的工具调用？」</p>
+<p><strong>丢在哪一步</strong>：链路本来是全的。</p>
+<pre><code>worker 每轮模型调用完成
+  → 写 tool_call 帧（name/args/toolCallId/agent）        ← Redis runlive
+  → 执行工具
+  → 写 tool_result 帧（name/output/toolCallId/agent）
+  → 定稿时同一份 payload 进 runlog 账本行               ← PG
+  → 前端 pollFrames / getLog 拉回来
+  → chat.ts 过滤：不是 read_skill / use_skill / read_skill_file 就 return null   ← ★断在这里</code></pre>
+<p>断点的来历是 <a href="52-技能.html">doc/52</a> C5：当时只做技能三件的卡，注释顺手写了「页面不演终端」。技能之外的调用（bash / web_search / web_fetch / read_file / 子代理）从此在界面上不存在。</p>
+<p><strong>不做的后果</strong>：用户没法判断 agent 在干什么、卡在哪一步、是哪一次抓取失败了。一场 5 分钟的 run 看起来像「模型在发呆」。</p>
+<h2 id="2-数据面两条路径同一个事件形状">2. 数据面：两条路径，同一个事件形状</h2>
+<p>工具调用有两个来源，字段同形，前端收敛成一个 <code>ToolEvent</code>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>来源</th>
+<th>什么时候读</th>
+<th>一条记录长什么样</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>帧</td>
+<td>run 活着时每 400ms 轮询 <code>GET /api/runs/:runId/frames</code></td>
+<td><code>{"kind":"tool_call","name":"web_fetch","args":"{\"url\":\"…\"}","toolCallId":"call_00_…","agent":""}</code>；回执行是 <code>kind:"tool_result"</code>，把 <code>args</code> 换成 <code>output</code></td>
+</tr>
+<tr>
+<td>runlog 行</td>
+<td>打开历史会话 / 翻页 <code>GET /api/sessions/:id/log</code></td>
+<td><code>{"role":"tool_call","agent":"","payload":"{\"name\":\"bash\",\"args\":\"{\\\"command\\\":\\\"ls\\\"}\",\"toolCallId\":\"call_00_…\"}"}</code>；回执行 <code>role:"tool_result"</code>、payload 里是 <code>output</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>映射代码在 <code>web/src/chat.ts</code>：<code>toolFrameEvent</code>（<code>:244</code>）与 <code>toolRowEvent</code>（<code>:258</code>）各自把来源解成同一个形状：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode ts"><code class="sourceCode typescript"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> ToolEvent <span class="op">=</span> { callId<span class="op">:</span> <span class="dt">string</span><span class="op">;</span> name<span class="op">:</span> <span class="dt">string</span><span class="op">;</span> args<span class="op">?:</span> <span class="dt">string</span><span class="op">;</span> output<span class="op">?:</span> <span class="dt">string</span><span class="op">;</span> agent<span class="op">?:</span> <span class="dt">string</span> }</span></code></pre></div>
+<p><code>mergeTool</code>（<code>:292</code>）按 <code>toolCallId</code> 把 call 和 result 叠到同一张卡上：先到的建卡，后到的补另一半。 一个工具调用<strong>允许一帧到得比另一半早</strong>（同一轮多个调用并行时回执顺序可以交错），所以配对键必须是 <code>toolCallId</code>，不能按行号或数组下标。</p>
+<p><code>agent</code> 是产出这条记录的代理：空串 = 主代理，非空 = 子代理名字（<code>types.go</code> 与 runlog 一直带着这两列，只是之前前端 <code>Row</code> 类型没声明）。</p>
+<h2 id="3-画成什么样一行摘要点开看详情">3. 画成什么样：一行摘要，点开看详情</h2>
+<p><code>web/src/App.vue</code> 的 <code>toolCardLabel</code>（<code>:276</code>）把一次调用压成一行：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>工具</th>
+<th>摘要</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>web_search</code></td>
+<td><code>搜索：&lt;query&gt;</code></td>
+</tr>
+<tr>
+<td><code>web_fetch</code></td>
+<td><code>抓取：&lt;url&gt;</code></td>
+</tr>
+<tr>
+<td><code>read_file</code></td>
+<td><code>读取：&lt;path&gt;</code>（分页读时带「（从第 N 行）」）</td>
+</tr>
+<tr>
+<td><code>bash</code></td>
+<td><code>执行：&lt;命令首行&gt;</code></td>
+</tr>
+<tr>
+<td><code>write_file</code> / <code>edit_file</code></td>
+<td><code>写文件：&lt;path&gt;</code></td>
+</tr>
+<tr>
+<td><code>use_skill</code> / <code>read_skill</code> / <code>read_skill_file</code></td>
+<td>沿用 doc/52 C5 的中文措辞（<code>使用技能：…</code> 等）</td>
+</tr>
+<tr>
+<td>其余</td>
+<td><code>&lt;工具名&gt;：&lt;参数 JSON 前 90 字&gt;</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>摘要里所有文本压成单行（<code>oneLine</code>：折叠空白、超 90 字加省略号），过长的摘要用 CSS 省略号截断，不换行撑破气泡。</p>
+<p>卡片是 <code>&lt;details&gt;</code>：默认收起，展开依次是</p>
+<ol type="1">
+<li>失败原因（回执判为失败时，<code>&lt;p class="tool-fail"&gt;</code>）；</li>
+<li>参数原文（<code>&lt;pre class="tool-args"&gt;</code>，参数是 <code>{}</code> 时不画）；</li>
+<li>回执原文（<code>&lt;pre class="tool-out"&gt;</code>；还没有回执时写「还没有回执。」）。</li>
+</ol>
+<p>失败 / 执行中是摘要行右侧的 chip：<code>toolCardState</code>（<code>:315</code>）先看有没有失败，再看有没有回执——没有回执且气泡在跑 = <code>执行中</code>。 回执不设内部滚动条：整段直接撑开（用户明确不要嵌套滚动条），代价是超长回执会把页面拉长，因此有截断上限（§4）。</p>
+<h2 id="4-失败判定与截断">4. 失败判定与截断</h2>
+<p><strong>失败判定</strong>统一走工具错误文本的契约：所有工具的错误结果都由 <code>tools.go</code> 的 <code>toolErrorText</code> 包一次，<strong>恒以「错误：」开头</strong>。 所以 <code>toolCardFail</code>（<code>:297</code>）对通用工具只看前缀；只有技能三件保留结构化信封判据（<code>code≠0</code> 时取 <code>message</code>，成功回执以 <code>&lt;skill</code> 开头）。</p>
+<p>这替代了旧判据「不是 <code>&lt;skill</code> 开头就是失败」——那个判据对 <code>web_search</code>（回执以「来源：」开头）会把 21 次里的每一次成功搜索都标成失败。</p>
+<p><strong>截断</strong>（<code>clipped</code>，<code>:271</code>）：参数 2,000 字符、回执 8,000 字符。超出时保留前一段，末尾换行写「…（后面还有 N 字符，已截断）」。 保留原文而不是摘要，是因为展开卡片的用途就是看模型到底收到了什么；截断只防一场 34 次调用 × 50KB 把页面拖死。</p>
+<h2 id="5-两条路径各自的坑">5. 两条路径各自的坑</h2>
+<h3 id="51-账本行可能先于气泡到达">5.1 账本行可能先于气泡到达</h3>
+<p>runlog 里工具行排在它那场的 assistant 终稿行之前。打开历史会话时，气泡还不存在，卡片无处可挂。 <code>attachToolRow</code> 因此先按 <code>runId</code> 把事件排进 <code>pendingTools</code>（<code>:322</code>），assistant 气泡一出现就 <code>flushPendingTools</code> 补齐。</p>
+<h3 id="52-初始窗口可能切在一次调用与它的回执之间">5.2 初始窗口可能切在一次调用与它的回执之间</h3>
+<p><code>GET /api/sessions/:id/log</code> 的游标是<strong>排他</strong>的（返回 offset &gt; N 的行），初始窗口是 <code>高水位 - 10</code>。 高水位 44 时从 34 拉，拿到 35–44：如果一次 bash 的调用行在 34、回执行在 37，<strong>调用行落在窗口外</strong>，卡片只剩回执——摘要显示成 <code>执行：</code>（没有命令）、点开也没有参数。</p>
+<p>修法在取数侧：<code>hasUnpairedToolResult</code>（<code>:278</code>）检查一批行里有没有「回执找不到同批的调用行」，有就把起点再往前挪一页重拉，直到配对完整或到达会话开头（0）。 翻页 <code>loadOlder</code> 用同一判据。这条规则不引入新的 API 语义，只改前端取窗口的起点。</p>
+<h3 id="53-实时路径的执行中">5.3 实时路径的「执行中」</h3>
+<p>帧路径里 <code>tool_call</code> 帧先到、<code>tool_result</code> 帧后到，所以卡片会先以「执行中」出现，回执到后同一张卡合并结果并翻成完成。 这是可见性修复真正要给的东西：<strong>run 跑到一半就能看出它正在做什么</strong>，不用等定稿。</p>
+<h3 id="54-正文与卡片谁在上按行序不按模板">5.4 正文与卡片谁在上（按行序，不按模板）</h3>
+<p>一段普通的 run（<code>get_time</code> 那种）在账本里的行序是 <code>user</code> → <code>tool_call</code> → <code>tool_result</code> → <code>assistant</code>： 卡片对应的事<strong>先发生</strong>，答案后到。但气泡模板里正文块写在卡片块前面，第一版就一律画成「答案在上、卡片在下」—— 与行序相反，读起来像先回答了再补查。</p>
+<p>判据放在数据侧（<code>web/src/chat.ts</code>）：气泡上带一个 <code>toolsFirst</code>，凡是「第一张卡到达时这个气泡还没有任何正文」就置真—— 历史面走 <code>flushPendingTools</code>（排队的工具行先于气泡创建）与 <code>attachToolRow</code>（翻页时按 <code>logOffset</code> 比先后）， 实时面走 <code>mergeTool</code>（工具帧早于第一个 delta）。渲染侧 <code>bubbleBlocks</code>（<code>web/src/App.vue</code>）据此决定两块谁在上。</p>
+<p>普通工具调用仍只分<strong>两块</strong>：runlog 把整场 root 正文 Σ 成一行（<code>store.go</code> 的 <code>writeTurnRows</code>）， 模型中途说的「我先搜一下」和最后的答案在库里是同一行字，拆不开（见 §6 第 2 条）。</p>
+<p><strong>2026-11-03 补记（等人工具边界开始分段）</strong>：<code>writeTurnRows</code> 在 <code>ask_user</code> / <code>submit_plan</code> / <code>skill_install</code> 之前记下 root 正文的 rune 偏移，写进那条 assistant 行 payload 的 <code>segments</code>（<code>[{end,toolCallId}]</code>，行数仍是一条）。 前端按偏移把同一行切成多段气泡，问题卡挂到切点前那段；已答的自由文本问题紧跟一个右对齐答案气泡。 于是「段 1 → 问题卡 → 答案气泡 → 段 2」可以按真实先后排开，刷新与实时走同一套切法。 代价是工具卡仍统一挂在<strong>第一段</strong>（<code>toolsFirst</code> 不变），回答后才发生的工具在收口/刷新后会随第一段上移。</p>
+<h2 id="6-已知缺口明确不做--未验">6. 已知缺口（明确不做 / 未验）</h2>
+<ol type="1">
+<li><strong>没有耗时</strong>：帧与账本行都不带开始/结束时间戳，卡片无法显示「这条跑了 12 秒」。要显示得先加字段（属于帧契约变更，不在本篇）。</li>
+<li><strong>正文只在等人工具边界分段，普通工具仍不逐段交错</strong>：一场 run 的正文在库里仍是一条 Σ 行，普通工具调用前后的话拆不开，界面只能排「卡片全部在上 / 全部在下」。2026-11-03 起 <code>ask_user</code> / <code>submit_plan</code> / <code>skill_install</code> 的边界会把正文切成多段（<code>segments</code> 偏移，见 §5.4 补记），问答块因此能按真实先后排开；要让每个普通工具调用也交错，得改 runlog 的行形状（按轮次写多行 assistant），牵到 19v6 的定稿锚与折叠输入，仍未做。</li>
+<li><strong>子代理前缀未活体验证</strong>：<code>agent</code> 非空时摘要前画一个代理名字 chip（<code>.tool-agent</code>），代码路径已通，但最近 12 场会话里没有带 <code>agent</code> 的工具行，没有活体样本。</li>
+<li><strong>只读展示</strong>：卡片不提供重试、复制参数、跳转到工作区文件等操作。</li>
+</ol>
+<h2 id="7-验收记录2026-11-01">7. 验收记录（2026-11-01）</h2>
+<ul>
+<li>历史会话（同一场 Merriam-Webster run）：21 次工具调用按序全上屏，<code>web_search</code> / <code>read_file</code> / <code>web_fetch</code> / <code>bash</code> 都有；两张失败的 <code>web_fetch</code> 显示「失败」与 <code>错误：HTTP 404</code>；展开可见参数、回执原文与截断提示（5 条超 8,000 字符的回执带「已截断」标注）。</li>
+<li>活体：新发「用 bash 执行 echo hello，只回复 ok」→ 工具卡在运行中以「执行：echo hello / 执行中」出现，回执到后同一张卡合并输出并翻成完成；刷新后答案、卡片仍在（runlog 路径）。</li>
+<li><code>cd yk-tako-eino/web &amp;&amp; npm run typecheck &amp;&amp; npm run build</code> 绿。</li>
+<li>窗口边界修正前，同一会话首屏出现过一张参数为空的 <code>执行：</code> 卡；修正后消失（<code>hasUnpairedToolResult</code>）。</li>
+<li>2026-11-01 补拍（正文/卡片顺序）：用户按 <code>GET /api/sessions/:id/log</code> 的原始行序（<code>user</code> → <code>tool_call</code> → <code>tool_result</code> → <code>assistant</code>）指出页面把答案画在了卡片上方。改为按 <code>toolsFirst</code> 排两块（§5.4）后浏览器复核：<code>get_time</code> 会话（<code>s_01M6BNXHHGQ74DJ2FDG6PCJGKZ</code>）与 <code>echo hello</code> 会话的 <code>.bubble-main</code> 子节点顺序均为 <code>tool-cards</code> → <code>bubble-text</code>，答案在卡片下方；<code>npm run typecheck</code> / <code>build</code> 绿、<code>npm test</code> 14 件全过。</li>
+<li>2026-11-03 分段补记验收：活体一轮「先确认一下 → ask_user 选 A/B → 答 A → 只回复 ok」，页面节点顺序为 <code>user</code> → <code>assistant(卡+「我先确认一下，再问你。」)</code> → <code>问题卡</code> → <code>答案气泡「A」</code> → <code>assistant「ok」</code>；刷新后 6 个节点顺序与文本逐项一致（<code>docScrollWidth == innerWidth</code>，无横向溢出）。runlog 仍是一条 assistant 行，payload <code>segments:[{"end":7,"toolCallId":"call_…"}]</code>；没有提问的 run 不出现 <code>segments</code>。</li>
+</ul>
+<h2 id="8-与-doc52-c5-的关系">8. 与 doc/52 C5 的关系</h2>
+<p><a href="52-技能.html">doc/52</a> C5 的<strong>卡片机制</strong>（<code>toolCallId</code> 配对、失败显示结构化 message、展开看回执原文）是本篇的地基，原样保留。 本篇翻掉的是它的<strong>范围</strong>：C5 只对技能三件建卡，其余工具帧与账本行被白名单丢掉。现在所有工具都建卡，技能三件只是多了中文摘要措辞。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/59-%E5%B7%A5%E5%85%B7%E8%B0%83%E7%94%A8%E5%8F%AF%E8%A7%81%E6%80%A7.md"><code>doc/59-工具调用可见性.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

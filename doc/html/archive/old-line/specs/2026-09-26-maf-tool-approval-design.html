@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MAF 最小审批回路（L1 tool guard 的 MAF 等价物）设计 · tako 文档</title>
+<link rel="stylesheet" href="../../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../../assets/tako-architecture.html">架构总览</a><a href="../../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="maf-最小审批回路l1-tool-guard-的-maf-等价物设计">MAF 最小审批回路（L1 tool guard 的 MAF 等价物）设计</h1>
+<blockquote>
+<p>状态：设计已批准（2026-09-26），待实施。 缘起：<code>doc/09-设计了解.md</code> §12 讨论的问题——Eino 的 resume 中段里，写入端 （<code>adkrun</code> 的 <code>Targets</code>）与读取端（guard 的 <code>GetResumeContext</code>）分居两文件、靠 checkpoint 的 ID↔︎地址映射与 ctx 公告板在运行时相遇。用户要求核对 MAF 是否有 对应功能；MAF 没有，故本设计在 <code>maf/</code> 里补上这个功能，并按 MAF 自己的最地道 实践实现（不迁就与 Eino 的形状一致），实现后再做机制对比（落在 <code>doc/10-MAF审批回路与Eino对照.md</code>）。</p>
+</blockquote>
+<h2 id="1-背景与前提事实可检验">1. 背景与前提（事实，可检验）</h2>
+<p><strong>F1 — 本仓库 MAF 现状：连功能都没有。</strong> <code>maf/</code> 是 L2 任务规划的 MAF 对照，README 明说「只覆盖 L2（L1 守卫不在内）」（<code>maf/README.md:8</code>）。全目录 grep <code>Resume|Interrupt|Checkpoint|Approval</code> 零命中：没有守卫、没有中断、没有恢复。 <code>README.md:49</code> 自述「要持久化得自己序列化 <code>TodoStore</code>（L6 断点恢复时再处理）」。 所以 §12 的问题在 MAF 不是「解法不同」，而是「回路尚未存在」。前提确认：本设计 需要先给 MAF 补上 L1 的最小审批回路。</p>
+<p><strong>F2 — MAF 框架自带这条回路（API 已用反射探针逐一钉死，包 <code>Microsoft.Agents.AI</code> 1.22.0 / <code>Microsoft.Extensions.AI</code> 10.10.0）：</strong></p>
+<ul>
+<li><code>ApprovalRequiredAIFunction(AIFunction)</code>：把一个工具标成「执行前需批准」。</li>
+<li><code>FunctionInvokingChatClient</code>（FICC，ChatClientAgent 内部的函数调用循环）： 响应里含需批准的工具调用时，把 <code>FunctionCallContent</code> 换成 <code>ToolApprovalRequestContent{RequestId = 由 tool_call_id 拼出}</code> 返回调用方； 入站的 <code>ToolApprovalResponseContent</code> 一律按 RequestId 绑定到「框架真正 surfaced 过的请求」，批准的重建函数调用并执行，拒绝的生成失败工具结果。</li>
+<li><code>ToolApprovalAgent(innerAgent, options)</code>：审批中间件，负责排队（多个请求一次只露 一个）、standing rule（"always approve"）、自动批准规则 （<code>AutoApprovalRules: IEnumerable&lt;Func&lt;ToolAutoApprovalRuleContext, ValueTask&lt;bool&gt;&gt;&gt;</code>， 上下文含 <code>FunctionCallContent</code>、<code>Session</code>、<code>RequestMessages</code> 等），状态存 <code>AgentSession.StateBag</code>。</li>
+<li>调用方协议：从 <code>AgentResponse.Messages</code> 里取 <code>ToolApprovalRequestContent</code>， <code>req.CreateResponse(approved, reason)</code> 得到 <code>ToolApprovalResponseContent</code>， 装进 <code>new ChatMessage(ChatRole.User, IList&lt;AIContent&gt;)</code> 再 <code>RunAsync</code>。</li>
+</ul>
+<p><strong>F3 — 框架的审批不是 Eino 式 interrupt/resume。</strong> 没有执行图、没有 checkpoint， 是<strong>消息级请求-回执协议</strong>：跑完的响应把「待批请求」作为内容交给调用方，调用方 下一条消息把「回执」带回来，FICC 重建并执行被批的那次调用。「重入」由 FICC 的 重建机制完成，历史一致性（tool_calls 与结果配对）由框架保证。</p>
+<p><strong>F4 — Eino 侧的对照物（<code>doc/09</code> §12 已述）：</strong> 写入端 <code>yk-tako-eino/internal/adkrun/turn.go:98-110</code>（<code>targets[point.ID]=decision</code>）， 读取端 <code>yk-tako-eino/internal/guard/middleware.go:98-107</code>（<code>ownInterrupt</code> + <code>resumeDecision</code>），钥匙是 <code>point.ID</code> + checkpoint 的 ID↔︎地址映射，公告板是 ctx。</p>
+<p><strong>F5 — 规则表是框架无关的，可移植。</strong> <code>yk-tako-eino/internal/guard/toolguard.go</code> 的文件头自述「不含 Eino 依赖，规则本身与框架无关」，<code>DefaultRules</code> 10 条危险命令 规则瞄 shell 工具（<code>bash</code>/<code>execute</code> 的 <code>command</code> 参数），带 Severity、Excludes、 三模式（block / warn / require_approval）。Eino 入口默认 <code>ModeApprove</code> （<code>cmd/yktako/main.go:49</code>），<code>/mode</code> 可切。</p>
+<h2 id="2-目标功能语义与-eino-对齐的三态">2. 目标功能语义（与 Eino 对齐的三态）</h2>
+<p>前提：guard 规则表先在<strong>工具执行前</strong>扫参数，扫出命中清单（Finding）。按模式：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>模式</th>
+<th>命中</th>
+<th>无命中</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>warn</code></td>
+<td>命中任意规则：打印 ⚠️ 告警后放行</td>
+<td>放行</td>
+</tr>
+<tr>
+<td><code>block</code></td>
+<td>命中达拦截级别（Critical/High）：不执行，拦截文案作为工具结果回给模型（不打扰人）；命中未达级别：放行</td>
+<td>放行</td>
+</tr>
+<tr>
+<td><code>require_approval</code>（默认）</td>
+<td>命中达拦截级别（Critical/High/Medium）：暂停问人，批准→执行、拒绝→拒绝文案作为工具结果回给模型；命中未达级别：放行</td>
+<td>放行</td>
+</tr>
+</tbody>
+</table></div>
+<p>级别映射沿用 Eino <code>blocking</code>（<code>toolguard.go:149-153</code>）：block 拦 Critical/High， require_approval 连 Medium 也拦，warn 不拦。</p>
+<p>REPL 交互补两条（对齐 <code>cmd/yktako/main.go:85-103</code>）：默认 <code>require_approval</code>； <code>/mode block|warn|require_approval</code> 切换。审批文案对齐 <code>cmd/yktako/main.go:107-124</code>（工具、参数、命中说明、<code>批准执行？[y/N]</code>）。</p>
+<h2 id="3-设计已选定全用-maf-自带-approval-管线">3. 设计（已选定：全用 MAF 自带 approval 管线）</h2>
+<h3 id="31-为什么是这条路取舍回顾">3.1 为什么是这条路（取舍回顾）</h3>
+<ul>
+<li>方案 B（自写 chat 中间件按参数动态把命中调用转成审批请求）与方案 C（抛异常手写 中断 + 自建 decision board）都被否：C 在 MAF 没有可恢复执行图的前提下，必须自己 重建 tool-call/tool-result 消息对才能让重入成立——而这正是 FICC 替你做的事； B 要自己处理框架的 all-or-nothing（一个响应里任一工具需审批则全部转请求， 见 <code>ApprovalRequirement</code> 文档）并重造自动回执。两者都是重造轮子。</li>
+<li>方案 A（本设计）用足框架：静态标记让调用进入审批管线，规则引擎只决定 「自动批/不批」，暂停、绑定、执行、拒绝回执全部交给框架。与 Eino 的语义差异只 剩「未命中的 execute 调用也多走一次管线内部循环」，对用户不可见。</li>
+</ul>
+<h3 id="32-组件与文件改动">3.2 组件与文件改动</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文件</th>
+<th>改动</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>maf/src/Guard.cs</code></td>
+<td>新增</td>
+<td><code>Severity</code>/<code>Rule</code>/<code>Mode</code>/<code>Finding</code>/<code>Engine</code>（<code>Guard</code>、<code>ShouldBlock</code>、<code>Configure</code>、<code>Mode</code>）+ <code>DefaultRules</code> 10 条移植（含 <code>commentLine</code>/Excludes 语义）+ <code>FormatFindings</code>（对齐 Eino <code>formatFindings</code>，≤5 条，带 snippet/remediation）</td>
+</tr>
+<tr>
+<td><code>maf/src/BasicTools.cs</code></td>
+<td>修改</td>
+<td>加假 shell 工具 <code>execute(string command)</code>：不真执行，返回「（演示用假 shell）将执行：&lt;命令&gt;」类回执</td>
+</tr>
+<tr>
+<td><code>maf/Program.cs</code></td>
+<td>修改</td>
+<td>① <code>execute</code> 注册时用 <code>ApprovalRequiredAIFunction</code> 包一层；② builder 链追加 <code>UseToolApproval(new ToolApprovalAgentOptions { AutoApprovalRules = [guardRule] })</code>，追加位置在最内层（贴近 <code>ChatClientAgent</code>），保持 Nudge 最外不破坏「一轮」语义；③ REPL 增审批回路与 <code>/mode</code> 命令</td>
+</tr>
+<tr>
+<td><code>maf/tests/YkTako.MafL2.Tests.csproj</code> + <code>maf/tests/GuardEngineTests.cs</code></td>
+<td>新增</td>
+<td>xunit 2.4.2（本地缓存，离线可还原）单测规则引擎：命中/排除/三模式/片段截取，不打模型</td>
+</tr>
+<tr>
+<td><code>maf/README.md</code></td>
+<td>修改</td>
+<td>状态行标注限定解冻；机制映射表、文件列表、实测记录各补一条</td>
+</tr>
+<tr>
+<td><code>doc/10-MAF审批回路与Eino对照.md</code></td>
+<td>新增</td>
+<td>实现记录 + MAF vs Eino 逐点对比（最终版）</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="33-自动批准规则规则引擎的落点">3.3 自动批准规则（规则引擎的落点）</h3>
+<pre><code>guardRule(ctx):
+    call      = ctx.FunctionCallContent            // execute 调用
+    findings  = engine.Guard(call.Name, ParseArgs(call.Arguments))
+    if engine.Mode() == warn:
+        if findings 非空: 打印 ⚠️ FormatFindings(...)
+        return true                                 // warn：一律自动批，放行
+    return !engine.ShouldBlock(findings)            // 无阻断命中：自动批；
+                                                    // 有阻断命中：不批，留给 REPL</code></pre>
+<p>推导：<code>AutoApprovalRules</code> 只能「批或跳过」，不能拒绝——所以<strong>放行路径全部在这里 消化</strong>（用户不可见）；需要拦或问人的调用由规则返回 false，冒泡到 REPL。</p>
+<h3 id="34-repl-审批回路写入端">3.4 REPL 审批回路（写入端）</h3>
+<pre><code>response = agent.RunAsync(input, session)
+loop:
+    pending = response.Messages 里 RequiresConfirmation 为真的 ToolApprovalRequestContent
+    if pending 为空: break
+    replies = []
+    for req in pending:
+        call = req.ToolCall as FunctionCallContent
+        findings = engine.Guard(call.Name, ParseArgs(call.Arguments))
+        if engine.Mode() == block &amp;&amp; engine.ShouldBlock(findings):
+            (approved, reason) = (false, FormatFindings(findings, &quot;工具调用被安全策略拦截（command guard）&quot;))
+        else if !engine.ShouldBlock(findings):
+            (approved, reason) = (true, &quot;&quot;)     // 兜底：自动批准上限路径也可能 surfaced 非阻断请求，
+                                                // 此时不打扰人（与 Eino「未达级别直接放行」一致）
+        else:
+            (approved, reason) = 问人（⏸️ 人工审批：工具/参数/命中说明；y/N）
+        replies.Add(req.CreateResponse(approved, reason))
+    response = agent.RunAsync(new ChatMessage(ChatRole.User, replies), session)   // 只回执，不回放用户输入
+print response.Text</code></pre>
+<p>说明：TAA 一次只 surfaced 一个请求（其余排队），loop 自然逐个走完；FICC 对批准 的重建调用执行、对拒绝的生成失败工具结果，模型在同一个 <code>RunAsync</code> 内继续。</p>
+<h3 id="35-数据流与-12-对照初步实现后-doc10-给实测版">3.5 数据流与 §12 对照（初步；实现后 doc/10 给实测版）</h3>
+<pre><code>模型输出 FunctionCallContent(execute, call_id)
+  → FICC：检出 ApprovalRequiredAIFunction → 换成 ToolApprovalRequestContent
+           {RequestId = ComposeApprovalRequestId(call_id)}
+  → TAA：查 guardRule
+       ├─ 无阻断命中 → collected response 注入 → 重入 inner → FICC 重建调用并执行 → 模型继续
+       └─ 阻断命中   → 写 session.StateBag 的 SurfacedApprovalRequests → 返回 REPL
+REPL：问人或按 block 直接拒 → CreateResponse → 作为新 user 消息回传
+  → TAA：BindApprovalResponses 按 RequestId 绑定（快照比对，防伪造）
+  → FICC：批准→重建执行；拒绝→失败工具结果给模型</code></pre>
+<ul>
+<li>钥匙：<code>RequestId</code>（由 tool_call_id 派生）。Eino 用 <code>point.ID</code> + ID↔︎地址映射。</li>
+<li>公告板：随消息走的 Request/Response 内容（in-band）+ <code>AgentSession.StateBag</code>。 Eino 用 checkpoint + <code>addrCtx</code>（out-of-band）。</li>
+<li>写入端：REPL 回执循环 ≈ <code>turn.go</code> 的 <code>targets[point.ID]=decision</code> 循环。</li>
+<li>读取端：TAA 绑定 + FICC 执行 ≈ guard wrapper 重入时 <code>GetResumeContext</code>。</li>
+<li>结构同构（ID 钥匙 + 公告板 + 两端不直接互引），介质相反（消息协议 vs ctx）。</li>
+</ul>
+<h2 id="4-偏离与风险反例优先">4. 偏离与风险（反例优先）</h2>
+<ul>
+<li><strong>假 shell</strong>：不真执行命令（Eino 的 <code>bash</code> 是真执行）。安全考虑，明示偏离； 规则里 <code>bash</code> 工具不存在，实际只有 <code>execute</code> 会命中，README 标注。</li>
+<li><strong>all-or-nothing</strong>：框架规定一个响应里任一工具需审批则全部转请求；因只标 <code>execute</code>，只影响同批的 execute 调用（TAA 排队逐个问）。</li>
+<li><strong>R1 链序</strong>：TAA 追加在最内层（Nudge 最外）。审批往返会重新进入 Nudge （<code>BeginTurn</code> 复位）——若实测出现「审批回合中催更/重置」异常，调整链序并在 doc/10 记录。验证手段：冒烟第 1 步带 write_todos 的场景。</li>
+<li><strong>R2 自动批准上限</strong>：<code>MaxAutoApprovalIterations</code> 默认值未核实；REPL 兜底循环 对 surfaced 请求（含上限触发路径）一视同仁，不依赖该上限。</li>
+<li><strong>R3 拒绝路径</strong>：拒绝生成「失败工具结果」的确切形状（错误文本）未实测；以冒烟 第 2 步确认模型能收到拒绝理由并继续。</li>
+<li><strong>R4 模式评估重复</strong>：规则在 TAA（自动批判定）与 REPL（拦截/问人判定）各评一次； 引擎纯函数、同参数同结果，无一致性风险。</li>
+</ul>
+<h2 id="5-测试与验证">5. 测试与验证</h2>
+<ul>
+<li><code>dotnet build maf</code>（编译过）。</li>
+<li><code>dotnet test maf/tests</code>：规则引擎单测（不打模型）：
+<ol type="1">
+<li><code>execute</code> + <code>rm -rf /tmp/x</code> → High 命中；</li>
+<li><code>execute</code> + 注释行 <code># rm</code> → 被 commentLine 排除；</li>
+<li>Unicode 空白命令 → 命中；</li>
+<li><code>sudo apt install</code> → Medium：在 require_approval 拦、在 block 不拦；</li>
+<li>无命中 → findings 空；</li>
+<li><code>FormatFindings</code> 截断到 5 条。</li>
+</ol></li>
+<li>手动冒烟（<strong>会真实调模型，需用户同意后跑</strong>）：管道输入 <code>执行 rm -rf /tmp/x</code> → 期望出现 ⏸️ 审批块；<code>y</code> → 假工具回执；<code>N</code> → 拒绝文案； <code>执行 echo hi</code> → 不打扰直接执行；<code>/mode warn</code> 同上打印 ⚠️；<code>/mode block</code> 不问直拒。</li>
+<li>验收标准（可检验）：
+<ol type="1">
+<li>命中命令出现人工审批块（工具/参数/命中说明/<code>[y/N]</code>）；</li>
+<li>批准后模型收到工具结果并继续；</li>
+<li>拒绝后模型收到拒绝理由、工具未执行；</li>
+<li>未命中命令无审批打扰；</li>
+<li>三模式行为与 §2 表一致；</li>
+<li><code>dotnet test</code> 全绿。</li>
+</ol></li>
+</ul>
+<h2 id="6-范围外本设计不做">6. 范围外（本设计不做）</h2>
+<ul>
+<li>文件系统守卫与 PII 打码（Eino L1 三件套的另外两件）。</li>
+<li>真实 shell 执行（假工具仅为演示审批回路）。</li>
+<li>checkpoint 持久化（进程内 session 与会话同生共死）。</li>
+<li>MAF 的 <code>ApprovalNotRequiredFunctionBypassing</code> / standing rule（"always approve"） 等增强能力的显式开关（默认行为即可，不额外配置）。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/archive/old-line/specs/2026-09-26-maf-tool-approval-design.md"><code>doc/archive/old-line/specs/2026-09-26-maf-tool-approval-design.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>文档归属重构（2026-11-03） · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="文档归属重构2026-11-03">文档归属重构（2026-11-03）</h1>
+<blockquote>
+<p>性质：<strong>变更记录</strong>——当时为什么动、动了什么、怎么验收。不是方案，也不是施工真源。 现行规则看 <a href="../../index.html">doc/README.md</a> §5 与 <a href="https://github.com/Ykworm/yk-tako/blob/main/AGENTS.md">AGENTS.md</a>「文档状态与真源」。 执行流水看同目录 <a href="tasks.html">tasks.md</a>（冻结）。</p>
+</blockquote>
+<h2 id="病灶">病灶</h2>
+<p>旧规则按<strong>时效</strong>分家：<code>doc/</code> 现行、<code>docs/</code> 历史、<code>tmp/</code> 台账。但实际放法按<strong>类型</strong>分——交接稿进 <code>docs/</code>、方案进 <code>doc/</code>、裁定进 <code>doc/problems/</code>。两套规则打架，同一类文档出现多个家：</p>
+<ol type="1">
+<li><strong>记录被当垃圾</strong>：<code>docs/2026-10-19-多租户-handoff.md</code> 是 doc/28 引用的施工期实测实录，还在服役，目录名却说它过期。</li>
+<li><strong>同类文档三个家</strong>：交接稿在 <code>docs/</code> 有 9 篇，<code>doc/</code> 根还躺着 <code>handoff-doc24-…</code> 与 <code>XX-taskboard-…</code>。</li>
+<li><strong>检索污染</strong>：grep 一个机制先命中 v3/v4 再命中现行，逼出「已作废不作论据」这条补丁规则。</li>
+<li><strong>判断成本高</strong>：新人得先读规则才知道 <code>doc/</code> 与 <code>docs/</code> 的区别，而规则本身与刚写进去的跑分文章矛盾。</li>
+</ol>
+<p>根因是用会变化的「时效」当归属轴：从现行变历史要搬家，但搬家从没发生；新内容又按类型随手放进一个叫「历史」的目录。</p>
+<h2 id="拍的轴">拍的轴</h2>
+<p>按<strong>类型</strong>定家，不按时效：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>类型</th>
+<th>家</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>现行真源</td>
+<td><code>doc/</code> 顶层编号文档 + <code>doc/19-v6/</code></td>
+</tr>
+<tr>
+<td>设计裁定</td>
+<td><code>doc/problems/</code></td>
+</tr>
+<tr>
+<td>带日期的记录（交接、跑分、台账、文章）</td>
+<td><code>doc/log/</code></td>
+</tr>
+<tr>
+<td>被整代取代的材料</td>
+<td><code>doc/archive/</code></td>
+</tr>
+<tr>
+<td>非方案（故事、求职材料）</td>
+<td><code>doc/blog/</code></td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>时效变化不搬家，只改状态</strong>；只有被整代取代才进 <code>doc/archive/</code>。</p>
+<h2 id="动了什么">动了什么</h2>
+<ul>
+<li><strong>A1</strong>：<code>docs/</code> 的 9 篇日期记录 <code>git mv</code> 到 <code>doc/log/</code>，新建 <a href="../README.html">doc/log/README.md</a> 索引，改 4 处入边与记录内部旧路径。</li>
+<li><strong>A2</strong>：<code>doc/01</code>–<code>15</code>、<code>18</code>、两篇命名 handoff、<code>19-v5</code>、<code>superpowers/{plans,specs}</code> 共 31 篇移入 <code>doc/archive/old-line|engine</code>，新建 <a href="../../archive/README.html">doc/archive/README.md</a>；<code>superpowers</code> 分组名按用户意见取消，计划与设计并入 <code>old-line/</code>。</li>
+<li><strong>A3</strong>：<code>AGENTS.md</code>、根 <code>README.md</code>、<code>doc/README.md</code> §0/§5、<code>doc/53</code> §7、<code>doc/16</code> 头注改成四类归属；写入台账生命周期（todos → <code>doc/log/&lt;日期&gt;-&lt;方案&gt;/tasks.md</code>，planning 提炼成同目录 README）。</li>
+<li><strong>A4</strong>：新增 <a href="https://github.com/Ykworm/yk-tako/blob/main/scripts/check-doc-layout.sh">scripts/check-doc-layout.sh</a>（旧目录不复活、顶层无日期文件、log 命名与内容、归档清单覆盖、相对链接可解析），删除空 <code>docs/</code>，本目录作为新规则的第一个样本。</li>
+</ul>
+<h2 id="验收">验收</h2>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">bash</span> scripts/check-doc-layout.sh    <span class="co"># doc layout: OK</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">bash</span> scripts/check-master-plan.sh   <span class="co"># OK：doc/16 已覆盖 README §1 全部现行编号</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="bu">test</span> ! <span class="at">-d</span> docs                      <span class="co"># docs gone</span></span></code></pre></div>
+<p>负向自检：在 <code>doc/</code> 顶层放一个 <code>2026-01-01-*.md</code>，脚本判红并退出 1；删除后恢复 OK。</p>
+<h2 id="关联真源">关联真源</h2>
+<ul>
+<li>归属规则：<a href="../../index.html">doc/README.md</a> §5</li>
+<li>目录结构：<a href="../../53-模块地图.html">doc/53-模块地图.md</a> §7</li>
+<li>协作纪律（台账生命周期）：<a href="https://github.com/Ykworm/yk-tako/blob/main/AGENTS.md">AGENTS.md</a>「台账产物」</li>
+<li>记录索引：<a href="../README.html">doc/log/README.md</a></li>
+<li>归档索引：<a href="../../archive/README.html">doc/archive/README.md</a></li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/log/2026-11-03-%E6%96%87%E6%A1%A3%E5%BD%92%E5%B1%9E%E9%87%8D%E6%9E%84/README.md"><code>doc/log/2026-11-03-文档归属重构/README.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

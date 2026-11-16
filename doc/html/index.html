@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>doc/ 文档索引 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="doc-文档索引">doc/ 文档索引</h1>
+<blockquote>
+<p>性质：<strong>索引</strong>，不是方案。本文只回答「这篇文档是什么、能不能照着施工、代码在哪、被谁取代」。 最后核对：2026-11-16。 状态口径：✅ 已落地 · 🔶 部分落地／待收口 · ⬜ 未做 · 存档 = 历史材料，不作施工面。 代码路径均相对 <code>yk-tako-eino/</code>。</p>
+</blockquote>
+<h2 id="0-先读哪篇">0. 先读哪篇</h2>
+<p><strong>第一次进仓库，按这个顺序：</strong></p>
+<ol type="1">
+<li>根 <code>README.md</code>：项目是什么、怎么把引擎和前端跑起来。</li>
+<li>系统说明页（可离线打开）：<a href="../assets/tako-architecture.html">总览</a> → <a href="../assets/tako-run-lifecycle.html">单场 run</a> → <a href="../assets/tako-orchestration.html">长任务与编排</a> → <a href="../assets/tako-data-model.html">数据与存储</a>。先建立结构，再读契约。</li>
+<li>本索引：分清哪些文档能施工、哪些只是历史。</li>
+<li><a href="19-v6/19-运行引擎架构-v6.html"><code>19-v6/19-运行引擎架构-v6.md</code></a>：v6（第六代引擎，非服务版本）文档集总入口。</li>
+<li>契约与存储四篇，按这个顺序读：
+<ul>
+<li><a href="19-v6/19v6-01-契约-四个API.html"><code>19v6-01-契约-四个API.md</code></a>：四个端点的请求／响应／错误字节。</li>
+<li><a href="19-v6/19v6-03-存储形态与生命周期.html"><code>19v6-03-存储形态与生命周期.md</code></a>：四表 + 两键（runlive / runepoch）、真源划分、多副本。</li>
+<li><a href="19-v6/19v6-02-reconcile与双游标.html"><code>19v6-02-reconcile与双游标.md</code></a>：客户端轮询与游标。</li>
+<li><a href="19-v6/19v6-04-验收-curl.html"><code>19v6-04-验收-curl.md</code></a>：用例 → curl → 期望字节。</li>
+</ul></li>
+</ol>
+<p><strong>想在浏览器里读：</strong> <code>doc/html/</code> 下每个 md 都有一页网页版（站点首页 · 本索引的网页版），由 <code>scripts/build-doc-html.py</code> 从 md 自动生成。<strong>内容以 md 为准</strong>——网页版是同批生成的读物，改了 md 要重跑脚本，别直接改 html。</p>
+<p><strong>按任务查：</strong></p>
+<ul>
+<li>改运行引擎、API、存储：先读 19-v6 四篇，再查本表第 1 节。</li>
+<li>加工具、改子代理：<code>19v6-05</code>、<code>19v6-08</code>、<code>doc/23</code>、<code>doc/25</code>、<code>doc/26</code>、<code>doc/39</code>。</li>
+<li>改上下文压缩：<code>19v6-07</code>、<code>19v6-09</code>、<code>19v6-10</code>。</li>
+<li>改登录、租户、会话归属：<code>doc/28</code>、<code>doc/34</code>、<code>doc/35</code>。</li>
+<li>改响应信封／业务码表：<code>doc/40</code>（规则在根 <code>AGENTS.md</code>，码表在 doc/40 §4）。</li>
+<li>改契约字节、要重跑验收：<code>doc/19-v6/19v6-04</code>（人读版）、<code>scripts/acceptance/</code>（机器真源与断言器）、<code>yk-tako-eino/internal/runengine/contract_test.go</code>（快闸）。</li>
+<li>改团队前端（切换器／成员管理／邀请落地页）：<code>doc/36</code>。</li>
+<li>改界面可用性（markdown 渲染／会话历史入口／停止按钮／文件可达／破坏性操作与文案／<strong>md 文件按 markdown 渲染显示</strong>，doc/48 §10）：<code>doc/48</code>。</li>
+<li>改侧栏项目树（项目 → 对话二级、10 条上限、展示全部）：<code>doc/50</code>。</li>
+<li>改视觉（配色／字阶／间距／圆角／侧栏三段／手机抽屉／气泡）：<code>doc/51</code>。</li>
+<li>加技能、改技能目录／加载／依赖／管理面：<code>doc/52</code>。</li>
+<li>改删除与档案清理（连带删会话、单场删除、保留窗口）：<code>doc/37</code>。</li>
+<li>改记忆、召回：<code>doc/65</code>（已落地：<code>pipeline</code> = PG 两层 + 抽取代理 + Redpanda；<code>markdown</code> = <code>USER.md</code> / 项目 <code>runtime/memory/MEMORY.md</code> 同步直写）；<code>doc/29</code> 的线一已被 doc/65 取代，线二 <code>dialogue_chunks</code> 仍现行；想借鉴别家记忆设计（nanoMuse：防重／整理／变更账）：<code>doc/62</code>。</li>
+<li>改崩溃续跑：<code>doc/30</code>。</li>
+<li>改 Redis 临时键（移除 draft）：<code>doc/38</code>。</li>
+<li>改流式端点：<code>doc/31</code>。</li>
+<li>改媒体／附件：<code>doc/32</code>、<code>doc/35</code>。</li>
+<li>接 MCP：<code>doc/33</code>。</li>
+<li>看产品路线与优先级：<code>doc/16</code>。</li>
+<li>不知道某块代码在哪、归哪个模块：<code>doc/53</code>（模块地图）。</li>
+<li>想知道「agent 怎么测、公开基准选哪个、哪些不该跑」：<code>doc/56</code>。</li>
+<li>改网络抓取（<code>web_fetch</code>）：<code>doc/57</code>。</li>
+<li>改读文件（<code>read_file</code> 怎么分页）或 bash 大输出（留尾／全文落盘）：<code>doc/58</code>。</li>
+<li>改对话页的工具卡（哪些工具进气泡、摘要／失败／截断口径）：<code>doc/59</code>。</li>
+<li>改多会话并发（切走保留／实例上限／空对话项目落点／侧栏运行中）：<code>doc/60</code>。</li>
+<li>改持久 Task／多 Agent 编排：<code>doc/70</code>、<code>doc/72</code>、<code>doc/73</code>；并行任务的工作区隔离、结果交接与发布恢复：<code>doc/74</code>（已落地）。</li>
+<li>改后台命令（前台等待窗口／job 输出／停止／失联恢复）、<code>wait_task</code> 就地认领与路径账本：<code>doc/82</code>（已落地）。</li>
+<li>改目标可行性判断、继任编排组与 handoff：<code>doc/75</code>；改项目内容根、运行资源容器与整容器删除：<code>doc/76</code>（两篇 2026-11-13 已落地）。</li>
+<li>改对话页右侧任务面板（项目 Task 常驻、处理项就地打开）：<code>doc/77</code>（已落地）。</li>
+<li>改对话页右侧工作区（项目目录树、任务、Todo、文件标签与「改动的文件」回执）：<code>doc/78</code>（已落地；取代 doc/77 §3「Todo 不进面板」）。</li>
+<li>改任务列表的会话过滤（任务面板／任务页默认「本会话」、可切「本项目全部」）：<code>doc/80</code>（已落地；取代 doc/77 §3「不按会话过滤」与 doc/78 §3 同名条款）。</li>
+<li>想知道某个设计当时为什么这么裁、代价是什么：<code>doc/problems/</code>（问题档案，按模块分组）。</li>
+</ul>
+<p><strong>不要先读：</strong> <code>doc/archive/</code>（旧线 01–15、18 与引擎 v3／v4／v5）与 <code>doc/log/</code>（历史交接与文章）。这些是历史材料，不是现行施工面。</p>
+<h2 id="1-现行真源施工按这些">1. 现行真源（施工按这些）</h2>
+<ul>
+<li><p><strong>16</strong> <a href="16-能力复刻总规划.html">能力复刻总规划</a> 🔶</p>
+<ul>
+<li>落点：全仓；分篇见本表</li>
+<li>产品能力总纲。<strong>2026-10-23 已按 doc/35–49 重基线</strong>：§0.1 现状快照、§2 表补 5b（子代理持久档案与 resume）/ 9b（团队协作前端）/ 12（项目目录）/ 13（删除与档案清理）、§2c 横切契约（响应信封 doc/40、临时键 doc/38）、§5.1 当前待做、§6 索引补齐 doc/23、24、35–49 与 v6 文档集；doc/48 与 doc/49 已落地并从欠账里划掉；<strong>2026-10-27 增补 doc/52 技能方案（已点头；A1–A4、B1–B8、C1–C5、D1、E1、E2、F1–F3、G1 已落地 2026-10-28，24 拍收口）</strong>。🔶＝总纲自身仍列着 ⬜ 未做能力（IM/cron、场景化 Eval；多 Agent 协作已落地）</li>
+</ul></li>
+<li><p><strong>17</strong> <a href="17-后续计划-代码子代理与记忆.html">后续计划：代码子代理与记忆</a> 🔶</p>
+<ul>
+<li>落点：<code>internal/runengine/notes.go</code>、<code>bash.go</code>、<code>agents/</code>、<code>web/</code></li>
+<li>笔记／执行／停止／搜索／子代理折叠已落地；§5 由 doc/22 取代，§6 由 doc/25 取代</li>
+</ul></li>
+<li><p><strong>19-v6</strong> <a href="19-v6/19-运行引擎架构-v6.html">运行引擎架构 v6（index）</a> ✅</p>
+<ul>
+<li>落点：<code>cmd/yktako/</code>、<code>internal/runengine/</code>、<code>web/</code></li>
+<li>v6 文档集总入口；取代 v5</li>
+</ul></li>
+<li><p><strong>19v6-01</strong> <a href="19-v6/19v6-01-契约-四个API.html">契约：四个 API</a> ✅</p>
+<ul>
+<li>落点：<code>server.go</code>、<code>types.go</code>、<code>product_api.go</code></li>
+<li>端点字节真源；含 SSE 端点（doc/31）的翻案标注。2026-10-21 校准：帧 kind 断言改七种（补 <code>usage</code> / <code>resume</code>）、session 响应补 <code>lastRunStatus</code>/<code>lastRunId</code>/<code>workspaceId</code></li>
+</ul></li>
+<li><p><strong>19v6-02</strong> <a href="19-v6/19v6-02-reconcile与双游标.html">reconcile 与双游标</a> ✅</p>
+<ul>
+<li>落点：<code>server.go</code>、<code>redisstore.go</code>、<code>store.go</code></li>
+<li>客户端流程与 <code>eventOffset</code> 语义</li>
+</ul></li>
+<li><p><strong>19v6-03</strong> <a href="19-v6/19v6-03-存储形态与生命周期.html">存储形态与生命周期</a> ✅</p>
+<ul>
+<li>落点：<code>pgstore.go</code>、<code>redisstore.go</code>、<code>store.go</code></li>
+<li>四表 + 两键（runlive / runepoch）、真源划分、多副本</li>
+</ul></li>
+<li><p><strong>19v6-04</strong> <a href="19-v6/19v6-04-验收-curl.html">验收（curl 手打）</a> ✅</p>
+<ul>
+<li>落点：—（被测端点见 19v6-01）；机器版在 <code>scripts/acceptance/</code></li>
+<li>改契约字节必须同步改本篇并重跑。2026-10-21 校准：session 期望字节追平现行代码，头注附实跑实录。<strong>2026-10-22</strong>：机器可重跑版已入库——机器真源 <code>scripts/acceptance/expected.json</code>、断言器 <code>assert_contract.py</code>、散文↔︎清单一致性 <code>check-expected.sh</code>；「重跑」从此是一句命令，快闸在 <code>internal/runengine/contract_test.go</code></li>
+</ul></li>
+<li><p><strong>19v6-05</strong> <a href="19-v6/19v6-05-tool-loop.html">tool loop（T 系列）</a> ✅</p>
+<ul>
+<li>落点：<code>tools.go</code>、<code>agents.go</code>、<code>agentlog.go</code>、<code>midfold.go</code>、<code>toolsearch.go</code>、<code>profile.go</code></li>
+<li>T1–T3 已落地；T4/T5（分级 + BM25 <code>tool_search</code>）2026-10-20 落地（A1 <code>ad1ab6b</code>、A2 <code>a190f4d</code>；A3 寿命验收、A4 回归收口）</li>
+</ul></li>
+<li><p><strong>19v6-06</strong> <a href="19-v6/19v6-06-deferred-tools与缓存机制.html">工具分级与 deferred tools</a> ✅</p>
+<ul>
+<li>落点：—（纯机制背景篇，无代码落点）</li>
+<li>非契约篇；client mode 已是终态底座，hosted mode 2026-10-21 裁定不接；厂商矩阵与链路留作背景</li>
+</ul></li>
+<li><p><strong>19v6-07</strong> <a href="19-v6/19v6-07-compact.html">compact（v6 形态）</a> ✅</p>
+<ul>
+<li>落点：<code>compact.go</code>、<code>compact_test.go</code></li>
+<li>C1–C4 已落地</li>
+</ul></li>
+<li><p><strong>19v6-08</strong> <a href="19-v6/19v6-08-file-tools.html">文件工具族（F 系列）</a> ✅</p>
+<ul>
+<li>落点：<code>fileops.go</code>、<code>filetools.go</code>、<code>media.go</code></li>
+<li>文件工具机制与契约真源</li>
+</ul></li>
+<li><p><strong>19v6-09</strong> <a href="19-v6/19v6-09-溢出修复层.html">溢出修复层</a> ✅</p>
+<ul>
+<li>落点：<code>overflow.go</code>、<code>overflow_test.go</code></li>
+<li>一期／二期／三期均已落地</li>
+</ul></li>
+<li><p><strong>19v6-10</strong> <a href="19-v6/19v6-10-mid-run-fold.html">mid-run fold</a> ✅</p>
+<ul>
+<li>落点：<code>midfold.go</code>、<code>midfold_test.go</code></li>
+<li>run 中途压缩；A5 已验收</li>
+</ul></li>
+<li><p><strong>19v6-90</strong> <a href="19-v6/19v6-90-演进记录.html">演进记录</a> ✅</p>
+<ul>
+<li>落点：—（修订记录）</li>
+<li>只追加不篡改；契约本身看 19v6-01</li>
+</ul></li>
+<li><p><strong>21</strong> <a href="21-同会话历史查找.html">同会话历史查找</a> ✅</p>
+<ul>
+<li>落点：<code>search.go</code>、<code>search_test.go</code></li>
+<li>H1–H5 落地；<code>search_history</code> 工具</li>
+</ul></li>
+<li><p><strong>22</strong> <a href="22-网络搜索.html">网络搜索</a> ✅</p>
+<ul>
+<li>落点：<code>websearch.go</code>、<code>websearch_test.go</code></li>
+<li>已切 DeepSeek <code>/v1/tools/search</code>；结果始终落盘再给描述段</li>
+</ul></li>
+<li><p><strong>23</strong> <a href="23-coder规格.html">coder 规格</a> ✅</p>
+<ul>
+<li>落点：<code>agents/coder.md</code>、<code>agents.go</code></li>
+<li>§2 已逐字落盘；<code>tools:</code> 白名单挡 <code>search_history</code>／<code>web_search</code></li>
+</ul></li>
+<li><p><strong>24</strong> <a href="24-用量计数.html">用量账单、滤思考与折叠触发</a> ✅</p>
+<ul>
+<li>落点：<code>compact.go</code>、<code>agentlog.go</code>、<code>worker.go</code></li>
+<li>计数、滤思考、Usage mid-run 触发</li>
+</ul></li>
+<li><p><strong>25</strong> <a href="25-子代理折叠.html">子代理进程内折叠</a> ✅</p>
+<ul>
+<li>落点：<code>midfold.go</code>、<code>agentfold_test.go</code>、<code>agents.go</code>（壳化装配）</li>
+<li>取代 doc/17 §6；A1–A3 已验收；2026-10-23 翻案落地壳化装配（per-delegation 重装的壳化变体：装载输入/观测面 run 级不动，实例每次委派新建，#1177 委派路径消除）</li>
+</ul></li>
+<li><p><strong>26</strong> <a href="26-researcher工具护栏.html">researcher 的工具护栏</a> ✅</p>
+<ul>
+<li>落点：<code>agents.go</code>、<code>agents/researcher.md</code>、<code>agents/coder.md</code></li>
+<li><code>exclude_tools</code> 四态；排除清单只剩 <code>bash</code></li>
+</ul></li>
+<li><p><strong>27</strong> <a href="27-用量可见.html">用量可见化</a> ✅</p>
+<ul>
+<li>落点：<code>product_api.go</code>、<code>server.go</code>、<code>worker.go</code>、<code>web/src/</code></li>
+<li>usage 帧／页面阈值／runlog 历史行</li>
+</ul></li>
+<li><p><strong>28</strong> <a href="28-多租户.html">多租户运行时</a> ✅</p>
+<ul>
+<li>落点：<code>auth.go</code>、<code>identity_store.go</code>、<code>members_store.go</code>、<code>tenant_api.go</code>、<code>scope.go</code>、<code>pgstore.go</code></li>
+<li>2026-10-21 收口。A0–A6 共 30 拍已落地并 curl 验收，随 <code>9c21b66</code> 入库。团队前端不在本篇（doc/36 已落地）；A7 那一档里「旧成功体换信封」已由 <a href="40-响应信封统一.html">doc/40</a> 于 2026-10-22 落地，<strong>计费、API key、SSO、组织共享、审计导出整批已拍不做</strong>（2026-10-22 用户裁，与运行时关系不大的商业化、合规项，§15；2026-10-23 复核维持）</li>
+</ul></li>
+<li><p><strong>29</strong> <a href="29-长期记忆.html">长期记忆与对话召回</a> ✅（<strong>线一 2026-11-10 起被 <a href="65-记忆两层方案.html">doc/65</a> 取代；线二 dialogue_chunks 仍现行</strong>）</p>
+<ul>
+<li>落点：线二现行 = <code>dialogue.go</code>、<code>worker.go</code>；线一旧实现（<code>recall.go</code> 的 Go 侧词法召回、PG 轮询抽取循环）已退役</li>
+<li>A1–B4 全落地；两条加工线共用 runlog。<strong>2026-10-22</strong>：召回块改进「本轮输入」并写回 mh 的 seq=1（runlog 仍纯原话）→ mid-run 折叠不再抹掉它；块带 created time；计入折叠预算。折叠链本身未改</li>
+</ul></li>
+<li><p><strong>30</strong> <a href="30-崩溃续跑.html">崩溃续跑</a> 🔶</p>
+<ul>
+<li>落点：<code>journal.go</code>、<code>worker.go</code>、<code>resume_test.go</code>、<code>web/src/api.ts</code>、<code>web/src/chat.ts</code>、<code>web/src/App.vue</code></li>
+<li>A1–A5 已落地；A6 自动巡检 2026-10-21 裁为客户端触发式恢复（server 巡检不做）；<strong>A8 前端 reattach 已落地并验收</strong>（interrupted 琥珀提示 +「继续这一轮」按钮，2026-10-21）；A7 回归收口已跑（<code>go test -count=1</code> 25.3s 绿、vet 干净、<code>19v6-04</code> 矩阵重放全过）。<strong>2026-10-22</strong>：§10.1/§10.2/§10.4 的期望字节已随 <a href="40-响应信封统一.html">doc/40</a> 换信封（404 <code>112002</code>、409 三态 <code>112102</code>/<code>112103</code>/<code>112104</code>）</li>
+</ul></li>
+<li><p><strong>31</strong> <a href="31-sse流式端点.html">SSE 流式端点</a> ✅</p>
+<ul>
+<li>落点：<code>server.go</code>、<code>redisstore.go</code>、<code>stream_test.go</code></li>
+<li>同一帧面的第二种运输方式；拉是正确性、流是优化</li>
+</ul></li>
+<li><p><strong>32</strong> <a href="32-media-offload.html">media_offload（对话只存 path）</a> ✅</p>
+<ul>
+<li>落点：<code>media.go</code>、<code>media_send.go</code>、<code>media_tokens.go</code>、<code>filetools.go</code>、<code>pdftext.go</code>、<code>pdftool.go</code>、<code>midfold.go</code>、<code>worker.go</code>、<code>guard.go</code>、<code>profile.go</code>、<code>compact.go</code>、<code>provider-catalog.json</code>、<code>media_test.go</code></li>
+<li>2026-10-21 收口，两个半边都落地（存储纪律 A1–A2；模型可见 A3 五拍）。A1–A7 已落地（dcf3e6b）；A3-1 至 A3-5 已落地并活体验收（2026-10-20）。A3-5 按 DeepSeek v41 计价：800×800 为 422、100×100 为 184；窗口 940 上 814&gt;752 进入折叠。A8-1 已施工并活体验收（2026-10-20，run <code>r_01M5CF1DFS9ZAD72GYQ5YXRYH8</code> complete，assistant 含 banana，user 行仍是占位，该 run 两表零 base64）。A8-2 边界已活体验收（2026-10-20）：第 3 页 run <code>r_01M5CH3GN1Y9KDKPMJ90R0NPCS</code> 含 orange；第 99 页 run <code>r_01M5CH3MM7HTQ2KDXA36YWW35M</code> 返回 pages=3 与超出范围；扫描件 run <code>r_01M5CH3RM7JY9GS0CX779Y5S0Y</code> 写明无文本层；音视频 run <code>r_01M5CH3WK609YQJBGFVCAQ4BDN</code> 上 <code>read_pdf_text</code> 拒绝非 PDF；<code>TAKO_MEDIA_SEND=off</code> 的 run <code>r_01M5CH5KCY1RQA6T7Z1QY0YW7Y</code> 仍读到 orange 且无 media send 行。这些 run 的两表零 base64。扫描件 OCR 不做。<strong>2026-10-22</strong>：media 的 404 按 <a href="40-响应信封统一.html">doc/40</a> 拆成三个码（<code>114001</code> 项目看不见／<code>114101</code> 文件不存在／<code>114102</code> 路径不对），成功体仍是图片字节、不进信封</li>
+</ul></li>
+<li><p><strong>33</strong> <a href="33-mcp-client.html">MCP client</a> ✅</p>
+<ul>
+<li>落点：<code>mcp.go</code>、<code>mcpconf.go</code>、<code>mcpconf_test.go</code></li>
+<li>stdio 本地 server；工具直接进池</li>
+</ul></li>
+<li><p><strong>34</strong> <a href="34-租户运行时装配.html">租户运行时装配</a> ✅</p>
+<ul>
+<li>落点：<code>tenantmodel.go</code>、<code>agents.go</code>、<code>mcpconf.go</code>、<code>tenant_runtime_test.go</code>、<code>web/</code></li>
+<li>R1–R5＋U1 已落地并浏览器验收；commit 9c21b66</li>
+</ul></li>
+<li><p><strong>35</strong> <a href="35-项目目录.html">项目目录（workspace）</a> ✅</p>
+<ul>
+<li>落点：<code>product_store.go</code>、<code>session_access.go</code>、<code>media.go</code>、<code>web/</code></li>
+<li>2026-10-21 收口。A1–A8c 共 13 拍已落地并 curl 验收，随 e30d1f9 入库；路径方案取代 doc/32 的 <code>sessions/&lt;sid&gt;/</code> 版。第 0 节第 3 条「删除只删空项目」已由 doc/37 改写（2026-10-21 已落地）：有会话改为连带软删，<code>114002</code> 退役，活 run 用 <code>114006</code>，单场删除用 <code>114007</code></li>
+</ul></li>
+<li><p><strong>36</strong> <a href="36-团队前端.html">团队前端（切换器／成员／邀请）</a> ✅</p>
+<ul>
+<li>落点：<code>web/</code>（<code>App.vue</code>、<code>MembersView.vue</code>、<code>InviteLanding.vue</code>、<code>PendingInvites.vue</code>、<code>auth.ts</code>）；G1/G3 小改在 <code>product_api.go</code>、<code>product_store.go</code></li>
+<li>2026-10-21 已落地，随 <code>0fd15c5</code> 入库：切换器／成员页／邀请落地页与待处理邀请；收尾 build/test/vet 全绿</li>
+</ul></li>
+<li><p><strong>37</strong> <a href="37-删除与档案清理.html">删除与档案清理</a> ✅</p>
+<ul>
+<li>落点：<code>pgstore.go</code>、<code>product_api.go</code>、<code>session_access.go</code>、<code>store.go</code>、<code>server.go</code>、<code>worker.go</code>、<code>archive_sweep.go</code>、<code>auth.go</code>、<code>cmd/yktako/main.go</code></li>
+<li>2026-10-21 已落地。D1、D2 随 0fd15c5 入库；D3、D4 在 8905 curl 验收后入库。改写 doc/35「删除只删空项目」；单场删除仅属主；清扫器持 <code>cleaner_state</code> 租约，<code>-archive-ttl</code> 默认 168h，探针 <code>POST /api/dev/clean-sweep</code>。<code>114002</code> 退役</li>
+<li><strong>D-l 已落地（2026-11-10 随 <a href="65-记忆两层方案.html">doc/65</a>）</strong>：按 scope 删除——<code>pipeline</code> 清该项目两层 <code>scope='workspace'</code> 的 <code>memory_items</code> 与相关 <code>memory_jobs</code>，保留跨项目 <code>user</code> 行；<code>markdown</code> 的项目 <code>MEMORY.md</code> 随目录删除、用户 <code>USER.md</code> 不动；两种模式都清 <code>dialogue_chunks</code>，租户归档不动记忆行。代码在 <code>pgstore.go</code> 删除事务与 <code>memory_migrate.go</code>；活体 <code>scripts/acceptance/memory_project_delete_live.sh</code>（9/9）</li>
+</ul></li>
+<li><p><strong>38</strong> <a href="38-删除draft键.html">删除 tk:draft 键</a> ✅</p>
+<ul>
+<li>落点：<code>redisstore.go</code>、<code>store.go</code>、<code>server.go</code>、<code>worker.go</code>、<code>store_test.go</code></li>
+<li>2026-10-20 已落地；定稿正文来自 turn，写口只认 runepoch</li>
+</ul></li>
+<li><p><strong>39</strong> <a href="39-子代理持久化与resume.html">子代理持久化与 resume</a> ✅</p>
+<ul>
+<li>落点：<code>agents.go</code>、<code>subagent_wire.go</code>、<code>resume_subagent.go</code>、<code>archive_sweep.go</code>、<code>worker.go</code>、<code>server.go</code></li>
+<li>2026-10-21 已落地。S1 随 e476749 入库；S2、S3 在 8905 curl 验收后入库。每实例追加式 wire（<code>.tako/subagents/</code>，无 PG 表）+ <code>resume_subagent</code>（只认完整档案；不做半截重接，对齐 doc/30）。第三类清扫挂在 doc/37 同一轮，只删过窗文件</li>
+</ul></li>
+<li><p><strong>40</strong> <a href="40-响应信封统一.html">响应信封统一</a> ✅</p>
+<ul>
+<li>落点：<code>auth.go</code>、<code>server.go</code>、<code>mcp.go</code>、<code>product_api.go</code>、<code>archive_sweep.go</code>、<code>envelope_test.go</code>、<code>web/src/api.ts</code>、<code>web/src/chat.ts</code></li>
+<li>2026-10-22 落地，随 <code>cd85050</code> 入库。A7-1…A7-8 共 8 拍：后端六拍（curl 逐字节）+ 前端一拍（Playwright 活体）+ 收口一拍。runs／sessions／mcp／media／memory 五组旧接口整包换 <code>{code,message,data}</code>；<strong>不动存储、不动帧格式、不动 HTTP 状态码</strong>；media 的二进制成功体与 SSE 帧面不进信封。台账 <code>tmp/A7-信封迁移/</code>（不入库）</li>
+</ul></li>
+<li><p><strong>41</strong> <a href="41-任务看板与人工审批.html">任务看板与人工审批</a> ✅</p>
+<ul>
+<li>落点：<code>pii.go</code>、<code>pii_test.go</code>、<code>pii_mount_test.go</code>、<code>tasktools.go</code>、<code>tasktools_test.go</code>、<code>tools.go</code>、<code>midfold.go</code>、<code>memory.go</code>、<code>worker.go</code>、<code>pgstore.go</code>、<code>server.go</code>、<code>contract_test.go</code>、<code>store_test.go</code>、<code>web/src/{api.ts,chat.ts,App.vue}</code>、<code>scripts/acceptance/taskboard_crash.sh</code></li>
+<li>2026-10-23 落地。<strong>B（PII 脱敏）+ C（任务看板）两线全施工</strong>；<strong>Loop A（人审回路）整条不做</strong>（bash 与 MCP 的越界都由沙箱围栏硬挡 → 没有需要挂起问人的场景，§3.1 与 §6 的 A1–A7 留档备查）。PII 三处挂载点：工具统一出口 <code>wrapToolErrors</code>（含 MCP）＋ 模型输入唯一转换口 <code>toSchemaMessages</code>（覆盖折叠后）＋ 记忆入库前（密钥拒收 / 证件打码）。看板：PG 表 <code>run_tasks</code> + 四把工具 + <code>kind=task</code> 帧（词表 7→8）+ 前端看板块；<strong>活得过崩溃</strong>（kill -9 → 重启 → resume，崩前建的行一条没丢且续跑里继续更新）。task 帧字节在 doc/19-v6-04「用例 8」登记为暂不断言（模型行为不稳）。对应 doc/16 §5.1 第 1、2 项与 §2 表 #2/#3</li>
+</ul></li>
+<li><p><strong>42</strong> <a href="42-产品形态收窄与共享项目退役.html">产品形态收窄与共享项目退役</a> ✅</p>
+<ul>
+<li>落点：<code>pgstore.go</code>、<code>store.go</code>、<code>product_store.go</code>、<code>product_api.go</code>、<code>server.go</code>、<code>auth.go</code>、<code>filetools.go</code></li>
+<li>2026-10-22 落地，随 <code>44cf7ca</code> 入库。形态定稿：tako = 多租户的 AI 工作台，<strong>一个员工 = 一个项目</strong>，<strong>项目文件由多 session 共享</strong>，团队共享账号/额度/审计、<strong>不共享文件</strong>（不做协同编辑）。退役两样：跨成员共享项目（可见性判定只剩属主；<code>PATCH /api/workspaces/:id/visibility</code> 端点留着路由恒回 404 <code>114001</code>；<code>114004</code> 退役）、项目闸（<code>one_live_run_per_workspace</code> 索引 DROP，同项目并发不再被 409 挡）。另：不再有游离会话——每场 run 自动挂默认项目</li>
+</ul></li>
+<li><p><strong>43</strong> <a href="43-租户并发闸入DB.html">租户并发闸入 DB</a> ✅</p>
+<ul>
+<li>落点：<code>store.go</code>、<code>scope.go</code>、<code>server.go</code>、<code>product_api.go</code>、<code>store_test.go</code>、<code>scripts/acceptance/tenant_gate.sh</code></li>
+<li>2026-10-23 落地。<strong>租户并发上限</strong>（<code>tenants.max_concurrent_runs</code>，默认 8）那道闸原来在 API 层「数一遍 → 比上限 → 放行」，数与放行是两次独立的事 → 并发下超发（活体实测：上限 2，并发四打进来 4 场）。<strong>现在数与放行收进同一笔 PG 事务</strong>，中间持一把所有副本共享的顾问锁（<code>pg_advisory_xact_lock</code>）→ 并发下不可能超发。<strong>无 DDL、无存量迁移</strong>、计数口径逐字不变（僵尸行不算活，不误拒）、<strong>契约字节不变</strong>（满租户仍回 429 <code>113001</code>）。回归网：存储层 <code>TestTenantGateConcurrent</code>（摘掉闸即红）+ 活体 <code>tenant_gate.sh</code>。对应 doc/16 §2c「闸在数据库」</li>
+</ul></li>
+<li><p><strong>44</strong> <a href="44-前端三处欠账.html">前端三处欠账</a> ✅</p>
+<ul>
+<li>落点：<code>web/src/{api.ts,chat.ts,App.vue,ProjectsView.vue,ConfirmDialog.vue}</code></li>
+<li>2026-10-23 落地。三处前端入口：<strong>个人项目页</strong>（列表／新建／改名／删除／项目下会话／开新对话）、<strong>项目与单场会话删除 + 确认弹窗</strong>（服务端 409 文案原样显示）、<strong>当前会话的子代理列表与「继续」</strong>（把带 <code>sa_id</code> 的指令追加进输入框，由父 agent 调 <code>resume_subagent</code>，不新增 HTTP 端点）。<strong>后端零改动</strong>。当前项目按租户存 <code>localStorage['tako.workspaceId.&lt;tid&gt;']</code>，<code>workspaceId</code> 只随新会话的 <code>POST /api/runs</code> 发送。对应 doc/16 §5.1 第 2 项与 §2 表 #5b/#12/#13</li>
+</ul></li>
+<li><p><strong>45</strong> <a href="45-场景化Eval框架.html">场景化 Eval 框架（方案）</a> ⬜（方案待点头）</p>
+<ul>
+<li>落点：—（未施工）</li>
+<li>2026-10-23 立项。给「<strong>活有没有干完</strong>」建一层可机器重跑的回归——前两层（快闸 <code>contract_test.go</code> + 契约 <code>scripts/acceptance/</code>）只断"接口有没有按约定回"，断不了"活干完了没有"（2026-10-23 PII 挂载点选错时两层全绿）。场景 = 准备/动作/判定/证据四件套；判定分 <strong>K 系统字节 / S 引擎裁决 / B 模型行为 / C 只登记</strong> 四组（按「判定锁在被测系统上」分，不按「模型会不会抖」分）；判定 = <strong>M=M</strong>（跑 M 次全过才算过，M=5），不通过也逐次记录；红的成因分<strong>归因</strong>（<code>engine_regression</code> / <code>model_below_baseline</code> / <code>model_baseline</code> / <code>unasserted</code> / <code>incomplete</code>），<strong>只有前两者拦门禁</strong>；语料 = <strong>17 条四组目录</strong>（K 7 / S 4 / B 4 / C 1 + 示例 2）。<strong>不改 <code>internal/runengine/</code> 生产代码</strong>——Eval 站在引擎外面看它。预计落点 <code>scripts/eval/</code>（复用 <code>scripts/acceptance/harness.py</code>，不另起 HTTP 底座）。对应 doc/16 §2b 第 6 行与 §2c「验收可机器重跑」第三层</li>
+</ul></li>
+<li><p><strong>46</strong> <a href="46-变更同步与事件通道.html">变更同步与事件通道</a> ✅</p>
+<ul>
+<li>落点：<code>yk-tako-eino/internal/runengine/{events.go,server.go,auth.go,product_api.go,contract_test.go}</code>、<code>web/src/{mutation.ts,api.ts,chat.ts,App.vue,ProjectsView.vue}</code>、<code>scripts/acceptance/events_live.sh</code></li>
+<li>2026-10-23 落地。多 tab 失效通知的根治：<strong>Loop A</strong> BroadcastChannel 同机广播 + 统一失效函数（清落点/重拉列表/会话已删横幅）+ 投递 114001 自愈；<strong>Loop B</strong> 账号级 SSE <code>GET /api/events</code>（Redis Stream <code>tk:events:&lt;tid&gt;</code> 第三临时键，<code>XADD</code> 写口=变更端点横切契约；<code>Last-Event-ID</code> 续传、新连接从 <code>$</code> 起；<code>?access_token=</code> 兜底鉴权）——doc/16 #8b 前置。前端 EventSource 与广播并存、同喂一个 dispatch。活体：B2 七条 + B3 三条全过；用例 9 进 <code>expected.json</code> declared_not_asserted（<code>events_live.sh</code> 判红）+ <code>TestContractStreamEventBytes</code> 快闸。doc/16 §2c 扩两行</li>
+</ul></li>
+<li><p><strong>47</strong> <a href="47-Plan审核与追问澄清.html">Plan 审核与追问澄清</a> ✅</p>
+<ul>
+<li>落点：<code>runengine/{questions.go,waittools.go,plangate.go,journal.go,worker.go,server.go,store.go,pgstore.go,types.go,store_test.go,contract_test.go}</code>、<code>web/src/{chat.ts,App.vue,api.ts}</code>、<code>scripts/acceptance/question_crash.sh</code></li>
+<li>2026-10-23 立项并落地。<strong>Q（ask_user）</strong>：<code>run_questions</code> 表 + <code>kind=question</code> 帧（词表 8→9）+ 三拍（落行/发帧/轮询）+ CAS 一答终答 + resume 重放第三分支 + options 快捷选项；<strong>P（plan gate，A 形态=kimi 式运行时守卫）</strong>：模型自主调 <code>enter_plan_mode</code>，<code>planGuardHandler</code> 黑名单硬 deny 写/执行，<code>submit_plan</code> 复用等人机器过人审（可编辑方案卡），批准注回并放行。P/Q 共用一张表（kind 列）一种帧一套 resume 分支；新增 <code>15</code> 人审与问答段（115002/115101）。<code>question_crash.sh</code> 16 条断言验「挂起中 kill -9 → resume → 答 → complete」；<code>seed-question</code> 脚手架已转只读 <code>question-check</code>。翻 doc/41 §7「不做 Plan 层人审 gate」之案（用户 2026-10-23 拍）</li>
+<li><strong>2026-11-03 补记（§5.5）</strong>：一场 run 的正文按等人工具分段——仍是一条 Σ assistant 行，payload 加 <code>segments:[{end,toolCallId}]</code>（rune 偏移）；历史/收口/实时同套切法，问题卡挂切点前那段，已答自由文本问题紧跟右对齐答案气泡。<code>questionView</code> 补 <code>toolCallId</code>，<code>answer</code> 对 question/plan/install 全量返回。无提问 run 的 payload 字节不变</li>
+</ul></li>
+<li><p><strong>48</strong> <a href="48-前端可用性欠账.html">前端可用性欠账（方案）</a> ✅（2026-10-23 全部 17 拍落地；<strong>2026-11-14 补充 §10</strong>：md 文件按 markdown 渲染显示、默认预览态可切「原文」，doc/79）</p>
+<ul>
+<li>落点：<code>yk-tako-eino/web/{playwright.config.ts,e2e/,test/,src/{App.vue,ProjectsView.vue,WorkspaceFileView.vue,Configure.vue,MembersView.vue,api.ts,chat.ts,markdown.ts,markdown.css}}</code>、<code>yk-tako-eino/internal/runengine/{product_api.go,server.go,contract_test.go}</code>、<code>scripts/acceptance/{expected.json,harness.py,assert_contract.py}</code>（<strong>新增</strong>：文件清单端点 <code>GET /api/workspaces/:id/files</code>、项目对象的 <code>isDefault</code> 字段；markdown 渲染走 <code>marked</code> + <code>dompurify</code>）</li>
+<li>2026-10-23 立项。2026-10-23 浏览器走查（四个页面 × 两种视口宽度 + 只读 API 交叉核对）逐条验出 <strong>17 条界面现象（归并为 14 项修复）</strong>：<strong>markdown 渲染是 v6 契约违背</strong>（19v6-03:118 写明「客户端按 markdown 渲染」，代码是纯文本插值）；<strong>后端早有的能力前端没入口</strong>（停止端点 <code>POST /api/runs/:id/stop</code> 一次没调 / 跨项目会话列表 <code>GET /api/sessions</code> 前端从不裸调 / 文件字节出口 <code>GET /api/media</code> 只有图片在用）；<strong>agent 产出的文件用户拿不走</strong>（项目页不列文件、文件片不可点）。分 4 个 loop 17 个 action，<strong>只有 2 条动后端</strong>（B1 新增 <code>GET /api/workspaces/:id/files</code>、C1 响应体加 <code>isDefault</code> 字段）。台账 <code>tmp/48-前端可用性欠账/</code>（不入库）</li>
+<li><strong>2026-11-14 补充（doc/79）</strong>：项目里的 <code>.md</code> / <code>.markdown</code> 在<strong>两个入口</strong>（对话页右侧文件标签、项目页文件列表）按 markdown 渲染显示、<strong>默认预览态</strong>、可切「原文」；排版样式抽成<strong>全局</strong> <code>.md-body</code> 三处共用（Vue 的 scoped 样式不跨组件，抄不进第二个组件）；渲染复用 <code>markdown.ts</code> 既有管线（marked + DOMPurify），md 用 <code>breaks: false</code>、气泡仍 <code>breaks: true</code>；<strong>先截断后渲染</strong>、不把 token 拼进 URL。纯前端、<strong>契约字节零变化</strong>；单测 8 条 + playwright 2 条新断言全绿。详见 §10</li>
+</ul></li>
+<li><p><strong>49</strong> <a href="49-走查缺陷修复.html">走查缺陷修复</a> ✅（已落地，2026-10-23）</p>
+<ul>
+<li>落点：<code>internal/runengine/{agents.go,product_api.go,server.go,accesslog_test.go,agents_test.go}</code>、<code>web/src/{chat.ts,App.vue,Configure.vue,ProjectsView.vue,InviteLanding.vue,markdown.ts,auth.ts}</code>、<code>web/test/markdown.test.ts</code></li>
+<li>2026-10-23 立项并于同日落地。doc/48 落地后的<strong>第二次</strong>全站走查：Playwright 逐页点击 + 真停止 + 跨标签页 + 窄屏 + 引擎日志对读，逐条验出 <strong>12 项</strong>。<strong>1 项 P0</strong>：子代理名字含空格/中文 → 厂商 <code>tools[i].function.name</code> 400 → <strong>整个租户所有 run 失败</strong>（保存/导入/落盘三个入口都没校验）；<strong>5 项 P1</strong>：停止/失败刷新后整轮消失、等人面板被别端停掉后卡死输入框且等待期间无停止入口、删除会话事件不剪侧栏（死链点进空对话）、新建同名内置助手静默清空说明/规格/工具、导入默认可见性（团队）与手工新建（仅自己）相反；<strong>6 项 P2/P3</strong>：报错带 HTTP 状态码、refresh 失效静默登出、邀请页印错邮箱、复制失败无反馈、密钥空名行谎报成功、灯箱不能关/不放大、名字无长度上限、自动链接吞中文标点、项目页两句话与行为不符、访问日志含完整 <code>access_token</code>。四问按推荐值落地（§14），落地与验收记录见 §15。台账 <code>tmp/49-走查缺陷修复/</code>（不入库）</li>
+</ul></li>
+<li><p><strong>50</strong> <a href="50-侧栏项目树.html">侧栏项目树（方案）</a> ✅（A1–A5 已落地 2026-11-15）</p>
+<ul>
+<li>落点：<code>web/src/App.vue</code>（只此一处）</li>
+<li>2026-10-24 立项。侧栏从「最近 10 条扁平会话 + 内部滚动条」改为<strong>全部项目 → 各自对话</strong>的二级树（手风琴、默认全展开、空项目显示「还没有对话」）：整栏合计 10 条、超出点「展示更多」就地 +10、全展开后变「收起」；<strong>每个项目再限 10 条</strong>，项目内超出时该项目下出「展示全部」，点开只放开这一个项目；项目名前是文件夹图标（开口=展开、合口=折叠）。列表内滚动条已删。<strong>后端零改动</strong>（<code>GET /api/workspaces</code> + <code>GET /api/sessions</code> 现有字段够拼）。A1 数据层／A2 树与空态／A3 展示更多／A4 双层上限与图标均已浏览器验收；<strong>A5（<code>workspace_renamed</code>/<code>workspace_deleted</code> 事件重载、窄屏、文档回填）已于 2026-11-15 收口</strong>（<code>App.vue</code> 的 <code>onMutation</code> 对上两类事件即重拉侧栏树，窄屏一项由 doc/51 U6 覆盖；Playwright <code>web/e2e/sidebar-events.spec.ts</code>，commit <code>cba0339</code>）。台账 <code>tmp/50-侧栏项目树/</code>（不入库）</li>
+</ul></li>
+<li><p><strong>51</strong> <a href="51-UI视觉重做.html">UI 视觉重做</a> ✅（已落地，2026-10-24）</p>
+<ul>
+<li>落点：<code>web/src/base.css</code> + <code>web/src/App.vue</code> + <code>web/src/{ProjectsView,Configure,MembersView,ConfirmDialog,InviteLanding,PendingInvites,PlanDoc}.vue</code>（样式段；后端零改动）</li>
+<li>2026-10-24 立项并于同日 U1–U7 落地。<strong>token 层先行</strong>（8 个组件 150 处硬编码颜色 → <code>base.css</code> 变量），中性现代风（浅灰白 + 单一蓝强调、白卡细边、无暖阴影）；侧栏三段式修掉 900px 高时底栏压住树；三页骨架/弹层统一 860px 列、22px 标题、12px 卡片、28/32 控件；对话列 720px、气泡 ≤86% 且用量/复制移到气泡下方；≤860px 顶栏 52px + 280px 抽屉（遮罩 / <code>Esc</code> / 开会话三法关闭，焦点往返、<code>aria-modal</code>）；四档 1440/1024/700/390 收口：无横向溢出、正文 16.88:1、次要 4.51:1、控件高 28/32、行高 30/34。<strong>不改后端契约、不改交互流程、不改 doc/50 的树逻辑</strong>。台账 <code>tmp/51-UI重做/</code>（不入库）。<strong>2026-11-03 改口径</strong>：对话列去掉 45rem 上限、铺满内容区（左右 1.5rem），助手气泡 100%、用户气泡 78%；手机断点仍是 100% − 1.2rem（doc/47 §5.5）</li>
+</ul></li>
+<li><p><strong>52</strong> <a href="52-技能.html">技能（Agent Skills）</a> ✅（已落地 2026-10-28；<strong>A1–A4、B1–B8、C1–C5、D1、E1、E2、F1、F2、F3、G1 全部施工并验收，24 拍收口</strong>）</p>
+<ul>
+<li>落点：<strong>A1 已落</strong>：<code>internal/runengine/skills.go</code>（<code>skill_rows</code> / <code>skill_disables</code> 两张表 + <code>GET /api/skills</code>）、<code>internal/runengine/pgstore.go</code>（建表与部分唯一索引 <code>(tenant_id, name) WHERE valid</code>）、<code>internal/runengine/server.go</code>（路由）；契约字节 <code>scripts/acceptance/expected.json</code> 用例 14 + <code>doc/19-v6/19v6-04-验收-curl.md</code> 同号散文。</li>
+<li><strong>A2 已落</strong>：<code>internal/runengine/skills_scan.go</code>（<code>POST /api/skills/rescan</code>、frontmatter 解析、扫盘）、<code>internal/runengine/skills_test.go</code>（解析与扫盘单测）；库级两级锁（<code>pg_advisory_lock</code> 会话级，全局共享 + 租户独占）；<code>-system-skills-dir</code> 旗标（<code>cmd/yktako/main.go</code>）；契约字节用例 15。</li>
+<li><strong>A3 已落</strong>：系统管理员全量重扫（<code>-bootstrap-admin-email</code>；全局独占锁；系统根 + 每个租户根；系统行落空串桶）；系统根读失败 → 整次中止不删行、读到 0 条 → 只报数不删行；租户级重扫只涉本租户根与本租户的行；跨桶同名按「先占的生效」显式比；平铺形态也进扫描；契约字节用例 16。</li>
+<li><strong>A4 已落</strong>：<code>GET /api/skills/:name</code> 详情（租户视界解析、<code>body</code> 逐字原文、<code>missing</code> 恒空数组）；契约字节用例 17。</li>
+<li><strong>B1 已落</strong>：<code>internal/runengine/skilltools.go</code>（<code>&lt;available_skills&gt;</code> 目录、<code>read_skill</code>/<code>use_skill</code>/<code>read_skill_file</code> 占位、子代理剔除四名）、<code>profile.go</code>（目录只拼 manager Instruction）、<code>agents.go</code>、<code>worker.go</code>、<code>types.go</code>（<code>Frame.toolCallId</code>）、<code>store.go</code>（payload <code>toolCallId</code>）、<code>server.go</code>（<code>GET /api/runs/:id/skills</code> 空实现）；契约字节用例 18 + 用例 1 末步。</li>
+<li><strong>B2 已落</strong>：<code>read_skill</code> 真身（租户视界查行 → 禁用闸 <code>116107</code> → 读盘剥 frontmatter → <code>&amp;</code>/<code>&lt;</code> 转义成 <code>&lt;skill name source bytes&gt;正文&lt;/skill&gt;</code>，不带 <code>path</code>；超 16,384 token／64KB 回 <code>116116</code> 不截断；计数器由工具自己懒构造，<code>-compact-window=0</code> 照判）、目录转义补齐、<code>auth.go</code>（<code>116107</code>／<code>116116</code>）、<code>skilltools_test.go</code>（切分/转义往返/两条上限/信封逐字）；契约进 <code>declared_not_asserted</code> 用例 19 + 同号散文。</li>
+<li><strong>B3 已落</strong>：<code>use_skill</code> 真身（与 <code>read_skill</code> 同一条读路、成功回执逐字相同；成功时把 <code>{name, root}</code> 记进 run 内技能盒子 <code>skillbox.go</code>）、<code>sandboxProfile(root, extraReadRoots)</code>（盒子里每个技能根只加只读 <code>file-read*</code>；<code>sandboxWrap</code> 传 <code>nil</code>；子代理在 <code>runSubagentGuarded</code> 换空盒）、<code>(allow network-outbound)</code> + <code>/private/etc/ssl</code> 实测补丁（D37；入站不开）、<code>commandInsideRoot</code>／<code>sandboxRealPath</code> 两侧 <code>Abs()</code>（修 <code>-workspace</code> 传相对路径时租户 MCP 全被判围栏外）、<code>skillbox_test.go</code>／<code>skillfence_test.go</code>／<code>mcpfence_test.go</code>（相对根）、验收夹具 <code>scripts/acceptance/mcp_fetch_server.py</code>；契约进 <code>declared_not_asserted</code> 用例 20 + 同号散文。 未施工：拟落 <code>skills_install.go</code>、<code>skillops.go</code>、<code>tools.go</code>、<code>web/src/SkillsView.vue</code>、<code>web/src/ToolsView.vue</code>；另涉 <code>internal/runengine/{compact.go,fileops.go,sandbox.go,bash.go,agents.go,tasktools.go}</code></li>
+<li>2026-10-27 立项。本地 Markdown 技能包：安装时校验 <code>name</code>/<code>description</code>（≤1024 字符），run 装配时读 <code>skill_rows</code>（PG）生成 <code>&lt;available_skills&gt;</code> 目录（派生视图，同一场 run 只算一次，装配不扫盘）；盘上的偏离靠写入口与 <code>rescan</code> 收；<strong>目录不截断</strong>，成本靠作用域／禁用两把闸控（<strong>不做技能搜索</strong>——目录体积是已知天花板）；<strong>2026-10-28 执行模型翻案</strong>：取消内置 <code>skill agent</code>，<strong>manager（根助手／主代理）自己 <code>read_skill</code>／<code>use_skill</code> 读正文、自己执行</strong>，正文里的步骤展开成<strong>看板任务</strong>（<code>run_tasks</code> 加 <code>skill_name</code> 列）——正文是说明书、任务是替身，压缩时正文可折、任务不折；普通子代理仍技能盲（池里无技能工具、bash 看不到技能根）；正文以 <code>&lt;skill name=…&gt;</code> 包裹进上下文（trim 整块替换不夹切），折叠时程序侧钉「技能记录块」进摘要末尾；不做技能市场，但<strong>认来源串与 <code>npx skills add …</code> 命令串</strong>（严格解析、原生抓取、不执行 npx），对话里也能装（<code>skill_install</code>，只建不覆盖），删除只有管理面；系统技能与团队技能都在共享 PVC 上（系统技能部署时从仓库同步、应用只读）、项目删除不伤真身；staging→rename 原子更新；<code>requires</code> 安装时 <code>LookPath</code> 检查；<strong>2026-10-28 第十四轮</strong>：新增工具上传写面（<code>GET</code>／<code>POST</code>／<code>DELETE /api/tools</code>，单文件、文件级校验、不执行不探测），工具根 <code>&lt;tenant&gt;/tools</code> 按租户常开（所有角色含普通子代理可用、<code>bin</code> 前置进 <code>PATH</code>），技能根仍证据收窄——缺 <code>ffmpeg</code> 团队自己补，不必等运维；<strong>2026-10-28 第十五轮</strong>：bash 围栏放开出站网络（D37，租户 MCP 一并生效），<code>use_skill</code> 返回时按 <code>requires</code> 现查并在 <code>&lt;skill&gt;</code> 标签给 <code>missing</code>（D38，不阻断、只提示上传）；子进程 <code>PATH</code> 只留围栏读得到的目录，围栏外解释器报 <code>command not found</code> 而不是 EPERM（D39）；帧与 runlog 补 <code>toolCallId</code>。Linux 沙箱单独 loop。待拍项见该篇 §9。</li>
+<li><strong>B4 已落</strong>：<code>read_skill_file</code> 换真身——资源根内解析 <code>path</code>（拒绝对路径与任何一段 <code>..</code>，<code>EvalSymlinks</code> 后判包含，软链越界同 <code>116114</code>），入口 <code>SKILL.md</code> 用 <code>os.SameFile</code> 认出并指向 <code>read_skill</code>，目录回不递归条目列表，文件与正文同一条上限（超 64KB／16,384 token 报 <code>116115</code>、不带部分内容）；<code>GET /api/runs/:id/skills</code> 改从 runlog 真派生（<code>toolCallId</code> 配对、<code>seq</code> 排序、<code>path</code> 只在 <code>read_skill_file</code> 行）；落点 <code>skilltools.go</code>、<code>skills.go</code>、<code>server.go</code>、<code>auth.go</code>、<code>skillresource_test.go</code></li>
+<li><strong>B5 已落</strong>：<code>run_tasks</code> 加 <code>skill_name</code>（<code>TaskCreate</code> 按本 run 最近一次 <code>use_skill</code> 盖戳；<code>read_skill</code> 不盖）；<code>taskBoardView</code> 每行带「（技能：名字）」（<code>TaskList</code>/写回执/<code>kind=task</code> 帧同源）；task 帧加顶层 <code>skillName</code>；落点 <code>tasktools.go</code>、<code>skillbox.go</code>、<code>types.go</code>；契约字节用例 22。</li>
+<li><strong>B6 已落</strong>：<code>TaskList</code> 读侧拼「上一场」（未完成行 + 说明；全完成一行提示），写回执与 task 帧不带；run 装配按看板 <code>skill_name</code> 把技能根补回 bash 盒子（续跑查本 run、新 run 查上一场，逐项重判）；落点 <code>tasktools.go</code>、<code>skillrestore.go</code>、<code>worker.go</code>；契约字节用例 23。</li>
+<li><strong>B7 已落</strong>：正文用完让位（D33）——<code>skillslim.go</code> 从行序算「更晚的地方建过 <code>TaskCreate</code>」的 <code>read_skill</code>/<code>use_skill</code> 结果，<code>slimSkillBlocks</code> 每枪在 <code>BeforeModelRewriteState</code> 最上面把正文换成 <code>&lt;skill name="…" folded="true" reload="read_skill" tasks="见看板"/&gt;</code>（state 与 base 一起改，<code>-compact-window=0</code> 也执行）；fold 转录写 marker、trim 不进预算与还原队列；runlog 仍是全文。</li>
+<li><strong>B8 已落</strong>：<code>skillops.go</code> 技能记录块（<code>&lt;!-- tako:skill-ops v1 --&gt;</code>，用过/看过两组，旧摘要继承 ∪ 本次提取，与 file-ops 块并排钉摘要末尾、同一套三档收口）；trim 对 <code>&lt;skill&gt;</code> 块整块替换；摘要里不写正文、不写看板任务号。契约字节用例 24。</li>
+<li><strong>C1 已落</strong>：<code>skillinstall.go</code> 安装/更新/删除——multipart zip/tar.gz（按魔数判格式），staging 内解包校验（zip slip/软链/层级/文件数/总字节/正文上限），锁内只搬目录与写行（旧目录进 <code>.trash/&lt;name&gt;-&lt;ts&gt;</code>）；同名冲突 install 用 <code>skillNameTaken</code>（同桶也算）、update 用 <code>nameTakenInView</code>；<code>DELETE</code> 同事务删 <code>skill_rows</code> 与 <code>skill_disables</code>；<code>POST /api/skills/install</code>（201）、<code>POST /api/skills/:name/update</code>（200）、<code>DELETE /api/skills/:name</code>（<code>{"status":"deleted"}</code>），写面只给 owner/admin。契约字节用例 25。</li>
+<li><strong>C2 已落</strong>：<code>skillsource.go</code>（来源串／<code>npx skills add</code> 命令串的严格解析：只认 <code>owner/repo</code>、<code>@ref</code>／<code>#ref</code>、<code>tree/&lt;ref&gt;/&lt;subpath&gt;</code>、GitHub/GitLab/归档直链；命令用自写分词器，不执行 npx，拒绝 <code>;\|&lt;&gt;</code>$()<code>与换行）＋</code>skillfetch.go<code>（原生抓取：拨号前解析并校验 IP、直接拨已验证 IP、禁代理、重定向 ≤5 跳每跳重验、拒回环/私网/</code>100.64.0.0/10<code>/元数据地址；GitHub 走 </code>codeload.github.com/<o>/<r>/tar.gz/&lt;ref|HEAD&gt;<code>，GitLab 先查 </code>default_branch<code>）＋ </code>skillresolve.go<code>（</code>POST /api/skills/preview<code>、来源安装 </code>POST /api/skills/install<code>的</code>{source}<code>／</code>{command}<code>分支；歧义 116108 带</code>data.skills<code>）；仓库归档容忍 PAX 头与非普通文件（上传仍拒）、frontmatter 名优先于目录名（只警告）、多行／折叠式 frontmatter 与 </code>requires:` 块序列；契约字节用例 26。</li>
+<li><strong>C3 已落</strong>：对话内安装 HITL（D20/D24）——<code>skillask.go</code> 新建，<code>skill_install</code> 只提议（解析 → <code>.staging</code> → <code>run_questions(kind=install)</code> 行 → <code>kind=question</code> 帧 → 挂起），approve 由答案端点 CAS 赢下后由程序装盘（重新校验 staging 路径、重扫候选、同一把锁、删 staging、发 <code>skills_changed</code>），cancel/过期/未知三种收尾文本；角色闸在 <code>answerQuestion</code> 里按「可读 run + <code>roleRank&gt;=admin</code>」判（viewer 403 <code>111203</code>，不走只放 owner 的 <code>denyRunWrite</code>）；续跑不重装；<code>Store.PublishEvent</code> + 事件词表新增 <code>skills_changed</code>（doc/46 §7.6）；契约字节用例 27（<code>declared_not_asserted</code>，活体字节在 19v6-04 用例 27）。</li>
+<li><strong>C4 已落</strong>：<code>web/src/SkillsView.vue</code>（列表／描述折叠／详情抽屉／上传／删除确认／invalid 区／重扫；按 doc/51 浅色皮肤）；导航新增「技能」（<code>Page</code> + <code>App.vue</code> 模板分支）；<code>api.ts</code> 技能类型与调用、<code>mutation.ts</code> 事件类型加 <code>skills_changed</code>、列表收到事件自动重拉。同拍补 <code>PATCH /api/skills/:name</code> 的服务端半（<code>SetSkillDisabled</code> 幂等写/删 <code>skill_disables</code>、回 <code>data.skill</code>、发事件、admin 闸），E2 收剩余口径与契约用例。<code>npm run typecheck</code>／<code>build</code> 绿，活体浏览器验收（列/详情/开关/上传/删除/重扫）。</li>
+<li><strong>C5 已落</strong>：<code>web/src/SkillsView.vue</code> 安装入口收成一个输入框＋「预览」（来源串／整条 <code>npx skills add …</code>／本地包 multipart），预览卡列全部候选（名字、描述、<code>字节 · 文件数</code>、依赖、已选✓／未选○）与 warnings；<code>web/src/SkillInstallCard.vue</code> 新建，只按 <code>kind=install</code> 的 <code>args</code> 渲染来源/ref/候选全表/选中集/「本会话未出现」提示，<code>owner</code>/<code>admin</code> 才出「安装」「取消」，其他角色只看到「已提交，等管理员确认」；<code>web/src/App.vue</code> 输入区与历史区共用这张卡（历史区无按钮），对话页工具卡 <code>use_skill</code>/<code>read_skill</code>/<code>read_skill_file</code>（按 <code>toolCallId</code> 配对、失败显示结构化 message）；<code>web/src/chat.ts</code> 的 install 行带 <code>answer</code> 复述；服务端 preview 补 <code>selected</code>（与执行同一套默认）与候选 <code>files</code>，<code>questions</code> 列表只对 install 行回 <code>answer</code>。</li>
+<li><strong>D1 已落</strong>：<code>requires</code> 从「存着」变成「三处同源地用」——<code>use_skill</code> 成功标签多两个属性 <code>requires="…" missing="…"</code>（<code>read_skill</code> 逐字节不带；<code>missing</code> 调用那一刻现查、不阻断），列表/详情的 <code>missing[]</code> 同源现算，新端点 <code>GET /api/skills/:name/check</code> 回 <code>{dependencies:[{name,found,path?}],checkedOn:"host"}</code>（安装/更新响应用同一形状）；子进程 <code>PATH</code> 与沙箱 profile 共用 <code>sandboxReadRoots</code>（<code>subprocesspath.go</code> 逐段 <code>EvalSymlinks</code>＋保序去重），围栏外解释器报 <code>command not found</code> 而不是 <code>Operation not permitted</code>，检查说找到的路径与 bash 解析到的是同一个；落点 <code>sandbox.go</code>、<code>subprocesspath.go</code>、<code>skilldeps.go</code>、<code>bash.go</code>、<code>skilltools.go</code>、<code>skills.go</code>、<code>skillinstall.go</code>、<code>server.go</code>、<code>web/src/{api.ts,SkillsView.vue}</code>；契约字节用例 28（+ 用例 25 形状改动），单测 <code>subprocesspath_test.go</code>／<code>skilldeps_test.go</code>。</li>
+<li><strong>E1 已落</strong>：manager 规格的 <code>skills:</code>／<code>exclude_skills:</code>（parse 层同写拒载；<code>skills: []</code> 靠指针非 nil = 一个都不要）落成 <code>tenant_agents</code>／<code>agent_defaults</code> 的 <code>skill_policy</code> 列，JSON 面 <code>{"mode":"allow\|exclude\|inherit","names":[…]}</code>（agent 读写与导入认 <code>skillPolicy</code>）；作用域在四处解析时点生效——装配期目录过滤、<code>read_skill</code>／<code>use_skill</code> 共用的 <code>loadByName</code>、<code>read_skill_file</code>、D35 看板恢复；范围外名字与「表里没有」同回 <code>116001</code> 同字节；普通子代理写 allow／exclude 在入口 400 <code>111002</code>（JSON 与 md 导入同判），出厂规格 seed 时日志拒载，显式 <code>inherit</code> 放行；落点 <code>agents.go</code>、<code>product_store.go</code>、<code>product_api.go</code>、<code>skills.go</code>、<code>profile.go</code>、<code>worker.go</code>、<code>skilltools.go</code>、<code>skillrestore.go</code>、新文件 <code>skillscope.go</code>，测试 <code>skillscope_test.go</code>／<code>agents_test.go</code>；活体抓到 <code>UpdateAgent</code> 漏写 <code>skill_policy</code> 并补列＋回归测试；契约字节用例 29。</li>
+<li><strong>E2 已落</strong>：禁用收口成可撤销、按租户、不被吞的开关——<code>PATCH /api/skills/:name</code> 只写 <code>skill_disables</code>（false = FirstOrCreate、true = Delete，两方向幂等），不碰 <code>skill_rows</code>、不碰盘；目录装配与 <code>read_skill</code>／<code>use_skill</code>／<code>read_skill_file</code> 读同一张禁用表（禁用后目录无它、调用回 <code>116107</code>），正在跑的 run 盒子不回缩；写面 <code>owner</code>／<code>admin</code>（viewer 403 <code>111203</code>、未登录 401 <code>111102</code>）；禁用/恢复各发一条 <code>skills_changed</code>，字节按 doc/46 §7.6 <code>{seq,type,id,at}</code>（<strong>台账原写的 <code>{action,name}</code> 作废</strong>——action 是状态，事件带状态会诱导客户端就地改副本而不重拉）；<code>DELETE</code> 同事务清禁用行（重装同名回 <code>enabled:true</code>，行为可证）；落点 <code>skills.go</code>、<code>events.go</code>、<code>skilltools.go</code>、<code>web/src/SkillsView.vue</code>；验收原语新增 <code>invite_viewer</code> 与 <code>tokenVar</code>（「有身份但角色不够」不能用 401 代替）；契约字节用例 30（15 步）与 <code>19v6-04</code> 同号散文，core 活体 93/93。</li>
+<li><strong>F1 已落</strong>：工具上传写面 <code>GET</code>／<code>POST</code>／<code>DELETE /api/tools</code>——工具根 <code>&lt;tenant&gt;/tools/&lt;name&gt;/bin/&lt;name&gt;</code> 不进表（列表即扫盘，跳过 <code>.</code> 开头）；128MB 上限 413 <code>116118</code>、名字白名单＋预留名＋空文件 400 <code>116117</code>、<code>ReserveStorage</code> 额度 429 <code>113001</code>、staging→<code>.trash</code>→rename 与 C1 同一把锁；写入只给 owner/admin、列表全员可读；删除先过白名单（<code>..</code> 拼成租户根）、不存在 404 <code>116119</code>；成功发 <code>tools_changed</code>；落点 <code>toolroots.go</code>；契约字节用例 31（19 步），core 活体 138/138</li>
+<li><strong>F2 已落</strong>：工具根对所有角色常开（含普通子代理）——<code>&lt;tenant&gt;/tools</code> 整棵进 profile 只读白名单（写仍只在项目根）、每个 <code>&lt;name&gt;/bin</code> 前置进子进程 <code>PATH</code>（跳过 <code>.</code> 开头、与宿主 <code>PATH</code> 同一套 <code>sandboxReadRoots</code> 过滤），依赖检查同走这条；<code>which hello</code> → 工具根、<code>which python3</code> → 宿主；子代理跑 <code>hello</code> 成功而 <code>cat &lt;技能根&gt;/SKILL.md</code> 被拒；run 中覆盖后下一枪即新版、<code>DELETE</code> 后 <code>command not found</code> 而 run 仍 complete；落点 <code>sandbox.go</code>、<code>subprocesspath.go</code>、<code>bash.go</code>、<code>skilldeps.go</code></li>
+<li><strong>F3 已落</strong>：工具区前端 <code>web/src/ToolsView.vue</code>（列表带「被技能引用」、上传、同名覆盖确认、删除确认、无检测按钮），导航与路由接进 <code>App.vue</code>；技能详情每个缺失依赖旁「上传 &lt;名字&gt;」跳到工具区预填；<code>api.ts</code> 加三个端点封装，<code>mutation.ts</code> 补 <code>tools_changed</code> 事件类型，<code>ConfirmDialog</code> 加 <code>tone</code>／<code>busyText</code>；浏览器全流程验收 + <code>npm run typecheck</code>／<code>build</code> 绿</li>
+<li><strong>G1 已落</strong>：<code>.staging</code>／<code>.trash</code> 的 24h 清扫（<code>internal/runengine/tempsweep.go</code>，<code>tempDirTTL</code> + <code>sweepTempDirs(root, now)</code>）只在已有的锁内跑——技能安装／删除／租户重扫／全量重扫（每个根各清一次）、工具上传／删除；技能根与工具根同一规则，启动时不扫盘、失败只记日志（<code>TestSweepTempDirsByMtime</code>／<code>NoDirs</code>）。活体：两个根各造 25 小时前与刚建的条目 → 一次 <code>rescan</code>（技能根）与一次工具删除（工具根）之后旧条目消失、新条目留下；<code>rescan</code> 对账：造目录 → <code>added</code> 有它、删目录 → <code>removed</code> 一次、再扫 <code>removed:[]</code>、表里无重复行；并发装+扫三轮技能都不丢</li>
+</ul></li>
+<li><p><strong>54</strong> <a href="54-运行级OTel追踪.html">运行级 OTel 追踪</a> ✅（已落地，2026-10-31）</p>
+<ul>
+<li>落点：<code>yk-tako-eino/internal/observability/</code>（装配／内容序列化／开关）、<code>internal/runengine/{trace.go,trace_run.go,worker.go,journal.go,recall.go,compact.go,memory.go,server.go}</code>、<code>cmd/yktako/main.go</code>、<code>.env</code>（内容开关）</li>
+<li>2026-10-31 立项并同日 A1–A9 落地。按 <strong>OTel GenAI 语义</strong>写 span（<code>gen_ai.*</code> 均为 Development），走 <strong>OTLP/http protobuf</strong> 上报 CozeLoop：run 根 <code>invoke_agent yktako</code>（CLIENT；usage 口径＝对话账本 <code>tako.usage.scope=conversation</code>，与 usage 帧求和逐值对账）、HTTP 入口 <code>POST /api/runs</code>（SERVER，<code>tako.run.start_delay_ms</code>）、每次模型调用 <code>chat &lt;model&gt;</code>（TTFT/TPOT/usage/内容）、每次根级工具 <code>execute_tool</code>，以及 <code>tako.step.{quota,workspace,history,recall,compact,finalize,memory_extract}</code> 内部步骤 span（召回下挂 <code>search_memory</code>/<code>retrieval</code>）；内容属性由 <code>OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT</code> 控制（<code>.env</code> 默认 <code>SPAN_ONLY</code>，8KiB/文本段、64KiB/属性截断）；缺令牌/空间 ID 即 noop，导出失败只记日志、不影响 run。<strong>实跑证据（2026-10-31）</strong>：探针回 <code>exported:true</code>；真 run 日志打出 <code>traceId=</code>，含 <code>get_time</code> 调用的一轮 usage 帧求和 13717/112 与根 span 同源；<code>go test ./internal/runengine ./internal/observability</code> 全绿。<strong>注</strong>：<code>COZELOOP_WORKSPACE_ID</code> 必须是令牌所属工作区，不匹配时 OTLP 回 400。台账 <code>tmp/cozeloop/</code>（不入库）。<strong>2026-11-01</strong>：新增第二出口 Langfuse（<code>LANGFUSE_PUBLIC_KEY</code>／<code>LANGFUSE_SECRET_KEY</code>／<code>LANGFUSE_BASE_URL</code>；与 CozeLoop 可并存双发、可单发、都不配即 noop），实测 <code>gen_ai.*</code> 到 Langfuse 原生模型（AGENT／GENERATION／TOOL、sessionId、usage、工具入参回执）的映射与 v2 observations 读回路径，见该篇 §3.1</li>
+</ul></li>
+<li><p><strong>56</strong> <a href="56-Agent测试与基准选型.html">Agent 测试与基准选型（方案·部分落地）</a> 🔶（G1 已跑完出数，两臂配对 11-01，k=5 基线 11-02）</p>
+<ul>
+<li>落点：<code>scripts/bench/</code>（<code>row.schema.json</code> / <code>arms/tako.py</code> / <code>arms/dsh.py</code> / <code>judge.py</code> / <code>cases/gaia_l1_25.json</code> / <code>slice.py</code> / <code>run_bench.py</code> / <code>pricing.json</code> / <code>check-schema.sh</code>）；回填 <code>scripts/eval/</code>（doc/45）仍未施工；不改 <code>internal/runengine/</code></li>
+<li>2026-10-31 立项。11-01 第一批落地：把「测谁」钉死（<strong>公开基准测的是模型 + 它自带的 harness，不是 tako</strong>），并落纸<strong>可比性协议</strong>（doc/56 §4.7：受试者=runtime、钉死的变量、答案抽取规则、官方 scorer 三支、报告必带口径字段、三条禁语）。GAIA 验证集 L1 的 25 题纯文本切片是<strong>唯一现在能直接跑 tako</strong> 的公开基准——切片<strong>只入配方 + <code>slice_hash</code></strong>（题面/答案/task_id 不入库，依据 GAIA 条款），判定器内置官方 scorer 三支并有 <code>--selftest</code> 对照官方源码；<strong>GAIA 25 题已实跑两轮单臂并出报告</strong>（题面本身 2/25；题面 + 尾句 21/25——差的全在「答案长什么样」，口径钉死见 doc/56 §4.8）；<strong>同日装上 dsh 臂并跑出两臂配对</strong>（tako 22/25 vs dsh 20/25，都过 18、只有 tako 过 4、只有 dsh 过 2——但同臂隔一小时重跑的逐题分歧率 28% 比两臂之间的 24% 还大，即换 harness 的影响不如重跑一次，<strong>所以这轮不给两臂排名</strong>，见 doc/56 §4.9）；pi 臂未装；<strong>11-02 凌晨 k=5 首轮基线跑完</strong>（tako Pass@5 24/25 · pass^5 20/25，dsh 23/25 · 14/25，配对 pass^5 为 都过 13 / 只 tako 7 / 只 dsh 1 / 都没过 4；基线落 <code>scripts/bench/baselines/gaia.json</code>，只存 task_id 短哈希，见 doc/56 §4.10），三臂并排留到下一轮；SWE-bench 先在 Linux 服务器用 mini-swe-agent 跑 25 题作<strong>模型基线</strong>（C2，明确不叫 tako 分数），tako 级要补引擎镜像与 bash 容器后端（G4，容器当围栏，见 §5.5）；HumanEval/MBPP/LiveCodeBench/AgentBench 不作 tako 测试；τ-bench/Claw-Eval 不移植环境，只借 pass^k、终态断言、安全一票否决回填 doc/45；另借 pi <code>packages/evals</code> 的 A/B 对照协议（case × 两臂 × 重复 → 配对 lift，只借协议不移植 vitest 栈，§6.5/G5），Eino 开源仓无 eval 包可接。<strong>CI 门禁仍只认确定性断言</strong>（L0 快闸 / L1 契约 / L2 doc/45 K/S 组）</li>
+</ul></li>
+<li><p><strong>57</strong> <a href="57-网络抓取.html">网络抓取（<code>web_fetch</code>）</a> ✅（2026-11-01，A1–A3）</p>
+<ul>
+<li>落点：<code>internal/runengine/{webfetch.go,webfetch_test.go,worker.go,fileops.go,search.go}</code>、<code>agents/researcher.md</code></li>
+<li>父池加 <code>web_fetch</code>：按调用方厂商选择器走 DeepSeek <code>/v1/tools/fetch</code>（只用 <code>deepseek</code> 一行，其他厂商直接报错）；整页 Markdown 落盘 <code>.tako/fetch/</code>，工具只回描述段；researcher 走继承自动拿到，coder 白名单不动</li>
+</ul></li>
+<li><p><strong>58</strong> <a href="58-读分页与输出留存.html">读分页与输出留存</a> ✅（2026-11-01，A0–A8）</p>
+<ul>
+<li>落点：<code>internal/runengine/{readwindow.go,filetools.go,bash.go,bashspill.go,notes.go,product_api.go}</code>、<code>internal/runengine/{filetools_test.go,bashspill_test.go}</code></li>
+<li>两处「拿不到就永远拿不到」的收口：<code>read_file</code> 改<strong>分页读</strong>（入参 <code>path</code>/<code>offset</code>/<code>limit</code>，<code>head</code>/<code>tail</code> 删掉；每页 2000 行 / 50KB / 单行 2000 字符；页脚恒带总行数与下一个 <code>offset</code>；「超 200KB 直接报错」撤掉，长文件读得到中间）；<code>bash</code> 改<strong>留尾 + 全文落盘 + 回路径</strong>（每流 64,000 字节尾窗；全文落 <code>.tako/bash/&lt;runId&gt;/&lt;seq&gt;.out</code>，64MB/流，<strong>装不下全文就删文件、不报路径</strong>；回执行给路径；30 天清扫，每次 bash 调用前触发）。四个 API 的请求／响应字节不动；<code>POST /api/dev/workspace/read</code>（A0）让 read 的模型侧字节可 curl 逐字断言</li>
+</ul></li>
+<li><p><strong>59</strong> <a href="59-工具调用可见性.html">工具调用可见性</a> ✅（2026-11-01，A1–A2）</p>
+<ul>
+<li>落点：<code>web/src/{chat.ts,App.vue,api.ts}</code>（前端零后端改动）；2026-11-03 分段补记同批动 <code>internal/runengine/{store.go,pgstore.go,types.go,waittools.go,questions.go}</code> 与契约测试</li>
+<li>对话页把<strong>每一次</strong>工具调用画成工具卡（帧与 runlog 两条路径、按 <code>toolCallId</code> 配对）：删掉「只认技能三件」的白名单；摘要行 + 展开看参数／回执原文，失败按「错误：」前缀标「失败」，参数 2,000 / 回执 8,000 字符截断；初始窗口与翻页加了「回执找不到同批调用行就往前扩一页」的取数规则。翻掉 doc/52 C5 的窄口（卡片机制保留、筛选去掉），子代理行带 <code>agent</code> 前缀。<strong>2026-11-03</strong>：等人工具边界开始把正文切段（runlog assistant 行 payload <code>segments</code>），问题卡与答案气泡可按真实先后排开；普通工具调用仍只分「卡片在上/在下」两块</li>
+</ul></li>
+<li><p><strong>60</strong> <a href="60-多会话并发.html">前端多会话并发</a> ✅（2026-11-01，A1–A6）</p>
+<ul>
+<li>落点：<code>web/src/{App.vue,chat.ts,chatpool.ts}</code>、<code>web/test/chatpool.test.ts</code>、<code>web/e2e/multisession.spec.ts</code>（后端零改动、契约字节零变化）</li>
+<li>前端从「全局一个 <code>useChat()</code>」改成「每个打开过的会话一个实例」：切走不打断轮询，草稿／排队消息／游标随会话保留；空对话在输入区可选项目落点、侧栏项目行「＋」可直接开新对话；删除／换租户／上限 8（只淘汰已持久化、不在跑、没草稿的实例）收口；侧栏「运行中」先用本 tab 的 <code>busy</code> 本地信号，刷新/跨端的运行状态留 P1（列表接口加 <code>liveRunId</code>）</li>
+</ul></li>
+<li><p><strong>61</strong> <a href="61-并发控制设计.html">并发控制设计</a> ✅（2026-11-03，设计说明，无新增代码）</p>
+<ul>
+<li>落点：<code>internal/runengine/{pgstore.go,store.go,redisstore.go,filefp.go,filetools.go}</code></li>
+<li>解释「为什么不需要分布式锁」：互斥下沉到存储层原语（唯一索引 + 租约 + 行锁 + flock），核心路径无共享可变状态；含与应用层分布式锁的对比及适用边界。文件写入的读者完整性、多副本与长任务隔离后续方案见 <code>doc/71</code>，不把待点头方案当现状</li>
+</ul></li>
+<li><p><strong>65</strong> <a href="65-记忆两层方案.html">记忆双模式（<code>pipeline</code> = PG 两层 + 统一抽取代理 + Redpanda；<code>markdown</code> = <code>USER.md</code> / <code>MEMORY.md</code> 同步直写）</a> ✅（<strong>2026-11-10 落地</strong>）</p>
+<ul>
+<li>落点：<code>internal/runengine/{memory.go,memory_pipeline.go,memory_queue.go,memory_search.go,memory_store.go,memory_types.go,memory_mode.go,memory_dispatch.go,memory_markdown.go,memory_migrate.go,memory_write.go,memory_text_guard.go,atomicfile.go,notes.go}</code>、<code>cmd/yktako/main.go</code>（<code>TAKO_MEMORY_MODE</code>）；<code>scripts/acceptance/memory_*.sh</code> 六件活体；演进记录见 <code>doc/log/2026-11-09-记忆两层方案演进.md</code>（非方案）</li>
+<li>两种模式是独立运行形态，不是同一管线的两个存储后端。<code>pipeline</code>：<code>memory_items</code> 两层（resident/recall）+ Redpanda 按会话分区派工 + 消费者三段流抽取（抽条目 → 全量筛候选 → 终局动作）+ 每回合 BM25 召回 + <code>search_memory</code> 现实时点回放与历史链；<code>markdown</code>：master 用 add/replace/remove/batch 同步维护两份文件，不启动抽取/MQ/BM25</li>
+<li>同批统一：取消记忆管理面与管理 API；inrun 由 master 登记 <code>targetLayer</code>，postrun 永不写常驻；证据时间取 <code>source_run_id + source_seq → runlog_entries.created_at</code>；项目删除按 <code>scope='workspace'</code> 清记忆、保留 <code>user</code> 行（<a href="37-删除与档案清理.html">doc/37</a> D-l 同批落地）</li>
+<li>可靠性与并发：Redpanda 按 session 分区 + consumer group，PG <code>memory_jobs</code> 仍是状态真源，DB 前置条件保证 postrun 不越过未完成 inrun，对账器兜住漏投与崩溃；写事务用 workspace advisory lock；候选全量扫描但按 token 分批，不设 150 行上限；写幂等用持久化 job/批次身份，不用正文去重</li>
+<li>Markdown 写入只给 master，锁内重读 + 操作式修改 + 同目录临时文件原子 rename（<code>atomicfile.go</code>）；多副本用 PG advisory lock 协调。Rakazo 的真实内置存储已核为 PG document + revision，Hermes 才是纯文件参照</li>
+<li>验收：观测口与守卫字节在 <code>expected.json</code> 用例 35–38 + 快闸 <code>TestContractMemoryObserveBytes</code>；活体六件——pipeline_live 20/20、markdown_live 26/26、migrate_live 42/42、file_race 11/11、project_delete 9/9、redpanda_crash（真 broker kill -9 补投与 A→B→A 不被吞）；<a href="29-长期记忆.html">doc/29</a> 线一被本篇取代、线二仍现行</li>
+</ul></li>
+<li><p><strong>70</strong> <a href="70-多Agent编排与Task/03-第一版方案.html">多 Agent 编排与持久 Task：第一版方案</a> ✅（<strong>2026-11-10 施工+活体验收，commit <code>9b31baa</code></strong>）</p>
+<ul>
+<li>落点：<code>internal/runengine/agent_task_{api,delivery,graph,runner,scheduler,store,tools,types}.go</code> + <code>auth.go</code>（117xxx 码，<a href="40-响应信封统一.html">doc/40</a> §4.2c）+ <code>events.go</code>（<code>agent_tasks_changed</code>／<code>agent_orchestrations_changed</code>，<a href="46-变更同步与事件通道.html">doc/46</a> §7.7）+ <code>cmd/yktako/main.go</code>（<code>-task-interval</code>）；<code>web/src/TasksView.vue</code>（任务页）；活体 <code>scripts/acceptance/agent_task_{single,busy,dag,crash,two_replicas}_live.sh</code> + <code>agent_task_live_lib.sh</code>；方案集与调研入口见 <a href="70-多Agent编排与Task/README.html">doc/70 README</a></li>
+<li>2026-11-09 立项收束 V1，2026-11-10 一次施工完成：一件可持久、执行、通知、停止与显式恢复的 Task（独立执行 session，恢复复用 doc/30 的同 run epoch+1 接管），加「初始 DAG 整组原子创建 → 并行推进 → 依赖满足后 C 汇总 → 失败阻断传播 → 整组单次交付」。四张表（<code>agent_orchestrations</code>/<code>agent_tasks</code>/<code>agent_task_links</code>/<code>agent_notifications</code>）+ 模型工具 <code>delegate_task</code>/<code>create_orchestration</code>/<code>submit_task_result</code> + 八端点；V1 固定节点内容、执行者与依赖边，Goal 驱动的动态改图留作下一版</li>
+<li>验收：单测全绿（图校验/事件/产出归一/依赖失败传播钉子）；活体五场 single 24/24、busy 14/14、dag 22/22、crash 20/20、two_replicas 13/13；浏览器走查停止链与恢复链、交付一次审计（来源会话 17 组各恰一条 <code>orchestration_finished</code>）；施工期契约缺口修复已回填 doc/40 §4.2c 与 doc/46 §7.7</li>
+<li>与现行文档的边界：doc/25、doc/39 的同步子代理与 wire 档案不因此改变；doc/41 的 <code>run_tasks</code> 仍是一场 run 内的看板，与本 Task 不能混名；doc/71 长任务 worktree 是独立方案，V1 不做并行仓库合并</li>
+</ul></li>
+<li><p><strong>71</strong> <a href="71-文件写入竞争.html">文件写入竞争：短写入互斥、版本校验、原子替换与长任务隔离</a> 🔶（<strong>短写入三件套 2026-11-10 落地；长任务 worktree 归 doc/70 未开工</strong>）</p>
+<ul>
+<li>落点：<code>internal/runengine/{filefp.go,filelock.go,atomicfile.go,filetools.go}</code>；长任务编排便签归 <code>doc/70</code></li>
+<li>2026-11-09 立项。把锁、版本校验与原子 rename 分到三类故障：写者同时写、依据旧版覆盖、读者看到半截；整文件 <code>write_file</code> 保留 run/agent 级读取基准，局部 <code>edit_file</code> 与条目 Memory 在锁内按内容操作，不额外背整文件 map</li>
+<li><strong>已落地（2026-11-10）</strong>：目标短写入链 = 锁内校验/操作（PG advisory lock，<code>filelock.go</code>）→ 同目录临时文件 → 原子 rename（<code>atomicfile.go</code>）→ 刷新基准；读者不排队，写者仍排队。<code>write_file</code>／<code>edit_file</code> 与 Markdown 记忆文件共用一条写盘路。活体 <code>memory_file_race.sh</code>（两台隔离引擎：串行、版本拒绝、原子读、kill -9 释放，11/11）</li>
+<li>参考核查：Kimi 的 ToolAccesses 调度器只覆盖当前工具批次，Tower 用 worktree；Hermes 普通文件确有跨 subagent 的读取版本与同路径锁，但主要是进程内；Rakazo 的 expectedRevision + Serializable 只直接适用于 PG 文档。doc/61 仍是当前机制说明，doc/65 链接本篇消费文件写入原则</li>
+</ul></li>
+<li><p><strong>72</strong> <a href="72-多Agent编排下一阶段.html">多 Agent 编排下一阶段：有界修订、Task HITL 与事件驱动</a> ✅（<strong>2026-11-11 施工+活体验收，commit <code>a5a9a5e</code></strong>）</p>
+<ul>
+<li>落点：<code>internal/runengine/agent_task_{revision,revision_api,attention,scheduler,delivery}.go</code> + <code>questions.go</code>（<code>expires_at</code>／115102）+ <code>events.go</code>（<code>tk:agent-task-wake</code>）+ <code>cmd/yktako/main.go</code>（<code>-task-input-timeout</code>）+ <code>web/src/{App.vue,TasksView.vue,api.ts}</code>；活体 <code>scripts/acceptance/agent_task_{revision,hitl,attention,wakeup}_live.sh</code> + <code>expected.json</code> 用例 51–54（人读版 <a href="19-v6/19v6-04-验收-curl.html">19v6-04</a>）</li>
+<li>2026-11-11 成文并补可靠性边界。四条范围：有界计划修订（追加／替代未来工作、图版本防过期、累计 32 节点／32 次修订、版本时间线）、Task 内 <code>ask_user</code>（每 Task 自己的 PG 问题队列、question ID 回答与同 run 续接、可配置截止时间 + <code>input_timeout</code>）、左侧任务展开与“需要我处理”（待答／计划决策／中断／交付失败，复用账号级 SSE，不建未读表）、Task 调度事件唤醒 + 默认 30 秒 PG 对账。doc/70 V1 仍是固定 DAG 真源</li>
+<li>验收：契约 51–54 逐字节；活体 revision 68/68、hitl 48/48、attention 39/39、wakeup 14/14；V1 五场回归 single 24/24、busy 14/14、dag 22/22、crash 20/20、two_replicas 13/13；浏览器走查左侧四类处理项、点入抽屉、答后/继续后消失、刷新重建与修订时间线（doc/72 §11.6）。施工期发现并修掉 V1 交付通知消费的两处真实缺陷（忙通知恒占队首、已终止通知永留 pending），回填 doc/72 §8.2 与新增两条单测</li>
+</ul></li>
+<li><p><strong>73</strong> <a href="73-协调通知与交付恢复.html">协调通知与交付恢复</a> ✅（<strong>2026-11-11 施工+活体验收</strong>）</p>
+<ul>
+<li>落点：<code>internal/runengine/agent_task_{delivery,recovery,scheduler,store,runner,types,api}.go</code> + <code>agent_task_attention.go</code>、<code>auth.go</code>（117003/117109/117110）、<code>pgstore.go</code> 与 <code>store.go</code>（<code>expireDeadSessionRunsTx</code>）、<code>worker.go</code>/<code>agent_task_scheduler.go</code>（RunEnd 与调度对账）+ <code>web/src/{App.vue,TasksView.vue,NotificationRecovery.vue,api.ts}</code>；活体 <code>scripts/acceptance/agent_task_delivery_recovery_live.sh</code> + <code>expected.json</code> 用例 55–56（人读版 <a href="19-v6/19v6-04-验收-curl.html">19v6-04</a>）</li>
+<li>2026-11-11 成文并同日落地。区分 DAG 执行失败与来源 session 交付失败：down／interrupted 走原 run、epoch+1 显式续跑；error／stopped 保留历史并由人工创建同一通知的新处理 run；<code>resultRevision</code> 管结果版本、<code>lease_epoch</code> 管执行权、当前 claim run 管通知收尾。补通知 failed 状态、每次处理 attempt 审计、RunEnd 与慢速对账同一收尾、结果摘要与文件路径定位、交付只读工具面及双副本防重</li>
+<li>验收：契约 55–56 逐字节（<code>assert_contract.py</code> 344 条）；活体十场 109/109，doc/72 的 attention/revision/hitl/wakeup（39/68/48/14）与 V1 五场回归（single 24、busy 14、dag 22、crash 20、two_replicas 13）全绿；<code>spotcheck.sh</code> 37/37。施工期修掉「崩溃留下的中断 run 卡死后续认领」的收敛缺陷（认领／重试先跑与 <code>AcquireRun</code> 同一条过期行扫尾）</li>
+</ul></li>
+<li><p><strong>74</strong> <a href="74-并行任务工作区隔离.html">并行任务工作区隔离</a> ✅（已落地 2026-11-12）</p>
+<ul>
+<li>落点：<code>internal/runengine/workspace_{provider,engine,git,directory,result,publish,verify,view}.go</code> + <code>agent_task_artifact.go</code>（artifact / retry-publication）+ <code>agent_task_{graph,api,tools,scheduler,runner,store,types,attention}.go</code>、<code>worker.go</code>、<code>sandbox.go</code>/<code>bash.go</code>/<code>bashspill.go</code>、<code>store.go</code>/<code>pgstore.go</code>、<code>auth.go</code>（117111–117113）、<code>server.go</code>；前端 <code>web/src/{TasksView.vue,App.vue,api.ts}</code>；活体 <code>scripts/acceptance/workspace_{git,directory,publication,crash}_live.sh</code></li>
+<li>2026-11-11 按责任边界重写。Task／DAG 永远通用；<strong>LLM 决定节点、依赖与隔离需求，WorkspaceProvider 按真实项目选择 Git 或非 Git 目录实现，引擎调用 Provider 创建现场并协调执行与发布，system prompt 只指导模型配合</strong>。默认 shared 不变</li>
+<li>Git 只在已有仓库、需要持久修改并合回项目时启用；非 Git 由 DirectoryProvider 完成目录副本、文件变更清单、冲突与发布恢复。PG 不保存 branch／commit／repo path／worktree path／文件哈希；Provider 状态与不可变结果在共享持久卷</li>
+<li>验收：活体四场 git 51／directory 42／publication 34／crash 57 全绿；契约用例 57–59 逐字节、用例 60 登记 declared_not_asserted（模型与真实现场场景由活体判红）；既有 70–73 回归（single 24、busy 14、dag 22、crash 20、two_replicas 13、revision 68、attention 39、hitl 48、wakeup 14、delivery_recovery 109）与 <code>spotcheck.sh</code> 37/37 全绿；浏览器走查隔离标识／发布面板／验证失败／受阻后重新发布闭环</li>
+</ul></li>
+<li><p><strong>75</strong> <a href="75-目标重规划与继任编排组.html">目标重规划与继任编排组</a> ✅（<strong>2026-11-12 立项／施工，2026-11-13 活体验收与文档收口</strong>）</p>
+<ul>
+<li>落点：<code>internal/runengine/agent_task_{successor,handoff,tools,api,store,scheduler,types,delivery,runner}.go</code> + <code>project_layout.go</code>（继任组目录）+ <code>auth.go</code>（117004／117114／117115／117116）+ <code>server.go</code>（<code>POST /api/orchestrations/:id/successors</code>、<code>GET /api/orchestrations/:id/handoff</code>）；前端 <code>web/src/{TasksView.vue,api.ts}</code>；活体 <code>scripts/acceptance/goal_replan_live.sh</code>（124 条）、<code>goal_replan_crash_live.sh</code>（46 条）+ <code>expected.json</code> 用例 61–63（人读版 <a href="19-v6/19v6-04-验收-curl.html">19v6-04</a>）</li>
+<li>2026-11-12 立项、2026-11-13 与 doc/76 合并一个施工包落地。先判断目标可行性（<code>goalAssessment.outcome == feasible</code> 才建组），再决定 doc/72 同组修订或创建继任编排组；不可行／不确定时告知或问用户，不盲目新建。继任组写 <code>successor.json</code> + <code>handoff.md</code>（frontmatter 机器读、正文给人读，记 replanOf／原因／复用引用／深度），按 <code>(taskId,resultRevision)</code> 复用旧组不可变结果；深度上限 8、原组先收口、预算不重置、外部副作用不自动重放</li>
+<li>明确不做跨组调度依赖边、无限重规划、多继任组竞争与 Git 字段入 PG；验收含同组修订、继任复用、不可行、不确定、并发（两副本一条继任行，202／409 117114）、预算、副作用与 <code>kill -9</code> 崩溃（<code>preparing</code> 不调度、重启后继续）</li>
+</ul></li>
+<li><p><strong>76</strong> <a href="76-项目内容目录与运行资源容器.html">项目内容目录与运行资源容器</a> ✅（<strong>2026-11-12 立项／施工，2026-11-13 活体验收与文档收口</strong>）</p>
+<ul>
+<li>落点：<code>internal/runengine/project_layout.go</code>（容器路径与 <code>layout.json</code>）+ <code>scope.go</code>／<code>worker.go</code>（工作现场落 runtime）+ <code>media*.go</code>／<code>bashspill.go</code>／<code>webfetch.go</code>／<code>websearch.go</code>（运行资源根）+ <code>memory_markdown.go</code>／<code>memory_migrate.go</code>（项目记忆在 <code>runtime/memory/</code>）+ <code>workspace_{provider,engine,git,directory,result,publish,view}.go</code>（最终结果发布进 <code>content/</code>）+ <code>filetools.go</code>／<code>product_api.go</code>（删除回 <code>cleanup=done|pending</code>）+ <code>pgstore.go</code>／<code>store.go</code>（<code>project_cleanups</code>）+ <code>archive_sweep.go</code>／<code>tempsweep.go</code> + <code>cmd/yktako/main.go</code>（<code>-migrate-project-layout</code>）；前端 <code>web/src/{ProjectsView.vue,api.ts}</code>；活体 <code>scripts/acceptance/project_layout_live.sh</code>（36 条）、<code>project_layout_migration_live.sh</code>（51 条）、<code>memory_project_delete_live.sh</code>（10 条）+ <code>expected.json</code> 用例 58／60</li>
+<li>2026-11-12 立项、2026-11-13 与 doc/75 合并一个施工包落地。<code>workspaces/&lt;wid&gt;</code> 成为项目资源容器：用户只看 <code>content/</code>，异步工作区、不可变结果、临时文件、媒体与项目记忆归 <code>runtime/{orchestrations,tmp,media,memory}</code>；shared 是同组共享工作现场，isolated 是每 Task 独立现场，两者中间结果都不直接写 content，最终才发布（共享组同样发布，doc/76 §10.5）</li>
+<li>存量迁移走离线命令的复制 → 校验 → 原子切换，旧布局项目在 HTTP 层直接 409 <code>117116</code>；删除清整个项目容器但不误删租户技能／工具、系统技能与用户记忆，容器删除失败回 <code>cleanup=pending</code> 由 <code>project_cleanups</code> 补偿；没有临时实现或过渡开关。用户级 skill／plugin 本期不做</li>
+</ul></li>
+<li><p><strong>77</strong> <a href="77-对话页任务面板.html">对话页右侧任务面板</a> ✅（<strong>2026-11-13 落地</strong>：<code>web/src/App.vue</code>、<code>web/src/TasksView.vue</code>，无后端改动）</p>
+<ul>
+<li>落点：<code>web/src/App.vue</code>（对话页布局与面板壳）、<code>web/src/TasksView.vue</code>（<code>embedded</code> 嵌入模式）；无后端改动、无契约字节变化</li>
+<li>病灶：Task 在后台异步执行，而可观察面只在「任务」页；用户看状态、答 Task 提问、做计划决策都要离开对话再回来。面板把当前项目的 Task 列表与「需要我处理」放到对话页右侧，点行复用任务页同一个详情抽屉；范围是<strong>当前项目</strong>而非当前会话</li>
+<li>不改 Task 的存储、状态机、调度与 API；移动端（≤860px）不出现面板，仍走左侧「任务」入口。<strong>§3 第 4 条（Todo 不进面板）已被 <a href="78-对话页右侧工作区与改动文件.html">doc/78</a> 取代</strong>；<strong>§3 第 1 条（不按会话过滤）与 §4.2 已被 <a href="80-任务列表按会话过滤.html">doc/80</a> 取代</strong></li>
+</ul></li>
+<li><p><strong>78</strong> <a href="78-对话页右侧工作区与改动文件.html">对话页右侧工作区与改动文件</a> ✅（<strong>2026-11-13 落地</strong>：<code>internal/runengine/runviews.go</code>、<code>web/src/ChatDock.vue</code> 等，契约用例 65）</p>
+<ul>
+<li>落点：<code>internal/runengine/{runviews.go,runviews_test.go,server.go,contract_test.go}</code>、<code>web/src/{App.vue,api.ts,ChatDock.vue,WorkspaceTree.vue,WorkspaceFileView.vue,RunTodoPanel.vue,RunChangedFiles.vue}</code>、<code>scripts/acceptance/expected.json</code>（用例 65）、<code>doc/19-v6/19v6-04</code>、<code>doc/40</code>（端点表）</li>
+<li>把 doc/77 的单面板扩成多标签工作区（项目目录 / 任务 / Todo / 文件），并新增两个只读端点：<code>GET /api/runs/:id/changed-files</code>（从 runlog 工具调用行派生本轮写入/编辑过的文件）与 <code>GET /api/runs/:id/tasks</code>（<code>run_tasks</code> 的第一个 HTTP 读口）；助手回复结尾列出改动文件，点开在右侧打开文件标签</li>
+<li>不改 run 执行、Task 状态机、文件工具行为与帧格式；不做右侧编辑、不做 diff、不做拖拽调宽；≤860px 工作区不渲染，Todo 留在输入框上方</li>
+<li><strong>2026-11-14 补充（doc/79）</strong>：文件标签里的 <code>.md</code> / <code>.markdown</code> <strong>按 markdown 渲染显示，默认预览态、可切「原文」</strong>（§2 第 6 条已改口径；样式与判定见 <a href="48-前端可用性欠账.html">doc/48</a> §10）。取字节的路径、端点与响应字节<strong>一个字没变</strong></li>
+</ul></li>
+<li><p><strong>80</strong> <a href="80-任务列表按会话过滤.html">任务列表按会话过滤</a> ✅（<strong>2026-11-14 落地</strong>：<code>internal/runengine/{agent_task_store.go,agent_task_api.go}</code>、<code>web/src/{api.ts,TasksView.vue,ChatDock.vue,App.vue}</code>，契约用例 80）</p>
+<ul>
+<li>落点：<code>internal/runengine/{agent_task_store.go,agent_task_api.go}</code>（<code>ListWorkspaceTasks</code> 加 <code>sessionID</code> 参数 + 子查询）、<code>web/src/{api.ts,TasksView.vue,ChatDock.vue,App.vue}</code>、<code>scripts/acceptance/expected.json</code>（用例 80）、<code>doc/19-v6/19v6-04</code></li>
+<li>病灶：Task 由对话派发、结果回到对话，但任务面板与任务页只按<strong>项目</strong>列出，同一项目里多个会话派发的任务混在一起。<code>GET /api/workspaces/:id/tasks</code> 新增可选参数 <code>sessionId</code>（不传=全部、非空=按来源会话过滤、未知会话=200 空列表）；面板／任务页默认「本会话」、可一键切「本项目全部」；处理条仍项目级聚合</li>
+<li>纯过滤，不校验会话存在性；<code>sessionId=</code> 空串等于不传；不动 Task 的存储、状态机、调度与其它 API 字节。<strong>取代 <a href="77-对话页任务面板.html">doc/77</a> §3「不按会话过滤」与 <a href="78-对话页右侧工作区与改动文件.html">doc/78</a> §3 同名条款</strong></li>
+</ul></li>
+<li><p><strong>81</strong> <a href="81-刷新失败不误判登出.html">刷新失败不误判登出</a> ✅（<strong>2026-11-14 落地</strong>：<code>web/src/auth.ts</code>、<code>web/test/authrefresh.test.ts</code>，无后端改动）</p>
+<ul>
+<li>落点：<code>web/src/auth.ts</code>（<code>RefreshOutcome</code> / <code>readRefreshOutcome</code> / <code>isEnvelope</code> 三态判定，<code>doRefresh</code> 按三态分支）、<code>web/test/authrefresh.test.ts</code>（新增回归网 8 条）；纯前端、契约字节零变化</li>
+<li>病灶：<code>doRefresh</code> 把「<code>/api/auth/refresh</code> 拿到任何非 2xx」都当登录失效并 <code>clearAuth('expired')</code>；dev 重启引擎时 Vite 代理回 500（<code>text/plain</code>），开着的标签页被无端登出。改为只有「HTTP 401 且响应是引擎信封且 <code>code≠0</code>」才登出，5xx／代理 500／非信封 401 都是暂时性故障、静默保留 token 等下一拍</li>
+</ul></li>
+<li><p><strong>82</strong> <a href="82-可组合执行原语与后台任务.html">可组合执行原语与后台任务</a> ✅（<strong>2026-11-15 落地</strong>：<code>internal/runengine/{bash_job,bash_job_sweeper,bashspill,agent_task_*}.go</code> 等 + <code>scripts/acceptance/</code> 用例 82–83，活体四脚本全绿）</p>
+<ul>
+<li>落点：<code>internal/runengine/{bash_job.go,bash_job_sweeper.go,bashspill.go,agent_task_tools.go,agent_task_delivery.go,agent_task_scheduler.go,agent_task_store.go,agent_task_runner.go,agent_task_recovery.go,agent_task_attention.go,agent_task_api.go,orchestration_journey.go,sandbox.go}</code>、<code>internal/config/model.go</code>、<code>cmd/yktako/main.go</code>（5 旗标）、<code>agents/{coder,researcher}.md</code>、<code>web/src/{api.ts,TasksView.vue,NotificationRecovery.vue}</code>、<code>scripts/acceptance/</code>（expected.json 用例 82–83 + bash_job_live.sh 等）、<a href="19-v6/19v6-04-验收-curl.html">19v6-04</a>、<a href="40-响应信封统一.html">doc/40</a> §4.2e（117117/117118/117119）</li>
+<li>2026-11-15 立项并落地。bash 的 30 秒改为前台等待窗口（默认 8s，超时保留进程并返回 <code>bj_…</code>），补输出读取／有限等待／停止（SIGKILL 整进程组）／持久通知与失联处理（owner watcher 续租写终态、sweeper 对账 interrupted）；<code>wait_task</code> 让当前 run 已读结果时就地认领通知（<code>claimed_in_place=true</code>，不建 run、不写 attempt 行），避免重复交付；编排组内并发按 <code>workspace_mode</code> 取值（shared=1、isolated=2）；创建编排补 <code>finalTaskId</code>；新增路径账本 <code>GET /api/orchestrations/:id/journey</code>（只读投影，从计划修订、Task 终态、结果复用、通知尝试与继任 handoff 派生，刷新与换副本一致）</li>
+<li>不增加用户可见 DAG 模式或 JS 引擎：同步子代理、持久 Task、等待和依赖保持可组合；新工作继续走 doc/72 同组修订，已交付后走 doc/75 继任组；shared 组改为串行，需并行修改时使用 doc/74 isolated 现场。验收：单测/契约 506/0、活体四脚本（bash job 62/0、编排 49/49、journey 22/0、orchestration 回归）+ <code>spotcheck.sh</code> 37/0 + 浏览器走查（桌面/移动端 390 断言）；doc/58 的 bash 落盘落点与清扫触发点被本篇改定</li>
+</ul></li>
+</ul>
+<h2 id="2-历史存档docarchive不作施工面">2. 历史存档（<code>doc/archive/</code>，不作施工面）</h2>
+<p>归档按两代分组，逐篇清单见 <a href="archive/README.html">doc/archive/README.md</a>。</p>
+<blockquote>
+<p>正文里出现 <code>doc/01</code>–<code>doc/15</code>、<code>doc/18</code>、<code>doc/19-v3/v4/v5</code>、<code>docs/superpowers/</code> 这类旧路径，都是当时的位置；按文件名到对应分组里找。</p>
+</blockquote>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>分组</th>
+<th>内容</th>
+<th>入口</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>old-line</td>
+<td>v6 之前的旧线方案与交接（01–15、18、XX、handoff-doc24），以及旧线 Web UI / MAF 的计划与设计（<code>plans/</code>、<code>specs/</code>）</td>
+<td><a href="archive/README.html">archive/old-line/</a></td>
+</tr>
+<tr>
+<td>engine</td>
+<td>运行引擎 v3／v4／v5</td>
+<td><a href="archive/README.html">archive/engine/</a></td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="3-非方案内容">3. 非方案内容</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>文档</th>
+<th>状态</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>doc/blog/</code></td>
+<td><a href="blog/被Eino坑的一天.html">叶子才是根：被 Eino 中断契约坑掉的一天</a></td>
+<td>非方案</td>
+<td>工程故事；不作施工面</td>
+</tr>
+<tr>
+<td><code>doc/</code></td>
+<td><a href="53-模块地图.html">53-模块地图</a></td>
+<td>非方案</td>
+<td>代码结构索引：顶层模块与小模块 → 落点文件与职责；讲「代码在哪一块」，不讲「该怎么施工」</td>
+</tr>
+<tr>
+<td><code>doc/</code></td>
+<td><a href="55-Go-少见玩法辑录.html">55-Go 少见玩法辑录</a></td>
+<td>非方案</td>
+<td>代码阅读笔记：flock / SSE / Lua CAS / seatbelt 等 20 处不常见写法的落点、动机与代价；不作施工面</td>
+</tr>
+<tr>
+<td><code>doc/</code></td>
+<td><a href="62-nanoMuse记忆设计调研.html">62-nanoMuse 记忆设计调研</a></td>
+<td>非方案，调研记录</td>
+<td>2026-11-04 读浙大开源个人 agent nanoMuse（Meta Muse 的开源平替，本地 clone 于 <code>ref-agent/nanoMuse/</code>）的记忆模块源码：写时防重／读时检索／闲时整理／全程留账四条机制与对 tako 记忆（doc/29）的借鉴清单；借鉴条目落地须另立方案篇；不作施工面</td>
+</tr>
+<tr>
+<td><code>doc/</code></td>
+<td><a href="63-参照实现对照-子代理与折叠回查.html">63-参照实现对照：子代理与折叠回查</a></td>
+<td>非方案，对照记录</td>
+<td>2026-11-05 把根 README 里的对照表搬来正文：子代理（规格／回传／续跑／工具权限／嵌套／模型／运行形态）与折叠回查两张表，kimi 侧带代码指针、tako 侧带落点；只作对照阅读，不作施工真源</td>
+</tr>
+<tr>
+<td><code>doc/</code></td>
+<td><a href="66-诉求对照-场景应用与生产就绪.html">66-诉求对照：场景应用与生产就绪</a></td>
+<td>非方案，对照记录</td>
+<td>2026-11-07 把两组外部诉求（应用侧：Trace／Replay／灰度／成本、高敏决策与人工审核、证据链、任务编排；平台侧：Compose／模型网关／基础设施／Metrics／版本管理／Feature Flag／灰度回滚／成本／Runbook）合到一篇逐条对现状：有 3、半有 3、无 4，并给依赖顺序；原 doc/66 与 doc/67 同日合并于此，不作施工真源</td>
+</tr>
+<tr>
+<td><code>doc/</code></td>
+<td><a href="68-记忆检索的故事演示.html">68-记忆检索的故事演示</a></td>
+<td>非方案，演示读物</td>
+<td>2026-11-08：doc/65 §4.4 <code>search_memory</code> 语义的故事版演示——一场搬家 + 六个问题，覆盖 as_of 现实回放、include_history 改口链、removed 删除边界、过期退场；认知回放只作对比说明，现行工具不开放；参考脉络 Zep/Graphiti（借查询语义、不抄图谱存储）；不作施工真源</td>
+</tr>
+<tr>
+<td><code>doc/</code></td>
+<td><a href="69-参照实现对照-rakazo与octop.html">69-参照实现对照：rakazo 与 octop</a></td>
+<td>非方案，对照记录</td>
+<td>2026-11-08：读 rakazo（<code>ref-agent/rakazo/</code>）与 Octop（<code>ref-agent/Octop/</code>）源码的对照——agent 管理（rakazo 的 Bot+Subagent 双形态、octop 的 Expert→Agent→Team 三层）、plugin（rakazo「静态声明不执行代码」vs octop「plugin.yaml+main.py 可执行包」）、skill（三家同构的 SKILL.md）；结论：rakazo 无 expert、octop 有、tako 无 plugin/expert/协作；只作对照阅读，不作施工真源</td>
+</tr>
+<tr>
+<td><code>doc/problems/</code></td>
+<td><a href="problems/README.html">问题与方案库</a>（43 条）</td>
+<td>非方案</td>
+<td>决策档案：每条一个设计选择题——当时遇到什么、桌上有哪些候选、为什么这么裁、代价是什么、今天还成不成立；按模块分组，并在 <code>doc/53</code> 各小模块后反链</td>
+</tr>
+<tr>
+<td><code>doc/assets/</code></td>
+<td><a href="../assets/tako-architecture.html">系统架构总览</a></td>
+<td>非方案，交互图</td>
+<td>2026-11-16 重基线：约 20 个责任节点讲清前端、接入、run worker、长任务、结果发布、模型、扩展与存储；点节点/连线看输入输出、代码与真源。静态版 <code>tako-architecture.png</code>（3840×2822）由 <code>scripts/export-architecture-poster.sh</code> 派生。四页共享 <code>tako-architecture.css/js</code>，<code>scripts/check-architecture-pages.mjs</code> 检查数据与链接</td>
+</tr>
+<tr>
+<td><code>doc/assets/</code></td>
+<td><a href="../assets/tako-run-lifecycle.html">单场 run 生命周期</a></td>
+<td>非方案，交互图</td>
+<td>从 POST /api/runs 到定稿、记忆与显式续跑；含九种帧、runlog/模型输入/journal 分工、问答与 compact</td>
+</tr>
+<tr>
+<td><code>doc/assets/</code></td>
+<td><a href="../assets/tako-orchestration.html">长任务与多 Agent 编排</a></td>
+<td>非方案，交互图</td>
+<td>持久 Task、依赖调度、wait_task、shared/isolated、结果发布、后台 bash、通知恢复、同组修订与继任组</td>
+</tr>
+<tr>
+<td><code>doc/assets/</code></td>
+<td><a href="../assets/tako-data-model.html">数据、状态与存储</a></td>
+<td>非方案，交互图</td>
+<td>PostgreSQL 当前模型、四类 Redis 临时状态、项目 content/runtime、会话 wire、记忆双模式与多副本共享卷边界</td>
+</tr>
+<tr>
+<td><code>doc/html/</code></td>
+<td>文档站首页 · 全部文档索引</td>
+<td>非方案，网页版</td>
+<td>2026-11-16：每个已入库 md 对应一页网页版，由 <code>scripts/build-doc-html.py</code>（pandoc gfm→html5）生成并重写链接——doc 之间的链接转成 html、代码与脚本链接转成 GitHub blob、仓库里没有的（tmp/ 施工包、ref-agent 参考实现）去掉链接保留文字。<strong>只转已被 git 跟踪的 md</strong>（<code>doc/interview/</code> 等被 .gitignore 挡住的私有材料不入站）；内容以 md 为准，改了 md 要重跑脚本。<code>--check</code> 只比对不写盘，可进机器验收</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-doclog-记录">4. <code>doc/log/</code> 记录</h2>
+<p><code>doc/log/</code> 只放<strong>某一时刻的交接、执行台账与文章</strong>，按日期命名，不作为施工真源；需要了解「当时为什么这么做」时再读。清单与说明见 <a href="log/README.html">log/README.md</a>。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>日期</th>
+<th>文档</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2026-09-30</td>
+<td><a href="log/2026-09-30-uncommitted-review-handoff.html">未提交改动审查交接</a></td>
+<td>交接</td>
+<td>旧线未提交改动审查</td>
+</tr>
+<tr>
+<td>2026-10-07</td>
+<td><a href="log/2026-10-07-v6-gap-handoff.html">v6 现状与能力差距</a></td>
+<td>交接</td>
+<td>v6 现状快照与 pi／WeKnora 差距</td>
+</tr>
+<tr>
+<td>2026-10-08</td>
+<td><a href="log/2026-10-08-pre-t3-handoff.html">pre-T3 落地</a></td>
+<td>执行交接</td>
+<td>T3 之前的 lease／T1／T2</td>
+</tr>
+<tr>
+<td>2026-10-08</td>
+<td><a href="log/2026-10-08-subagent-design-handoff.html">子代理设计素材</a></td>
+<td>素材盘点</td>
+<td>子代理设计的已核实素材</td>
+</tr>
+<tr>
+<td>2026-10-09</td>
+<td><a href="log/2026-10-09-deferred-loading.html">Deferred loading：把工具 schema 移出前缀</a></td>
+<td>文章</td>
+<td>前缀缓存与工具 schema</td>
+</tr>
+<tr>
+<td>2026-10-12</td>
+<td><a href="log/2026-10-12-overflow-handoff.html">溢出修复层一期落地</a></td>
+<td>执行交接</td>
+<td>检出／救援链／截断检出</td>
+</tr>
+<tr>
+<td>2026-10-16</td>
+<td><a href="log/2026-10-16-overflow-b2b3-handoff.html">溢出修复层二期 B2/B3</a></td>
+<td>执行交接</td>
+<td>guard 救援链＋槽位落库</td>
+</tr>
+<tr>
+<td>2026-10-19</td>
+<td><a href="log/2026-10-19-多租户-handoff.html">多租户运行时现状交接</a></td>
+<td>现状交接</td>
+<td>多租户全改后代码停在哪</td>
+</tr>
+<tr>
+<td>2026-11-02</td>
+<td><a href="log/2026-11-02-gaia-k5-两臂可靠性对照.html">GAIA k=5：一个模型，两个 harness</a></td>
+<td>文章</td>
+<td>tako／dsh 两臂 k=5 可靠性对照</td>
+</tr>
+<tr>
+<td>2026-11-03</td>
+<td><a href="log/2026-11-03-文档归属重构/README.html">文档归属重构</a></td>
+<td>变更记录</td>
+<td><code>docs/</code> 并入 <code>doc/</code>、旧线归档、机器闸落地；执行流水见同目录 <code>tasks.md</code></td>
+</tr>
+<tr>
+<td>2026-11-09</td>
+<td><a href="log/2026-11-09-记忆两层方案演进.html">记忆两层方案演进</a></td>
+<td>演进记录</td>
+<td>2026-11-07～08 的改稿过程；现行双模式方案以 doc/65 为准，本文不作施工真源</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="5-新增修改文档的规则">5. 新增／修改文档的规则</h2>
+<ol type="1">
+<li><strong>编号与位置</strong>
+<ul>
+<li>主系列：<code>doc/NN-短标题.md</code>，编号递增，不复用已删编号。</li>
+<li>v6 子系列：<code>doc/19-v6/19v6-NN-短标题.md</code>；index 与演进记录分别是 <code>19-运行引擎架构-v6.md</code>、<code>19v6-90-演进记录.md</code>。</li>
+<li>交接／文章：<code>doc/log/YYYY-MM-DD-短标题.md</code>；变更记录：<code>doc/log/&lt;YYYY-MM-DD&gt;-&lt;方案名&gt;/</code>。</li>
+<li>执行期台账：<code>tmp/&lt;方案名&gt;/</code>（本地，不入库），验收后按第 8 条留档。</li>
+</ul></li>
+<li><strong>头注必须写四件事</strong>：性质（方案／实现真源／讨论稿／存档）、状态（✅／🔶／⬜）、日期、代码落点。写了“未定案”的文档不能被当成施工真源引用。</li>
+<li><strong>替代关系写在头注</strong>：新文档取代旧文档时，旧文档头注加“已被 X 取代”，新文档写“取代 Y”；不删除旧文。</li>
+<li><strong>同一机制只留一份真源</strong>：其他文档只写指针，不复制条款；发现两处冲突，先改真源，再改指针。</li>
+<li><strong>代码落点必须是真实路径</strong>：没有代码就写 <code>—（文档／验收／记录）</code>，不要写已删除的包。</li>
+<li><strong>新增或改状态时同步本索引</strong>：同一提交里更新对应行；纯错别字修正除外。 <strong>动了产品能力的增减或状态翻转，同批还要更新 <a href="16-能力复刻总规划.html">doc/16</a></strong>（§2 能力表 + §2c 横切契约 + 头注基线日期）——本索引是目录页，doc/16 是结论页，两个都得更，只更一边总纲的「现状」就是假的。收尾跑 <code>scripts/check-master-plan.sh</code>（比对本表 §1 的现行真源编号与 doc/16 的引用，漏引即失败）。</li>
+<li><strong>四类归属</strong>：现行真源（<code>doc/</code> 顶层编号文档）、决策档案（<code>doc/problems/</code>）、记录（<code>doc/log/</code>）、归档（<code>doc/archive/</code>）。四者不互相冒充。 <strong>时效变化不搬家，只改状态</strong>：一篇方案过时了就在头注改状态或标「已取代」；只有被整代取代（旧线、旧引擎代际）才进 <code>doc/archive/</code>。</li>
+<li><strong>施工包留档</strong>：开工前由主 Agent 写 <code>tmp/&lt;方案名&gt;/施工包.md</code> 并交用户确认；开发模型随后一次完成大任务，机器验收后由主 Agent 终审。用户验收后，施工包<strong>原样</strong>搬进 <code>doc/log/&lt;YYYY-MM-DD&gt;-&lt;方案名&gt;/build.md</code> 并加状态头，此后冻结；结论提炼进同目录 <code>README.md</code>，随后删 <code>tmp/&lt;方案名&gt;/</code>。<code>build.md</code> 只记「当时怎么施工的」，与 <code>doc/NN</code> 冲突时以 <code>doc/NN</code> 为准。</li>
+</ol>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/README.md"><code>doc/README.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

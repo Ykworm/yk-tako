@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>34 · 租户运行时装配（团队 agent / 子代理 / 租户 model / MCP） · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="34--租户运行时装配团队-agent--子代理--租户-model--mcp">34 · 租户运行时装配（团队 agent / 子代理 / 租户 model / MCP）</h1>
+<blockquote>
+<p>性质：<strong>方案</strong>。2026-10-19 用户点头。R1–R5 与 U1 已写进 <code>yk-tako-eino/</code>，当天在 <code>127.0.0.1:8901</code> 用 curl 验收过。U1 已在浏览器验收：登录、Root/Subagent 列表、编辑默认生成覆盖、重置、custom 增删、md 导入、runtime-config 密钥掩码、自定义 MCP failed 状态。同日补修两处页面缺口并复验：对话页接入登录态（发送不再 401、token 过期自动刷新、媒体图片带登录取回），保存 Team 设置后 MCP 状态当场重测。已提交 9c21b66，也不表示版本号跳了一档。 真源关系：身份/租户/会话边界看 <a href="28-多租户.html">doc/28</a>；媒体占位看 <a href="32-media-offload.html">doc/32</a>； MCP 协议与工具面看 <a href="33-mcp-client.html">doc/33</a>；子代理规格看 doc/17、doc/26。 范围：团队 agent 与子代理的 DB/UI 配置；租户 model key；系统 MCP + 自定义 MCP； 每场 run 的运行时装配；预检、失败语义、密钥与配额收尾。 不在本篇：旧接口信封 A7、API key、组织/跨租户共享、SSO、账单。U1 的页面契约在第 11.3 节，实现在 <code>yk-tako-eino/web/</code>。</p>
+</blockquote>
+<h2 id="0-一句话结论">0. 一句话结论</h2>
+<p>团队 agent 不是第二种 agent runtime；它是这一场 run 的 <strong>root agent 的配置来源</strong>。 子代理也不是文件系统旁路：默认和租户配置都落 DB，<code>agents/*.md</code> 只做 seed / 导入格式。 一场 run 在抢闸前收成一份 <strong>RunProfile</strong>：模型、工具、MCP、instruction 都从这里来。R1–R5 和 U1 就是这条链。</p>
+<h2 id="1-名词与边界">1. 名词与边界</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>名词</th>
+<th>真身</th>
+<th>谁用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>默认 root agent</td>
+<td>没有选团队 agent 时的 root；<code>sessions.agent_id</code> 为空</td>
+<td>每次新会话的默认行为</td>
+</tr>
+<tr>
+<td>团队 agent / root agent</td>
+<td><code>agent_defaults</code> 或 <code>tenant_agents</code> 的 root 行</td>
+<td>用户在 <code>POST /api/runs</code> 里通过 <code>agentId</code> 直接选</td>
+</tr>
+<tr>
+<td>子代理 / subagent</td>
+<td>同一套默认/租户行，<code>kind=subagent/both</code>；<code>agents/*.md</code> 只做 seed/导入</td>
+<td>root 在 run 内通过委派工具调用，用户不直接选</td>
+</tr>
+<tr>
+<td>默认 agent</td>
+<td><code>agent_defaults</code> 里的平台默认行；租户未覆盖时使用</td>
+<td>平台 seed；租户 UI 只读</td>
+</tr>
+<tr>
+<td>租户覆盖</td>
+<td><code>tenant_agents</code> 里 <code>default_id</code> 指向默认行的 full copy</td>
+<td>租户 UI 编辑；同名覆盖默认</td>
+</tr>
+<tr>
+<td>系统 MCP</td>
+<td>平台 <code>mcp.json</code>，所有租户默认可用</td>
+<td>平台运维配置</td>
+</tr>
+<tr>
+<td>自定义 MCP</td>
+<td>租户 <code>runtime-config.mcpServers</code>，配了才用</td>
+<td>租户 admin 可选配置</td>
+</tr>
+<tr>
+<td>RunProfile</td>
+<td>一场 run 的不可变装配结果：model、translator、tools、MCP、instruction</td>
+<td><code>newRunAgent</code> 消费</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>“主 agent”</strong> 是旧称呼：进程启动时用 <code>TAKO_MODEL</code>、全局工具池和全局系统提示构造的默认 root。 R3 之后它仍然存在，但“默认”也按租户解析；团队 agent 只是显式覆盖。</p>
+<h2 id="2-现状与病灶">2. 现状与病灶</h2>
+<p>当前代码的事实（以工作区为准）：</p>
+<ul>
+<li><code>newRunAgent</code> 已经每场 run 新建一个 <code>adk.ChatModelAgent</code>，并发隔离成立；</li>
+<li><code>resolveRunInstruction</code> 已经读 <code>sessions.agent_id</code>，把 <code>tenant_agents.spec</code> 放进 <code>Instruction</code>；</li>
+<li><code>newRunAgent</code> 仍写死 <code>Model: w.chat</code>、<code>Tools: w.tools</code>，不看 <code>model_ref</code> / <code>tool_policy</code>；</li>
+<li><code>TenantAgent.tools</code> 是库里旧字符串；<code>createAgent</code> / <code>updateAgent</code> 请求体没有 <code>tools</code>， <code>agentBody</code> 也不返回；自定义团队 agent 根本配不了工具；</li>
+<li>子代理 <code>agentSpecHandler</code> 只 <code>LoadAgentSpecs("agents")</code>，没有 DB/租户层；</li>
+<li><code>mcpToolHandler</code> 只读 <code>defaultMcpConfPath</code>（平台 <code>mcp.json</code>），不读租户 <code>mcpServers</code>；</li>
+<li>租户 <code>secrets</code> 已封存/掩码，但 <code>ModelRegistry</code> 用进程环境快照、cache key 只有 <code>ref</code>；</li>
+<li><code>TAKO_MODEL</code> 和进程 environment 里的 key 仍是所有 run 的默认。</li>
+</ul>
+<p><strong>失败故事</strong>：</p>
+<ul>
+<li>owner 建团队 agent，填 <code>model_ref</code> 和工具；member 选它发消息；prompt 换了，模型和工具仍是平台启动时那套。</li>
+<li>A、B 两个租户都用 <code>deepseek/deepseek-v4-flash</code>；各配自己的 key；全局 Registry 按 ref 缓存，key 串租户。</li>
+<li>租户在 config 里配了 MCP，run 仍只连平台 <code>mcp.json</code>；配了等于没配。</li>
+<li>租户想改子代理，只能改全局 <code>agents/</code> 文件，影响所有租户；前端也没有入口。</li>
+</ul>
+<h2 id="3-目标与不变量">3. 目标与不变量</h2>
+<ol type="1">
+<li><strong>租户隔离</strong>：model key、MCP secret、MCP 连接、工具池、子代理配置都不跨租户。</li>
+<li><strong>租户自备 model key</strong>：<code>TAKO_MODEL</code> 只做默认 ref；API key 来自租户 <code>secrets</code>，没有平台 key 回退。</li>
+<li><strong>所有模型调用都按租户</strong>：root、子代理、长期记忆抽取、上下文压缩摘要，全部用租户 key。</li>
+<li><strong>默认工具全量</strong>：团队 agent 不写 <code>tool_policy</code> 时，继承该租户的<strong>有效工具池</strong>全部； 显式 policy 才收缩；空名单 = 无工具。</li>
+<li><strong>默认/覆盖</strong>：系统默认 agent 在 DB；租户配置了就用租户，没有就用默认；同名覆盖。</li>
+<li><strong>子代理同样可配</strong>：root 和 subagent 都在 UI 可配；默认 DB，租户覆盖 DB；md 只是导入格式。</li>
+<li><strong>MCP 可失败就失败</strong>：自定义 MCP 显式配置且连不上 → <code>503</code>，不建 run；配置非法 → 400。</li>
+<li><strong>预检在抢闸前</strong>：坏 model/tool/MCP 配置不能先 202 再在 worker 里 error。</li>
+<li><strong>多副本</strong>：配置/密钥在 PG，连接句柄在进程内；不靠进程内状态做正确性。</li>
+<li><strong>旧接口信封不动</strong>：A7 单独做。</li>
+</ol>
+<h2 id="4-已拍决定与待拍项">4. 已拍决定与待拍项</h2>
+<h3 id="41-已拍">4.1 已拍</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>决定</th>
+<th>口径</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>团队 agent 是什么</td>
+<td><code>agent_defaults</code>/<code>tenant_agents</code> 的 root；不是子代理</td>
+</tr>
+<tr>
+<td>子代理默认</td>
+<td>DB；不是文件系统；md 只做 seed/导入</td>
+</tr>
+<tr>
+<td>默认/租户配置</td>
+<td>默认在 DB；租户配置了就用租户，没有就默认；同名覆盖</td>
+</tr>
+<tr>
+<td>UI</td>
+<td>root 和 subagent 都要能在 UI 配置；编辑、覆盖、重置、导入 md</td>
+</tr>
+<tr>
+<td>工具默认</td>
+<td>不写 <code>tool_policy</code> = 继承全部有效工具</td>
+</tr>
+<tr>
+<td>平台 key 回退</td>
+<td><strong>不允许</strong>；租户没配自己的 model key → 4xx，不建 run</td>
+</tr>
+<tr>
+<td>自定义 MCP 失败</td>
+<td><code>503</code>，不建 run；UI 显示 failed</td>
+</tr>
+<tr>
+<td>系统 MCP 失败</td>
+<td>降级为少工具；UI 显示 degraded</td>
+</tr>
+<tr>
+<td>租户 md</td>
+<td>租户上传 API；导入到 DB，不落共享文件系统</td>
+</tr>
+<tr>
+<td>子代理 model/tools</td>
+<td>默认继承根；配置了覆盖；租户 key 解析；不能扩权</td>
+</tr>
+<tr>
+<td>模型调用范围</td>
+<td>root、子代理、记忆抽取、摘要全走租户 key</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="42-待拍">4.2 待拍</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>暂定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>默认 agent 更新后，已有租户覆盖是否自动跟随</td>
+<td>不自动；覆盖是 full copy；UI 显示“默认已更新”</td>
+</tr>
+<tr>
+<td>自定义 provider / base URL</td>
+<td>先按平台 provider catalog；租户只能配 key</td>
+</tr>
+<tr>
+<td>secret 轮换</td>
+<td>当前 <code>seal1:</code> 用 <code>TAKO_JWT_SECRET</code> 派生；R5 定独立 key/版本</td>
+</tr>
+<tr>
+<td>团队前端页面</td>
+<td>独立 U1 loop；本文只给字段/状态契约</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="5-目标结构runprofile">5. 目标结构：RunProfile</h2>
+<div class="sourceCode" id="cb1"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">type</span> RunProfile <span class="kw">struct</span> <span class="op">{</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    TenantID   <span class="dt">string</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    UserID     <span class="dt">string</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    SessionID  SessionID</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    AgentID    <span class="dt">string</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    ModelRef   <span class="dt">string</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    Model      model<span class="op">.</span>BaseChatModel</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    Translator Translator</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>    Instruction <span class="dt">string</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    ToolPolicy ToolPolicy</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    Tools      <span class="op">[]</span>tool<span class="op">.</span>BaseTool</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>    MCP        <span class="op">[]</span>MCPConnection</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    ConfigVer  <span class="dt">string</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>装配顺序（<code>postRuns</code>）：</p>
+<pre class="text"><code>1. auth + 解析 agent（请求 agentId 或 sessions.agent_id）；默认/覆盖合并
+2. 读 tenant_settings / agent 配置；解封 secrets
+3. 解析 model：agent.model_ref &gt; tenant.modelRef &gt; TAKO_MODEL（只 ref）
+4. 解析 tool policy：有效池 = 平台工具 + 系统 MCP + 自定义 MCP
+5. 解析 MCP：系统 + 租户合并；自定义显式连接
+6. validate(profile)：model 可建、tool 名可解析、MCP 可用、策略不越界
+7. AcquireRun；失败（404/409/429）→ 关闭刚建的 MCP
+8. worker.Run(profile)；newRunAgent 用 profile.Model / profile.Tools / profile.Instruction</code></pre>
+<p><strong>Eino 的位置</strong>：<code>adk.NewChatModelAgent</code> 是第 8 步的构造器；它可能对 Model 为空、工具接口不合法报错， 但它不拥有租户、密钥、MCP、tool policy 的语义。<code>validate(profile)</code> 是我们自己的前置校验，不是 Eino API。</p>
+<h2 id="6-默认--租户覆盖的数据模型">6. 默认 / 租户覆盖的数据模型</h2>
+<h3 id="61-两张表">6.1 两张表</h3>
+<pre class="text"><code>agent_defaults(
+  id, name, kind, description, spec, model_ref, tool_policy,
+  version, created_at, updated_at
+)
+
+tenant_agents(
+  id, tenant_id, default_id, name, kind, description, spec,
+  model_ref, tool_policy, visibility, source, created_by, created_at
+)</code></pre>
+<ul>
+<li><code>kind</code>: <code>root | subagent | both</code>；</li>
+<li><code>agent_defaults</code> 是平台默认；由 <code>agents/*.md</code> seed，运行时不再读文件系统；</li>
+<li><code>tenant_agents</code> 是租户覆盖（<code>source=override</code>，<code>default_id</code> 非空）或自定义（<code>source=custom</code>）；</li>
+<li><strong>覆盖 = full copy</strong>：UI 点“编辑默认”时，把默认行整份复制成租户行；之后默认更新不自动改覆盖；</li>
+<li>删除 override = 回到默认；删除 custom = 真删；</li>
+<li><code>tenant_agents</code> 唯一性按 <code>(tenant_id, name)</code> 约束；kind 不参与唯一，避免同名 root/subagent 双份；</li>
+<li><code>sessions.agent_id</code> 可以是 <code>ad_</code>（默认 id）或 <code>ag_</code>（租户行 id）； 解析时先定位默认/租户行，再找同名 override。</li>
+</ul>
+<h3 id="62-有效-agent-解析">6.2 有效 agent 解析</h3>
+<pre class="text"><code>root：
+  defaults(kind=root|both) + tenant overrides/custom
+  同名租户覆盖默认
+subagent：
+  defaults(kind=subagent|both) + tenant overrides/custom
+  同名租户覆盖默认</code></pre>
+<ul>
+<li><code>GET /api/tenants/:id/agents?kind=root|subagent</code> 返回<strong>有效列表</strong>： <code>id</code>（当前生效 id）、<code>defaultId</code>、<code>source</code>（default/override/custom）、<code>overridden</code>、 <code>name/description/spec/modelRef/toolPolicy/visibility</code>。</li>
+<li>UI 对 default 行只读；编辑时创建 override；对 override/custom 可编辑/删除/重置。</li>
+<li><code>agentId</code> 选择：
+<ul>
+<li>选 default 行：<code>agentId=ad_...</code>；运行时查同名 override，有就用 override；</li>
+<li>选 override/custom 行：<code>agentId=ag_...</code>。</li>
+</ul></li>
+<li>预检：id 必须能解析成有效 agent；删除/不可见 → 404 <code>112003</code>，不建 run。</li>
+</ul>
+<h2 id="7-模型">7. 模型</h2>
+<h3 id="71-优先级">7.1 优先级</h3>
+<pre class="text"><code>agent.model_ref（空 = 不覆盖）
+  &gt; tenant_settings.modelRef（空 = 不覆盖）
+  &gt; TAKO_MODEL（平台默认 ref）</code></pre>
+<ul>
+<li><code>agent.model_ref</code> 为空不等于“没有模型”，是“继承租户默认”；</li>
+<li><code>TAKO_MODEL</code> 只提供 ref，<strong>不提供 key</strong>；</li>
+<li>租户没配 key 时，默认 agent 也不能跑；返回 4xx，不建 run；</li>
+<li>租户配了 key 但 ref 解析失败 → 4xx，不偷偷回退平台。</li>
+</ul>
+<h3 id="72-租户-key">7.2 租户 key</h3>
+<ul>
+<li><code>tenant_settings.secrets</code> 是环境变量名到值的映射，例如 <code>DEEPSEEK_API_KEY</code>；</li>
+<li>值封存后再落库。配了长度不少于 32 字节的 <code>TAKO_DATA_KEY</code> 时，新写入是 <code>seal2:</code>，密钥是这段数据密钥的 sha256。没配或太短时仍写 <code>seal1:</code>，密钥来自 <code>TAKO_JWT_SECRET</code>。解开 <code>seal2:</code> 时先试 <code>TAKO_DATA_KEY</code>，再试 <code>TAKO_DATA_KEY_PREVIOUS</code>；解开 <code>seal1:</code> 时先试 <code>TAKO_JWT_SECRET</code>，再试 <code>TAKO_JWT_SECRET_PREVIOUS</code>。已有的 <code>seal1:</code> 行在配上数据密钥之后仍然能解开；</li>
+<li>构造租户环境：<strong>平台非密钥配置</strong>（provider catalog、base URL 这类）+ <code>tenantSecrets</code>； 所有 <code>*_API_KEY</code>（包括 <code>TAKO_PROVIDER_*_API_KEY</code>）必须来自租户 map，平台进程里的 key 不注入；</li>
+<li><strong>不使用进程级 <code>TAKO_*</code> API key 作为租户 run 的回退</strong>；</li>
+<li>日志只打 provider、model、ref 和密钥指纹，不打 key，也不打密文。</li>
+</ul>
+<h3 id="73-resolver--cache">7.3 Resolver / cache</h3>
+<ul>
+<li>新增 <code>TenantModelResolver</code>（或在 <code>ModelResolver</code> 上加 tenant 维度）；</li>
+<li>cache key = <code>tenantID + ref + configVersion</code>；</li>
+<li><code>configVersion</code> 来自 <code>tenant_settings.config</code> 的哈希（含 secret 密文），配置改动后新 key；</li>
+<li>每个进程一份 cache；多副本不共享；重启丢失可重建；</li>
+<li>子代理、记忆抽取、摘要共用这个 resolver，不各自建全局 registry；</li>
+<li>对外不把 <code>tenantID</code> 明文放进响应。<code>GET /api/tenants/:id/model-resolve</code>（viewer 即可，owner 的角色更高，所以过得去）走和建 run 相同的 Resolve。成功时 <code>data</code> 是 <code>{ref, provider, model, keyFingerprint, cacheKey}</code>。<code>keyFingerprint</code> 是这把租户密钥 sha256 的前 12 个十六进制字符。<code>cacheKey</code> 是内部键 <code>tenantID + NUL + ref + NUL + configVersion</code> 的 sha256 十六进制。没配 key 时 HTTP 409、<code>code</code> 为 <code>111408</code>，<code>runs</code> 不增加。同一租户、同一配置连打两次，<code>cacheKey</code> 相同。两个租户用同一个 ref、不同的 key，指纹和 <code>cacheKey</code> 彼此不同，也不同于进程环境里那把平台密钥。这条探针不发起模型调用。</li>
+</ul>
+<h3 id="74-所有模型调用">7.4 所有模型调用</h3>
+<p>R2 之后：root <code>newRunAgent</code>、子代理、记忆抽取、上下文压缩摘要，全部用租户 resolver； 后台任务必须能从 <code>session_id</code> 找回 tenant，不能拿进程启动时的全局 chat 兜底。</p>
+<h2 id="8-工具">8. 工具</h2>
+<h3 id="81-tool_policy">8.1 <code>tool_policy</code></h3>
+<div class="sourceCode" id="cb6"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;mode&quot;</span><span class="fu">:</span><span class="st">&quot;inherit&quot;</span><span class="fu">,</span><span class="dt">&quot;names&quot;</span><span class="fu">:</span><span class="ot">[]</span><span class="fu">}</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;mode&quot;</span><span class="fu">:</span><span class="st">&quot;allow&quot;</span><span class="fu">,</span><span class="dt">&quot;names&quot;</span><span class="fu">:</span><span class="ot">[</span><span class="st">&quot;get_time&quot;</span><span class="ot">,</span><span class="st">&quot;read_text_file&quot;</span><span class="ot">]</span><span class="fu">}</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;mode&quot;</span><span class="fu">:</span><span class="st">&quot;exclude&quot;</span><span class="fu">,</span><span class="dt">&quot;names&quot;</span><span class="fu">:</span><span class="ot">[</span><span class="st">&quot;bash&quot;</span><span class="ot">]</span><span class="fu">}</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;mode&quot;</span><span class="fu">:</span><span class="st">&quot;none&quot;</span><span class="fu">,</span><span class="dt">&quot;names&quot;</span><span class="fu">:</span><span class="ot">[]</span><span class="fu">}</span></span></code></pre></div>
+<ul>
+<li><code>inherit</code>：有效池全部；不写 policy = inherit；</li>
+<li><code>allow</code>：只列出的名字；</li>
+<li><code>exclude</code>：有效池减名字；</li>
+<li><code>none</code>：空池；</li>
+<li><code>names</code> 只允许在 <code>allow</code> / <code>exclude</code> 下出现；<code>inherit</code> / <code>none</code> 带 names 是 400。</li>
+</ul>
+<h3 id="82-有效池">8.2 有效池</h3>
+<pre class="text"><code>有效池 = 平台第一方工具 + 系统 MCP 工具 + 租户自定义 MCP 工具</code></pre>
+<ul>
+<li>默认 agent 全拿；</li>
+<li>显式 policy 在有效池上过滤；</li>
+<li>子代理继承根过滤后的池，不能反向扩；</li>
+<li><code>bash</code> 也在池里；沙箱不可用时它的调用会失败。是否剔除 <code>bash</code>，待拍。</li>
+</ul>
+<h3 id="83-名字校验">8.3 名字校验</h3>
+<ul>
+<li>第一方工具名来自 <code>tool.Info().Name</code>；</li>
+<li>MCP 工具名 = <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>；</li>
+<li><code>tool_policy</code> 里未知名字 → 400，不建 run；</li>
+<li>自定义 MCP 的工具名只有连接后才知道，R4 的预检必须先连接再校验。</li>
+</ul>
+<h2 id="9-子代理默认-db租户覆盖md-导入">9. 子代理（默认 DB，租户覆盖，md 导入）</h2>
+<h3 id="91-运行时来源">9.1 运行时来源</h3>
+<ul>
+<li>子代理<strong>不再运行时扫 <code>agents/</code> 目录</strong>；</li>
+<li>启动/迁移时把 <code>agents/*.md</code> seed 成 <code>agent_defaults</code>（<code>kind=subagent/both</code>）；</li>
+<li>运行时从 <code>agent_defaults + tenant_agents</code> 解析有效子代理；</li>
+<li>多副本共享 PG，不共享文件系统作为 agent 真源。</li>
+</ul>
+<h3 id="92-租户配置">9.2 租户配置</h3>
+<ul>
+<li>UI 可编辑子代理：默认行只读，编辑创建 override；可重置；</li>
+<li>上传 md：解析 frontmatter + 正文，创建 override/custom；</li>
+<li>同名覆盖默认；不同名成为自定义子代理；</li>
+<li>子代理 <code>model</code>/<code>tool_policy</code> 默认继承根 profile；配置了覆盖；</li>
+<li>子代理工具池必须是根有效池的子集，不能借 md/UI 提权；</li>
+<li>子代理没有“用户直接选”的入口；它只作为 root 的委派工具。</li>
+</ul>
+<h3 id="93-与团队-agent-的关系">9.3 与团队 agent 的关系</h3>
+<ul>
+<li>团队 agent 是 root，用户选；</li>
+<li>子代理是 delegate，用户不直接选；</li>
+<li>built-in <code>coder</code> / <code>researcher</code> 在 <code>agent_defaults</code> 里 <code>kind=both</code>，同时出现在两个 UI；</li>
+<li>用户自建 root 默认不是子代理；用户自建 subagent 也不自动成为 root；</li>
+<li>UI 的 Agent 页分 Root / Subagent 两个 tab，共享同一套默认/覆盖规则。</li>
+</ul>
+<h2 id="10-mcp">10. MCP</h2>
+<h3 id="101-两源合并">10.1 两源合并</h3>
+<ul>
+<li>系统 MCP：平台 <code>mcp.json</code>；所有租户默认可用；</li>
+<li>自定义 MCP：<code>tenant_settings.mcpServers</code>；配了才用；</li>
+<li>合并：同名租户覆盖系统，不同名都保留；</li>
+<li>用户不需要配 MCP；不配就只用系统 MCP。</li>
+</ul>
+<p>租户 config 形状：</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;mcpServers&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;filesystem&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;command&quot;</span><span class="fu">:</span> <span class="st">&quot;npx&quot;</span><span class="fu">,</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;args&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="st">&quot;-y&quot;</span><span class="ot">,</span> <span class="st">&quot;@modelcontextprotocol/server-filesystem&quot;</span><span class="ot">,</span> <span class="st">&quot;/data&quot;</span><span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>      <span class="dt">&quot;env&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;TOKEN&quot;</span><span class="fu">:</span> <span class="st">&quot;secret://MCP_TOKEN&quot;</span><span class="fu">}</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    <span class="fu">}</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<ul>
+<li><code>env</code> 值 <code>secret://&lt;key&gt;</code> 从租户 <code>secrets</code> 解封；缺 key → 400；</li>
+<li>明文 env 只允许非敏感值；界面不显示 secret 明文；</li>
+<li>不允许 <code>seal1:</code> 密文直接当 env 值传给 MCP。</li>
+</ul>
+<h3 id="102-失败语义与-ui-状态">10.2 失败语义与 UI 状态</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>情况</th>
+<th>结果</th>
+<th>UI</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>租户 config JSON 非法</td>
+<td>400，不建 run</td>
+<td>表单错误</td>
+</tr>
+<tr>
+<td>自定义 server 连不上/握手失败</td>
+<td><strong>503</strong>，不建 run</td>
+<td>红色 failed + 原因</td>
+</tr>
+<tr>
+<td>自定义 server 工具名与 policy 不符</td>
+<td>400，不建 run</td>
+<td>表单错误</td>
+</tr>
+<tr>
+<td>系统 MCP 连不上</td>
+<td>降级为少工具，run 继续</td>
+<td>黄色 degraded</td>
+</tr>
+<tr>
+<td>抢闸前连上、AcquireRun 409</td>
+<td>关闭连接，返回 409</td>
+<td>会话忙提示</td>
+</tr>
+</tbody>
+</table></div>
+<ul>
+<li><strong>顺序成本</strong>：自定义 MCP 连接在 <code>AcquireRun</code> 之前；连上了却抢闸失败要立刻关闭。</li>
+<li><strong>连接生命周期</strong>：一次 run 一份；run 结束关闭；不跨 run 复用。</li>
+<li><strong>UI 状态接口</strong>：R4 增加 <code>GET /api/tenants/:id/mcp-status</code>（admin）： <code>system[]</code>（只读，state=connected/degraded/failed）、<code>custom[]</code>（state=connected/failed/disabled）， 不返回 secret；UI 用它显示“系统 MCP 降级 / 自定义 MCP 503”。</li>
+</ul>
+<h2 id="11-api--存储--ui">11. API / 存储 / UI</h2>
+<h3 id="111-agent-api">11.1 Agent API</h3>
+<pre class="text"><code>GET    /api/tenants/:id/agents?kind=root|subagent
+POST   /api/tenants/:id/agents                 # custom 或 override
+PUT    /api/tenants/:id/agents/:agent_id       # override/custom
+DELETE /api/tenants/:id/agents/:agent_id       # override 删除=回默认；custom 删除
+POST   /api/tenants/:id/agents/import          # md 导入，写 override/custom</code></pre>
+<ul>
+<li>请求/响应字段：<code>name</code>、<code>kind</code>、<code>description</code>、<code>spec</code>、<code>modelRef</code>、<code>toolPolicy</code>、<code>visibility</code>；</li>
+<li><code>GET</code> 返回 <code>id/defaultId/source/overridden</code>；</li>
+<li><code>POST</code> 同名默认 → override；否则 custom；</li>
+<li>导入 md 用 JSON <code>{files:[{name,content}]}</code>，服务端解析 frontmatter；</li>
+<li><code>toolPolicy</code> 结构校验 R1；工具名解析 R3/R4。</li>
+</ul>
+<h3 id="112-tenant-runtime-config">11.2 tenant runtime config</h3>
+<div class="sourceCode" id="cb10"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;modelRef&quot;</span><span class="fu">:</span> <span class="st">&quot;deepseek/deepseek-v4-flash&quot;</span><span class="fu">,</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;mcpServers&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;...&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;command&quot;</span><span class="fu">:</span> <span class="st">&quot;...&quot;</span><span class="fu">,</span> <span class="dt">&quot;args&quot;</span><span class="fu">:</span> <span class="ot">[]</span><span class="fu">,</span> <span class="dt">&quot;env&quot;</span><span class="fu">:</span> <span class="fu">{}}},</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;secrets&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;DEEPSEEK_API_KEY&quot;</span><span class="fu">:</span> <span class="st">&quot;seal1:...&quot;</span><span class="fu">},</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;sandbox&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;network&quot;</span><span class="fu">:</span> <span class="kw">false</span><span class="fu">}</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<ul>
+<li>R1 只校验结构；R2 用 secret；R4 用 MCP；</li>
+<li><code>secrets</code> 仍封存；GET 掩码；PUT 回掩码保留旧密文。</li>
+</ul>
+<h3 id="113-ui-契约独立-vue-loop不在-r1-实现">11.3 UI 契约（独立 Vue loop，不在 R1 实现）</h3>
+<ul>
+<li><strong>Agent 页</strong>：Root/Subagent 两个 tab；列表显示来源 default/override/custom、model、policy 摘要； 编辑 default 时先复制成 override；保存后标“已覆盖”；“重置”删除 override；新建 custom； 上传 md；错误按 400/404/409 显示。</li>
+<li><strong>Team 设置页</strong>：默认 modelRef；租户 model key（每个 provider 一行，掩码）； 系统 MCP 只读状态；自定义 MCP 增删改 + 测试连接；状态色：系统 degraded 黄、自定义 failed 红； run 503 时显示具体 server；secret 轮换 R5，页面先不做版本 UI。</li>
+<li><strong>依赖 API</strong>：<code>GET/PUT runtime-config</code>、<code>GET mcp-status</code>、Agent CRUD/import。</li>
+<li>页面在 <code>yk-tako-eino/web/</code>：顶栏切「对话 / 助手 / 团队」。登录态统一在 <code>web/src/auth.ts</code>，两个页面共用 <code>sessionStorage</code> 里的 access/refresh token——在哪边登录，另一边都算登录；一边退出，另一边也退回登录表单。</li>
+<li>对话页与配置页的请求都经 <code>authFetch</code>：带 <code>Authorization: Bearer</code>；遇 <code>401</code> 先用 refresh token 换一对新 token（refresh 是轮换的，并发 401 共用同一次刷新）再重试一次。refresh 已失效或旧会话没有 refresh token（U1 时期登录的存量会话）就清登录态、回到登录表单；网络错误不清登录态。对话页在未登录时直接渲染登录表单。</li>
+<li>媒体图片走 <code>GET /api/media</code> 也要求登录，而 <code>&lt;img src&gt;</code> 带不了请求头：页面先用 <code>authFetch</code> 取回字节、再以 object URL 交给 <code>&lt;img&gt;</code>，同一 path 只取一次。</li>
+<li>保存 Team 设置后当场重跑 <code>mcp-status</code>：状态是探针结果不是配置本身，保存后再显示旧结果会让用户以为新配置仍连着（之前要再点一次「测试连接」才更新）。</li>
+</ul>
+<h3 id="114-错误码">11.4 错误码</h3>
+<p>落地前补 <a href="28-多租户.html">doc/28 第 5.4 节</a>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>情况</th>
+<th>HTTP</th>
+<th>建议 code</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>agent/tool policy 字段非法</td>
+<td>400</td>
+<td><code>111002</code></td>
+</tr>
+<tr>
+<td>同名助手已经有租户配置</td>
+<td>409</td>
+<td><code>111412</code></td>
+</tr>
+<tr>
+<td>tool policy 未知工具</td>
+<td>400</td>
+<td><code>111409</code></td>
+</tr>
+<tr>
+<td>模型未配置/ref 不可用</td>
+<td>409</td>
+<td><code>111408</code></td>
+</tr>
+<tr>
+<td>MCP 配置非法</td>
+<td>400</td>
+<td><code>111410</code></td>
+</tr>
+<tr>
+<td>自定义 MCP 不可用</td>
+<td>503</td>
+<td><code>111411</code></td>
+</tr>
+<tr>
+<td>agent 不可见</td>
+<td>404</td>
+<td><code>112003</code></td>
+</tr>
+<tr>
+<td>会话忙</td>
+<td>409</td>
+<td>旧体 <code>session_busy</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>server 名不合法或缺少 <code>command</code>，仍回 400 <code>111002</code>，文案是「MCP 配置不合法」。<code>111410</code> 用在装配时：<code>secret://</code> 指到的密钥还没配，文案是「有一项 MCP 密钥还没配」；环境值本身是 <code>seal1:</code> 或 <code>seal2:</code> 密文，文案是「MCP 环境不能直接放密文」。自定义 MCP 连不上是 503 <code>111411</code>，文案是「自定义 MCP 连不上」。</p>
+<h2 id="12-r1r5--u1">12. R1–R5 + U1</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>段</th>
+<th>用户能验收什么</th>
+<th>系统改什么</th>
+<th>依赖</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>R1 契约</strong></td>
+<td>root/subagent 能列、改、重置、导入 md；默认/覆盖/自定义来源可见；runtime config typed；运行行为不变</td>
+<td><code>agent_defaults</code> + <code>tenant_agents</code> 覆盖模型；agent API/import；typed config</td>
+<td>无</td>
+</tr>
+<tr>
+<td><strong>R2 租户 key</strong></td>
+<td>租户能配自己的 model key；没 key 的 run 4xx；两租户同 ref 不同 key 各走各的</td>
+<td>secret 解封；TenantModelResolver；cache key；无平台回退；后台模型调用</td>
+<td>R1</td>
+</tr>
+<tr>
+<td><strong>R3 运行时</strong></td>
+<td>选中的 root agent 真换 model/tools；默认 agent 全量；子代理 DB 覆盖/继承</td>
+<td>RunProfile；根 model/tools；子代理 DB 解析；预检</td>
+<td>R2</td>
+</tr>
+<tr>
+<td><strong>R4 MCP</strong></td>
+<td>系统+自定义 MCP 合并；自定义连不上 503；UI 能看状态</td>
+<td>typed MCP；merge；secret 解封；预检连接；mcp-status</td>
+<td>R3</td>
+</tr>
+<tr>
+<td><strong>R5 收尾</strong></td>
+<td>并发上传不超存储；过期邀请零用户；换数据密钥可解旧 secret</td>
+<td>存储 reservation；邀请单事务；secret 版本/轮换</td>
+<td>独立</td>
+</tr>
+<tr>
+<td><strong>U1 UI</strong></td>
+<td>Agent 页/Team 设置页可用</td>
+<td>Vue 页面；不改后端契约</td>
+<td>R1/R4</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>A7 旧接口信封</code> 不在这六段；单独做。</p>
+<h2 id="13-安全与多副本">13. 安全与多副本</h2>
+<ul>
+<li><strong>secret</strong>：不解密不落日志；<code>seal1:</code> 不能直传 MCP；GET 只回掩码；密钥轮换 R5。</li>
+<li><strong>跨租户</strong>：model resolver cache key 带 tenant；MCP 连接按 run；工具池按 tenant；agent 覆盖按 tenant。</li>
+<li><strong>多副本</strong>：配置/密钥/默认 agent/租户覆盖都在 PG；model client/MCP 连接在进程内；不依赖进程内 cache 做正确性。</li>
+<li><strong>审计</strong>：agent/config 变更若要审计，复用 A2-4；本轮不新开审计表。</li>
+<li><strong>配额</strong>：storage reservation / token 计量见 R5；本轮不重做 A5。</li>
+</ul>
+<h2 id="14-验收原则">14. 验收原则</h2>
+<ol type="1">
+<li>第一行永远打跑着的引擎；不写“页面上看到 X”。</li>
+<li>每个 action 停；不自动 commit。</li>
+<li>两租户、同 ref、不同 key 必须各走各的。</li>
+<li>没 key / 坏 model / 坏 tool / 坏 MCP 的请求必须<strong>无 run 行</strong>。</li>
+<li>默认 agent 全量工具；显式 policy 只收缩；子代理不能扩权。</li>
+<li>自定义 MCP 挂掉 503；系统 MCP 失败降级并在 UI 显示 degraded。</li>
+<li>409 后关闭 MCP 连接，不留进程内句柄。</li>
+<li>旧接口成功体不变；新接口走信封。</li>
+</ol>
+<h2 id="15-非目标与待拍">15. 非目标与待拍</h2>
+<ul>
+<li>旧接口信封 A7；</li>
+<li>API key / SSO / 账单 / 组织共享；</li>
+<li>租户自定义 provider/base URL（先按平台 catalog）；</li>
+<li>默认 agent 更新后覆盖是否自动跟随（暂定不自动）；</li>
+<li>secret 轮换的页面版本 UI（R5 已有数据密钥/版本，页面不做）；</li>
+<li>系统 MCP 失败已定降级；自定义 MCP 失败 503。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/34-%E7%A7%9F%E6%88%B7%E8%BF%90%E8%A1%8C%E6%97%B6%E8%A3%85%E9%85%8D.md"><code>doc/34-租户运行时装配.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

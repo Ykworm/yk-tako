@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>78 · 对话页右侧工作区：项目目录、任务与 Todo，以及改动文件回执 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="78--对话页右侧工作区项目目录任务与-todo以及改动文件回执">78 · 对话页右侧工作区：项目目录、任务与 Todo，以及改动文件回执</h1>
+<blockquote>
+<p>性质：<strong>方案（已落地）</strong>。把 doc/77 的单一面板扩成「项目目录 / 任务 / Todo / 文件」多标签工作区，并让每一轮写完文件的回复在结尾列出改动文件、点开就在右侧查看。 状态：✅ 2026-11-13 落地（未 commit，等验收）。后端两个只读端点 + 快闸 + 契约用例 65；前端多标签工作区、目录树、文件查看、Todo 标签与回复回执。<code>go test ./internal/runengine</code>（171.8s）、<code>go vet ./internal/runengine</code>、<code>npm run typecheck</code>、<code>npm run build</code> 通过；契约全量 475 步通过（用例 65 全 21 步）；浏览器活体走查见 §7 第 3 层与「验收结果」。 <strong>2026-11-14 补充（doc/79）</strong>：文件标签里的 <code>.md</code> / <code>.markdown</code> <strong>按 markdown 渲染显示，默认预览态、可切「原文」</strong>（§2 第 6 条已改口径；样式与判定见 <a href="48-前端可用性欠账.html">doc/48</a> §10）。取字节的路径、端点与响应字节<strong>一个字没变</strong>。 <strong>2026-11-14 补充（doc/80）</strong>：「任务」标签的列表默认显示<strong>本会话</strong>派发的任务，可一键切「本项目全部」（本节 §3「不按会话过滤」与 §4.5 末句里的「不按会话过滤」被 <a href="80-任务列表按会话过滤.html">doc/80</a> 取代；其余条款继续有效）。 代码落点：<code>internal/runengine/{runviews.go,runviews_test.go,server.go,contract_test.go}</code>、<code>web/src/{App.vue,api.ts,ChatDock.vue,WorkspaceTree.vue,WorkspaceFileView.vue,RunTodoPanel.vue,RunChangedFiles.vue}</code>（<code>TasksView.vue</code> 只改滚动归属注释）、<code>scripts/acceptance/expected.json</code>（用例 65）、<code>doc/19-v6/19v6-04-验收-curl.md</code>、<code>doc/40-响应信封统一.md</code>（端点表）。 前置真源：<a href="77-对话页任务面板.html">doc/77</a>（右侧任务面板，已落地；本篇<strong>取代它的 §3 第 4 条</strong>「不把 Todo 合并进面板」）、<a href="76-项目内容目录与运行资源容器.html">doc/76</a>（项目容器 <code>content/</code> 与 <code>runtime/</code>）、<a href="48-前端可用性欠账.html">doc/48</a>（文件清单端点与媒体字节出口）、<a href="59-工具调用可见性.html">doc/59</a>（工具卡）、<a href="41-任务看板与人工审批.html">doc/41</a>（<code>run_tasks</code> 看板）、<a href="19-v6/19v6-08-file-tools.html">doc/19-v6/19v6-08</a>（折叠用的 file-ops 提取）。 边界：两个<strong>只读</strong>新端点；不改 run 执行、Task 状态机、文件工具行为与帧格式。</p>
+</blockquote>
+<h2 id="1-病灶文件写完了人却在别的页面找它">1. 病灶：文件写完了，人却在别的页面找它</h2>
+<p>一场日常的编码对话：</p>
+<pre class="text"><code>用户：把报价小工具补上折扣，顺便修一下那个红着的测试
+→ 助手 write_file quote.py、edit_file test_quote.py，跑 bash 得到 unittest 输出
+→ 回复写「已修好，test_discount 通过」
+→ 用户想看看改成了什么样
+→ 对话里只有一句「已修好」：工具卡里能翻到调用参数，但没有可点的文件
+→ 离开对话 → 左侧「项目」→ 选项目 → 在项目页的文件列表里找 quote.py → 预览
+→ 想接着聊，再点回对话，草稿和阅读位置重新找</code></pre>
+<p>第二次更糟：同一轮改了三个文件，用户只记得其中一个名字；或者过了两天刷新页面回来，回复还在，却没有任何线索指向「这一轮动过哪些文件」。</p>
+<p>另一半问题在右侧面板本身。doc/77 之后，右侧只有一个任务列表：</p>
+<ul>
+<li>项目里有什么文件、目录长什么样，对话页里看不到——那是「项目」页才有的东西；</li>
+<li>看板 Todo 挂在输入框上方，任务列表挂在右侧，两者都在讲「要做什么」，却分在两个位置；</li>
+<li>面板展开时只有一条内容通道，想看文件就得把任务列表换掉，反之亦然。</li>
+</ul>
+<p><strong>完整业务链路（今天断在哪）</strong>：</p>
+<pre class="text"><code>用户发消息 → agent 调 write_file/edit_file/bash 写盘 → 调用记录落 runlog（role=tool_call，payload 带 name/args/toolCallId）
+→ run 终态 → assistant 回复进 runlog → 对话页渲染回复
+     ↑ 链到这里断：回复只说「做完了」，程序手里有调用记录，但没有任何读口把「这轮改过哪些路径」交给页面
+→ 用户想核对 → 只能离开对话，从项目页重新找入口</code></pre>
+<p>面板的目标链路：</p>
+<pre class="text"><code>同一份 runlog 调用记录 → GET /api/runs/:id/changed-files（新增，程序派生）
+→ 回复结尾「改动的文件」→ 点击 → 右侧工作区开一个文件标签
+项目 content/ 目录 → GET /api/workspaces/:id/files（既有）→ 右侧「项目」标签的目录树 → 点击文件 → 同一套文件标签
+run_tasks → GET /api/runs/:id/tasks（新增）→ 右侧「Todo」标签（刷新后仍在）</code></pre>
+<h2 id="2-完成线">2. 完成线</h2>
+<ol type="1">
+<li>对话页右侧是一个<strong>可收起</strong>的工作区，标签固定三枚——<strong>项目 / 任务 / Todo</strong>——外加打开文件时追加的<strong>文件标签</strong>（可关闭）。收起后留一条窄轨，三个入口都在，任务标签带处理项计数；点任一入口展开并切到对应标签。</li>
+<li>「项目」标签显示当前项目 <code>content/</code> 的目录树：目录可展开/收起（按需拉取子目录），点文件在右侧开文件标签；有刷新；旧布局项目显示可读的迁移提示。</li>
+<li>「任务」标签就是 doc/77 的任务面板：处理条 + 嵌入的任务页，行为逐条不变（含 <code>dockFocus</code> 定位互斥、事件/重连/聚焦重拉）。</li>
+<li>「Todo」标签显示<strong>当前会话最近一场 run</strong> 的看板（编号、主题、状态、完成数/总数），刷新页面后仍在；桌面端输入框上方的 Todo 条移除，≤860px 仍留在输入框上方（此时右侧工作区整体不显示）。</li>
+<li>每一轮<strong>写过或改过文件</strong>的助手回复，结尾多一行「改动的文件」：逐个文件一个可点条目，带「写入 / 编辑」标记；点击展开工作区（若已收起）并打开该文件标签。没有改动时不出现这一行。</li>
+<li>文件标签能看内容：<strong><code>.md</code> / <code>.markdown</code> 按 markdown 渲染显示（默认预览态，可切「原文」看原始字节，排版走全局 <code>.md-body</code>；doc/48 §10）</strong>，其它文本按原样显示（超上限给截断说明与下载），图片直接预览，其它类型给下载；文件读失败有明确文案，不留白屏。</li>
+<li>窄屏（≤860px）与今天一致：右侧工作区不显示、无横向溢出，Todo 回到输入框上方。</li>
+<li>页面上不出现第二套任务详情实现、第二套文件列表协议或「假数据」占位。</li>
+</ol>
+<h2 id="3-非目标">3. 非目标</h2>
+<ul>
+<li><strong>不在右侧编辑文件</strong>。这一轮只做「看见 + 打开」，写入仍由 agent 的工具完成。编辑器、保存、冲突提示都不做。</li>
+<li>不做目录树上的新建/重命名/删除/上传；这些走项目页（doc/44、doc/48）。</li>
+<li>不做 diff 视图与版本对比：「改动文件」只回答改了哪些路径，不回答逐行改了什么。</li>
+<li>不做面板拖拽调宽（沿用 doc/77 的取舍），宽度是断点驱动的固定区间。</li>
+<li>不做按会话过滤任务：任务标签仍跟<strong>当前项目</strong>（doc/77 §3 第 1 条不翻案）。 <strong>2026-11-14 更新：本条已被 <a href="80-任务列表按会话过滤.html">doc/80</a> 取代</strong>——任务标签的列表默认显示本会话派发的任务，可一键切「本项目全部」（项目仍是容器，处理条仍是项目级聚合）。</li>
+<li>不让模型「自己汇报文件列表」：清单由程序从调用记录派生，模型的回复文字不参与判定（模型漏写路径不影响清单，模型编造路径也进不了清单）。</li>
+<li>不做文件标签的持久化：刷新后回到固定标签，已打开的文件标签不恢复（它们是临时查看态，不是用户数据）。</li>
+</ul>
+<h2 id="4-已拍定的设计选择">4. 已拍定的设计选择</h2>
+<h3 id="41-右侧从任务面板变成工作区标签是唯一的内容通道">4.1 右侧从「任务面板」变成「工作区」，标签是唯一的内容通道</h3>
+<p>doc/77 的面板只有一个内容面。再加文件树就必须有第二面，否则「看文件」和「看任务」互斥，用户又要在两个状态之间来回切。标签页是这一层最省的做法：固定标签回答「这里有哪些<strong>种类</strong>的信息」，文件标签回答「我正在看<strong>哪一个文件</strong>」。</p>
+<ul>
+<li>固定标签不可关、顺序恒定；文件标签按打开顺序追加，宽度均分、整行换行（不出现横向滚动条——标签本身就是导航，不能有藏起来的项）。</li>
+<li>同一路径重复打开只切到已存在的标签，不新建。</li>
+<li>收起是整块工作区的收起，不是「项目标签单独收起」；窄轨上三个入口与任务计数保留，保证收起后仍能一键回到任意标签。</li>
+</ul>
+<p>没这么做会怎样：要么文件树只能以弹窗出现（离开对话的阅读位置，正是要修的病灶），要么把任务和文件塞进同一个纵向滚动区（两件事互相挤占，任务多了文件永远在屏幕外）。</p>
+<h3 id="42-目录树与文件字节全部复用既有端点">4.2 目录树与文件字节全部复用既有端点</h3>
+<ul>
+<li>列目录：<code>GET /api/workspaces/:id/files?path=</code>（doc/48 B1）；它已经只列 <code>content/</code>、目录在前、过滤内部目录与软链、旧布局回 409 <code>117116</code>。</li>
+<li>取字节：<code>GET /api/media?path=workspaces/&lt;wid&gt;/&lt;相对路径&gt;</code>（doc/32/76）；非 <code>.media/</code> 路径按 <code>content/</code> 读。前端用 <code>authFetch</code> 取 blob（该端点要 Bearer 头，不能直接塞 <code>&lt;a href&gt;</code>）。</li>
+</ul>
+<p>没这么做会怎样：新写一套列目录/取字节，就要重新实现一遍「可见性判定 + 路径越界检查 + 旧布局拒绝 + 内部目录过滤」，漏一条就是一个越权或一个打不开的文件。</p>
+<h3 id="43-改动的文件由服务端从-runlog-派生而不是从回复文字里抓">4.3 「改动的文件」由服务端从 runlog 派生，而不是从回复文字里抓</h3>
+<p>引擎在折叠上下文时已经有一份<strong>文件操作提取器</strong>（<code>fileops.go</code>：<code>firstPartyFileEffects</code> 声明表 + <code>classifyToolCall</code> + <code>pathsFromArgs</code>，含 bash 命令的写意图扫描）。它今天只服务「压缩后提醒模型自己做过什么」。这一轮把<strong>同一套判定</strong>放到 HTTP 读口上，按 run 读 <code>runlog_entries</code> 的 <code>role=tool_call</code> 行。</p>
+<p>为什么不让模型在回复末尾自己写文件清单：模型会漏、会改写成口语、会在没写盘时说写了。清单要能回答「程序知道这一轮动了哪些路径」，只能以调用记录为真源；模型的文字是叙述，不是证据。</p>
+<p>派生规则（与折叠的 file-ops 完全同源）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>输入</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>工具名在 <code>firstPartyFileEffects</code></td>
+<td><code>write_file</code>/<code>create_directory</code>/<code>bash</code>… → 写入；<code>edit_file</code>/<code>move_file</code> → 编辑；<code>read_*</code> → 读取，不进清单；<code>memory</code> 等显式 none → 不计</td>
+</tr>
+<tr>
+<td>工具名不在声明表</td>
+<td>沿用前缀表（<code>write/edit/create/save/append/touch</code> → 写入，<code>read/cat/ls/...</code> → 读取）；有路径但判不出意图 → 记为写入（歧义按强信号记，与折叠一致）</td>
+</tr>
+<tr>
+<td>路径来源</td>
+<td>参数里的 <code>path</code> 字段 + <code>bash</code> 的 <code>command</code> 写意图扫描（重定向、<code>cp/mv</code>、<code>tee/touch/mkdir/install</code>、<code>sed/perl -i</code>、<code>dd of=</code>）</td>
+</tr>
+<tr>
+<td>只保留可打开的</td>
+<td>必须能解析到当前项目 <code>content/</code> 下、<code>stat</code> 到普通文件；绝对路径、含 <code>..</code> 段、<code>.tako/</code>、<code>.media/</code>、目录、当前已不存在的路径一律剔除</td>
+</tr>
+<tr>
+<td>去重与顺序</td>
+<td>按首次出现顺序；同一路径再次出现不换位置，<code>op</code> 取最后一次</td>
+</tr>
+</tbody>
+</table></div>
+<p>已知边界（写进契约，不假装覆盖）：</p>
+<ul>
+<li><code>move_file</code> 只记录源路径（<code>pathsFromArgs</code> 只读 <code>path</code> 字段），目标路径不进清单；</li>
+<li>heredoc 与解释器内部写盘对模式规则不可见（与折叠同一份有界性边界）；</li>
+<li>Task 的隔离 run 写的是 <code>runtime/</code> 里的工作现场，未发布前 <code>stat</code> 不到，因此不出现在清单里——这是对的：用户在 <code>content/</code> 里确实还看不到它。</li>
+</ul>
+<h3 id="44-回复结尾的位置与触发条件">4.4 回复结尾的位置与触发条件</h3>
+<p>只挂在<strong>助手气泡</strong>上，且该气泡满足：有 <code>runId</code>、是这场 run 的<strong>最后一段</strong>（没有 <code>segmentCallId</code>）、状态已是终态（<code>done</code> / <code>error</code> / <code>stopped</code> / <code>interrupted</code>）。位置在用量/复制那一行之下，即「回复的结尾」。</p>
+<ul>
+<li>运行中不显示：文件清单随 run 结束才定稿，边跑边列会闪。</li>
+<li>停止与失败也显示：已经写下的文件是真实存在的，用户同样需要能找到它们。</li>
+<li>一场 run 只拉一次（按 <code>runId</code> 缓存在模块级 Map）；续跑会把状态从终态拉回运行，此时清掉该 run 的缓存，收口后再拉一次。</li>
+</ul>
+<p>没这么做会怎样：每渲染一次气泡就打一次接口；或者把清单挂到每个工具卡里——用户还是得自己把多次调用拼成「这轮改了哪些文件」。</p>
+<h3 id="45-todo-从输入框上方搬进工作区桌面端">4.5 Todo 从输入框上方搬进工作区（桌面端）</h3>
+<p>同一份看板今天有两个位置会重复。桌面端右侧工作区常驻，Todo 进「Todo」标签；≤860px 工作区不渲染，Todo 仍留在输入框上方。数据源换成新端点（见 §5.2），因此刷新页面后 Todo 不再消失——这是从 doc/41 前端以来一直存在的缺口。</p>
+<p><strong>与 doc/77 的边界变更</strong>：doc/77 §3 第 4 条「不把 Todo 合并进面板」作废，由本节取代；其余条款（面板跟当前项目、详情抽屉复用、定位 nonce 互斥）全部继续有效（其中「不按会话过滤」一项已由 <a href="80-任务列表按会话过滤.html">doc/80</a> 取代）。</p>
+<h3 id="46-当前-run-的取法">4.6 当前 run 的取法</h3>
+<p>Todo 标签跟「本场对话最近一场 run」：取当前会话气泡里最后一条带 <code>runId</code> 的助手消息。理由：用户看到的是这场对话，Todo 属于这一轮；刷新后历史气泡仍带 <code>runId</code>（<code>rowBubbles</code> 逐行赋值），所以同一规则在刷新前后一致。会话还没有 run 时显示空态，不请求接口。</p>
+<h2 id="5-契约两个只读端点">5. 契约：两个只读端点</h2>
+<p>两个端点都挂在 <code>authn</code> 上，鉴权与 <code>GET /api/runs/:runId/skills</code>（doc/52 B4）同一套：按 run 所属会话的可见性判，<strong>看不见与不存在同字节</strong>。信封三字段 <code>code → message → data</code>。</p>
+<h3 id="51-get-apirunsrunidchanged-files">5.1 <code>GET /api/runs/{runId}/changed-files</code></h3>
+<pre><code>200 {&quot;code&quot;:0,&quot;message&quot;:&quot;&quot;,&quot;data&quot;:{
+  &quot;runId&quot;:&quot;r_01J…&quot;,
+  &quot;files&quot;:[{&quot;path&quot;:&quot;quote.py&quot;,&quot;op&quot;:&quot;write&quot;},{&quot;path&quot;:&quot;test_quote.py&quot;,&quot;op&quot;:&quot;edit&quot;}]
+}}</code></pre>
+<ul>
+<li><code>files</code> 恒为数组，无改动返回 <code>[]</code>（不是 <code>null</code>）。</li>
+<li><code>op</code> 词表只有两个值：<code>write</code>（新建/覆盖/命令写入）与 <code>edit</code>（原地修改）。前端据此显示「写入 / 编辑」。</li>
+<li><code>path</code> 是相对项目 <code>content/</code> 的路径，分隔符 <code>/</code>，不带前导 <code>./</code>。</li>
+</ul>
+<p>错误：</p>
+<pre><code>401 {&quot;code&quot;:111102,&quot;message&quot;:&quot;请先登录&quot;,&quot;data&quot;:null}
+404 {&quot;code&quot;:112002,&quot;message&quot;:&quot;找不到这次运行&quot;,&quot;data&quot;:null}
+409 {&quot;code&quot;:117116,&quot;message&quot;:&quot;这个项目还需要迁移目录后才能使用&quot;,&quot;data&quot;:null}
+500 {&quot;code&quot;:111901,&quot;message&quot;:&quot;服务暂时不可用，请再试一次&quot;,&quot;data&quot;:null}</code></pre>
+<p>409 与文件清单端点（doc/76）同一判据：旧布局项目的 <code>content/</code> 还不能当读根。会话没有项目（历史数据）时返回 <code>files: []</code>。</p>
+<h3 id="52-get-apirunsrunidtasks">5.2 <code>GET /api/runs/{runId}/tasks</code></h3>
+<pre><code>200 {&quot;code&quot;:0,&quot;message&quot;:&quot;&quot;,&quot;data&quot;:{
+  &quot;runId&quot;:&quot;r_01J…&quot;,
+  &quot;rows&quot;:[
+    {&quot;no&quot;:1,&quot;subject&quot;:&quot;读现有脚本&quot;,&quot;status&quot;:&quot;completed&quot;,&quot;description&quot;:&quot;&quot;,&quot;result&quot;:&quot;读到 3 个函数&quot;,&quot;skillName&quot;:&quot;&quot;,&quot;updatedAt&quot;:&quot;2026-11-13T10:02:11Z&quot;},
+    {&quot;no&quot;:2,&quot;subject&quot;:&quot;补折扣函数&quot;,&quot;status&quot;:&quot;in_progress&quot;,&quot;description&quot;:&quot;&quot;,&quot;result&quot;:&quot;&quot;,&quot;skillName&quot;:&quot;&quot;,&quot;updatedAt&quot;:&quot;2026-11-13T10:03:40Z&quot;}
+  ],
+  &quot;total&quot;:2,
+  &quot;done&quot;:1
+}}</code></pre>
+<ul>
+<li><code>rows</code> 按 <code>no</code> 升序；<code>deleted</code> 行不列（<code>ListTasks</code> 既有口径）。</li>
+<li><code>total = len(rows)</code>；<code>done</code> = <code>status == "completed"</code> 的行数（详情、完成比在前端算，服务端只给这两个数）。</li>
+<li><code>status</code> 词表沿用看板：<code>pending</code> / <code>in_progress</code> / <code>completed</code>。</li>
+<li>错误字节与 §5.1 相同（除 409：看板不读盘，旧布局也照常返回）。</li>
+</ul>
+<p>这是 <code>run_tasks</code> 的第一个 HTTP 读口；工具层的 <code>TaskList</code> 与 <code>kind=task</code> 帧<strong>不改字节</strong>。</p>
+<h3 id="53-不改的东西">5.3 不改的东西</h3>
+<ul>
+<li>帧格式、<code>task</code> 帧文本、<code>run_tasks</code> 表结构、<code>TaskCreate/TaskUpdate</code> 回执、<code>GET /api/workspaces/:id/files</code>、<code>/api/media</code>：全部不动。</li>
+<li>新端点不写任何表、不发事件、不做缓存表。</li>
+</ul>
+<h2 id="6-前端施工面">6. 前端施工面</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文件</th>
+<th>变更</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>web/src/api.ts</code></td>
+<td>两个新类型的封装 <code>getRunChangedFiles(runId)</code>、<code>getRunTasks(runId)</code>；沿用现有 <code>listWorkspaceFiles</code>、<code>workspaceFileUrl</code>、<code>authFetch</code></td>
+</tr>
+<tr>
+<td><code>web/src/App.vue</code></td>
+<td>用 <code>ChatDock</code> 替换内联 <code>.task-dock</code>；把 <code>taskDockOpen</code>、<code>dockFocus</code>、<code>dockReloadNonce</code>、<code>attentionItems</code> 传给工作区；新增 <code>dockFileRequest</code>（<code>workspaceId/path/nonce</code>）与「打开文件」的入口；气泡结尾挂 <code>RunChangedFiles</code>；<code>Todo</code> 条改为仅窄屏显示</td>
+</tr>
+<tr>
+<td><code>web/src/ChatDock.vue</code>（新）</td>
+<td>标签壳：固定三标签 + 文件标签、收起轨道、换行不滚动的标签条；持有文件标签列表与当前标签；消费 <code>dockFileRequest</code></td>
+</tr>
+<tr>
+<td><code>web/src/WorkspaceTree.vue</code>（新）</td>
+<td>懒加载目录树、展开/收起、刷新、错误态（含 409 117116 文案）</td>
+</tr>
+<tr>
+<td><code>web/src/WorkspaceFileView.vue</code>（新）</td>
+<td>文本/图片/其它三档查看；加载失败与超限文案；下载链接</td>
+</tr>
+<tr>
+<td><code>web/src/RunTodoPanel.vue</code>（新）</td>
+<td>读 §5.2，空态与错误态；看板变化（气泡上的 <code>task</code> 帧文本）与工作区重拉信号触发刷新</td>
+</tr>
+<tr>
+<td><code>web/src/RunChangedFiles.vue</code>（新）</td>
+<td>读 §5.1、模块级按 <code>runId</code> 缓存；渲染文件条目与「写入/编辑」标记，<code>emit('open', path)</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>交互约束：</p>
+<ul>
+<li>收起/展开仍记 <code>localStorage['tako.chatTaskDock']</code>（<code>'0'</code> = 收起，兼容 doc/77）；最后停留的固定标签记 <code>tako.chatDockTab</code>。</li>
+<li><code>dockFocus</code> 与任务页 <code>taskFocus</code> 仍是两份 nonce（doc/77 §4.4 的互斥规则原样保留）。</li>
+<li>文件标签的打开动作不依赖「项目」标签是否加载过：目录树与文件标签各自有数据来源。</li>
+<li>文件字节路径由<code>workspaceId + 相对路径</code>拼出；相对路径只来自服务端返回（目录条目名或改动文件清单），不接受用户手输，因此不存在前端构造越界路径的入口。</li>
+</ul>
+<h2 id="7-验收">7. 验收</h2>
+<p>三层都要有：</p>
+<ol type="1">
+<li><strong>快闸</strong>（<code>go test ./internal/runengine</code>）：新增纯函数/存储侧单测——去重与顺序、<code>op</code> 取最后一次、绝对路径/<code>..</code>/内部目录/目录/不存在文件的剔除、空清单是 <code>[]</code>；看板行映射与 <code>total/done</code>。期望字节<strong>先 curl 实跑再抄进测试</strong>，不手写。</li>
+<li><strong>契约</strong>（<code>scripts/acceptance/</code>）：新增机器用例（用例 65，<code>needs: pg</code>）——用 <code>seed_ws</code> 造 <code>content/</code> 文件，用 SQL 造会话/run/<code>runlog_entries</code> 工具调用行/<code>run_tasks</code> 行，逐字节断言两个端点的成功体（键序、<code>files</code> 顺序与 <code>op</code>、<code>rows</code> 顺序与 <code>total/done</code>、空态 <code>[]</code>）、404 <code>112002</code>、401 <code>111102</code>、跨租户不可见；同号散文进 <code>doc/19-v6/19v6-04-验收-curl.md</code>；<code>check-expected.sh</code> 与 <code>assert_contract.py</code> 变绿。</li>
+<li><strong>活体</strong>（浏览器，dev 8901 / 5173）：用一段真实编码对话（补折扣 + 修红测试）跑一轮，检查——回复结尾出现「改动的文件」且与 <code>runlog</code> 实际调用一致；点条目展开工作区并打开文件标签；「项目」标签目录树展开/刷新；「任务」标签行为与 doc/77 走查项一致；「Todo」标签在 run 结束后显示看板、刷新页面后仍在；收起后窄轨三入口与计数可用；≤860px 无横溢、Todo 回到输入框上方。截图留证，失败项如实报。</li>
+</ol>
+<p>完成线：上面 8 条全部满足，且 <code>go vet</code>、<code>npm run typecheck</code>、<code>npm run build</code> 绿。</p>
+<p><strong>验收结果（2026-11-13）</strong>：</p>
+<ul>
+<li>快闸：<code>go test ./internal/runengine</code> ok（171.8s）；<code>go vet ./internal/runengine</code> 无告警。</li>
+<li>契约：隔离引擎（PG <code>tako_acc78</code>、Redis/8、<code>-task-interval=-1s</code>、<code>-workspace ../tmp/workspace-acc78</code>）全量 <code>PASS 475 / FAIL 0 / SKIP 1</code>；用例 65 全 21 步绿；<code>check-expected.sh</code> 与 <code>check-master-plan.sh</code>、<code>check-doc-layout.sh</code> 均退出 0。</li>
+<li>前端：<code>npm run typecheck</code>、<code>npm run build</code> 退出 0。</li>
+<li>活体（浏览器，本机 5174 + 隔离引擎 8943，headless 800/1440 两档）：回执列出 <code>写入</code> 徽标文件、点开/切换/去重文件标签；目录树懒展开、目录在前、刷新反映删除；任务标签复用详情抽屉、「任务页」跳转可用；Todo 标签读到 <code>run_tasks</code>（1/2、已完成/待办、详情）；收起后窄轨三入口可恢复并记住选择；刷新保留收起状态与固定标签（文件标签按设计不保留）；≤860px 工作区隐藏、无横向溢出，Todo 条回到输入区上方；已删除文件的标签显示「找不到这个文件」而非白屏。</li>
+<li>施工期偏差：首次隔离引擎漏了 <code>-task-interval=-1s</code>，用例 44/50/56/59 因后台调度抢跑而红；按验收文档重起后四条全绿，全量 0 失败——是起法问题，不是代码回归。</li>
+</ul>
+<h2 id="8-风险与边界">8. 风险与边界</h2>
+<ul>
+<li><strong>清单可能多于用户直觉</strong>：bash 的写意图扫描是按模式规则抓的，<code>cp</code>、<code>tee</code>、重定向都会进清单；误抓的路径若不存在会被 <code>stat</code> 剔除，存在的就是真实被写过的文件。宁可多一行、不静默漏一个。</li>
+<li><strong>清单可能少于用户直觉</strong>：<code>move_file</code> 目标、heredoc、解释器内写入不可见（§4.3）；这是既有提取器的有界性，不在本篇扩容——扩它要同步改折叠行为，另立方案。</li>
+<li><strong>目录树逐层请求</strong>：目录很宽时要多次请求；目前按需展开、结果缓存在组件内，不做预取。项目文件量以个人工作台为口径，不按大规模仓库设计。</li>
+<li><strong>旧布局项目</strong>：文件树与改动文件都回 409 提示先迁移；任务与 Todo 不受影响。</li>
+</ul>
+<h2 id="9-所以这解决了什么">9. 所以这解决了什么</h2>
+<p>agent 写完文件，用户不必离开对话去项目页找：回复结尾直接列出这一轮动过的文件，点开就在右侧看；右侧本身也从「只能看任务」变成「项目目录、任务、Todo、文件」四类信息的一个工作区，收起只留一条窄轨。看、点、继续聊都在同一页完成。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/78-%E5%AF%B9%E8%AF%9D%E9%A1%B5%E5%8F%B3%E4%BE%A7%E5%B7%A5%E4%BD%9C%E5%8C%BA%E4%B8%8E%E6%94%B9%E5%8A%A8%E6%96%87%E4%BB%B6.md"><code>doc/78-对话页右侧工作区与改动文件.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

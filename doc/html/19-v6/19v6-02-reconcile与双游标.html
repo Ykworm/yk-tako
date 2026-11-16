@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>19v6-02 · reconcile 与双游标 · tako 文档</title>
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="19v6-02--reconcile-与双游标">19v6-02 · reconcile 与双游标</h1>
+<blockquote>
+<p>本篇是 doc/19-v6 文档集的<strong>客户端流程篇</strong>：refresh / reconnect 共用的纯轮询总流程，以及窗口化引入的两种游标之分。 端点字节真源在 <code>19v6-01</code>；概念表见 index（<code>19-运行引擎架构-v6.md</code>）。</p>
+</blockquote>
+<h2 id="reconcile--客户端纯轮询总流程refresh--reconnect-共用">reconcile —— 客户端纯轮询总流程（refresh / reconnect 共用）</h2>
+<p>本步只要求语义、不要求实现：</p>
+<ol type="1">
+<li><strong>查状态</strong> <code>GET /api/sessions/{sessionId}</code> → <code>{liveRunId, runlogOffset=高水位}</code>；</li>
+<li><strong>补历史</strong> <code>GET /api/sessions/{sessionId}/log?runlogOffset=本地值</code>（新 tab 本地值 = <code>max(0, 第 1 步的高水位 - 窗口)</code>，<strong>不是 0</strong>）→ 渲染这批定稿记录；本地 <code>runlogOffset</code> 推进到返回的 <code>nextOffset</code>；<strong>若 <code>nextOffset</code> 仍小于第 1 步的高水位，说明本批被 W 截断，重复拉直到追平</strong>；用户往上滚要更早的历史时，用更小的 offset <strong>临时</strong>拉一批（见下「两种游标」）；<strong>窗口起点可能正好落在一次工具调用与它的回执之间</strong>（游标排他）：取回的行里若有回执找不到同批的调用行，把起点再往前挪一页重拉，直到配对完整或到 0（卡片口径见 <a href="../59-工具调用可见性.html">doc/59</a> §5.2）；</li>
+<li><strong>观测生成</strong> 若 <code>liveRunId</code> 非空 → <code>GET /api/runs/{liveRunId}/frames?eventOffset=本地值</code>（新 tab = 0）→ 按 <code>eventOffset</code> 追加 delta 成「正在生成」气泡；按轮询间隔重复拉 <code>nextOffset</code> 之后；</li>
+<li><strong>收口</strong> 见 frames <code>status:done</code>（terminal）或 <code>status:gone</code>，或状态查询发现 <code>liveRunId</code> 变 <code>""</code> / 变了 → 回第 2 步拉一次 log，把那条 <code>assistant</code> 全文按 <code>runId</code> <strong>替换</strong>半截气泡；停止轮询该 run 的 frames。</li>
+</ol>
+<p>关键不变量：<strong>两个对齐游标各自只在自己的端点前进</strong>——本地 <code>runlogOffset</code> 只在拉 log 时 +，本地 <code>eventOffset</code> 只在拉 frames 时 +。所以在线的、断线重连的、run 结束后才开的新 tab，都靠「拉 log 补齐 + 有活 run 就拉 frames」这一条路径对齐，不需要「当时在场」。terminal 帧、<code>liveRunId</code> 变化、frames <code>gone</code> 三者任一都能触发收口，互为冗余，不押注单一信号。</p>
+<h2 id="两种游标别混窗口化引入的区分">两种游标别混（窗口化引入的区分）</h2>
+<ul>
+<li><strong>对齐游标</strong>（本地 <code>runlogOffset</code> / <code>eventOffset</code>）：表示「我已经对齐到哪」，<strong>只前进</strong>，就是上面那条不变量说的游标。</li>
+<li><strong>翻页游标</strong>（往上滚翻旧历史时用的 offset）：<strong>临时值，只用于那一次请求</strong>，拉完渲染即可，<strong>不回退对齐游标</strong>。</li>
+</ul>
+<p>之所以能这么拆，是因为 <code>runlogOffset</code> 永久有效：往回拨拉旧数据不破坏任何东西，服务端也不需要知道客户端翻到哪。窗口化因此<strong>不削弱</strong>「不需要当时在场」——恢复只要求「拿得到高水位 + 一段尾巴 + 之后能续」，从来不要求「拿到全部」。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/19-v6/19v6-02-reconcile%E4%B8%8E%E5%8F%8C%E6%B8%B8%E6%A0%87.md"><code>doc/19-v6/19v6-02-reconcile与双游标.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

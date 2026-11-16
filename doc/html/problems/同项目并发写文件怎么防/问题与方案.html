@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>同项目并发写文件怎么防 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="同项目并发写文件怎么防">同项目并发写文件怎么防</h1>
+<blockquote>
+<p>模块：工具层 / 项目目录 / 产品形态（<code>internal/runengine/</code>）｜ 状态：已落地（<code>b9cf037</code> 文件防护、<code>44cf7ca</code> 项目闸退役）｜ 证据：<code>doc/42-产品形态收窄与共享项目退役.md</code>、<code>tmp/文件写入并发/planning.md</code>、<code>doc/19-v6/19v6-08-file-tools.md</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>同一项目目录允许多场会话同时跑（这是「项目」这个概念的意义：上一场写的 <code>中间产物.md</code>，下一场要接着读）。一旦并发，两条实际的破坏链就出现了：</p>
+<ol type="1">
+<li><strong>基于旧内容的全量覆盖</strong>：run A 读完 <code>report.md</code>（3000 字），模型想了 20 秒，期间 run B 把同一文件改成了 3200 字；A 用自己记忆里的 3000 字整文件写回，B 的改动无声消失，而 A 得到「写入成功」的回执。</li>
+<li><strong>并行子代理互踩</strong>：主代理一次委派两个 coder，各写同一个 <code>src/main.go</code>，后完成的覆盖先完成的；两边都报成功。</li>
+</ol>
+<p>还有第三类，属于「读了旧文本再做局部编辑」：<code>edit_file</code> 按 <code>old_string</code> 替换，若这段文本在两次调用之间已被别人改掉，替换结果不是任何人预期的版本。</p>
+<p>核心矛盾：要 100% 不冲突，只能整层禁止并发（把项目闸请回来）；而禁止并发会把「项目」退化成排队，吞吐和体验都不可接受。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>候选</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>同项目并发</td>
+<td>A 项目闸：同时只允许一个活 run，冲突 409</td>
+<td>实现简单、绝对正确</td>
+<td>整层串行；误伤同用户多会话；与「项目」本意相反</td>
+</tr>
+<tr>
+<td></td>
+<td>B 允许并发，冲突显式失败</td>
+<td>吞吐与体验；跨机也成立</td>
+<td>极窄窗口关不掉；模型被拒后要重读再写</td>
+</tr>
+<tr>
+<td>写锁用什么</td>
+<td>A PG advisory lock</td>
+<td>跨进程</td>
+<td>要 DB 连接做锁，锁与文件生命周期脱节；持锁阻塞整项目</td>
+</tr>
+<tr>
+<td></td>
+<td>B Redis 锁</td>
+<td>快</td>
+<td>易失；多一套设施；过期语义要自己兜</td>
+</tr>
+<tr>
+<td></td>
+<td>C flock（定案）</td>
+<td>随 fd 释放、崩溃自动解锁、同机真串行；锁的对象就是文件</td>
+<td>跨机无效</td>
+</tr>
+<tr>
+<td>凭什么判过期</td>
+<td>A 只加锁不比内容</td>
+<td>简单</td>
+<td>「基于旧内容的覆盖」照样发生——锁解决同时写，不解决写过期</td>
+</tr>
+<tr>
+<td></td>
+<td>B 版本号 / etag</td>
+<td>精确</td>
+<td>需要文件系统或 DB 维护版本，外部改动跟踪不到</td>
+</tr>
+<tr>
+<td></td>
+<td>C 内容指纹 mtime+size+sha256（定案）</td>
+<td>不依赖外部元数据，bash/人工改动也能发现</td>
+<td>大文件哈希贵，要降级阈值</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>裁定：B + C + C。</strong> 允许并发；写前在 flock 内比对内容指纹，变了就显式失败；跨机靠同一套指纹兜底（两台机器各有各的 flock，但内容变了都能看见）。</p>
+<h2 id="3-同族小裁定">3. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>项目闸留不留？</td>
+<td>整条退役，<code>one_live_run_per_workspace</code> 索引删除</td>
+<td>doc/42 形态收窄；先发新代码（保留 409 兜底）再删索引，避免旧代码把冲突翻译成 500</td>
+</tr>
+<tr>
+<td>读到的指纹基准放哪？</td>
+<td>run 级内存 map，key =（agent 名, 绝对路径）</td>
+<td>「读过」是会话事实、不是文件事实；进程重启即丢可接受（重启后本来就要重读）</td>
+</tr>
+<tr>
+<td><code>edit_file</code> 也查基准吗？</td>
+<td>不查，只靠 <code>old_string</code> 不唯一即失败</td>
+<td>强制先读全文会带来一次全文 token 成本；edit 的失败模式由唯一性校验兜底</td>
+</tr>
+<tr>
+<td><code>bash</code> 写文件参与锁吗？</td>
+<td>不参与，交人工审批</td>
+<td>从命令串解析写目标不可靠（重定向、<code>tee</code>、脚本内部写都拿不到）；宁可承认缺口，也不做「看起来锁了其实没锁」的假保证</td>
+</tr>
+<tr>
+<td>大文件怎么降级？</td>
+<td>超过 64MB 只比 <code>(mtime, size)</code>，不算 sha256，并显式标记为弱指纹</td>
+<td>用弱判据换可用性，把「弱」建模出来而不是悄悄跳过</td>
+</tr>
+<tr>
+<td>锁粒度多细？</td>
+<td>256 桶（<code>b46893b</code> 后）</td>
+<td>早期按路径直接哈希做锁，桶化避免同一目录高频锁冲突</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-证据">4. 证据</h2>
+<ul>
+<li>方案：<code>doc/42-产品形态收窄与共享项目退役.md</code> §2.4（并发策略、锁选型、Kimi 四件事）、§3.2（索引退役两拍）、§8 开放问题 1；<code>doc/19-v6/19v6-08-file-tools.md</code>（文件工具语义裁定）。</li>
+<li>台账：<code>tmp/文件写入并发/planning.md</code> §2（三个真实事故）、§4.1（基准表）、§4.4（edit 不查）、§4.6（指纹与阈值）、§4.7/4.10（锁选型与 bash 缺口）、§10 演化记录。</li>
+<li>代码：<code>filefp.go:34-40</code>（64MB 阈值）、<code>filefp.go:77</code>（<code>fingerprintOf</code>）、<code>filefp.go:158</code>（<code>withFileBaseline</code>）、<code>filefp.go</code> 的 <code>lockPaths</code>；<code>filetools.go</code> 的 write / edit / move 调用点；<code>pgstore.go</code> 的幂等 <code>DROP INDEX IF EXISTS one_live_run_per_workspace</code>。</li>
+<li>复核命令：<code>grep -n "fingerprintHashMaxBytes\|func fingerprintOf\|func lockPaths" yk-tako-eino/internal/runengine/filefp.go</code>。</li>
+</ul>
+<h2 id="5-现状">5. 现状</h2>
+<p>仍有效。已知缺口登记在案：bash 写文件不受锁保护，靠人工审批兜底；跨机只靠指纹「事后发现」，不能事前串行。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E5%90%8C%E9%A1%B9%E7%9B%AE%E5%B9%B6%E5%8F%91%E5%86%99%E6%96%87%E4%BB%B6%E6%80%8E%E4%B9%88%E9%98%B2/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/同项目并发写文件怎么防/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

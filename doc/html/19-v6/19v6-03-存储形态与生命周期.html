@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>19v6-03 · 存储形态与生命周期 · tako 文档</title>
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="19v6-03--存储形态与生命周期">19v6-03 · 存储形态与生命周期</h1>
+<blockquote>
+<p>本篇是 doc/19-v6 文档集的<strong>存储篇</strong>：四表 + 两键（PG 四表 + Redis 的 <code>runlive</code> / <code>runepoch</code>）、生命周期、真源划分、多副本。 2026-10-20 起 <code>draft</code> 已移除（doc/38）。端点契约见 <code>19v6-01</code>；概念表见 index（<code>19-运行引擎架构-v6.md</code>）。</p>
+</blockquote>
+<h2 id="三搬两留一消失2026-10-07-d1-落库">三搬两留一消失（2026-10-07 D1 落库）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>结构</th>
+<th>原形态（Redis 六键）</th>
+<th>现形态</th>
+<th>介质</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>session</code></td>
+<td><code>tk:session:{id}</code> STRING</td>
+<td><strong><code>sessions</code> 表</strong></td>
+<td>PG</td>
+</tr>
+<tr>
+<td><code>model_history</code></td>
+<td><code>tk:mh:{session}</code> LIST</td>
+<td><strong><code>run_model_messages</code> 表</strong></td>
+<td>PG</td>
+</tr>
+<tr>
+<td><code>runlog</code></td>
+<td><code>tk:runlog:{session}</code> LIST</td>
+<td><strong><code>runlog_entries</code> 表</strong></td>
+<td>PG</td>
+</tr>
+<tr>
+<td><code>runlive</code></td>
+<td><code>tk:runlive:{run}</code> LIST</td>
+<td><strong>留 Redis</strong></td>
+<td>Redis</td>
+</tr>
+<tr>
+<td><code>draft</code></td>
+<td><code>tk:draft:{run}</code> STRING</td>
+<td><strong>已移除（doc/38）</strong></td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>runepoch</code></td>
+<td>doc/30 起新增，不在当初六键里</td>
+<td><strong>留 Redis</strong> <code>tk:runepoch:{run}</code> STRING</td>
+<td>Redis</td>
+</tr>
+<tr>
+<td><code>live</code>（闸）</td>
+<td><code>tk:live:{session}</code> STRING + 租约</td>
+<td><strong>消失</strong>——闸 = <code>runs</code> 表活行上的部分唯一索引</td>
+<td>PG</td>
+</tr>
+</tbody>
+</table></div>
+<ul>
+<li><strong>一次搬完，不走过渡双写</strong>；四个 API 的线上字节零变化（A4-1 baseline 原样重跑判据）。</li>
+<li><strong>留 Redis 的理由</strong>（2026-10-20 起，doc/38）：<code>runlive</code> 与 <code>runepoch</code> 是临时态——TTL 到即清、过期不影响历史正确性（真源划分见下）。 定稿正文在 turn 里，<code>EndRun</code> 把它写入 runlog，不再在 Redis 存全文。<code>AppendFrame</code>（唯一的帧写口，2026-10-21 起）每次只问 <code>runepoch</code> 是否等于本执行者的令牌。</li>
+<li>Redis 临时键只剩这两类，<strong><code>tk:</code> 前缀纪律不变</strong>（<code>tk:runlive:{runId}</code> / <code>tk:runepoch:{runId}</code>）： reset 用 <code>SCAN MATCH tk:*</code> 对未来新增的键天然免疫，也是连错实例时的误伤防线。</li>
+<li><strong>不复活 <code>Store</code> 接口</strong>（A4-3 已裁单实现）：唯一实现内部跨两存储——PG 管永久状态，Redis 管临时态。</li>
+</ul>
+<h2 id="四表pg">四表（PG）</h2>
+<ul>
+<li><p><strong><code>sessions</code></strong> —— 会话登记：<code>id</code>（<code>s_&lt;ULID&gt;</code>，主键）、<code>title</code>（展示字段，非契约；初值 = 首条用户消息 按 rune 截断，重复投递不重写）、<code>created_at</code>。存在即已登记（懒建于 POST 事务内）；永久状态。</p></li>
+<li><p><strong><code>runs</code></strong> —— run = 闸 + 状态 + 租约（执行单元本身），不存消息文本： <code>id</code>（<code>r_&lt;ULID&gt;</code>）、<code>session_id</code>、<code>status</code>（running / complete / error；<code>stopped</code> 后续 loop）、 <code>lease_until</code>（活行租约，终态置 NULL）、<code>created_at</code>、<code>finished_at</code>。</p>
+<ul>
+<li>闸本体 = 部分唯一索引 <strong><code>one_live_run_per_session</code></strong>：<code>UNIQUE (session_id) WHERE status = 'running'</code>；</li>
+<li>活行读 / 死行清扫走索引 <code>(session_id, status, lease_until)</code>。</li>
+<li><strong>租户并发闸</strong>（doc/43）：<code>AcquireRun</code> 事务内先 <code>pg_advisory_xact_lock(&lt;tenant id 哈希&gt;)</code>， 再数该租户的活 run（<code>runs JOIN sessions</code>，口径 <code>status='running' AND lease_until &gt; now()</code>）， 超 <code>tenants.max_concurrent_runs</code> 就拒（429 <code>113001</code>）。数与放行<strong>同一笔事务、期间持一把 所有副本共享的锁</strong>——这是会话闸之上的第二道闸（会话闸管「一场会话」，租户闸管「一个租户」）。</li>
+<li>一 run 的消息有多条，见下——<code>runs</code> 只留闸 / 状态 / 租约。</li>
+</ul></li>
+<li><p><strong><code>run_model_messages</code></strong> —— run 内的模型侧消息序列（<code>model_history</code> 的落库形态）： <code>id</code>（<code>msg_&lt;ULID&gt;</code> 行级主键，与契约字段 <code>messageId</code> 是两回事）、<code>session_id</code>（冗余列：消息不跨 run/session 移动）、 <code>run_id</code>、<code>seq</code>（run 内序号，从 1 起；0 = compact 摘要行）、<code>role</code>、<code>text</code>、<code>compacted</code>（默认 false）、<code>created_at</code>。</p>
+<ul>
+<li>自然键 <code>UNIQUE (run_id, seq)</code>；模型输入的热查询走部分索引 <code>(session_id) WHERE compacted = false</code>。</li>
+<li><strong>消息按行设计</strong>：一条消息一行，种类由 <code>role</code> 列的<strong>取值</strong>承载、不编码进列结构——本步只产生 user（POST 投递）/ assistant（定稿），agent 形态的多轮 ReAct 与 HITL 人工插入都是后续 seq 行 （<code>role</code> 是 TEXT 不是 ENUM，扩展零迁移）；结构化附加字段（tool_calls 等）随对应 loop 加列。</li>
+<li><code>compacted</code> 是 compact 的落点（原文行保留作审计、不进模型输入；可见内容由 seq=0 摘要行替代）—— compact 压本表、<strong>不动 runlog</strong>；触发形态与摘要行规格已定于 <strong>19v6-07</strong>（§1 触发者 = worker 发送前 自测、无定时器；§2 摘要行 role=user、挂点 = 本事件最后折入的 run、二级压缩不单做）。</li>
+</ul></li>
+<li><p><strong><code>runlog_entries</code></strong> —— 历史真源：<code>id</code>（<code>rl_&lt;ULID&gt;</code>）、<code>session_id</code>、<code>seq</code>（session 内序号 = <strong>runlogOffset 的列形态</strong>；列名避用 <code>offset</code>——PG 保留字；契约词汇 <code>runlogOffset</code>/<code>nextOffset</code> 不变）、 <code>run_id</code>、<code>role</code>（本步 user / assistant）、<code>message_id</code>（仅 user 行；客户端生成、服务端零读路径）、 <code>text</code>、<code>created_at</code>。</p>
+<ul>
+<li>自然键 <code>UNIQUE (session_id, seq)</code>：seq 分配（事务内 <code>MAX(seq)+1</code>，唯一约束兜底）、高水位（<code>MAX(seq)</code>）、 收口按 <code>run_id</code> 匹配半截气泡，全走它。</li>
+<li><strong>只增不删</strong>：「seq N 恒指同一条消息」是客户端对齐游标只前进的地基——任何失败路径都不删行； 「run 没跑成」的形状一律走 error 结局（留 user 行、无 assistant 行）。</li>
+</ul></li>
+</ul>
+<p>零 JSONB、零外键、全表代理主键（2026-10-07 裁）：消息、摘要都是行 / 列，无键序问题； 引用完整性归应用层（写入路径只有 engine 一处、且被闸串行化）；代理主键供未来行级引用。</p>
+<h2 id="闸的落库形态kill--9-在-db-形态下的答案">闸的落库形态（kill -9 在 DB 形态下的答案）</h2>
+<ul>
+<li><strong>闸 = 部分唯一索引</strong>：<code>AcquireRun</code> 事务 <code>INSERT runs(status='running')</code>，冲突即 409—— 「插入失败本身就是闸」的字面落地（AGENTS.md「闸放数据库不放进程」）；放闸 = 终态那笔 <code>UPDATE status</code>， 没有独立解锁动作。多副本同投一个空会话：唯一索引只放行一笔、另一笔 409。</li>
+<li><strong>出生即带租约</strong>：<code>INSERT</code> 同笔写 <code>lease_until = now() + lease</code>（<code>-lease-ttl</code>，dev 30s）—— A7-2 的「出生窗口」在 DB 形态天然闭合（不存在「先建后补租约」两步）。</li>
+<li><strong>watchdog 续约</strong>（只在生成期间；链路 = 抢闸成功 → 每 <code>-lease-renew</code> 续一次 → endRun 前先停 watchdog， <code>wg.Wait()</code> 保证续约全部退出）：
+<ul>
+<li>PG 半是 CAS 本体：<code>UPDATE runs SET lease_until = now() + lease WHERE id=$run AND session_id=$s AND status='running' AND lease_until &gt; now()</code>——影响 0 行 = 本 run 判死、停止续约；</li>
+<li>Redis 半：<code>tk:runlive</code>/<code>tk:runepoch</code> 两键 PEXPIRE 刷回 lease（PG 说活才刷）。</li>
+<li><code>lease_until &gt; now()</code> 那半是「过期不可复活」：A7 的 Redis CAS（闸键蒸发即 no-op）逐字同义。</li>
+</ul></li>
+<li><strong>读侧即回收</strong>：<code>GET /api/sessions/{id}</code> 的 <code>liveRunId</code> 按 <code>status='running' AND lease_until &gt; now()</code> 判活—— lease 已过的死行当场不再算活，不等清扫；<strong>清扫只为放行新 run</strong>（新 POST 时把死行翻 <code>error</code> + <code>finished_at</code> + <code>lease_until=NULL</code>，唯一索引随之放行新 INSERT）。</li>
+<li><strong>kill -9 全链</strong>：无人续约 → 两键 TTL 到期蒸发（frames <code>gone</code>）→ <code>liveRunId</code> 因 lease 判空 → 再 POST 得 <strong>202 不是 409</strong>（死行被清扫翻 <code>error</code>）。会话不再永久锁死；闸的「放」由终态 <code>UPDATE</code> / 租约判死两路达成，没有独立的解锁动作。</li>
+</ul>
+<h2 id="生命周期">生命周期</h2>
+<ul>
+<li><strong>POST 事务</strong>（跨两存储；<strong>PG 事务持有跨 Redis 写</strong>）：BEGIN → 懒建 <code>sessions</code>（首条消息截断写 <code>title</code>） → 清扫死行 → <code>INSERT runs</code>（'running'、出生即带 <code>lease_until</code>）→ <code>INSERT run_model_messages</code>（seq=1, role=user） → <code>INSERT runlog_entries</code>（seq=MAX+1, role=user）→ Redis 建 <code>tk:runlive</code> 压 <code>start</code> 帧 + 建 <code>tk:runepoch</code>（出生值 1） （两键出生即带同租约）→ <strong>全成才 COMMIT</strong>。Redis 写失败 → ROLLBACK → 500 零痕迹（与 409 同形「什么都不写」）； 409 = <code>runs</code> INSERT 唯一冲突 → 整笔回滚零痕迹（runlog 永不删行，只靠不写来保零痕迹）。</li>
+<li><strong>生成中</strong>：每 delta → <code>tk:runlive</code> RPUSH 一帧；写口先读 <code>tk:runepoch</code>，和本执行者的 epoch 比对，缺失或不等就拒收（<code>accepted=false</code>）。watchdog 按上面的链路续约。</li>
+<li><strong>run 结束</strong>（<code>endRun(sessionId, runId, status)</code>；<strong>watchdog 严格先停</strong>）：<strong>同一笔 PG 事务</strong>「放闸 + 定稿」—— <code>UPDATE runs</code> 落终态（守卫 <code>status='running' AND lease_until &gt; now()</code>；影响 0 行 = 空转、不 INSERT） 与 complete 的 <code>INSERT run_model_messages</code>（seq=2, assistant，文本 = turn 里 root assistant 的累计 <code>pending[""]</code>）+ <code>INSERT runlog_entries</code> （assistant）同事务——「<code>model_history</code> 与闸同事务」就此是事务边界，不存在「闸已放、历史还没那行」的窗口。 commit 后 Redis 半：压 <code>terminal</code> 帧 + <code>EXPIRE 300s</code>（覆盖租约残值）+ 删 <code>runepoch</code>；失败不补偿—— run 已定稿在权威（PG），runlive 到 TTL 走 <code>gone</code>，客户端从 log 拿全文（B1 冗余收口兜住）。</li>
+<li><strong><code>error</code> 结局</strong>：放闸；<strong>「这一轮已产出的内容」照常落库</strong>（失败留痕，2026-10-22）——runlog 有已说出的 assistant 行与工具行、<code>run_model_messages</code> 同样落这些行（缺结果的调用由 worker 侧配平补一条「没拿到结果」 的合成行，否则下一枪的 provider 会因 tool_calls 缺配对结果而 400）。<strong>「失败且无产出」那一档</strong>（还没说出 话就失败）<strong>仍是一行不写</strong>——与 2026-10-22 之前同形。<code>stopped</code> 与 <code>error</code> 同待遇（都是「这一轮做了一半」）。 （模型上下文保留这次失败的尝试，重投时看得到）。</li>
+<li><strong>进程死亡（<code>kill -9</code> / 崩溃）</strong>：无人续约 → <code>lease_until</code> 到点：① 读侧立即回收（<code>liveRunId</code> 不再报活）； ② 两键 TTL 蒸发（frames <code>gone</code>，客户端走 19v6-02 收口）；③ 死行由下次 POST 的清扫翻 <code>error</code> （形状 = error 结局：留 user 行、无 assistant 行；不翻也不影响读侧，清扫只为放行新 run）。 这场 run 不进历史；<code>runlog</code>/<code>run_model_messages</code> 的既有行不受影响。</li>
+</ul>
+<h2 id="真源划分">真源划分</h2>
+<p><strong><code>runlog</code> 记「产出了什么」（历史展示只读它）；<code>run_model_messages</code> 记「模型现在该看到什么」（worker 组装输入的唯一来源，compact 压它、不动 runlog）；<code>runlive</code> 是「正在生成的临时态」，TTL 到即清——清掉后那条回复的权威在 <code>runlog</code>，<code>runlive</code> 过期不影响历史正确性。</strong> root 终稿 = turn 里 root assistant 文本的累计（<code>pending[""]</code>），<code>EndRun</code> 写入 <code>runlog</code>，不从 Redis 读正文。</p>
+<ul>
+<li>历史展示（<code>GET /api/sessions/{id}/log</code>）只读 <code>runlog_entries</code>，按 <code>seq</code> 排；</li>
+<li>模型输入（worker）读 <code>run_model_messages</code>：<code>WHERE session_id=$s AND compacted=false ORDER BY run_id, seq</code> ——单表、双列过滤、无 JOIN（<code>run_id</code> 的 ULID 字典序即 run 时序）。</li>
+<li><strong>两表是同一对话的两个投影，别拿 <code>run_model_messages</code> 组历史展示</strong>：compact 后展示会塌 （compacted 原文行 + seq=0 摘要行泄进聊天）、tool 观测会泄进界面。</li>
+</ul>
+<blockquote>
+<p>「一条记录 / 一帧」= DB 的一行 row，不是文本的一行 line。<code>text</code> 里的 <code>\n</code> 原样保留，客户端按 markdown 渲染，排版不受影响。</p>
+</blockquote>
+<h2 id="多副本">多副本</h2>
+<p>全部状态在 PG 与 Redis 共享存储：客户端轮询打到任意副本从共享存储读；执行 run 的 worker 往 Redis 的 <code>runlive</code> 与 <code>runepoch</code> 写。 闸 = 部分唯一索引——跨副本天然成立；租约判定共用一个时钟（SQL <code>now()</code>），不依赖进程本地时间。 删掉 SSE 后不再有「持有长连接的副本 = 执行副本」的亲和问题。</p>
+<p><strong>reset（dev 端点）两半都清</strong>：PG <code>TRUNCATE</code> 四表 + Redis <code>SCAN MATCH tk:*</code> + <code>UNLINK</code>（返回 Redis 删除键数）。 <code>runs</code> 必须同清——它是闸的落点，漏清则幽灵 <code>running</code> 行永久残留（清扫只在新 POST 时按 session_id 触发， 旧 session 已 404，再没人替它扫）。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/19-v6/19v6-03-%E5%AD%98%E5%82%A8%E5%BD%A2%E6%80%81%E4%B8%8E%E7%94%9F%E5%91%BD%E5%91%A8%E6%9C%9F.md"><code>doc/19-v6/19v6-03-存储形态与生命周期.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

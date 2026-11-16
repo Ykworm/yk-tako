@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>崩溃前那半句要不要存 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="崩溃前那半句要不要存">崩溃前那半句要不要存</h1>
+<blockquote>
+<p>模块：运行生命周期 / Redis 临时态（<code>internal/runengine/</code>）｜ 状态：已落地（<code>6e4de68</code>，2026-10-20）｜ 证据：<code>doc/38-删除draft键.md</code>、<code>tmp/38-删除draft键/planning.md</code>、commit <code>6e4de68</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>一场 3000 字的回答，最后一个 delta 已经推到了浏览器上。<code>EndRun</code> 开始收尾，此时 Redis 正在做主从切换。</p>
+<p>旧实现里 <code>EndRun</code> 的第一件事是 <code>GET tk:draft</code>——把流式过程中缓存的正文读出来，再写进 <code>runlog_entries</code>。连接错误时它直接在开 PG 事务之前返回。结果：<strong>PG 里 run 仍是 running，租约过期后读侧判「已中断」，下一次 POST 把它清扫成 error。用户屏幕上明明看到了完整回答，刷新后却变成一个失败气泡</strong>——模型已经写完、PG 也健康，但这场回答永远不会进 runlog。</p>
+<p><code>tk:draft</code> 同时干着两件事，这是问题的根：</p>
+<ol type="1">
+<li><strong>定稿正文的缓存</strong>（EndRun 从这里拿文本）；</li>
+<li><strong>run 是否还活着的哨兵</strong>（append 前 <code>EXISTS draft</code>，不在了就停止推流）。</li>
+</ol>
+<p>两个职责都绑在一个易失键上，于是「缓存被 <code>maxmemory</code> 逐出」被误读成「执行者死了」，「最后一枪后 draft 消失」被写成「complete 但空回复」。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<p>要换的是「正文从哪拿」和「活判看什么」两件事。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>候选</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>EndRun 正文源</td>
+<td>A <code>GET tk:draft</code></td>
+<td>零改动</td>
+<td>定稿依赖 Redis 可用性；Redis 故障即丢整场回答</td>
+</tr>
+<tr>
+<td></td>
+<td>B 参数里现成的 <code>pending[""]</code>（内存 turn 累计）</td>
+<td>与 draft 逐字节同源；PG 事务照常提交</td>
+<td>依赖「turn 累计」这一约定</td>
+</tr>
+<tr>
+<td></td>
+<td>C 读 <code>run_journal</code> 拼正文</td>
+<td>PG 真源</td>
+<td>多一次读、多一个失败面，而 turn 已经在参数里</td>
+</tr>
+<tr>
+<td>活判哨兵</td>
+<td>A <code>EXISTS draft</code></td>
+<td>简单</td>
+<td>缓存被逐出 = 判死；最后一枪后写空回复</td>
+</tr>
+<tr>
+<td></td>
+<td>B <code>EXISTS runlive</code></td>
+<td>键一定在</td>
+<td>terminal 后还有 300s TTL，旧执行者能在收尾后继续追加；把帧流契约与判活绑死</td>
+</tr>
+<tr>
+<td></td>
+<td>C <code>runepoch == epoch</code></td>
+<td>回答「我还是不是这一代的执行者」</td>
+<td>要改名、改测试</td>
+</tr>
+<tr>
+<td>删法</td>
+<td>A 先换正文源、再换哨兵</td>
+<td>可逐字节对照</td>
+<td>两个不可发布的中间态：A1 后 draft 只写不读，A2 后 APPEND 可能重建无 TTL 的孤儿键</td>
+</tr>
+<tr>
+<td></td>
+<td>B 一次性删干净</td>
+<td>无中间态</td>
+<td>A1 diff 约 195 行，超过 80 行目标</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>裁定：正文取 <code>pending[""]</code>（B），哨兵换 <code>runepoch == epoch</code>（C），draft 一次性删干净。</strong> <code>pending[""]</code> 正是 <code>Σ root assistant turn Text</code>，写进 runlog 的字节与旧路完全相同；<code>runepoch</code> 回答的是执行者身份，不是「某个缓存键在不在」。</p>
+<h2 id="3-同族小裁定">3. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>拒写出口顺手把 status 改成 error 吗？</td>
+<td>只改名 <code>live</code>→<code>accepted</code>，不改行为</td>
+<td>四个 <code>!accepted</code> 出口仍直接 return；「被逐出算失败还是可接受的部分定稿」是产品判断，另案</td>
+</tr>
+<tr>
+<td>崩溃前那半截 delta 持久化吗？</td>
+<td>不存，随 resume 丢弃</td>
+<td>每个 delta 写 PG 会把 at-most-once 改成 at-least-once，需要新持久化层与幂等语义；doc/30 已裁 at-most-once</td>
+</tr>
+<tr>
+<td>保留 draft 只当缓存 / 加 <code>TAKO_DRAFT</code> 开关？</td>
+<td>不做</td>
+<td>「要不要一个缓存」不是运维选择，是结构决定</td>
+</tr>
+<tr>
+<td>正文写入的字节怎么保证不变？</td>
+<td>用单测与活体对账替代过渡态</td>
+<td>一次性删除的风险由「逐字节等价证明 + 六件单测 + 五场活体」吸收</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-证据">4. 证据</h2>
+<ul>
+<li>方案：<code>doc/38-删除draft键.md</code> §4（逐字节等价）、§4.5（哨兵等价）、§5.5（命名）、§6（移除方式）、§8.3（不做）、§9（被否决的替代方案）。</li>
+<li>台账：<code>tmp/38-删除draft键/planning.md</code> §5.1（EndRun 正文源）、§5.2（append 守卫）、§5.6（命名）、§6（过渡态与转正）。</li>
+<li>代码：<code>store.go</code> 的 pending 累计与 root assistant 行写入；<code>redisstore.go</code> 的 Lua 脚本比 epoch、<code>AppendFrame</code> 返回 <code>accepted</code>；全仓已无 <code>keyDraft</code> / <code>tk:draft</code>。</li>
+<li>复核命令：<code>grep -rn "tk:draft\|keyDraft" yk-tako-eino/internal/runengine</code>（应无命中）；<code>grep -n "accepted" yk-tako-eino/internal/runengine/redisstore.go</code>。</li>
+</ul>
+<h2 id="5-现状">5. 现状</h2>
+<p>已落地。<code>AppendDelta</code> 后来与 <code>AppendFrame</code> 合并为唯一写口（<code>4d64265</code>），但「正文来自 turn、活判来自 epoch」两条不变。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E5%B4%A9%E6%BA%83%E5%89%8D%E9%82%A3%E5%8D%8A%E5%8F%A5%E8%A6%81%E4%B8%8D%E8%A6%81%E5%AD%98/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/崩溃前那半句要不要存/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

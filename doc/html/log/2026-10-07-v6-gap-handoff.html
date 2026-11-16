@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Handoff · v6 现状与能力差距（2026-10-07） · tako 文档</title>
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="handoff--v6-现状与能力差距2026-10-07">Handoff · v6 现状与能力差距（2026-10-07）</h1>
+<blockquote>
+<p>性质：<strong>纯 handoff / 快照文档</strong>，不改动任何代码。 触发对话（2026-10-07）：用户问「现在的系统还差什么？可以对比 pi、weknora」。 本文记录：① 当日核实的 v6 现状快照；② 对比 pi / WeKnora 的能力差距（分「重建 / 从未做」两叠）； ③ 下一步候选与挂账清单。留给后续会话对照：D1 验收、下个 loop 立项、doc/16 状态重标。 文中「现状」均逐条对过代码或台账；pi / WeKnora 结论来自当日对其仓库的实读盘点（结论级）。</p>
+</blockquote>
+<h2 id="1-现状快照2026-10-07">1. 现状快照（2026-10-07）</h2>
+<h3 id="11-构成">1.1 构成</h3>
+<p><strong>v6 新仓 <code>yk-tako-eino/</code> 的全部 = 运行引擎 + 单会话聊天 UI + 模型配置层。</strong></p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cmd/yktako/</code></td>
+<td>单入口；旗标 <code>-engine -batch-window -dev -redis -pg -lease-ttl -lease-renew</code>；启动双 fail fast（Redis / PG / 模型配置任一不可达不起进程）</td>
+</tr>
+<tr>
+<td><code>internal/config/</code></td>
+<td><code>provider-catalog.json</code>（39 家厂商、openai/anthropic 两协议）+ <code>.env</code> 解析 + Eino ChatModel 装配；只支持 chat 一种模态</td>
+</tr>
+<tr>
+<td><code>internal/runengine/</code></td>
+<td>四个 API + dev reset + Store（跨 PG/Redis）+ Worker（真 LLM 流 + translator 归一层 + watchdog）</td>
+</tr>
+<tr>
+<td><code>web/</code></td>
+<td>Vue3 + TS 单会话聊天（~950 行）；U1–U6 + B1–B3 已验收</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>不存在</strong>：工具、护栏、看板、压缩、子代理、记忆、RAG、评测——旧线（v1–v5）已随 backup 整体出仓。</p>
+<h3 id="12-引擎已验收能力a-系列全部销账">1.2 引擎已验收能力（A 系列全部销账）</h3>
+<ul>
+<li><strong>四 API</strong>：<code>POST /api/runs</code> · <code>GET /api/sessions/{sessionId}</code> · <code>GET /api/runs/{runId}/frames</code> · <code>GET /api/sessions/{sessionId}/log</code>（+ dev <code>DELETE /api/dev/reset</code>）。 纯拉模型：无 SSE / 长连接 / 推送，实时性 = 客户端轮询节奏。</li>
+<li><strong>存储（D1 后）</strong>：PG 四表 <code>sessions</code> / <code>runs</code> / <code>runlog_entries</code> / <code>run_model_messages</code> + Redis 两键 <code>tk:runlive</code> / <code>tk:draft</code>（runlive 终态 TTL 300s，回收参数非正确性参数）。</li>
+<li><strong>闸 = <code>runs</code> 活行部分唯一索引</strong>（<code>one_live_run_per_session</code>），插入冲突即 409； 租约 <code>lease_until</code>（出生即带）+ worker watchdog 续约（CAS：UPDATE 影响 0 行 = 判死停续）。</li>
+<li><strong>双游标</strong>：<code>eventOffset</code>（run 内、临时，挂 frames）与 <code>runlogOffset</code>（session 内、永久，挂 log）， 各自只在自己端点前进；单批上限 W（<code>-batch-window</code>，dev 200）。</li>
+<li><strong>kill -9 自愈链</strong>（已实测）：lease 判死 → 两键蒸发 → frames <code>gone</code> → 会话自动解锁 → 再 POST 202； 死 run 不进历史（error 形状）。</li>
+<li><strong>provider 归一层</strong>：claude / openai / eino 三 translator——加厂商 = 加 translator，帧协议与存储侧不动。</li>
+<li>验收网：curl baseline（①–⑫ + ⓐ–ⓓ，字节级）+ <code>go test ./internal/runengine/ -count=1</code> 16 条真实例网 （真 6390 独立 db + 5433 临时库）+ 变异检查 M1–M10。</li>
+</ul>
+<h3 id="13-未-commit--挂账">1.3 未 commit / 挂账</h3>
+<p><strong>未 commit 三笔</strong>（commit 粒度归用户）：</p>
+<ol type="1">
+<li><strong>doc/19 拆篇</strong>：index + <code>19v6-01</code> 契约 / <code>02</code> reconcile 与双游标 / <code>03</code> 存储与生命周期 / <code>04</code> 验收 / <code>90</code> 演进记录，及全仓注释引用同步（含 <code>web/src/{api,chat}.ts</code>）。</li>
+<li><strong>D1 全套</strong>：<code>store.go</code> / <code>pgstore.go</code> / <code>store_test.go</code> 新增、<code>redisstore_test.go</code> 删除、 <code>redisstore.go</code> 收窄、<code>main/server/worker/types.go</code>、<code>go.mod</code>/<code>go.sum</code>（+gorm/postgres、−miniredis）、 <code>scripts/dev.sh</code>（PG 自举半边）。</li>
+<li><strong><code>chat.ts</code> 后加两笔</strong>（晚于台账落盘、此前无记录；核准未提交清单时补记）： ① <strong>B4#1 实修</strong>——<code>fetchAssistantRow</code> → <code>drainLog</code>：收口拉 log 时把游标经过的<strong>别人的</strong>定稿行 补渲染（<code>renderForeign</code>），本 tab 投递过的 user 行按 <code>messageId</code> 跳过；② 两处 D1 后过时注释 （「闸释放与 terminal 压入是同一笔原子写」）回填为「放闸与定稿同笔 PG 事务」的说法。 <strong>未 commit、未验收</strong>；<code>chat.ts</code> 因此不能按文件粒度折进 1 / 2 任一单批。</li>
+</ol>
+<p><strong>挂账</strong>（登记在案）：</p>
+<ul>
+<li><strong>D1 待用户验收</strong>；两处待过目：① planning §8.4「事务漏口方向」的修正（已改，可被否决）； ② <code>web/src/chat.ts</code> 两处 D1 后过时注释——已回填，见批次 3（回填在验收链之后，当时「前端零改动」 的证据不受影响）。</li>
+<li><strong>lease 参数</strong>：renew 默认 5s→10s、<code>-lease-ttl</code>/<code>-lease-renew</code> 默认值改从 <code>.env</code> 读 （按 <code>TAKO_*</code> 约定，如 <code>TAKO_LEASE_TTL</code>/<code>TAKO_LEASE_RENEW</code>）——已裁，待发话单开 action。</li>
+<li><strong>B4 前端遗留三条</strong>：① 多客户端下 <code>fetchAssistantRow</code> 推进对齐游标却不渲染经过的行——已在工作树 实修（批次 3），<strong>未 commit、未验收</strong>；② 一次性 DOM 失踪（未复现，观察项）；③ 自愈成新会话时 旧气泡滞留。</li>
+<li><strong>两个待裁议点</strong>：error 结局服务端要不要补 terminal 帧； endRun 时 DB 败要不要加进程内重试 / draft 打捞窗（现状 = 单次尝试、无重试、不压 terminal、无打捞窗）。</li>
+</ul>
+<h2 id="2-差距分析对比-pi--weknora">2. 差距分析（对比 pi / WeKnora）</h2>
+<h3 id="20-先点名一个对齐问题">2.0 先点名一个对齐问题</h3>
+<p><strong>doc/16 §2 能力总表的 ✅ 列是旧线口径</strong>：它标的落点（<code>internal/adkrun</code>、<code>internal/tools</code>、<code>internal/guard</code>、 <code>internal/taskboard</code>、<code>internal/compact</code>、<code>internal/mediaoffload</code>、<code>internal/webui</code>）在当前仓均不存在。 下次维护 doc/16 时需重标——建议拆「旧线达成（历史）/ v6 现状」两列，避免把「做过的」继续当「现在有的」。</p>
+<h3 id="21-两叠清单">2.1 两叠清单</h3>
+<p><strong>A. 需在 v6 重建</strong>（旧线达成过、代码已出仓、设计仍在 doc/）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>能力</th>
+<th>设计文档</th>
+<th>v6 接缝（已预留处）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>主循环 + 工具集（read/bash/edit/write 等）</td>
+<td>doc/05、08、09</td>
+<td><code>run_model_messages</code> 的 role 锚 OpenAI 标准（tool 行随 loop 进）；runlog 扩展行（tool_call/tool_result）已裁「进 runlog、种类由 role 取值承载」</td>
+</tr>
+<tr>
+<td>工具安全三件套 + 审批（放行/硬拒/暂停问人）</td>
+<td>doc/06</td>
+<td>「暂停问人」吃 <code>hitl_prompt</code>/<code>hitl_reply</code> 行；payload 列形状待立项时定（planning §8.6 ⑤）</td>
+</tr>
+<tr>
+<td>任务看板（Plan/Tasks/Actions）</td>
+<td>doc/01、02、07</td>
+<td>扩展行进 runlog 的裁定已覆盖；<strong>重建时用已裁名 <code>tasktracker</code></strong>（见 <code>doc/XX-taskboard-重命名-handoff.md</code>，改名当时未执行）</td>
+</tr>
+<tr>
+<td>上下文压缩</td>
+<td>doc/12、13</td>
+<td>落点已裁：<code>run_model_messages</code> 打 <code>compacted</code> 标记（原文保留）+ 每被压 run 一行 seq=0 摘要；触发者/摘要 role 未定</td>
+</tr>
+<tr>
+<td>media_offload（图片落盘换占位符）</td>
+<td>doc/18</td>
+<td>—（旧线末期遗留五问记录在 <code>doc/log/2026-09-30-uncommitted-review-handoff.md</code>）</td>
+</tr>
+<tr>
+<td>Web 端旧能力（审批 / 停止 / 事件回放等）</td>
+<td>doc/10、11、15</td>
+<td>现 web 只有聊天 + 连接自愈（reconcile / 双游标 / 409 排队 / 僵尸 sid 自愈）</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>B. 从未做过</strong>（doc/16 的 ⬜）：</p>
+<ul>
+<li><strong>T1</strong>：子代理（#5，旧排的「当前重心」；v6 里其前置 = 工具循环）、记忆（#6）、context_usage（#4c）。</li>
+<li><strong>T2</strong>：树状会话（pi）、skill 使用追踪（Hermes）、场景化 eval（pi/Hermes）、§2b 创意池其余。</li>
+<li><strong>T3</strong>：崩溃续跑、IM/cron、多用户多 Agent、对话→RAG（#10，有护栏）、 多会话列表 UI（会话列表端点当时被裁：没有用例逼出的端点不进契约）。</li>
+</ul>
+<h3 id="22-对照要点每源最值得偷什么">2.2 对照要点（每源最值得偷什么）</h3>
+<p><strong>pi</strong>（TS 极简 agent）：</p>
+<ul>
+<li>工具面：默认工具集只 read/bash/edit/write 四项（doc/16 说的「4 原语」实指它）； codemode——模型写 JS 在 QuickJS 沙箱一次并列调多个工具、结果过滤后才进上下文； MCP 工具默认不注入，BM25 搜索按需加载。</li>
+<li>上下文面：compaction 写 CompactionEntry——<code>firstKeptEntryId</code> 划保留区、<strong>原条目永不删除</strong>； <code>transformContext → convertToLlm</code> 两段转换（自定义消息可只给 UI 不进模型）。</li>
+<li>会话面：树状 JSONL（entry 带 <code>id/parentId</code>，只 active branch 进上下文），<code>/tree</code> 原地分支、<code>/fork</code>、<code>/clone</code>。</li>
+<li>分发布局：Skills 走 agentskills.io 标准（SKILL.md；启动只注入 name+description，渐进披露）； Pi Packages（npm/git/本地）一包同带 skills/extensions。</li>
+<li>评测：vitest-evals；docs-lift（Docker 双镜像 with_docs/without_docs 配对算「文档提升」）。</li>
+<li><strong>注意</strong>：pi 的多客户端/崩溃恢复在实验包（durable/chord），且明确不做 CRDT 离线合并、 storage 无跨进程锁——tako 的「多副本闸 + 租约 + 双游标」在这条线上已更彻底；树状会话才是它领先的形态。</li>
+</ul>
+<p><strong>WeKnora</strong>（Go，Eino 类库参考）：</p>
+<ul>
+<li>RAG 工程全套：docreader（独立 Python gRPC 解析）/ chunker（父子块 + 标题面包屑）/ 向量库抽象 ~10 后端（pgvector、ES、Qdrant、Milvus…）/ 混合检索 RRF 融合 / rerank / GraphRAG。</li>
+<li>记忆：asynq 异步抽取 → consolidate 合并 → topic 归类；向量+词法混合召回； 常驻块（profile/偏好）+ 按需块（fact/task/interest）；agent 有 search_memory 工具。</li>
+<li>agent：手写 ReAct 引擎（非 Eino）+ 工具审批 + MCP client/manager/OAuth。</li>
+<li>评测：指标族（Precision/Recall/NDCG/MRR/MAP/BLEU/ROUGE）+ parquet 数据集跑真实管线。</li>
+<li>产品面：~30 家 provider 分型（chat/embedding/rerank/vlm/asr）、多租户 RBAC、IM 十渠道、 数据源连接器、Langfuse 追踪。</li>
+<li><strong>护栏</strong>（doc/16 §4）：只借工程不学定位——正本永远结构化存储，向量库只是可重建派生副本； 只在「agent 回忆历史」场景服务 agent。</li>
+</ul>
+<p><strong>steer 附注</strong>：运行中插话——pi 有 steering/follow-up 双队列，WeKnora 有生产版收件箱 （inject/after 双模式、队深上限 10、SteerID 幂等键）。tako 现裁 = 409 + 客户端本地排队（B1 已落）， 属「明确不做」，不是遗漏。</p>
+<h3 id="23-归纳">2.3 归纳</h3>
+<p>引擎层（多副本正确性、崩溃自愈、纯拉取收敛）是刚打稳的地基，比两个参考源的同位物更彻底； <strong>agent 能力层几乎全空</strong>（重建 + 从未做两叠）；产品层（多会话管理、多入口、多模态、多用户）按 T3 排队。</p>
+<h2 id="3-下一步候选不预拍板供立项对话">3. 下一步候选（不预拍板，供立项对话）</h2>
+<ol type="1">
+<li><strong>工具循环 + 基础工具集</strong>——T1 三项（子代理 / 记忆 / context_usage）共同的前置，引擎 schema 已预留写入口， 也是第一个「重建」项。立项时第一个要拍的问题：循环走 <strong>Eino ADK</strong>（旧线路径，middleware/checkpoint 现成） 还是<strong>手写 ReAct</strong>（WeKnora 路径）还是<strong>在 v6 worker 上扩展</strong>——它决定 tool 消息写入 <code>run_model_messages</code>、以及 runlog 扩展行 payload 的形态（planning §8.6 ⑤）。</li>
+<li><strong>doc/16 状态重标到 v6 口径</strong>——小活，可与 1 同拍或先行。</li>
+<li><strong>D1 验收</strong>（用户点头后才谈 commit 粒度）。</li>
+<li>挂账零星项（§1.3）按用户发话逐个开 action。</li>
+</ol>
+<h2 id="4-环境与纪律给接手会话">4. 环境与纪律（给接手会话）</h2>
+<ul>
+<li><strong>协作模式</strong>（AGENTS.md）：planning + todos 交审 → 点头才 coding；每个 action 停下交审； <strong>不自动 commit</strong>；契约先行、先 API 后存储；验收第一行必须是「打一个跑着的东西」 （curl + 期望字节 / <code>kill -9</code> / 两个窗口），不写「页面上看到 X」。</li>
+<li><strong>端口纪律</strong>：6379（otel-ch-native 的 Redis，37 键）/ 5432（其 PG）/ 8090、8901（用户自己的实例） <strong>全程不动</strong>；dev 自建 = Redis 6390 + PG 5433；端口被占先 <code>lsof</code>，换端口不杀别人。</li>
+<li><strong>承重论断先验前提</strong>：doc 注释 / 记忆 / 印象 / 已废代码都不是证据； <strong><code>doc/19-v6/</code> 是引擎真源</strong>（v1–v5 不作论据）；<code>tmp/19-v6/</code> 是执行台账（不进版本库）。</li>
+<li><strong>命令</strong>：</li>
+</ul>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="co"># 起全栈（前台，Ctrl-C 一起停；Redis/PG 缺啥自举啥，已有监听者复用不杀）</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">./scripts/dev.sh</span>            <span class="co"># 引擎 8901 + vite 5173 + Redis 6390 + PG 5433</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="ex">./scripts/dev.sh</span> status     <span class="co"># 同理 stop；多实例按 ENGINE_PORT 区分</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co"># 单跑引擎 / 单测</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino             <span class="co"># .env 只查 CWD，必须从本目录起</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="va">PATH</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$HOME</span><span class="st">/sdk/go1.27.0/bin:</span><span class="va">$PATH</span><span class="st">&quot;</span> <span class="ex">go</span> run ./cmd/yktako <span class="at">-engine</span> 127.0.0.1:8901 <span class="dt">\</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">-redis</span> 127.0.0.1:6390 <span class="at">-pg</span> <span class="st">&quot;host=127.0.0.1 port=5433 dbname=tako sslmode=disable&quot;</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="va">PATH</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$HOME</span><span class="st">/sdk/go1.27.0/bin:</span><span class="va">$PATH</span><span class="st">&quot;</span> <span class="ex">go</span> test ./internal/runengine/ <span class="at">-count</span><span class="op">=</span>1   <span class="co"># 16 条真实例网</span></span></code></pre></div>
+<h2 id="5-关键文档索引">5. 关键文档索引</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文档</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>doc/19-v6/19-运行引擎架构-v6.md</code> + <code>19v6-01..04/90</code></td>
+<td><strong>引擎真源</strong>：契约四 API / reconcile 与双游标 / 存储形态与生命周期 / 验收 / 演进记录</td>
+</tr>
+<tr>
+<td><code>tmp/19-v6/planning.md</code> + <code>todos.md</code></td>
+<td>执行台账（planning §8 = 落库施工规格；D1 实测记录在 todos 节末）；不进版本库</td>
+</tr>
+<tr>
+<td><code>doc/16-能力复刻总规划.md</code></td>
+<td>能力总规划与梯队（状态列待按 v6 重标）</td>
+</tr>
+<tr>
+<td><code>doc/01–18</code></td>
+<td>旧线设计文档——重建时的设计来源；注意端点/协议措辞多为旧线口径，与 v6 冲突时以 v6 为准</td>
+</tr>
+<tr>
+<td><code>doc/log/2026-09-30-uncommitted-review-handoff.md</code></td>
+<td>旧线末期未清问题（mediaoffload 五问等）</td>
+</tr>
+<tr>
+<td><code>doc/XX-taskboard-重命名-handoff.md</code></td>
+<td>taskboard→tasktracker 改名决策与影响面（改名未执行）</td>
+</tr>
+<tr>
+<td>本文件</td>
+<td>现状快照 + 差距分析 + 下一步候选</td>
+</tr>
+</tbody>
+</table></div>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/log/2026-10-07-v6-gap-handoff.md"><code>doc/log/2026-10-07-v6-gap-handoff.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

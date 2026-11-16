@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>共享项目整条退役 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="共享项目整条退役">共享项目整条退役</h1>
+<blockquote>
+<p>模块：产品形态 / 项目目录（<code>internal/runengine/product_api.go</code>）｜ 状态：已翻身裁（<code>44cf7ca</code>，2026-10-22）｜ 证据：<code>doc/42-产品形态收窄与共享项目退役.md</code>、<code>doc/35-项目目录.md</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>团队用户期待「像 Figma 一样一起改同一个项目」：A 在项目里开一场会话说「把结论写进 report.md」，B 同时开另一场说「把 report.md 的第二节改一下」。</p>
+<p>如果项目允许共享，两场 run 在同一目录里并发写同一块可变状态：</p>
+<ul>
+<li>一个 agent 读另一个 agent 写到一半的字节；</li>
+<li><code>bash</code> 一句话清掉对方十分钟的产物；</li>
+<li>两边都向用户报「成功」。</li>
+</ul>
+<p>而「共享文件」真正要做的是<strong>协同编辑</strong>：CRDT / OT、在线状态、冲突合并、版本历史、撤销重做。tako 没有这个地基；做一个「能看见但不能同时改」的共享，只是半成品。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 保留 <code>private</code> / <code>tenant</code> 双值，做共享项目</td>
+<td>团队叙事完整</td>
+<td>要权限矩阵 + 并发闸 + 附件可见性传导，且仍不是协同编辑</td>
+<td>等于做另一个产品</td>
+</tr>
+<tr>
+<td>B 项目只写 <code>private</code>，共享退役</td>
+<td>归属简单、无跨成员并发</td>
+<td>对外故事少一条</td>
+<td>团队只共享账号、额度、审计，不共享项目</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>裁定：B。</strong> 项目属于个人；团队共享的是账号、额度与审计，不是文件树。</p>
+<p>这次收窄连带退役三样东西：</p>
+<ol type="1">
+<li><code>?scope=tenant</code> 与 workspace visibility 端点 → 恒 404（<code>114001</code> 退役说明）。</li>
+<li>项目闸（同项目同时只允许一个活 run）→ 退役，改为「允许并发 + 文件指纹显式失败」。</li>
+<li>「乐观并发远期缝」→ 撤销。</li>
+</ol>
+<h2 id="3-同族小裁定">3. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>并发写怎么防？</td>
+<td>允许并发，flock + 内容指纹，冲突显式失败</td>
+<td>详见 <code>doc/problems/同项目并发写文件怎么防</code>；跨机靠指纹「事后发现」，不能事前串行</td>
+</tr>
+<tr>
+<td>索引 <code>one_live_run_per_workspace</code> 先删还是先发代码？</td>
+<td><strong>先发新代码（保留 409 兜底），再删索引</strong></td>
+<td>先删索引会让旧代码把冲突翻译成 500/未知错误，出现坏行为窗口；先发码则窗口内用户看到的仍是 409，行为不变</td>
+</tr>
+<tr>
+<td>表上的 <code>visibility</code> 列删不删？</td>
+<td>保留但只写 <code>private</code></td>
+<td>删列要 DDL；保留列 + 端点 404 已足够，避免迁移风险</td>
+</tr>
+<tr>
+<td>前端项目页还显示成员共享吗？</td>
+<td>不显示；邀请流、成员页与项目页彻底分开</td>
+<td>否则用户会以为还能共享</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-证据">4. 证据</h2>
+<ul>
+<li>方案：<code>doc/42-产品形态收窄与共享项目退役.md</code> §0.2（三个理由）、§0.3（收窄定义）、§2.4（并发策略）、§3.2（索引退役两拍）。</li>
+<li>代码：<code>product_api.go</code> 的 <code>patchWorkspaceVisibility</code>（恒 404）；<code>pgstore.go</code> 的 <code>DROP INDEX IF EXISTS one_live_run_per_workspace</code>；<code>store.go</code> 的项目闸退役注释与空实现。</li>
+<li>复核命令：<code>grep -rn "one_live_run_per_workspace\|patchWorkspaceVisibility" yk-tako-eino/internal/runengine</code>。</li>
+</ul>
+<h2 id="5-现状">5. 现状</h2>
+<p>已翻身裁。<code>doc/35</code> 的「A7 团队可见项目」原设计与 <code>tmp/35-项目目录/planning.md</code> §13 的乐观并发缝均已作废；<code>doc/35</code> 表头与 §0 已同步改写。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E5%85%B1%E4%BA%AB%E9%A1%B9%E7%9B%AE%E6%95%B4%E6%9D%A1%E9%80%80%E5%BD%B9/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/共享项目整条退役/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

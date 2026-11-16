@@ -1,0 +1,935 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>模块地图 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="模块地图">模块地图</h1>
+<blockquote>
+<p>性质：<strong>结构索引</strong>，不是方案——本文只回答「有哪些模块、每个模块落在哪些文件、干什么」。 最后核对：2026-11-16（代码基线 <code>a3ee354</code>）。 口径：<strong>一层 = 顶层模块</strong>（谁负责什么）；<strong>二层 = 小模块</strong>（落点文件 + 一句话职责）。 代码路径均相对 <code>yk-tako-eino/</code>；文档路径相对 <code>doc/</code>。 本文与 <a href="index.html">doc/README.md</a>（目录页）分工：README 说「哪篇文档能施工」，本文说「代码在哪一块」。四张系统说明页在 <a href="../assets/tako-architecture.html">assets/tako-architecture.html</a>。</p>
+</blockquote>
+<h2 id="0-一眼看全">0. 一眼看全</h2>
+<h3 id="01-顶层模块">0.1 顶层模块</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>顶层模块</th>
+<th>位置</th>
+<th>负责什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>运行引擎</td>
+<td><code>internal/runengine/</code></td>
+<td>HTTP、run 生命周期、工具、同步子代理、持久 Task、后台命令、记忆与项目文件</td>
+</tr>
+<tr>
+<td>2</td>
+<td>模型与配置</td>
+<td><code>internal/config/</code></td>
+<td>厂商目录、环境变量发现、模型客户端构建、系统提示词</td>
+</tr>
+<tr>
+<td>3</td>
+<td>可观测装配</td>
+<td><code>internal/observability/</code></td>
+<td>OTel 出口、内容序列化与采集开关</td>
+</tr>
+<tr>
+<td>4</td>
+<td>服务入口</td>
+<td><code>cmd/yktako/</code></td>
+<td>唯一入口：工程参数、依赖连接、引擎与后台对账循环起停</td>
+</tr>
+<tr>
+<td>5</td>
+<td>出厂子代理规格</td>
+<td><code>agents/</code></td>
+<td>coder / researcher 的 Markdown + YAML 规格</td>
+</tr>
+<tr>
+<td>6</td>
+<td>前端</td>
+<td><code>web/</code></td>
+<td>Vue 3 + Vite 工作台：对话、项目、任务、文件、技能、工具与团队</td>
+</tr>
+<tr>
+<td>7</td>
+<td>验收与运维脚本</td>
+<td><code>scripts/</code></td>
+<td>开发环境、远端同步、文档检查、契约与活体验收、基准与海报导出</td>
+</tr>
+<tr>
+<td>8</td>
+<td>文档体系</td>
+<td><code>doc/</code></td>
+<td>现行方案与结构索引；<code>log/</code> 是记录，<code>archive/</code> 是整代归档</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="02-规模本次实盘点取约数">0.2 规模（本次实盘点，取约数）</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>部分</th>
+<th>文件与行数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Go 非测试代码（<code>internal/</code> + <code>cmd/</code>）</td>
+<td>127 个文件，约 5.35 万行；其中 runengine 120 个约 5.20 万行</td>
+</tr>
+<tr>
+<td>runengine 测试</td>
+<td>106 个文件，约 3.30 万行</td>
+</tr>
+<tr>
+<td>前端 <code>web/src</code>（Vue / TS / CSS）</td>
+<td>29 个文件，约 1.71 万行</td>
+</tr>
+<tr>
+<td>前端 <code>web/test</code> + <code>web/e2e</code></td>
+<td>12 个文件，约 1200 行</td>
+</tr>
+<tr>
+<td>活体验收 Shell（不含 Python 机器真源与共享库）</td>
+<td>39 个脚本，约 7600 行</td>
+</tr>
+</tbody>
+</table></div>
+<p>规模只用于理解仓库形状，不作为质量指标。runengine 仍是单 Go 包、文件平铺；下面的小模块按职责划分，不表示真实目录层级。</p>
+<h2 id="1-运行引擎internalrunengine">1. 运行引擎（<code>internal/runengine/</code>）</h2>
+<h3 id="11-运行时装配与模型密钥">1.1 运行时装配与模型密钥</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小模块</th>
+<th>落点</th>
+<th>干什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RunProfile 装配</td>
+<td><code>profile.go</code></td>
+<td>为一场 run 拼模型、工具、MCP、技能、子代理和记忆边界</td>
+</tr>
+<tr>
+<td>模型解析</td>
+<td><code>tenantmodel.go</code></td>
+<td>租户模型表 → 生效模型 ref → 可调用模型实例</td>
+</tr>
+<tr>
+<td>密钥密封</td>
+<td><code>secretseal.go</code></td>
+<td>API Key 落库前加密、使用时解密</td>
+</tr>
+<tr>
+<td>数据范围</td>
+<td><code>scope.go</code></td>
+<td>用户/租户/项目/会话范围、目录寻址、容量与存储额度</td>
+</tr>
+<tr>
+<td>会话可见性</td>
+<td><code>session_access.go</code></td>
+<td>按属主与租户判定会话可见、可写与列表范围</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote>
+<p>方案：<a href="28-多租户.html">doc/28</a>、<a href="34-租户运行时装配.html">doc/34</a>、<a href="42-产品形态收窄与共享项目退役.html">doc/42</a></p>
+</blockquote>
+<h3 id="12-身份团队与产品-api">1.2 身份、团队与产品 API</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小模块</th>
+<th>落点</th>
+<th>干什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>认证与响应信封</td>
+<td><code>auth.go</code></td>
+<td>access/refresh、中间件、业务码与 <code>code → message → data</code></td>
+</tr>
+<tr>
+<td>身份存储</td>
+<td><code>identity_store.go</code></td>
+<td>用户、租户、成员、refresh token、日用量</td>
+</tr>
+<tr>
+<td>成员与审计</td>
+<td><code>members_store.go</code>、<code>tenant_api.go</code></td>
+<td>成员角色、邀请以外的成员管理、审计读写</td>
+</tr>
+<tr>
+<td>产品面 API</td>
+<td><code>product_api.go</code>、<code>product_store.go</code></td>
+<td>项目、Agent 配置、邀请、运行时配置、模型预览与 dev 探针</td>
+</tr>
+<tr>
+<td>技能与工具 API</td>
+<td><code>skills.go</code>、<code>skills_scan.go</code>、<code>toolroots.go</code></td>
+<td>技能目录/重扫/禁用与租户可执行文件管理</td>
+</tr>
+<tr>
+<td>记忆观测 API</td>
+<td><code>server.go</code>、<code>memory_store.go</code></td>
+<td>pipeline 的条目、作业、召回观测；不是已取消的记忆管理面</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote>
+<p>方案：<a href="36-团队前端.html">doc/36</a>、<a href="40-响应信封统一.html">doc/40</a>、<a href="52-技能.html">doc/52</a>、<a href="65-记忆两层方案.html">doc/65</a></p>
+</blockquote>
+<h3 id="13-run-生命周期帧与客户端读取">1.3 run 生命周期、帧与客户端读取</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小模块</th>
+<th>落点</th>
+<th>干什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>路由与 run API</td>
+<td><code>server.go</code></td>
+<td>创建/停止/续跑 run，拉帧、run SSE、session 与 log、媒体出口</td>
+</tr>
+<tr>
+<td>执行权与定稿</td>
+<td><code>store.go</code></td>
+<td>AcquireRun / EndRun / StopRun / RenewLease；唯一运行、租约、容量事务</td>
+</tr>
+<tr>
+<td>Redis 临时面</td>
+<td><code>redisstore.go</code></td>
+<td><code>tk:runlive:&lt;runId&gt;</code> LIST 与 <code>tk:runepoch:&lt;runId&gt;</code> STRING；帧读写与代次检查</td>
+</tr>
+<tr>
+<td>worker 与 tool loop</td>
+<td><code>worker.go</code>、<code>tools.go</code>、<code>agentlog.go</code></td>
+<td>装配输入，模型—工具循环，写帧、结果与终态</td>
+</tr>
+<tr>
+<td>journal 与恢复</td>
+<td><code>journal.go</code>、<code>resume_subagent.go</code></td>
+<td>run 逐步意图/结果与重放；后者负责同步子代理完整档案恢复</td>
+</tr>
+<tr>
+<td>账号变更事件</td>
+<td><code>events.go</code></td>
+<td><code>tk:events:&lt;tid&gt;</code> Stream、<code>tk:agent-task-wake</code> Stream 与账号 SSE</td>
+</tr>
+<tr>
+<td>run 只读视图</td>
+<td><code>runviews.go</code></td>
+<td>本轮 Todo 与改动文件 HTTP 投影，不改变执行行为</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote>
+<p>方案：<a href="19-v6/19-运行引擎架构-v6.html">doc/19-v6</a>、<a href="30-崩溃续跑.html">doc/30</a>、<a href="31-sse流式端点.html">doc/31</a>、<a href="46-变更同步与事件通道.html">doc/46</a>、<a href="78-对话页右侧工作区与改动文件.html">doc/78</a></p>
+</blockquote>
+<h3 id="14-上下文媒体与历史查询">1.4 上下文、媒体与历史查询</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小模块</th>
+<th>落点</th>
+<th>干什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>compact</td>
+<td><code>compact.go</code></td>
+<td>窗口预算、分阶段压缩与摘要输入</td>
+</tr>
+<tr>
+<td>mid-run fold</td>
+<td><code>midfold.go</code></td>
+<td>run 与子代理中途折叠</td>
+</tr>
+<tr>
+<td>溢出处理</td>
+<td><code>guard.go</code>、<code>overflow.go</code></td>
+<td>溢出识别、救援压缩与有限重试</td>
+</tr>
+<tr>
+<td>文件/技能记录继承</td>
+<td><code>fileops.go</code>、<code>skillops.go</code>、<code>skillslim.go</code></td>
+<td>从真实调用记录继承路径与技能操作，不依赖模型记性</td>
+</tr>
+<tr>
+<td>媒体</td>
+<td><code>media.go</code>、<code>media_send.go</code>、<code>media_tokens.go</code></td>
+<td>媒体落盘、按需回填模型与 token 估算</td>
+</tr>
+<tr>
+<td>PDF</td>
+<td><code>pdftext.go</code>、<code>pdftool.go</code></td>
+<td>读取 PDF 文本层，不做扫描件 OCR</td>
+</tr>
+<tr>
+<td>会话历史与网络检索</td>
+<td><code>search.go</code>、<code>websearch.go</code>、<code>webfetch.go</code></td>
+<td><code>search_history</code>、<code>web_search</code>、<code>web_fetch</code>；全文落盘</td>
+</tr>
+<tr>
+<td>延迟工具发现</td>
+<td><code>toolsearch.go</code></td>
+<td>BM25 检索 deferred 工具并按需激活</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote>
+<p>方案：<a href="19-v6/19v6-07-compact.html">doc/19-v6/19v6-07</a>、<a href="32-media-offload.html">doc/32</a>、<a href="57-网络抓取.html">doc/57</a>、<a href="58-读分页与输出留存.html">doc/58</a></p>
+</blockquote>
+<h3 id="15-工具沙箱与同步子代理">1.5 工具、沙箱与同步子代理</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小模块</th>
+<th>落点</th>
+<th>干什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>文件工具</td>
+<td><code>filetools.go</code>、<code>readwindow.go</code></td>
+<td>读写、编辑、目录、搜索、分页读取与媒体文件读取</td>
+</tr>
+<tr>
+<td>文件短写入</td>
+<td><code>filelock.go</code>、<code>filefp.go</code>、<code>atomicfile.go</code></td>
+<td>锁内版本校验、PG advisory lock、本机降级与同目录原子替换</td>
+</tr>
+<tr>
+<td>bash 与输出</td>
+<td><code>bash.go</code>、<code>bashspill.go</code></td>
+<td>前台执行、输出尾部与全文路径；后台生命周期见 §1.8</td>
+</tr>
+<tr>
+<td>沙箱与 PATH</td>
+<td><code>sandbox.go</code>、<code>subprocesspath.go</code></td>
+<td>macOS seatbelt / Linux bwrap、技能与工具根只读范围、PATH 过滤</td>
+</tr>
+<tr>
+<td>MCP</td>
+<td><code>mcp.go</code>、<code>mcpconf.go</code></td>
+<td>stdio MCP、工具命名与进程围栏</td>
+</tr>
+<tr>
+<td>同步子代理</td>
+<td><code>agents.go</code></td>
+<td>规格加载、工具策略、同步派发与结果折叠</td>
+</tr>
+<tr>
+<td>子代理 wire</td>
+<td><code>subagent_wire.go</code></td>
+<td>会话目录 <code>.tako/subagents/&lt;sa&gt;.jsonl</code> 追加式档案</td>
+</tr>
+<tr>
+<td>PII</td>
+<td><code>pii.go</code></td>
+<td>工具出口、模型输入与记忆入库前的脱敏与密钥拒收</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote>
+<p>方案：<a href="23-coder规格.html">doc/23</a>、<a href="25-子代理折叠.html">doc/25</a>、<a href="33-mcp-client.html">doc/33</a>、<a href="39-子代理持久化与resume.html">doc/39</a>、<a href="41-任务看板与人工审批.html">doc/41</a>、<a href="71-文件写入竞争.html">doc/71</a></p>
+</blockquote>
+<h3 id="16-技能todo-与等人记录">1.6 技能、Todo 与等人记录</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小模块</th>
+<th>落点</th>
+<th>干什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>技能工具与范围</td>
+<td><code>skilltools.go</code>、<code>skillscope.go</code>、<code>skillbox.go</code></td>
+<td>读取/使用技能、资源读取、作用域与当前 run 可只读技能根</td>
+</tr>
+<tr>
+<td>技能安装</td>
+<td><code>skillinstall.go</code>、<code>skillsource.go</code>、<code>skillfetch.go</code>、<code>skillresolve.go</code></td>
+<td>包上传、来源解析、SSRF 防护、预览与安装</td>
+</tr>
+<tr>
+<td>依赖与恢复</td>
+<td><code>skilldeps.go</code>、<code>skillrestore.go</code></td>
+<td><code>requires</code> 现查与续跑技能范围恢复</td>
+</tr>
+<tr>
+<td>对话内安装确认</td>
+<td><code>skillask.go</code></td>
+<td>staging → <code>run_questions(kind=install)</code> → 管理员确认后装盘</td>
+</tr>
+<tr>
+<td>run 内 Todo</td>
+<td><code>tasktools.go</code></td>
+<td><code>run_tasks</code> 与 TaskCreate/Update/List/Get；不是持久 Task</td>
+</tr>
+<tr>
+<td>等人与 Plan</td>
+<td><code>questions.go</code>、<code>waittools.go</code>、<code>plangate.go</code></td>
+<td>ask/plan 持久现场、答案 CAS、计划模式写限制与恢复</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote>
+<p>方案：<a href="41-任务看板与人工审批.html">doc/41</a>、<a href="47-Plan审核与追问澄清.html">doc/47</a>、<a href="52-技能.html">doc/52</a></p>
+</blockquote>
+<h3 id="17-记忆与对话召回">1.7 记忆与对话召回</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小模块</th>
+<th>落点</th>
+<th>干什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>模式与类型</td>
+<td><code>memory_mode.go</code>、<code>memory_types.go</code>、<code>memory_store.go</code></td>
+<td>pipeline / markdown 选择、表模型与观测读取</td>
+</tr>
+<tr>
+<td>pipeline</td>
+<td><code>memory_pipeline.go</code>、<code>memory_write.go</code>、<code>memory_text_guard.go</code></td>
+<td>resident/recall 写入、候选筛选与最终动作</td>
+</tr>
+<tr>
+<td>派送与消费</td>
+<td><code>memory_queue.go</code>、<code>memory_dispatch.go</code>、<code>memory_redpanda.go</code></td>
+<td>Redpanda 按 session 派送、消费、租约与对账补投</td>
+</tr>
+<tr>
+<td>查询与召回</td>
+<td><code>memory_search.go</code></td>
+<td>BM25、<code>search_memory</code> 时点与历史链</td>
+</tr>
+<tr>
+<td>Markdown</td>
+<td><code>memory_markdown.go</code></td>
+<td>USER.md 与 runtime/memory/MEMORY.md 同步操作式写入</td>
+</tr>
+<tr>
+<td>迁移</td>
+<td><code>memory_migrate.go</code></td>
+<td>旧 memory_items 与 notes 迁移、模式互切；notes 随后退役</td>
+</tr>
+<tr>
+<td>对话块</td>
+<td><code>dialogue.go</code></td>
+<td><code>dialogue_chunks</code> 原文块与两种模式共用的召回线</td>
+</tr>
+<tr>
+<td>常驻记忆快照</td>
+<td><code>notes.go</code></td>
+<td>run 起手渲染并冻结常驻快照，两种模式各有来源；旧 <code>notes</code> 表与写入端点已退役</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote>
+<p>方案：<a href="65-记忆两层方案.html">doc/65</a>、<a href="29-长期记忆.html">doc/29</a>（线二仍现行）、<a href="37-删除与档案清理.html">doc/37</a>（按 scope 删除）</p>
+</blockquote>
+<h3 id="18-持久-task编排交付与后台命令">1.8 持久 Task、编排、交付与后台命令</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小模块</th>
+<th>落点</th>
+<th>干什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Task 模型与图</td>
+<td><code>agent_task_types.go</code>、<code>agent_task_graph.go</code>、<code>agent_task_store.go</code></td>
+<td>编排组、Task、依赖、状态、结果与组内并发</td>
+</tr>
+<tr>
+<td>模型工具与 API</td>
+<td><code>agent_task_tools.go</code>、<code>agent_task_api.go</code></td>
+<td>delegate/create/wait/submit、任务查询、停止与恢复</td>
+</tr>
+<tr>
+<td>调度与执行</td>
+<td><code>agent_task_scheduler.go</code>、<code>agent_task_runner.go</code></td>
+<td>事件唤醒 + PG 对账、ready 领取、独立 session/run</td>
+</tr>
+<tr>
+<td>有界修订</td>
+<td><code>agent_task_revision.go</code>、<code>agent_task_revision_api.go</code></td>
+<td>planRevision、追加/取消未来工作与版本时间线</td>
+</tr>
+<tr>
+<td>通知与交付</td>
+<td><code>agent_task_delivery.go</code>、<code>agent_task_recovery.go</code></td>
+<td>通知认领、消费/失败、attempt、交付恢复与人工重试</td>
+</tr>
+<tr>
+<td>处理提醒</td>
+<td><code>agent_task_attention.go</code></td>
+<td>待答、计划决策、中断、交付失败与发布受阻聚合</td>
+</tr>
+<tr>
+<td>继任与 handoff</td>
+<td><code>agent_task_successor.go</code>、<code>agent_task_handoff.go</code></td>
+<td>feasible 校验、继任组、复用、noReplay 与深度限制</td>
+</tr>
+<tr>
+<td>执行历程</td>
+<td><code>orchestration_journey.go</code></td>
+<td>从持久记录派生计划、终态、复用、继任与交付时间线</td>
+</tr>
+<tr>
+<td>后台 bash</td>
+<td><code>bash_job.go</code></td>
+<td>bj_…、输出/等待/停止、owner 租约、终态与通知</td>
+</tr>
+<tr>
+<td>后台命令对账</td>
+<td><code>bash_job_sweeper.go</code></td>
+<td>owner 失联后收 interrupted，不自动重放命令</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote>
+<p>方案：<a href="70-多Agent编排与Task/README.html">doc/70</a>、<a href="72-多Agent编排下一阶段.html">doc/72</a>、<a href="73-协调通知与交付恢复.html">doc/73</a>、<a href="75-目标重规划与继任编排组.html">doc/75</a>、<a href="82-可组合执行原语与后台任务.html">doc/82</a></p>
+</blockquote>
+<h3 id="19-工作现场结果发布与项目容器">1.9 工作现场、结果发布与项目容器</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小模块</th>
+<th>落点</th>
+<th>干什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Provider 接口与引擎</td>
+<td><code>workspace_provider.go</code>、<code>workspace_engine.go</code></td>
+<td>Task/DAG 与 Git 细节解耦，统一准备现场、验收与发布</td>
+</tr>
+<tr>
+<td>Git Provider</td>
+<td><code>workspace_git.go</code></td>
+<td>已有 Git 仓库需要隔离修改时使用 worktree</td>
+</tr>
+<tr>
+<td>Directory Provider</td>
+<td><code>workspace_directory.go</code></td>
+<td>非 Git 项目使用目录副本、变更清单与冲突检查</td>
+</tr>
+<tr>
+<td>不可变结果与验证</td>
+<td><code>workspace_result.go</code>、<code>workspace_verify.go</code>、<code>agent_task_artifact.go</code></td>
+<td>结果版本、产物、verifyCommand 与重试发布</td>
+</tr>
+<tr>
+<td>发布协调</td>
+<td><code>workspace_publish.go</code></td>
+<td>项目级事务协调、项目变化检查与发布恢复</td>
+</tr>
+<tr>
+<td>项目布局</td>
+<td><code>project_layout.go</code></td>
+<td><code>layout.json</code>、<code>content/</code>、<code>runtime/{orchestrations,tmp,media,memory}</code></td>
+</tr>
+<tr>
+<td>存量迁移</td>
+<td><code>project_migrate.go</code></td>
+<td>复制 → 校验 → 原子切换，不做新旧双读</td>
+</tr>
+<tr>
+<td>删除补偿</td>
+<td><code>project_cleanup.go</code></td>
+<td>整容器清理与 <code>project_cleanups</code> pending 补偿</td>
+</tr>
+<tr>
+<td>工作区视图</td>
+<td><code>workspace_view.go</code></td>
+<td>将 Provider 状态投成 API 可读信息，不把 Git 字段塞进 PG</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote>
+<p>方案：<a href="74-并行任务工作区隔离.html">doc/74</a>、<a href="75-目标重规划与继任编排组.html">doc/75</a>、<a href="76-项目内容目录与运行资源容器.html">doc/76</a></p>
+</blockquote>
+<h3 id="110-清理追踪与其他横切">1.10 清理、追踪与其他横切</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小模块</th>
+<th>落点</th>
+<th>干什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>归档清扫</td>
+<td><code>archive_sweep.go</code></td>
+<td>软删保留窗口、wire 过窗清理与清扫租约</td>
+</tr>
+<tr>
+<td>临时目录清扫</td>
+<td><code>tempsweep.go</code></td>
+<td>技能/工具 <code>.staging</code>、<code>.trash</code> 的 24 小时清理</td>
+</tr>
+<tr>
+<td>OTel run 埋点</td>
+<td><code>trace.go</code>、<code>trace_run.go</code></td>
+<td>run、模型、工具与内部步骤 span；观测不接管业务状态</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote>
+<p>方案：<a href="37-删除与档案清理.html">doc/37</a>、<a href="52-技能.html">doc/52</a>、<a href="54-运行级OTel追踪.html">doc/54</a></p>
+</blockquote>
+<h2 id="2-模型配置与观测internalconfiginternalobservability">2. 模型配置与观测（<code>internal/config/</code>、<code>internal/observability/</code>）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小模块</th>
+<th>落点</th>
+<th>干什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>厂商目录</td>
+<td><code>internal/config/catalog.go</code>、<code>provider-catalog.json</code></td>
+<td>协议、base URL、模型清单与视觉能力</td>
+</tr>
+<tr>
+<td>环境发现与解析</td>
+<td><code>internal/config/resolve.go</code></td>
+<td>ResolvedProvider → ResolvedModel，含 Ollama 特例</td>
+</tr>
+<tr>
+<td>模型客户端与提示词</td>
+<td><code>internal/config/model.go</code></td>
+<td>构建 ToolCallingChatModel、系统提示与执行策略</td>
+</tr>
+<tr>
+<td>模型注册表</td>
+<td><code>internal/config/modelregistry.go</code></td>
+<td>按 ref 构建与指纹缓存</td>
+</tr>
+<tr>
+<td>OTel 装配</td>
+<td><code>internal/observability/</code></td>
+<td>OTLP 出口、CozeLoop/Langfuse、内容采集开关与序列化</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="3-服务入口cmdyktako">3. 服务入口（<code>cmd/yktako/</code>）</h2>
+<p><code>main.go</code> 是唯一可执行入口：解析工程参数，连接 PG/Redis/Redpanda，执行启动迁移，创建 store/worker/router，并启动 Task 调度、后台命令对账、记忆对账、归档清理和 HTTP 服务。</p>
+<p>与长任务相关的参数包括 <code>-task-interval</code>、<code>-task-input-timeout</code>、<code>-bash-foreground-wait</code>、<code>-wait-window</code>、<code>-job-lease-*</code> 与 <code>-job-reconcile-interval</code>。当前代码默认 bash 前台等待窗口为 30 秒；以旗标与环境变量实际值为准。</p>
+<h2 id="4-出厂子代理规格agents">4. 出厂子代理规格（<code>agents/</code>）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文件</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>agents/coder.md</code></td>
+<td>可改文件、写脚本、跑命令的执行规格</td>
+</tr>
+<tr>
+<td><code>agents/researcher.md</code></td>
+<td>调研与资料整理规格，排除 bash</td>
+</tr>
+</tbody>
+</table></div>
+<p>规格使用 YAML frontmatter + 正文指令。同步子代理与持久 Task 可以复用执行规格，但两者的等待与恢复语义仍由 §1.5 和 §1.8 分别决定。</p>
+<h2 id="5-前端web">5. 前端（<code>web/</code>）</h2>
+<h3 id="51-状态与基础设施">5.1 状态与基础设施</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小模块</th>
+<th>落点</th>
+<th>干什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>API 与类型</td>
+<td><code>src/api.ts</code>、<code>src/configureApi.ts</code></td>
+<td>run/Task/job/项目/团队/配置端点与响应类型</td>
+</tr>
+<tr>
+<td>鉴权</td>
+<td><code>src/auth.ts</code></td>
+<td>token、刷新三态、租户切换；代理 5xx 不误判登出</td>
+</tr>
+<tr>
+<td>变更同步</td>
+<td><code>src/mutation.ts</code></td>
+<td>BroadcastChannel + 账号 SSE，统一失效并重拉</td>
+</tr>
+<tr>
+<td>对话状态</td>
+<td><code>src/chat.ts</code>、<code>src/chatpool.ts</code></td>
+<td>帧/历史/工具卡/提问组装与每会话实例池</td>
+</tr>
+<tr>
+<td>Markdown</td>
+<td><code>src/markdown.ts</code>、<code>src/markdown.css</code></td>
+<td>marked + DOMPurify 与共享 <code>.md-body</code></td>
+</tr>
+<tr>
+<td>全局样式</td>
+<td><code>src/base.css</code></td>
+<td>设计变量、布局与响应式基础</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="52-页面与组件">5.2 页面与组件</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小模块</th>
+<th>落点</th>
+<th>干什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>主壳与侧栏</td>
+<td><code>src/App.vue</code></td>
+<td>对话、项目/会话树、导航、处理提醒、页面分支与移动端抽屉</td>
+</tr>
+<tr>
+<td>项目页</td>
+<td><code>src/ProjectsView.vue</code></td>
+<td>项目、会话、文件清单、Markdown 预览与删除补偿提示</td>
+</tr>
+<tr>
+<td>右侧工作区</td>
+<td><code>src/ChatDock.vue</code>、<code>WorkspaceTree.vue</code>、<code>WorkspaceFileView.vue</code></td>
+<td>目录、任务、Todo、文件与后台命令标签</td>
+</tr>
+<tr>
+<td>本轮视图</td>
+<td><code>src/RunTodoPanel.vue</code>、<code>RunChangedFiles.vue</code></td>
+<td>run 内 Todo 与改动文件回执</td>
+</tr>
+<tr>
+<td>任务页</td>
+<td><code>src/TasksView.vue</code></td>
+<td>Task/编排详情、修订、发布、后台命令与执行历程；可嵌入右侧工作区</td>
+</tr>
+<tr>
+<td>交付恢复</td>
+<td><code>src/NotificationRecovery.vue</code></td>
+<td>交付失败详情、人工重试与结果定位</td>
+</tr>
+<tr>
+<td>技能与工具</td>
+<td><code>src/SkillsView.vue</code>、<code>SkillInstallCard.vue</code>、<code>ToolsView.vue</code></td>
+<td>技能目录/安装/禁用与工具根上传/删除</td>
+</tr>
+<tr>
+<td>团队</td>
+<td><code>src/MembersView.vue</code>、<code>InviteLanding.vue</code>、<code>PendingInvites.vue</code></td>
+<td>成员、邀请落地与待处理邀请</td>
+</tr>
+<tr>
+<td>配置与通用组件</td>
+<td><code>src/Configure.vue</code>、<code>PlanDoc.vue</code>、<code>ConfirmDialog.vue</code></td>
+<td>Agent/模型/MCP 配置、方案渲染与确认框</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="53-测试">5.3 测试</h3>
+<ul>
+<li><code>web/test/*.test.ts</code>：chatpool、Markdown、鉴权刷新等单元测试。</li>
+<li><code>web/e2e/*.spec.ts</code>：smoke、UI、文件、Markdown 预览、多会话与侧栏事件等 Playwright 场景。</li>
+</ul>
+<blockquote>
+<p>方案：<a href="50-侧栏项目树.html">doc/50</a>、<a href="60-多会话并发.html">doc/60</a>、<a href="77-对话页任务面板.html">doc/77</a>、<a href="78-对话页右侧工作区与改动文件.html">doc/78</a>、<a href="80-任务列表按会话过滤.html">doc/80</a>、<a href="81-刷新失败不误判登出.html">doc/81</a></p>
+</blockquote>
+<h2 id="6-验收与运维脚本scripts">6. 验收与运维脚本（<code>scripts/</code>）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小模块</th>
+<th>落点</th>
+<th>干什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>开发环境</td>
+<td><code>scripts/dev.sh</code></td>
+<td>Redis + PostgreSQL + 引擎 + Vite；status/stop/restart</td>
+</tr>
+<tr>
+<td>双远端同步</td>
+<td><code>scripts/sync-remotes.sh</code></td>
+<td><strong>先 GitHub <code>origin</code>，成功后再 AtomGit <code>atomgit</code></strong></td>
+</tr>
+<tr>
+<td>文档布局与总纲检查</td>
+<td><code>scripts/check-doc-layout.sh</code>、<code>check-master-plan.sh</code></td>
+<td>文档归档布局与 doc/README ↔︎ doc/16 引用一致性</td>
+</tr>
+<tr>
+<td>架构页检查</td>
+<td><code>scripts/check-architecture-pages.mjs</code></td>
+<td>四页 JSON、节点/连线、导航、代码与文档链接、当前机制最低事实集</td>
+</tr>
+<tr>
+<td>海报导出</td>
+<td><code>scripts/export-architecture-poster.sh</code></td>
+<td>从总览 HTML 的 <code>?poster=1</code> 导出 3840×2822 PNG</td>
+</tr>
+<tr>
+<td>契约机器真源</td>
+<td><code>scripts/acceptance/expected.json</code>、<code>assert_contract.py</code></td>
+<td>可判红的期望响应与真实端点断言</td>
+</tr>
+<tr>
+<td>用例与抽验</td>
+<td><code>scripts/acceptance/matrix.py</code>、<code>spotcheck.sh</code>、<code>check-expected.sh</code></td>
+<td>实跑矩阵、存储/可见性抽验与散文用例号一致性</td>
+</tr>
+<tr>
+<td>run/记忆活体</td>
+<td><code>taskboard_crash.sh</code>、<code>question_crash.sh</code>、<code>memory_*.sh</code></td>
+<td>kill -9、问答、双模式、迁移、文件竞争、项目删除与 broker 崩溃</td>
+</tr>
+<tr>
+<td>Task 活体</td>
+<td><code>agent_task_{single,busy,dag,crash,two_replicas,revision,hitl,attention,wakeup,delivery_recovery,wait,demo}_live.sh</code></td>
+<td>单件、依赖、双副本、修订、提问、提醒、唤醒、交付与主动等待</td>
+</tr>
+<tr>
+<td>工作区与重规划</td>
+<td><code>workspace_{git,directory,publication,crash}_live.sh</code>、<code>goal_replan*_live.sh</code></td>
+<td>Provider、发布、崩溃、继任与复用</td>
+</tr>
+<tr>
+<td>项目与后台命令</td>
+<td><code>project_layout*_live.sh</code>、<code>bash_job*_live.sh</code>、<code>orchestration_live.sh</code></td>
+<td>布局迁移、后台命令、执行历程与整组回归</td>
+</tr>
+<tr>
+<td>基准</td>
+<td><code>scripts/bench/</code></td>
+<td>GAIA 切片配方、官方口径判定器、双臂运行与基线报告</td>
+</tr>
+</tbody>
+</table></div>
+<blockquote>
+<p>方案：<a href="45-场景化Eval框架.html">doc/45</a>（待点头）、<a href="56-Agent测试与基准选型.html">doc/56</a>、<a href="70-多Agent编排与Task/README.html">doc/70</a>、<a href="82-可组合执行原语与后台任务.html">doc/82</a></p>
+</blockquote>
+<h2 id="7-文档与运行时产物">7. 文档与运行时产物</h2>
+<h3 id="71-文档归属">7.1 文档归属</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>是什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>doc/README.md</code></td>
+<td>目录页：现行真源、历史存档、非方案内容与记录</td>
+</tr>
+<tr>
+<td><code>doc/16-能力复刻总规划.md</code></td>
+<td>结论页：能力现状与下一步；与目录页同批更新</td>
+</tr>
+<tr>
+<td><code>doc/19-v6/</code></td>
+<td>v6 核心契约、存储、tool loop 与上下文机制</td>
+</tr>
+<tr>
+<td><code>doc/70-多Agent编排与Task/</code></td>
+<td>Task 方案集与参照调研</td>
+</tr>
+<tr>
+<td><code>doc/assets/tako-*.html</code></td>
+<td>系统总览、run、编排、数据四张说明页；导读而非施工真源</td>
+</tr>
+<tr>
+<td><code>doc/problems/</code></td>
+<td>设计问题与候选的决策档案</td>
+</tr>
+<tr>
+<td><code>doc/log/</code></td>
+<td>交接、施工记录与文章，不作现行施工真源</td>
+</tr>
+<tr>
+<td><code>doc/archive/</code></td>
+<td>被整代取代的旧线与 v3/v4/v5</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="72-运行时产物不入库">7.2 运行时产物（不入库）</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>是什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yk-tako-eino/workspace/</code></td>
+<td>租户、项目、会话、技能、工具与系统技能等共享存储根</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/tmp/</code></td>
+<td>本地隔离引擎与施工运行产物</td>
+</tr>
+<tr>
+<td>根 <code>tmp/</code></td>
+<td>执行期施工包与返工记录，验收后按纪律留档并清理</td>
+</tr>
+<tr>
+<td><code>yk-tako-eino/.env</code>、<code>mcp.json</code></td>
+<td>本机秘密与 MCP 真配置，不入库，也不进入架构页或截图</td>
+</tr>
+</tbody>
+</table></div>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/53-%E6%A8%A1%E5%9D%97%E5%9C%B0%E5%9B%BE.md"><code>doc/53-模块地图.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

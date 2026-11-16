@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>50 · 侧栏项目树（项目 → 对话二级） · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="50--侧栏项目树项目--对话二级">50 · 侧栏项目树（项目 → 对话二级）</h1>
+<blockquote>
+<p>性质：<strong>方案（2026-10-24 立项）</strong>。 状态：✅ <strong>已落地</strong>——A1（数据层：会话按项目分组、默认项目第一、未归项目殿后）、A2（二级树与空态）、A3（展示更多 +10 / 收起）、A4（整栏 10 条 + 项目内 10 条双层上限、文件夹图标）均已施工并浏览器验收；<strong>A5 于 2026-11-15 收口</strong>：<code>workspace_renamed</code> / <code>workspace_deleted</code> 触发侧栏树重拉（<code>App.vue</code> 的 <code>onMutation</code>），窄屏一项由 doc/51 U6 覆盖。验收：<code>web/e2e/sidebar-events.spec.ts</code> 三条（同窗口改名、跨窗口改名、跨窗口删项目），先红后绿；<code>npm run typecheck</code> / <code>npm run build</code> 通过。commit <code>cba0339</code>。台账 <code>tmp/50-侧栏项目树/</code>（不入库）。 真源关系：侧栏现状来自 <a href="48-前端可用性欠账.html">doc/48</a> A2（「最近会话」快捷回跳）；会话与项目的归属规则是 <a href="42-产品形态收窄与共享项目退役.html">doc/42</a>、<a href="44-前端三处欠账.html">doc/44</a>；跨窗口失效逻辑是 <a href="46-变更同步与事件通道.html">doc/46</a>。 <strong>呈现层已重排（2026-10-24）</strong>：<a href="51-UI视觉重做.html">doc/51</a> U2/U6 把侧栏改成三段式，并在 ≤860px 收成 52px 顶栏 + 280px 抽屉——<strong>树本身的结构与交互（折叠、整栏 10 条 / 项目内 10 条、「展示全部」）仍是本文真源</strong>。A5 的「窄屏」一项已由 doc/51 U6 实测覆盖（390×844 聊天列表 699px、抽屉遮罩 / <code>Esc</code> / 开会话三法关闭）；<strong>A5 的 <code>workspace_renamed</code> / <code>workspace_deleted</code> 事件重载已于 2026-11-15 落地</strong>。 <strong>不改后端契约</strong>：<code>GET /api/workspaces</code> + <code>GET /api/sessions</code> 的现有字段已经够拼出这棵树。</p>
+</blockquote>
+<hr />
+<h2 id="0-病灶侧栏找不到那个项目里的那个对话">0. 病灶：侧栏找不到「那个项目里的那个对话」</h2>
+<p>用户在 A 项目里和 agent 调了十几轮，过两天回来想接着聊。侧栏只有一列「最近会话」：扁平的 10 条标题，<strong>项目名一个都不在</strong>，第 11 条起要靠列表内部那条滚动条去翻。翻不到时唯一的出路是点「在项目页看全部 →」跳到项目页，点开项目、找到会话、再点回来——回一个对话要三步，而侧栏本来就是为「一步回去」建的。</p>
+<p>更糟的是「没有把所有项目都显示出来」：一个项目最近没动静，它的对话就彻底沉到 10 条之外，用户在侧栏上看到的世界和真实存在的项目对不上。</p>
+<p>修完的目标：<strong>侧栏本身就是一张全量目录</strong>——所有项目都在，每个项目下面挂着它的对话，项目可以收起/展开；整栏再多也只在 10 条以内，想看更多点「展示更多」，不出现列表内滚动条。</p>
+<h2 id="1-目标形态三问已拍2026-10-24">1. 目标形态（三问已拍，2026-10-24）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>决策</th>
+<th>取值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>「展示更多」口径</td>
+<td><strong>整栏合计 10 条对话</strong>；点一次就地再放 10 条；全部展开后按钮变「收起」，点回收起到 10 条</td>
+</tr>
+<tr>
+<td>项目范围</td>
+<td><strong>全部项目都列</strong>；空项目下显示一行灰色「还没有对话」</td>
+</tr>
+<tr>
+<td>展开状态</td>
+<td><strong>默认全部展开</strong>；点项目行收起/展开（手风琴）</td>
+</tr>
+<tr>
+<td>项目内口径（2026-10-24 追加）</td>
+<td><strong>每个项目再限 10 条</strong>；项目内超 10 条时该项目下出「展示全部」，点开<strong>只放开这一个项目</strong>（按钮变「收起」），其它项目仍受整栏上限</td>
+</tr>
+<tr>
+<td>项目行识别（2026-10-24 追加）</td>
+<td>项目名前的记号是<strong>文件夹图标</strong>，展开态画开口文件夹、折叠态画合口文件夹（图标本身就是状态指示，不再另画 <code>▸/▾</code>）</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="2-数据从哪来零后端改动">2. 数据从哪来（零后端改动）</h2>
+<p>一次 <code>GET /api/workspaces</code>（本人项目，服务端按 <code>created_at</code> 升序；<strong>默认项目不保证在第一</strong>——实测本账号「验收项目」比「默认」早建 107 ms）+ 一次 <code>GET /api/sessions</code>（不带 <code>workspaceId</code> = 本人全部会话，每行带 <code>workspaceId</code>）。</p>
+<p>客户端把会话按 <code>workspaceId</code> 挂到项目下：</p>
+<ul>
+<li>项目顺序：<strong>默认项目排第一</strong>（<code>isDefault</code>），其后按接口给的 <code>created_at</code> 升序。</li>
+<li><code>workspaceId = null</code> 的存量游离会话：只有存在时才多出一组「未归项目」，排在最后（实测开发库有 4 条）。</li>
+<li>会话在组内按 <code>createdAt</code> 倒序（最近的在上）。</li>
+</ul>
+<h2 id="3-交互细节">3. 交互细节</h2>
+<ul>
+<li><strong>项目行</strong>：整行是一个按钮，左侧 <code>▾/▸</code>，右侧项目名；点击切换 <code>aria-expanded</code>，展开态显示其下会话（缩进一级、字号略小）。</li>
+<li><strong>当前会话</strong>：保持高亮；打开某会话时，若它所属项目是收起状态，自动展开（否则人会「跳到一个看不见的条目」）。</li>
+<li><strong>10 条上限按整栏算</strong>：所有会话先按 <code>createdAt</code> 倒序排成一条全局列表，取前 N 条（初始 N=10），项目分组只渲染这 N 条里属于它的条目。<strong>有会话但都被截掉的项目不显示「还没有对话」</strong>——那一行只属于真正空的项目，否则等于骗人。</li>
+<li><strong>展示更多/收起</strong>：<code>N += 10</code>；当 <code>N ≥ 会话总数</code>，按钮文案变「收起」，点击把 N 重置回 10（同时收回所有项目内的放开，否则按了看着没变）。</li>
+<li><strong>项目内也限 10 条</strong>：某一组最多先显示 10 条；组内还有没露出的（被这一层或整栏上限截住），组下出「展示全部」，点开只把这<strong>一个</strong>项目放全，按钮变「收起」。打开一条被截住的会话时，自动只放开它所属的那一个项目。</li>
+<li><strong>项目行前是文件夹图标</strong>（<code>--accent</code>，15px 线稿）：项目行与会话行字号只差 0.02rem，靠缩进认层级不够；展开/折叠两态用开口/合口两个 SVG，状态由图标自身表达。</li>
+<li><strong>去掉列表内滚动</strong>：删掉 <code>.recent-list</code> 的 <code>max-height: 14rem</code> 与 <code>overflow-y: auto</code>（含窄屏那条 <code>max-height: 9rem</code>）；高度完全由「上限 + 折叠」控制。</li>
+</ul>
+<h2 id="4-别的窗口改了数据怎么办doc46">4. 别的窗口改了数据怎么办（doc/46）</h2>
+<ul>
+<li><code>session_deleted</code>：从对应项目组里剪掉（现有逻辑是过滤扁平列表，改成过滤分组）。</li>
+<li><code>workspace_renamed</code>：<strong>重拉一次树</strong>（<code>loadSidebarTree()</code>）。侧栏常驻项目名，不重拉就会一直显示旧名——改名当事 tab 也一样：<code>broadcastMutation</code> 的自回声被 <code>sourceId</code> 挡掉，兑现它的是服务端事件流（SSE 按租户扇出，不排除发起连接）。</li>
+<li><code>workspace_deleted</code>：先沿用现有 <code>onWorkspaceDeleted</code>（丢弃该项目下的会话实例、把落点清回默认项目），<strong>再重拉树</strong>——侧栏自己存着项目行，只清实例不重拉会留下一个点进去 404 的死项目。磁盘清理补偿完成时还会再发一次同 id 事件，重拉是幂等的。</li>
+<li>新会话出现：沿用现有重拉点（切换会话、一轮收口）。<strong>不新增</strong> <code>session_created</code> 事件——那是事件通道的另一个方案。</li>
+</ul>
+<h2 id="5-验收">5. 验收</h2>
+<ul>
+<li>数据：<code>curl GET /api/workspaces</code> 与 <code>curl GET /api/sessions</code> 的返回里能拿到项目名、<code>isDefault</code>、每行 <code>workspaceId</code>、<code>createdAt</code>（这一拍证明零后端可行）。</li>
+<li>交互（浏览器）：项目可收起/展开；空项目显示「还没有对话」；超过 10 条时出现「展示更多」，点击就地 +10，全部展开后变「收起」；<code>document.querySelector('.recent-list').scrollHeight === clientHeight</code>（无内部滚动）；打开老会话时侧栏高亮且该项目展开。</li>
+<li>回归：<code>npm run typecheck</code>、<code>npm test</code>；窄屏 700/380 两档侧栏不溢出。</li>
+<li>事件重载（A5，<code>cd web &amp;&amp; npx playwright test e2e/sidebar-events.spec.ts</code>）：造一个时间戳命名的项目、收尾删掉，不碰开发库既有项目。三条都先在未改代码时跑成红（红停在最终断言）：①同一窗口在项目页改名后侧栏当场换名；②另一个窗口经 API 改名，本窗口不刷新就换名；③别处删项目，两个窗口的侧栏那一行自己消失。</li>
+</ul>
+<h2 id="6-明确不做">6. 明确不做</h2>
+<ul>
+<li><strong>不做后端分组端点</strong>：两次现有请求在客户端合并不值得动契约。</li>
+<li><strong>不做折叠状态持久化</strong>：刷新后回到「全部展开」，少一处存储与一处不一致。</li>
+<li><strong>不在侧栏做项目增删改</strong>：那是项目页的职责（doc/44）。</li>
+<li><strong>不解决「别的窗口新建会话不实时出现」</strong>：事件通道没有 <code>session_created</code>，本次只在切会话/收口时重拉。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/50-%E4%BE%A7%E6%A0%8F%E9%A1%B9%E7%9B%AE%E6%A0%91.md"><code>doc/50-侧栏项目树.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

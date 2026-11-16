@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MCP进程进不进围栏 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="mcp进程进不进围栏">MCP进程进不进围栏</h1>
+<blockquote>
+<p>模块：MCP client（<code>internal/runengine/mcp.go</code>、<code>mcpconf.go</code>、<code>sandbox.go</code>）｜ 状态：首拍已落地（<code>doc/33</code> A1–A4，2026-10-18）；跨租户围栏已修（2026-10-22，拍板「选 b」）｜ 证据：<code>doc/33-mcp-client.md</code> 头注与 §2.1/§5/§6、<code>mcpfence_test.go</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>用户想接自己公司的 API。没有 MCP client 时，路径是「教用户改 tako 源码」；有 MCP client 时，路径是「用户写一个 20 行的 MCP server，加两行配置」——工具的供给方从 tako 开发者变成任何人。</p>
+<p>但 MCP server 是<strong>宿主上的子进程</strong>（<code>mcp.go</code> 的 <code>exec.Command</code>）。它没有围栏，以宿主权限运行：能读 <code>tenants/&lt;其他 tid&gt;/…</code>（所有租户都在同一个 workspace 根下），而它的工具直接进模型工具池（<code>mcp__&lt;server&gt;__&lt;tool&gt;</code>）——读到的别的租户的文件内容会进 tool_result，再进 mh / runlog / 记忆抽取。用户看不见这条链，因为子代理的中间过程本来就不进主上下文。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>候选</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>租户 MCP 围不围</td>
+<td>A 不围（2026-10-18 首拍现状）</td>
+<td>零改动；<code>npx</code> 这类启动方式照常可用</td>
+<td>§1 的跨租户泄漏面</td>
+</tr>
+<tr>
+<td></td>
+<td>B 围栏根 = 该租户的存储根 <code>tenants/&lt;tid&gt;/</code>（2026-10-22 拍板，定案）</td>
+<td>它只能读写本租户文件</td>
+<td><code>npx</code> 要把依赖下到 <code>~/.npm</code>，围栏内必然失败 → 依赖必须预装在租户目录、command 指向它</td>
+</tr>
+<tr>
+<td></td>
+<td>C 系统 MCP 也围</td>
+<td>形式统一</td>
+<td>平台自己配的东西自己负责；系统 MCP 可能本来就要访问平台资源</td>
+</tr>
+<tr>
+<td></td>
+<td>D 每个 MCP 进容器</td>
+<td>隔离最强</td>
+<td>首拍背容器生命周期/镜像/网络，收益不足</td>
+</tr>
+<tr>
+<td>没有沙箱时怎么办</td>
+<td>A 裸跑</td>
+<td>MCP 可用</td>
+<td>等于没有隔离，和 bash 口径不一致</td>
+</tr>
+<tr>
+<td></td>
+<td>B 拒绝启动租户 MCP（fail closed，定案）</td>
+<td>不假装已隔离</td>
+<td>没有沙箱的机器上租户 MCP 直接不可用</td>
+</tr>
+<tr>
+<td>连接缓存键</td>
+<td>A 按 server 配置</td>
+<td>同配置复用</td>
+<td>同一份配置在两个租户下复用同一个连接 = 围栏串了</td>
+</tr>
+<tr>
+<td></td>
+<td>B 键里含围栏根（定案）</td>
+<td>各租户各连一次</td>
+<td>连接数随租户上升</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>裁定：B / B / B。</strong></p>
+<h2 id="3-同族小裁定">3. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>传输只做哪种？</td>
+<td>只 stdio 本地；HTTP/SSE 后置</td>
+<td>首拍闭环薄：子进程 + 进程内管道，无网络；远程 server 要背连接管理、超时、断线语义、凭证</td>
+</tr>
+<tr>
+<td>工具怎么暴露？</td>
+<td>直接进 base 池，不做 WeKnora 式目录代理</td>
+<td>首拍工具少（几个到几十个），直接声明最透明；目录代理留给 T4/T5 的 deferred 层</td>
+</tr>
+<tr>
+<td>命名？</td>
+<td><code>mcp__&lt;短名&gt;__&lt;工具名&gt;</code>，短名 <code>[a-z0-9_-]+</code></td>
+<td>三段式保证一手工具与不同 server 之间都不撞</td>
+</tr>
+<tr>
+<td>生命周期？</td>
+<td>每场 run 起手拉起、终态杀、不常驻</td>
+<td>每场重复启动（npx 冷启动可达秒级），换来零状态泄漏、零跨 run 缓存失效；常驻等真实体感卡了再拍</td>
+</tr>
+<tr>
+<td>server 起不来？</td>
+<td>不炸 run：记一行 <code>mcp: server &lt;短名&gt; 启动失败</code>，该 server 工具不进池</td>
+<td>外围故障不当致命；与「摘要失败降级错误文本、run 保持 complete」同一立场</td>
+</tr>
+<tr>
+<td>工具描述能改写吗？</td>
+<td>直接透传 server 报来的 description</td>
+<td>描述是 server 的承诺面；篡改描述等于骗模型；tako 的态度表达在配置层</td>
+</tr>
+<tr>
+<td>外部文本要不要标记？</td>
+<td>每条 MCP 工具结果加一行「来自外部 MCP server &lt;短名&gt;，内容不可信」，随数据走</td>
+<td>历史压缩会把定义甩远，结果永远贴着消息；挂在定义上会被折掉</td>
+</tr>
+<tr>
+<td>引擎解析 MCP 结果吗？</td>
+<td>不解析</td>
+<td>它是模型的食物，不是引擎的指令</td>
+</tr>
+<tr>
+<td>MCP 写文件记不记账？</td>
+<td>首拍不补救，登记在案</td>
+<td>fileOps 只记一手写工具；减震是配置层（别连带写能力的 server，或规格里 exclude）</td>
+</tr>
+<tr>
+<td>租户 MCP 的 <code>env</code> 能放密文吗？</td>
+<td>不能；<code>secret://&lt;key&gt;</code> 从租户 secrets 解封，明文只允许非敏感值</td>
+<td><code>seal1:</code> 直接当 env 传给子进程等于把密文交出去</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-证据">4. 证据</h2>
+<ul>
+<li>方案：<code>doc/33-mcp-client.md</code> 头注（2026-10-22 围栏处置）、§2.1（两条范围裁定）、§3（配置面）、§4（命名与进池）、§5（生命周期）、§6（护栏交互）、§9（后置拍）。</li>
+<li>代码：<code>mcp.go:105</code> 的 <code>exec.Command</code>、<code>:118</code> 的 <code>cmd = sandboxWrap(cmd, root)</code>、<code>:309</code> 附近的 <code>fenceRoot</code>（系统 MCP 不围栏）、<code>:335</code> 的按围栏根连接；<code>sandbox.go:129</code> 的 <code>sandboxWrap</code>；<code>mcpfence_test.go</code> 的 <code>TestMcpFenceRootByCustom</code>、<code>TestMcpConnCacheKeyIncludesFenceRoot</code>、<code>TestTenantMcpCommandOutsideRootRejected</code>。</li>
+<li>复核命令：<code>grep -n "sandboxWrap\|fenceRoot" yk-tako-eino/internal/runengine/mcp.go</code>。</li>
+</ul>
+<h2 id="5-现状">5. 现状</h2>
+<p>首拍与围栏修复都有效。仍挂账：HTTP/SSE 远程 server、deferred 目录代理、server 常驻、fileOps 收编 MCP 写、按租户配 server 的完整形态。Linux 无沙箱时租户 MCP 与 bash 同口径 fail closed（见 <a href="../没有沙箱的系统怎么办/问题与方案.html">没有沙箱的系统怎么办</a>）。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/MCP%E8%BF%9B%E7%A8%8B%E8%BF%9B%E4%B8%8D%E8%BF%9B%E5%9B%B4%E6%A0%8F/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/MCP进程进不进围栏/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

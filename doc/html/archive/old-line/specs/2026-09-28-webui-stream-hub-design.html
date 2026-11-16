@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Web UI 流式枢纽设计（v3：落盘地基 + seq 续传） · tako 文档</title>
+<link rel="stylesheet" href="../../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../../assets/tako-architecture.html">架构总览</a><a href="../../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="web-ui-流式枢纽设计v3落盘地基--seq-续传">Web UI 流式枢纽设计（v3：落盘地基 + seq 续传）</h1>
+<blockquote>
+<p>状态：<strong>草案 v3</strong>（2026-09-29 审阅后修订），可按此实现。 缘起：T2（最小 Web UI）验收收尾期间的架构讨论。结论：以「落盘事件日志 + seq 续传」为地基，会话拥有 run、日志承接事件、连接只是读者。结构学 WeKnora 的五个决策，落盘与 completed 表字段比 WeKnora 更进一步（它靠 Redis TTL + 消息行，我们两张表从第一天起落盘）。见第 3 节。 关联：T2 定案《doc/10》、台账《doc/11》；对照实现 <code>ref-agent/WeKnora</code>； 现状事实锚点在第 2 节，均有文件:行号。 修订史：v1 曾按 V1/V1.5/V2/V3 分版（内存日志起步）。用户四点拍板后，v2 改为 任务制 + 落盘先行，原四个未决问题转入第 3 节。v3 钉死续传游标、seq 范围、 契约并入落盘、档案行生命周期、停止路径；REPL 不写库。 2026-09-29 续：页面改读进程内事件列表，列表不因完成而删除；重启后从事件表装回。 模型下一轮读档案里带产出的已完成轮次，不再使用 <code>session.history</code>。 助手正文逐字进入这份列表：同一条消息、同一个序号，字变长就再推一次；写完才进事件表。 没写完的半截不落库。 2026-09-30 续：已结束的对话按会话从 <code>event_log</code> 懒加载（<code>GET /api/session/history</code>）， 游标用 <code>(created_at, run_id)</code>。Chrome 只保留 <code>yktakoSession</code>，不保存助手正文。 正在跑的轮次仍用 <code>from=0</code> 接上。计划见 <code>doc/15-页面从event_log读对话的实施计划.md</code>。 Redis、运行中插话仍不做。</p>
+</blockquote>
+<h2 id="0-修正记录先把一处口误钉死">0. 修正记录（先把一处口误钉死）</h2>
+<p><strong>当前实现的事件信封里没有 Seq。</strong> 现有 SSE 载荷是 <code>sseEvent</code> （<code>yk-tako-eino/internal/webui/sse.go:24-32</code>），字段只有 <code>kind / agent / role / text / toolName / toolNames / approval</code>，<strong>无 seq</strong>。 此前对话里说的「我们的事件信封里已经有 Seq」是把本方案的设计说成了现状，属于 口误。Seq 是本方案引入的新字段（第 4 节环 2），引入前请把它当成「未存在的事实」。</p>
+<h2 id="1-目标与范围">1. 目标与范围</h2>
+<p><strong>目标</strong>：以落盘事件日志为地基，把 Web UI 运行时从「连接即 run」改为 「会话拥有 run、日志承接事件、连接只是读者」。断线续传、多读者、崩溃可查 都从这张表上长出来。REPL 的终端输出与退出行为不变。多用户方向不做。</p>
+<p><strong>地基定义（用户拍板：先做，否则上层白做）</strong>：续传、多读者、回放、审计 的全部前提只有一句：<strong>日志有一个比进程命长的家</strong>。事件表 + 档案表就是 T1 （第 7 节），不是可后补的选项。</p>
+<p><strong>范围冻结</strong>（照《10》第 5 节的纪律，超出的记第 10 节）：</p>
+<ul>
+<li>不做：steer 运行中插话、多用户鉴权、WS 传输、另立一种 token delta 事件、 标题/索引/记忆等 WeKnora 增值层、断线后的空闲超时。 2026-09-29 起，已完成轮次的消息会在下一轮从档案装回。在途轮次仍然不续跑。 助手正文逐字更新同一条消息，不另加事件种类。</li>
+<li>只做：事件契约补参数、落盘两张表（事件 + 档案）、seq 续传、运行侧与连接侧解耦、 按 run 的追加日志轮询、live-run 闸、显式停止、completed 双标记、 按会话读取当前 live run。 2026-09-29 起另做了：助手正文在内存里逐字变长，写完才落事件表；半截不落库。 2026-09-30 起：已结束的对话按会话从 <code>event_log</code> 懒加载，Chrome 不保存助手正文。</li>
+</ul>
+<p>崩溃之后能回看已落盘的事件，能知道哪一轮没写完终局。在途轮次不续跑 （第 2 节 F5）。下一轮模型读的是档案里已经写上产出的轮次。</p>
+<h2 id="2-现状事实可检验">2. 现状事实（可检验）</h2>
+<p><strong>F1 — 连接即 run。</strong> <code>server.go:99</code> 把 <code>r.Context()</code> 传给 <code>sess.runTurn</code>： 浏览器一断，run 被取消，这一轮作废（<code>server.go:107-110</code> 注释明写此语义）。 这是《10》第 4.4 节冻结的语义，且前端「停止」按钮就是靠 abort 触发这条链的 （<code>index.html:1088-1090</code>）。</p>
+<p><strong>F2 — 事件只进请求级管道。</strong> <code>server.go:96</code> 的 <code>events</code> chan（容量 16）是 本次 HTTP 响应私有。Web sink（<code>session.go:111</code>）与审批 ask （<code>session.go:115-126</code>）两道门各把事件塞进去。连接之外无人可读，进程一退全无。</p>
+<p><strong>F3 — 事件信封有损且无序号。</strong> <code>eventFrom</code>（<code>event.go:56-61</code>）只抽 <code>Function.Name</code>，<code>arguments</code> 被丢弃。SSE 载荷无 seq（见第 0 节）。日志一旦成为 档案，回放时连「调了什么」都展示不出来。</p>
+<p><strong>F4 — 单 run 闸存在但只是布尔。</strong> <code>session.active</code>（<code>session.go:29,51-54</code>）</p>
+<ul>
+<li>409（<code>server.go:82-86</code>），粒度正确（每会话一轮），但回答不了「当前活跃 run 是哪一轮」，无法被 stop / 续传按 runID 寻址。</li>
+</ul>
+<p><strong>F5 — checkpoint 救不了在途轮次。</strong> Eino checkpoint 只在审批中断时打点， 正常执行路径无存点。Store 是内存 map（<code>adkrun/turn.go:21-24</code>，webui 每会话 一份 <code>session.go:42</code>），进程崩溃后无点可查。本方案不追求在途轮次崩溃续跑 （那是路线 #7 完整版）。事件侧因落盘而可回放（第 4 节环 6）。</p>
+<p><strong>F6 — 档案只在内存。</strong> 会话历史是 <code>session.history []*schema.Message</code> （<code>session.go:29</code>），run 结束追加（<code>session.go:66-67</code>），进程退即失。completed 目前无处可标。这正是 T1 要建档案表的原因。成功才落历史；<code>err != nil</code> 不落， 这个口径继续有效。</p>
+<h2 id="3-已拍板决策">3. 已拍板决策</h2>
+<p><strong>D1 — 续传游标是「最后收到的 seq」（仅限正在跑的轮次）。</strong> 客户端每帧记下 <code>lastSeq</code>。重连请求 <code>GET /api/chat/stream?run=&lt;runID&gt;&amp;from=&lt;lastSeq&gt;</code>，服务端返回 <code>seq &gt; from</code> 的行。 <code>&gt;</code> 保证不重，<code>ORDER BY seq</code> 保证不漏。<code>from</code> 缺省与 <code>from=0</code> 都表示从头 （<code>seq &gt; 0</code>）。<code>from</code> 超过当前最大 seq 时返回空，不是错误。</p>
+<p>例：客户端已经渲染 seq 17，重连带 <code>from=17</code>，服务端从 seq 18 起补。 客户端若改传 <code>lastSeq+1</code>，会把下一帧跳掉，实现时禁止这种配对。</p>
+<p>从 0 全量回放只在游标丢失时使用。跳号自检见第 4 节环 5，它是客户端的断言， 主路径仍是这条游标。</p>
+<p><strong>已结束的对话不用这条游标。</strong> 历史按会话从 <code>event_log</code> 懒加载（<code>GET /api/session/history</code>）， 游标是 <code>(created_at, run_id)</code>，滚到顶才取更早的一页。<code>lastSeq</code> 只活在同一页内存里， 供正在跑的那一轮断线后续传，不写入 Chrome。</p>
+<p><strong>D2 — 溢出问题随落盘消失，容量界不设。</strong> 溢出是内存日志的两难：不设界 会泄漏（WeKnora <code>memory_manager.go:26</code> 的 map 只进不出），设界成环形缓冲 又会把回放截断。落盘后一场 run 的事件在语义级粒度只有几十到几百行（KB 级）， 磁盘不是瓶颈。旧 run 删不删归保留策略（第 9 节 N2），不进本方案的实现范围。</p>
+<p><strong>D3 — completed 从第一天就是表格字段。</strong> 档案表带 <code>is_completed</code> 与 <code>status</code>， 与事件表同属 T1。<code>is_completed = 1</code> 当且仅当 <code>status = completed</code>。 出错和用户停止也算这一轮已经结束（见 D7）。进程崩溃、没写上终局信封的行保持 <code>is_completed = 0</code>，启动对账把 <code>status</code> 改成 <code>failed</code>。</p>
+<p><strong>D4 — 契约与落盘同属 T1，契约在写入之前落地。</strong> 事件表是续传、多读者、 回放、审计的地址来源。先写旧信封再补参数，已经入库的行就是残的。 <code>tool_call</code> 带上原始参数、终局与审批走同一信封，都是 T1 的第一刀，不再单列后期任务。</p>
+<p><strong>D5 — seq 属于一场 run，从 1 计。</strong> 约束是 <code>PRIMARY KEY (run_id, seq)</code>。 分配发生在该 run 的一条 <code>BEGIN IMMEDIATE</code> 事务里：<code>SELECT MAX(seq)</code> 后 <code>INSERT</code> 同一整数，列上的 seq 与 payload 里的 seq 是这一个值。 <code>UNIQUE</code> 冲突时整笔事务重试一次。SQLite 用纯 Go 驱动 <code>modernc.org/sqlite</code>， Web 进程 <code>MaxOpenConns = 1</code>。不同会话的 run 会并发写同一库，事务负责把 <code>MAX+1</code> 串起来。</p>
+<p>同一场 run 的信封只由该 run 的 goroutine 写入，包括审批请求、审批回执和终局。 审批 HTTP 只把决定送进现有通道。停止 HTTP 只取消上下文，不写行。</p>
+<p><strong>D6 — 库只挂在 Web 入口。</strong> REPL 不打开这个库，磁盘失败不影响终端一轮。 两套入口共用的是 <code>adkrun.Event</code> 的结构（<code>tool_call</code> 带参数）。 Web 侧写失败则这一轮快速失败，不先把事件推给已经连着的读者。</p>
+<p><strong>D7 — 档案行开跑时插入，终局时与信封同一事务更新。</strong> 开跑、调用模型之前：</p>
+<ol type="1">
+<li>插入档案行：<code>status = running</code>，<code>is_completed = 0</code>，记下本轮用户消息；</li>
+<li>写入 <code>kind = start</code> 的信封（payload 带 run、seq、用户消息文本）。</li>
+</ol>
+<p>跑完时，终局信封与档案更新在同一个事务里：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>结局</th>
+<th>终局 kind</th>
+<th>档案</th>
+<th>下一轮模型</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>成功（<code>err == nil</code>）</td>
+<td><code>complete</code></td>
+<td><code>status=completed</code>，<code>is_completed=1</code>，写入本轮产出</td>
+<td>读到用户消息与产出</td>
+</tr>
+<tr>
+<td>运行失败</td>
+<td><code>error</code></td>
+<td><code>status=completed</code>，<code>is_completed=1</code>，不写产出</td>
+<td>不读这轮</td>
+</tr>
+<tr>
+<td>用户停止</td>
+<td><code>stop</code></td>
+<td><code>status=completed</code>，<code>is_completed=1</code>，不写产出</td>
+<td>不读这轮</td>
+</tr>
+<tr>
+<td>进程死在终局之前</td>
+<td>无终局信封</td>
+<td>启动对账改为 <code>status=failed</code>，<code>is_completed</code> 仍为 0</td>
+<td>不读这轮</td>
+</tr>
+</tbody>
+</table></div>
+<p>一场 run 只有一条终局信封。<code>status=completed</code> 表示「我们知道它怎么结束的」， 成功、失败、停止都算。<code>failed</code> 只留给没能写下终局的崩溃。 回看事件读 <code>event_log</code>，回看这一轮的用户消息与成功时的产出读档案表。 页面平时读进程内列表；列表没有这场 run 时从 <code>event_log</code> 装入。下一轮模型从档案装入带产出的轮次。</p>
+<p><strong>D8 — 停止是进程内取消，日志只作记录。</strong> <code>POST /api/stop</code> 核对 <code>liveRun.runID</code> 与请求体里的 run 一致后，取消这个 run 的上下文，返回 200。 不一致或会话没有 live run，返回 404。不存在独立的 watcher，也不经事件总线。</p>
+<p>T3 之后，这个上下文只会被这条停止请求取消，因此 run 退出时：</p>
+<ul>
+<li><code>ctx.Err() != nil</code> → 终局 <code>stop</code>；</li>
+<li>其它 <code>err != nil</code> → 终局 <code>error</code>；</li>
+<li><code>err == nil</code> → 终局 <code>complete</code>。</li>
+</ul>
+<p>取消会打断挂起的审批（ask 仍选择 <code>ctx.Done()</code>）。读者从终局信封知道停止， 取消本身不靠轮询日志。</p>
+<p><strong>D9 — 第二块屏幕用会话查询拿到 run。</strong> <code>GET /api/session?id=&lt;sessionID&gt;</code> 返回 <code>{"sessionId","liveRun"}</code>。有在跑的轮次时 <code>liveRun</code> 是 run id，否则为空字符串。 未知会话也返回空 <code>liveRun</code>，并且不因此创建会话。<code>sessionId</code> 为空则 400。 第一块屏幕从 <code>start</code> 信封得知 run id；后打开的页面先查这个接口，再接 <code>stream?run&amp;from=0</code>（或自己的 <code>lastSeq</code>）。</p>
+<p><strong>结构决策（学 WeKnora 的五个，拆哪条都散架）</strong>：</p>
+<ol type="1">
+<li>每次 run 一条追加日志，读者带 <code>from</code> 按 seq 顺序读；</li>
+<li>run 的 ctx 与请求脱钩（T3；此前 T1/T2 仍用请求 ctx）；</li>
+<li>SSE handler 轮询日志拉增量，不订阅内存扇出（T2 起，T1 仍可沿用请求内通道，但必须先落盘）；</li>
+<li>会话级 live-run 标记做 409（检查先于写 SSE 响应头）；</li>
+<li>stop 在进程内取消 run；终局信封由 run 的退出路径写入，读者据此收流。</li>
+</ol>
+<p><strong>不抄</strong>：Redis/TTL 后端（我们 SQLite 全落盘）、多租户、steer、资源 URL 改写、 前端工程规模。内存日志那一版不存在，所以也没有「只进不出」的 map 要清理。</p>
+<p><strong>已知后果，本次不处理</strong>：断线之后，挂起的审批继续占着 live run，直到另一台设备 回执或用户停止。没有空闲超时。这是多读者要的行为（第 9 节 N4 已拍板）。</p>
+<h2 id="4-续传机制链路一条-message-的一生">4. 续传机制链路（一条 message 的一生）</h2>
+<p>源头消息（模型要调工具，Eino 交回的原始形态）：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span> <span class="dt">&quot;role&quot;</span><span class="fu">:</span> <span class="st">&quot;assistant&quot;</span><span class="fu">,</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;tool_calls&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="fu">{</span><span class="dt">&quot;id&quot;</span><span class="fu">:</span> <span class="st">&quot;call_1&quot;</span><span class="fu">,</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;function&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;name&quot;</span><span class="fu">:</span> <span class="st">&quot;bash&quot;</span><span class="fu">,</span> <span class="dt">&quot;arguments&quot;</span><span class="fu">:</span> <span class="st">&quot;{</span><span class="ch">\&quot;</span><span class="st">command</span><span class="ch">\&quot;</span><span class="st">:</span><span class="ch">\&quot;</span><span class="st">date</span><span class="ch">\&quot;</span><span class="st">}&quot;</span><span class="fu">}}</span><span class="ot">]</span> <span class="fu">}</span></span></code></pre></div>
+<p><strong>环 1 — 分类（<code>event.go</code> 的 <code>eventFrom</code>）。</strong> 把 <code>schema.Message</code> 翻成 <code>Event{Kind:"tool_call"}</code>。载荷改为 <code>ToolCalls:[{Name, Args}]</code>。 <code>Args</code> 是 <code>Function.Arguments</code> 的原始字符串，产生侧不截断、不改写。 工具调用 id 仍不进入契约：现有 <code>tool_result</code> 也只按工具名配对，本次不扩大范围。</p>
+<p><strong>环 2 — 封信封。</strong> Web sink 是 adkrun 与外界的缝。信封：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span> <span class="dt">&quot;run&quot;</span><span class="fu">:</span> <span class="st">&quot;r_7f3a&quot;</span><span class="fu">,</span> <span class="dt">&quot;seq&quot;</span><span class="fu">:</span> <span class="dv">17</span><span class="fu">,</span> <span class="dt">&quot;ts&quot;</span><span class="fu">:</span> <span class="st">&quot;2026-09-28T15:00:15Z&quot;</span><span class="fu">,</span> <span class="dt">&quot;kind&quot;</span><span class="fu">:</span> <span class="st">&quot;tool_call&quot;</span><span class="fu">,</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;agent&quot;</span><span class="fu">:</span> <span class="st">&quot;yk-tako&quot;</span><span class="fu">,</span> <span class="dt">&quot;role&quot;</span><span class="fu">:</span> <span class="st">&quot;assistant&quot;</span><span class="fu">,</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;toolCalls&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="fu">{</span><span class="dt">&quot;name&quot;</span><span class="fu">:</span> <span class="st">&quot;bash&quot;</span><span class="fu">,</span> <span class="dt">&quot;args&quot;</span><span class="fu">:</span> <span class="st">&quot;{</span><span class="ch">\&quot;</span><span class="st">command</span><span class="ch">\&quot;</span><span class="st">:</span><span class="ch">\&quot;</span><span class="st">date</span><span class="ch">\&quot;</span><span class="st">}&quot;</span><span class="fu">}</span><span class="ot">]</span> <span class="fu">}</span></span></code></pre></div>
+<p><code>run</code> 是这场 run 的 id，写入库之后全局唯一。用不可预测的短 id。 不复用 <code>session.turn</code>：那个计数在进程重启后归零，会和库里的旧行撞车。 <code>seq</code> 是这场 run 内从 1 起的单调序号（D5）。<code>ts</code> 是 RFC3339 UTC。</p>
+<p><strong>环 3 — 落地。</strong> <code>INSERT INTO event_log(run_id, seq, payload)</code>。 先写 SQLite，写成功之后才谈推送。写失败则 run 快速失败（D6）。 库文件由 <code>webui.Config.DBPath</code> 指定；命令行在 <code>-web</code> 之外增加 <code>-web-db</code>， 默认相对工作目录的 <code>yktako-webui.db</code>。测试用临时文件。</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode sql"><code class="sourceCode sql"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> event_log (</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  run_id  TEXT    <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>  seq     <span class="dt">INTEGER</span> <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>  payload TEXT    <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>  <span class="kw">PRIMARY</span> <span class="kw">KEY</span> (run_id, seq)</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>);</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="kw">CREATE</span> <span class="kw">TABLE</span> run_archive (</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>  run_id        TEXT    <span class="kw">PRIMARY</span> <span class="kw">KEY</span>,</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>  session_id    TEXT    <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>  status        TEXT    <span class="kw">NOT</span> <span class="kw">NULL</span>, <span class="co">-- running | completed | failed</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>  is_completed  <span class="dt">INTEGER</span> <span class="kw">NOT</span> <span class="kw">NULL</span>, <span class="co">-- 1 当且仅当 status = completed</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>  user_message  TEXT    <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>  produced_json TEXT,             <span class="co">-- 仅成功时写入，内容是本轮产出的消息</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>  created_at    TEXT    <span class="kw">NOT</span> <span class="kw">NULL</span>,</span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>  finished_at   TEXT</span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>);</span></code></pre></div>
+<p>启动时，在对外监听之前执行：</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode sql"><code class="sourceCode sql"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">UPDATE</span> run_archive <span class="kw">SET</span> status <span class="op">=</span> <span class="st">&#39;failed&#39;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a> <span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;running&#39;</span>;</span></code></pre></div>
+<p>已落盘的 <code>event_log</code> 不动。</p>
+<p><strong>环 4 — 轮询读取。</strong> 一个读者持有自己的游标 <code>from</code>：</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode sql"><code class="sourceCode sql"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">SELECT</span> seq, payload <span class="kw">FROM</span> event_log</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a> <span class="kw">WHERE</span> run_id <span class="op">=</span> ? <span class="kw">AND</span> seq <span class="op">&gt;</span> ?</span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a> <span class="kw">ORDER</span> <span class="kw">BY</span> seq</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a> <span class="kw">LIMIT</span> <span class="dv">50</span></span></code></pre></div>
+<p>一次醒来先把批次读完：本批满 50 行就立刻再查，不足 50 行才睡眠 100ms。 命中行的 payload 原样 <code>writeSSE</code>。游标推进到本批最大 seq。 慢读者只是自己落后。N 个读者是 N 个 <code>(run, from)</code>，各查各的。</p>
+<p><strong>环 5 — 客户端续传。</strong> 客户端每帧更新 <code>lastSeq</code>。断线、刷新或换设备：</p>
+<p><code>GET /api/chat/stream?run=r_7f3a&amp;from=17</code></p>
+<p>服务端返回 <code>seq &gt; 17</code> 的全部行。客户端若看到相邻两帧的 seq 相差大于 1 （例如 17 之后直接是 19），视为写入或库有洞：正常的 <code>MAX+1</code> 不会跳号。 处理是从最后连续的 seq 再请求一次，并在界面上标出来。这不是第二条恢复协议。</p>
+<p><strong>环 6 — 收尾。</strong> 终局与档案更新同一事务（D7）。读者见到 <code>complete</code> / <code>error</code> / <code>stop</code> 就收流。此后查这一轮的结论看档案表， 看过程看事件表。</p>
+<pre><code>Server（进程 ctx）
+ └─ Session(id)                         ← 活过单连接
+     ├─ runner / agent                  ← 下一轮从档案装入已完成的消息
+     ├─ liveRun: {runID, cancel}        ← 替 session.active；T3 起
+     └─ run goroutine
+           开跑：INSERT 档案行 + start 信封（在调用模型之前）
+           事件：信封 → event_log → 读者可见
+           退出：唯一一条终局信封 + 档案更新，同一事务
+
+POST /api/chat
+  已有 liveRun → 409，此时还没有 text/event-stream 响应头
+  没有         → 插入档案、写 start、跑起来；本连接从 from=0 轮询
+GET /api/session?id=... → {sessionId, liveRun}    ← 第二块屏幕靠它
+GET /api/chat/stream?run&amp;from=N → 续传 / 旁观
+POST /api/stop {session, run}
+  liveRun 一致 → cancel()，200；终局 stop 由 run 退出路径写下
+  否则         → 404
+启动对账 → status=running 的档案行改为 failed；事件保持可回放</code></pre>
+<h2 id="5-事件信封契约对10第-42-节的修订">5. 事件信封契约（对《10》第 4.2 节的修订）</h2>
+<p>T1 同步改 <code>event.go</code>、REPL sink、<code>sse.go</code>、两侧测试。Web 静态页在 T1 改为读取 <code>toolCalls</code>。停止按钮改走 <code>POST /api/stop</code> 属于 T3：T3 之前它仍 abort 当前请求。</p>
+<ol type="1">
+<li><strong>地址</strong>：<code>run</code> + <code>seq</code>。读取、去重、续传都靠这一对。SSE 载荷带上它们。</li>
+<li><strong><code>tool_call</code> 带参数</strong>：<code>ToolNames []string</code> 改为 <code>ToolCalls []ToolCall</code>， <code>ToolCall</code> 为 <code>{Name, Args string}</code>。REPL 打印前用现有 <code>repl.Clip</code>，上限 120， 与 <code>tool_result</code> 正文同一条规则。Web 前端折叠显示，产生侧不裁。</li>
+<li><strong>同一信封、同一种写入路径</strong>，用 <code>kind</code> 区分：
+<ul>
+<li><code>start</code>：模型调用之前，文本为本轮用户消息；</li>
+<li><code>message</code> / <code>tool_call</code> / <code>tool_result</code> / <code>board</code>：原呈现四类；</li>
+<li><code>approval</code>：待批请求（id、tool、args、message），落盘后才挂起；</li>
+<li><code>approval_result</code>：回执（id、decision），run goroutine 收到决定后、继续执行前落盘；</li>
+<li><code>complete</code> / <code>error</code> / <code>stop</code>：终局，一场 run 只有一条。</li>
+</ul></li>
+<li>REPL 格式锁定测试按新的参数截断规则更新。未知 kind 在终端仍不打印。 REPL 不写 <code>start</code> / 终局 / seq：那些是 Web 信封上的字段，<code>adkrun.Event</code> 只增加 工具参数，不增加序号。序号在 Web 落盘时分配（D5）。</li>
+</ol>
+<h2 id="6-行为变化对10第-44-节冻结条目的正式修订">6. 行为变化（对《10》第 4.4 节冻结条目的正式修订）</h2>
+<p>下表是 T3 完成之后的语义。T1 只保证「写进去了」；断线仍会取消 run，终局为 <code>error</code>。 T2 能把已经落盘的行按游标读回来，包括这场已经结束的 run。T3 才让断线不再取消 run。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>原语义（冻结）</th>
+<th>新语义（T3 起）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>断线即这一轮作废</td>
+<td>断线只结束这个读者；run 继续。重连带最后收到的 seq</td>
+</tr>
+<tr>
+<td>停止 = abort fetch</td>
+<td>停止 = <code>POST /api/stop</code> 取消 run 上下文；退出路径写一条 <code>stop</code></td>
+</tr>
+<tr>
+<td>一个会话一个观众</td>
+<td>一个会话 N 个读者，各自一份 <code>(run, from)</code></td>
+</tr>
+<tr>
+<td>409 靠 <code>session.active</code> 布尔</td>
+<td>409 靠 <code>liveRun</code>（带 runID，检查先于 SSE 响应头）</td>
+</tr>
+<tr>
+<td>档案在内存、completed 无处标</td>
+<td>开跑插入档案行；终局与 <code>is_completed</code> 同一事务</td>
+</tr>
+</tbody>
+</table></div>
+<p>流侧的「结束」是那条终局信封。档案侧的「结束」是 <code>is_completed = 1</code>。 两者在同一个事务里出现，崩溃窗口里不会只看到一半。</p>
+<h2 id="7-任务拆分">7. 任务拆分</h2>
+<p>v2 把契约修订单列为最后一刀。v3 把它并进 T1，避免先写下残信封。</p>
+<ul>
+<li><strong>T1 契约与落盘</strong>：<code>ToolCalls</code> 带原始参数；REPL 打印截断与格式锁定测试； Web 信封种类按第 5 节补齐；静态页改读 <code>toolCalls</code>。 <code>event_log</code> + <code>run_archive</code>；<code>modernc.org/sqlite</code>，单连接； <code>-web-db</code> 默认 <code>yktako-webui.db</code>。开跑插入档案行并写 <code>start</code>（在模型调用之前）； 事件先落盘；终局与 <code>is_completed</code> 同一事务；启动对账把残留的 <code>running</code> 标 <code>failed</code>。 此阶段 run 仍使用请求 ctx，断线仍取消 run。REPL 不打开数据库。</li>
+<li><strong>T2 按游标读</strong>：轮询器替换请求私有通道；<code>GET /api/chat/stream?run&amp;from=</code>； 客户端记 <code>lastSeq</code>；<code>from</code> 的语义按 D1；跳号只做客户端断言。 此阶段重连读到的是已经落盘的行（run 可能已因断线结束）。</li>
+<li><strong>T3 连接解耦</strong>：run 的 ctx 改为会话级，只受 <code>POST /api/stop</code> 取消； <code>liveRun</code> 替换布尔闸；409 先于 SSE 响应头；<code>GET /api/session</code> 返回 <code>liveRun</code>； 断线只结束读者；停止按钮改为 POST，不再 abort。 挂起的审批在断线后继续等，直到回执或停止。</li>
+<li><strong>T4 验收</strong>：第 8 节的机器用例，外加仿 T2 密度另起草的人工用例。</li>
+<li><strong>T5 文档回填</strong>：第 10 节清单。</li>
+<li><strong>后续再排</strong>：鉴权、绑 <code>0.0.0.0</code>、多用户、redis/nats、WS、steer、保留策略、 审批空闲超时。已完成轮次装回模型上下文、助手正文逐字流出，已在 2026-09-29 的读法里做了。</li>
+</ul>
+<h2 id="8-验收t4">8. 验收（T4）</h2>
+<p>机器验收（全部 <code>-race</code>）：</p>
+<ol type="1">
+<li>事件表：同一 run 的 seq 从 1 单调且唯一；并发的是不同 run 同时写同一库。 列 seq 与 payload 内 seq 相等。写失败不产生读者可见的事件。 <code>from</code> 的边界：空表、<code>from=0</code>、<code>from</code> 等于最后一帧、<code>from</code> 超过最大 seq。</li>
+<li>断线不杀 run（T3）：httptest 起流、中途断开、断言 run 跑完且事件表完整，终局一条 <code>complete</code>。</li>
+<li>续传：断开后以最后收到的 seq 作为 <code>from</code> 重连，无重复、无缺失。</li>
+<li>重启回放：终局写完之前进程消失（测试里直接关库再新开），已落盘事件仍可按 <code>from</code> 读， 档案行 <code>status=failed</code> 且 <code>is_completed=0</code>。成功结束的行是 <code>completed</code> / <code>1</code>， 且与终局信封同在。用户停止与运行失败也是 <code>completed</code> / <code>1</code>，终局分别是 <code>stop</code> 与 <code>error</code>， 模型历史不增加。</li>
+<li>双读者：两个连接各带自己的 <code>(run, from)</code>，序列一致。后一个连接通过 <code>GET /api/session</code> 拿到 run id，不靠第一个连接转发。</li>
+<li>stop：<code>POST /api/stop</code> 在 liveRun 匹配时返回 200 并取消 run；日志里出现一条 <code>stop</code>， 没有第二条终局。不匹配返回 404。REPL 回归不受影响（不打开 <code>-web-db</code>）。</li>
+<li>409：liveRun 存在时 <code>POST /api/chat</code> 返回 409，响应头没有 <code>text/event-stream</code>。</li>
+<li>契约：<code>tool_call</code> 的 <code>args</code> 等于模型给出的原始参数字符串。 REPL 格式锁定测试按 <code>repl.Clip(..., 120)</code> 全绿。<code>start</code> 的落盘早于模型被调用。</li>
+</ol>
+<p>人工验收（浏览器）：断网或刷新后从最后一帧接上、停止按钮、两个标签页同看一轮、REPL 回归。</p>
+<h2 id="9-未决问题">9. 未决问题</h2>
+<p>第 3 节已吃掉的项不再挂在这里：续传游标（D1）、档案写入时点（D7）、 审批入流（第 5 节，请求与回执各一种 kind）。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>问题</th>
+<th>决定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>N1</td>
+<td>事件粒度：语义级，还是另加一种 token delta</td>
+<td>仍是语义级事件。助手正文在同一条消息上逐字变长，不另加 delta 种类</td>
+</tr>
+<tr>
+<td>N2</td>
+<td>旧 run 的 <code>event_log</code> 与档案删不删</td>
+<td>先不设限。有真实体积后再按 run 清理</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="10-文档同步清单t5-回填">10. 文档同步清单（T5 回填）</h2>
+<ul>
+<li>《10》第 4.2 节事件契约表：<code>tool_call</code> 载荷、<code>approval</code> / <code>approval_result</code> / 终局入流、增加 <code>seq</code> / <code>run</code> 列；</li>
+<li>《10》第 4.4 节：断线语义改写（本篇第 6 节的表）；</li>
+<li>《11》T2 行与第 4 节：指向本篇，并按第 7 节的任务编号改台账；</li>
+<li>《05》第 4 节路线表 #7 / #8 行：状态更新；</li>
+<li>两份 README 的 Web 分支描述：停止、续传、多读者。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/archive/old-line/specs/2026-09-28-webui-stream-hub-design.md"><code>doc/archive/old-line/specs/2026-09-28-webui-stream-hub-design.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

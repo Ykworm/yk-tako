@@ -1,0 +1,887 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MAF 最小审批回路 Implementation Plan · tako 文档</title>
+<link rel="stylesheet" href="../../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../../assets/tako-architecture.html">架构总览</a><a href="../../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="maf-最小审批回路-implementation-plan">MAF 最小审批回路 Implementation Plan</h1>
+<blockquote>
+<p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (<code>- [ ]</code>) syntax for tracking.</p>
+</blockquote>
+<p><strong>Goal:</strong> 给 <code>maf/</code> 补上「规则命中 → 暂停问人 → resume 执行/拒绝」的最小审批回路（L1 tool guard 的 MAF 等价物），全部走 MAF 自带 approval 管线。</p>
+<p><strong>Architecture:</strong> 规则引擎（<code>GuardEngine</code>，从 Eino <code>toolguard.go</code> 逐条移植，框架无关）决定「自动批 / 不批」；<code>execute</code> 假 shell 工具用 <code>ApprovalRequiredAIFunction</code> 标记；<code>ToolApprovalAgent</code> + <code>FunctionInvokingChatClient</code> 承担暂停、绑定、执行、拒绝回执；REPL 负责问人与 block 模式直拒。</p>
+<p><strong>Tech Stack:</strong> .NET 8 / C#、Microsoft.Agents.AI 1.22.0、Microsoft.Extensions.AI 10.10.0、xunit 2.4.2（已在本机 NuGet 缓存，离线可还原）。设计文档：<code>docs/superpowers/specs/2026-09-26-maf-tool-approval-design.md</code>。</p>
+<p><strong>执行说明（与默认流程的两处有意偏离，原因可检验）：</strong></p>
+<ol type="1">
+<li>不新建 worktree/分支：本计划只触碰 <code>maf/</code>、<code>doc/</code>、<code>docs/</code>，与工作区现有未提交改动（<code>yk-tako-eino/</code>、<code>README.md</code> 等）无交集；沿用仓库既有的「直接提交 master」习惯（见 <code>git log</code>）。</li>
+<li>提交按仓库风格写中文短句，不加 <code>feat:</code> 前缀。</li>
+</ol>
+<hr />
+<h3 id="task-1-测试项目骨架--规则引擎最小实现第一条命中测试">Task 1: 测试项目骨架 + 规则引擎最小实现（第一条命中测试）</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>maf/tests/YkTako.MafL2.Tests.csproj</code></li>
+<li>Create: <code>maf/tests/GuardEngineTests.cs</code></li>
+<li>Create: <code>maf/src/Guard.cs</code></li>
+</ul>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 1: 建测试项目文件</strong></label></li>
+</ul>
+<p><code>maf/tests/YkTako.MafL2.Tests.csproj</code>：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode xml"><code class="sourceCode xml"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>&lt;<span class="kw">Project</span> <span class="ot">Sdk=</span><span class="st">&quot;Microsoft.NET.Sdk&quot;</span>&gt;</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">PropertyGroup</span>&gt;</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">TargetFramework</span>&gt;net8.0&lt;/<span class="kw">TargetFramework</span>&gt;</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">ImplicitUsings</span>&gt;enable&lt;/<span class="kw">ImplicitUsings</span>&gt;</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">Nullable</span>&gt;enable&lt;/<span class="kw">Nullable</span>&gt;</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">IsPackable</span>&gt;false&lt;/<span class="kw">IsPackable</span>&gt;</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>  &lt;/<span class="kw">PropertyGroup</span>&gt;</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">ItemGroup</span>&gt;</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">PackageReference</span> <span class="ot">Include=</span><span class="st">&quot;Microsoft.NET.Test.Sdk&quot;</span> <span class="ot">Version=</span><span class="st">&quot;17.5.0&quot;</span> /&gt;</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">PackageReference</span> <span class="ot">Include=</span><span class="st">&quot;xunit&quot;</span> <span class="ot">Version=</span><span class="st">&quot;2.4.2&quot;</span> /&gt;</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">PackageReference</span> <span class="ot">Include=</span><span class="st">&quot;xunit.runner.visualstudio&quot;</span> <span class="ot">Version=</span><span class="st">&quot;2.4.5&quot;</span> /&gt;</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>  &lt;/<span class="kw">ItemGroup</span>&gt;</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">ItemGroup</span>&gt;</span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">ProjectReference</span> <span class="ot">Include=</span><span class="st">&quot;../YkTako.MafL2.csproj&quot;</span> /&gt;</span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>  &lt;/<span class="kw">ItemGroup</span>&gt;</span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>&lt;/<span class="kw">Project</span>&gt;</span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 2: 写第一条失败测试（rm 命中 High）</strong></label></li>
+</ul>
+<p><code>maf/tests/GuardEngineTests.cs</code>：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode csharp"><code class="sourceCode cs"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> Xunit<span class="op">;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> YkTako<span class="op">.</span><span class="fu">MafL2</span><span class="op">;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">namespace</span> YkTako<span class="op">.</span><span class="fu">MafL2</span><span class="op">.</span><span class="fu">Tests</span><span class="op">;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="co">/// </span><span class="kw">&lt;summary&gt;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="co">/// 规则引擎单测：只验纯逻辑（工具名 + 参数 → 命中清单 / 拦截判断），不打模型、不碰 MAF。</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="co">/// 语义对齐 yk-tako-eino/internal/guard/toolguard.go 与 guard_test.go。</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="co">/// </span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="kw">sealed</span> <span class="kw">class</span> GuardEngineTests</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">默认规则 + require_approval 模式，覆盖最常用的判定路径。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="kw">static</span> GuardEngine <span class="fu">NewApproveEngine</span><span class="op">()</span> <span class="op">=&gt;</span> <span class="kw">new</span><span class="op">(</span>GuardMode<span class="op">.</span><span class="fu">RequireApproval</span><span class="op">);</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">把一条 shell 命令装成工具参数表（参数名对齐 DefaultRules 的 commandArg）。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="kw">static</span> Dictionary<span class="op">&lt;</span><span class="dt">string</span><span class="op">,</span> <span class="dt">object</span><span class="op">?&gt;</span> <span class="fu">Args</span><span class="op">(</span><span class="dt">string</span> command<span class="op">)</span> <span class="op">=&gt;</span> <span class="kw">new</span><span class="op">()</span> <span class="op">{</span> <span class="op">[</span><span class="st">&quot;command&quot;</span><span class="op">]</span> <span class="op">=</span> command <span class="op">};</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span>Fact<span class="op">]</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">RmCommand_IsCaught_AsHigh</span><span class="op">()</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> findings <span class="op">=</span> <span class="fu">NewApproveEngine</span><span class="op">().</span><span class="fu">Guard</span><span class="op">(</span><span class="st">&quot;execute&quot;</span><span class="op">,</span> <span class="fu">Args</span><span class="op">(</span><span class="st">&quot;rm -rf /tmp/x&quot;</span><span class="op">));</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> finding <span class="op">=</span> Assert<span class="op">.</span><span class="fu">Single</span><span class="op">(</span>findings<span class="op">);</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>        Assert<span class="op">.</span><span class="fu">Equal</span><span class="op">(</span><span class="st">&quot;TOOL_CMD_DANGEROUS_RM&quot;</span><span class="op">,</span> finding<span class="op">.</span><span class="fu">RuleId</span><span class="op">);</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>        Assert<span class="op">.</span><span class="fu">Equal</span><span class="op">(</span>GuardSeverity<span class="op">.</span><span class="fu">High</span><span class="op">,</span> finding<span class="op">.</span><span class="fu">Severity</span><span class="op">);</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>        Assert<span class="op">.</span><span class="fu">Equal</span><span class="op">(</span><span class="st">&quot;command&quot;</span><span class="op">,</span> finding<span class="op">.</span><span class="fu">ParamName</span><span class="op">);</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 3: 跑测试，确认失败</strong></label></li>
+</ul>
+<p>Run: <code>dotnet test maf/tests/YkTako.MafL2.Tests.csproj --nologo</code> Expected: 编译失败——<code>GuardMode</code>/<code>GuardEngine</code>/<code>GuardSeverity</code> 不存在。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 4: 写 Guard.cs 最小实现</strong></label></li>
+</ul>
+<p><code>maf/src/Guard.cs</code>：</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode csharp"><code class="sourceCode cs"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> System<span class="op">.</span><span class="fu">Globalization</span><span class="op">;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> System<span class="op">.</span><span class="fu">Text</span><span class="op">.</span><span class="fu">Json</span><span class="op">;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> System<span class="op">.</span><span class="fu">Text</span><span class="op">.</span><span class="fu">RegularExpressions</span><span class="op">;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="kw">namespace</span> YkTako<span class="op">.</span><span class="fu">MafL2</span><span class="op">;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">规则命中的严重级别，从 Critical 到 Info（对齐 Eino guard.Severity）。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="kw">enum</span> GuardSeverity <span class="op">{</span> Critical<span class="op">,</span> High<span class="op">,</span> Medium<span class="op">,</span> Low<span class="op">,</span> Info <span class="op">}</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">守卫运行模式：block 直接拦，warn 只提示，require_approval 暂停问人（对齐 Eino guard.Mode）。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="kw">enum</span> GuardMode <span class="op">{</span> Block<span class="op">,</span> Warn<span class="op">,</span> RequireApproval <span class="op">}</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">一条工具调用检查规则：限定工具与参数名，用正则找危险特征，Excludes 用来放过误报。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="kw">sealed</span> record <span class="fu">GuardRule</span><span class="op">(</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a>    <span class="dt">string</span> Id<span class="op">,</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    <span class="dt">string</span><span class="op">[]</span> Tools<span class="op">,</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>    <span class="dt">string</span><span class="op">[]</span> Params<span class="op">,</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    GuardSeverity Severity<span class="op">,</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>    <span class="dt">string</span><span class="op">[]</span> Patterns<span class="op">,</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>    <span class="dt">string</span><span class="op">[]</span> Excludes<span class="op">,</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>    <span class="dt">string</span> Description<span class="op">,</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>    <span class="dt">string</span> Remediation<span class="op">);</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a><span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">一条命中记录，带命中片段的前后文，方便人判读。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="kw">sealed</span> record <span class="fu">Finding</span><span class="op">(</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>    <span class="dt">string</span> RuleId<span class="op">,</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>    GuardSeverity Severity<span class="op">,</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>    <span class="dt">string</span> ToolName<span class="op">,</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a>    <span class="dt">string</span> ParamName<span class="op">,</span></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a>    <span class="dt">string</span> Snippet<span class="op">,</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>    <span class="dt">string</span> Description<span class="op">,</span></span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>    <span class="dt">string</span> Remediation<span class="op">);</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a><span class="co">/// </span><span class="kw">&lt;summary&gt;</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a><span class="co">/// 命令守卫的规则引擎 —— 从 yk-tako-eino/internal/guard/toolguard.go 逐条移植。</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a><span class="co">/// 只负责「工具名 + 参数 → 命中清单」与「按模式判断该不该拦」，不依赖 MAF：</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a><span class="co">/// 自动批准判定（Program.cs 的 guardRule）与 REPL 审批回路共用同一个实例。</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a><span class="co">/// </span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a><span class="kw">public</span> <span class="kw">sealed</span> <span class="kw">class</span> GuardEngine</span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">规则默认瞄的 shell 工具名；MAF 演示里只有 execute 真实存在（bash 分支永不命中）。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="kw">static</span> <span class="kw">readonly</span> <span class="dt">string</span><span class="op">[]</span> ShellTools <span class="op">=</span> <span class="op">[</span><span class="st">&quot;bash&quot;</span><span class="op">,</span> <span class="st">&quot;execute&quot;</span><span class="op">];</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">shell 工具的命令参数名。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="kw">static</span> <span class="kw">readonly</span> <span class="dt">string</span><span class="op">[]</span> CommandArg <span class="op">=</span> <span class="op">[</span><span class="st">&quot;command&quot;</span><span class="op">];</span></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-47"><a href="#cb3-47" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">注释行特殊排除的源码，要和 IsCommentLine 的判等用同一字面量。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-48"><a href="#cb3-48" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="kw">static</span> <span class="kw">readonly</span> <span class="dt">string</span> CommentLine <span class="op">=</span> @<span class="st">&quot;^\s*#&quot;</span><span class="op">;</span></span>
+<span id="cb3-49"><a href="#cb3-49" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-50"><a href="#cb3-50" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span></span>
+<span id="cb3-51"><a href="#cb3-51" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// DefaultRules：从 harness 的危险命令表里抽出的 10 条（与 Eino DefaultRules 逐条一致，</span></span>
+<span id="cb3-52"><a href="#cb3-52" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// 安全知识与语言、框架无关）。这里只放第一条，后续任务补齐。</span></span>
+<span id="cb3-53"><a href="#cb3-53" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-54"><a href="#cb3-54" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="kw">static</span> <span class="kw">readonly</span> GuardRule<span class="op">[]</span> DefaultRules <span class="op">=</span></span>
+<span id="cb3-55"><a href="#cb3-55" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span></span>
+<span id="cb3-56"><a href="#cb3-56" aria-hidden="true" tabindex="-1"></a>        <span class="kw">new</span><span class="op">(</span><span class="st">&quot;TOOL_CMD_DANGEROUS_RM&quot;</span><span class="op">,</span> ShellTools<span class="op">,</span> CommandArg<span class="op">,</span> GuardSeverity<span class="op">.</span><span class="fu">High</span><span class="op">,</span></span>
+<span id="cb3-57"><a href="#cb3-57" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>@<span class="st">&quot;</span><span class="sc">\b</span><span class="st">rm</span><span class="sc">\b</span><span class="st">&quot;</span><span class="op">,</span> @<span class="st">&quot;</span><span class="sc">\b</span><span class="st">del</span><span class="sc">\b</span><span class="st">&quot;</span><span class="op">,</span> @<span class="st">&quot;(?i)</span><span class="sc">\b</span><span class="st">Remove-Item</span><span class="sc">\b</span><span class="st">&quot;</span><span class="op">],</span></span>
+<span id="cb3-58"><a href="#cb3-58" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>CommentLine<span class="op">],</span></span>
+<span id="cb3-59"><a href="#cb3-59" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;命令包含 rm/del，可能造成数据丢失&quot;</span><span class="op">,</span></span>
+<span id="cb3-60"><a href="#cb3-60" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;执行删除前与用户确认&quot;</span><span class="op">),</span></span>
+<span id="cb3-61"><a href="#cb3-61" aria-hidden="true" tabindex="-1"></a>    <span class="op">];</span></span>
+<span id="cb3-62"><a href="#cb3-62" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-63"><a href="#cb3-63" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="kw">readonly</span> <span class="op">(</span>GuardRule Rule<span class="op">,</span> Regex<span class="op">[]</span> Patterns<span class="op">,</span> Regex<span class="op">[]</span> Excludes<span class="op">)[]</span> _rules<span class="op">;</span></span>
+<span id="cb3-64"><a href="#cb3-64" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> GuardMode _mode<span class="op">;</span></span>
+<span id="cb3-65"><a href="#cb3-65" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-66"><a href="#cb3-66" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">构造引擎：mode 决定拦截级别；rules 为 null 用 DefaultRules。正则在这里一次编译。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-67"><a href="#cb3-67" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="fu">GuardEngine</span><span class="op">(</span>GuardMode mode<span class="op">,</span> GuardRule<span class="op">[]?</span> rules <span class="op">=</span> <span class="kw">null</span><span class="op">)</span></span>
+<span id="cb3-68"><a href="#cb3-68" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb3-69"><a href="#cb3-69" aria-hidden="true" tabindex="-1"></a>        _mode <span class="op">=</span> mode<span class="op">;</span></span>
+<span id="cb3-70"><a href="#cb3-70" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> source <span class="op">=</span> rules <span class="op">??</span> DefaultRules<span class="op">;</span></span>
+<span id="cb3-71"><a href="#cb3-71" aria-hidden="true" tabindex="-1"></a>        _rules <span class="op">=</span> source</span>
+<span id="cb3-72"><a href="#cb3-72" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span><span class="fu">Select</span><span class="op">(</span>rule <span class="op">=&gt;</span> <span class="op">(</span></span>
+<span id="cb3-73"><a href="#cb3-73" aria-hidden="true" tabindex="-1"></a>                rule<span class="op">,</span></span>
+<span id="cb3-74"><a href="#cb3-74" aria-hidden="true" tabindex="-1"></a>                rule<span class="op">.</span><span class="fu">Patterns</span><span class="op">.</span><span class="fu">Select</span><span class="op">(</span>p <span class="op">=&gt;</span> <span class="kw">new</span> <span class="fu">Regex</span><span class="op">(</span>p<span class="op">,</span> RegexOptions<span class="op">.</span><span class="fu">Compiled</span><span class="op">)).</span><span class="fu">ToArray</span><span class="op">(),</span></span>
+<span id="cb3-75"><a href="#cb3-75" aria-hidden="true" tabindex="-1"></a>                rule<span class="op">.</span><span class="fu">Excludes</span><span class="op">.</span><span class="fu">Select</span><span class="op">(</span>p <span class="op">=&gt;</span> <span class="kw">new</span> <span class="fu">Regex</span><span class="op">(</span>p<span class="op">,</span> RegexOptions<span class="op">.</span><span class="fu">Compiled</span><span class="op">)).</span><span class="fu">ToArray</span><span class="op">()))</span></span>
+<span id="cb3-76"><a href="#cb3-76" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span><span class="fu">ToArray</span><span class="op">();</span></span>
+<span id="cb3-77"><a href="#cb3-77" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-78"><a href="#cb3-78" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-79"><a href="#cb3-79" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">当前模式。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-80"><a href="#cb3-80" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> GuardMode Mode <span class="op">=&gt;</span> _mode<span class="op">;</span></span>
+<span id="cb3-81"><a href="#cb3-81" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-82"><a href="#cb3-82" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">切换运行时模式（对齐 Eino Engine.Configure）。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-83"><a href="#cb3-83" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">Configure</span><span class="op">(</span>GuardMode mode<span class="op">)</span> <span class="op">=&gt;</span> _mode <span class="op">=</span> mode<span class="op">;</span></span>
+<span id="cb3-84"><a href="#cb3-84" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-85"><a href="#cb3-85" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">扫一遍工具调用的参数，返回命中清单；片段前后各留 40 字上下文（对齐 Eino Engine.Guard）。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-86"><a href="#cb3-86" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> IReadOnlyList<span class="op">&lt;</span>Finding<span class="op">&gt;</span> <span class="fu">Guard</span><span class="op">(</span><span class="dt">string</span> toolName<span class="op">,</span> IDictionary<span class="op">&lt;</span><span class="dt">string</span><span class="op">,</span> <span class="dt">object</span><span class="op">?&gt;?</span> args<span class="op">)</span></span>
+<span id="cb3-87"><a href="#cb3-87" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb3-88"><a href="#cb3-88" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> findings <span class="op">=</span> <span class="kw">new</span> List<span class="op">&lt;</span>Finding<span class="op">&gt;();</span></span>
+<span id="cb3-89"><a href="#cb3-89" aria-hidden="true" tabindex="-1"></a>        <span class="kw">if</span> <span class="op">(</span>args <span class="kw">is</span> <span class="kw">null</span><span class="op">)</span></span>
+<span id="cb3-90"><a href="#cb3-90" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb3-91"><a href="#cb3-91" aria-hidden="true" tabindex="-1"></a>            <span class="kw">return</span> findings<span class="op">;</span></span>
+<span id="cb3-92"><a href="#cb3-92" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-93"><a href="#cb3-93" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-94"><a href="#cb3-94" aria-hidden="true" tabindex="-1"></a>        <span class="kw">foreach</span> <span class="op">(</span><span class="fu">var</span> <span class="op">(</span>paramName<span class="op">,</span> raw<span class="op">)</span> <span class="kw">in</span> args<span class="op">)</span></span>
+<span id="cb3-95"><a href="#cb3-95" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb3-96"><a href="#cb3-96" aria-hidden="true" tabindex="-1"></a>            <span class="dt">var</span> value <span class="op">=</span> <span class="fu">ToText</span><span class="op">(</span>raw<span class="op">);</span></span>
+<span id="cb3-97"><a href="#cb3-97" aria-hidden="true" tabindex="-1"></a>            <span class="kw">if</span> <span class="op">(</span><span class="dt">string</span><span class="op">.</span><span class="fu">IsNullOrWhiteSpace</span><span class="op">(</span>value<span class="op">))</span></span>
+<span id="cb3-98"><a href="#cb3-98" aria-hidden="true" tabindex="-1"></a>            <span class="op">{</span></span>
+<span id="cb3-99"><a href="#cb3-99" aria-hidden="true" tabindex="-1"></a>                <span class="kw">continue</span><span class="op">;</span></span>
+<span id="cb3-100"><a href="#cb3-100" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb3-101"><a href="#cb3-101" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-102"><a href="#cb3-102" aria-hidden="true" tabindex="-1"></a>            <span class="kw">foreach</span> <span class="op">(</span><span class="fu">var</span> <span class="op">(</span>rule<span class="op">,</span> patterns<span class="op">,</span> excludes<span class="op">)</span> <span class="kw">in</span> _rules<span class="op">)</span></span>
+<span id="cb3-103"><a href="#cb3-103" aria-hidden="true" tabindex="-1"></a>            <span class="op">{</span></span>
+<span id="cb3-104"><a href="#cb3-104" aria-hidden="true" tabindex="-1"></a>                <span class="kw">if</span> <span class="op">(</span>rule<span class="op">.</span><span class="fu">Tools</span><span class="op">.</span><span class="fu">Length</span> <span class="op">&gt;</span> <span class="dv">0</span> <span class="op">&amp;&amp;</span> <span class="op">!</span>rule<span class="op">.</span><span class="fu">Tools</span><span class="op">.</span><span class="fu">Contains</span><span class="op">(</span>toolName<span class="op">))</span></span>
+<span id="cb3-105"><a href="#cb3-105" aria-hidden="true" tabindex="-1"></a>                <span class="op">{</span></span>
+<span id="cb3-106"><a href="#cb3-106" aria-hidden="true" tabindex="-1"></a>                    <span class="kw">continue</span><span class="op">;</span></span>
+<span id="cb3-107"><a href="#cb3-107" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb3-108"><a href="#cb3-108" aria-hidden="true" tabindex="-1"></a>                <span class="kw">if</span> <span class="op">(</span>rule<span class="op">.</span><span class="fu">Params</span><span class="op">.</span><span class="fu">Length</span> <span class="op">&gt;</span> <span class="dv">0</span> <span class="op">&amp;&amp;</span> <span class="op">!</span>rule<span class="op">.</span><span class="fu">Params</span><span class="op">.</span><span class="fu">Contains</span><span class="op">(</span>paramName<span class="op">))</span></span>
+<span id="cb3-109"><a href="#cb3-109" aria-hidden="true" tabindex="-1"></a>                <span class="op">{</span></span>
+<span id="cb3-110"><a href="#cb3-110" aria-hidden="true" tabindex="-1"></a>                    <span class="kw">continue</span><span class="op">;</span></span>
+<span id="cb3-111"><a href="#cb3-111" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb3-112"><a href="#cb3-112" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-113"><a href="#cb3-113" aria-hidden="true" tabindex="-1"></a>                <span class="fu">var</span> <span class="op">(</span>scanned<span class="op">,</span> keep<span class="op">)</span> <span class="op">=</span> <span class="fu">TextForRule</span><span class="op">(</span>value<span class="op">,</span> excludes<span class="op">);</span></span>
+<span id="cb3-114"><a href="#cb3-114" aria-hidden="true" tabindex="-1"></a>                <span class="kw">if</span> <span class="op">(!</span>keep <span class="op">||</span> <span class="dt">string</span><span class="op">.</span><span class="fu">IsNullOrWhiteSpace</span><span class="op">(</span>scanned<span class="op">))</span></span>
+<span id="cb3-115"><a href="#cb3-115" aria-hidden="true" tabindex="-1"></a>                <span class="op">{</span></span>
+<span id="cb3-116"><a href="#cb3-116" aria-hidden="true" tabindex="-1"></a>                    <span class="kw">continue</span><span class="op">;</span></span>
+<span id="cb3-117"><a href="#cb3-117" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb3-118"><a href="#cb3-118" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-119"><a href="#cb3-119" aria-hidden="true" tabindex="-1"></a>                Regex<span class="op">?</span> hit <span class="op">=</span> <span class="kw">null</span><span class="op">;</span></span>
+<span id="cb3-120"><a href="#cb3-120" aria-hidden="true" tabindex="-1"></a>                <span class="kw">foreach</span> <span class="op">(</span><span class="dt">var</span> pattern <span class="kw">in</span> patterns<span class="op">)</span></span>
+<span id="cb3-121"><a href="#cb3-121" aria-hidden="true" tabindex="-1"></a>                <span class="op">{</span></span>
+<span id="cb3-122"><a href="#cb3-122" aria-hidden="true" tabindex="-1"></a>                    <span class="kw">if</span> <span class="op">(</span>pattern<span class="op">.</span><span class="fu">IsMatch</span><span class="op">(</span>scanned<span class="op">))</span></span>
+<span id="cb3-123"><a href="#cb3-123" aria-hidden="true" tabindex="-1"></a>                    <span class="op">{</span></span>
+<span id="cb3-124"><a href="#cb3-124" aria-hidden="true" tabindex="-1"></a>                        hit <span class="op">=</span> pattern<span class="op">;</span></span>
+<span id="cb3-125"><a href="#cb3-125" aria-hidden="true" tabindex="-1"></a>                        <span class="kw">break</span><span class="op">;</span></span>
+<span id="cb3-126"><a href="#cb3-126" aria-hidden="true" tabindex="-1"></a>                    <span class="op">}</span></span>
+<span id="cb3-127"><a href="#cb3-127" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb3-128"><a href="#cb3-128" aria-hidden="true" tabindex="-1"></a>                <span class="kw">if</span> <span class="op">(</span>hit <span class="kw">is</span> <span class="kw">null</span><span class="op">)</span></span>
+<span id="cb3-129"><a href="#cb3-129" aria-hidden="true" tabindex="-1"></a>                <span class="op">{</span></span>
+<span id="cb3-130"><a href="#cb3-130" aria-hidden="true" tabindex="-1"></a>                    <span class="kw">continue</span><span class="op">;</span></span>
+<span id="cb3-131"><a href="#cb3-131" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb3-132"><a href="#cb3-132" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-133"><a href="#cb3-133" aria-hidden="true" tabindex="-1"></a>                <span class="dt">var</span> match <span class="op">=</span> hit<span class="op">.</span><span class="fu">Match</span><span class="op">(</span>scanned<span class="op">);</span></span>
+<span id="cb3-134"><a href="#cb3-134" aria-hidden="true" tabindex="-1"></a>                <span class="dt">var</span> start <span class="op">=</span> match<span class="op">.</span><span class="fu">Success</span> <span class="op">?</span> match<span class="op">.</span><span class="fu">Index</span> <span class="op">:</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-135"><a href="#cb3-135" aria-hidden="true" tabindex="-1"></a>                <span class="dt">var</span> end <span class="op">=</span> match<span class="op">.</span><span class="fu">Success</span> <span class="op">?</span> match<span class="op">.</span><span class="fu">Index</span> <span class="op">+</span> match<span class="op">.</span><span class="fu">Length</span> <span class="op">:</span> <span class="dv">0</span><span class="op">;</span></span>
+<span id="cb3-136"><a href="#cb3-136" aria-hidden="true" tabindex="-1"></a>                <span class="dt">var</span> from <span class="op">=</span> Math<span class="op">.</span><span class="fu">Max</span><span class="op">(</span><span class="dv">0</span><span class="op">,</span> start <span class="op">-</span> <span class="dv">40</span><span class="op">);</span></span>
+<span id="cb3-137"><a href="#cb3-137" aria-hidden="true" tabindex="-1"></a>                <span class="dt">var</span> to <span class="op">=</span> Math<span class="op">.</span><span class="fu">Min</span><span class="op">(</span>scanned<span class="op">.</span><span class="fu">Length</span><span class="op">,</span> end <span class="op">+</span> <span class="dv">40</span><span class="op">);</span></span>
+<span id="cb3-138"><a href="#cb3-138" aria-hidden="true" tabindex="-1"></a>                findings<span class="op">.</span><span class="fu">Add</span><span class="op">(</span><span class="kw">new</span> <span class="fu">Finding</span><span class="op">(</span></span>
+<span id="cb3-139"><a href="#cb3-139" aria-hidden="true" tabindex="-1"></a>                    rule<span class="op">.</span><span class="fu">Id</span><span class="op">,</span> rule<span class="op">.</span><span class="fu">Severity</span><span class="op">,</span> toolName<span class="op">,</span> paramName<span class="op">,</span></span>
+<span id="cb3-140"><a href="#cb3-140" aria-hidden="true" tabindex="-1"></a>                    scanned<span class="op">[</span>from<span class="op">..</span><span class="fu">to</span><span class="op">],</span> rule<span class="op">.</span><span class="fu">Description</span><span class="op">,</span> rule<span class="op">.</span><span class="fu">Remediation</span><span class="op">));</span></span>
+<span id="cb3-141"><a href="#cb3-141" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb3-142"><a href="#cb3-142" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-143"><a href="#cb3-143" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-144"><a href="#cb3-144" aria-hidden="true" tabindex="-1"></a>        <span class="kw">return</span> findings<span class="op">;</span></span>
+<span id="cb3-145"><a href="#cb3-145" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-146"><a href="#cb3-146" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-147"><a href="#cb3-147" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">按当前模式判断命中清单里有没有该拦的级别（对齐 Eino Engine.ShouldBlock）。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-148"><a href="#cb3-148" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">bool</span> <span class="fu">ShouldBlock</span><span class="op">(</span>IReadOnlyList<span class="op">&lt;</span>Finding<span class="op">&gt;</span> findings<span class="op">)</span></span>
+<span id="cb3-149"><a href="#cb3-149" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb3-150"><a href="#cb3-150" aria-hidden="true" tabindex="-1"></a>        <span class="kw">foreach</span> <span class="op">(</span><span class="dt">var</span> finding <span class="kw">in</span> findings<span class="op">)</span></span>
+<span id="cb3-151"><a href="#cb3-151" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb3-152"><a href="#cb3-152" aria-hidden="true" tabindex="-1"></a>            <span class="kw">if</span> <span class="op">(</span><span class="fu">IsBlocking</span><span class="op">(</span>_mode<span class="op">,</span> finding<span class="op">.</span><span class="fu">Severity</span><span class="op">))</span></span>
+<span id="cb3-153"><a href="#cb3-153" aria-hidden="true" tabindex="-1"></a>            <span class="op">{</span></span>
+<span id="cb3-154"><a href="#cb3-154" aria-hidden="true" tabindex="-1"></a>                <span class="kw">return</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb3-155"><a href="#cb3-155" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb3-156"><a href="#cb3-156" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-157"><a href="#cb3-157" aria-hidden="true" tabindex="-1"></a>        <span class="kw">return</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb3-158"><a href="#cb3-158" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-159"><a href="#cb3-159" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-160"><a href="#cb3-160" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">模式 → 该拦哪些级别：warn 全放行，require_approval 连 Medium 也拦。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-161"><a href="#cb3-161" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="kw">static</span> <span class="dt">bool</span> <span class="fu">IsBlocking</span><span class="op">(</span>GuardMode mode<span class="op">,</span> GuardSeverity severity<span class="op">)</span> <span class="op">=&gt;</span> mode <span class="kw">switch</span></span>
+<span id="cb3-162"><a href="#cb3-162" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb3-163"><a href="#cb3-163" aria-hidden="true" tabindex="-1"></a>        GuardMode<span class="op">.</span><span class="fu">Block</span> <span class="op">=&gt;</span> severity <span class="kw">is</span> GuardSeverity<span class="op">.</span><span class="fu">Critical</span> or GuardSeverity<span class="op">.</span><span class="fu">High</span><span class="op">,</span></span>
+<span id="cb3-164"><a href="#cb3-164" aria-hidden="true" tabindex="-1"></a>        GuardMode<span class="op">.</span><span class="fu">RequireApproval</span> <span class="op">=&gt;</span> severity <span class="kw">is</span> GuardSeverity<span class="op">.</span><span class="fu">Critical</span> or GuardSeverity<span class="op">.</span><span class="fu">High</span> or GuardSeverity<span class="op">.</span><span class="fu">Medium</span><span class="op">,</span></span>
+<span id="cb3-165"><a href="#cb3-165" aria-hidden="true" tabindex="-1"></a>        _ <span class="op">=&gt;</span> <span class="kw">false</span><span class="op">,</span></span>
+<span id="cb3-166"><a href="#cb3-166" aria-hidden="true" tabindex="-1"></a>    <span class="op">};</span></span>
+<span id="cb3-167"><a href="#cb3-167" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-168"><a href="#cb3-168" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">参数值转文本：string 原样；JsonElement（FICC 反序列化的常见形态）取字符串或原始 JSON。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-169"><a href="#cb3-169" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="kw">static</span> <span class="dt">string</span> <span class="fu">ToText</span><span class="op">(</span><span class="dt">object</span><span class="op">?</span> raw<span class="op">)</span> <span class="op">=&gt;</span> raw <span class="kw">switch</span></span>
+<span id="cb3-170"><a href="#cb3-170" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb3-171"><a href="#cb3-171" aria-hidden="true" tabindex="-1"></a>        <span class="kw">null</span> <span class="op">=&gt;</span> <span class="st">&quot;&quot;</span><span class="op">,</span></span>
+<span id="cb3-172"><a href="#cb3-172" aria-hidden="true" tabindex="-1"></a>        <span class="dt">string</span> text <span class="op">=&gt;</span> text<span class="op">,</span></span>
+<span id="cb3-173"><a href="#cb3-173" aria-hidden="true" tabindex="-1"></a>        JsonElement element <span class="op">=&gt;</span> element<span class="op">.</span><span class="fu">ValueKind</span> <span class="op">==</span> JsonValueKind<span class="op">.</span><span class="fu">String</span></span>
+<span id="cb3-174"><a href="#cb3-174" aria-hidden="true" tabindex="-1"></a>            <span class="op">?</span> element<span class="op">.</span><span class="fu">GetString</span><span class="op">()</span> <span class="op">??</span> <span class="st">&quot;&quot;</span></span>
+<span id="cb3-175"><a href="#cb3-175" aria-hidden="true" tabindex="-1"></a>            <span class="op">:</span> element<span class="op">.</span><span class="fu">GetRawText</span><span class="op">(),</span></span>
+<span id="cb3-176"><a href="#cb3-176" aria-hidden="true" tabindex="-1"></a>        IFormattable formattable <span class="op">=&gt;</span> formattable<span class="op">.</span><span class="fu">ToString</span><span class="op">(</span><span class="kw">null</span><span class="op">,</span> CultureInfo<span class="op">.</span><span class="fu">InvariantCulture</span><span class="op">),</span></span>
+<span id="cb3-177"><a href="#cb3-177" aria-hidden="true" tabindex="-1"></a>        _ <span class="op">=&gt;</span> raw<span class="op">.</span><span class="fu">ToString</span><span class="op">()</span> <span class="op">??</span> <span class="st">&quot;&quot;</span><span class="op">,</span></span>
+<span id="cb3-178"><a href="#cb3-178" aria-hidden="true" tabindex="-1"></a>    <span class="op">};</span></span>
+<span id="cb3-179"><a href="#cb3-179" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-180"><a href="#cb3-180" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span></span>
+<span id="cb3-181"><a href="#cb3-181" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// 对齐 Eino textForRule：`^</span><span class="an">\s*#`</span><span class="co"> 只剥注释行，剩下的文本继续匹配；</span></span>
+<span id="cb3-182"><a href="#cb3-182" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// 其它排除模式命中整段则本条规则不报警。</span></span>
+<span id="cb3-183"><a href="#cb3-183" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-184"><a href="#cb3-184" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="kw">static</span> <span class="op">(</span><span class="dt">string</span> Text<span class="op">,</span> <span class="dt">bool</span> Keep<span class="op">)</span> <span class="fu">TextForRule</span><span class="op">(</span><span class="dt">string</span> value<span class="op">,</span> Regex<span class="op">[]</span> excludes<span class="op">)</span></span>
+<span id="cb3-185"><a href="#cb3-185" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb3-186"><a href="#cb3-186" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> comments <span class="op">=</span> <span class="kw">new</span> List<span class="op">&lt;</span>Regex<span class="op">&gt;();</span></span>
+<span id="cb3-187"><a href="#cb3-187" aria-hidden="true" tabindex="-1"></a>        <span class="kw">foreach</span> <span class="op">(</span><span class="dt">var</span> pattern <span class="kw">in</span> excludes<span class="op">)</span></span>
+<span id="cb3-188"><a href="#cb3-188" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb3-189"><a href="#cb3-189" aria-hidden="true" tabindex="-1"></a>            <span class="kw">if</span> <span class="op">(</span><span class="fu">IsCommentLine</span><span class="op">(</span>pattern<span class="op">))</span></span>
+<span id="cb3-190"><a href="#cb3-190" aria-hidden="true" tabindex="-1"></a>            <span class="op">{</span></span>
+<span id="cb3-191"><a href="#cb3-191" aria-hidden="true" tabindex="-1"></a>                comments<span class="op">.</span><span class="fu">Add</span><span class="op">(</span>pattern<span class="op">);</span></span>
+<span id="cb3-192"><a href="#cb3-192" aria-hidden="true" tabindex="-1"></a>                <span class="kw">continue</span><span class="op">;</span></span>
+<span id="cb3-193"><a href="#cb3-193" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb3-194"><a href="#cb3-194" aria-hidden="true" tabindex="-1"></a>            <span class="kw">if</span> <span class="op">(</span>pattern<span class="op">.</span><span class="fu">IsMatch</span><span class="op">(</span>value<span class="op">))</span></span>
+<span id="cb3-195"><a href="#cb3-195" aria-hidden="true" tabindex="-1"></a>            <span class="op">{</span></span>
+<span id="cb3-196"><a href="#cb3-196" aria-hidden="true" tabindex="-1"></a>                <span class="kw">return</span> <span class="op">(</span><span class="st">&quot;&quot;</span><span class="op">,</span> <span class="kw">false</span><span class="op">);</span></span>
+<span id="cb3-197"><a href="#cb3-197" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb3-198"><a href="#cb3-198" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-199"><a href="#cb3-199" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-200"><a href="#cb3-200" aria-hidden="true" tabindex="-1"></a>        <span class="kw">if</span> <span class="op">(</span>comments<span class="op">.</span><span class="fu">Count</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb3-201"><a href="#cb3-201" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb3-202"><a href="#cb3-202" aria-hidden="true" tabindex="-1"></a>            <span class="kw">return</span> <span class="op">(</span>value<span class="op">,</span> <span class="kw">true</span><span class="op">);</span></span>
+<span id="cb3-203"><a href="#cb3-203" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-204"><a href="#cb3-204" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-205"><a href="#cb3-205" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> kept <span class="op">=</span> <span class="kw">new</span> List<span class="op">&lt;</span><span class="dt">string</span><span class="op">&gt;();</span></span>
+<span id="cb3-206"><a href="#cb3-206" aria-hidden="true" tabindex="-1"></a>        <span class="kw">foreach</span> <span class="op">(</span><span class="dt">var</span> line <span class="kw">in</span> value<span class="op">.</span><span class="fu">Split</span><span class="op">(</span><span class="ch">&#39;\n&#39;</span><span class="op">))</span></span>
+<span id="cb3-207"><a href="#cb3-207" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb3-208"><a href="#cb3-208" aria-hidden="true" tabindex="-1"></a>            <span class="dt">var</span> skip <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb3-209"><a href="#cb3-209" aria-hidden="true" tabindex="-1"></a>            <span class="kw">foreach</span> <span class="op">(</span><span class="dt">var</span> pattern <span class="kw">in</span> comments<span class="op">)</span></span>
+<span id="cb3-210"><a href="#cb3-210" aria-hidden="true" tabindex="-1"></a>            <span class="op">{</span></span>
+<span id="cb3-211"><a href="#cb3-211" aria-hidden="true" tabindex="-1"></a>                <span class="kw">if</span> <span class="op">(</span>pattern<span class="op">.</span><span class="fu">IsMatch</span><span class="op">(</span>line<span class="op">))</span></span>
+<span id="cb3-212"><a href="#cb3-212" aria-hidden="true" tabindex="-1"></a>                <span class="op">{</span></span>
+<span id="cb3-213"><a href="#cb3-213" aria-hidden="true" tabindex="-1"></a>                    skip <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb3-214"><a href="#cb3-214" aria-hidden="true" tabindex="-1"></a>                    <span class="kw">break</span><span class="op">;</span></span>
+<span id="cb3-215"><a href="#cb3-215" aria-hidden="true" tabindex="-1"></a>                <span class="op">}</span></span>
+<span id="cb3-216"><a href="#cb3-216" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb3-217"><a href="#cb3-217" aria-hidden="true" tabindex="-1"></a>            <span class="kw">if</span> <span class="op">(!</span>skip<span class="op">)</span></span>
+<span id="cb3-218"><a href="#cb3-218" aria-hidden="true" tabindex="-1"></a>            <span class="op">{</span></span>
+<span id="cb3-219"><a href="#cb3-219" aria-hidden="true" tabindex="-1"></a>                kept<span class="op">.</span><span class="fu">Add</span><span class="op">(</span>line<span class="op">);</span></span>
+<span id="cb3-220"><a href="#cb3-220" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb3-221"><a href="#cb3-221" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb3-222"><a href="#cb3-222" aria-hidden="true" tabindex="-1"></a>        <span class="kw">return</span> <span class="op">(</span><span class="dt">string</span><span class="op">.</span><span class="fu">Join</span><span class="op">(</span><span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> kept<span class="op">),</span> <span class="kw">true</span><span class="op">);</span></span>
+<span id="cb3-223"><a href="#cb3-223" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb3-224"><a href="#cb3-224" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-225"><a href="#cb3-225" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">认出 CommentLine 这条特殊排除（判等用源码字面量，和 Eino isCommentLineExclude 同法）。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb3-226"><a href="#cb3-226" aria-hidden="true" tabindex="-1"></a>    <span class="kw">private</span> <span class="kw">static</span> <span class="dt">bool</span> <span class="fu">IsCommentLine</span><span class="op">(</span>Regex pattern<span class="op">)</span> <span class="op">=&gt;</span> pattern<span class="op">.</span><span class="fu">ToString</span><span class="op">()</span> <span class="op">==</span> CommentLine<span class="op">;</span></span>
+<span id="cb3-227"><a href="#cb3-227" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 5: 跑测试，确认通过</strong></label></li>
+</ul>
+<p>Run: <code>dotnet test maf/tests/YkTako.MafL2.Tests.csproj --nologo</code> Expected: 1 passed。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 6: 提交</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb4"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> add maf/src/Guard.cs maf/tests/YkTako.MafL2.Tests.csproj maf/tests/GuardEngineTests.cs</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> commit <span class="at">-m</span> <span class="st">&quot;MAF：规则引擎最小实现与测试骨架（rm 命中用例）&quot;</span></span></code></pre></div>
+<hr />
+<h3 id="task-2-补齐-defaultrules-10-条--模式排除语义测试">Task 2: 补齐 DefaultRules 10 条 + 模式/排除语义测试</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Modify: <code>maf/src/Guard.cs</code>（<code>DefaultRules</code> 数组）</li>
+<li>Modify: <code>maf/tests/GuardEngineTests.cs</code></li>
+</ul>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 1: 先写失败测试（追加到 GuardEngineTests）</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb5"><pre class="sourceCode csharp"><code class="sourceCode cs"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span>Fact<span class="op">]</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">CommentLines_AreStripped_BeforeMatching</span><span class="op">()</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> findings <span class="op">=</span> <span class="fu">NewApproveEngine</span><span class="op">().</span><span class="fu">Guard</span><span class="op">(</span><span class="st">&quot;execute&quot;</span><span class="op">,</span> <span class="fu">Args</span><span class="op">(</span><span class="st">&quot;# rm -rf /</span><span class="sc">\n</span><span class="st">ls&quot;</span><span class="op">));</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>        Assert<span class="op">.</span><span class="fu">Empty</span><span class="op">(</span>findings<span class="op">);</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span>Fact<span class="op">]</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">UnicodeWhitespace_IsCaught</span><span class="op">()</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> findings <span class="op">=</span> <span class="fu">NewApproveEngine</span><span class="op">().</span><span class="fu">Guard</span><span class="op">(</span><span class="st">&quot;execute&quot;</span><span class="op">,</span> <span class="fu">Args</span><span class="op">(</span><span class="st">&quot;rm\u00a0-rf /tmp/x&quot;</span><span class="op">));</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a>        Assert<span class="op">.</span><span class="fu">Contains</span><span class="op">(</span>findings<span class="op">,</span> f <span class="op">=&gt;</span> f<span class="op">.</span><span class="fu">RuleId</span> <span class="op">==</span> <span class="st">&quot;TOOL_CMD_UNICODE_WHITESPACE&quot;</span><span class="op">);</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span>Fact<span class="op">]</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">Sudo_Medium_IsBlockedOnlyInApproveMode</span><span class="op">()</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> approve <span class="op">=</span> <span class="kw">new</span> <span class="fu">GuardEngine</span><span class="op">(</span>GuardMode<span class="op">.</span><span class="fu">RequireApproval</span><span class="op">);</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> block <span class="op">=</span> <span class="kw">new</span> <span class="fu">GuardEngine</span><span class="op">(</span>GuardMode<span class="op">.</span><span class="fu">Block</span><span class="op">);</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> args <span class="op">=</span> <span class="fu">Args</span><span class="op">(</span><span class="st">&quot;sudo apt update&quot;</span><span class="op">);</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>        Assert<span class="op">.</span><span class="fu">True</span><span class="op">(</span>approve<span class="op">.</span><span class="fu">ShouldBlock</span><span class="op">(</span>approve<span class="op">.</span><span class="fu">Guard</span><span class="op">(</span><span class="st">&quot;execute&quot;</span><span class="op">,</span> args<span class="op">)));</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>        Assert<span class="op">.</span><span class="fu">False</span><span class="op">(</span>block<span class="op">.</span><span class="fu">ShouldBlock</span><span class="op">(</span>block<span class="op">.</span><span class="fu">Guard</span><span class="op">(</span><span class="st">&quot;execute&quot;</span><span class="op">,</span> args<span class="op">)));</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span>Fact<span class="op">]</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">WarnMode_NeverBlocks</span><span class="op">()</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> warn <span class="op">=</span> <span class="kw">new</span> <span class="fu">GuardEngine</span><span class="op">(</span>GuardMode<span class="op">.</span><span class="fu">Warn</span><span class="op">);</span></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a>        Assert<span class="op">.</span><span class="fu">False</span><span class="op">(</span>warn<span class="op">.</span><span class="fu">ShouldBlock</span><span class="op">(</span>warn<span class="op">.</span><span class="fu">Guard</span><span class="op">(</span><span class="st">&quot;execute&quot;</span><span class="op">,</span> <span class="fu">Args</span><span class="op">(</span><span class="st">&quot;rm -rf /tmp/x&quot;</span><span class="op">))));</span></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span>Fact<span class="op">]</span></span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">BenignCommand_HasNoFindings</span><span class="op">()</span></span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a>        Assert<span class="op">.</span><span class="fu">Empty</span><span class="op">(</span><span class="fu">NewApproveEngine</span><span class="op">().</span><span class="fu">Guard</span><span class="op">(</span><span class="st">&quot;execute&quot;</span><span class="op">,</span> <span class="fu">Args</span><span class="op">(</span><span class="st">&quot;echo hi&quot;</span><span class="op">)));</span></span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-39"><a href="#cb5-39" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span>Fact<span class="op">]</span></span>
+<span id="cb5-40"><a href="#cb5-40" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">NonShellTool_IsNotScanned</span><span class="op">()</span></span>
+<span id="cb5-41"><a href="#cb5-41" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb5-42"><a href="#cb5-42" aria-hidden="true" tabindex="-1"></a>        Assert<span class="op">.</span><span class="fu">Empty</span><span class="op">(</span><span class="fu">NewApproveEngine</span><span class="op">().</span><span class="fu">Guard</span><span class="op">(</span><span class="st">&quot;calculate&quot;</span><span class="op">,</span> <span class="fu">Args</span><span class="op">(</span><span class="st">&quot;rm -rf /tmp/x&quot;</span><span class="op">)));</span></span>
+<span id="cb5-43"><a href="#cb5-43" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-44"><a href="#cb5-44" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-45"><a href="#cb5-45" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span>Fact<span class="op">]</span></span>
+<span id="cb5-46"><a href="#cb5-46" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">WholeValueExclude_SkipsRule</span><span class="op">()</span></span>
+<span id="cb5-47"><a href="#cb5-47" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb5-48"><a href="#cb5-48" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> rule <span class="op">=</span> <span class="kw">new</span> <span class="fu">GuardRule</span><span class="op">(</span><span class="st">&quot;T_LS&quot;</span><span class="op">,</span> <span class="op">[</span><span class="st">&quot;execute&quot;</span><span class="op">],</span> <span class="op">[</span><span class="st">&quot;command&quot;</span><span class="op">],</span> GuardSeverity<span class="op">.</span><span class="fu">High</span><span class="op">,</span></span>
+<span id="cb5-49"><a href="#cb5-49" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>@<span class="st">&quot;</span><span class="sc">\b</span><span class="st">ls</span><span class="sc">\b</span><span class="st">&quot;</span><span class="op">],</span> <span class="op">[</span>@<span class="st">&quot;</span><span class="sc">\b</span><span class="st">safe</span><span class="sc">\b</span><span class="st">&quot;</span><span class="op">],</span> <span class="st">&quot;d&quot;</span><span class="op">,</span> <span class="st">&quot;r&quot;</span><span class="op">);</span></span>
+<span id="cb5-50"><a href="#cb5-50" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> engine <span class="op">=</span> <span class="kw">new</span> <span class="fu">GuardEngine</span><span class="op">(</span>GuardMode<span class="op">.</span><span class="fu">Block</span><span class="op">,</span> <span class="op">[</span>rule<span class="op">]);</span></span>
+<span id="cb5-51"><a href="#cb5-51" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-52"><a href="#cb5-52" aria-hidden="true" tabindex="-1"></a>        Assert<span class="op">.</span><span class="fu">Empty</span><span class="op">(</span>engine<span class="op">.</span><span class="fu">Guard</span><span class="op">(</span><span class="st">&quot;execute&quot;</span><span class="op">,</span> <span class="fu">Args</span><span class="op">(</span><span class="st">&quot;ls safe&quot;</span><span class="op">)));</span></span>
+<span id="cb5-53"><a href="#cb5-53" aria-hidden="true" tabindex="-1"></a>        Assert<span class="op">.</span><span class="fu">Single</span><span class="op">(</span>engine<span class="op">.</span><span class="fu">Guard</span><span class="op">(</span><span class="st">&quot;execute&quot;</span><span class="op">,</span> <span class="fu">Args</span><span class="op">(</span><span class="st">&quot;ls x&quot;</span><span class="op">)));</span></span>
+<span id="cb5-54"><a href="#cb5-54" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 2: 跑测试，确认失败</strong></label></li>
+</ul>
+<p>Run: <code>dotnet test maf/tests/YkTako.MafL2.Tests.csproj --nologo</code> Expected: <code>UnicodeWhitespace_IsCaught</code>、<code>Sudo_Medium_IsBlockedOnlyInApproveMode</code> 失败（规则还没补）。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 3: 补齐 DefaultRules</strong></label></li>
+</ul>
+<p>把 <code>maf/src/Guard.cs</code> 里 <code>DefaultRules</code> 的数组替换为完整 10 条（保留注释与新加项，顺序与 Eino 一致）：</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode csharp"><code class="sourceCode cs"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// DefaultRules：从 harness 的危险命令表里抽出的 10 条（与 Eino DefaultRules 逐条一致，</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// 安全知识与语言、框架无关）。</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="kw">static</span> <span class="kw">readonly</span> GuardRule<span class="op">[]</span> DefaultRules <span class="op">=</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>        <span class="kw">new</span><span class="op">(</span><span class="st">&quot;TOOL_CMD_DANGEROUS_RM&quot;</span><span class="op">,</span> ShellTools<span class="op">,</span> CommandArg<span class="op">,</span> GuardSeverity<span class="op">.</span><span class="fu">High</span><span class="op">,</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>@<span class="st">&quot;</span><span class="sc">\b</span><span class="st">rm</span><span class="sc">\b</span><span class="st">&quot;</span><span class="op">,</span> @<span class="st">&quot;</span><span class="sc">\b</span><span class="st">del</span><span class="sc">\b</span><span class="st">&quot;</span><span class="op">,</span> @<span class="st">&quot;(?i)</span><span class="sc">\b</span><span class="st">Remove-Item</span><span class="sc">\b</span><span class="st">&quot;</span><span class="op">],</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>CommentLine<span class="op">],</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;命令包含 rm/del，可能造成数据丢失&quot;</span><span class="op">,</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;执行删除前与用户确认&quot;</span><span class="op">),</span></span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>        <span class="kw">new</span><span class="op">(</span><span class="st">&quot;TOOL_CMD_DANGEROUS_MV&quot;</span><span class="op">,</span> ShellTools<span class="op">,</span> CommandArg<span class="op">,</span> GuardSeverity<span class="op">.</span><span class="fu">High</span><span class="op">,</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>@<span class="st">&quot;</span><span class="sc">\b</span><span class="st">mv</span><span class="sc">\b</span><span class="st">&quot;</span><span class="op">],</span> <span class="op">[],</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;命令包含 mv，可能意外移动或覆盖文件&quot;</span><span class="op">,</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;执行移动/重命名前与用户确认&quot;</span><span class="op">),</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>        <span class="kw">new</span><span class="op">(</span><span class="st">&quot;TOOL_CMD_FS_DESTRUCTION&quot;</span><span class="op">,</span> ShellTools<span class="op">,</span> CommandArg<span class="op">,</span> GuardSeverity<span class="op">.</span><span class="fu">Critical</span><span class="op">,</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>@<span class="st">&quot;(?i)</span><span class="sc">\b</span><span class="st">mkfs(\.[a-z0-9_]+)?</span><span class="sc">\b</span><span class="st">&quot;</span><span class="op">,</span> @<span class="st">&quot;(?i)</span><span class="sc">\b</span><span class="st">mke2fs</span><span class="sc">\b</span><span class="st">&quot;</span><span class="op">,</span> @<span class="st">&quot;(?i)</span><span class="sc">\b</span><span class="st">dd\s+.*of=/dev/&quot;</span><span class="op">,</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>             @<span class="st">&quot;&gt;\s*/dev/(sd[a-z]\d*|vd[a-z]\d*|nvme\d+n\d+(p\d+)?)&quot;</span><span class="op">],</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>            <span class="op">[],</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;检测到磁盘格式化/擦除等底层破坏性命令&quot;</span><span class="op">,</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;直接拦截。agent 不应操作裸块设备。&quot;</span><span class="op">),</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>        <span class="kw">new</span><span class="op">(</span><span class="st">&quot;TOOL_CMD_DOS_FORK_BOMB&quot;</span><span class="op">,</span> ShellTools<span class="op">,</span> CommandArg<span class="op">,</span> GuardSeverity<span class="op">.</span><span class="fu">Critical</span><span class="op">,</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>@<span class="st">&quot;:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&amp;\s*\}\s*;\s*:&quot;</span><span class="op">,</span> @<span class="st">&quot;</span><span class="sc">\b</span><span class="st">kill\s+-9\s+(-1</span><span class="sc">\b</span><span class="st">|1</span><span class="sc">\b</span><span class="st">)&quot;</span><span class="op">],</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a>            <span class="op">[],</span></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;检测到 fork 炸弹或批量杀进程命令&quot;</span><span class="op">,</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;立即拦截。这类命令会搞垮宿主机。&quot;</span><span class="op">),</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a>        <span class="kw">new</span><span class="op">(</span><span class="st">&quot;TOOL_CMD_PIPE_TO_SHELL&quot;</span><span class="op">,</span> ShellTools<span class="op">,</span> CommandArg<span class="op">,</span> GuardSeverity<span class="op">.</span><span class="fu">Critical</span><span class="op">,</span></span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>@<span class="st">&quot;(?i)</span><span class="sc">\b</span><span class="st">(curl|wget)</span><span class="sc">\b</span><span class="st">\s+.*\|.*</span><span class="sc">\b</span><span class="st">(bash|sh|zsh|ash|dash)</span><span class="sc">\b</span><span class="st">&quot;</span><span class="op">],</span></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true" tabindex="-1"></a>            <span class="op">[],</span></span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;检测到 curl|bash 模式：下载并立即执行远程脚本&quot;</span><span class="op">,</span></span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;与用户确认。agent 应先审查脚本内容再执行。&quot;</span><span class="op">),</span></span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true" tabindex="-1"></a>        <span class="kw">new</span><span class="op">(</span><span class="st">&quot;TOOL_CMD_REVERSE_SHELL&quot;</span><span class="op">,</span> ShellTools<span class="op">,</span> CommandArg<span class="op">,</span> GuardSeverity<span class="op">.</span><span class="fu">Critical</span><span class="op">,</span></span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>@<span class="st">&quot;(?i)/dev/(tcp|udp)/&quot;</span><span class="op">,</span> @<span class="st">&quot;(?i)</span><span class="sc">\b</span><span class="st">nc\s+.*-e\s*\S+&quot;</span><span class="op">,</span> @<span class="st">&quot;(?i)</span><span class="sc">\b</span><span class="st">ncat\s+.*-e\s*\S+&quot;</span><span class="op">,</span> @<span class="st">&quot;(?i)</span><span class="sc">\b</span><span class="st">socat\s+.*EXEC:&quot;</span><span class="op">],</span></span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true" tabindex="-1"></a>            <span class="op">[],</span></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;检测到反弹 shell / 未授权网络隧道&quot;</span><span class="op">,</span></span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;直接拦截。agent 无需绑定交互式 shell 或隧道。&quot;</span><span class="op">),</span></span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true" tabindex="-1"></a>        <span class="kw">new</span><span class="op">(</span><span class="st">&quot;TOOL_CMD_UNICODE_WHITESPACE&quot;</span><span class="op">,</span> ShellTools<span class="op">,</span> CommandArg<span class="op">,</span> GuardSeverity<span class="op">.</span><span class="fu">High</span><span class="op">,</span></span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span><span class="st">&quot;[\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]&quot;</span><span class="op">],</span></span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true" tabindex="-1"></a>            <span class="op">[],</span></span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;命令含 Unicode 空白字符，可能造成解析歧义绕过检查&quot;</span><span class="op">,</span></span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;拦截含非 ASCII 空白的命令，使用普通空格。&quot;</span><span class="op">),</span></span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true" tabindex="-1"></a>        <span class="kw">new</span><span class="op">(</span><span class="st">&quot;TOOL_CMD_PROC_ENVIRON&quot;</span><span class="op">,</span> ShellTools<span class="op">,</span> CommandArg<span class="op">,</span> GuardSeverity<span class="op">.</span><span class="fu">High</span><span class="op">,</span></span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>@<span class="st">&quot;/proc/(?:self|\d+)/environ(?:</span><span class="sc">\b</span><span class="st">|$)&quot;</span><span class="op">],</span></span>
+<span id="cb6-44"><a href="#cb6-44" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>CommentLine<span class="op">],</span></span>
+<span id="cb6-45"><a href="#cb6-45" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;访问 /proc/*/environ，可能泄露 API Key 等环境变量&quot;</span><span class="op">,</span></span>
+<span id="cb6-46"><a href="#cb6-46" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;拦截对进程环境变量文件的访问。&quot;</span><span class="op">),</span></span>
+<span id="cb6-47"><a href="#cb6-47" aria-hidden="true" tabindex="-1"></a>        <span class="kw">new</span><span class="op">(</span><span class="st">&quot;TOOL_CMD_JQ_SYSTEM&quot;</span><span class="op">,</span> ShellTools<span class="op">,</span> CommandArg<span class="op">,</span> GuardSeverity<span class="op">.</span><span class="fu">High</span><span class="op">,</span></span>
+<span id="cb6-48"><a href="#cb6-48" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>@<span class="st">&quot;(?i)</span><span class="sc">\b</span><span class="st">jq</span><span class="sc">\b</span><span class="st">.*</span><span class="sc">\b</span><span class="st">system\s*\(&quot;</span><span class="op">],</span></span>
+<span id="cb6-49"><a href="#cb6-49" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>CommentLine<span class="op">],</span></span>
+<span id="cb6-50"><a href="#cb6-50" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;jq 的 system() 可执行任意命令，把数据处理工具变成执行通道&quot;</span><span class="op">,</span></span>
+<span id="cb6-51"><a href="#cb6-51" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;拦截使用 system() 的 jq 命令。&quot;</span><span class="op">),</span></span>
+<span id="cb6-52"><a href="#cb6-52" aria-hidden="true" tabindex="-1"></a>        <span class="kw">new</span><span class="op">(</span><span class="st">&quot;TOOL_CMD_SUDO&quot;</span><span class="op">,</span> ShellTools<span class="op">,</span> CommandArg<span class="op">,</span> GuardSeverity<span class="op">.</span><span class="fu">Medium</span><span class="op">,</span></span>
+<span id="cb6-53"><a href="#cb6-53" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>@<span class="st">&quot;(?i)</span><span class="sc">\b</span><span class="st">sudo</span><span class="sc">\b</span><span class="st">&quot;</span><span class="op">,</span> @<span class="st">&quot;(?i)</span><span class="sc">\b</span><span class="st">doas</span><span class="sc">\b</span><span class="st">&quot;</span><span class="op">],</span></span>
+<span id="cb6-54"><a href="#cb6-54" aria-hidden="true" tabindex="-1"></a>            <span class="op">[</span>CommentLine<span class="op">],</span></span>
+<span id="cb6-55"><a href="#cb6-55" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;命令试图提升权限（sudo/doas）&quot;</span><span class="op">,</span></span>
+<span id="cb6-56"><a href="#cb6-56" aria-hidden="true" tabindex="-1"></a>            <span class="st">&quot;agent 原则上不应需要提权，与用户确认。&quot;</span><span class="op">),</span></span>
+<span id="cb6-57"><a href="#cb6-57" aria-hidden="true" tabindex="-1"></a>    <span class="op">];</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 4: 跑测试，确认通过</strong></label></li>
+</ul>
+<p>Run: <code>dotnet test maf/tests/YkTako.MafL2.Tests.csproj --nologo</code> Expected: 8 passed。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 5: 提交</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb7"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> add maf/src/Guard.cs maf/tests/GuardEngineTests.cs</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> commit <span class="at">-m</span> <span class="st">&quot;MAF：补齐危险命令规则表 10 条与模式/排除语义测试&quot;</span></span></code></pre></div>
+<hr />
+<h3 id="task-3-formatfindings--jsonelement-参数测试">Task 3: FormatFindings + JsonElement 参数测试</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Modify: <code>maf/src/Guard.cs</code>（加 <code>FormatFindings</code> 静态方法）</li>
+<li>Modify: <code>maf/tests/GuardEngineTests.cs</code></li>
+</ul>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 1: 先写失败测试</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb8"><pre class="sourceCode csharp"><code class="sourceCode cs"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span>Fact<span class="op">]</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">JsonElementArguments_AreRead</span><span class="op">()</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>        <span class="kw">using</span> <span class="dt">var</span> doc <span class="op">=</span> JsonDocument<span class="op">.</span><span class="fu">Parse</span><span class="op">(</span><span class="st">&quot;</span><span class="sc">\&quot;</span><span class="st">rm -rf /tmp/x</span><span class="sc">\&quot;</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> findings <span class="op">=</span> <span class="fu">NewApproveEngine</span><span class="op">().</span><span class="fu">Guard</span><span class="op">(</span><span class="st">&quot;execute&quot;</span><span class="op">,</span> <span class="kw">new</span> Dictionary<span class="op">&lt;</span><span class="dt">string</span><span class="op">,</span> <span class="dt">object</span><span class="op">?&gt;</span> <span class="op">{</span> <span class="op">[</span><span class="st">&quot;command&quot;</span><span class="op">]</span> <span class="op">=</span> doc<span class="op">.</span><span class="fu">RootElement</span> <span class="op">});</span></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a>        Assert<span class="op">.</span><span class="fu">Single</span><span class="op">(</span>findings<span class="op">);</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span>Fact<span class="op">]</span></span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="dt">void</span> <span class="fu">FormatFindings_CapsAtFive_AndCountsRest</span><span class="op">()</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> findings <span class="op">=</span> Enumerable<span class="op">.</span><span class="fu">Range</span><span class="op">(</span><span class="dv">0</span><span class="op">,</span> <span class="dv">7</span><span class="op">)</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span><span class="fu">Select</span><span class="op">(</span>i <span class="op">=&gt;</span> <span class="kw">new</span> <span class="fu">Finding</span><span class="op">(</span>$<span class="st">&quot;R{i}&quot;</span><span class="op">,</span> GuardSeverity<span class="op">.</span><span class="fu">High</span><span class="op">,</span> <span class="st">&quot;execute&quot;</span><span class="op">,</span> <span class="st">&quot;command&quot;</span><span class="op">,</span> $<span class="st">&quot;snippet{i}&quot;</span><span class="op">,</span> $<span class="st">&quot;desc{i}&quot;</span><span class="op">,</span> $<span class="st">&quot;fix{i}&quot;</span><span class="op">))</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span><span class="fu">ToList</span><span class="op">();</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> text <span class="op">=</span> GuardEngine<span class="op">.</span><span class="fu">FormatFindings</span><span class="op">(</span>findings<span class="op">,</span> <span class="st">&quot;表头&quot;</span><span class="op">);</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a>        Assert<span class="op">.</span><span class="fu">Contains</span><span class="op">(</span><span class="st">&quot;表头&quot;</span><span class="op">,</span> text<span class="op">);</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a>        Assert<span class="op">.</span><span class="fu">Equal</span><span class="op">(</span><span class="dv">5</span><span class="op">,</span> text<span class="op">.</span><span class="fu">Split</span><span class="op">(</span><span class="ch">&#39;\n&#39;</span><span class="op">).</span><span class="fu">Count</span><span class="op">(</span>line <span class="op">=&gt;</span> line<span class="op">.</span><span class="fu">StartsWith</span><span class="op">(</span><span class="st">&quot;- [&quot;</span><span class="op">)));</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a>        Assert<span class="op">.</span><span class="fu">Contains</span><span class="op">(</span><span class="st">&quot;... 以及另外 2 条告警&quot;</span><span class="op">,</span> text<span class="op">);</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span></code></pre></div>
+<p>（文件顶部补 <code>using System.Text.Json;</code>。）</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 2: 跑测试，确认失败</strong></label></li>
+</ul>
+<p>Run: <code>dotnet test maf/tests/YkTako.MafL2.Tests.csproj --nologo</code> Expected: <code>FormatFindings</code> 不存在，编译失败。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 3: 实现 FormatFindings</strong></label></li>
+</ul>
+<p>加到 <code>GuardEngine</code> 类内（<code>IsCommentLine</code> 之前）：</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode csharp"><code class="sourceCode cs"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span><span class="co">把命中清单排成人读的几行，最多列 5 条（对齐 Eino formatFindings）。</span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="kw">static</span> <span class="dt">string</span> <span class="fu">FormatFindings</span><span class="op">(</span>IReadOnlyList<span class="op">&lt;</span>Finding<span class="op">&gt;</span> findings<span class="op">,</span> <span class="dt">string</span> header<span class="op">)</span></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> toolName <span class="op">=</span> findings<span class="op">.</span><span class="fu">Count</span> <span class="op">&gt;</span> <span class="dv">0</span> <span class="op">?</span> findings<span class="op">[</span><span class="dv">0</span><span class="op">].</span><span class="fu">ToolName</span> <span class="op">:</span> <span class="st">&quot;?&quot;</span><span class="op">;</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> lines <span class="op">=</span> <span class="kw">new</span> List<span class="op">&lt;</span><span class="dt">string</span><span class="op">&gt;</span> <span class="op">{</span> header<span class="op">,</span> <span class="st">&quot;Tool: &quot;</span> <span class="op">+</span> toolName<span class="op">,</span> <span class="st">&quot;&quot;</span> <span class="op">};</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> limit <span class="op">=</span> Math<span class="op">.</span><span class="fu">Min</span><span class="op">(</span>findings<span class="op">.</span><span class="fu">Count</span><span class="op">,</span> <span class="dv">5</span><span class="op">);</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a>        <span class="kw">for</span> <span class="op">(</span><span class="dt">var</span> i <span class="op">=</span> <span class="dv">0</span><span class="op">;</span> i <span class="op">&lt;</span> limit<span class="op">;</span> i<span class="op">++)</span></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a>            <span class="dt">var</span> finding <span class="op">=</span> findings<span class="op">[</span>i<span class="op">];</span></span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>            lines<span class="op">.</span><span class="fu">Add</span><span class="op">(</span>$<span class="st">&quot;- [{finding.Severity}] {finding.Description}&quot;</span><span class="op">);</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>            lines<span class="op">.</span><span class="fu">Add</span><span class="op">(</span>$<span class="st">&quot;  snippet: {finding.Snippet}&quot;</span><span class="op">);</span></span>
+<span id="cb9-12"><a href="#cb9-12" aria-hidden="true" tabindex="-1"></a>            lines<span class="op">.</span><span class="fu">Add</span><span class="op">(</span>$<span class="st">&quot;  remediation: {finding.Remediation}&quot;</span><span class="op">);</span></span>
+<span id="cb9-13"><a href="#cb9-13" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb9-14"><a href="#cb9-14" aria-hidden="true" tabindex="-1"></a>        <span class="kw">if</span> <span class="op">(</span>findings<span class="op">.</span><span class="fu">Count</span> <span class="op">&gt;</span> <span class="dv">5</span><span class="op">)</span></span>
+<span id="cb9-15"><a href="#cb9-15" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb9-16"><a href="#cb9-16" aria-hidden="true" tabindex="-1"></a>            lines<span class="op">.</span><span class="fu">Add</span><span class="op">(</span>$<span class="st">&quot;... 以及另外 {findings.Count - 5} 条告警&quot;</span><span class="op">);</span></span>
+<span id="cb9-17"><a href="#cb9-17" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb9-18"><a href="#cb9-18" aria-hidden="true" tabindex="-1"></a>        <span class="kw">return</span> <span class="dt">string</span><span class="op">.</span><span class="fu">Join</span><span class="op">(</span><span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">,</span> lines<span class="op">);</span></span>
+<span id="cb9-19"><a href="#cb9-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 4: 跑测试，确认通过</strong></label></li>
+</ul>
+<p>Run: <code>dotnet test maf/tests/YkTako.MafL2.Tests.csproj --nologo</code> Expected: 10 passed。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 5: 提交</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb10"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> add maf/src/Guard.cs maf/tests/GuardEngineTests.cs</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> commit <span class="at">-m</span> <span class="st">&quot;MAF：命中清单格式化与 JsonElement 参数解析测试&quot;</span></span></code></pre></div>
+<hr />
+<h3 id="task-4-假-shell-工具--programcs-接入审批管线与-repl-回路">Task 4: 假 shell 工具 + Program.cs 接入审批管线与 REPL 回路</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Modify: <code>maf/src/BasicTools.cs</code></li>
+<li>Modify: <code>maf/Program.cs</code></li>
+</ul>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 1: BasicTools 加假 shell 工具</strong></label></li>
+</ul>
+<p>在 <code>BasicTools</code> 类内、<code>Calculate</code> 之后加：</p>
+<div class="sourceCode" id="cb11"><pre class="sourceCode csharp"><code class="sourceCode cs"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;summary&gt;</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// 假 shell：审批回路的演示载体，不真正执行任何命令，只回显。</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// 它是规则表唯一能命中的工具（DefaultRules 瞄 shellTools = bash/execute；</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// MAF 演示里没有 bash，故不注册）。</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">/// </span><span class="kw">&lt;/summary&gt;</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span><span class="fu">Description</span><span class="op">(</span><span class="st">&quot;执行一条 shell 命令（演示用假 shell：不会真正执行，只回显命令文本）&quot;</span><span class="op">)]</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">public</span> <span class="kw">static</span> <span class="dt">string</span> <span class="fu">Execute</span><span class="op">([</span><span class="fu">Description</span><span class="op">(</span><span class="st">&quot;要执行的命令行&quot;</span><span class="op">)]</span> <span class="dt">string</span> command<span class="op">)</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>        Console<span class="op">.</span><span class="fu">WriteLine</span><span class="op">(</span>$<span class="st">&quot;  ⚙️ （假 shell）将执行: {command}&quot;</span><span class="op">);</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a>        <span class="kw">return</span> $<span class="st">&quot;（演示用假 shell，未真正执行）命令已受理：{command}&quot;</span><span class="op">;</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 2: Program.cs 全量替换为接线版</strong></label></li>
+</ul>
+<p><code>maf/Program.cs</code> 新内容（保留原文件头注释，只在其后追加一段审批回路说明）：</p>
+<div class="sourceCode" id="cb12"><pre class="sourceCode csharp"><code class="sourceCode cs"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="co">/**</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="co"> * L2 演示 —— 任务规划（Microsoft Agent Framework 版）</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="co"> *</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a><span class="co"> * 对照 TS 版 src/l2/01-planning.ts（不含 L1 守卫栈，按需求只复刻 L2）：</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a><span class="co"> *</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a><span class="co"> *   用户输入 ──→ 模型 ←── [chat 中间件：注入&quot;什么时候列计划&quot;提示词]</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a><span class="co"> *                 │</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="co"> *        ┌────────┴─────────┐</span></span>
+<span id="cb12-9"><a href="#cb12-9" aria-hidden="true" tabindex="-1"></a><span class="co"> *        ▼                  ▼</span></span>
+<span id="cb12-10"><a href="#cb12-10" aria-hidden="true" tabindex="-1"></a><span class="co"> *   普通工具执行       write_todos → TodoStore（todos 频道的 MAF 等价物）</span></span>
+<span id="cb12-11"><a href="#cb12-11" aria-hidden="true" tabindex="-1"></a><span class="co"> *        │                  │</span></span>
+<span id="cb12-12"><a href="#cb12-12" aria-hidden="true" tabindex="-1"></a><span class="co"> *   [function 中间件：并行 write_todos 按 CallId 拦截]</span></span>
+<span id="cb12-13"><a href="#cb12-13" aria-hidden="true" tabindex="-1"></a><span class="co"> *        │</span></span>
+<span id="cb12-14"><a href="#cb12-14" aria-hidden="true" tabindex="-1"></a><span class="co"> *   [agent run 中间件：本轮清单没走完就想收工 → 追加提醒再跑一次]</span></span>
+<span id="cb12-15"><a href="#cb12-15" aria-hidden="true" tabindex="-1"></a><span class="co"> *</span></span>
+<span id="cb12-16"><a href="#cb12-16" aria-hidden="true" tabindex="-1"></a><span class="co"> * 2026-09-26 追加 L1 最小审批回路（对照 yk-tako-eino 的 interrupt/resume，见 doc/10）：</span></span>
+<span id="cb12-17"><a href="#cb12-17" aria-hidden="true" tabindex="-1"></a><span class="co"> *   execute 工具被 ApprovalRequiredAIFunction 标记 → FICC 把调用换成「待批准请求」</span></span>
+<span id="cb12-18"><a href="#cb12-18" aria-hidden="true" tabindex="-1"></a><span class="co"> *   返回 REPL（ToolApprovalAgent 驱动）；guardRule 无阻断命中时自动批准（用户不可见），</span></span>
+<span id="cb12-19"><a href="#cb12-19" aria-hidden="true" tabindex="-1"></a><span class="co"> *   有阻断命中时留给 REPL 问人或直拒，回执经 CreateResponse 作为新 user 消息回传。</span></span>
+<span id="cb12-20"><a href="#cb12-20" aria-hidden="true" tabindex="-1"></a><span class="co"> *</span></span>
+<span id="cb12-21"><a href="#cb12-21" aria-hidden="true" tabindex="-1"></a><span class="co"> * 试试这些输入：</span></span>
+<span id="cb12-22"><a href="#cb12-22" aria-hidden="true" tabindex="-1"></a><span class="co"> *   现在几点                                  → 简单任务，不该列计划</span></span>
+<span id="cb12-23"><a href="#cb12-23" aria-hidden="true" tabindex="-1"></a><span class="co"> *   帮我规划一下：先查现在时间，再算 1234*5678，最后写个总结</span></span>
+<span id="cb12-24"><a href="#cb12-24" aria-hidden="true" tabindex="-1"></a><span class="co"> *                                             → 复杂任务，先列清单再逐项执行</span></span>
+<span id="cb12-25"><a href="#cb12-25" aria-hidden="true" tabindex="-1"></a><span class="co"> *   执行 echo hi                              → execute 无命中，直接执行（假 shell）</span></span>
+<span id="cb12-26"><a href="#cb12-26" aria-hidden="true" tabindex="-1"></a><span class="co"> *   执行 rm -rf /tmp/x                        → 命中危险规则，暂停问人</span></span>
+<span id="cb12-27"><a href="#cb12-27" aria-hidden="true" tabindex="-1"></a><span class="co"> * 斜杠命令：</span></span>
+<span id="cb12-28"><a href="#cb12-28" aria-hidden="true" tabindex="-1"></a><span class="co"> *   /todos   查看当前任务清单（直接读 TodoStore —— 清单是状态，不是消息）</span></span>
+<span id="cb12-29"><a href="#cb12-29" aria-hidden="true" tabindex="-1"></a><span class="co"> *   /mode    切换守卫模式 block|warn|require_approval</span></span>
+<span id="cb12-30"><a href="#cb12-30" aria-hidden="true" tabindex="-1"></a><span class="co"> */</span></span>
+<span id="cb12-31"><a href="#cb12-31" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> Microsoft<span class="op">.</span><span class="fu">Agents</span><span class="op">.</span><span class="fu">AI</span><span class="op">;</span></span>
+<span id="cb12-32"><a href="#cb12-32" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> Microsoft<span class="op">.</span><span class="fu">Extensions</span><span class="op">.</span><span class="fu">AI</span><span class="op">;</span></span>
+<span id="cb12-33"><a href="#cb12-33" aria-hidden="true" tabindex="-1"></a><span class="kw">using</span> YkTako<span class="op">.</span><span class="fu">MafL2</span><span class="op">;</span></span>
+<span id="cb12-34"><a href="#cb12-34" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-35"><a href="#cb12-35" aria-hidden="true" tabindex="-1"></a><span class="co">// ── 模型：复用 yk-tako-eino 的 .env 和 provider-catalog.json，与 Go 主线同一条 TAKO_MODEL ──</span></span>
+<span id="cb12-36"><a href="#cb12-36" aria-hidden="true" tabindex="-1"></a><span class="dt">var</span> repoRoot <span class="op">=</span> EnvFile<span class="op">.</span><span class="fu">FindRepoRoot</span><span class="op">()</span></span>
+<span id="cb12-37"><a href="#cb12-37" aria-hidden="true" tabindex="-1"></a>    <span class="op">??</span> <span class="kw">throw</span> <span class="kw">new</span> <span class="fu">InvalidOperationException</span><span class="op">(</span><span class="st">&quot;向上找不到 yk-tako-eino 目录（yk-tako-eino/internal/config/provider-catalog.json）&quot;</span><span class="op">);</span></span>
+<span id="cb12-38"><a href="#cb12-38" aria-hidden="true" tabindex="-1"></a>EnvFile<span class="op">.</span><span class="fu">Load</span><span class="op">(</span>repoRoot<span class="op">);</span></span>
+<span id="cb12-39"><a href="#cb12-39" aria-hidden="true" tabindex="-1"></a><span class="dt">var</span> modelConfig <span class="op">=</span> ModelResolver<span class="op">.</span><span class="fu">Resolve</span><span class="op">(</span>repoRoot<span class="op">);</span></span>
+<span id="cb12-40"><a href="#cb12-40" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-41"><a href="#cb12-41" aria-hidden="true" tabindex="-1"></a><span class="co">// ── 组装：IChatClient →（chat 中间件）→ ChatClientAgent →（function + run + approval 中间件）──</span></span>
+<span id="cb12-42"><a href="#cb12-42" aria-hidden="true" tabindex="-1"></a><span class="dt">var</span> store <span class="op">=</span> <span class="kw">new</span> <span class="fu">TodoStore</span><span class="op">();</span></span>
+<span id="cb12-43"><a href="#cb12-43" aria-hidden="true" tabindex="-1"></a><span class="dt">var</span> planning <span class="op">=</span> <span class="kw">new</span> <span class="fu">PlanningMiddleware</span><span class="op">(</span>store<span class="op">);</span></span>
+<span id="cb12-44"><a href="#cb12-44" aria-hidden="true" tabindex="-1"></a><span class="dt">var</span> guardEngine <span class="op">=</span> <span class="kw">new</span> <span class="fu">GuardEngine</span><span class="op">(</span>GuardMode<span class="op">.</span><span class="fu">RequireApproval</span><span class="op">);</span> <span class="co">// 对齐 Eino 入口默认；/mode 可切</span></span>
+<span id="cb12-45"><a href="#cb12-45" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-46"><a href="#cb12-46" aria-hidden="true" tabindex="-1"></a><span class="dt">var</span> chatClient <span class="op">=</span> modelConfig<span class="op">.</span><span class="fu">BuildChatClient</span><span class="op">()</span></span>
+<span id="cb12-47"><a href="#cb12-47" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span><span class="fu">AsBuilder</span><span class="op">()</span></span>
+<span id="cb12-48"><a href="#cb12-48" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span><span class="fu">Use</span><span class="op">(</span>getResponseFunc<span class="op">:</span> planning<span class="op">.</span><span class="fu">ChatMiddleware</span><span class="op">,</span> getStreamingResponseFunc<span class="op">:</span> <span class="kw">null</span><span class="op">)</span></span>
+<span id="cb12-49"><a href="#cb12-49" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span><span class="fu">Build</span><span class="op">();</span></span>
+<span id="cb12-50"><a href="#cb12-50" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-51"><a href="#cb12-51" aria-hidden="true" tabindex="-1"></a><span class="dt">var</span> baseAgent <span class="op">=</span> <span class="kw">new</span> <span class="fu">ChatClientAgent</span><span class="op">(</span></span>
+<span id="cb12-52"><a href="#cb12-52" aria-hidden="true" tabindex="-1"></a>    chatClient<span class="op">,</span></span>
+<span id="cb12-53"><a href="#cb12-53" aria-hidden="true" tabindex="-1"></a>    instructions<span class="op">:</span> <span class="st">&quot;你是 yk-tako 的 MAF 移植版，一个命令行 AI 工作伙伴。&quot;</span><span class="op">,</span></span>
+<span id="cb12-54"><a href="#cb12-54" aria-hidden="true" tabindex="-1"></a>    name<span class="op">:</span> <span class="st">&quot;yk-tako-maf-l2&quot;</span><span class="op">,</span></span>
+<span id="cb12-55"><a href="#cb12-55" aria-hidden="true" tabindex="-1"></a>    tools<span class="op">:</span></span>
+<span id="cb12-56"><a href="#cb12-56" aria-hidden="true" tabindex="-1"></a>    <span class="op">[</span></span>
+<span id="cb12-57"><a href="#cb12-57" aria-hidden="true" tabindex="-1"></a>        AIFunctionFactory<span class="op">.</span><span class="fu">Create</span><span class="op">(</span>BasicTools<span class="op">.</span><span class="fu">GetCurrentTime</span><span class="op">,</span> name<span class="op">:</span> <span class="st">&quot;get_current_time&quot;</span><span class="op">),</span></span>
+<span id="cb12-58"><a href="#cb12-58" aria-hidden="true" tabindex="-1"></a>        AIFunctionFactory<span class="op">.</span><span class="fu">Create</span><span class="op">(</span>BasicTools<span class="op">.</span><span class="fu">Calculate</span><span class="op">,</span> name<span class="op">:</span> <span class="st">&quot;calculate&quot;</span><span class="op">),</span></span>
+<span id="cb12-59"><a href="#cb12-59" aria-hidden="true" tabindex="-1"></a>        planning<span class="op">.</span><span class="fu">CreateWriteTodosTool</span><span class="op">(),</span></span>
+<span id="cb12-60"><a href="#cb12-60" aria-hidden="true" tabindex="-1"></a>        <span class="co">// execute：规则表唯一能命中的工具；ApprovalRequiredAIFunction 让 FICC 把它的调用</span></span>
+<span id="cb12-61"><a href="#cb12-61" aria-hidden="true" tabindex="-1"></a>        <span class="co">// 换成「待批准请求」返回调用方（这是 MAF 原生的 interrupt 等价物，见 doc/10）。</span></span>
+<span id="cb12-62"><a href="#cb12-62" aria-hidden="true" tabindex="-1"></a>        <span class="kw">new</span> <span class="fu">ApprovalRequiredAIFunction</span><span class="op">(</span>AIFunctionFactory<span class="op">.</span><span class="fu">Create</span><span class="op">(</span>BasicTools<span class="op">.</span><span class="fu">Execute</span><span class="op">,</span> name<span class="op">:</span> <span class="st">&quot;execute&quot;</span><span class="op">)),</span></span>
+<span id="cb12-63"><a href="#cb12-63" aria-hidden="true" tabindex="-1"></a>    <span class="op">]);</span></span>
+<span id="cb12-64"><a href="#cb12-64" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-65"><a href="#cb12-65" aria-hidden="true" tabindex="-1"></a><span class="co">// 自动批准规则：无阻断命中 → 批（用户不可见）；有阻断命中 → 不批，冒泡给 REPL。</span></span>
+<span id="cb12-66"><a href="#cb12-66" aria-hidden="true" tabindex="-1"></a><span class="co">// warn 模式一律批，只把告警打印出来（对齐 Eino ModeWarn）。</span></span>
+<span id="cb12-67"><a href="#cb12-67" aria-hidden="true" tabindex="-1"></a><span class="dt">var</span> guardRule <span class="op">=</span> <span class="kw">new</span> Func<span class="op">&lt;</span>ToolAutoApprovalRuleContext<span class="op">,</span> ValueTask<span class="op">&lt;</span><span class="dt">bool</span><span class="op">&gt;&gt;(</span>ctx <span class="op">=&gt;</span></span>
+<span id="cb12-68"><a href="#cb12-68" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb12-69"><a href="#cb12-69" aria-hidden="true" tabindex="-1"></a>    <span class="dt">var</span> call <span class="op">=</span> ctx<span class="op">.</span><span class="fu">FunctionCallContent</span><span class="op">;</span></span>
+<span id="cb12-70"><a href="#cb12-70" aria-hidden="true" tabindex="-1"></a>    <span class="dt">var</span> findings <span class="op">=</span> guardEngine<span class="op">.</span><span class="fu">Guard</span><span class="op">(</span>call<span class="op">.</span><span class="fu">Name</span><span class="op">,</span> call<span class="op">.</span><span class="fu">Arguments</span><span class="op">);</span></span>
+<span id="cb12-71"><a href="#cb12-71" aria-hidden="true" tabindex="-1"></a>    <span class="kw">if</span> <span class="op">(</span>guardEngine<span class="op">.</span><span class="fu">Mode</span> <span class="op">==</span> GuardMode<span class="op">.</span><span class="fu">Warn</span><span class="op">)</span></span>
+<span id="cb12-72"><a href="#cb12-72" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb12-73"><a href="#cb12-73" aria-hidden="true" tabindex="-1"></a>        <span class="kw">if</span> <span class="op">(</span>findings<span class="op">.</span><span class="fu">Count</span> <span class="op">&gt;</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb12-74"><a href="#cb12-74" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb12-75"><a href="#cb12-75" aria-hidden="true" tabindex="-1"></a>            Console<span class="op">.</span><span class="fu">WriteLine</span><span class="op">(</span>$<span class="st">&quot;</span><span class="sc">\n</span><span class="st">⚠️  [tool_guard] {GuardEngine.FormatFindings(findings, &quot;</span>检测到风险参数（warn 模式，放行）<span class="st">&quot;)}</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb12-76"><a href="#cb12-76" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb12-77"><a href="#cb12-77" aria-hidden="true" tabindex="-1"></a>        <span class="kw">return</span> ValueTask<span class="op">.</span><span class="fu">FromResult</span><span class="op">(</span><span class="kw">true</span><span class="op">);</span></span>
+<span id="cb12-78"><a href="#cb12-78" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-79"><a href="#cb12-79" aria-hidden="true" tabindex="-1"></a>    <span class="kw">return</span> ValueTask<span class="op">.</span><span class="fu">FromResult</span><span class="op">(!</span>guardEngine<span class="op">.</span><span class="fu">ShouldBlock</span><span class="op">(</span>findings<span class="op">));</span></span>
+<span id="cb12-80"><a href="#cb12-80" aria-hidden="true" tabindex="-1"></a><span class="op">});</span></span>
+<span id="cb12-81"><a href="#cb12-81" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-82"><a href="#cb12-82" aria-hidden="true" tabindex="-1"></a><span class="dt">var</span> agent <span class="op">=</span> baseAgent</span>
+<span id="cb12-83"><a href="#cb12-83" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span><span class="fu">AsBuilder</span><span class="op">()</span></span>
+<span id="cb12-84"><a href="#cb12-84" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span><span class="fu">Use</span><span class="op">(</span>runFunc<span class="op">:</span> planning<span class="op">.</span><span class="fu">NudgeMiddleware</span><span class="op">,</span> runStreamingFunc<span class="op">:</span> <span class="kw">null</span><span class="op">)</span> <span class="co">// 半途而废提醒（最外层）</span></span>
+<span id="cb12-85"><a href="#cb12-85" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span><span class="fu">Use</span><span class="op">(</span>planning<span class="op">.</span><span class="fu">FunctionMiddleware</span><span class="op">)</span>                               <span class="co">// 并行 write_todos 拦截</span></span>
+<span id="cb12-86"><a href="#cb12-86" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span><span class="fu">UseToolApproval</span><span class="op">(</span><span class="kw">new</span> ToolApprovalAgentOptions <span class="op">{</span> AutoApprovalRules <span class="op">=</span> <span class="op">[</span>guardRule<span class="op">]</span> <span class="op">})</span> <span class="co">// 审批回路（最内层）</span></span>
+<span id="cb12-87"><a href="#cb12-87" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span><span class="fu">Build</span><span class="op">();</span></span>
+<span id="cb12-88"><a href="#cb12-88" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-89"><a href="#cb12-89" aria-hidden="true" tabindex="-1"></a><span class="dt">var</span> session <span class="op">=</span> await agent<span class="op">.</span><span class="fu">CreateSessionAsync</span><span class="op">();</span></span>
+<span id="cb12-90"><a href="#cb12-90" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-91"><a href="#cb12-91" aria-hidden="true" tabindex="-1"></a>Console<span class="op">.</span><span class="fu">WriteLine</span><span class="op">(</span>$<span class="st">&quot;L2 任务规划 + L1 最小审批回路（MAF approval 管线）。模型 {modelConfig.Ref}。&quot;</span><span class="op">);</span></span>
+<span id="cb12-92"><a href="#cb12-92" aria-hidden="true" tabindex="-1"></a>Console<span class="op">.</span><span class="fu">WriteLine</span><span class="op">(</span>$<span class="st">&quot;ToolGuard 模式: {GuardEngine.ModeName(guardEngine.Mode)}（/mode 可切换）。/todos 看清单，quit 退出。</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb12-93"><a href="#cb12-93" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-94"><a href="#cb12-94" aria-hidden="true" tabindex="-1"></a><span class="kw">while</span> <span class="op">(</span><span class="kw">true</span><span class="op">)</span></span>
+<span id="cb12-95"><a href="#cb12-95" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb12-96"><a href="#cb12-96" aria-hidden="true" tabindex="-1"></a>    Console<span class="op">.</span><span class="fu">Write</span><span class="op">(</span><span class="st">&quot;你: &quot;</span><span class="op">);</span></span>
+<span id="cb12-97"><a href="#cb12-97" aria-hidden="true" tabindex="-1"></a>    <span class="dt">var</span> input <span class="op">=</span> Console<span class="op">.</span><span class="fu">ReadLine</span><span class="op">()?.</span><span class="fu">Trim</span><span class="op">();</span></span>
+<span id="cb12-98"><a href="#cb12-98" aria-hidden="true" tabindex="-1"></a>    <span class="kw">if</span> <span class="op">(</span>input <span class="kw">is</span> <span class="kw">null</span> or <span class="st">&quot;quit&quot;</span> or <span class="st">&quot;exit&quot;</span><span class="op">)</span> <span class="kw">break</span><span class="op">;</span></span>
+<span id="cb12-99"><a href="#cb12-99" aria-hidden="true" tabindex="-1"></a>    <span class="kw">if</span> <span class="op">(</span>input<span class="op">.</span><span class="fu">Length</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span> <span class="kw">continue</span><span class="op">;</span></span>
+<span id="cb12-100"><a href="#cb12-100" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-101"><a href="#cb12-101" aria-hidden="true" tabindex="-1"></a>    <span class="co">// /todos：直接读 TodoStore——清单是状态，不是消息，所以能绕过对话这样查</span></span>
+<span id="cb12-102"><a href="#cb12-102" aria-hidden="true" tabindex="-1"></a>    <span class="kw">if</span> <span class="op">(</span>input <span class="op">==</span> <span class="st">&quot;/todos&quot;</span><span class="op">)</span></span>
+<span id="cb12-103"><a href="#cb12-103" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb12-104"><a href="#cb12-104" aria-hidden="true" tabindex="-1"></a>        Console<span class="op">.</span><span class="fu">WriteLine</span><span class="op">(</span>$<span class="st">&quot;📋 当前任务清单:</span><span class="sc">\n</span><span class="st">{store.FormatAll()}</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb12-105"><a href="#cb12-105" aria-hidden="true" tabindex="-1"></a>        <span class="kw">continue</span><span class="op">;</span></span>
+<span id="cb12-106"><a href="#cb12-106" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-107"><a href="#cb12-107" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-108"><a href="#cb12-108" aria-hidden="true" tabindex="-1"></a>    <span class="kw">if</span> <span class="op">(</span>input<span class="op">.</span><span class="fu">StartsWith</span><span class="op">(</span><span class="st">&quot;/mode &quot;</span><span class="op">,</span> StringComparison<span class="op">.</span><span class="fu">Ordinal</span><span class="op">))</span></span>
+<span id="cb12-109"><a href="#cb12-109" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb12-110"><a href="#cb12-110" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> value <span class="op">=</span> input<span class="op">[</span><span class="dv">6</span><span class="op">..].</span><span class="fu">Trim</span><span class="op">();</span></span>
+<span id="cb12-111"><a href="#cb12-111" aria-hidden="true" tabindex="-1"></a>        <span class="kw">if</span> <span class="op">(</span>GuardEngine<span class="op">.</span><span class="fu">TryParseMode</span><span class="op">(</span>value<span class="op">,</span> <span class="kw">out</span> <span class="dt">var</span> mode<span class="op">))</span></span>
+<span id="cb12-112"><a href="#cb12-112" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb12-113"><a href="#cb12-113" aria-hidden="true" tabindex="-1"></a>            guardEngine<span class="op">.</span><span class="fu">Configure</span><span class="op">(</span>mode<span class="op">);</span></span>
+<span id="cb12-114"><a href="#cb12-114" aria-hidden="true" tabindex="-1"></a>            Console<span class="op">.</span><span class="fu">WriteLine</span><span class="op">(</span>$<span class="st">&quot;ToolGuard 模式已切换为: {GuardEngine.ModeName(mode)}</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb12-115"><a href="#cb12-115" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb12-116"><a href="#cb12-116" aria-hidden="true" tabindex="-1"></a>        <span class="kw">else</span></span>
+<span id="cb12-117"><a href="#cb12-117" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb12-118"><a href="#cb12-118" aria-hidden="true" tabindex="-1"></a>            Console<span class="op">.</span><span class="fu">WriteLine</span><span class="op">(</span><span class="st">&quot;用法: /mode block|warn|require_approval</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb12-119"><a href="#cb12-119" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb12-120"><a href="#cb12-120" aria-hidden="true" tabindex="-1"></a>        <span class="kw">continue</span><span class="op">;</span></span>
+<span id="cb12-121"><a href="#cb12-121" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-122"><a href="#cb12-122" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-123"><a href="#cb12-123" aria-hidden="true" tabindex="-1"></a>    <span class="kw">try</span></span>
+<span id="cb12-124"><a href="#cb12-124" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb12-125"><a href="#cb12-125" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> response <span class="op">=</span> await agent<span class="op">.</span><span class="fu">RunAsync</span><span class="op">(</span>input<span class="op">,</span> session<span class="op">);</span></span>
+<span id="cb12-126"><a href="#cb12-126" aria-hidden="true" tabindex="-1"></a>        response <span class="op">=</span> await <span class="fu">ResolveApprovalsAsync</span><span class="op">(</span>agent<span class="op">,</span> session<span class="op">,</span> response<span class="op">,</span> guardEngine<span class="op">);</span></span>
+<span id="cb12-127"><a href="#cb12-127" aria-hidden="true" tabindex="-1"></a>        Console<span class="op">.</span><span class="fu">WriteLine</span><span class="op">(</span>$<span class="st">&quot;</span><span class="sc">\n</span><span class="st">🐙 {response.Text}</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb12-128"><a href="#cb12-128" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-129"><a href="#cb12-129" aria-hidden="true" tabindex="-1"></a>    <span class="kw">catch</span> <span class="op">(</span>Exception ex<span class="op">)</span></span>
+<span id="cb12-130"><a href="#cb12-130" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb12-131"><a href="#cb12-131" aria-hidden="true" tabindex="-1"></a>        Console<span class="op">.</span><span class="fu">Error</span><span class="op">.</span><span class="fu">WriteLine</span><span class="op">(</span>$<span class="st">&quot;出错了: {ex.Message}&quot;</span><span class="op">);</span></span>
+<span id="cb12-132"><a href="#cb12-132" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-133"><a href="#cb12-133" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb12-134"><a href="#cb12-134" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-135"><a href="#cb12-135" aria-hidden="true" tabindex="-1"></a><span class="co">// 审批回路（写入端）：RunAsync 返回的响应里可能有待批准的工具调用</span></span>
+<span id="cb12-136"><a href="#cb12-136" aria-hidden="true" tabindex="-1"></a><span class="co">// （ToolApprovalRequestContent，钥匙是这个请求的 RequestId）。逐个判定：</span></span>
+<span id="cb12-137"><a href="#cb12-137" aria-hidden="true" tabindex="-1"></a><span class="co">//   block 模式 + 阻断级命中 → 直接拒绝（不进人）；</span></span>
+<span id="cb12-138"><a href="#cb12-138" aria-hidden="true" tabindex="-1"></a><span class="co">//   未达阻断级（自动批准上限路径的兜底）→ 静默批准；</span></span>
+<span id="cb12-139"><a href="#cb12-139" aria-hidden="true" tabindex="-1"></a><span class="co">//   其余 → 问人。回执装成一条新 user 消息回传，ToolApprovalAgent 按 RequestId</span></span>
+<span id="cb12-140"><a href="#cb12-140" aria-hidden="true" tabindex="-1"></a><span class="co">//   绑定到它 surfaced 过的请求，FICC 重建调用执行或生成拒绝结果。</span></span>
+<span id="cb12-141"><a href="#cb12-141" aria-hidden="true" tabindex="-1"></a><span class="kw">static</span> async Task<span class="op">&lt;</span>AgentResponse<span class="op">&gt;</span> <span class="fu">ResolveApprovalsAsync</span><span class="op">(</span></span>
+<span id="cb12-142"><a href="#cb12-142" aria-hidden="true" tabindex="-1"></a>    AIAgent agent<span class="op">,</span> AgentSession session<span class="op">,</span> AgentResponse response<span class="op">,</span> GuardEngine engine<span class="op">)</span></span>
+<span id="cb12-143"><a href="#cb12-143" aria-hidden="true" tabindex="-1"></a><span class="op">{</span></span>
+<span id="cb12-144"><a href="#cb12-144" aria-hidden="true" tabindex="-1"></a>    <span class="kw">while</span> <span class="op">(</span><span class="kw">true</span><span class="op">)</span></span>
+<span id="cb12-145"><a href="#cb12-145" aria-hidden="true" tabindex="-1"></a>    <span class="op">{</span></span>
+<span id="cb12-146"><a href="#cb12-146" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> pending <span class="op">=</span> response<span class="op">.</span><span class="fu">Messages</span></span>
+<span id="cb12-147"><a href="#cb12-147" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span><span class="fu">SelectMany</span><span class="op">(</span>m <span class="op">=&gt;</span> m<span class="op">.</span><span class="fu">Contents</span><span class="op">)</span></span>
+<span id="cb12-148"><a href="#cb12-148" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span><span class="fu">OfType</span><span class="op">&lt;</span>ToolApprovalRequestContent<span class="op">&gt;()</span></span>
+<span id="cb12-149"><a href="#cb12-149" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span><span class="fu">Where</span><span class="op">(</span>r <span class="op">=&gt;</span> r<span class="op">.</span><span class="fu">RequiresConfirmation</span><span class="op">)</span></span>
+<span id="cb12-150"><a href="#cb12-150" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span><span class="fu">ToList</span><span class="op">();</span></span>
+<span id="cb12-151"><a href="#cb12-151" aria-hidden="true" tabindex="-1"></a>        <span class="kw">if</span> <span class="op">(</span>pending<span class="op">.</span><span class="fu">Count</span> <span class="op">==</span> <span class="dv">0</span><span class="op">)</span></span>
+<span id="cb12-152"><a href="#cb12-152" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb12-153"><a href="#cb12-153" aria-hidden="true" tabindex="-1"></a>            <span class="kw">return</span> response<span class="op">;</span></span>
+<span id="cb12-154"><a href="#cb12-154" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb12-155"><a href="#cb12-155" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-156"><a href="#cb12-156" aria-hidden="true" tabindex="-1"></a>        <span class="dt">var</span> replies <span class="op">=</span> <span class="kw">new</span> List<span class="op">&lt;</span>AIContent<span class="op">&gt;();</span></span>
+<span id="cb12-157"><a href="#cb12-157" aria-hidden="true" tabindex="-1"></a>        <span class="kw">foreach</span> <span class="op">(</span><span class="dt">var</span> request <span class="kw">in</span> pending<span class="op">)</span></span>
+<span id="cb12-158"><a href="#cb12-158" aria-hidden="true" tabindex="-1"></a>        <span class="op">{</span></span>
+<span id="cb12-159"><a href="#cb12-159" aria-hidden="true" tabindex="-1"></a>            <span class="dt">var</span> call <span class="op">=</span> request<span class="op">.</span><span class="fu">ToolCall</span> <span class="kw">as</span> FunctionCallContent<span class="op">;</span></span>
+<span id="cb12-160"><a href="#cb12-160" aria-hidden="true" tabindex="-1"></a>            <span class="dt">var</span> findings <span class="op">=</span> call <span class="kw">is</span> <span class="kw">null</span></span>
+<span id="cb12-161"><a href="#cb12-161" aria-hidden="true" tabindex="-1"></a>                <span class="op">?</span> <span class="op">(</span>IReadOnlyList<span class="op">&lt;</span>Finding<span class="op">&gt;)</span>Array<span class="op">.</span><span class="fu">Empty</span><span class="op">&lt;</span>Finding<span class="op">&gt;()</span></span>
+<span id="cb12-162"><a href="#cb12-162" aria-hidden="true" tabindex="-1"></a>                <span class="op">:</span> engine<span class="op">.</span><span class="fu">Guard</span><span class="op">(</span>call<span class="op">.</span><span class="fu">Name</span><span class="op">,</span> call<span class="op">.</span><span class="fu">Arguments</span><span class="op">);</span></span>
+<span id="cb12-163"><a href="#cb12-163" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-164"><a href="#cb12-164" aria-hidden="true" tabindex="-1"></a>            <span class="dt">bool</span> approved<span class="op">;</span></span>
+<span id="cb12-165"><a href="#cb12-165" aria-hidden="true" tabindex="-1"></a>            <span class="dt">string</span> reason<span class="op">;</span></span>
+<span id="cb12-166"><a href="#cb12-166" aria-hidden="true" tabindex="-1"></a>            <span class="kw">if</span> <span class="op">(</span>engine<span class="op">.</span><span class="fu">Mode</span> <span class="op">==</span> GuardMode<span class="op">.</span><span class="fu">Block</span> <span class="op">&amp;&amp;</span> engine<span class="op">.</span><span class="fu">ShouldBlock</span><span class="op">(</span>findings<span class="op">))</span></span>
+<span id="cb12-167"><a href="#cb12-167" aria-hidden="true" tabindex="-1"></a>            <span class="op">{</span></span>
+<span id="cb12-168"><a href="#cb12-168" aria-hidden="true" tabindex="-1"></a>                approved <span class="op">=</span> <span class="kw">false</span><span class="op">;</span></span>
+<span id="cb12-169"><a href="#cb12-169" aria-hidden="true" tabindex="-1"></a>                reason <span class="op">=</span> GuardEngine<span class="op">.</span><span class="fu">FormatFindings</span><span class="op">(</span>findings<span class="op">,</span> <span class="st">&quot;工具调用被安全策略拦截（command guard）&quot;</span><span class="op">);</span></span>
+<span id="cb12-170"><a href="#cb12-170" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb12-171"><a href="#cb12-171" aria-hidden="true" tabindex="-1"></a>            <span class="kw">else</span> <span class="kw">if</span> <span class="op">(!</span>engine<span class="op">.</span><span class="fu">ShouldBlock</span><span class="op">(</span>findings<span class="op">))</span></span>
+<span id="cb12-172"><a href="#cb12-172" aria-hidden="true" tabindex="-1"></a>            <span class="op">{</span></span>
+<span id="cb12-173"><a href="#cb12-173" aria-hidden="true" tabindex="-1"></a>                approved <span class="op">=</span> <span class="kw">true</span><span class="op">;</span></span>
+<span id="cb12-174"><a href="#cb12-174" aria-hidden="true" tabindex="-1"></a>                reason <span class="op">=</span> <span class="st">&quot;&quot;</span><span class="op">;</span></span>
+<span id="cb12-175"><a href="#cb12-175" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb12-176"><a href="#cb12-176" aria-hidden="true" tabindex="-1"></a>            <span class="kw">else</span></span>
+<span id="cb12-177"><a href="#cb12-177" aria-hidden="true" tabindex="-1"></a>            <span class="op">{</span></span>
+<span id="cb12-178"><a href="#cb12-178" aria-hidden="true" tabindex="-1"></a>                Console<span class="op">.</span><span class="fu">WriteLine</span><span class="op">(</span><span class="st">&quot;</span><span class="sc">\n</span><span class="st">⏸️  ═══════════════ 人工审批（tool approval）═══════════════&quot;</span><span class="op">);</span></span>
+<span id="cb12-179"><a href="#cb12-179" aria-hidden="true" tabindex="-1"></a>                Console<span class="op">.</span><span class="fu">WriteLine</span><span class="op">(</span>$<span class="st">&quot;工具: {call!.Name}   参数: {FormatArgs(call)}&quot;</span><span class="op">);</span></span>
+<span id="cb12-180"><a href="#cb12-180" aria-hidden="true" tabindex="-1"></a>                Console<span class="op">.</span><span class="fu">WriteLine</span><span class="op">(</span>GuardEngine<span class="op">.</span><span class="fu">FormatFindings</span><span class="op">(</span>findings<span class="op">,</span> <span class="st">&quot;工具调用需要人工批准（命中风险规则）&quot;</span><span class="op">));</span></span>
+<span id="cb12-181"><a href="#cb12-181" aria-hidden="true" tabindex="-1"></a>                Console<span class="op">.</span><span class="fu">Write</span><span class="op">(</span><span class="st">&quot;批准执行？[y/N] &quot;</span><span class="op">);</span></span>
+<span id="cb12-182"><a href="#cb12-182" aria-hidden="true" tabindex="-1"></a>                <span class="dt">var</span> answer <span class="op">=</span> Console<span class="op">.</span><span class="fu">ReadLine</span><span class="op">()?.</span><span class="fu">Trim</span><span class="op">().</span><span class="fu">ToLowerInvariant</span><span class="op">();</span></span>
+<span id="cb12-183"><a href="#cb12-183" aria-hidden="true" tabindex="-1"></a>                approved <span class="op">=</span> answer <span class="kw">is</span> <span class="st">&quot;y&quot;</span> or <span class="st">&quot;yes&quot;</span><span class="op">;</span></span>
+<span id="cb12-184"><a href="#cb12-184" aria-hidden="true" tabindex="-1"></a>                reason <span class="op">=</span> approved <span class="op">?</span> <span class="st">&quot;用户批准&quot;</span> <span class="op">:</span> <span class="st">&quot;用户拒绝&quot;</span><span class="op">;</span></span>
+<span id="cb12-185"><a href="#cb12-185" aria-hidden="true" tabindex="-1"></a>                Console<span class="op">.</span><span class="fu">WriteLine</span><span class="op">(</span>approved <span class="op">?</span> <span class="st">&quot;✅ 已批准，继续执行</span><span class="sc">\n</span><span class="st">&quot;</span> <span class="op">:</span> <span class="st">&quot;🚫 已拒绝</span><span class="sc">\n</span><span class="st">&quot;</span><span class="op">);</span></span>
+<span id="cb12-186"><a href="#cb12-186" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span></span>
+<span id="cb12-187"><a href="#cb12-187" aria-hidden="true" tabindex="-1"></a>            replies<span class="op">.</span><span class="fu">Add</span><span class="op">(</span>request<span class="op">.</span><span class="fu">CreateResponse</span><span class="op">(</span>approved<span class="op">,</span> reason<span class="op">));</span></span>
+<span id="cb12-188"><a href="#cb12-188" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span></span>
+<span id="cb12-189"><a href="#cb12-189" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-190"><a href="#cb12-190" aria-hidden="true" tabindex="-1"></a>        response <span class="op">=</span> await agent<span class="op">.</span><span class="fu">RunAsync</span><span class="op">(</span><span class="kw">new</span> <span class="fu">ChatMessage</span><span class="op">(</span>ChatRole<span class="op">.</span><span class="fu">User</span><span class="op">,</span> replies<span class="op">),</span> session<span class="op">);</span></span>
+<span id="cb12-191"><a href="#cb12-191" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb12-192"><a href="#cb12-192" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb12-193"><a href="#cb12-193" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb12-194"><a href="#cb12-194" aria-hidden="true" tabindex="-1"></a><span class="co">// 审批提示里的参数展示：函数调用的参数表拍平成一行的 key=value。</span></span>
+<span id="cb12-195"><a href="#cb12-195" aria-hidden="true" tabindex="-1"></a><span class="kw">static</span> <span class="dt">string</span> <span class="fu">FormatArgs</span><span class="op">(</span>FunctionCallContent call<span class="op">)</span> <span class="op">=&gt;</span></span>
+<span id="cb12-196"><a href="#cb12-196" aria-hidden="true" tabindex="-1"></a>    call<span class="op">.</span><span class="fu">Arguments</span> <span class="kw">is</span> <span class="kw">null</span></span>
+<span id="cb12-197"><a href="#cb12-197" aria-hidden="true" tabindex="-1"></a>        <span class="op">?</span> <span class="st">&quot;(无)&quot;</span></span>
+<span id="cb12-198"><a href="#cb12-198" aria-hidden="true" tabindex="-1"></a>        <span class="op">:</span> <span class="dt">string</span><span class="op">.</span><span class="fu">Join</span><span class="op">(</span><span class="st">&quot;, &quot;</span><span class="op">,</span> call<span class="op">.</span><span class="fu">Arguments</span><span class="op">.</span><span class="fu">Select</span><span class="op">(</span>kv <span class="op">=&gt;</span> $<span class="st">&quot;{kv.Key}={kv.Value}&quot;</span><span class="op">));</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 3: 编译</strong></label></li>
+</ul>
+<p>Run: <code>dotnet build maf/YkTako.MafL2.csproj --nologo</code> Expected: Build succeeded（0 error；若有 warning 先记录不阻塞）。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 4: 回归单测（确认没把工程结构改坏）</strong></label></li>
+</ul>
+<p>Run: <code>dotnet test maf/tests/YkTako.MafL2.Tests.csproj --nologo</code> Expected: 10 passed。</p>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 5: 真模型冒烟（需要用户同意；会消耗 API 配额）</strong></label></li>
+</ul>
+<p>先问用户是否同意跑，同意后交互式执行：</p>
+<div class="sourceCode" id="cb13"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">dotnet</span> run <span class="at">--project</span> maf/YkTako.MafL2.csproj</span></code></pre></div>
+<p>Expected（逐条核对并记录到 doc/10）：</p>
+<ol type="1">
+<li><code>执行 echo hi</code> → 无审批块，直接出现「⚙️ （假 shell）」；</li>
+<li><code>执行 rm -rf /tmp/x</code> → 出现 <code>⏸️ 人工审批</code> 块；输入 <code>N</code> → 模型收到拒绝理由并继续；再试一次输入 <code>y</code> → 假 shell 回执；</li>
+<li><code>/mode warn</code> 后重复第 2 条 → 打印 ⚠️ 且直接执行；</li>
+<li><code>/mode block</code> 后重复第 2 条 → 不问直接拒（模型收到拦截文案）；</li>
+<li>若模型不肯调用 <code>execute</code>（安全对齐拒答），改用更中性话术或在输入里明确「请调用 execute 工具」；仍不行则记录为冒烟受限并标注。</li>
+</ol>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 6: 提交</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb14"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> add maf/src/BasicTools.cs maf/Program.cs</span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> commit <span class="at">-m</span> <span class="st">&quot;MAF：假 shell + 审批回路接线（ApprovalRequiredAIFunction/ToolApprovalAgent/REPL 回执）&quot;</span></span></code></pre></div>
+<hr />
+<h3 id="task-5-readme-更新">Task 5: README 更新</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Modify: <code>maf/README.md</code></li>
+</ul>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 1: 状态行加限定解冻说明</strong></label></li>
+</ul>
+<p>把 <code>maf/README.md:3-5</code> 的状态段落改为：</p>
+<div class="sourceCode" id="cb15"><pre class="sourceCode markdown"><code class="sourceCode markdown"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; 状态：**冻结存档**（2026-09-24 起不再推进）。主线已定为 Go/Eino（</span><span class="in">`yk-tako-eino/`</span><span class="at">），</span></span>
+<span id="cb15-2"><a href="#cb15-2" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; 原 TypeScript 实现已删除；下文中&quot;TS 版&quot;均指这份已删除的 LangGraph.js 实现，</span></span>
+<span id="cb15-3"><a href="#cb15-3" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; 机制对照描述仍然有效。</span></span>
+<span id="cb15-4"><a href="#cb15-4" aria-hidden="true" tabindex="-1"></a><span class="at">&gt;</span></span>
+<span id="cb15-5"><a href="#cb15-5" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; 2026-09-26 限定解冻：追加 L1 最小审批回路（</span><span class="in">`src/Guard.cs`</span><span class="at"> + </span><span class="in">`Program.cs`</span><span class="at"> 的</span></span>
+<span id="cb15-6"><a href="#cb15-6" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; approval 管线接线），用于与 Go/Eino 的 interrupt/resume 做机制对照（见 </span><span class="in">`doc/10`</span><span class="at">）。</span></span>
+<span id="cb15-7"><a href="#cb15-7" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; 主线仍在 Go/Eino；本目录除该回路外不再演进。</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 2: 机制映射表加一行</strong></label></li>
+</ul>
+<p>在「机制映射：LangGraph → MAF」表格末尾追加：</p>
+<div class="sourceCode" id="cb16"><pre class="sourceCode markdown"><code class="sourceCode markdown"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="pp">|</span> L1 工具守卫的审批回路（Go/Eino：interrupt + resume） <span class="pp">|</span> 规则引擎 <span class="in">`GuardEngine`</span> 判「自动批/不批」+ MAF <span class="in">`ToolApprovalAgent`</span> 与 FICC 的 approval 管线承担暂停/回执/执行 <span class="pp">|</span> <span class="in">`src/Guard.cs`</span> + <span class="in">`Program.cs`</span> <span class="pp">|</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 3: 文件列表与实测记录</strong></label></li>
+</ul>
+<p>文件列表加一行：</p>
+<pre class="text"><code>src/Guard.cs        L1 规则引擎（移植自 Go/Eino 的 toolguard.go）+ 命中格式化</code></pre>
+<p>实测记录表格追加（冒烟实跑后按实际补文案，先留行）：</p>
+<div class="sourceCode" id="cb18"><pre class="sourceCode markdown"><code class="sourceCode markdown"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="pp">|</span> <span class="in">`执行 rm -rf /tmp/x`</span> <span class="pp">|</span> execute 命中危险规则 → ⏸️ 人工审批 → 拒绝则模型收到拒绝理由、批准则假 shell 回执 ✅ <span class="pp">|</span></span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 4: 提交</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb19"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> add maf/README.md</span>
+<span id="cb19-2"><a href="#cb19-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> commit <span class="at">-m</span> <span class="st">&quot;MAF：README 记录限定解冻与审批回路&quot;</span></span></code></pre></div>
+<hr />
+<h3 id="task-6-doc10-对比文档maf-vs-eino">Task 6: doc/10 对比文档（MAF vs Eino）</h3>
+<p><strong>Files:</strong></p>
+<ul>
+<li>Create: <code>doc/10-MAF审批回路与Eino对照.md</code></li>
+</ul>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 1: 写文档</strong></label></li>
+</ul>
+<p>结构（内容按冒烟实测补全；设计层结论已定，见 spec）：</p>
+<div class="sourceCode" id="cb20"><pre class="sourceCode markdown"><code class="sourceCode markdown"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="fu"># 10 - MAF 审批回路与 Eino 对照</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; 承接 doc/09 §12：Eino 的 resume 中段（Targets ↔ GetResumeContext）如何相遇。</span></span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; 本文回答：MAF 有没有这个问题、补上对应功能后两者差在哪。实现记录在</span></span>
+<span id="cb20-5"><a href="#cb20-5" aria-hidden="true" tabindex="-1"></a><span class="at">&gt; maf/src/Guard.cs、maf/Program.cs；设计见 docs/superpowers/specs/2026-09-26-maf-tool-approval-design.md。</span></span>
+<span id="cb20-6"><a href="#cb20-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-7"><a href="#cb20-7" aria-hidden="true" tabindex="-1"></a><span class="fu">## 1. 结论先行</span></span>
+<span id="cb20-8"><a href="#cb20-8" aria-hidden="true" tabindex="-1"></a>（改前 MAF 无此功能；改后走 MAF 自带 approval 管线；两边的「钥匙+公告板」同构、介质相反）</span>
+<span id="cb20-9"><a href="#cb20-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-10"><a href="#cb20-10" aria-hidden="true" tabindex="-1"></a><span class="fu">## 2. MAF 改前为什么没有这个问题</span></span>
+<span id="cb20-11"><a href="#cb20-11" aria-hidden="true" tabindex="-1"></a>（无 L1 → 无中断 → 无从相遇；框架其实自带 approval 管线）</span>
+<span id="cb20-12"><a href="#cb20-12" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-13"><a href="#cb20-13" aria-hidden="true" tabindex="-1"></a><span class="fu">## 3. 实现记录</span></span>
+<span id="cb20-14"><a href="#cb20-14" aria-hidden="true" tabindex="-1"></a>（文件清单、三个模式的终端行为、冒烟实测输出摘要）</span>
+<span id="cb20-15"><a href="#cb20-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-16"><a href="#cb20-16" aria-hidden="true" tabindex="-1"></a><span class="fu">## 4. 逐点对照</span></span>
+<span id="cb20-17"><a href="#cb20-17" aria-hidden="true" tabindex="-1"></a><span class="pp">|</span> 维度 <span class="pp">|</span> Eino <span class="pp">|</span> MAF <span class="pp">|</span></span>
+<span id="cb20-18"><a href="#cb20-18" aria-hidden="true" tabindex="-1"></a><span class="pp">|</span> 钥匙 <span class="pp">|</span> point.ID + checkpoint 的 ID↔地址映射 <span class="pp">|</span> RequestId（tool_call_id 派生） <span class="pp">|</span></span>
+<span id="cb20-19"><a href="#cb20-19" aria-hidden="true" tabindex="-1"></a><span class="pp">|</span> 公告板 <span class="pp">|</span> ctx（addrCtx）<span class="pp">|</span> 消息内 Request/Response 内容 + AgentSession.StateBag <span class="pp">|</span></span>
+<span id="cb20-20"><a href="#cb20-20" aria-hidden="true" tabindex="-1"></a><span class="pp">|</span> 写入端 <span class="pp">|</span> adkrun.Run 的 targets 循环 <span class="pp">|</span> REPL 的 ResolveApprovalsAsync 回执循环 <span class="pp">|</span></span>
+<span id="cb20-21"><a href="#cb20-21" aria-hidden="true" tabindex="-1"></a><span class="pp">|</span> 读取端 <span class="pp">|</span> guard wrapper 重入读 GetResumeContext <span class="pp">|</span> ToolApprovalAgent 绑定 + FICC 重建执行 <span class="pp">|</span></span>
+<span id="cb20-22"><a href="#cb20-22" aria-hidden="true" tabindex="-1"></a><span class="pp">|</span> 重入 <span class="pp">|</span> 执行链原样重跑（无 resume 分支） <span class="pp">|</span> FICC 重建 FunctionCall 并执行（框架统一处理） <span class="pp">|</span></span>
+<span id="cb20-23"><a href="#cb20-23" aria-hidden="true" tabindex="-1"></a><span class="pp">|</span> 持久化 <span class="pp">|</span> checkpoint 可落盘、跨进程 <span class="pp">|</span> 会话内存，进程内 <span class="pp">|</span></span>
+<span id="cb20-24"><a href="#cb20-24" aria-hidden="true" tabindex="-1"></a><span class="pp">|</span> 防伪造 <span class="pp">|</span> 无（回执按 ID 直接取） <span class="pp">|</span> 只认 surfaced 请求 + 快照比对 <span class="pp">|</span></span>
+<span id="cb20-25"><a href="#cb20-25" aria-hidden="true" tabindex="-1"></a><span class="pp">|</span> 并行多中断 <span class="pp">|</span> 每个 wrapper 独立决定 <span class="pp">|</span> 同响应全部转请求，TAA 排队逐问 <span class="pp">|</span></span>
+<span id="cb20-26"><a href="#cb20-26" aria-hidden="true" tabindex="-1"></a><span class="pp">|</span> 两端是否同文件 <span class="pp">|</span> 否（turn.go / middleware.go） <span class="pp">|</span> 是（都在框架内部；我们只写规则与回执循环） <span class="pp">|</span></span>
+<span id="cb20-27"><a href="#cb20-27" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-28"><a href="#cb20-28" aria-hidden="true" tabindex="-1"></a><span class="fu">## 5. §12 的「隐性耦合」在 MAF 的形态</span></span>
+<span id="cb20-29"><a href="#cb20-29" aria-hidden="true" tabindex="-1"></a>（数据耦合仍在：request id 是隐性契约；但框架用「只认 surfaced request」把契约显式化，</span>
+<span id="cb20-30"><a href="#cb20-30" aria-hidden="true" tabindex="-1"></a>调用方不允许自行构造钥匙——对照 Eino 的 ID 注释误导问题，谁更防呆）</span>
+<span id="cb20-31"><a href="#cb20-31" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb20-32"><a href="#cb20-32" aria-hidden="true" tabindex="-1"></a><span class="fu">## 6. 本仓库口径</span></span>
+<span id="cb20-33"><a href="#cb20-33" aria-hidden="true" tabindex="-1"></a>（maf 只做对照实验；主线在 Go/Eino）</span></code></pre></div>
+<ul class="task-list">
+<li><label><input type="checkbox" /><strong>Step 2: 提交</strong></label></li>
+</ul>
+<div class="sourceCode" id="cb21"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> add doc/10-MAF审批回路与Eino对照.md</span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> commit <span class="at">-m</span> <span class="st">&quot;doc 10：MAF 审批回路与 Eino interrupt/resume 对照&quot;</span></span></code></pre></div>
+<hr />
+<h2 id="self-review-记录">Self-Review 记录</h2>
+<ul>
+<li><strong>Spec coverage</strong>：三模式语义 → Task 2/4；规则表移植 → Task 2；假 shell → Task 4；automatic-approval 分流 → Task 4；REPL 回执循环 → Task 4；单测 → Task 1-3；README 解冻标注 → Task 5；doc/10 → Task 6。全覆盖。</li>
+<li><strong>Placeholder scan</strong>：Task 5 的实测记录行与 Task 6 的段落标注了「按实测补全」，这是对运行时观测的显式依赖（冒烟需用户同意），不是未决设计；其余步骤均为完整代码/命令。</li>
+<li><strong>Type consistency</strong>：<code>GuardEngine.Guard(string, IDictionary&lt;string, object?&gt;?)</code>、<code>ShouldBlock(IReadOnlyList&lt;Finding&gt;)</code>、<code>FormatFindings(IReadOnlyList&lt;Finding&gt;, string)</code>、<code>TryParseMode(string, out GuardMode)</code>、<code>ModeName(GuardMode)</code> 在 Task 1-4 中签名一致；<code>Finding</code> 记录的位置参数顺序在 Task 1 定义、Task 3 测试与 Task 4 使用中一致。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/archive/old-line/plans/2026-09-26-maf-tool-approval.md"><code>doc/archive/old-line/plans/2026-09-26-maf-tool-approval.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

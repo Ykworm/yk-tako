@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>看板正本放哪里：内存 Store 复活成 PG 表 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="看板正本放哪里内存-store-复活成-pg-表">看板正本放哪里：内存 Store 复活成 PG 表</h1>
+<blockquote>
+<p>模块：运行引擎 · 任务看板（doc/41 C 线 + doc/52 D32/D34/D35）｜状态：<strong>已落地</strong>（2026-10-23，<code>fd6a489</code>；B5/B6 2026-10-28 追加）｜证据：<code>doc/41-任务看板与人工审批.md</code> §3.3/§5.1、<code>doc/52-技能.md</code> D32/D34/D35、<code>internal/runengine/tasktools.go</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>用户发了一条「把这三个接口改造成异步，顺便补测试」的长任务，run 跑了二十分钟。页面上只有一段段 tool_call 帧在滚——哪步做完了、卡在哪、还剩几件，全在模型脑子里。用户看不出整体进展。</p>
+<p>旧线的任务看板（doc/01）本来解决这个，但它的正本是<strong>进程内内存 Store</strong>（doc/01 §3 原文：「进程退出即清空」）。随 v1–v5 旧线一起删掉后，v6 至今空着。</p>
+<p>第二个病灶来自同一根：run 会崩。如果看板还是内存里的那张表，<code>kill -9</code> 一下，之前建的任务全部消失，续跑的模型面对一个空白看板，只能重新规划——而它重新规划的结果未必和原来一致。</p>
+<p>病根不是「没有看板 UI」，是<strong>看板的状态归谁持有</strong>。归进程，崩溃即丢、多副本看不见、续跑接不上；归 PG，这三件事同时解决。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 内存 Store（旧线 doc/01）</td>
+<td>进程内 map + eino session 镜像</td>
+<td>零 I/O、实现最简单</td>
+<td>进程退出即清空；多副本下各看各的；崩溃续跑全丢。旧线正是死在这里</td>
+</tr>
+<tr>
+<td>B PG 正本 + 四工具（选定）</td>
+<td><code>run_tasks</code> 表为唯一真源，工具 handler 直写行</td>
+<td>崩得掉、续得上、多副本共享；会话内跨 run 可续做</td>
+<td>每次工具调用一次 DB 写；需要 run 内自增序号</td>
+</tr>
+<tr>
+<td>C 从帧/running 内存重建</td>
+<td>看板不落库，每次从 runlive 帧回放</td>
+<td>不新增表</td>
+<td>帧只活 300 秒；多副本读不到别人的帧；等于没存</td>
+</tr>
+<tr>
+<td>D 落在 mh 里当一条消息</td>
+<td>把看板当普通 assistant 文本存进模型消息</td>
+<td>复用现有存储</td>
+<td>看板会参与折叠、被压缩截断——任务一多就丢行</td>
+</tr>
+</tbody>
+</table></div>
+<p>选 B。与 v6 的整条存储哲学一致：<strong>凡要长期存在的状态，先问多副本下它在哪</strong>。看板行在 PG，续跑和崩溃接管天然兼容——续跑时 <code>TaskList</code> 读到的就是真相，不需要任何重建动作。</p>
+<h2 id="3-对外协议逐字继承旧线已验证的部分">3. 对外协议：逐字继承旧线已验证的部分</h2>
+<p>四把工具、一个状态词表，不重新发明：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>工具</th>
+<th>签名</th>
+<th>干什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>TaskCreate</code></td>
+<td><code>(subject, description?, activeForm?) → taskId</code></td>
+<td>建一行，返回 <code>task_no</code></td>
+</tr>
+<tr>
+<td><code>TaskUpdate</code></td>
+<td><code>(taskId, status?, …)</code></td>
+<td>改状态 / 字段</td>
+</tr>
+<tr>
+<td><code>TaskList</code></td>
+<td><code>()</code></td>
+<td>当前看板紧凑视图（+ 上一场未完成段）</td>
+</tr>
+<tr>
+<td><code>TaskGet</code></td>
+<td><code>(taskId)</code></td>
+<td>单行详情</td>
+</tr>
+</tbody>
+</table></div>
+<p>状态词表：<code>pending → in_progress → completed</code>，不再需要时 <code>deleted</code>（<code>TaskList</code> 不列出）。</p>
+<p><strong>约束写在 tool description，不写状态机</strong>：≥3 步或用户列了多件事才建表；一步任务不建；动手前标 <code>in_progress</code>，同时尽量一条；做完立刻 <code>completed</code>；测试红 / 做了一半 / 未解报错不准 <code>completed</code>；卡住就 Create 一条 blocker。</p>
+<p><strong>每个工具输出 = 操作回执 + 当前看板紧凑视图 + 催更块</strong>。模型的眼睛始终能自校准——这条在跨进程续跑里更关键：被中断未执行的调用按 doc/30 默认不回放，模型靠 <code>TaskList</code> 自己对齐进度。</p>
+<h2 id="4-同族小裁定">4. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>注入方式</td>
+<td><strong>静态注册</strong>进一手工具池，不走旧线的动态 middleware</td>
+<td>v6 没有「只在有看板语义下才有意义」的状态——每个 run 都是干活 run。子代理通过既有 <code>tools:</code>/<code>exclude_tools:</code> 自行裁剪</td>
+</tr>
+<tr>
+<td>Plan 层要不要重建</td>
+<td><strong>不重建</strong>。Plan 只是提示词约定的口述方案</td>
+<td>doc/01 既定；v1 没有人审 gate。<code>enter_plan_mode</code>/<code>submit_plan</code> 是 doc/47 另起的一拍，不是看板的一部分</td>
+</tr>
+<tr>
+<td>要不要 Action↔︎Task 双射</td>
+<td><strong>不做</strong></td>
+<td>「要硬进度：收窄执行模型，不要在开放 ReAct 上做语义对齐」（doc/01 §6）</td>
+</tr>
+<tr>
+<td>模型漏 Update 时自动勾选</td>
+<td><strong>不做</strong></td>
+<td>同上；语义对齐不可靠，宁可显式漏</td>
+</tr>
+<tr>
+<td>Graph 拓扑强制顺序</td>
+<td><strong>不做</strong></td>
+<td>同上</td>
+</tr>
+<tr>
+<td>前端怎么渲染</td>
+<td>tool_result 文本带紧凑视图（给模型），另发 <code>kind=task</code> 帧（给前端）</td>
+<td>前端解析自然语言文本一换措辞就渲染错；帧是结构，文本是给人和模型的。词表 7→8</td>
+</tr>
+<tr>
+<td>用户说的「第 N 步」指什么</td>
+<td>页面看到的 <code>task_no</code>（<code>#%d [%s] %s</code>），<strong>不是</strong>技能正文的步骤编号</td>
+<td>两者不保证对齐，必须在文档里说清</td>
+</tr>
+<tr>
+<td>上一场的看板在新 run 里看不见怎么办</td>
+<td><code>TaskList</code> 额外带「上一场」段：同租户同会话、最近一个<strong>有任务</strong>的 run、只列未完成行</td>
+<td>D34（2026-10-28）。取「最近一个有任务的」而非「最近一个 run」——后者就是当前这场，等于取空。全完成只回一行提示</td>
+</tr>
+<tr>
+<td>写操作回执带不带上一场</td>
+<td><strong>不带</strong>，只有显式 <code>TaskList</code> 才有</td>
+<td>否则每建/改一条任务就把上一场的说明重付一遍 token</td>
+</tr>
+<tr>
+<td>「上一场」靠什么续上</td>
+<td><code>description</code> 语义升级为「<strong>这一步具体做什么</strong>」</td>
+<td>这是 schema 文案 + 提示词约定，<strong>靠模型自觉、不是结构闸</strong>；兜底是重读技能正文</td>
+</tr>
+<tr>
+<td>任务归哪个技能</td>
+<td><code>run_tasks.skill_name</code> 列，唯一写入点是 <code>TaskCreate</code>，按本 run 最近一次成功 <code>use_skill</code> 盖戳</td>
+<td>D32。不用 <code>Subject</code> 前缀编码（前缀脆、与序号挤在一起）；程序不代建任务</td>
+</tr>
+<tr>
+<td>行的生命周期</td>
+<td>完成不删（只改 <code>status</code>）；删除单位是<strong>会话</strong>不是 run</td>
+<td>全仓 <code>DELETE FROM</code> 没有一条指向 <code>run_tasks</code>。<strong>今天的缺口</strong>：<code>sweepDeletedSessionBatch</code> 只清 <code>run_model_messages</code>，<code>run_tasks</code>/<code>run_questions</code> 都没进清单</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="5-证据">5. 证据</h2>
+<p><strong>方案</strong>：<code>doc/41-任务看板与人工审批.md</code> §3.3（看板设计）、§5.1（<code>run_tasks</code> 表 + 生命周期 + <code>skill_name</code> + 会话续做读）、§5.2（<code>kind=task</code> 帧）。<strong>技能侧增量</strong>：<code>doc/52-技能.md</code> D32（skill_name）/ D34（跨 run 续做）/ D35（看板恢复执行权）。</p>
+<p><strong>台账</strong>：<code>tmp/41-任务看板与人工审批/</code>（本地，不入库）。</p>
+<p><strong>代码符号</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>是什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>internal/runengine/tasktools.go:30</code></td>
+<td><code>RunTask</code> struct（PG 表 <code>run_tasks</code>）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/tasktools.go:87</code></td>
+<td><code>Store.CreateTask</code></td>
+</tr>
+<tr>
+<td><code>internal/runengine/tasktools.go:136</code></td>
+<td><code>Store.ListTasks</code>（按 run）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/tasktools.go:154</code></td>
+<td><code>Store.PreviousBoardRun</code>（会话续做读）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/tasktools.go:164</code></td>
+<td><code>Store.ListOpenTasks</code></td>
+</tr>
+<tr>
+<td><code>internal/runengine/tasktools.go:185</code></td>
+<td><code>taskBoardView</code>：紧凑视图</td>
+</tr>
+<tr>
+<td><code>internal/runengine/tasktools.go:213</code></td>
+<td><code>taskReceipt</code>：写操作回执（不带上一场）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/tasktools.go:220</code></td>
+<td><code>previousBoardView</code>：上一场段</td>
+</tr>
+<tr>
+<td><code>internal/runengine/tasktools.go:251</code></td>
+<td><code>emitTaskFrame</code>：<code>kind=task</code> 帧</td>
+</tr>
+<tr>
+<td><code>internal/runengine/tasktools.go:321</code></td>
+<td>四把工具的构造函数</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>复核命令</strong>：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;TableName\|PreviousBoardRun\|taskBoardView&quot;</span> internal/runengine/tasktools.go</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-rn</span> <span class="st">&quot;DELETE FROM run_tasks\|DELETE FROM run_questions&quot;</span> internal/runengine/   <span class="co"># 应为空（今天的缺口）</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;</span><span class="dt">\&quot;</span><span class="st">task</span><span class="dt">\&quot;</span><span class="st">&quot;</span> internal/runengine/contract_test.go</span></code></pre></div>
+<p><strong>活体验收</strong>：</p>
+<ul>
+<li>崩溃续跑（2026-10-23）：<code>kill -9</code> 引擎 → 重启 → <code>POST /api/runs/{id}/resume</code>（202，lease_epoch 1→2）→ 崩前建的行<strong>一条没丢</strong>，且在续跑里被继续更新。机器可重跑：<code>scripts/acceptance/taskboard_crash.sh</code>。</li>
+<li><code>skill_name</code>（2026-10-28 隔离引擎 8943）：<code>use_skill(demo)</code> → 两条 <code>TaskCreate</code> → <code>kind=task</code> 帧带 <code>"skillName":"demo"</code>；再 <code>use_skill(other)</code> 不建任务 → 行上的 <code>skill_name</code> 仍是 <code>demo</code>；新 run 只 <code>read_skill</code> 后 <code>TaskCreate</code> → 帧不带 <code>skillName</code>、列空。</li>
+<li>会话续做（D34/B6）：run A 建 3 条完成 #1 → run B 的 <code>TaskList</code> 出现上一场 #2/#3 及说明、写回执不带；run C 回「已全部完成」；只 use 不建任务的 run D → run E 不给执行权、无「上一场」。</li>
+</ul>
+<h2 id="6-现状">6. 现状</h2>
+<ul>
+<li><strong>仍有效</strong>：PG 正本、四工具、四状态、静态注册、<code>kind=task</code> 帧、<code>skill_name</code> 列、会话续做读。</li>
+<li><strong>未做</strong>：Action↔︎Task 双射 / 自动勾选 / 拓扑强制（明确不做）；<code>run_tasks</code>/<code>run_questions</code> 的会话清扫（已知缺口，要单独一拍）。</li>
+<li><strong>同族问题</strong>：等人现场用什么表 → <a href="../等人现场放哪里/问题与方案.html">等人现场放哪里</a>；审批闸要不要做 → <a href="../工具三态守卫与审批回路/问题与方案.html">工具三态守卫与审批回路</a>；技能与任务怎么挂钩 → <a href="../技能谁读谁执行/问题与方案.html">技能谁读谁执行</a>；崩溃续跑 → <a href="../崩溃后这场run算什么状态/问题与方案.html">崩溃后这场 run 算什么状态</a>。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E7%9C%8B%E6%9D%BF%E6%AD%A3%E6%9C%AC%E6%94%BE%E5%93%AA%E9%87%8C/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/看板正本放哪里/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

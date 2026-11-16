@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>06 · 工具安全层 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="06--工具安全层">06 · 工具安全层</h1>
+<blockquote>
+<p>性质：<strong>能力记录</strong>。新系列第六篇，改写自旧《04-L1-工具安全层》：机制分析（三态裁决、规则引擎、 审批回路、守卫分层）与踩坑记录保留，删掉 TS 时代残留的对照句，入口统一改成 <code>cmd/yktako</code> （旧演示入口 <code>cmd/l1guard</code> 已由《02》Task 7 删除），行号锚点与文件清单按当前代码重写。 参照对象：harness-agent 的 <code>security/tool_guard/</code> 与 <code>middleware/{tool_guard,filesystem_guard,pii}.py</code>。</p>
+</blockquote>
+<h2 id="0-这一层解决什么">0. 这一层解决什么</h2>
+<p>主循环回答了"agent 怎么用工具"，这一层回答一个更现实的问题：<strong>agent 有了手（bash、文件读写）之后，怎么防止它闯祸？</strong></p>
+<p>落点（全在 <code>yk-tako-eino/internal/</code>）：</p>
+<pre class="text"><code>guard/toolguard.go     命令守卫：危险命令规则表 + 模式 × 严重度阈值 + 命中判定
+guard/filesystem.go    文件守卫：路径规则、工作区内外的三态裁决（纯函数 Decide）
+guard/pii.go           出口脱敏：API Key 打码（幂等）
+guard/middleware.go    挂载点：三个 ADK middleware + interrupt 载荷 + resume 判定
+tools/                 被守卫的对象：bash、read_file / write_file（故意不防护）</code></pre>
+<p>装配方式（<code>cmd/yktako</code>）：<code>Handlers = [taskboard] + guard.Handlers(engine, guard.Options{WorkspaceRoot: cwd})</code>。</p>
+<h2 id="1-三件套各管一件事">1. 三件套各管一件事</h2>
+<pre class="text"><code>用户输入 ──→ [PII 脱敏] ──→ 模型 ──→ 决定调工具
+                                    │
+        ┌───────────────────────────┤
+        ▼                           ▼
+[ToolGuard 查命令参数]      [FilesystemGuard 查文件路径]
+        │                           │
+  放行/拒绝/审批                放行/拒绝/问人
+        └──────────→ 工具执行 ←──────┘
+                      │
+            [PII 脱敏工具结果] ──→ 回到模型</code></pre>
+<p>两个守卫都是<strong>三态</strong>：<code>allow</code> 直接放行、<code>deny</code> 把解释性 string 当结果挡回给模型（<strong>不抛 error</strong>）、 <code>ask</code> 用 <code>compose.StatefulInterrupt</code> 暂停整张图等人裁决，人回答后 <code>Runner.ResumeWithParams</code> 接着跑。</p>
+<h2 id="2-从-harness-读到了什么">2. 从 harness 读到了什么</h2>
+<h3 id="21-tool_guard约-620-行精读过">2.1 tool_guard（约 620 行，精读过）</h3>
+<p>语义骨架其实很小，大的是规则库：</p>
+<ul>
+<li><strong>引擎</strong> <code>ToolGuardEngine.guard(tool_name, params)</code> → 返回 findings 列表，空 = 安全。</li>
+<li><strong>三模式 × 严重度阈值</strong>决定拦不拦：</li>
+</ul>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>模式</th>
+<th>拦截的严重度</th>
+<th>语义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>block</code></td>
+<td>CRITICAL / HIGH</td>
+<td>硬拦，工具不执行</td>
+</tr>
+<tr>
+<td><code>require_approval</code></td>
+<td>+ MEDIUM</td>
+<td>暂停，等人裁决</td>
+</tr>
+<tr>
+<td><code>warn</code></td>
+<td>无</td>
+<td>亮黄牌但放行</td>
+</tr>
+</tbody>
+</table></div>
+<ul>
+<li><strong>规则</strong>是 YAML 里的正则签名表（<code>dangerous_shell_commands.yaml</code>，约 300 行）：rm/mv、mkfs/dd 写裸设备、 fork 炸弹、<code>curl|bash</code>、反弹 shell、Unicode 空白、<code>/proc/*/environ</code>、jq <code>system()</code>、zsh 危险内建…… 每条带 severity、remediation、<code>exclude_patterns</code>（比如注释行不报警）。</li>
+<li><strong>审批</strong>用 <code>langgraph.types.interrupt</code>：图整个暂停，人批准后从断点继续。</li>
+</ul>
+<h3 id="22-filesystem_guard">2.2 filesystem_guard</h3>
+<p>当 deepagents 自带的权限机制不可用时（sandbox backend），在工具调用边界补一层路径策略： 有序规则表先命中先生效，路径要展开 realpath（macOS <code>/etc</code> → <code>/private/etc</code> 的符号链接坑）， <code>/etc/**</code> 这种模式也要匹配 <code>/etc</code> 本身。</p>
+<p><strong>重要：这层是 deny-only 的降级版。</strong> deepagents 上游的 permissions 本来是三态（含 <code>interrupt</code> 审批）， 但因为 shell backend 下会抛 <code>NotImplementedError</code> 被整个禁用；harness 只在工具边界补回了 deny 半边， <code>interrupt</code> 只剩一个抄来的注解（详见 §4）。</p>
+<h3 id="23-pii">2.3 pii</h3>
+<p>它自己也不是从零写的：框架自带 <code>PIIMiddleware</code> 检测 email/信用卡/IP，但<strong>不认识 API Key</strong>。 harness 补了一个自定义检测器，专抓 <code>sk-...</code>、<code>sk-ant-...</code>、<code>AKIA...</code>、<code>AIzaSy...</code>、<code>hf_...</code> 和 <code>api_key=...</code> 赋值形式，配 <code>mask</code> 策略（留头尾、中间打星）。</p>
+<h2 id="3-我们的实现">3. 我们的实现</h2>
+<p>三件套语义与 harness 一致，挂载点换成 Eino 的 ADK middleware。判断逻辑全部抽成不依赖框架的纯函数， 可以脱离 agent 单测（<code>Decide</code>、<code>Engine.Guard</code>、<code>MaskSecrets</code>）。</p>
+<h3 id="31-命令守卫规则引擎guardtoolguardgo">3.1 命令守卫：规则引擎（<code>guard/toolguard.go</code>）</h3>
+<ul>
+<li><p><code>Severity</code> 五级：CRITICAL / HIGH / MEDIUM / LOW / INFO。</p></li>
+<li><p><code>Rule</code>：限定 <code>Tools</code> 与 <code>Params</code>，用 <code>Patterns</code> 找危险特征，<code>Excludes</code> 放过误报。</p></li>
+<li><p><code>DefaultRules</code> 从 harness 的危险命令表里提炼 <strong>10 条</strong>（安全知识与语言无关，直接借）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>规则 ID</th>
+<th>严重度</th>
+<th>抓什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>TOOL_CMD_DANGEROUS_RM</code></td>
+<td>HIGH</td>
+<td><code>rm</code> / <code>del</code> / <code>Remove-Item</code>（排除注释行）</td>
+</tr>
+<tr>
+<td><code>TOOL_CMD_DANGEROUS_MV</code></td>
+<td>HIGH</td>
+<td><code>mv</code>（意外移动/覆盖）</td>
+</tr>
+<tr>
+<td><code>TOOL_CMD_FS_DESTRUCTION</code></td>
+<td>CRITICAL</td>
+<td><code>mkfs*</code>、<code>mke2fs</code>、<code>dd of=/dev/*</code>、<code>&gt; /dev/sd*</code></td>
+</tr>
+<tr>
+<td><code>TOOL_CMD_DOS_FORK_BOMB</code></td>
+<td>CRITICAL</td>
+<td>fork 炸弹、<code>kill -9 -1/1</code></td>
+</tr>
+<tr>
+<td><code>TOOL_CMD_PIPE_TO_SHELL</code></td>
+<td>CRITICAL</td>
+<td><code>curl/wget ... | bash/sh/zsh/...</code></td>
+</tr>
+<tr>
+<td><code>TOOL_CMD_REVERSE_SHELL</code></td>
+<td>CRITICAL</td>
+<td><code>/dev/tcp/</code>、<code>nc -e</code>、<code>ncat -e</code>、<code>socat EXEC:</code></td>
+</tr>
+<tr>
+<td><code>TOOL_CMD_UNICODE_WHITESPACE</code></td>
+<td>HIGH</td>
+<td>非 ASCII 空白（解析歧义绕过）</td>
+</tr>
+<tr>
+<td><code>TOOL_CMD_PROC_ENVIRON</code></td>
+<td>HIGH</td>
+<td><code>/proc/{self,数字}/environ</code>（泄露环境变量）</td>
+</tr>
+<tr>
+<td><code>TOOL_CMD_JQ_SYSTEM</code></td>
+<td>HIGH</td>
+<td><code>jq ... system(</code> （把数据处理变成命令通道）</td>
+</tr>
+<tr>
+<td><code>TOOL_CMD_SUDO</code></td>
+<td>MEDIUM</td>
+<td><code>sudo</code> / <code>doas</code></td>
+</tr>
+</tbody>
+</table></div></li>
+<li><p>模式 → 可拦级别是一张表（<code>blocking</code>）：<code>block</code> 拦 CRITICAL+HIGH，<code>require_approval</code> 连 MEDIUM 也拦， <code>warn</code> 一张空表（永不拦）。<code>Engine.Configure(mode)</code> 支持运行时热切换（REPL 里 <code>/mode ...</code>）。</p></li>
+<li><p><code>Engine.Guard(tool, params)</code> 只扫规则声明的参数（命令守卫看 <code>bash</code>/<code>execute</code> 的 <code>command</code>）， 命中片段截前后各 40 字给人判读；<code>ShouldBlock</code> 按当前模式判断该不该拦。</p></li>
+<li><p>写坏的规则直接 <code>regexp.MustCompile</code> 在启动时炸掉，不留到运行期。</p></li>
+</ul>
+<h3 id="32-文件守卫路径三态裁决guardfilesystemgo">3.2 文件守卫：路径三态裁决（<code>guard/filesystem.go</code>）</h3>
+<ul>
+<li><p>文件工具按读/写分类：<code>ls</code> / <code>read_file</code> / <code>glob</code> / <code>grep</code> 是读，<code>write_file</code> / <code>edit_file</code> / <code>delete</code> 是写。</p></li>
+<li><p>裁决顺序（先命中先返回）：</p>
+<ol type="1">
+<li><p><strong>用户规则</strong>（<code>Options.Rules</code>），支持 <code>allow</code> 显式放行；</p></li>
+<li><p><strong>默认规则</strong>（<code>defaultFsRules</code>）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>路径</th>
+<th>操作</th>
+<th>处置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>**/.env</code>、<code>**/.env.*</code>、<code>**/.git/**</code>、<code>**/.ssh/**</code>、<code>**/id_rsa*</code></td>
+<td>读 + 写</td>
+<td><strong>deny</strong>（密钥/凭据/版本库内部）</td>
+</tr>
+<tr>
+<td><code>/etc/**</code>、<code>/private/etc/**</code>、<code>/System/**</code>、<code>/usr/**</code>、<code>/bin/**</code>、<code>/sbin/**</code></td>
+<td>写</td>
+<td><strong>deny</strong>（系统目录没有合法写理由）</td>
+</tr>
+</tbody>
+</table></div></li>
+<li><p><strong>工作区内</strong> → <code>allow</code>；</p></li>
+<li><p><strong>区外</strong> → <code>Options.OutsideWorkspace</code>（留空默认 <code>ask</code>，摆成 <code>deny</code> 即回到"一律拒"的旧行为）。</p></li>
+</ol></li>
+<li><p>路径先做 <code>filepath.Abs</code> + <code>Clean</code>，再取 realpath 作为<strong>第二个候选项</strong>（符号链接 <code>/etc</code> → <code>/private/etc</code> 那类坑）。</p></li>
+<li><p>glob 匹配自己写了 30 行 <code>globToRegExp</code>：<code>**/</code> → <code>(?:.*/)?</code>、<code>**</code> → <code>.*</code>、<code>*</code> → <code>[^/]*</code>，<code>~</code> 展开成 <code>$HOME</code>； 模式以 <code>/**</code> 结尾时，目录本身也算命中（<code>/etc/**</code> 命中 <code>/etc</code>）。</p></li>
+<li><p>关键取舍：<strong>能问的不拒，该拒的不问</strong>。全用 ask 会把审批弹窗变成噪音，人就会无脑点 y； 全用 deny 会逼 agent 绕道（自己去 bash 里 <code>cat</code>），反而丧失可观测性。</p></li>
+</ul>
+<h3 id="33-pii出口打码guardpiigo">3.3 PII：出口打码（<code>guard/pii.go</code>）</h3>
+<ul>
+<li>7 条正则，顺序与 harness 的检测器一致：<code>sk-proj-</code>、<code>sk-ant-</code>、<code>sk-</code>、<code>AKIA/ASIA</code>、<code>AIza</code>、<code>hf_</code>、 以及 <code>api_key=... / secret_key=... / access_token=...</code> 赋值形式。 Go 正则没有负向前瞻，<code>sk-</code> 那条靠"起点已被更具体的规则占住"来避开 <code>sk-proj-</code> / <code>sk-ant-</code>。</li>
+<li><code>maskToken</code> 保留头尾各 4 位、中间打星；<code>MaskSecrets</code> 去重区间后从后往前替换，<strong>幂等</strong>（再跑一遍结果不变）。</li>
+<li>两个挂载点：
+<ul>
+<li><code>BeforeModelRewriteState</code>：把历史消息里的密钥打码后再喂模型。这里是<strong>就地改 state</strong>， 而 <code>state.Messages</code> 与事件流、调用方的 history 共享指针，所以改写会写穿回 REPL 历史—— 当前语义下正是想要的（历史同样脱敏）；若哪天要"只对模型脱敏、历史留原文"，得先浅拷贝消息再改。</li>
+<li><code>WrapInvokableToolCall</code>：工具输出打码后再交回给模型（<code>cat .env</code> 这类绕道读到的 key 也挡一下）。</li>
+</ul></li>
+</ul>
+<h3 id="34-挂载点与审批回路guardmiddlewarego">3.4 挂载点与审批回路（<code>guard/middleware.go</code>）</h3>
+<p>三个 handler 都是 <code>adk.ChatModelAgentMiddleware</code> 的实现（内嵌 <code>adk.BaseChatModelAgentMiddleware</code> 拿其余钩子的空实现，各自带 <code>var _ adk.ChatModelAgentMiddleware = (*Type)(nil)</code> 编译期断言）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>handler</th>
+<th>覆盖的钩子</th>
+<th>干什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>toolGuardHandler</code></td>
+<td><code>WrapInvokableToolCall</code></td>
+<td>命令规则命中 → 按模式放行 / 打断（拒绝 string）/ 审批</td>
+</tr>
+<tr>
+<td><code>filesystemHandler</code></td>
+<td><code>WrapInvokableToolCall</code></td>
+<td>路径三态 → 放行 / 拒绝 string / 审批</td>
+</tr>
+<tr>
+<td><code>piiHandler</code></td>
+<td><code>BeforeModelRewriteState</code> + <code>WrapInvokableToolCall</code></td>
+<td>入模型与出工具双向打码</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>Handlers()</code> 返回的顺序就是包裹顺序：<strong>命令守卫在外 → 文件守卫居中 → PII 最贴工具</strong>。</p>
+<p>审批回路（Eino 版，比 LangGraph 清爽）：</p>
+<pre class="text"><code>中间件里 compose.StatefulInterrupt(ctx, 载荷, savedCall)   REPL 里：
+   │ 图暂停，整个 runContext gob 进 CheckPointStore          adkrun.Run 收 Action.Interrupted
+   │                                                        → 回调 ask(info) 打印工具与参数
+   └────────── resume 值 &quot;approve&quot; / &quot;reject&quot; ◄──────────── runner.ResumeWithParams(targets)
+        恢复后中间件用 ownInterrupt(ctx, kind) 认出&quot;是自己那笔&quot;，
+        读 compose.GetResumeContext[string] 拿到人的决定：
+          批准 → endpoint(ctx, stored.Args, ...) 原样重放
+          拒绝 → 返回解释性 string，不调工具</code></pre>
+<p>细节：</p>
+<ul>
+<li><code>savedCall.Kind</code>（<code>tool_guard</code> / <code>fs_guard</code>）用来分辨嵌套守卫里这次中断归谁，<code>ownInterrupt</code> 靠它认领。</li>
+<li><code>ApprovalInfo</code> 与 <code>savedCall</code> 都用 <code>schema.RegisterName[类型]("tako_*")</code> 注册了名字——checkpoint 走 gob， 类型名要稳定。</li>
+<li>resume 值用 <code>"approve"</code> / <code>"reject"</code> 字符串，<strong>不用布尔</strong>（falsy 的 resume 在 LangGraph 侧会炸， Eino 侧同样避免这种退化写法）。</li>
+<li>硬拒为什么返回 string 而不是 error：抛 error 模型只看到"tool execution failed"，不知道为什么错， 容易傻重试；返回"用户拒绝了这次调用，不要重试相同命令，如需类似操作先和用户商量替代方案"， 模型就能改道或收手。<strong>当前这次工具调用从未发生，但整个思考循环没有中断。</strong></li>
+</ul>
+<h2 id="4-溯源纠错三态注解--两态实现">4. 溯源纠错：三态注解 + 两态实现</h2>
+<p>写这一层时曾误以为"harness 原版也有 ask 态"，核源码（<code>orcakit_harness_agent 1.0.14</code>， deepagents 0.7.18 / GitHub main，两者一致）后更正：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th></th>
+<th>harness 自研 fs guard</th>
+<th>deepagents 上游</th>
+<th>我们</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>规则 mode 类型</td>
+<td><code>Literal["allow","deny"]</code></td>
+<td><code>Literal["allow","deny","interrupt"]</code></td>
+<td><code>allow | deny | ask</code></td>
+</tr>
+<tr>
+<td><code>interrupt</code> 态实现</td>
+<td><strong>无</strong>。返回注解里有 <code>"interrupt"</code>，是从 deepagents 私有函数抄来的签名；树里只有这一处，中间件无分支、无 <code>interrupt</code> 导入</td>
+<td>完整：<code>_fs_interrupt.py</code> 把 interrupt 规则转成 HITL 配置（含 <code>when</code> 谓词），审批人有 4 个决策</td>
+<td><code>interrupt()</code> 内联在中间件里，审批只有批准/拒绝</td>
+</tr>
+<tr>
+<td>死签名的后果</td>
+<td>配置里写 <code>mode: interrupt</code> → 加载时被<strong>静默丢弃</strong>；程序内直接构造则 <code>"interrupt" != "deny"</code> → <strong>放过（fail-open）</strong></td>
+<td>——</td>
+<td>——</td>
+</tr>
+<tr>
+<td>为什么 harness 这么弱</td>
+<td>deepagents 在 backend 支持命令执行时直接抛 <code>NotImplementedError</code>，整套 permissions（含审批）被禁用；只好在工具边界重做一个<strong>只留 deny 的降级版</strong></td>
+<td>——</td>
+<td>——</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>这是个教训</strong>：一个三态的类型注解配一个两态的实现，比没有更危险——它给人「这里有审批」的错觉， 实际是静默丢弃或静默放行。读上游代码要顺注解一路查到 <code>return</code>，别信签名。</p>
+<p>deepagents 上游还有两个我们<strong>暂时没抄</strong>的设计点，记在这里备用：</p>
+<ol type="1">
+<li><strong>策略与审批解耦</strong>：fs 守卫只做纯策略判定，interrupt 规则由映射函数转成 HITL 配置，审批逻辑不污染守卫。</li>
+<li><strong>批量工具的锚定</strong>：<code>ls</code>/<code>glob</code>/<code>grep</code> 的中断按"搜索子树是否与规则锚定前缀重叠"触发； 全通配（<code>/**/secrets</code>）会收敛到 <code>/</code>，保守过度触发。我们目前只有单路径工具，还没这个问题， 以后加批量工具必须补。</li>
+</ol>
+<h2 id="5-中间件模式在-agent-场景的真实代价">5. 中间件模式在 agent 场景的真实代价</h2>
+<p>中间件不止放 guard：官方自带的还有上下文中和（compaction）、重试、限流、能力增强等十几种。 和 Gin 的中间件类比很准，但有个关键差异：<strong>Gin 包的是一次请求-响应（几百毫秒、进栈出栈）； agent 中间件包的是一个多轮循环</strong>——一次用户输入可能触发 N 轮"模型→工具→模型"，每个钩子每轮都触发， 消息历史在循环里持续累积。HTTP 请求不会"聊着聊着上下文爆了"，agent 会；HTTP handler 不会 "失败了自己决定重试"，模型调用会抖。所以需要照顾的方面天然多，"杂"是场景决定的。</p>
+<p>杂有真实的代价，三条：</p>
+<ol type="1">
+<li><strong>顺序变成语义</strong>。PII 脱敏放在压缩前还是后，结果不同；Handlers 数组的顺序就是包裹顺序。 本层三个守卫顺序无关是运气好（互相独立），不是普遍规律。</li>
+<li><strong>隐式交互</strong>。两个中间件各自单测都过，组合起来可能互相干扰——例如重试把审批又触发一遍， 人要看两次弹窗。</li>
+<li><strong>调试变难</strong>。行为分散在 N 个中间件里，出问题要沿链条逐个排查。</li>
+</ol>
+<p>应对办法不是"少放"，是<strong>约定 + 可见性</strong>：</p>
+<ul>
+<li>顺序约定：安全类最前、压缩类靠后；本仓库固定 <code>[taskboard] + guard 三件套</code>。</li>
+<li>可见性：拒绝/审批的理由都拼成人读的文本（<code>formatFindings</code> 最多列 5 条命中， 含 severity、snippet、remediation），既能回给模型，也能直接打印给人看。</li>
+<li>保持互相独立：判断逻辑抽纯函数（<code>Decide</code> 不碰 <code>interrupt</code> 和工具），把"组合爆炸"的基数压小。</li>
+</ul>
+<h2 id="6-有意偏离-harness-的一处语义exclude_patterns">6. 有意偏离 harness 的一处语义（exclude_patterns）</h2>
+<p>harness 原版：<code>exclude_patterns</code> 任何一条命中<strong>整段参数</strong>，整条规则放弃。副作用是 <code># 注释\nrm -rf /</code> 这类"注释行 + 危险命令"的多行输入会绕过所有带注释排除的规则（漏报）。</p>
+<p>我们的版本（<code>textForRule</code>）：<code>/^\s*#/</code> 这类注释行模式只<strong>剥掉注释行</strong>后继续扫剩余文本； 其它排除模式仍保持整段排除。单测覆盖了注释 + rm、纯注释、普通命令三个边界。</p>
+<p>已知脆弱点：<code>isCommentLineExclude</code> 靠<strong>正则源码逐字符相等</strong>来识别"注释行模式"， 改写法（如 <code>/^ *#/</code>）会静默退化为整段排除。规则表扩大时应改成规则上的显式开关（例如 <code>StripCommentLines: true</code>）。</p>
+<h2 id="7-实测记录">7. 实测记录</h2>
+<p>（当时用 <code>go run ./cmd/l1guard</code> 实测；该演示入口已随《02》Task 7 的单入口收敛删除，行为现已并入 <code>cmd/yktako</code>。）</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>输入</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>用 bash 执行 echo hello-l1</code></td>
+<td>无命中，直接放行，输出 <code>hello-l1</code></td>
+</tr>
+<tr>
+<td><code>用 bash 执行 rm -rf /tmp/l1test</code></td>
+<td>命中 <code>TOOL_CMD_DANGEROUS_RM:HIGH</code> → 图暂停 → 审批 UI → 输入 n → 工具不执行，模型收到"用户拒绝"并主动给出替代方案</td>
+</tr>
+<tr>
+<td><code>用 read_file 读取 /etc/passwd 的第一行</code></td>
+<td>区外 → 暂停问人 → 输入 y → 工具真的执行；模型随后自己说明"read_file 不支持只读前 N 行，要精确用 bash head"</td>
+</tr>
+<tr>
+<td><code>用 read_file 读取 .env</code></td>
+<td>规则级 deny，不弹窗，直接返回"敏感文件"拒绝理由</td>
+</tr>
+<tr>
+<td><code>/mode block</code> / <code>/mode warn</code></td>
+<td>热切换模式；warn 模式下命中只打印 ⚠️ 报告，不拦</td>
+</tr>
+</tbody>
+</table></div>
+<p>单元测试（不打模型）：<code>internal/guard/guard_test.go</code> 三个测试函数—— <code>TestToolGuard</code>（rm、<code>curl | bash</code>、注释行混淆、纯注释不误报、<code>echo</code> 放行、sudo 在 block 与 require_approval 下的差异）、<code>TestFilesystemGuard</code>（工作区内读放行、<code>.env</code> deny、<code>/etc/passwd</code> ask、 写 <code>/etc/hosts</code> deny、区外 <code>OutsideWorkspace: deny</code>）、<code>TestMaskSecrets</code>（<code>sk-</code> 打码、幂等、<code>api_key=</code> 赋值形式）。</p>
+<h3 id="71-一个值得记录的观察">7.1 一个值得记录的观察</h3>
+<p>被文件守卫拦下后，模型<strong>自己指出</strong>了防御缺口：<code>bash cat /etc/passwd</code> 可以绕过 <code>read_file</code> 的工作区边界—— 并主动声明不这么做。两点结论：</p>
+<ol type="1">
+<li><strong>逐工具的守卫 ≠ 沙箱</strong>。bash 能读任意路径，文件守卫只管文件工具。Codex 的 <code>workspace-write</code> 是 seatbelt/landlock 在<strong>系统调用层</strong>兜底，agent 无论从哪个工具发起都逃不掉；我们的守卫只在工具调用边界生效， 属于"可观测、可协商"的软约束。harness 的解法是纵深防御：文件守卫拦路径、命令守卫拦 <code>/proc/environ</code> 这类高危路径、更上层还有沙箱 backend。<strong>守卫分层，每层都有自己看得见和看不见的东西。</strong></li>
+<li><strong>把拦截原因写清楚，模型会配合</strong>。ToolMessage 里带拒绝理由（"超出工作区"），模型不仅理解了， 还内化了策略意图；模糊的错误只会让模型乱试。</li>
+</ol>
+<p>副产物：<code>ask</code> 态把"区外访问"<strong>升格成了用户可见事件</strong>。以前 agent 用 bash 绕道读系统文件，我们永远不知道； 现在只要它走文件工具，就会弹出来问一句。软约束的收益不在拦截率，在于让越界行为变得可见。</p>
+<h2 id="8-与-harness-的差距有意留下的">8. 与 harness 的差距（有意留下的）</h2>
+<ul>
+<li>规则只有 10 条代表性规则；harness 有 ~25 条 + YAML 热加载 + 用户自定义 <code>rules_dir</code>。 补齐是体力活，随时可做；当前换来了"规则即代码、可单测"的确定性。</li>
+<li>审批是 REPL 的 y/n；harness 是 <code>HITLRequest</code> 结构（action_requests / review_configs），为 Web 审批 UI 预留。 等"多入口统一路由"那一层再对齐。</li>
+<li>harness 的 guardian 接口支持插件化（规则 guardian 之外还能接 LLM guardian），我们只留了 <code>Rules</code> 数组注入。</li>
+<li>没有系统调用层沙箱（Codex 有 seatbelt/landlock）。要真堵 bash 绕道，得等沙箱能力落地， 或者把 bash 本身纳入"参数级路径解析"——后者不可靠，不划算。</li>
+</ul>
+<h2 id="9-与其他层的关系">9. 与其他层的关系</h2>
+<ul>
+<li><strong>入口</strong>：三件套挂在唯一入口的 <code>Handlers</code> 链上，与任务看板 middleware 并列（见《01》§5、《02》Task 6）。</li>
+<li><strong>下一层</strong>：任务看板（见《07》）——看板让任务变长，长任务的上下文膨胀问题随后就到， 那才是上下文管理（《05》§4 能力路线第 4 项）的入场时机。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/archive/old-line/06-%E5%B7%A5%E5%85%B7%E5%AE%89%E5%85%A8%E5%B1%82.md"><code>doc/archive/old-line/06-工具安全层.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

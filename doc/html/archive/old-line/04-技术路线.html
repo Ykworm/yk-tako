@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>04 · 技术路线 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="04--技术路线">04 · 技术路线</h1>
+<blockquote>
+<p>性质：<strong>路线记录</strong>。新系列第四篇，改写自旧《02-技术路线讨论》：保留「要不要整合 T-Mem」「LangGraph.js 还是 Eino」这两个真问题的取舍，以及那张 LangGraph→Eino 映射表（至今仍是移植手册），把来回反转压成一篇决策记， 结论按 2026-09-26 定案落定。 关联：立项与命名见《03》，Eino 依据的完整调研见《08》，Octop 剖析与复刻方针见《05》。</p>
+</blockquote>
+<h2 id="1-当时摆在桌上的两个问题">1. 当时摆在桌上的两个问题</h2>
+<p>项目从"照着 Octop 复刻一个 AI 工作伙伴"起步时，有两个必须先答的问题：</p>
+<ol type="1">
+<li>Octop 的<strong>记忆</strong>能力，要不要连同腾讯的 T-Mem 算法一起整合？</li>
+<li>复刻的<strong>技术栈</strong>选 LangGraph.js（贴近 Octop 的 Python LangGraph 血统）还是 Eino（Go）？</li>
+</ol>
+<p>两个问题的答案都不是"第一直觉"，两个都反转过。</p>
+<h2 id="2-问题一是否整合-t-mem">2. 问题一：是否整合 T-Mem？</h2>
+<p><strong>结论：值得，但不要第一天就整合——把它藏在 Memory 接口后面，分两期走。</strong></p>
+<h3 id="21-t-mem-是什么">2.1 T-Mem 是什么</h3>
+<ul>
+<li>定位：对话式 Agent 的<strong>长时记忆架构</strong>（arXiv:2606.15405，腾讯 + 港科广），LoCoMo / LoCoMo-Plus 双基准 SOTA</li>
+<li>核心思想："<strong>记忆应当预判，而非归档</strong>"——写入时由 LLM 为每条记忆预演两类触发器：
+<ul>
+<li>描述性触发器（措辞/实体相似就能召回）</li>
+<li>联想性触发器（与记忆无表面特征重叠、靠潜在语义弧关联的查询也能召回）</li>
+</ul></li>
+<li>结构：Scene → Topic → Item 三层图 + 级联检索（RRF 融合 BM25 + 稠密向量 + 硬余弦门控）</li>
+<li>参考实现：Python（<code>github.com/Sherlockwz/T-Mem</code>），构建期 LLM 调用密集</li>
+</ul>
+<h3 id="22-两期方案">2.2 两期方案</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>方案</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>一期</td>
+<td>pgvector + 简单情景记忆表（session 摘要 + 事实抽取）</td>
+<td>先跑通 Agent 主循环，<strong>记忆接口先行</strong>；接口不钉死，二期才换得动</td>
+</tr>
+<tr>
+<td>二期</td>
+<td>实现 T-Mem 算法</td>
+<td>触发器预演 + 三层级联检索是算法层面的东西，<strong>不绑定 Python</strong>，可以用 Go 重写；也可先跑 Python 参考实现做 sidecar 验证效果</td>
+</tr>
+</tbody>
+</table></div>
+<p>注意点：</p>
+<ul>
+<li>T-Mem 写入成本高（每段对话多次 LLM 调用：边界判定、主题分配、触发器实例化），需要<strong>异步写入管线</strong></li>
+<li>WeKnora 已有"跨会话长时记忆"实现，可对照参考。</li>
+<li>Octop 自带的记忆系统较简单，T-Mem 是差异化竞争力的候选。</li>
+</ul>
+<blockquote>
+<p>现状（2026-09-26）：记忆还没开工（排在能力路线靠后位置），上表仍是待执行的计划，不是实现记录。</p>
+</blockquote>
+<h2 id="3-问题二langgraphjs-还是-eino">3. 问题二：LangGraph.js 还是 Eino？</h2>
+<h3 id="31-对比">3.1 对比</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>LangGraph.js (Node/TS)</th>
+<th>Eino (Go)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>移植工作量</td>
+<td>⭐ API 与 Python LangGraph 几乎一一对应，接近"逐行翻译"</td>
+<td>概念一一对应（Graph/Node/Edge/State/Checkpoint），但 API 需重写</td>
+</tr>
+<tr>
+<td>与 Octop 现有后端</td>
+<td>引入第三种运行时（Go + Python + Node），或被迫砍掉 Go 部分</td>
+<td>⭐ 收敛为<strong>纯 Go 单语言</strong>，gRPC 边界最终可整个删掉</td>
+</tr>
+<tr>
+<td>DeepAgents 对应物</td>
+<td>deepagents 有 JS 版，生态跟随紧密</td>
+<td>Eino ADK（多智能体/supervisor），较新但在快速迭代</td>
+</tr>
+<tr>
+<td>桌面 Agent 形态</td>
+<td>Node 守护进程部署重</td>
+<td>⭐ Go 单二进制，天然适合本地数字员工</td>
+</tr>
+<tr>
+<td>MCP / 流式</td>
+<td>LangChain 生态成熟</td>
+<td>Eino 官方支持 MCP，流式基于 callback 机制完善</td>
+</tr>
+<tr>
+<td>技术资产一致性</td>
+<td>新增 TS 栈</td>
+<td>⭐ 与 WeKnora（Go）一脉相承，架构经验直接复用</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="32-结论选-eino">3.2 结论：选 Eino</h3>
+<p>决定性理由不是"Eino 比 LangGraph.js 强"，而是<strong>系统拓扑</strong>：</p>
+<ol type="1">
+<li>Octop 自己是"Python 应用 + Python Agent 芯"；用 LangGraph.js 复刻只是换一种双语双进程， 复杂度没降下来；用 Eino 则收敛为纯 Go 单语言，少一种运行时。</li>
+<li>目标是本地数字员工形态，Go 单二进制部署是硬优势。</li>
+<li>参考系（WeKnora）全是 Go，遇到问题有两个大型 Go 项目（WeKnora + Eino 自身）可抄。</li>
+</ol>
+<p>代价：复刻不是"翻译"而是"重写"，需要先建立 LangGraph → Eino 的概念映射表。</p>
+<h3 id="33-langgraph--eino-概念映射移植手册">3.3 LangGraph → Eino 概念映射（移植手册）</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>LangGraph (Python)</th>
+<th>Eino (Go)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>StateGraph</code></td>
+<td><code>compose.Graph</code> / <code>compose.NewChain</code></td>
+</tr>
+<tr>
+<td><code>add_node</code> / <code>add_edge</code></td>
+<td><code>AddNode</code> / <code>AddEdge</code></td>
+</tr>
+<tr>
+<td>条件边 <code>add_conditional_edges</code></td>
+<td><code>AddBranch</code>（<code>GraphBranch</code>）</td>
+</tr>
+<tr>
+<td>State（TypedDict + reducer）</td>
+<td>泛型 State + <code>WithStatePostHandler</code> / <code>GenLocalState</code></td>
+</tr>
+<tr>
+<td><code>Checkpointer</code>（PostgresSaver）</td>
+<td>Checkpoint 接口（<code>compose.CheckPointStore</code>），需自实现存储</td>
+</tr>
+<tr>
+<td><code>interrupt</code> / 人机协同</td>
+<td>Eino Interrupt &amp; Resume（<code>compose.StatefulInterrupt</code> + <code>Runner.ResumeWithParams</code>）</td>
+</tr>
+<tr>
+<td>ReAct Agent（prebuilt）</td>
+<td><code>react.Agent</code> / ADK <code>ChatModelAgent</code></td>
+</tr>
+<tr>
+<td>多智能体 supervisor</td>
+<td>Eino ADK 的多 Agent 组合（<code>flowAgent</code> 等）</td>
+</tr>
+<tr>
+<td>工具节点 ToolNode</td>
+<td><code>compose.ToolsNode</code> + MCP 工具适配</td>
+</tr>
+<tr>
+<td>流式 <code>astream_events</code></td>
+<td>Callbacks + <code>StreamReader</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>这张表在后续每层都用得上：读 Octop/harness 的 Python 实现时，先用它把"这个概念在 Eino 里叫什么"定位出来， 再决定是"照抄语义"还是"用 Eino 的正式做法重做"（后者更多，见《05》§翻译原则）。</p>
+<h2 id="4-反转记2026-09-23--2026-09-24">4. 反转记（2026-09-23 → 2026-09-24）</h2>
+<p>路线来回走了两圈，两次反转都有具体原因，记下来避免重复踩：</p>
+<h3 id="41-第一圈定全栈-typescript2026-09-23">4.1 第一圈：定全栈 TypeScript（2026-09-23）</h3>
+<p>理由不是技术对比，而是<strong>人的连续性</strong>：owner 之前用 TS 和 Go 各复刻过一遍 pi agent（双语言对照实验）， 实测体感 TS 更适合；生长式路线下"学习连续性"权重最高；且 harness-agent 的中间件矩阵在 JS 版 deepagents 上有官方对应物，翻译最直接。最终技术栈定为 LangGraph.js + deepagents(JS) + Node 后端。</p>
+<h3 id="42-实地验证推翻前提同日晚">4.2 实地验证推翻前提（同日晚）</h3>
+<p>clone 了 <code>ref-agent/Octop</code> 实际代码（v0.9.33）后发现：<strong>不存在"可保留的 Go 后端"</strong>—— Octop 主进程是 Python 3.12+ 单进程（FastAPI + uvicorn，src 约 13.1 万行），Go 只存在于 <code>desktop/</code> 桌面外壳（约 2.6k 行）； Agent 核心在外部 pip 包 <code>orcakit-harness-agent</code> 里。两条路线都意味着全量重写，谁也没有存量优势。</p>
+<h3 id="43-第二圈回到-eino2026-09-24终版">4.3 第二圈：回到 Eino（2026-09-24）——终版</h3>
+<p>爬完 L2（任务规划）后做了一轮 Eino 专题调研，暴露的核心问题是<strong>规划与执行的时序保证</strong>： 在 LangGraph 系里，这类约束只有 middleware 一层可做文章（<code>afterModel</code> 之类），用软钩子模拟硬约束； Eino 却把分界写死——<strong>Graph 管确定性、Agent 管自主性，不要用静态编排去假装动态决策</strong>， 要硬保证时直接编图（Workflow Agents / Plan-Execute 节点图）。</p>
+<p>换句话说，"对确定性有正式的一等公民答案"这件事，Eino 有，LangGraph 系没有。这正是后续层级 （子代理、断点恢复、多入口）会反复碰到的问题。调研全文见《08》。</p>
+<p><strong>决策</strong>：</p>
+<ul>
+<li>只保留 <code>yk-tako-eino/</code> 作为唯一主线，后续能力全部在 Go/Eino 里生长；</li>
+<li>复刻方针：<strong>功能翻译，按 Eino 的思想写</strong>（细则见《05》§翻译原则）；</li>
+<li>TypeScript 实现全部删除；<code>maf/</code>（.NET 对照）冻结为存档，不再推进。</li>
+</ul>
+<h2 id="5-落点与现状2026-09-26">5. 落点与现状（2026-09-26）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>事项</th>
+<th>现状</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>技术栈</td>
+<td>Go 1.25 + Eino v0.9.21（<code>yk-tako-eino/go.mod</code>）</td>
+</tr>
+<tr>
+<td>唯一入口</td>
+<td><code>cmd/yktako</code>（已收敛，见《02》Task 6/7）；旧 L0–L2 五个入口与 <code>internal/planexec</code> 已删除</td>
+</tr>
+<tr>
+<td>记忆两期方案</td>
+<td>未开工，先留着接口位置（能力路线见《05》§4）</td>
+</tr>
+<tr>
+<td>参考资产</td>
+<td>Octop <code>ref-agent/Octop</code>、WeKnora <code>ref-agent/WeKnora</code>、harness-* <code>harness-pkg/</code></td>
+</tr>
+</tbody>
+</table></div>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/archive/old-line/04-%E6%8A%80%E6%9C%AF%E8%B7%AF%E7%BA%BF.md"><code>doc/archive/old-line/04-技术路线.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

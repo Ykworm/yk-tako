@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>51 · UI 视觉重做（中性现代风 + 手机抽屉） · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="51--ui-视觉重做中性现代风--手机抽屉">51 · UI 视觉重做（中性现代风 + 手机抽屉）</h1>
+<blockquote>
+<p>性质：<strong>已落地（2026-10-24，U1–U7）</strong>。 状态：✅ 落地。U1 token 层 / U2 侧栏三段式 / U3 侧栏收色 / U4 三页骨架与弹层 / U5 气泡与输入区 / U6 手机抽屉 / U7 四档收口全部施工并机器验收；实测数字见 §7。 来源：2026-10-24 用户「现在挺差的，你可以去优化 UI 设计了」；两问已拍——<strong>视觉方向 = 中性现代风</strong>（浅灰白 + 单一强调色），<strong>手机 ≤860px = 抽屉式</strong>。 真源关系：侧栏树的结构与交互（折叠、10 条上限、展示全部）仍由 <a href="50-侧栏项目树.html">doc/50</a> 定义，本篇只改呈现层；页面职责是 <a href="44-前端三处欠账.html">doc/44</a>、<a href="42-产品形态收窄与共享项目退役.html">doc/42</a>；响应信封 <a href="40-响应信封统一.html">doc/40</a> 不动。 <strong>不改后端契约、不改交互流程</strong>，只动 CSS 与少量模板结构（抽屉重复使用同一棵树的 DOM/状态，没有复制数据）。</p>
+</blockquote>
+<hr />
+<h2 id="0-病灶在真屏幕上这套界面有四个具体失败">0. 病灶：在真屏幕上，这套界面有四个具体失败</h2>
+<p>2026-10-24 用 Playwright 无头跑 1440×900 与 390×844 两档实拍（图在 <code>/tmp/tako-ui/</code>，不入库），不是凭印象：</p>
+<ol type="1">
+<li><strong>侧栏底部压住内容</strong>（1440×900）。<code>.rail</code> 是 flex 列、<code>.recent</code> 有 <code>min-height: 0</code> 但树内容 <code>overflow: visible</code>，<code>.rail-foot</code> 又是 <code>margin-top: auto</code>。10 条会话 + 3 个项目行超过可用高度后，树继续往下画，用户卡片和「退出」直接盖在「验收项目」和「展示更多」上——最下面那行会话点不到。</li>
+<li><strong>手机端聊天被挤成一条</strong>（390×844）。≤860px 时 <code>.rail</code> 变成三行 grid，<strong>整棵项目树留在顶栏里</strong>，占掉约 560px；聊天正文只剩底部约 120px，输入框贴底。打开会话要先看过半屏的目录。</li>
+<li><strong>没有层级与比例</strong>。同一页里：页面标题 24.8px/620、卡片标题 14px、正文 15px、侧栏会话 12.8px、按钮 12.8px；圆角同时存在 999 / 22 / 18 / 14 / 10 / 5px 六种；阴影里外混用；卡片是暖白贴米底，几乎看不出边界。</li>
+<li><strong>对话像两块贴纸</strong>。用户气泡 474px 宽、助手气泡 232px 宽，宽度全由内容决定、左右跳动；用量与「复制」是 12px 灰字塞在气泡底部，读起来像脚注；助手气泡的表格/代码块没有统一的内边距。</li>
+</ol>
+<p>第 1、2 条是<strong>功能伤</strong>（点不到 / 没法用），第 3、4 条是<strong>观感伤</strong>。先修功能伤再统一观感。</p>
+<h2 id="1-拍板2026-10-24">1. 拍板（2026-10-24）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>项</th>
+<th>取值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>视觉方向</td>
+<td><strong>中性现代风</strong>：浅灰白底、白色卡片、1px 细边、单一蓝色强调色；去掉米色与暖阴影</td>
+</tr>
+<tr>
+<td>手机 ≤860px</td>
+<td><strong>抽屉式</strong>：顶栏只留 品牌 / 新对话 / 菜单；导航 + 项目树 + 账户进左侧抽屉；聊天占满屏</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="2-为什么先做-token-层">2. 为什么先做 Token 层</h2>
+<p>现在颜色和尺寸是散着写的：8 个组件里 <strong>150 处</strong>硬编码颜色（App.vue 99、Configure.vue 16、ProjectsView.vue 12、MembersView.vue 8、ConfirmDialog.vue 6、InviteLanding.vue 5、PlanDoc.vue 3、PendingInvites.vue 1），还有 <code>#f6f1e7</code>、<code>#8fbfb0</code>、<code>rgba(15,110,86,.1)</code> 这类直接写死的值。<strong>方向一换，逐页找颜色改</strong>必然漏，而且下次再换还来一遍。所以第一拍只做一件事：把颜色/字阶/间距/圆角/阴影收进 <code>base.css</code> 的变量，组件里换成变量引用；视觉变化先只在 token 层生效，结构不动。</p>
+<h2 id="3-token-取值落-websrcbasecss">3. Token 取值（落 <code>web/src/base.css</code>）</h2>
+<div class="sourceCode" id="cb1"><pre class="sourceCode css"><code class="sourceCode css"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>--bg<span class="in">:</span> <span class="pp">#f6f7f9</span>;          <span class="co">/* 页面底：冷灰白 */</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>--bg-raised<span class="in">:</span> <span class="pp">#ffffff</span>;   <span class="co">/* 卡片/气泡 */</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>--sidebar<span class="in">:</span> <span class="pp">#fbfbfc</span>;     <span class="co">/* 侧栏：比页面略亮 */</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>--ink<span class="in">:</span> <span class="pp">#14161a</span>;         <span class="co">/* 主文字 */</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>--ink-soft<span class="in">:</span> <span class="pp">#3d434d</span>;    <span class="co">/* 次要文字 */</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>--muted<span class="in">:</span> <span class="pp">#6b7280</span>;       <span class="co">/* 说明/时间 */</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>--line<span class="in">:</span> <span class="pp">#e6e8ec</span>;</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>--line-strong<span class="in">:</span> <span class="pp">#d3d7de</span>;</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>--accent<span class="in">:</span> <span class="pp">#2f6feb</span>;      <span class="co">/* 单一强调色 */</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>--accent-ink<span class="in">:</span> <span class="pp">#1d4ed8</span>;</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>--accent-soft<span class="in">:</span> <span class="pp">#eaf1fe</span>;</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>--danger<span class="in">:</span> <span class="pp">#d92d20</span>;  --danger-soft<span class="in">:</span> <span class="pp">#fef3f2</span>;</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>--warn<span class="in">:</span> <span class="pp">#b54708</span>;    --warn-soft<span class="in">:</span> <span class="pp">#fffaeb</span>;</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>--shadow<span class="in">:</span> 0 1px 2px rgba<span class="in">(</span>16<span class="op">,</span>17<span class="op">,</span>20<span class="op">,</span><span class="fu">.05</span><span class="in">)</span><span class="op">,</span> 0 12px 32px rgba<span class="in">(</span>16<span class="op">,</span>17<span class="op">,</span>20<span class="op">,</span><span class="fu">.08</span><span class="in">)</span>;</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>--radius<span class="in">:</span> 12px;</span></code></pre></div>
+<p>字阶与间距（同样进 <code>:root</code>）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>名称</th>
+<th>值</th>
+<th>用在哪</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--text-xs</code></td>
+<td>12px</td>
+<td>时间、kicker、徽标</td>
+</tr>
+<tr>
+<td><code>--text-sm</code></td>
+<td>13px</td>
+<td>按钮、侧栏、次要说明</td>
+</tr>
+<tr>
+<td><code>--text-base</code></td>
+<td>14px</td>
+<td>卡片正文、表单</td>
+</tr>
+<tr>
+<td><code>--text-md</code></td>
+<td>15px</td>
+<td>对话正文</td>
+</tr>
+<tr>
+<td><code>--text-lg</code></td>
+<td>17px</td>
+<td>卡片标题、区块标题</td>
+</tr>
+<tr>
+<td><code>--text-xl</code></td>
+<td>22px</td>
+<td>页面标题</td>
+</tr>
+<tr>
+<td><code>--space-1..6</code></td>
+<td>4 / 8 / 12 / 16 / 24 / 32px</td>
+<td>全站间距</td>
+</tr>
+</tbody>
+</table></div>
+<p>圆角只有三档：<strong>8px（控件）/ 12px（卡片、气泡）/ 16px（面板、抽屉）</strong>；999px 只给状态徽标与 chip。</p>
+<h2 id="4-侧栏三段式修病灶-1">4. 侧栏：三段式（修病灶 1）</h2>
+<ul>
+<li>结构：<code>.rail</code> = <code>head</code>（品牌 + 新对话 + 导航，不滚）+ <code>tree</code>（项目树，唯一可伸缩/可滚的一段）+ <code>foot</code>（账户，钉底、带 <code>border-top</code>）。</li>
+<li><code>.recent</code> 从 flex 子项改成「可缩小 + <code>overflow</code> 收在自己身上」；树的滚动<strong>只在视口真的装不下时出现</strong>，不再设 <code>max-height</code>。900px 高、10 条会话、3 个项目的目标是<strong>完全不出现滚动条</strong>（下面 §6 有验收命令）。</li>
+<li>会话行改<strong>单行</strong>：标题左、时间右（12px <code>--muted</code>），行高 30px，原来标题/时间上下叠的 40px 行去掉。项目行 34px，组间距 16px。10 条 × 30 + 3 行 × 34 + 两个「展示/收起」按钮 ≈ 470px，900px 视口能全放下。</li>
+<li>折叠、10 条上限、「展示全部」逻辑<strong>一行不动</strong>（doc/50）。</li>
+</ul>
+<h2 id="5-手机抽屉修病灶-2">5. 手机抽屉（修病灶 2）</h2>
+<ul>
+<li>≤860px：<code>.rail</code> 只当顶栏用（高 52px）：品牌、新对话、菜单按钮（汉堡）；导航与树全部收进抽屉。</li>
+<li>抽屉：宽 280px，从左侧滑入，背后半透明遮罩；内容复用<strong>同一棵</strong>树的 DOM 与状态（<code>collapsed</code> / <code>visibleCount</code> / <code>expandedProjects</code>），不复制数据。</li>
+<li>关闭方式三种：点遮罩、按 <code>Esc</code>、打开任意会话后自动关闭。</li>
+<li>焦点：打开时聚焦抽屉第一项，关闭后回到菜单按钮；遮罩与抽屉都带 <code>aria-modal</code> / <code>aria-hidden</code> 的正确语义。</li>
+<li>聊天在 ≤860px 占满剩余高度；输入区贴底并留 <code>env(safe-area-inset-bottom)</code>。</li>
+</ul>
+<h2 id="6-其余三块">6. 其余三块</h2>
+<p><strong>页面骨架（项目 / 助手 / 团队）</strong></p>
+<ul>
+<li>统一 <code>.page</code>：<code>max-width: 860px</code>、左右 32px、顶部 28px；kicker 12px 大写灰、标题 22px/600、说明 13px <code>--muted</code>。</li>
+<li>卡片：白底 + 1px <code>--line</code> + 12px 圆角 + 20px 内边距，<strong>无外阴影</strong>；卡间距 16px。</li>
+<li>按钮四型：primary（accent 实心）/ secondary（白底细边）/ ghost（透明）/ danger（白底红边红字）；高 32px、圆角 8px、13px/500。<strong>每张卡最多一个 primary</strong>。</li>
+<li>输入：高 36px、白底、1px <code>--line</code>；focus 时 accent 边框 + 3px <code>--accent-soft</code> 环。</li>
+</ul>
+<p><strong>对话页（修病灶 4）</strong></p>
+<ul>
+<li>内容列 720px；气泡最大宽度 86%，用户右对齐、助手左对齐。（<strong>2026-11-03 改</strong>：对话列去掉 720px/45rem 上限、铺满内容区左右各留 1.5rem；助手气泡 <code>max-width:100%</code>、用户气泡 78%。见 doc/47 §5.5。）</li>
+<li>用户气泡：中性深墨 <code>--ink</code> 底 + 近白字（保留 doc/49 #13 的深底覆盖）；助手气泡：白卡 + 1px 边。圆角 14px，同侧下角 4px；内边距 12/16；消息间距 16px。</li>
+<li>用量与「复制」从气泡内移到<strong>气泡下方一行</strong>（12px <code>--muted</code>，gap 8px）；用户气泡只保留「复制」。</li>
+<li>空态居中：标题 20px、说明 13px、示例 chips 一行。</li>
+</ul>
+<p><strong>细节</strong></p>
+<ul>
+<li>去掉 <code>.app</code> 的米色 <code>radial-gradient</code>，背景纯 <code>--bg</code>。</li>
+<li>滚动条统一 8px、滑块 <code>--line-strong</code>、轨道透明。</li>
+<li><code>:focus-visible</code> 用 accent；hover 底色 <code>#f2f3f5</code>；当前项 <code>--accent-soft</code> + <code>--accent-ink</code>。</li>
+<li>时间/用量用 <code>font-variant-numeric: tabular-nums</code>。</li>
+</ul>
+<h2 id="7-验收">7. 验收</h2>
+<p>四档截图：1440×900、1024×768、700×900、390×844（Playwright 无头，脚本放 <code>tmp/51-UI重做/</code>）。判据都能脚本断言：</p>
+<ol type="1">
+<li><strong>侧栏不重叠</strong>：900px 高、10 条会话时，<code>rail-foot</code> 的 <code>top ≥ tree</code> 的 <code>bottom</code>；<code>.tree</code> 的 <code>scrollHeight === clientHeight</code>。</li>
+<li><strong>手机可用</strong>：390×844 时聊天列表可视高度 ≥ 560px；抽屉能用遮罩 / <code>Esc</code> / 打开会话三种方式关闭。</li>
+<li><strong>对比度</strong>：正文对背景 ≥ 7:1，次要文字 ≥ 4.5:1（按相对亮度脚本算）。</li>
+<li><strong>无横向溢出</strong>：四档 <code>document.documentElement.scrollWidth === clientWidth</code>。</li>
+<li><strong>一致性</strong>：控件（有边框或实色底的按钮/输入）高度只有 28（小号）与 32（普通）两档，列表行 30（会话）与 34（项目）；圆角只出现 4 / 8 / 12 / 14 / 16 / 999 / 50%（气泡 14 与同侧下角 4 在 U5 定义）。</li>
+<li>回归：<code>npm run typecheck</code>、<code>npm test</code>；<code>scripts/check-master-plan.sh</code>。</li>
+</ol>
+<h3 id="实测2026-10-24u7-收口">实测（2026-10-24，U7 收口）</h3>
+<p><code>node tmp/51-UI重做/verify.mjs all</code>，同一账号打开有问答的会话逐档量（Playwright 无头，Node 22）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>档位</th>
+<th>溢出</th>
+<th>正文对比度</th>
+<th>次要文字对比度</th>
+<th>圆角集合</th>
+<th>控件高 / 行高</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1440×900</td>
+<td>0</td>
+<td>16.88:1（<code>--on-ink</code> on <code>--ink</code>）</td>
+<td>4.51:1（<code>--muted</code> on <code>--bg</code>）</td>
+<td>4/8/14/16/50%</td>
+<td>28/32 · 30/34</td>
+</tr>
+<tr>
+<td>1024×768</td>
+<td>0</td>
+<td>同上</td>
+<td>同上</td>
+<td>同上</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>700×900</td>
+<td>0</td>
+<td>同上</td>
+<td>同上</td>
+<td>同上</td>
+<td>32 · —（树在抽屉里）</td>
+</tr>
+<tr>
+<td>390×844</td>
+<td>0</td>
+<td>同上</td>
+<td>同上</td>
+<td>同上</td>
+<td>32 · —</td>
+</tr>
+</tbody>
+</table></div>
+<ul>
+<li>390×844：顶栏 52px、聊天列表可视 <strong>699px</strong>、抽屉 280px；三种关闭方式（遮罩 / <code>Esc</code> / 打开会话）均回到关闭态，焦点按「抽屉第一项 ↔︎ 菜单按钮」往返。</li>
+<li>单拍回归：<code>all</code> 28/28、<code>tokens</code> 12/12、<code>rail</code> 4/4、<code>sidebar</code> 5/5、<code>pages</code> 29/29、<code>bubbles</code> 16/16、<code>invite</code> 1/1、<code>mobile</code> 12/12；<code>npm run typecheck</code> 退出码 0、<code>npm test</code> 14/14、<code>scripts/check-master-plan.sh</code> OK。</li>
+<li>未实拍的两处：<code>PendingInvites</code>（当前测试账号只有一个租户、<code>/api/me/invitations</code> 为空；构造一条要再建一个账号/租户）与 <code>PlanDoc</code>（16 场会话的 log 里没有 <code>kind=plan</code> 记录；造一条要真跑一轮 plan 模式）。两者本拍只有 CSS 改动，<strong>没有真实形态截图</strong>；等各自功能再被真跑时补拍。</li>
+</ul>
+<h2 id="8-明确不做">8. 明确不做</h2>
+<ul>
+<li><strong>不做深色主题与主题切换</strong>（用户未选；以后要做得先把 token 层收完，本篇正是那一步）。</li>
+<li><strong>不引入 UI 框架/组件库</strong>：现有是手写 CSS，换库等于把全部页面重写一遍，收益不抵风险。</li>
+<li><strong>不改交互流程与后端契约</strong>：增删改查、事件通道、响应信封都不动。</li>
+<li><strong>不改 doc/50 的树逻辑</strong>：折叠状态、10 条上限、「展示全部」的语义保持。</li>
+<li><strong>不做插画/动效花活</strong>：只保留现有的 0.18s 入场与流式光标。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/51-UI%E8%A7%86%E8%A7%89%E9%87%8D%E5%81%9A.md"><code>doc/51-UI视觉重做.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>07 · 任务规划与看板 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="07--任务规划与看板">07 · 任务规划与看板</h1>
+<blockquote>
+<p>性质：<strong>能力记录 + 决策记录</strong>。新系列第七篇，改写自旧《05-L2-任务规划》：问题陈述与"从 deepagents/harness 读到的东西"保留（那是对照物的事实），但<strong>结论换了</strong>——旧稿的手写规划中间件（<code>internal/planning</code>）与 两个对照入口（<code>cmd/l2planning</code>、<code>cmd/l2builtin</code>）已随 2026-09-26 定案删除， 现在是 Plan / Tasks / Actions 三层分离 + 自研看板（定案见《01》，实现计划见《02》）。 为什么退掉那两条软约束线，见《08-Eino规划机制调研》。</p>
+</blockquote>
+<h2 id="1-问题">1. 问题</h2>
+<p>多步任务下，agent 需要：先把任务拆成步骤、执行中能被看见进度、被打断后不丢施工状态。 "看见进度"和"记账准确"是两件事，混在一起就出问题：</p>
+<ul>
+<li>让模型每轮把<strong>整张清单</strong>重写一遍（DeepAgent 的 <code>write_todos</code>），模型漏更新时账本就是旧的；</li>
+<li>想让"改哪一行"有据可依，就得给行一个<strong>稳定主键</strong>，而不是每次全量覆盖。</li>
+</ul>
+<h2 id="2-从参考实现读到什么">2. 从参考实现读到什么</h2>
+<h3 id="21-harness-自己没有-todo-中间件">2.1 harness 自己没有 todo 中间件</h3>
+<p>带着"任务规划参考 harness 哪个文件"的问题翻 <code>harness_agent/middleware/</code>，24 个中间件里<strong>没有 todo</strong>—— harness 直接用 deepagents 的。目录里的 <code>tool_order.py</code> 名字像规划，实际是另一件事：把 <code>task</code> 工具排到 工具列表末尾，让父子 agent 的公共工具前缀对齐，<strong>给 prompt cache 复用服务的</strong>。 提醒：按名字猜职责会踩空，得看实现。</p>
+<h3 id="22-官方-todolistmiddleware-的四个零件">2.2 官方 <code>TodoListMiddleware</code> 的四个零件</h3>
+<p>官方实现是 Python 的 <code>TodoListMiddleware</code>（<code>langchain.agents.middleware</code>，deepagents 直接引用）； 我们精读过的是它的 JS 移植（<code>agents/middleware/todoListMiddleware.js</code>，约 100 行有效代码），四个零件与 Python 版一致：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>零件</th>
+<th>机制</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>状态频道</td>
+<td><code>stateSchema: z.object({ todos: ...default([]) })</code></td>
+<td>给 agent 状态图加 <code>todos</code> 频道</td>
+</tr>
+<tr>
+<td><code>write_todos</code> 工具</td>
+<td>返回 <code>Command({ update: { todos, messages } })</code></td>
+<td><strong>全量替换</strong>清单 + 回执 ToolMessage</td>
+</tr>
+<tr>
+<td>提示词注入</td>
+<td><code>wrapModelCall</code> 里拼 <code>systemMessage</code></td>
+<td>教模型什么时候该用、什么时候别用</td>
+</tr>
+<tr>
+<td>并行防守</td>
+<td><code>afterModel</code> 检查一轮内 <code>write_todos</code> 调用数</td>
+<td>&gt;1 次就全部换成错误 ToolMessage</td>
+</tr>
+</tbody>
+</table></div>
+<p>两个值得停下来想的设计点：</p>
+<ol type="1">
+<li><strong>为什么全量替换而不是增量操作</strong>（没有 add_todo / complete_todo）：增量 API 需要 id 管理和冲突处理； 全量替换把"当前计划长什么样"的权威来源始终放在模型手里——模型每轮都能在上次回执里看到完整清单， 改起来一步到位。代价是并行调用会产生歧义，所以要有零件 4 的防守。</li>
+<li><strong>提示词是最大的代码量</strong>。官方版有效代码约 100 行，提示词约 200 行（带 8 组正反示例）。 什么时候列清单、什么时候别列，全靠提示词约束——这不是工程问题，是 prompt engineering。</li>
+</ol>
+<h3 id="23-半途而废提醒我们外扩过的一格">2.3 半途而废提醒（我们外扩过的一格）</h3>
+<p>官方版有个能力空档：模型列了计划，但执行到一半就输出最终回答收工了（清单里还有 <code>in_progress</code> 项）， 没有任何机制纠正它。当时在 middleware 里补过一格：模型想收工 + 清单里有 <code>in_progress</code></p>
+<ul>
+<li>本轮写过清单 + 本轮还没提醒过 → 注入一条提醒并跳回模型节点。四条约束（只催 in_progress、 只催本轮刚写过的、每轮最多一次、只在无待执行 tool_calls 时跳转）在旧稿里有完整记录， <strong>这套状态机已随 <code>internal/planning</code> 删除</strong>；它的"提醒"意图被新设计继承成了<strong>工具输出尾部的催更块</strong>（见 §4）。</li>
+</ul>
+<h2 id="3-两条旧线的退场决策记录">3. 两条旧线的退场（决策记录）</h2>
+<h3 id="31-手写规划中间件internalplanning--cmdl2planning">3.1 手写规划中间件（<code>internal/planning</code> + <code>cmd/l2planning</code>）</h3>
+<p>复刻了官方四个零件，提示词换成紧凑中文版（15 行 vs 官方 200 行）。实测结论值得留档： <strong>在 deepseek-flash 这个量级上，紧凑中文提示词与官方 200 行版行为无差别</strong>——"什么时候列清单" 不需要 8 组示例；提示词长度与效果的拐点在哪，留给后续继续观察。</p>
+<p>顺带留下一条 Eino 侧的实现差异备忘：<code>ChatModelAgent</code> 没有自定义 state 频道，清单只能放进程内； "半途而废提醒"因此不能靠"追加 HumanMessage + jumpTo"（那是 LangGraph 的路由玩法）， 要让图走进工具节点再回到模型，只能补一次对模型隐藏的工具调用。</p>
+<p><strong>退场原因</strong>（2026-09-26 定案）：单入口产品形态下不需要"同一能力两套实现"； 而这类软约束的定位本身尴尬——它只解决"提醒模型更新"，不解决"账本对不对"（见《08》§0）。</p>
+<h3 id="32-官方-write_todos-对照cmdl2builtin">3.2 官方 <code>write_todos</code> 对照（<code>cmd/l2builtin</code>）</h3>
+<p><code>deep.New</code> 自带 <code>write_todos</code>，当时的用途是"官方软对照"。它随单入口收敛一起删除： 对照结论已经写进《08》，留一个演示入口没有意义。</p>
+<h3 id="33-硬编排线cmdl2planexec--internalplanexec">3.3 硬编排线（<code>cmd/l2planexec</code> + <code>internal/planexec</code>）</h3>
+<p>同一批收敛里退场的还有 planexecute 硬编排（<code>Sequential(Gate, Loop(Executor, Replanner))</code>）。 它证明过"时序可以由图保证"，但产品形态是<strong>一个能聊的助手</strong>，不是流程图应用： 强制 <code>tool_choice</code> 的结构化 Planner/Replanner 带来过度规划、阶段间无共享对话等代价（实测记录见《08》§6、§7）， 而定案选择的是"看板记账 + 模型自主推进"。图能力留在工具箱里，等真需要确定性流程时再用。</p>
+<h2 id="4-现在的答案三层分离--看板">4. 现在的答案：三层分离 + 看板</h2>
+<h3 id="41-三层不并成一层">4.1 三层，不并成一层</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>层</th>
+<th>是什么</th>
+<th>谁写</th>
+<th>主键</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Plan</strong></td>
+<td>给人审的方案（背景、步骤、文件、风险）</td>
+<td>模型 + 用户改</td>
+<td>文档结构</td>
+</tr>
+<tr>
+<td><strong>Tasks</strong></td>
+<td>执行期勾选看板</td>
+<td>模型用记账工具</td>
+<td><strong><code>taskId</code></strong>（自增数字）</td>
+</tr>
+<tr>
+<td><strong>Actions</strong></td>
+<td><code>bash</code> / 读写文件等干活工具</td>
+<td>模型按 ReAct 选</td>
+<td>tool_call id，与 task <strong>无外键</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p>关系是<strong>分离</strong>（对标 Claude 默认）：Plan 是给人审的文档；开干后模型用 <code>TaskCreate</code> 建看板， 文案不必逐行等于 plan。一条 Task 下可以有任意多次 Action，<code>taskId</code> 只寻址看板行。</p>
+<blockquote>
+<p>Plan 层本轮不新增机制：没有人审 gate、没有 ExitPlanMode 式 interrupt，Plan 仅以提示词约定的口述方案形态存在。 Tasks 账本是本轮唯一新建机制。</p>
+</blockquote>
+<h3 id="42-记账协议四个工具">4.2 记账协议（四个工具）</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>工具</th>
+<th>入参</th>
+<th>返回</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>TaskCreate</code></td>
+<td><code>subject</code>、<code>description?</code>、<code>activeForm?</code></td>
+<td>新建行 + <code>taskId</code></td>
+</tr>
+<tr>
+<td><code>TaskUpdate</code></td>
+<td><code>taskId</code>、<code>status?</code>、<code>subject?</code>、<code>description?</code>、<code>activeForm?</code></td>
+<td>按 id patch（空串字段不动）</td>
+</tr>
+<tr>
+<td><code>TaskList</code></td>
+<td>—</td>
+<td>全部未删除任务</td>
+</tr>
+<tr>
+<td><code>TaskGet</code></td>
+<td><code>taskId</code></td>
+<td>单条</td>
+</tr>
+</tbody>
+</table></div>
+<ul>
+<li>状态：<code>pending → in_progress → completed</code>；不再需要时用 <code>deleted</code>（<code>TaskList</code> 不列出，快照里保留）。</li>
+<li>约束写在 <strong>tool description</strong>（不是状态机）：≥3 步或用户一次列了多件事才建表；动手前标 <code>in_progress</code> 且同时尽量只留一条；做完立刻标 <code>completed</code>；测试红 / 做了一半 / 未解报错<strong>不准</strong>标 <code>completed</code>； 卡住就新建一条 blocker。</li>
+<li>全局约定（什么时候该建表）进 agent 的 <code>Instruction</code>（<code>taskboard.Instruction</code>，由 <code>cmd/yktako</code> 拼在 <code>config.SystemPrompt()</code> 后面）。</li>
+<li>每个工具的输出 = <strong>操作回执 + 当前看板紧凑视图 + 催更块</strong>（存在未完成项时提醒"先更新状态再干活""做完立刻勾"）。 催更块是把 §2.3 那个"半途而废提醒"从 middleware 钩子<strong>下移到工具回执尾部</strong>的做法， 灵感来自 WeKnora 的 <code>todo_write</code>（在 tool_result 尾部注入 Important Reminder）。</li>
+</ul>
+<h3 id="43-存储正本--镜像">4.3 存储：正本 + 镜像</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>层</th>
+<th>角色</th>
+<th>生命周期</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>middleware 自持 <code>*Store</code>（mutex + map + 自增计数器）</td>
+<td><strong>正本</strong>：四个工具直接读写</td>
+<td>agent 建一次 → 跨 REPL 轮次存活</td>
+</tr>
+<tr>
+<td><code>adk.AddSessionValue(SessionKey, snapshot)</code></td>
+<td><strong>镜像</strong>：每次变更后全量写入</td>
+<td>interrupt 时随 runContext gob 进 checkpoint</td>
+</tr>
+</tbody>
+</table></div>
+<p>机制依据（eino v0.9.21 源码核实）：<code>adk/runctx.go</code> 的 <code>runSession.Values</code> 标注 <code>CheckpointSchema: persisted via serialization.RunCtx (gob)</code>——session 值在 interrupt 时随整个 runContext gob 序列化进 <code>CheckPointStore</code>，<strong>账本镜像随图状态一起落盘是免费得到的</strong>（快照类型必须 <code>gob.Register</code>）。 但 session 每轮 <code>runner.Run</code> 新建，能把父 session 带进子 run 的 option 未导出，所以<strong>跨轮正本不能放 session</strong>， 只能 middleware 自持。进程重启全丢——<code>adkrun.Store</code> 本来就是内存实现，磁盘持久化留给后面的层级。</p>
+<p>同一 middleware 实例内用 mutex 把四个工具串行化（参照 eino plantask），防同轮并行调用写坏账本； 入口再开 <code>ExecuteSequentially: true</code> 让同批工具调用串行（秩序偏好，不是正确性保证）。</p>
+<h3 id="44-明确不解决什么">4.4 明确不解决什么</h3>
+<ul>
+<li>Action ↔︎ Task 双射（不推断「这次调用对应哪条 todo」）；</li>
+<li>模型漏更新时自动勾选正确的行；</li>
+<li>用图拓扑强制执行顺序。</li>
+</ul>
+<p>要硬进度：收窄执行模型（一次只推进一条 / 子 Agent 交卷才算完 / 测试或 goal 作为验收标准）， 不要在开放 ReAct 上做语义对齐。</p>
+<h2 id="5-与官方-write_todos-的对照">5. 与官方 <code>write_todos</code> 的对照</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>DeepAgent <code>write_todos</code></th>
+<th>本仓库 taskboard</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>清单存放</td>
+<td>session（<code>deep_agent_session_key_todos</code>）</td>
+<td>middleware 自持 <code>Store</code> 正本 + session 镜像</td>
+</tr>
+<tr>
+<td>更新粒度</td>
+<td>整表替换</td>
+<td>按 <code>taskId</code> patch</td>
+</tr>
+<tr>
+<td>主键</td>
+<td>无（靠数组顺序/文案）</td>
+<td>自增数字 <code>taskId</code></td>
+</tr>
+<tr>
+<td>同轮并发</td>
+<td><code>afterModel</code> 并行防守：一轮 &gt;1 次调用就全部换成错误回执</td>
+<td><code>Store</code> 全方法加锁 + <code>ExecuteSequentially</code></td>
+</tr>
+<tr>
+<td>催更</td>
+<td>无</td>
+<td>工具回执尾部催更块</td>
+</tr>
+<tr>
+<td>依赖图</td>
+<td>无（eino <code>PlanTask</code> 有 <code>blockedBy</code> + 环检测）</td>
+<td>有意不做（只做看板，不做编排器）</td>
+</tr>
+<tr>
+<td>提示词位置</td>
+<td>中间件注入 systemMessage</td>
+<td><code>Instruction</code>（全局约定）+ tool description（工具级约束）</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="6-实现状态与落点">6. 实现状态与落点</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>部分</th>
+<th>落点</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Store 正本（Task/Patch/Status、自增 id、deleted 过滤、Snapshot）</td>
+<td><code>internal/taskboard/taskboard.go</code></td>
+<td>✅ Task 1（6 个单测，<code>-race</code> 通过）</td>
+</tr>
+<tr>
+<td>四工具 + 回执/看板/催更输出</td>
+<td><code>internal/taskboard/tools.go</code></td>
+<td>✅ Task 2（7 个单测）</td>
+</tr>
+<tr>
+<td>middleware（<code>BeforeAgent</code> 注入）+ <code>Instruction</code></td>
+<td><code>internal/taskboard/middleware.go</code></td>
+<td>✅ Task 3（2 个单测）</td>
+</tr>
+<tr>
+<td>流式投影（分类归 <code>adkrun</code>（<code>IsBoardTool</code>），打印归 REPL sink）</td>
+<td><code>internal/adkrun/event.go</code> + <code>cmd/yktako/sink.go</code></td>
+<td>✅ Task 4；T1 重构后落点</td>
+</tr>
+<tr>
+<td>集成测试（假模型走真实图 + checkpoint 里能 gob 解出账本）</td>
+<td><code>internal/taskboard/integration_test.go</code></td>
+<td>✅ Task 5（3 个集成测试，<code>-race</code> 通过）</td>
+</tr>
+<tr>
+<td>入口接线（<code>Handlers = [taskboard] + guard</code>，<code>ExecuteSequentially</code>）</td>
+<td><code>cmd/yktako/main.go</code></td>
+<td>✅ Task 6</td>
+</tr>
+</tbody>
+</table></div>
+<p>Task 7（删除旧 L0–L2 五个入口与 <code>internal/planexec</code>）已执行：<code>cmd/</code> 只剩 <code>yktako</code>， <code>internal/</code> 保留 <code>adkrun / config / fsbackend / guard / repl / taskboard / tools</code>。</p>
+<p>测试计划（定案 §7）：CRUD、非法 id、<code>deleted</code> 不出现在 <code>List</code>、status 校验、session 镜像写入、 看板/催更输出、并行调用串行化、<code>BeforeAgent</code> 注入、投影格式、以及 interrupt 后能从 checkpoint 字节里 gob 解出账本快照。</p>
+<h2 id="7-下一层">7. 下一层</h2>
+<p><del><strong>上下文管理</strong>（《05》§4 能力路线第 4 项）：看板让任务变长，长任务的上下文膨胀问题随后就到—— 参考 harness 的 <code>compaction</code> / <code>media_offload</code> / <code>context_usage</code>。</del></p>
+<p><strong>更新（2026-09-26，见《10》）</strong>：下一层改为<strong>最小 Web UI</strong>（事件 sink 重构 → HTTP + SSE 单页 → HITL 审批结构），本节原判断<strong>顺延一位、不作废</strong>——「任务变长 → 上下文膨胀」的 入场条件不依赖入口形态，UI 完成后回到本层。顺延的完整论证见《10》§2.2。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/archive/old-line/07-%E4%BB%BB%E5%8A%A1%E8%A7%84%E5%88%92%E4%B8%8E%E7%9C%8B%E6%9D%BF.md"><code>doc/archive/old-line/07-任务规划与看板.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

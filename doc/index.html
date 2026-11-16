@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>tako 文档站</title>
+<meta name="description" content="tako 是多租户 Agent 运行时与 AI 工作台。这里是它的系统说明页与全部文档索引。" />
+<style>
+  :root {
+    --bg: #faf9f5;
+    --surface: #ffffff;
+    --soft: #f4f0e8;
+    --ink: #29241f;
+    --muted: #746d63;
+    --line: #e2dcd1;
+    --accent: #955a2c;
+    --accent-strong: #75431f;
+    --accent-soft: #f0dec2;
+    --cocoa: #543a29;
+    --shadow: 0 14px 40px rgba(84, 58, 41, 0.07);
+    --sans: "Outfit", "Avenir Next", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.75;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 0 24px 72px; }
+  header.hero {
+    padding: 64px 0 40px;
+    border-bottom: 1px solid var(--line);
+    margin-bottom: 40px;
+  }
+  .mark { display: flex; align-items: center; gap: 12px; margin-bottom: 22px; }
+  .mark svg { width: 34px; height: 34px; }
+  .mark span { font-size: 15px; letter-spacing: 2.5px; color: var(--muted); text-transform: uppercase; }
+  h1 { margin: 0 0 14px; font-size: 2.6rem; line-height: 1.2; color: var(--cocoa); letter-spacing: -0.5px; }
+  .lede { margin: 0 0 26px; font-size: 1.1rem; color: var(--muted); max-width: 62ch; }
+  .cta { display: flex; gap: 12px; flex-wrap: wrap; }
+  .cta a {
+    display: inline-block; padding: 10px 20px; border-radius: 8px;
+    text-decoration: none; font-weight: 600; font-size: 0.95rem;
+    border: 1px solid var(--line-strong); background: var(--surface); color: var(--cocoa);
+  }
+  .cta a.primary { background: var(--cocoa); border-color: var(--cocoa); color: #fff; }
+  .cta a:hover { border-color: var(--accent); color: var(--accent-strong); }
+  .cta a.primary:hover { background: var(--accent-strong); border-color: var(--accent-strong); color: #fff; }
+  h2 {
+    margin: 44px 0 6px; font-size: 1.05rem; letter-spacing: 1.4px;
+    text-transform: uppercase; color: var(--muted); font-weight: 700;
+  }
+  .hint { margin: 0 0 20px; color: var(--muted); font-size: 0.92rem; }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+  .card {
+    display: block; text-decoration: none; color: inherit;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+    padding: 20px 22px; box-shadow: var(--shadow);
+    transition: border-color .16s ease, transform .16s ease;
+  }
+  .card:hover { border-color: var(--accent); transform: translateY(-2px); }
+  .card h3 { margin: 0 0 6px; font-size: 1.08rem; color: var(--cocoa); }
+  .card p { margin: 0; font-size: 0.93rem; color: var(--muted); }
+  .card .tag {
+    display: inline-block; margin-bottom: 10px; padding: 2px 9px; border-radius: 20px;
+    background: var(--accent-soft); color: var(--accent-strong);
+    font-size: 0.72rem; font-weight: 700; letter-spacing: .6px;
+  }
+  footer {
+    margin-top: 56px; padding-top: 24px; border-top: 1px solid var(--line);
+    color: var(--muted); font-size: 0.88rem;
+  }
+  footer a { color: var(--accent-strong); }
+  @media (max-width: 640px) {
+    .wrap { padding: 0 18px 48px; }
+    header.hero { padding: 40px 0 30px; }
+    h1 { font-size: 2rem; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="hero">
+    <div class="mark">
+      <svg viewBox="0 0 64 64" role="img" aria-label="Tako Grid">
+        <rect x="8" y="26" width="12" height="12" rx="2" fill="#543A29"/>
+        <rect x="26" y="8" width="12" height="12" rx="2" fill="#BB7738"/>
+        <rect x="26" y="26" width="12" height="12" rx="2" fill="#543A29"/>
+        <rect x="26" y="44" width="12" height="12" rx="2" fill="#BB7738"/>
+        <rect x="44" y="26" width="12" height="12" rx="2" fill="#543A29"/>
+      </svg>
+      <span>Tako Grid</span>
+    </div>
+    <h1>tako 文档站</h1>
+    <p class="lede">
+      tako 是多租户 Agent 运行时与 AI 工作台。你给它一个目标，它能读写项目、执行命令、搜索资料、
+      委派子代理，把长工作拆成可恢复的 Task，最后交付一份能打开检查的文件。
+    </p>
+    <div class="cta">
+      <a class="primary" href="html/index.html">全部文档索引</a>
+      <a href="assets/tako-architecture.html">架构总览</a>
+      <a href="https://github.com/Ykworm/yk-tako">GitHub 仓库</a>
+    </div>
+  </header>
+
+  <h2>系统说明页</h2>
+  <p class="hint">四页可交互说明页，可离线打开；点节点看职责与代码落点，点连线看数据流。</p>
+  <div class="grid">
+    <a class="card" href="assets/tako-architecture.html">
+      <span class="tag">结构</span>
+      <h3>架构总览</h3>
+      <p>前端、接入层、run worker、长任务、结果发布、模型、扩展与存储——约 20 个责任节点。</p>
+    </a>
+    <a class="card" href="assets/tako-run-lifecycle.html">
+      <span class="tag">单场</span>
+      <h3>run 生命周期</h3>
+      <p>从 POST /api/runs 到定稿、记忆与显式续跑；九种帧、runlog／模型输入／journal 的分工。</p>
+    </a>
+    <a class="card" href="assets/tako-orchestration.html">
+      <span class="tag">长任务</span>
+      <h3>长任务与多 Agent 编排</h3>
+      <p>持久 Task、依赖调度、结果发布、后台 bash、通知恢复、同组修订与继任组。</p>
+    </a>
+    <a class="card" href="assets/tako-data-model.html">
+      <span class="tag">存储</span>
+      <h3>数据、状态与存储</h3>
+      <p>PostgreSQL 当前模型、四类 Redis 临时状态、项目 content／runtime、会话 wire 与记忆双模式。</p>
+    </a>
+  </div>
+
+  <h2>文档</h2>
+  <p class="hint">
+    全部文档的网页版由 <code>scripts/build-doc-html.py</code> 从 <code>doc/</code> 下的 md 自动生成。
+    内容以仓库里的 md 为准——要改，改 md 再重跑脚本。
+  </p>
+  <div class="grid">
+    <a class="card" href="html/index.html">
+      <span class="tag">索引</span>
+      <h3>doc/README.md</h3>
+      <p>现行真源、历史存档、非方案内容三张表——哪篇能照着施工、代码落在哪。</p>
+    </a>
+    <a class="card" href="html/16-能力复刻总规划.html">
+      <span class="tag">总纲</span>
+      <h3>能力复刻总规划</h3>
+      <p>结论页：tako 做什么、做到哪了、下一步做什么。</p>
+    </a>
+    <a class="card" href="html/53-模块地图.html">
+      <span class="tag">落点</span>
+      <h3>模块地图</h3>
+      <p>代码在哪一块、每个顶层模块与二层小模块干什么。</p>
+    </a>
+    <a class="card" href="html/70-多Agent编排与Task/README.html">
+      <span class="tag">方案</span>
+      <h3>多 Agent 编排与持久 Task</h3>
+      <p>持久 Task、固定 DAG 编排、结果发布与交付恢复的方案集。</p>
+    </a>
+  </div>
+
+  <footer>
+    <p>
+      本页与 <code>doc/html/</code> 下的页面由 <code>scripts/build-doc-html.py</code> 生成；
+      <code>doc/assets/</code> 的四页是手写的。源码在
+      <a href="https://github.com/Ykworm/yk-tako">github.com/Ykworm/yk-tako</a>。
+    </p>
+  </footer>
+</div>
+</body>
+</html>

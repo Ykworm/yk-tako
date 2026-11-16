@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>74 · 并行任务工作区隔离：责任分工、执行环境与发布恢复 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="74--并行任务工作区隔离责任分工执行环境与发布恢复">74 · 并行任务工作区隔离：责任分工、执行环境与发布恢复</h1>
+<blockquote>
+<p>性质：<strong>已落地</strong>。本稿解决并行 Task 共用项目目录互相覆盖的问题：Task／DAG 保持通用，WorkspaceProvider 按真实项目提供 Git 或目录隔离现场，引擎协调执行、结果验收与发布恢复。 状态：✅ 已落地；2026-11-11 按责任边界重写并方案收口，2026-11-12 施工并活体验收。 施工包：tmp/74-并行任务工作区隔离/施工包.md（施工期材料；用户验收后留档 <code>doc/log/</code>）。 日期：2026-11-11 成文，2026-11-12 落地。 代码落点：<code>internal/runengine/workspace_{provider,engine,git,directory,result,publish,verify,view}.go</code>、<code>agent_task_artifact.go</code>（artifact + retry-publication）、<code>agent_task_{graph,api,tools,scheduler,runner,store,types,attention}.go</code>、<code>worker.go</code>、<code>sandbox.go</code>/<code>bash.go</code>/<code>bashspill.go</code>、<code>store.go</code>/<code>pgstore.go</code>、<code>auth.go</code>（117111–117113）、<code>server.go</code>；前端 <code>web/src/{TasksView.vue,App.vue,api.ts}</code>。验收：<code>scripts/acceptance/workspace_{git,directory,publication,crash}_live.sh</code>（51/42/34/57）、<code>expected.json</code> 用例 57–60、<code>go test ./internal/runengine</code>、既有 70–73 回归与 <code>spotcheck.sh</code> 全绿；接缝明细见 §12。 前置真源：<a href="70-多Agent编排与Task/README.html">doc/70</a>（通用持久 Task 与 DAG）、<a href="71-文件写入竞争.html">doc/71</a>（普通文件短写入）、<a href="72-多Agent编排下一阶段.html">doc/72</a>（修订、Task HITL 与唤醒）、<a href="73-协调通知与交付恢复.html">doc/73</a>（通知与交付恢复）。 后续方案：<a href="75-目标重规划与继任编排组.html">doc/75</a>（目标可行性、修订或继任组）与 <a href="76-项目内容目录与运行资源容器.html">doc/76</a>（项目内容根与资源容器）——两篇 2026-11-13 已落地，与本文合并一个施工包；shared 组同样发布进 <code>content/</code>，发布准入按项目静默判定，受阻后与 isolated 共用同一条 retry-publication 恢复（见 doc/76 §10.5）。 重写说明：旧稿把 Git 字段带进 Task 与 PG 设计，混淆了通用业务对象和执行环境。本稿从责任分工重新推导；旧稿已删除，不作引用或施工依据。</p>
+</blockquote>
+<h2 id="1-原点task-与-git-没有必然关系">1. 原点：Task 与 Git 没有必然关系</h2>
+<p>Task 是一件通用持久工作：有输入、执行者、依赖、执行 run、状态、结果和恢复方式。调研、写作、数据处理、文件整理和编码都可以是 Task。</p>
+<p>只有同时满足以下条件，一次 Task 的<strong>执行环境</strong>才涉及 Git：</p>
+<ol type="1">
+<li>目标要求持续修改当前项目，而不是只读分析或单独交付一份文件；</li>
+<li>当前项目已经是 Git 仓库；</li>
+<li>修改需要合并回这个项目；</li>
+<li>LLM 为并行执行请求了隔离工作区，WorkspaceProvider 因而选择 Git 实现。</li>
+</ol>
+<p>在 Git 仓库里做只读审查不需要 worktree；修改非 Git 目录不需要 Git；生成独立报告也不需要分支。<strong>Git 是可选的执行环境实现，不是 Task 类型，也不是编排协议的一部分。</strong></p>
+<p>本方案真正要解决的问题是：多个 Task 并行修改同一项目时，怎样让执行者各有工作现场、让下游得到确定输入、让最终结果安全回到项目，并在故障后恢复。</p>
+<h2 id="2-一个具体失败故事">2. 一个具体失败故事</h2>
+<p>用户提出：</p>
+<pre class="text"><code>A 整理调研材料，B 制作数据表，C 合并成最终报告</code></pre>
+<p>当前所有 Task 共用项目目录。A 用 bash 运行生成器，B 同时保存同名汇总文件；文件工具里的逐路径锁管不到 bash 内部的每次写入。C 最后看到的是两份执行者都没有完整验证过的混合目录。</p>
+<p>把整场 run 都锁住会让小时级任务互相排队；给 Task 增加 Git 字段又会在非 Git 目录里失效。因此需要从“谁来决定、谁来创建、谁来验证、谁来发布”重新设计，而不是先选 Git 表结构。</p>
+<h2 id="3-责任分工先钉死谁不做什么">3. 责任分工：先钉死谁不做什么</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>角色</th>
+<th>负责</th>
+<th>明确不负责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>LLM／mAgent</strong></td>
+<td>拆解目标；决定 A/B/C、依赖与并行关系；表达需要共享还是隔离工作区；给出通用验证要求；处理执行中的语义冲突</td>
+<td>不决定宿主路径、数据库列或 Git 引用名；不直接证明创建、验证或发布已经成功</td>
+</tr>
+<tr>
+<td><strong>Task／DAG 模型</strong></td>
+<td>保存目标、内容、执行者、依赖、状态、结果摘要和结果版本</td>
+<td>不知道 branch、commit、worktree、repo path 或文件哈希</td>
+</tr>
+<tr>
+<td><strong>WorkspaceProvider</strong></td>
+<td>根据项目真实形态实现隔离工作区；准备基线与 Task 目录；生成对应 prompt 补充；保存不可变结果；实现合并、读取、发布与清理</td>
+<td>不决定 DAG，不改变 Task 业务状态，不绕过 run 权限</td>
+</tr>
+<tr>
+<td><strong>运行引擎</strong></td>
+<td>调度与领取 run；调用 Provider；校验当前 run／epoch；执行通用结果验收；协调项目准入与发布；驱动恢复、事件和交付</td>
+<td>不把 Provider 的内部字段复制进 PG，不用 prompt 代替程序检查</td>
+</tr>
+<tr>
+<td><strong>system prompt 补充</strong></td>
+<td>告诉执行者当前工作区怎样使用、何时提交结果、如何运行验证和处理冲突</td>
+<td>不是安全边界，不是执行事实，不是恢复记录</td>
+</tr>
+<tr>
+<td><strong>PG</strong></td>
+<td>保存通用业务状态、当前执行者、结果版本、发布状态与执行代次</td>
+<td>不保存 Git 分支、commit、仓库路径或目录文件哈希</td>
+</tr>
+<tr>
+<td><strong>共享持久卷</strong></td>
+<td>保存工作区、Provider 状态、不可变结果和发布恢复记录</td>
+<td>不参与 DAG 裁决，不取代 PG 的多副本执行协调</td>
+</tr>
+</tbody>
+</table></div>
+<p>一句话操作版：<strong>LLM 决定“要什么工作区”，Provider 决定“怎样实现”，引擎决定“现在谁能执行和发布”，prompt 只告诉模型“怎么配合”。</strong></p>
+<h2 id="4-通用调用契约只表达工作区需求">4. 通用调用契约：只表达工作区需求</h2>
+<p>创建单件 Task 或编排组时，LLM 只增加通用、可选的工作区意图：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;workspaceMode&quot;</span><span class="fu">:</span> <span class="st">&quot;isolated&quot;</span><span class="fu">,</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;verifyCommand&quot;</span><span class="fu">:</span> <span class="st">&quot;npm test&quot;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<ul>
+<li><code>workspaceMode=shared</code>：同组 Task 共用项目运行资源区里的 <code>work/shared</code>，最终结果同样经发布链进 <code>content/</code>（doc/76 §4 改写了本条的“沿用现有项目目录”口径）；缺省也是 <code>shared</code>。</li>
+<li><code>workspaceMode=isolated</code>：本组需要独立工作现场，最终结果仍需发布回原项目。</li>
+<li><code>verifyCommand</code>：通用的结果检查命令，与 Git 无关；文档任务可以省略，编码任务建议提供。为空时只能证明技术交接条件满足，不能宣称通过业务测试。</li>
+<li>两个字段都是组级通用配置，进入创建幂等计划；Task 节点不各带一套，避免同一组里共享与隔离混用。</li>
+<li><code>workspaceMode</code> 建时固定：修订命令里没有这个字段，<code>revise_orchestration</code> 与 <code>continue_orchestration</code> 都不改它；组内并发预算按模式取值（shared=1、isolated=2，读实现 <code>orchestrationModeConcurrency</code>），换现场只能新建继任组（doc/82）。</li>
+</ul>
+<p>Provider 在创建或第一次执行前检查真实项目：</p>
+<pre class="text"><code>已有 Git 仓库 + isolated + 需要发布回项目 → GitWorkspaceProvider
+非 Git 目录 + isolated + 需要发布回项目 → DirectoryWorkspaceProvider
+shared → 按同一套 Provider 选择准备 `work/shared`（doc/76 §4：shared 与 isolated 都先 PrepareGroup 再 PrepareTask，区别只在现场是整组共用还是每 Task 独立）</code></pre>
+<p>不自动 <code>git init</code>，不要求非 Git 任务先变成 Git 项目，也不根据模型猜测伪造项目类型。</p>
+<h2 id="5-workspaceprovider-的真实职责">5. WorkspaceProvider 的真实职责</h2>
+<p>Provider 不是一段提示词，也不是一张数据库表。它是引擎调用的一组文件与版本操作，输入是组、Task 和现有结果版本，输出是可执行工作现场或可读取结果。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>操作</th>
+<th>输入 → 输出</th>
+<th>不完成会怎样</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>准备编排组</td>
+<td>原项目与编排组 ID（<code>orchestrationId</code>）→ 编排组基线、Provider 状态目录</td>
+<td>没有共同起点，无法判断发布时是否覆盖新工作</td>
+</tr>
+<tr>
+<td>准备 Task</td>
+<td>组基线、父 Task 的结果版本 → 当前 Task 的工作目录与 prompt 补充</td>
+<td>执行者没有独立现场，或下游拿不到父结果</td>
+</tr>
+<tr>
+<td>接受结果</td>
+<td>当前 work、Task ID、resultRevision → 不可变结果引用与产物入口</td>
+<td>模型说完成但结果可能继续变化，恢复时找不到</td>
+</tr>
+<tr>
+<td>读取结果</td>
+<td>Task ID + resultRevision + 产物路径 → 该版本的文件字节</td>
+<td>主项目同路径文件可能不是当时结果</td>
+</tr>
+<tr>
+<td>发布结果</td>
+<td>最终不可变结果 → 原项目已更新，或明确受阻原因</td>
+<td>结果只停留在内部工作区，用户项目得不到它</td>
+</tr>
+<tr>
+<td>恢复与清理</td>
+<td>组目录、实际文件／版本状态 → 可继续现场或安全清理</td>
+<td>崩溃后只能靠重做，清理可能删掉唯一工作</td>
+</tr>
+</tbody>
+</table></div>
+<p>Provider 的状态写在共享持久卷。PG 不保存 Provider 的内部版本标识；需要展示或恢复时，引擎通过 Provider 现读。</p>
+<h2 id="6-共享持久卷上的组目录">6. 共享持久卷上的组目录</h2>
+<p>所有实现共用下面的逻辑布局；路径由组与 Task ID 推导，不由模型传入：</p>
+<pre class="text"><code>&lt;tenant&gt;/.tako/orchestrations/&lt;orchestrationId&gt;/workspace/
+  state.json                 # 通用 Provider 类型、格式版本、生命周期状态
+  provider/                  # Provider 自己的基线与内部状态
+  work/&lt;taskId&gt;/             # 当前 Task 的工作目录
+  results/&lt;taskId&gt;/&lt;resultRevision&gt;/
+    result.json              # 不可变结果描述与 Provider 引用
+    artifacts/...            # 需要独立保存的产物
+  publication/               # 每次发布的恢复记录</code></pre>
+<p><code>state.json</code> 可以记录 Provider 类型和少量启动配置。Provider 自己的 Git 引用或目录清单放在 <code>provider/</code> 与 <code>results/</code>，不复制进 PG。</p>
+<p>状态文件的每次修改使用现有短临界区：按组协调、锁内重读、同目录临时文件、原子 rename。多副本下可以使用 PG advisory lock 协调这次文件修改，但<strong>锁在 PG 不等于 Git 数据进 PG</strong>。</p>
+<h2 id="7-端到端主链">7. 端到端主链</h2>
+<pre class="text"><code>用户提出目标
+→ LLM 创建 A/B/C、依赖边、workspaceMode 与通用 verifyCommand
+→ PG 保存通用组、Task、依赖与配置
+→ 引擎按依赖和容量领取 A/B
+→ 引擎调用 WorkspaceProvider 准备组基线与 A/B 的工作目录
+→ Provider 返回目录与 prompt 补充
+→ A/B 各自执行，调用 submit_task_result
+→ 引擎校验当前 run／epoch、通用结果格式与验证命令
+→ Provider 把结果保存成不可变版本
+→ run complete 后 A/B succeeded
+
+→ C 具备执行资格
+→ Provider 按父 Task ID + resultRevision 读取 A/B 的不可变结果
+→ Provider 把这些结果带进 C 的工作目录，并标出交接冲突
+→ C 在自己的目录中解决冲突、完成工作、提交结果
+→ 最终结果经验证并持久保存
+
+→ 引擎取得项目发布准入，调用 Provider 发布最终结果
+→ 发布成功且最终 run complete，最终 Task 与组才 succeeded
+→ 现有协调通知回到来源会话
+→ doc/73 的交付 run 展示摘要和不可变产物
+→ 通知 consumed，组 delivered</code></pre>
+<p>每一步的输出是下一步输入：不可变父结果是 C 的输入；已验证的最终结果是发布输入；发布事实与 run 终态是组收口输入；组收口事实才是交付通知输入。</p>
+<h2 id="8-gitworkspaceprovider只在合适时出现">8. GitWorkspaceProvider：只在合适时出现</h2>
+<h3 id="81-创建与隔离">8.1 创建与隔离</h3>
+<p>Git Provider 使用：</p>
+<pre class="text"><code>原始项目仓库
+  └── 本组中间 bare clone
+        ├── 每 Task 一个 linked worktree
+        └── 每 Task 一个内部分支</code></pre>
+<ul>
+<li>原始项目根与原始 <code>.git</code> 不进入执行者沙箱；</li>
+<li>中间仓库按组创建，不跨组共享；</li>
+<li>worktree 按 Task 领取时创建；</li>
+<li>执行者只写自己的 worktree，并访问本组中间仓库完成正常 Git 操作；</li>
+<li>同组 Task 共享中间仓库元数据，是合作写者，不宣称各有独立 <code>.git</code>；</li>
+<li>不配置远端凭据，不自动 push，不让模型沿 origin 回到原始项目。</li>
+</ul>
+<p>这些是 Provider 的文件与 Git 操作，不进入 Task 业务模型。</p>
+<h3 id="82-结果与父结果交接">8.2 结果与父结果交接</h3>
+<p>执行者通过 prompt 补充得知“完成工作后提交修改”。但结果是否可接受由程序检查：</p>
+<ul>
+<li>当前 worktree 与 Task 绑定正确；</li>
+<li>工作区没有未提交结果，声明产物存在于当前 HEAD；</li>
+<li>所有父结果提交都是当前 HEAD 的祖先；</li>
+<li>配置了 <code>verifyCommand</code> 时，程序实际运行并检查退出状态。</li>
+</ul>
+<p>通过后，Provider 用当前 <code>resultRevision</code> 写结果引用：</p>
+<pre class="text"><code>refs/tako/results/&lt;taskId&gt;/&lt;resultRevision&gt; → 已验证提交</code></pre>
+<p>该引用先保存在本组中间仓库，再由引擎控制的 Provider 导出到原始仓库的内部引用。原始主分支与工作树此时不变。PG 只存已有的 <code>resultRevision</code>，不存 commit；API 和下游通过引用现读 commit。</p>
+<p>C 准备时，Provider 按 PG 中已有的父 Task ID 与结果版本解析这些引用，合并对应提交。父 worktree 是否还在不影响读取。</p>
+<h3 id="83-发布">8.3 发布</h3>
+<p>发布前由引擎排除项目内其他活 run 并设置通用发布标记，Provider 再检查原始仓库：</p>
+<ul>
+<li>原始分支未前进：可以 fast-forward 到最终结果提交；</li>
+<li>原始分支已前进：返回通用 <code>workspace_changed</code>，不覆盖；</li>
+<li>引擎把当前基线带入本组中间仓库，最终执行者在自己的 worktree 合并、解决冲突并重新提交；</li>
+<li>新结果重新验证、导出、发布。</li>
+</ul>
+<p>这里 LLM 决定是否合并与怎样解决语义冲突；Provider 执行 Git 操作；引擎决定何时允许发布。prompt 本身不证明任何一步成功。</p>
+<h2 id="9-directoryworkspaceprovider非-git-也有完整链">9. DirectoryWorkspaceProvider：非 Git 也有完整链</h2>
+<h3 id="91-基线与-task-工作目录">9.1 基线与 Task 工作目录</h3>
+<p>Directory Provider 不初始化 Git。准备组时：</p>
+<ol type="1">
+<li>遍历允许进入工作区的普通文件，排除引擎运行时目录、特殊文件与越界软链；</li>
+<li>把基线文件保存到组级 Provider 目录；</li>
+<li>写基线清单：每个相对路径对应内容哈希、文件类型与权限；</li>
+<li>为每个 Task 从该基线复制独立工作目录。</li>
+</ol>
+<p>目录与结果都计入租户存储配额。没有 Git 不代表可以忽略存储、路径与权限边界。</p>
+<h3 id="92-结果清单与父子交接">9.2 结果清单与父子交接</h3>
+<p>接受结果时，Provider 比较 Task 工作目录与组基线，生成：</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;added&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="fu">{</span><span class="dt">&quot;path&quot;</span><span class="fu">:</span> <span class="st">&quot;report/final.md&quot;</span><span class="fu">,</span> <span class="dt">&quot;sha256&quot;</span><span class="fu">:</span> <span class="st">&quot;…&quot;</span><span class="fu">}</span><span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;modified&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="fu">{</span><span class="dt">&quot;path&quot;</span><span class="fu">:</span> <span class="st">&quot;data/summary.csv&quot;</span><span class="fu">,</span> <span class="dt">&quot;sha256&quot;</span><span class="fu">:</span> <span class="st">&quot;…&quot;</span><span class="fu">}</span><span class="ot">]</span><span class="fu">,</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;deleted&quot;</span><span class="fu">:</span> <span class="ot">[</span><span class="fu">{</span><span class="dt">&quot;path&quot;</span><span class="fu">:</span> <span class="st">&quot;draft/old.md&quot;</span><span class="fu">}</span><span class="ot">]</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>清单与结果文件一起保存进 <code>results/&lt;taskId&gt;/&lt;resultRevision&gt;/</code>。PG 仍只保存结果版本，不保存这些文件哈希。</p>
+<p>子任务准备时按父 Task key 的固定顺序应用结果：</p>
+<ul>
+<li>不同路径直接带入；</li>
+<li>同一路径且最终内容相同，幂等保留；</li>
+<li>同一路径内容不同，或一方删除另一方修改，形成交接冲突；</li>
+<li>冲突由当前子任务在自己的目录中解决，不写原项目。</li>
+</ul>
+<h3 id="93-发布与恢复记录">9.3 发布与恢复记录</h3>
+<p>发布时逐路径比较原项目当前内容与组基线：</p>
+<ul>
+<li>当前内容仍等于基线：允许新增、修改或删除；</li>
+<li>当前内容已经变化：返回 <code>workspace_changed</code>，不覆盖；</li>
+<li>当前路径类型不符或无法读取：明确失败。</li>
+</ul>
+<p>新增与修改使用同目录临时文件 + 原子替换；删除先在发布恢复记录中登记。每个路径的实际完成状态都写入恢复记录，进程崩溃后据此对账。</p>
+<p>**Directory 只保证单文件原子替换，不宣称多文件发布是一次原子事务。**发生中途失败时，页面展示已完成与未完成的实际状态，由恢复流程继续；不能把“部分发布”标成完整成功。</p>
+<h2 id="10-通用结果发布与恢复契约">10. 通用结果、发布与恢复契约</h2>
+<h3 id="101-pg-只保存通用事实">10.1 PG 只保存通用事实</h3>
+<p>现有表继续使用；若需要新增字段，只允许与 Provider 无关的配置和状态：</p>
+<pre class="text"><code>agent_orchestrations:
+  workspace_mode           -- shared / isolated
+  verify_command           -- 通用验证配置，可为空
+  publication_status       -- 空 / pending / publishing / blocked / published
+  publication_error_code   -- 通用机器原因
+  publication_epoch        -- 当前发布代次
+
+workspaces:
+  publication_orchestration_id
+  publication_epoch        -- 与当前发布者配对，防旧发布者清理新标记</code></pre>
+<p>不新增 <code>agent_task_git</code>，不新增 <code>base_commit</code>、<code>result_commit</code>、<code>repo_path</code>、<code>worktree_path</code>、<code>publication_commit</code> 等字段。</p>
+<p>Task 结果仍保存摘要、产物引用、通用 metadata、resultRevision、resultRunID 与 resultEpoch。Provider 引用和文件清单在结果目录中，不进 Task JSON。</p>
+<h3 id="102-通用结果验收顺序">10.2 通用结果验收顺序</h3>
+<pre class="text"><code>确认 Task running
+→ 确认 submit 来自当前 run 与当前 epoch
+→ 校验摘要、产物数量与通用路径规则
+→ Provider 校验自己的工作现场并形成不可变结果
+→ 若配置 verifyCommand，在沙箱中实际执行
+→ Provider 固化结果与产物
+→ PG 保存 resultRevision 与通用结果
+→ 发 Task 变更事件</code></pre>
+<p>Provider 固化失败或 PG 保存失败都不能返回成功。崩溃发生在两者之间时，恢复按 Task ID + run + epoch + resultRevision 检查已有结果，不制造另一份结果版本。</p>
+<h3 id="103-发布受阻与人工恢复">10.3 发布受阻与人工恢复</h3>
+<p>通用发布原因只有业务可处理的几类：</p>
+<ul>
+<li><code>workspace_busy</code>：项目还有其他活 run，结果已保存，稍后自动重试；</li>
+<li><code>workspace_changed</code>：原项目已变化，需要最终执行者合并或解决冲突；</li>
+<li><code>workspace_dirty</code>：存在会阻挡发布的未保存内容，不自动清理；</li>
+<li><code>publication_recovery_required</code>：现场无法安全解释，停止自动写入并给出处理说明。</li>
+</ul>
+<p>最终 run 仍在场时，执行者收到工具回执并继续处理。最终 run 已结束时，Task 进入 <code>blocked</code>，左侧“需要我处理”出现发布项；用户点击“重新发布”后，引擎为同一最终 Task 创建新处理 run，Provider 从不可变最终结果恢复工作现场。父 Task 与整张 DAG 不重跑。</p>
+<h3 id="104-发布后与交付失败">10.4 发布后与交付失败</h3>
+<p>发布成功后如果最终 run error：</p>
+<ul>
+<li>PG 保留 <code>publicationStatus=published</code>；</li>
+<li>Provider 的不可变结果与产物仍可读取；</li>
+<li>Task／组按现有规则记录执行失败；</li>
+<li>通知明确区分“结果已发布”和“交付说明失败”；</li>
+<li>不自动回滚项目，不把交付失败翻译成依赖失败；</li>
+<li>来源会话的说明与通知恢复继续由 doc/73 负责。</li>
+</ul>
+<h2 id="11-apiprompt页面与事件">11. API、prompt、页面与事件</h2>
+<h3 id="111-api">11.1 API</h3>
+<p>现有创建接口只增加 §4 的两个通用字段（<code>workspaceMode</code>、<code>verifyCommand</code>）。shared 详情字节不变（18 键，不带 <code>workspace</code>）；isolated 详情在末尾追加第 19 键 <code>workspace</code>，组体（<code>GET /api/orchestrations/:id</code>）同形。键序固定 <code>mode → provider → verification → publication</code>。</p>
+<p>刚创建、Provider 尚未准备工作现场时（<code>provider="pending"</code>，验证已配置但未跑）：</p>
+<div class="sourceCode" id="cb11"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;workspace&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;mode&quot;</span><span class="fu">:</span> <span class="st">&quot;isolated&quot;</span><span class="fu">,</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;provider&quot;</span><span class="fu">:</span> <span class="st">&quot;pending&quot;</span><span class="fu">,</span></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;verification&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;configured&quot;</span><span class="fu">:</span> <span class="kw">true</span><span class="fu">,</span> <span class="dt">&quot;status&quot;</span><span class="fu">:</span> <span class="st">&quot;&quot;</span><span class="fu">},</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;publication&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;status&quot;</span><span class="fu">:</span> <span class="st">&quot;&quot;</span><span class="fu">,</span> <span class="dt">&quot;errorCode&quot;</span><span class="fu">:</span> <span class="st">&quot;&quot;</span><span class="fu">,</span> <span class="dt">&quot;epoch&quot;</span><span class="fu">:</span> <span class="dv">0</span><span class="fu">}</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>Directory Provider 执行并验证后（<code>configured=false</code> 表示未配 <code>verifyCommand</code>，空验证平凡通过，仍写证据文件）：</p>
+<div class="sourceCode" id="cb12"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span></span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>  <span class="dt">&quot;workspace&quot;</span><span class="fu">:</span> <span class="fu">{</span></span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;mode&quot;</span><span class="fu">:</span> <span class="st">&quot;isolated&quot;</span><span class="fu">,</span></span>
+<span id="cb12-4"><a href="#cb12-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;provider&quot;</span><span class="fu">:</span> <span class="st">&quot;directory&quot;</span><span class="fu">,</span></span>
+<span id="cb12-5"><a href="#cb12-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;verification&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;configured&quot;</span><span class="fu">:</span> <span class="kw">false</span><span class="fu">,</span> <span class="dt">&quot;status&quot;</span><span class="fu">:</span> <span class="st">&quot;passed&quot;</span><span class="fu">,</span> <span class="dt">&quot;exitCode&quot;</span><span class="fu">:</span> <span class="dv">0</span><span class="fu">,</span> <span class="dt">&quot;outputPath&quot;</span><span class="fu">:</span> <span class="st">&quot;verification/&lt;taskId&gt;.out&quot;</span><span class="fu">},</span></span>
+<span id="cb12-6"><a href="#cb12-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">&quot;publication&quot;</span><span class="fu">:</span> <span class="fu">{</span><span class="dt">&quot;status&quot;</span><span class="fu">:</span> <span class="st">&quot;&quot;</span><span class="fu">,</span> <span class="dt">&quot;errorCode&quot;</span><span class="fu">:</span> <span class="st">&quot;&quot;</span><span class="fu">,</span> <span class="dt">&quot;epoch&quot;</span><span class="fu">:</span> <span class="dv">0</span><span class="fu">}</span></span>
+<span id="cb12-7"><a href="#cb12-7" aria-hidden="true" tabindex="-1"></a>  <span class="fu">}</span></span>
+<span id="cb12-8"><a href="#cb12-8" aria-hidden="true" tabindex="-1"></a><span class="fu">}</span></span></code></pre></div>
+<p>字段词表（实测字节，机器真源 <code>scripts/acceptance/expected.json</code> 用例 57/58）：</p>
+<ul>
+<li><code>mode</code>：<code>shared</code>／<code>isolated</code>；</li>
+<li><code>provider</code>：<code>pending</code>（未准备）／<code>directory</code>／<code>git</code>，由引擎向 Provider 现读或从通用执行记录派生，不从 PG 的 Git 列复制；</li>
+<li><code>verification</code>：<code>configured</code>（是否配了验证命令）、<code>status</code>（空／<code>passed</code>／<code>failed</code>），跑过验证再带 <code>exitCode</code> 与 <code>outputPath</code>（证据文件相对路径）；</li>
+<li><code>publication</code>：<code>status</code>（空／<code>pending</code>／<code>publishing</code>／<code>blocked</code>／<code>published</code>）、<code>errorCode</code>（发布三码 <code>workspace_changed</code>／<code>workspace_dirty</code>／<code>publication_recovery_required</code>，无错为空）、<code>epoch</code>（发布代次，未发布为 0）。</li>
+</ul>
+<p>Provider 自己的版本详情（分支、commit、worktree 路径、目录哈希）通过独立诊断读取，不进入 Task 结果模型，也不落 PG 的 Task／组表。</p>
+<p>新增统一结果产物入口：</p>
+<pre class="text"><code>GET /api/tasks/:id/artifact?path=&lt;结果中声明的相对路径&gt;</code></pre>
+<p>按 Task 当前 resultRevision 调用 Provider 读取不可变结果，<strong>成功回原始字节逐字（不进信封）</strong>，不读主项目里的同路径文件。项目当前文件仍走现有 <code>GET /api/media</code>。错误：产物缺失／不在清单／越界 409 <code>117110</code>、未知任务 404 <code>117001</code>、未登录 401 <code>111102</code>、跨租户 404 <code>117001</code>。shared 与 isolated 都有不可变结果，读口同一条（doc/76 §4 取代了本条的“shared 400 111002”）。</p>
+<p>新增人工恢复：</p>
+<pre class="text"><code>POST /api/tasks/:id/retry-publication</code></pre>
+<p>只接受最终 Task 的发布受阻状态，创建同 Task 的新处理 run。成功 202，<code>data</code> 键序 <code>taskId → runId → status → publicationEpoch</code>（<code>status="running"</code>，<code>publicationEpoch=当前+1</code>）；已有活 run 时 200 幂等命中同形。双击、多标签页与多副本同时请求只能成功一次。错误：租户容量满 429 <code>113001</code>、结果缺失 409 <code>117110</code>、非 blocked／非最终 409 <code>117112</code>、未知 404 <code>117001</code>、viewer 403 <code>111203</code>、跨租户 404 <code>117001</code>。shared 受阻后同样可重新发布（doc/76 §10.5 第 3 条）。</p>
+<p>以上字节已对运行中的引擎 curl 验收，钉在 <code>expected.json</code> 用例 57（创建与读面）／58（artifact）／59（retry-publication）。</p>
+<h3 id="112-prompt-补充">11.2 prompt 补充</h3>
+<p>Provider 只返回当前执行者需要的行为约定。例如 Git worktree 中提示提交修改，Directory 中提示不要写当前目录之外，配置了验证命令时提示执行检查。</p>
+<p>prompt 不承担路径准入、结果校验、发布条件或恢复裁决。模型忽略 prompt 时，程序检查仍必须拒绝不合格结果。</p>
+<h3 id="113-页面与事件">11.3 页面与事件</h3>
+<ul>
+<li>Task／组详情显示共享或隔离、Provider 类型、验证配置与状态、发布状态和受阻原因；</li>
+<li>结果产物按不可变版本打开；另有“查看项目当前文件”入口；</li>
+<li>左侧新增通用 <code>publication_blocked</code> 处理项，不出现 Git 专属业务状态；</li>
+<li>状态翻转仍发 <code>agent_tasks_changed</code>／<code>agent_orchestrations_changed</code>，事件只通知重拉；</li>
+<li>trace 记录 orchestration、Task、run、resultRevision、provider、publicationEpoch 与通用错误码，不记录敏感文件正文。</li>
+</ul>
+<h2 id="12-代码落点与施工顺序">12. 代码落点与施工顺序</h2>
+<p>已落地。通用 Task 侧的接缝（全部在 <code>internal/runengine/</code>）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>实际落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>agent_task_graph.go</code></td>
+<td>通用 workspaceMode／verifyCommand 创建输入与幂等计划 hash（省略 = shared，旧字节不变）</td>
+</tr>
+<tr>
+<td><code>agent_task_api.go</code> / <code>agent_task_tools.go</code></td>
+<td>通用创建输入、详情读面（workspace 摘要由 <code>workspace_view.go</code> 现读拼装）</td>
+</tr>
+<tr>
+<td><code>agent_task_artifact.go</code>（新增）</td>
+<td><code>GET /api/tasks/:id/artifact</code> 与 <code>POST /api/tasks/:id/retry-publication</code> 两个端点</td>
+</tr>
+<tr>
+<td><code>agent_task_scheduler.go</code> / <code>agent_task_runner.go</code></td>
+<td>调度仍归引擎；领取／恢复前经 <code>workspace_engine.go</code> 调 Provider 准备工作现场；submit_task_result 经 wrapToolErrors 入池</td>
+</tr>
+<tr>
+<td><code>agent_task_store.go</code> / <code>agent_task_types.go</code></td>
+<td>通用结果版本、当前 run／epoch、发布状态列与枚举（pending/publishing/blocked/published）</td>
+</tr>
+<tr>
+<td><code>agent_task_attention.go</code></td>
+<td>通用 <code>publication_blocked</code> 处理项（不出现 Git 专属业务状态）</td>
+</tr>
+<tr>
+<td><code>worker.go</code></td>
+<td>将 Provider 返回的工作目录装入 WorkspaceRef；WorkspaceID 保持原项目</td>
+</tr>
+<tr>
+<td><code>sandbox.go</code> / <code>bash.go</code> / <code>bashspill.go</code></td>
+<td>按 Provider 声明开放工作目录与执行环境路径，不开放原始仓库管理目录；验证命令复用同一 bash 沙箱</td>
+</tr>
+<tr>
+<td><code>store.go</code> / <code>pgstore.go</code></td>
+<td>通用项目发布准入、发布代次（publicationEpoch）与删除保护</td>
+</tr>
+<tr>
+<td><code>web/src/{TasksView.vue,App.vue,api.ts}</code></td>
+<td>通用工作区、验证、发布受阻面板、不可变产物与「项目当前文件」入口</td>
+</tr>
+<tr>
+<td><code>scripts/acceptance/workspace_{git,directory,publication,crash}_live.sh</code>（新增）</td>
+<td>Git／Directory／发布协调／崩溃四场活体</td>
+</tr>
+</tbody>
+</table></div>
+<p>Provider 分层（新增文件，逻辑边界与方案一致；shared 行为留在既有引擎，未单拆 <code>workspace_shared.go</code>）：</p>
+<pre class="text"><code>internal/runengine/workspace_provider.go    # Provider 接口、GroupHandle、CleanupReport
+internal/runengine/workspace_engine.go      # 引擎装配层：Store→组句柄/配额，领取/恢复时准备工作现场
+internal/runengine/workspace_git.go         # GitWorkspaceProvider（中间 bare 仓 + linked worktree）
+internal/runengine/workspace_directory.go   # DirectoryWorkspaceProvider（基线冻结 + 变更集）
+internal/runengine/workspace_result.go      # 不可变结果固化（staging→原子 rename）与读取
+internal/runengine/workspace_publish.go     # 发布准入、Provider 发布、收尾对账、过窗清理（Cleanup 在此调用）
+internal/runengine/workspace_verify.go      # 通用验证命令执行口（现有 bash 沙箱，10 分钟超时）
+internal/runengine/workspace_view.go        # 详情/列表的 workspace 摘要读面（PG 通用列 + 现读 state.json）</code></pre>
+<p>Provider 内部状态（branch/commit/repo path/worktree path/目录哈希）只落在共享卷的组目录与 Provider 自己的持久记录，不反向渗入 Task 表与调度事务。过窗清理由 <code>workspace_publish.go</code> 的发布对账慢路径按组生命周期调 <code>Provider.Cleanup</code>，未改 <code>archive_sweep.go</code>；<code>scope.go</code>／<code>subprocesspath.go</code> 未改（工作目录开放走 <code>sandbox.go</code>）。</p>
+<p>施工按以下顺序完成（施工包 = <code>tmp/74-并行任务工作区隔离/施工包.md</code>，已点头）：</p>
+<ol type="1">
+<li>用真实端点钉死通用创建、详情、产物与恢复契约；</li>
+<li>完成 shared 不变、组目录、不可变结果和通用发布状态；</li>
+<li>分别实现 Git 与 Directory Provider 的准备、交接、验证、发布和恢复；</li>
+<li>接通引擎调度、沙箱、权限、事件与前端；</li>
+<li>完成双副本、kill -9、项目变化、发布受阻、清理与既有回归，主 Agent 审查实际 diff。</li>
+</ol>
+<h2 id="13-验收与完成线">13. 验收与完成线</h2>
+<h3 id="131-责任边界测试">13.1 责任边界测试</h3>
+<ol type="1">
+<li>同一通用 Task／DAG 创建请求可用于 Git 与非 Git 项目，Task JSON 与 PG 不出现 Git 字段。</li>
+<li>LLM 决定节点、依赖和 workspaceMode；Provider 决定实现；引擎决定执行与发布资格。</li>
+<li>删除或改变 prompt 补充不会绕过工作区检查、结果验收与发布条件。</li>
+<li>PG 中没有 branch、commit、repo path、worktree path 或目录哈希；这些都能从 Provider 与共享持久卷恢复。</li>
+<li>shared 模式同样有组工作现场 <code>work/shared</code> 与不可变结果，经发布链进 <code>content/</code>（doc/76 §4 改写了本条的“不创建组目录”）。</li>
+</ol>
+<h3 id="132-git-活体">13.2 Git 活体</h3>
+<ol type="1">
+<li>已有 Git 项目中 A/B 并行修改，C 合并两者的确定结果，原始项目在最终结果验证前不变。</li>
+<li>父合并冲突只出现在 C 的 worktree；解决并验证后发布。</li>
+<li>未提交结果、缺父提交、验证失败均不接受；结果引用可按 resultRevision 读取。</li>
+<li>原始主分支前进时不覆盖；合并新基线并重新验证后发布成功。</li>
+<li>中间仓库损坏后，已接受结果能从原始仓库内部引用恢复。</li>
+<li>原始仓库与其他组目录始终不在执行者读写范围内。</li>
+</ol>
+<h3 id="133-directory-活体">13.3 Directory 活体</h3>
+<ol type="1">
+<li>非 Git 目录中 A/B 修改不同文件，C 得到两份结果；同路径不同内容形成可见冲突并由 C 解决。</li>
+<li>新增、修改、删除清单与真实字节一致；结果目录在 work 清理后仍可读。</li>
+<li>原项目文件在基线后发生变化时拒绝覆盖；处理后可重新发布。</li>
+<li>多文件发布中途 kill -9：恢复记录能区分已写与未写，不把部分发布标成成功。</li>
+<li>未跟踪文件、软链越界、特殊文件、配额不足和跨租户访问均按边界拒绝。</li>
+</ol>
+<h3 id="134-通用故障与回归">13.4 通用故障与回归</h3>
+<ul>
+<li>双副本同时准备同一组、同一 Task：只有一份工作现场与一个当前执行 run；</li>
+<li>结果接受、发布前、发布中、发布后分别 kill -9：无重复结果、无旧 epoch 覆盖、无假 delivered；</li>
+<li>最终 run 结束后发布受阻：左侧处理项与重新发布闭环可用，父 Task 不重跑；</li>
+<li>交付 run 崩溃走 doc/73，不触发重新执行或自动回滚；</li>
+<li>浏览器验证不可变产物、项目当前文件、验证失败、发布受阻与多标签页重拉；</li>
+<li>doc/70 五场、doc/72 四场、doc/73 十场及标准 Go／前端／契约门禁全绿。</li>
+</ul>
+<p>完成不是“支持 Git”，而是：<strong>通用 Task 不需知道执行环境；LLM 能选择隔离意图；Git 与非 Git 都有准备、执行、交接、验证、发布和恢复闭环；共享模式不受影响。</strong></p>
+<h2 id="14-参照证据与取舍">14. 参照证据与取舍</h2>
+<ul>
+<li><strong>Kimi Tower</strong>：LLM 通过 Tower 工具规划 mission 与 worker；底层服务创建 worktree 并执行合并检查。分支、worktree、spawnBase 等状态在 <code>.tower/comms/state.json</code>，不是业务数据库；状态文件使用锁、临时文件与原子 rename。证据在 <code>ref-agent/kimi-code/packages/agent-core-v2/src/features/tower/{protocol,workerProfile.ts}</code>。本方案借“LLM 规划、程序创建、文件保存执行环境状态、程序校验合并”，不照搬单机文件锁或状态丢失后的最小恢复。</li>
+<li><strong>Comma</strong>：LLM 创建带 repo 需求的 coding Task，station 的 Coding 服务准备 canonical clone 与 session worktree；checkout 绑定写 <code>coding.json</code>，恢复依靠已推送分支。证据在 <code>ref-agent/Comma/systems/station/src/tasks/{coding.ts,tasks.ts}</code>。本方案借“通用任务请求与 workspace 创建分离”，不搬远端 Token、push、PR 或沙箱生命周期。</li>
+<li><strong>tako 多副本约束</strong>：PG 仍负责业务状态、执行权和发布准入；Provider 文件与 Git 引用必须在所有引擎副本共享的持久卷上。参照实现不能替代这条要求。</li>
+</ul>
+<h2 id="15-开工前需要点头的责任裁决">15. 开工前需要点头的责任裁决</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>决策</th>
+<th>本稿结论</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Task 是否认识 Git</td>
+<td>否；Task 与 DAG 永远通用</td>
+</tr>
+<tr>
+<td>谁决定拆任务与隔离需求</td>
+<td>LLM</td>
+</tr>
+<tr>
+<td>谁选择 Git 或 Directory</td>
+<td>WorkspaceProvider 根据真实项目与通用隔离请求选择</td>
+</tr>
+<tr>
+<td>谁实际创建工作区</td>
+<td>引擎调用 Provider 执行，不是 prompt 自己完成</td>
+</tr>
+<tr>
+<td>Git 状态是否进 PG</td>
+<td>否；Git 引用与 Provider 文件承担</td>
+</tr>
+<tr>
+<td>PG 还管什么</td>
+<td>通用 Task、run、结果版本、执行代次、发布状态与项目准入</td>
+</tr>
+<tr>
+<td>prompt 管什么</td>
+<td>只指导模型配合，不提供安全、完成或恢复保证</td>
+</tr>
+<tr>
+<td>非 Git 怎么办</td>
+<td>DirectoryProvider 完整支持，不自动 git init</td>
+</tr>
+<tr>
+<td>同组 Git 隔离边界</td>
+<td>原始仓库硬隔离；同组共享中间仓库元数据，是合作写者</td>
+</tr>
+<tr>
+<td>多文件目录发布</td>
+<td>单文件原子替换 + 发布恢复记录，不宣称整体原子</td>
+</tr>
+<tr>
+<td>默认行为</td>
+<td>shared，现有 Task 与普通聊天不变</td>
+</tr>
+</tbody>
+</table></div>
+<p>这些责任裁决随方案与施工包一起交审；用户点头前不改代码、不建施工脚手架。</p>
+<h2 id="16-所以这解决了什么">16. 所以这解决了什么</h2>
+<p>本稿把问题从“Task 怎样保存 Git 信息”纠正为“并行 Task 怎样获得合适的执行环境”。</p>
+<p>LLM 负责规划，Task 模型保持通用，Provider 负责工作区实现，引擎负责执行与发布协调，prompt 负责行为指导，PG 只保存业务事实，共享持久卷保存工作现场与不可变结果。这样 Git 不会污染通用业务模型，非 Git 任务也不会被落下，同时并行写入、结果交接、发布冲突与崩溃恢复都仍有明确负责人。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/74-%E5%B9%B6%E8%A1%8C%E4%BB%BB%E5%8A%A1%E5%B7%A5%E4%BD%9C%E5%8C%BA%E9%9A%94%E7%A6%BB.md"><code>doc/74-并行任务工作区隔离.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

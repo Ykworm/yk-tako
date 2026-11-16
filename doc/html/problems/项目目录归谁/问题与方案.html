@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>项目目录归谁 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="项目目录归谁">项目目录归谁</h1>
+<blockquote>
+<p>模块：产品面 / 项目目录（<code>internal/runengine/product_store.go</code> / <code>media.go</code>）｜ 状态：已落地｜ 证据：<code>doc/35-项目目录.md</code>、<code>tmp/35-项目目录/planning.md</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>用户为「Q4 调研」连开三场会话：第一场搜集资料写了 <code>中间产物.md</code>，第二场想接着读；第三场贴了一张图给模型看。</p>
+<p>如果每场会话各有一个私有子目录：</p>
+<ul>
+<li>第二场 <code>read_file</code> 直接失败——「项目」退化成列表里的一个标签；</li>
+<li>第三场贴的图落在会话目录，第一场、第二场都读不到；</li>
+<li>删掉会话时产出跟着没，或者反过来留下永远没人认领的孤儿文件。</li>
+</ul>
+<p>另外还有「游离会话」：用户直接点「新对话」，不带 <code>workspaceId</code>。如果允许它存在，产出落在会话目录，项目页永远看不到这些对话，删会话就留下孤儿。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>候选</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>同项目的多场会话</td>
+<td>A 每 session 一个子目录</td>
+<td>天然隔离</td>
+<td>跨会话读不到，项目名不副实</td>
+</tr>
+<tr>
+<td></td>
+<td>B 同项目共享 <code>workspaces/&lt;wid&gt;/</code>（定案）</td>
+<td>像 IDE 打开同一个项目</td>
+<td>并发写同一块可变状态（由文件锁与指纹兜底，见 <code>doc/problems/同项目并发写文件怎么防</code>）</td>
+</tr>
+<tr>
+<td>默认工作区粒度</td>
+<td>A 每租户一个</td>
+<td>省行</td>
+<td>团队里 Bob 的私人附件会进所有成员的眼</td>
+</tr>
+<tr>
+<td></td>
+<td>B 每（租户, 用户）一个私有默认工作区（定案）</td>
+<td>隐私按人切</td>
+<td>每人一行；要部分唯一索引 <code>(tenant_id, user_id) WHERE is_default</code> 防重</td>
+</tr>
+<tr>
+<td>附件挂哪</td>
+<td>A 挂会话</td>
+<td>实现简单</td>
+<td>项目内不共享；删会话即失图</td>
+</tr>
+<tr>
+<td></td>
+<td>B 挂 workspace，可见性跟容器（定案）</td>
+<td>项目内共享、归属稳定</td>
+<td>要迁移旧 path、改取图与模型读图</td>
+</tr>
+<tr>
+<td>允许游离会话吗</td>
+<td>A 允许</td>
+<td>兼容存量、少一步</td>
+<td>产出归属混乱、删会话留孤儿、项目页看不到</td>
+</tr>
+<tr>
+<td></td>
+<td>B 不带项目就挂该成员默认项目；存量在下一场 run 归位（定案）</td>
+<td>产出有归属</td>
+<td>需要默认工作区与归位逻辑</td>
+</tr>
+<tr>
+<td>附件路径留几套</td>
+<td>A 新旧并存</td>
+<td>老图还能看</td>
+<td>双解析路径、双清理逻辑，漏改一处就是 404 或删不干净</td>
+</tr>
+<tr>
+<td></td>
+<td>B 只留 <code>workspaces/&lt;wid&gt;/.media/</code>，存量清掉、老 path 自然 404（定案）</td>
+<td>单一形态</td>
+<td>dev 期老图失效，要写 release note</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>裁定：B / B / B / B / B。</strong></p>
+<h2 id="3-同族小裁定">3. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>附件可见性跟会话的 private/tenant 传导吗？</td>
+<td>不传导，附件永远跟 workspace</td>
+<td>否则私人会话的图会因项目共享而泄露</td>
+</tr>
+<tr>
+<td>默认工作区怎么防重复创建？</td>
+<td>部分唯一索引 <code>one_default_workspace_per_user</code></td>
+<td>闸放数据库不放进程；并发 <code>EnsureDefaultWorkspace</code> 不会造出两个默认项目</td>
+</tr>
+<tr>
+<td>会话换项目怎么办？</td>
+<td><code>PATCH /api/sessions/:id/workspace</code> 挂/解绑</td>
+<td>解绑后下一场 run 归位到默认项目</td>
+</tr>
+<tr>
+<td>项目重命名后旧路径怎么办？</td>
+<td>目录随重命名移动，DB 存的是 workspace id 不是路径</td>
+<td>避免路径成为第二个真源</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-证据">4. 证据</h2>
+<ul>
+<li>方案：<code>doc/35-项目目录.md</code> §0 第 1/2/5/6 条、§14 A8（附件）。</li>
+<li>台账：<code>tmp/35-项目目录/planning.md</code> §0（五条已拍）、§13 A7、§14 A8。</li>
+<li>代码：<code>product_store.go</code> 的 <code>EnsureDefaultWorkspace</code>；<code>pgstore.go</code> 的 <code>VisibleWorkspace</code>、<code>one_default_workspace_per_user</code>；<code>media.go</code> 的 <code>parseSessionMediaPath</code>（只认 <code>workspaces/&lt;wid&gt;/</code>）；<code>server.go</code> 的 run 前 <code>EnsureDefaultWorkspace</code> 与 <code>patchSessionWorkspace</code>。</li>
+<li>复核命令：<code>grep -n "one_default_workspace_per_user\|func EnsureDefaultWorkspace" yk-tako-eino/internal/runengine/*.go</code>。</li>
+</ul>
+<h2 id="5-现状">5. 现状</h2>
+<p>仍有效。项目「共享给团队成员」这一层后来整条退役，见 <code>doc/problems/共享项目整条退役</code>。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E9%A1%B9%E7%9B%AE%E7%9B%AE%E5%BD%95%E5%BD%92%E8%B0%81/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/项目目录归谁/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

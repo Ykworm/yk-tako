@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>并发控制设计：为什么不需要分布式锁 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="并发控制设计为什么不需要分布式锁">并发控制设计：为什么不需要分布式锁</h1>
+<blockquote>
+<p>状态：已落地（设计说明文档，无新增代码） 最后核对：2026-11-03 代码落点：<code>internal/runengine/{pgstore.go,store.go,redisstore.go,filefp.go,filetools.go}</code> 后续边界：文件写入的读者完整性、多副本协调与长任务 worktree 方向见 <a href="71-文件写入竞争.html">doc/71</a>（方案待点头）；本文仍是 2026-11-03 已落地机制的设计说明，不把 doc/71 当成现状。</p>
+</blockquote>
+<h2 id="一句话结论">一句话结论</h2>
+<p><strong>分布式锁保护的是"共享可变状态"。如果这个状态本身就在数据库或磁盘里，对它的修改天然是原子的（事务 + 约束），就不需要在应用层再套一层锁。</strong> tako 把所有互斥需求下沉到存储层原语——锁和数据在同一个存储层，一致性由该层保证，不是由应用代码维护"加锁→改数据→解锁"的三步协议。</p>
+<h2 id="背景要解决什么问题">背景：要解决什么问题</h2>
+<p>tako 是无状态多副本部署的 AI 引擎——任意一个进程崩了，另一个进程要能接手。但多个进程同时操作同一份数据时，如果没有互斥，会出现：</p>
+<ul>
+<li>同一会话同时跑两场 run（互相覆盖输出）</li>
+<li>两个 run 同时写同一个文件（后者抹掉前者）</li>
+<li>租户配额超发（上限 2 放进 4 场）</li>
+<li>崩溃的进程"复活"后写脏数据</li>
+</ul>
+<p><strong>病灶</strong>：如果用应用层分布式锁（Redis <code>SETNX</code> 那类），锁在 Redis、数据在 PG，两个存储之间没有事务——写数据成功但解锁失败会留死锁，加锁成功但写数据失败会留脏行，进程崩溃后锁要等 TTL 才能释放，期间相关请求全部阻塞。</p>
+<h2 id="核心路径为什么没有竞态">核心路径为什么没有竞态</h2>
+<p>在讲"用什么当锁"之前，先说清楚：<strong>tako 的核心运行路径里，大部分场景根本没有共享可变状态需要锁。</strong></p>
+<h3 id="1-单-run-单-worker-串行">1. 单 run 单 worker 串行</h3>
+<p>一个 run 由一个 worker goroutine 从头到尾跑完，不拆给多个 worker 协作。同一个 run 的所有帧（root 正文、子代理正文、工具调用、工具结果）都通过同一个事件迭代器串行取出、由同一个 goroutine 写入。子代理虽然内部并发，但输出汇入同一个事件流。</p>
+<p><strong>没它会怎样</strong>：如果多个 worker 同时写一个 run，帧顺序乱、runlog 序号冲突、工具调用结果对错号。</p>
+<h3 id="2-历史表只增不删append-only">2. 历史表只增不删（append-only）</h3>
+<p><code>runlog_entries</code>、<code>run_model_messages</code> 都只 INSERT 不 DELETE。seq（序号）在事务内分配，有唯一约束兜底。</p>
+<p><strong>没它会怎样</strong>：如果有"先读—改—再写"的需求，就会出现丢失更新（lost update）。只增不删把竞态需求直接消掉了。</p>
+<h3 id="3-状态机单向且终态不可逆">3. 状态机单向且终态不可逆</h3>
+<p><code>runs.status</code> 只有 <code>running → complete / error</code> 两个方向，终态之后不能再转回去。终态写入是一笔原子 <code>UPDATE ... WHERE status='running'</code>，<code>RowsAffected=0</code> 就知道输了。</p>
+<p><strong>没它会怎样</strong>：如果状态可以双向流转，就要处理"两个方向同时抢转换"的竞态。单向设计让竞争自然消解。</p>
+<h2 id="五个互斥机制">五个互斥机制</h2>
+<p>边界场景（并发发起、崩溃接管、文件并发写、配额判断、租户并发上限）仍然需要互斥，tako 用了五套原语，全在存储层。</p>
+<h3 id="机制-1部分唯一索引当主闸">机制 1：部分唯一索引当主闸</h3>
+<p><strong>保护对象</strong>：同一会话同时只能跑一场 run。</p>
+<p><strong>真身</strong>（<code>runs</code> 表）：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode sql"><code class="sourceCode sql"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">UNIQUE</span> (session_id) <span class="kw">WHERE</span> status <span class="op">=</span> <span class="st">&#39;running&#39;</span></span></code></pre></div>
+<p><strong>操作</strong>：</p>
+<ul>
+<li>抢闸 = <code>INSERT runs(status='running', lease_until=now()+lease)</code></li>
+<li>撞索引 → 整笔事务回滚 → HTTP 409 <code>session_busy</code></li>
+<li>放闸 = <code>UPDATE runs SET status='complete'/'error', lease_until=NULL</code></li>
+</ul>
+<p><strong>没它会怎样</strong>：如果用 Redis <code>SETNX lock:session:{sid}</code>，锁在 Redis、run 行在 PG，两个存储之间没有事务——写 PG 成功但 DEL 锁失败 → 锁留 30s；加锁成功但写 PG 前进程崩 → run 行不存在但锁还在，30s 内同会话无法发新消息。唯一索引让锁和数据合一：INSERT 成功 = 拿到锁 + 数据就位，一笔完成。</p>
+<h3 id="机制-2租约列当-ttl">机制 2：租约列当 TTL</h3>
+<p><strong>保护对象</strong>：进程 <code>kill -9</code> 时，唯一索引的行不能永远卡在 <code>running</code>。</p>
+<p><strong>真身</strong>：<code>runs.lease_until</code> 列，活行出生即带租约，watchdog 每 10s 续约。</p>
+<p><strong>操作</strong>：</p>
+<ul>
+<li>租约过期 → 读侧（<code>GET /sessions/{id}</code>）当场不算活（<code>status='running' AND lease_until &gt; now()</code>）</li>
+<li>新 POST 来时先清扫死行（<code>UPDATE ... SET status='error' WHERE lease_until &lt; now()</code>）→ 唯一索引自动放行</li>
+</ul>
+<p><strong>没它会怎样</strong>：如果只靠"正常结束时 UPDATE 放闸"，进程被 <code>kill -9</code> 时根本跑不到那行代码，会话永久锁死，必须人工去库里改状态。租约让"进程死亡 → 自动解锁"不需要外部 reaper。</p>
+<h3 id="机制-3接管令牌lease_epoch">机制 3：接管令牌（lease_epoch）</h3>
+<p><strong>保护对象</strong>：租约过期后新进程接管 run，旧进程（网络分区后复活）不能继续写。</p>
+<p><strong>真身</strong>：<code>runs.lease_epoch</code> 列，出生 = 1，每次 claim 续跑 +1。所有写点（EndRun、RenewLease）都带 <code>WHERE lease_epoch = ?</code>。</p>
+<p><strong>操作</strong>：</p>
+<ul>
+<li>新进程 claim 时 <code>UPDATE runs SET lease_epoch = lease_epoch + 1 ... RETURNING lease_epoch</code></li>
+<li>旧进程的写操作 <code>WHERE lease_epoch = 旧值</code> → 不匹配 → <code>RowsAffected=0</code> → 自然失败</li>
+</ul>
+<p><strong>没它会怎样</strong>：如果没有令牌，旧进程复活后会继续写帧、写 runlog，和接管者的写操作交错，数据被两边同时改。<code>lease_epoch</code> 是数据库列，写操作自带校验，不用在应用层判断 fencing token。</p>
+<h3 id="机制-4flock--内容指纹比对">机制 4：flock + 内容指纹比对</h3>
+<p><strong>保护对象</strong>：同一会话/不同会话的两个 run 同时写同一个文件。</p>
+<p><strong>真身</strong>：<code>syscall.Flock</code>（OS 文件锁，粒度=文件）+ sha256 指纹比对。</p>
+<p><strong>操作</strong>（<code>write_file</code> 流程）：</p>
+<ol type="1">
+<li>先 <code>read_file</code>，记录基准指纹（sha256）</li>
+<li><code>write_file</code> 时取 flock 排它锁（30s 超时）</li>
+<li><strong>在锁内</strong>重新算当前指纹，和基准比对</li>
+<li>指纹变了 → 拒绝，提示"先重新 read_file"</li>
+<li>指纹没变 → 写入，刷新基准</li>
+</ol>
+<p><strong>没它会怎样</strong>：如果只有锁，B 的内容在拿锁之前就基于旧版算好了 → 照样用旧版覆盖新版（两边都报成功）。如果只有指纹比对，检查和写之间有缝，另一个写者能在缝里落盘。<strong>比对必须在锁内做</strong>——锁让"检查—写"成为原子段。</p>
+<p>为什么用 flock 不用分布式锁：flock 是 OS 级锁，<strong>进程死了 OS 自动释放，不需要 TTL</strong>。锁和被保护的文件在同一个存储层（磁盘），一致性由文件系统保证。多副本部署时要求 workspace 挂共享盘且支持 POSIX 锁（CephFS/NFSv4）。</p>
+<h3 id="机制-5行锁--咨询锁短事务">机制 5：行锁 / 咨询锁（短事务）</h3>
+<p><strong>保护对象</strong>：需要"读—改—写"原子性的场景，且操作在短事务内完成。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>场景</th>
+<th>锁什么</th>
+<th>解决什么问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>同会话并发 POST</td>
+<td><code>sessions</code> 行 <code>FOR UPDATE</code></td>
+<td>串行化抢闸，避免两个请求同时 INSERT</td>
+</tr>
+<tr>
+<td>配额判断</td>
+<td><code>tenant_storage</code> 行 <code>FOR UPDATE</code></td>
+<td>两个并发上传不能都拿同一份目录大小通过（超发）</td>
+</tr>
+<tr>
+<td>租户并发上限</td>
+<td><code>pg_advisory_xact_lock</code> + 数活 run</td>
+<td>数与放行在同一笔事务、持同一把锁，不可能超发</td>
+</tr>
+<tr>
+<td>任务队列</td>
+<td><code>FOR UPDATE SKIP LOCKED</code></td>
+<td>多副本各捡各的任务，不互相等</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>没它会怎样</strong>：租户并发闸曾在 API 层"数一遍 → 比上限 → 放行"，数和放行是两次独立操作 → 并发下超发（实测上限 2 放进 4 场）。收进同一笔事务 + 咨询锁后，并发下不可能超发。</p>
+<p><strong>为什么不需要 TTL</strong>：这些锁都在短事务内，事务结束（提交/回滚/超时）自动释放。请求超时 → Go context 取消 → 事务回滚 → 锁释放。卡住的请求本身会被超时机制清掉。</p>
+<h2 id="对比如果用应用层分布式锁">对比：如果用应用层分布式锁</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>维度</th>
+<th>tako 的方案</th>
+<th>应用层分布式锁（Redis SETNX）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>锁和数据的关系</td>
+<td>同一存储层（锁就是数据本身）</td>
+<td>跨存储（锁在 Redis，数据在 PG）</td>
+</tr>
+<tr>
+<td>原子性</td>
+<td>数据库事务保证</td>
+<td>加锁→写数据→解锁三步，无事务</td>
+</tr>
+<tr>
+<td>进程崩溃</td>
+<td>租约过期自动放行</td>
+<td>锁等 TTL 过期（通常 30s）</td>
+</tr>
+<tr>
+<td>旧进程复活写脏数据</td>
+<td><code>lease_epoch</code> 让旧写自然失败</td>
+<td>需要 fencing token，应用层判断，容易漏</td>
+</tr>
+<tr>
+<td>解锁遗漏</td>
+<td>无（终态 UPDATE 自动放闸）</td>
+<td>DEL 失败 → 死锁到 TTL</td>
+</tr>
+<tr>
+<td>锁的 TTL</td>
+<td><code>lease_until</code> 列（和数据同一行）</td>
+<td>Redis key TTL（独立于数据）</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="适用边界什么时候需要分布式锁">适用边界：什么时候需要分布式锁</h2>
+<p>当前所有互斥都能下沉到 PG / 磁盘，因为<strong>被保护的数据就在这些存储层里</strong>。</p>
+<p>将来如果出现以下需求，原语不够用了，才需要引入分布式锁：</p>
+<ol type="1">
+<li><strong>协调存储层之外的资源</strong>：比如第三方 API 的全局限流（外部服务的配额不在我们的数据库里）</li>
+<li><strong>跨服务的复合操作</strong>：tako 拆成多个服务后，一个操作要跨多个服务的数据存储，单个数据库事务包不住</li>
+<li><strong>跨存储层的原子性</strong>：一个操作要同时改 PG 和一个外部系统，且两者不能纳入同一事务</li>
+</ol>
+<p>判断标准：<strong>被保护的资源在不在我们能控制的存储层里？</strong> 在 → 用该层原语；不在 → 才考虑分布式锁。</p>
+<h2 id="所以这解决了什么">所以这解决了什么</h2>
+<p>tako 不是"不需要锁"，而是<strong>不需要在应用层自己造一把跨存储的分布式锁</strong>。所有互斥都复用了存储层已经提供的原子性（唯一索引、行锁、事务、flock），把"加锁—改数据—解锁"从三步操作压成一步数据库写。核心运行路径（单 run 单 worker、append-only、单向状态机）通过设计消除了竞态需求，锁只处理并发发起和崩溃接管两个边界。多副本部署时，数据库就是唯一的裁判，任何副本拿到请求都能直接抢闸，不需要协调"谁持锁"。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/61-%E5%B9%B6%E5%8F%91%E6%8E%A7%E5%88%B6%E8%AE%BE%E8%AE%A1.md"><code>doc/61-并发控制设计.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

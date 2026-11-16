@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>11 · 最小 Web-UI 实施计划（方案 A 执行台账） · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="11--最小-web-ui-实施计划方案-a-执行台账">11 · 最小 Web-UI 实施计划（方案 A 执行台账）</h1>
+<blockquote>
+<p>性质：<strong>实施计划 + 进度追踪</strong>。定案在《10》§2.4（四步走），本篇是《10》§7 说的 「参照《02》另起的实现计划」，但比《02》多一个职责：<strong>它是唯一执行台账</strong>——每推进一步 就更新状态列与 §6 进度日志，未完成的写清卡在哪。后来者（包括未来的自己） 先读本篇状态表，再决定从哪开工。 编号说明：maf 冻结线的《10-MAF审批回路与Eino对照》已移入 <code>maf/doc/</code>（2026-09-26， P1 关闭），doc/ 下编号归新系列独有；本篇顺延为 11。</p>
+</blockquote>
+<h2 id="0-使用方式持续更新的规矩">0. 使用方式（持续更新的规矩）</h2>
+<ul>
+<li><strong>状态记号</strong>：⬜ 未开始 / 🔶 进行中 / ✅ 完成 / ⛔ 阻塞。</li>
+<li><strong>完成判定</strong>：该任务「产出」列全部满足 + 验收命令全绿 + §3.4 文档同步清单无遗漏 （AGENTS.md：行为改了必须同步改注释/文档，漏了不算完成）。</li>
+<li><strong>每次推进</strong>：① 改 §1 状态表该行；② 在 §6 进度日志<strong>倒序追加一行</strong> （日期 | 任务号 | commit | 变更摘要）；③ 被阻塞的写进 §5。</li>
+<li><strong>范围纪律</strong>：范围冻结清单以《10》§5 为准，超出冻结范围的需求不进本表， 记到《10》之后的后续篇目，防止被 WeKnora 带跑。</li>
+</ul>
+<h2 id="1-任务总览状态表">1. 任务总览（状态表）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>任务</th>
+<th>内容</th>
+<th>产出</th>
+<th>验收命令</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>T0</strong></td>
+<td>提交基线</td>
+<td>2 笔 commit + .gitignore 补编译产物</td>
+<td><code>git status</code> 干净；<code>go build/vet/test ./...</code> 全绿</td>
+<td>✅ 2026-09-26（<code>1d0d1eb</code> + <code>076d6d3</code>）</td>
+</tr>
+<tr>
+<td><strong>T1</strong></td>
+<td>事件 sink 重构（《10》§2.4 步 1）</td>
+<td><code>adkrun</code> 只产事件；REPL sink 落消费方；sink 单测</td>
+<td>《10》§6 关口 2：<code>turn_test</code> 回归 + sink 事件序列断言 + REPL 打印格式不破</td>
+<td>✅ 2026-09-26（<code>31e88a6</code>+<code>eaa8e41</code>、<code>12e08c0</code>+<code>6950f85</code>、<code>c0e4c7b</code>+<code>d609d3d</code>+<code>6ecd330</code>）</td>
+</tr>
+<tr>
+<td><strong>T2</strong></td>
+<td>HTTP + SSE 最小 UI（步 2）</td>
+<td>SSE handler、会话 map、审批 channel 化、embed 单页</td>
+<td>《10》§6 关口 3/4：SSE 事件序列断言、审批端到端、<code>-race</code> 全绿</td>
+<td>⬜（细化时机见 §4）</td>
+</tr>
+<tr>
+<td><strong>T3</strong></td>
+<td>回 #4 上下文管理（步 3）</td>
+<td>能力路线 #4 落地</td>
+<td>该层自己的计划另起（不在本台账展开）</td>
+<td>⬜ 占位</td>
+</tr>
+<tr>
+<td><strong>流式枢纽</strong></td>
+<td>事件落盘、seq 续传、断线不取消、显式停止。编号与上面的 sink T1 / HTTP T2 不是同一套</td>
+<td><code>internal/webui</code> 事件库 + 契约；REPL 不写库</td>
+<td><code>cd yk-tako-eino &amp;&amp; go test -race ./...</code></td>
+<td>🔶 2026-09-29 代码与文档已按设计稿 v3 落地，尚未提交。设计 <code>docs/superpowers/specs/2026-09-28-webui-stream-hub-design.md</code>，执行 <code>docs/superpowers/plans/2026-09-29-webui-stream-hub.md</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>前置关系：T0 → T1 → T2 → T3，严格串行；T1 不依赖 T2 的任何东西（所以 T1 是 「无悔改动」，中途叫停也不浪费，《10》§4.1）。</p>
+<h2 id="2-t0-提交基线-white_check_mark已完成留档">2. T0 提交基线 ✅（已完成，留档）</h2>
+<p><strong>为什么先提交</strong>：《10》§2.4 步 0——不先落基线，UI 改动会和「删旧入口」混进同一个 diff， 日后无法回看接 UI 前的状态。</p>
+<p><strong>做了什么</strong>：</p>
+<ol type="1">
+<li>全绿校验：<code>gofmt -l</code>（空）+ <code>go build ./...</code> + <code>go vet ./...</code> + <code>go test ./...</code>（7 包 ok）。</li>
+<li><code>.gitignore</code> 补 <code>yk-tako-eino/yktako</code>（<code>go build</code> 的 Mach-O 产物，原先会混进提交）。</li>
+<li>两笔提交：
+<ul>
+<li><code>1d0d1eb</code> 单入口收敛：45 files（删 7 个旧入口 + planexec/planning、新增 taskboard 7 文件、 README×2、AGENTS.md）；</li>
+<li><code>076d6d3</code> doc 新系列 01–10 + 删旧 01–06 + doc/blog（17 files，+4187/−1029）。</li>
+</ul></li>
+<li>提交前确认：stash 为空、无丢失风险；<code>maf/</code> 工作区干净。</li>
+</ol>
+<p><strong>顺带发现（不是本任务的事，但记下）</strong>：HEAD 基线（<code>63e5efe</code>）之前已落了 9 笔 MAF 限定解冻 实验提交（<code>f4543b0</code>→<code>63e5efe</code>），其中包含 <code>10-MAF审批回路与Eino对照.md</code>——它带来了 编号冲突，见 §5。</p>
+<h2 id="3-t1-事件-sink-重构-white_check_mark2026-09-26-完成">3. T1 事件 sink 重构 ✅（2026-09-26 完成）</h2>
+<p><strong>目标</strong>（《10》§4.1）：<code>adkrun</code> 只<strong>产生</strong>结构化事件，呈现归 sink；判定标准—— 重构后 <code>adkrun</code> 不再自己决定输出到哪，REPL 退化成第一个 sink。</p>
+<h3 id="31-侦察结论已核实的事实实现时直接用不必重查">3.1 侦察结论（已核实的事实，实现时直接用，不必重查）</h3>
+<ol type="1">
+<li><strong><code>adkrun.Run</code> 调用方只有 2 处</strong>：<code>cmd/yktako/main.go:106</code>、<code>internal/adkrun/turn_test.go:61</code>。 taskboard 集成测试直接用 <code>runner.Run</code>（<code>integration_test.go:178/215/244</code>），<strong>不受签名影响</strong>。 → 加 <code>sink</code> 参数只改这 2 处。</li>
+<li><strong>REPL sink 不能进 <code>internal/repl</code></strong>：该包头注释承诺「与 Eino 无关」（<code>repl.go:1</code>）， 而 sink 实现要 import <code>adkrun</code>（进而拉入 Eino），会破坏承诺。→ 落点候选： <code>cmd/yktako</code>（消费方，最贴合「呈现归消费方」）——<strong>已定：<code>cmd/yktako</code>（P2 关闭， 理由记在 <code>sink.go</code> 注释）</strong>。</li>
+<li><strong>Sink 用函数类型</strong>：包内已有先例 <code>type Ask func(info guard.ApprovalInfo) (string, error)</code> （<code>turn.go:66</code>），单方法无状态，函数类型足够，不必定义 interface（也就不需要编译期断言）。</li>
+<li><strong>eino 类型事实</strong>（<code>go doc</code> 核实，v0.9.21）：
+<ul>
+<li><code>adk.MessageVariant = TypedMessageVariant[*schema.Message]</code>，关键字段 <code>Role</code> / <code>ToolName</code> （<code>Role==schema.Tool</code> 且 <code>ToolName</code> 非空 = 工具回执）；</li>
+<li><code>schema.ToolCall.Function</code> 是 <code>FunctionCall{Name, Arguments}</code>；</li>
+<li><code>schema.Message</code> 自带 <code>ToolName</code> 字段，构工具消息用 <code>schema.ToolMessage(content, id, schema.WithToolName(name))</code>。</li>
+</ul></li>
+<li><strong>重构前分类逻辑的位置</strong>（拆分依据）：<code>printMessage</code>（<code>turn.go:157-193</code>）实际 3 个分支—— ① <code>ToolCalls</code> → 调用；② <code>Role==Tool</code> → 回执（<code>IsBoardTool</code> 再分看板）；③ <code>Content</code> → 正文。 「子代理前缀」（<code>agentName != root</code>）只是修饰，不是独立分支。3 支映射《10》§4.2 的 <code>message / tool_call / tool_result / board</code> 四类（看板是回执的子类）。 <strong>§4.2 另外两类不在 <code>printMessage</code></strong>：<code>approval</code> 来自 interrupt（<code>turn.go:142-151</code>）、 <code>error</code> 来自 <code>event.Err</code>（<code>turn.go:129-131</code>）——产出点归属见 T1.1 的口径。</li>
+<li><strong>测试素材可复用</strong>：<code>taskboard/integration_test.go</code> 的 <code>scriptModel</code> + <code>toolCallMsg</code> 模式 能构造「调工具 → 回执 → 收尾」的真实事件序列；<code>turn_test.go</code> 的 <code>fakeAgent</code> 走的是 <code>Run</code> 入口，直接可用。</li>
+</ol>
+<h3 id="32-实现子步骤未开始的打-white_large_square做一步勾一步">3.2 实现子步骤（未开始的打 ⬜，做一步勾一步）</h3>
+<blockquote>
+<p>细粒度执行计划（TDD 步骤 + 完整代码 + 提交切分）在 <code>docs/superpowers/plans/2026-09-26-web-ui-sink.md</code>；本节是概要台账，两边保持同步。</p>
+<p>行号说明：§3.1/§3.2 的行号与 <code>printMessage</code> 是 T1 动手前的侦察/计划快照，<code>printMessage</code> 已删除；实际落点：分类 <code>internal/adkrun/event.go</code>（<code>eventFrom</code>）、格式化 <code>cmd/yktako/sink.go</code>（<code>newREPLSink</code>）。当前行号以代码为准，完成情况见 §3.4。</p>
+</blockquote>
+<ul>
+<li>✅ <strong>T1.1</strong> 定义事件类型与 Sink：新文件（候选 <code>internal/adkrun/event.go</code>）—— <code>Event{Kind, Agent, Text, ToolNames...}</code> + <code>Kind</code> 常量 + <code>type Sink func(Event)</code>，全部中文注释。 <strong>口径（本步先定死，防 T2 返工）</strong>：T1 只落 4 类呈现事件 <code>message / tool_call / tool_result / board</code>；<code>approval</code> <strong>不经 Sink</strong>——由消费方的 ask 实现产出（REPL=现有 审批问答，HTTP=T2.3 推 SSE），<code>error</code> 维持 <code>Run</code> 返回给调用方。理由：T1 要求零行为 变化，而这两类今天就不经过 <code>printMessage</code>；此边界须写进 <code>Event</code> 的注释。</li>
+<li>✅ <strong>T1.2</strong> <code>consume</code> 改产事件：<code>turn.go:118-154</code> 里 <code>printMessage</code> 调用点改为 「分类构 <code>Event</code> → <code>sink(event)</code>」；<strong>分类函数留在 <code>adkrun</code></strong>（含 <code>IsBoardTool</code> 判定， 它属于「产生事件」而非「呈现」；HTTP sink 不能再做一遍）；<strong>history 攒取与 interrupt 收集两段逻辑一行不动</strong>（它们不属于呈现，动了就是范围膨胀）。</li>
+<li>✅ <strong>T1.3</strong> REPL sink 落点 + 打印格式化搬迁：搬的是 <code>printMessage</code> 的<strong>格式化部分</strong> （emoji、缩进、<code>repl.Clip</code>），输出格式逐字符不变；分类已在 T1.2 留在 <code>adkrun</code>，不搬。 搬完 <code>adkrun</code> 应可删 <code>repl</code> import（现在仅为 <code>Clip</code>，<code>turn.go:13</code>/<code>:187</code>）。决定落点 并在注释里写清理由（对照 §3.1 第 2 条的候选），P2 随本步关闭。</li>
+<li>✅ <strong>T1.4</strong> <code>Run</code> 签名加 sink 参数，接线 <code>main.go:106</code> 与 <code>turn_test.go:61</code> （传 nil 的语义：不呈现——需在 <code>Run</code> 注释里写明 nil 合法）。</li>
+<li>✅ <strong>T1.5</strong> 测试：① sink 单测——假模型事件序列 → 断言收到的事件 Kind 顺序； ② REPL sink 格式锁定测试（打印字节级断言，防格式漂移；捕获方式随 P2 落点定—— <code>cmd/yktako</code> 走 <code>os.Stdout</code> 管道、<code>internal/sink</code> 注入 <code>io.Writer</code>）；③ 既有 <code>turn_test</code> 回归。 全部 <code>-race</code>。</li>
+<li>✅ <strong>T1.6</strong> 文档同步（§3.4 清单逐项勾）+ 本台账更新 + commit。</li>
+</ul>
+<h3 id="33-验收106-关口-2">3.3 验收（《10》§6 关口 2）</h3>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino <span class="kw">&amp;&amp;</span> <span class="ex">gofmt</span> <span class="at">-l</span> . <span class="kw">&amp;&amp;</span> <span class="ex">go</span> build ./... <span class="kw">&amp;&amp;</span> <span class="ex">go</span> vet ./... <span class="kw">&amp;&amp;</span> <span class="ex">go</span> test ./... <span class="at">-race</span></span></code></pre></div>
+<p>外加两条人工判定：REPL 跑一次多步任务，终端输出与重构前<strong>肉眼无差异</strong>； <code>grep -rn 'fmt.Printf' internal/adkrun/</code> 为空（呈现彻底出包）。</p>
+<h3 id="34-文档同步清单t1-的完成条件之一漏一项不算完成">3.4 文档同步清单（T1 的完成条件之一，漏一项不算完成）</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文件:位置</th>
+<th>现状</th>
+<th>要改成</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yk-tako-eino/README.md:73</code></td>
+<td>「internal/adkrun 事件打印（含看板投影）」</td>
+<td>事件产出归 <code>adkrun</code>、打印归 sink（补 sink 落点）；:15 树图顺带复查（现只提 CheckPointStore，预计不改）</td>
+<td>✅ 已改</td>
+</tr>
+<tr>
+<td><code>README.md</code>（根）</td>
+<td>能力段未直接提打印</td>
+<td>T1.6 时 grep「打印/事件」复查一遍</td>
+<td>✅ 已复查（无涉及，不改）</td>
+</tr>
+<tr>
+<td><code>doc/01:85</code></td>
+<td>「<code>printMessage</code> 认四个账本工具名」</td>
+<td>改述为「事件分类认账本工具名，投影由 sink 打印」</td>
+<td>✅ 已改</td>
+</tr>
+<tr>
+<td><code>doc/10</code> §4 全部 <code>turn.go</code> 锚点（:28、:120、:123、:132、:137-140、:144、:154、:159、:169…）</td>
+<td>引 <code>printMessage</code> 与 <code>turn.go</code> 行号</td>
+<td>逐处复查、刷新为 sink 后的行号/文件（consume 改动 + printMessage 删除会让多数锚点漂移，不能只改枚举的几处）</td>
+<td>✅ 已逐处刷新（含枚举外的 :7、:221）</td>
+</tr>
+<tr>
+<td><code>doc/10:140</code></td>
+<td><code>approval</code> 行的来源只写 interrupt</td>
+<td>补一句「产出点在消费方 ask，不经 sink」（T1.1 口径）</td>
+<td>✅ 已改</td>
+</tr>
+<tr>
+<td><code>maf/doc/10-MAF审批回路与Eino对照</code>（原 doc/；:83、:161、:162）</td>
+<td>引 <code>turn.go:98-110</code> 等行号</td>
+<td><strong>不改</strong>——P1 已移入 <code>maf/doc/</code> 作冻结存档（同 <code>doc/02</code>）</td>
+<td>✅ 确认不改</td>
+</tr>
+<tr>
+<td><code>doc/09</code> §5/§11 约 15 处 <code>turn.go:NN</code></td>
+<td>其中 <code>:157-160</code>（前缀）、<code>:134</code>（筛历史）会挪位</td>
+<td>机制篇按《01》§9 约定<strong>必须</strong>跟当前代码刷新</td>
+<td>✅ 已逐处刷新（前缀改指 <code>sink.go</code>）</td>
+</tr>
+<tr>
+<td><code>doc/07:160</code>（§6 落点表）</td>
+<td>「流式投影（<code>adkrun</code> 认看板工具，原样打印 📋 看板）| <code>internal/adkrun/turn.go</code>」</td>
+<td>改为「分类归 <code>adkrun</code>（<code>IsBoardTool</code>）、打印归 sink」</td>
+<td>✅ 已改</td>
+</tr>
+<tr>
+<td><code>internal/adkrun/turn.go:1-3</code> 包头</td>
+<td>「事件消费（打印过程…）」</td>
+<td>改为「事件产出（呈现归 sink）」</td>
+<td>✅ 已改（T1.1：包文档移入 <code>event.go</code>）</td>
+</tr>
+<tr>
+<td><code>doc/02:515、:812、:836</code></td>
+<td>引 printMessage 行号</td>
+<td><strong>不改</strong>——历史计划记录当时状态（《01》§9:160「被删掉的实现不抹掉记录」）</td>
+<td>✅ 确认不改</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-t2-http--sse-最小-uiwhite_large_square细化时机有约定">4. T2 HTTP + SSE 最小 UI（⬜，细化时机有约定）</h2>
+<p>《10》§7 已声明：逐任务计划<strong>等 sink 重构定型后再写</strong>，避免计划先行于已知事实。 所以本节只立骨架，T1 完成后展开成 §3 那样的子步骤：</p>
+<ul>
+<li>⬜ T2.1 会话存储：进程内 <code>map[sessionID][]*schema.Message</code>（《10》§4.4 边界）；</li>
+<li>⬜ T2.2 SSE handler：事件转 <code>text/event-stream</code>；<strong>冲突检查先于写 header</strong> （WeKnora <code>qa.go:658</code> 的 409/503 顺序，见《10》§3.1）；</li>
+<li>⬜ T2.3 审批回路 channel 化：<code>ask</code> 从阻塞 stdin 改为挂起等 POST（《10》§4.3）， resume 值 <code>"approve"</code> / <code>"reject"</code> 不变；</li>
+<li>⬜ T2.4 embed 单页：聊天流 + 审批卡片 + 看板面板，<code>go:embed</code>（《09》§10）；</li>
+<li>⬜ T2.5 测试：《10》§6 关口 3/4（SSE 序列、审批端到端、<code>-race</code>）。</li>
+</ul>
+<h2 id="5-待定问题需要决策不属于任何任务">5. 待定问题（需要决策，不属于任何任务）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>问题</th>
+<th>事实</th>
+<th>建议</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>P1</td>
+<td><strong>doc 编号冲突</strong>：两个 <code>10-</code></td>
+<td><code>10-MAF审批回路与Eino对照.md</code>（maf 冻结线）与 <code>10-最小Web-UI.md</code>（新系列）并存</td>
+<td>移入 <code>maf/doc/</code> 冻结存档，新系列编号归位；《01》§9 加说明</td>
+<td>✅ 2026-09-26 已执行（已随 <code>e1aafd9</code> 提交）</td>
+</tr>
+<tr>
+<td>P2</td>
+<td>T1.3 sink 具体落点</td>
+<td>候选：<code>cmd/yktako</code>（贴「呈现归消费方」）vs 新建 <code>internal/sink</code>（若 REPL 与 HTTP 要共享打印逻辑）</td>
+<td>已定：<code>cmd/yktako</code>——HTTP sink 输出 SSE JSON，与终端文本没有可共享的格式化，不必新开包；理由记在 <code>sink.go</code> 注释（T1.5 捕获方式随之定：注入 <code>io.Writer</code> + <code>bytes.Buffer</code>）</td>
+<td>✅ 2026-09-26（<code>12e08c0</code>）</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="6-进度日志倒序追加格式日期--任务--commit--摘要">6. 进度日志（倒序追加，格式：日期 | 任务 | commit | 摘要）</h2>
+<ul>
+<li>2026-09-29 | 流式枢纽 | 工作区（未提交） | 事件先落 SQLite，<code>tool_call</code> 带原始参数；按 <code>from=最后收到的 seq</code> 续传；断线不取消 run；<code>POST /api/stop</code> 只取消上下文，退出路径写一条 <code>stop</code>。设计稿 v3，执行计划同日</li>
+<li>2026-09-26 | T1 | <code>cff708c</code> | T1 完成：事件 sink 重构落地——adkrun 只产事件，REPL sink 在 cmd/yktako；README/doc/01/doc/07/doc/09/doc/10 锚点刷新；计划偏差补记入执行计划文件</li>
+<li>2026-09-26 | T1 | —（验收） | 关口 2 通过：全量 <code>-race</code> 绿、<code>fmt.Printf</code> 出 adkrun 归零；人工跑 REPL 多步任务（查时间→计算→总结）：<code>→ 🔧</code>×6、<code>← 🔧</code>×2、<code>🐙</code>×1、看板 📋 投影正常，格式与重构前一致</li>
+<li>2026-09-26 | T1 | <code>c0e4c7b</code>+<code>d609d3d</code>+<code>6ecd330</code> | 驱动层接线：Run/consume 加 sink、删 printMessage、main/turn_test 接线；consume 序列载荷测试 + interrupt 同帧测试（审查加固）</li>
+<li>2026-09-26 | T1 | <code>12e08c0</code>+<code>6950f85</code> | REPL sink（cmd/yktako）+ 格式锁定 11 用例；P2 落点定在 cmd/yktako</li>
+<li>2026-09-26 | T1 | <code>31e88a6</code>+<code>eaa8e41</code> | 事件契约：Event/Sink/eventFrom + 分类 8 用例；包文档移入 event.go</li>
+<li>2026-09-26 | 计划 | 工作区（未提交） | P1 关闭：10-MAF审批回路与Eino对照 移入 maf/doc/ 冻结存档，doc/ 编号唯一；《01》§9 加说明；§3.4 对应行改「不改」；maf/README.md、maf/Program.cs 的 <code>doc/10</code> 引用同步修正</li>
+<li>2026-09-26 | 计划 | 本文档 | 审阅修订：T1 口径收窄为 4 类呈现事件（approval 走消费方 ask、error 走 Run 返回）；分类留 adkrun、只搬格式化；§3.4 补 doc/07:160、doc/10 全锚点与 doc/10-MAF（随 P1），修正 README:15 现状与《01》§9 出处</li>
+<li>2026-09-26 | 计划 | 本文档 | 建立执行台账：T0 ✅、T1 侦察结论入档（6 条事实 + 文档同步清单 7 项）、T2 骨架、P1 编号冲突待定</li>
+<li>2026-09-26 | T0 | <code>1d0d1eb</code> + <code>076d6d3</code> | 基线两笔提交：代码收敛（45 files）+ doc 新系列（17 files）；.gitignore 补编译产物；提交前后全绿</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/archive/old-line/11-%E6%9C%80%E5%B0%8FWeb-UI%E5%AE%9E%E6%96%BD%E8%AE%A1%E5%88%92.md"><code>doc/archive/old-line/11-最小Web-UI实施计划.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

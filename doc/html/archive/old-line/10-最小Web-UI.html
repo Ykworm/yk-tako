@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>10 · 最小 Web UI（方案 A 定案） · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="10--最小-web-ui方案-a-定案">10 · 最小 Web UI（方案 A 定案）</h1>
+<blockquote>
+<p>性质：<strong>定案</strong>。新系列第十篇，记 2026-09-26 的一次路线讨论：在「先接 UI」与「按《07》§7 顺序先做上下文管理」之间，选了<strong>方案 A——最小 Web UI 先行</strong>。本篇按推理链记 「为什么这么定、范围冻在哪、事件契约怎么落」，实现计划另起《11》执行台账（T1 已完成）。 关联：能力路线表在《05》§4（本篇改变了它的顺序）、审批回路缺口在《06》§8、 事件产出与呈现现状在《07》§6、<code>internal/adkrun/event.go</code> 与 <code>cmd/yktako/sink.go</code>、 <code>//go:embed</code> 机制在《09》§10。</p>
+</blockquote>
+<h2 id="0-问题">0. 问题</h2>
+<p>摆在桌上的问题只有一个：<strong>现在要不要先把 UI 接上？</strong></p>
+<p>表面上这不是个路线问题——路线表（《05》§4）里根本没有「UI」这一行。但正因为没有， 才要先回答它到底算哪一层、会挤掉谁。</p>
+<h2 id="1-前提当前代码离能接-ui的真实距离">1. 前提：当前代码离「能接 UI」的真实距离</h2>
+<p>先核对事实，不凭感觉。当前版本（工作区未提交状态，入口 <code>cmd/yktako/main.go</code>） 有四个<strong>结构性缺口</strong>，不是「加个前端就能连」：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>缺口</th>
+<th>现状</th>
+<th>位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>无 HTTP 层</td>
+<td><code>internal/</code> 下没有任何 server 包，唯一 I/O 是 REPL 的 stdin/stdout</td>
+<td><code>cmd/yktako/main.go</code> 全文</td>
+</tr>
+<tr>
+<td>无流式</td>
+<td><code>EnableStreaming: false</code>，整轮跑完才一次性拿到结果</td>
+<td><code>main.go:77</code></td>
+</tr>
+<tr>
+<td>会话在进程内存</td>
+<td><code>history</code> 是 main 的局部变量，重启即丢；checkpoint 只在 interrupt 时用</td>
+<td><code>main.go:85</code></td>
+</tr>
+<tr>
+<td>审批阻塞在 stdin</td>
+<td>审批回调 = <code>console.ReadLine("批准执行？[y/N]")</code>，同步阻塞</td>
+<td><code>main.go:109-128</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>外加一个隐性的第五缺口：<strong>规划时 <code>adkrun</code> 直接往 stdout 打印</strong>（规划时在 <code>internal/adkrun/turn.go</code> 的打印分支与看板投影；T1 重构后分类在 <code>internal/adkrun/event.go</code> 的 <code>eventFrom</code>， 格式化在 <code>cmd/yktako/sink.go</code> 的 <code>newREPLSink</code>）——事件的「产生」和「呈现」焊死在一起， UI 需要的「同一份事件换个消费者」当前做不到。</p>
+<p><strong>推导</strong>：这五个缺口里，流式对应路线 <strong>#7（断点恢复与流式）</strong>，HTTP 层 + 审批结构 + 会话存储对应 <strong>#8（多入口统一路由）</strong>。也就是说，「先接 UI」在路线表上不是插队到 一个无关的新层，而是<strong>把 #7 和 #8 的主体提前做</strong>。</p>
+<p><strong>边界检查</strong>：#4（上下文管理）的入场理由是「看板让任务变长，上下文膨胀随后就到」 （《07》§7）——这个理由<strong>不依赖 UI 做不做</strong>，REPL 里任务照样变长。所以 UI 提前与 #4 是<strong>正交通道</strong>，不是互相阻塞：#4 被顺延，但没有被取消，也没有失去入场条件。</p>
+<h2 id="2-三个候选方案与取舍">2. 三个候选方案与取舍</h2>
+<h3 id="21-方案清单">2.1 方案清单</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>方案</th>
+<th>内容</th>
+<th>一句话评价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>A. 最小 Web UI 先行</strong></td>
+<td>事件 sink 重构 → HTTP + SSE 单页 UI + HITL 审批结构，之后回 #4</td>
+<td>选它</td>
+</tr>
+<tr>
+<td>B. 按原路线先做 #4 上下文管理</td>
+<td>UI 缓后，纪律成本最低</td>
+<td>放弃，理由见 2.2</td>
+</tr>
+<tr>
+<td>C. 直接上 Wails 桌面壳</td>
+<td>WeKnora <code>cmd/desktop</code> 同款（Go 单二进制 + webview）</td>
+<td>放弃时机，理由见 2.3</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="22-为什么不选-b先-4">2.2 为什么不选 B（先 #4）</h3>
+<p>B 的唯一优势是<strong>不改动已定案的顺序</strong>（《07》§7 白纸黑字「下一层 = 上下文管理」）。</p>
+<p>但生长式复刻的每层节奏是「实现 → <strong>对比</strong> → 反思」（《05》§3），对比的对象决定了 反思的质量。当前对比对象是控制台日志：看板投影、审批卡片、越界访问提醒全部埋在 终端输出里。而《06》§7.1 已经观察到：ask 态的真正收益<strong>不在拦截率，在于让越界行为 变得可见</strong>——UI 是这个收益的放大器，把「控制台里划过的一行字」变成「用户盯着的卡片」。</p>
+<p><strong>结论</strong>：B 解决的是「任务变长」，A 解决的是「用户能看见和操作的东西太少」。 两个都是真问题，但 A 还额外把 #7/#8 一起带了，B 只带 #4。选 A。</p>
+<p><strong>反例（主动找的）</strong>：A 会不会让 #4 的问题恶化——UI 让任务更容易跑长，上下文膨胀 来得更快？会。但这是「问题更早暴露」而非「问题被制造」，REPL 下同样存在； 且 #4 的解法（compaction）不因入口形态改变而改变。风险可接受，代价是 #4 顺延一个身位。</p>
+<h3 id="23-为什么不选-cwails-先行">2.3 为什么不选 C（Wails 先行）</h3>
+<p>C 的吸引力是贴合「Go 单二进制本地数字员工」的终局形态（《04》§3.2）， WeKnora 的 <code>cmd/desktop</code>（wails v2）是现成参照。</p>
+<p>但壳是容器，<strong>容器里装的事件流协议还没定</strong>：没有 sink 抽象、没有 SSE 契约、 审批还堵在 stdin。先套壳等于让 webview 去适配一个不存在的接口，返工概率高。 正确顺序是 A 先把协议定下来，壳随时能套（A → C，不是跳过 A 直接 C）。</p>
+<h3 id="24-定案">2.4 定案</h3>
+<p><strong>选方案 A</strong>，分四步走：</p>
+<ol start="0" type="1">
+<li><strong>提交基线</strong>：当前工作区那批「单入口收敛」改动（删 7 个旧入口、doc 新系列） 尚未 commit（<code>git log</code> 最新停在 09-24 的 <code>28fcdeb</code>）。先落基线， 否则 UI 改动会和「删旧入口」混进同一个 diff，日后无法回看接 UI 前的状态。</li>
+<li><strong>事件 sink 重构</strong>（无悔改动）：把 <code>adkrun</code> 的打印拆成「产生事件 / 消费事件」， REPL 退化成第一个 sink。</li>
+<li><strong>HTTP + SSE 最小 UI</strong>：单页面（聊天流 + 审批卡片 + 看板面板）， <code>go:embed</code> 内嵌（机制见《09》§10），补齐 HITL 审批结构。</li>
+<li><strong>回到 #4 上下文管理</strong>：UI 让长任务更常见，#4 的入场条件反而更充足。</li>
+</ol>
+<h2 id="3-从-weknora-取什么不取什么">3. 从 WeKnora 取什么、不取什么</h2>
+<p>按《05》§5 翻译原则——参考实现只回答「要什么」。翻了 <code>ref-agent/WeKnora</code> 之后的清单：</p>
+<h3 id="31-取三样">3.1 取（三样）</h3>
+<ol type="1">
+<li><strong>SSE 事件契约</strong>：<code>internal/handler/session/qa.go:658</code> <code>setupSSEStream</code>—— 一个 run 的生命周期怎么切成事件发给前端。特别注意它<strong>在写 <code>text/event-stream</code> header 之前先做冲突检查</strong>（409/503，<code>qa.go</code> 注释原文 "SetLiveRun happens before SSE headers"）——流一旦开了就没法回头报错，这个顺序是踩坑换来的，照学。</li>
+<li><strong>传输层与运行解耦</strong>：<code>internal/stream/</code> 有 <code>memory_manager</code> 与 <code>redis_manager</code> 两套实现，同一份事件流可本地消费也可跨实例。印证「先做 sink 抽象」的方向： REPL 和 HTTP 各是一个 sink，将来 IM 入口再加一个。</li>
+<li><strong>HITL 审批的 API 形态</strong>：<code>mcp_tool_approval</code> 的 <code>PUT /mcp-services/:id/tool-approvals/:tool</code> 加上会话内审批——正好补《06》§8 留下的缺口（「审批是 REPL 的 y/n…… 等多入口那一层再对齐」）。UI 提前 = 这个缺口提前补。</li>
+</ol>
+<h3 id="32-不取一样但要写清楚为什么">3.2 不取（一样，但要写清楚为什么）</h3>
+<p><strong>WeKnora 的前端工程规模不取</strong>：Vue3 + Vite + TDesign + i18n + mermaid + 虚拟滚动， <code>frontend/src</code> 下 views/api/stores/hooks 一整套，后端 <code>internal/handler/</code> 一百多个文件。 照抄它违反《05》§5「功能翻译，不是设计移植」——它的规模服务的是知识库/RBAC/多租户， 我们当前形态是单用户本地 agent，<strong>一个页面够用</strong>。前端第一期就是 <code>go:embed</code> 内嵌的一个静态页，不引构建链。</p>
+<p>（顺带标记下一站：WeKnora <code>steer.go</code> 的运行中插话——队列深度 10、<code>inject</code>/<code>after</code> 两种投递时机——是 UI 之后顺路的好东西，但<strong>明确不在本期范围</strong>。）</p>
+<h2 id="4-事件契约草案方案-a-的核心技术决策">4. 事件契约草案（方案 A 的核心技术决策）</h2>
+<h3 id="41-事件-sink-抽象">4.1 事件 sink 抽象</h3>
+<p><code>adkrun.Run</code> 规划时把事件直接 <code>fmt.Printf</code> 出去（原 <code>turn.go</code> 的打印分支，当时 157-193 行）。重构目标：</p>
+<ul>
+<li><code>adkrun</code> 只<strong>产生</strong>结构化事件（channel 或回调，实现时定）；</li>
+<li>消费方各取所需：REPL sink 接现在的打印逻辑（分类留 <code>adkrun.eventFrom</code>， 格式化搬到 <code>cmd/yktako/sink.go</code> 的 <code>newREPLSink</code>），HTTP sink 把事件转 SSE；</li>
+<li>判定标准：<strong>做完后 <code>adkrun</code> 不再自己决定输出到哪</strong>，输出格式归 sink 所有。</li>
+</ul>
+<p>这一步不引入任何 UI，单独可验收（现有 <code>turn_test.go</code> 回归 + sink 单测）， 所以标为「无悔改动」——即使方案 A 后续叫停，这个重构对 #7/#8 依然有效。</p>
+<h3 id="42-事件类型第一期整消息级">4.2 事件类型（第一期：整消息级）</h3>
+<p>按 <code>consume</code>（<code>turn.go:117-159</code>；分类在 <code>event.go:52</code> 的 <code>eventFrom</code>）现有的事件分类推导， 第一期事件类型：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>事件</th>
+<th>载荷</th>
+<th>来源</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>start</code></td>
+<td>run、seq、用户消息文本</td>
+<td>Web 在调用模型之前写入事件库。不在 <code>adkrun.Event</code> 上</td>
+</tr>
+<tr>
+<td><code>message</code></td>
+<td>文本、agent 名（子代理带前缀）、role</td>
+<td><code>MessageOutput</code> 完整消息</td>
+</tr>
+<tr>
+<td><code>tool_call</code></td>
+<td><code>toolCalls: [{name, args}]</code>，args 是模型给出的原始参数字符串</td>
+<td><code>msg.ToolCalls</code>（<code>event.go</code> 的 <code>eventFrom</code>）</td>
+</tr>
+<tr>
+<td><code>tool_result</code></td>
+<td>工具名 + 内容（截断归消费方）</td>
+<td><code>Role=Tool</code> 消息</td>
+</tr>
+<tr>
+<td><code>board</code></td>
+<td>看板回执原文</td>
+<td><code>taskboard.IsBoardTool</code> 命中</td>
+</tr>
+<tr>
+<td><code>approval</code></td>
+<td>id、tool、args、message</td>
+<td>Web 的 ask，落盘后才挂起。不经 adkrun sink</td>
+</tr>
+<tr>
+<td><code>approval_result</code></td>
+<td>id、decision</td>
+<td>ask 收到决定后、继续执行前落盘</td>
+</tr>
+<tr>
+<td><code>complete</code> / <code>error</code> / <code>stop</code></td>
+<td>终局。一场 run 只有一条</td>
+<td>run 退出路径与档案 <code>is_completed</code> 同一事务</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>seq</code> 与 <code>run</code> 是 Web 信封上的地址，在写入 SQLite 时分配。<code>adkrun.Event</code> 只有呈现字段，REPL 不写库、也不分配序号。</p>
+<p><strong>明确分期</strong>：第一期<strong>不做 token 级 delta</strong>。理由：当前 <code>consume</code> 消费的是 <code>AgentEvent</code> 里 <code>GetMessage()</code> 拿到的完整消息（<code>turn.go:131-146</code>）， delta 需要开 <code>EnableStreaming</code> 并改消费方式，牵动 <code>Runner</code> 配置与历史攒取逻辑。 SSE 推整消息级事件<strong>已经是流式</strong>（逐事件推送，不是跑完才回）， 用户可见的最小收益（过程实时可见、审批卡片实时弹出）第一期就拿得到； token delta 列为第二期，跟着 #7 的 streaming 一起做。</p>
+<h3 id="43-审批回路从阻塞-stdin到挂起等另一个请求">4.3 审批回路：从「阻塞 stdin」到「挂起等另一个请求」</h3>
+<p>这是方案 A 最核心的技术难点，先说清结构再动手：</p>
+<ul>
+<li>现状：<code>Run</code> 的循环里 <code>ask(info)</code> 同步阻塞在 stdin（<code>turn.go:103</code>）， 整个 run 挂在 REPL 这一个 goroutine 上。</li>
+<li>Web 下：<code>ask</code> 不能再等 stdin，但 run 也不能退出。解法是<strong>通道挂起</strong>—— run 在自己的 goroutine 里跑，<code>ask</code> 内部阻塞在一个 channel 上； 前端收到 <code>approval</code> 事件后 POST 决定，HTTP handler 把 <code>"approve"</code> / <code>"reject"</code> 塞进 channel，<code>ask</code> 返回，<code>Run</code> 走既有的 <code>ResumeWithParams</code>（<code>turn.go:109</code>）继续。</li>
+<li><strong>不变量</strong>：resume 的值仍然是字符串 <code>"approve"</code> / <code>"reject"</code> （<code>guard/middleware.go:41-42</code>），<code>ApprovalInfo</code> 结构不动—— 只换「谁来回答」，不换「回答什么」。REPL 的 stdin 回答方式保留为 sink 之一， 两条入口共用同一套 interrupt/resume 语义。</li>
+</ul>
+<h3 id="44-会话与持久化">4.4 会话与持久化</h3>
+<p>模型下一轮读档案里已经写上产出的轮次（用户消息加上 <code>produced_json</code>）。失败、停止、没写上终局的轮次没有产出，不进入下一轮。checkpoint 仍是 <code>adkrun</code> 的内存 Store，进程崩溃后不能把在途轮次续跑。</p>
+<p>事件和档案另有 SQLite（<code>-web-db</code>，默认 <code>yktako-webui.db</code>）。开跑时插入档案行并写下 <code>start</code>；终局信封（<code>complete</code> / <code>error</code> / <code>stop</code>）与 <code>is_completed=1</code> 在同一事务。 没写上终局的行，下次启动对账标 <code>failed</code>，已落盘的事件仍可按 seq 回放。</p>
+<p>页面读进程内的事件列表，按序号取副本，读走不删。列表里还没有这场 run 时，从事件表装回来再读。进程重启后内存是空的，第一次读取完成这次装载。 助手正文逐字进这份列表，同一序号随着字变长再推一次；写完才进事件表。没写完的半截不落库，模型出错则读者看到失败后从内存删掉。 已结束的对话按会话从 <code>event_log</code> 懒加载：滚到顶才取更早的一页，游标用 <code>(created_at, run_id)</code>。Chrome 只保留 <code>yktakoSession</code>，不保存助手正文。 连接只是读者：断线不取消 run，重连带上最后收到的 seq（<code>GET /api/chat/stream?run&amp;from=</code>）。 停止是 <code>POST /api/stop</code>，由 run 自己的退出路径写一条 <code>stop</code>。同一会话同时只跑一轮， 冲突在写 SSE 响应头之前返回 409。后来打开的页面用 <code>GET /api/session?id=</code> 拿当前 run。 定案与任务拆分见 <code>docs/superpowers/specs/2026-09-28-webui-stream-hub-design.md</code>。</p>
+<h2 id="5-明确不做什么范围冻结">5. 明确不做什么（范围冻结）</h2>
+<p>写下来是为了防止实现时被 WeKnora 带跑：</p>
+<ul>
+<li>❌ 多用户 / 鉴权 / RBAC——单用户，服务只绑 <code>127.0.0.1</code>；</li>
+<li>❌ token 级流式 delta（见 4.2，第二期）；</li>
+<li>❌ 跨实例、Redis。同一进程内的断线续传与事件回放已由流式枢纽落地（第 4.4 节）；</li>
+<li>❌ steer 运行中插话；</li>
+<li>❌ 前端构建链（Vue/Vite/TDesign）——一个 embed 静态页；</li>
+<li>❌ Wails 桌面壳（协议定型后再套，A → C）；</li>
+<li>❌ 顺手做 #4 的任何内容（compaction 等）——本期只回填 #7/#8 的主体。</li>
+</ul>
+<h2 id="6-测试计划">6. 测试计划</h2>
+<p>仿《02》的验收密度，按四步各设关口：</p>
+<ol type="1">
+<li><strong>基线</strong>：<code>git status</code> 干净，<code>go build ./... &amp;&amp; go vet ./... &amp;&amp; go test ./...</code> 全绿。</li>
+<li><strong>sink 重构</strong>：现有 <code>turn_test.go</code> 回归；新增 sink 单测—— 假模型事件序列 → 断言 sink 收到的事件类型与顺序；REPL sink 打印格式不破。</li>
+<li><strong>HTTP + SSE</strong>：<code>httptest</code> 起服务，假模型走真实图，断言 SSE 事件序列 （message → tool_call → board → 收尾）；冲突检查在写 SSE header 之前返回 409。</li>
+<li><strong>审批回路</strong>：端到端——假模型触发 interrupt → SSE 收到 <code>approval</code> 事件 → POST approve → run 恢复跑完；POST reject 对称验证；REPL 入口的 y/n 回归不受影响。</li>
+</ol>
+<p>全部 <code>-race</code> 通过（run goroutine 与 HTTP handler 跨 goroutine 传审批，竞态是真实风险）。</p>
+<h2 id="7-对既有文档的影响">7. 对既有文档的影响</h2>
+<ul>
+<li>《05》§4 能力路线表：#7、#8 标「进行中（Web UI 提前拉动）」，#4 注「顺延一位」；</li>
+<li>《07》§7「下一层 = 上下文管理」：改为「下一层 = 最小 Web UI（《10》）， 之后回上下文管理」——原判断不删，注明顺延原因；</li>
+<li>《01》§9 索引补一行本篇；</li>
+<li>本篇只记定案与契约，<strong>逐任务实现计划仿《02》另起一篇</strong>（当时留待 sink 重构的实现细节 定型后再写，避免计划先行于已知事实）。</li>
+<li><strong>更新（2026-09-26）</strong>：计划已另起——执行台账《11-最小Web-UI实施计划》与细粒度计划 <code>docs/superpowers/plans/2026-09-26-web-ui-sink.md</code>；T1（事件 sink 重构）已完成，见《11》§1/§6。</li>
+</ul>
+<h2 id="8-风险与反例主动找的">8. 风险与反例（主动找的）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>风险</th>
+<th>检验</th>
+<th>处置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>UI 范围膨胀成 WeKnora 全家桶</td>
+<td>§5 范围冻结是硬约束，每加一个功能先对照 §5</td>
+<td>超出冻结范围的需求记到后续篇，不进本期</td>
+</tr>
+<tr>
+<td>#4 顺延导致长任务先翻车</td>
+<td>反例成立的前提是「UI 下任务显著变长」——第一期用户量为零，任务长度分布不变</td>
+<td>可接受；#4 入场条件（长任务出现）不受影响</td>
+</tr>
+<tr>
+<td>sink 重构牵动面大、回归风险</td>
+<td>§6 第 2 关单独验收，不动语义只搬输出</td>
+<td>搬完跑全量测试，输出格式锁住</td>
+</tr>
+<tr>
+<td>审批跨 goroutine 竞态</td>
+<td>通道是唯一传递路径，无共享可变状态</td>
+<td><code>-race</code> 是合入门槛</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="9-参考来源">9. 参考来源</h2>
+<ul>
+<li>WeKnora（<code>ref-agent/WeKnora</code>）：<code>internal/handler/session/qa.go</code>（SSE 契约与 header 顺序）、<code>internal/stream/</code>（传输解耦）、<code>mcp_tool_approval</code>（审批 API 形态）、 <code>cmd/desktop</code>（Wails 壳，后置参照）；</li>
+<li>本仓库：<code>cmd/yktako/main.go</code>（四个缺口的出处）、<code>internal/adkrun/event.go</code>（事件分类契约）、 <code>internal/adkrun/turn.go</code>（审批回路现状）、<code>internal/guard/middleware.go</code>（ApprovalInfo 契约）；</li>
+<li>Eino：<code>Runner</code> 的 streaming 配置与 <code>ResumeWithParams</code>（《09》§12 拆过 resume 中段）。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/archive/old-line/10-%E6%9C%80%E5%B0%8FWeb-UI.md"><code>doc/archive/old-line/10-最小Web-UI.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

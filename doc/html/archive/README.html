@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>doc/archive/ 归档区 · tako 文档</title>
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="docarchive-归档区">doc/archive/ 归档区</h1>
+<blockquote>
+<p>性质：<strong>归档</strong>。这里只放被取代的整代材料与旧线方案，<strong>不作施工面</strong>。 判据：改代码不需要照着它做；只在回答「当时为什么这么做 / 旧版长什么样」时读。 正文里的路径与文件名是<strong>当时的状态</strong>，未随归档改写（如 <code>docs/superpowers/...</code>、<code>doc/07...</code>）；需要现行位置时以本目录清单为准。 现行真源见 <a href="../index.html">doc/README.md</a>；带日期的记录见 <code>doc/log/</code>。</p>
+</blockquote>
+<h2 id="old-linev6-之前的旧线">old-line/（v6 之前的旧线）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文件</th>
+<th>一句话</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="old-line/01-任务看板与单入口.html">01-任务看板与单入口</a></td>
+<td>单入口定案；旧线 Task 工具，v6 未继承</td>
+</tr>
+<tr>
+<td><a href="old-line/02-任务看板实现计划.html">02-任务看板实现计划</a></td>
+<td>旧线执行台账</td>
+</tr>
+<tr>
+<td><a href="old-line/03-立项与命名.html">03-立项与命名</a></td>
+<td>项目立项与命名记录</td>
+</tr>
+<tr>
+<td><a href="old-line/04-技术路线.html">04-技术路线</a></td>
+<td>Go＋Eino 路线决策；LangGraph→Eino 映射表</td>
+</tr>
+<tr>
+<td><a href="old-line/05-Octop架构剖析与生长式复刻.html">05-Octop架构剖析与生长式复刻</a></td>
+<td>Octop 架构剖析；「要什么」的背景地图</td>
+</tr>
+<tr>
+<td><a href="old-line/06-工具安全层.html">06-工具安全层</a></td>
+<td>旧线三态守卫与 PII 打码</td>
+</tr>
+<tr>
+<td><a href="old-line/07-任务规划与看板.html">07-任务规划与看板</a></td>
+<td>旧线任务规划与看板</td>
+</tr>
+<tr>
+<td><a href="old-line/08-Eino规划机制调研.html">08-Eino规划机制调研</a></td>
+<td><code>write_todos</code>／<code>PlanTask</code>／Workflow 对照</td>
+</tr>
+<tr>
+<td><a href="old-line/09-设计了解.html">09-设计了解</a></td>
+<td>Eino 机制笔记与面试材料</td>
+</tr>
+<tr>
+<td><a href="old-line/10-最小Web-UI.html">10-最小Web-UI</a></td>
+<td>旧线最小 Web UI 定案</td>
+</tr>
+<tr>
+<td><a href="old-line/11-最小Web-UI实施计划.html">11-最小Web-UI实施计划</a></td>
+<td>旧线 Web UI 执行台账</td>
+</tr>
+<tr>
+<td><a href="old-line/12-上下文压缩.html">12-上下文压缩</a></td>
+<td>旧线压缩算法；v6 真源见 19v6-07</td>
+</tr>
+<tr>
+<td><a href="old-line/13-上下文压缩实施计划.html">13-上下文压缩实施计划</a></td>
+<td>旧线压缩执行台账</td>
+</tr>
+<tr>
+<td><a href="old-line/15-页面从event_log读对话的实施计划.html">15-页面从event_log读对话的实施计划</a></td>
+<td>旧线 Web UI 实施计划</td>
+</tr>
+<tr>
+<td><a href="old-line/18-媒体落盘与图片读取.html">18-媒体落盘与图片读取</a></td>
+<td>旧线 mediaoffload；v6 真源见 doc/32、doc/35</td>
+</tr>
+<tr>
+<td><a href="old-line/XX-taskboard-重命名-handoff.html">XX-taskboard-重命名-handoff</a></td>
+<td>taskboard 重命名的决策记录</td>
+</tr>
+<tr>
+<td><a href="old-line/handoff-doc24-滤思考与Usage触发.html">handoff-doc24-滤思考与Usage触发</a></td>
+<td>doc/24 的交接稿；真源已并入 doc/24</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="engine运行引擎旧代">engine/（运行引擎旧代）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文件</th>
+<th>一句话</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="engine/19-运行引擎架构-v3.html">19-运行引擎架构-v3</a></td>
+<td>投递与执行解耦的早期方案</td>
+</tr>
+<tr>
+<td><a href="engine/19-运行引擎架构-v4.html">19-运行引擎架构-v4</a></td>
+<td>已被 v5 取代</td>
+</tr>
+<tr>
+<td><a href="engine/19-v5/19-运行引擎架构-v5.html">19-v5/19-运行引擎架构-v5</a></td>
+<td>已被 v6 取代</td>
+</tr>
+<tr>
+<td><a href="engine/19-v5/7.9-业务用例链路.html">19-v5/7.9-业务用例链路</a></td>
+<td>v5 附篇</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="old-lineplans旧线执行计划">old-line/plans/（旧线执行计划）</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文件</th>
+<th>一句话</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="old-line/plans/2026-09-26-maf-tool-approval.html">MAF 最小审批回路 Implementation Plan</a></td>
+<td>旧线计划；MAF 对照，冻结存档</td>
+</tr>
+<tr>
+<td><a href="old-line/plans/2026-09-26-web-ui-http-sse.html">最小 Web-UI T2：HTTP + SSE</a></td>
+<td>旧线 Web UI</td>
+</tr>
+<tr>
+<td><a href="old-line/plans/2026-09-26-web-ui-sink.html">最小 Web-UI T1：事件 sink 重构</a></td>
+<td>旧线 Web UI</td>
+</tr>
+<tr>
+<td><a href="old-line/plans/2026-09-27-t2-人工验收用例.html">T2 人工验收用例</a></td>
+<td>旧线 Web UI 验收</td>
+</tr>
+<tr>
+<td><a href="old-line/plans/2026-09-29-webui-memory-read.html">Web UI：页面读内存列表</a></td>
+<td>旧线 Web UI</td>
+</tr>
+<tr>
+<td><a href="old-line/plans/2026-09-29-webui-stream-hub-manual.html">流式枢纽人工验收</a></td>
+<td>旧线 Web UI 验收</td>
+</tr>
+<tr>
+<td><a href="old-line/plans/2026-09-29-webui-stream-hub.html">Web UI 流式枢纽 Implementation Plan</a></td>
+<td>旧线 Web UI</td>
+</tr>
+<tr>
+<td><a href="old-line/plans/2026-09-30-webui-gin-migration.html">WebUI net/http → Gin 迁移</a></td>
+<td>旧线 Web UI</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="old-linespecs旧线设计">old-line/specs/（旧线设计）</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文件</th>
+<th>一句话</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="old-line/specs/2026-09-26-maf-tool-approval-design.html">MAF 最小审批回路设计</a></td>
+<td>旧线设计；冻结存档</td>
+</tr>
+<tr>
+<td><a href="old-line/specs/2026-09-28-webui-stream-hub-design.html">Web UI 流式枢纽设计 v3</a></td>
+<td>旧线设计；落盘＋seq 续传</td>
+</tr>
+</tbody>
+</table></div>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/archive/README.md"><code>doc/archive/README.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

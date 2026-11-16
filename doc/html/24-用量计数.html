@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>24 · 用量账单、滤思考与折叠触发 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="24--用量账单滤思考与折叠触发">24 · 用量账单、滤思考与折叠触发</h1>
+<blockquote>
+<p>性质：<strong>实现真源</strong>。Yk 已明确要着手实现本篇对齐的 <strong>2 个需求</strong>（滤思考 + Usage mid-run 触发）。本篇公式与裁决（与 <code>doc/handoff-doc24-滤思考与Usage触发.md</code> 对齐）即实现真源，不必再等另一次口头点头。</p>
+<p>仍<strong>不写</strong> <code>tmp/</code> 台账。本拍仍<strong>不做</strong>存储面（思考进 runlog / 改 <code>19v6-03</code>）。本篇不加端点、不加帧 kind、不加表、不加列——除非另裁「思考进 runlog」那一拍再开存储面。</p>
+<p>本拍<strong>不改</strong> <code>19v6-07</code> 里已经生效的 limit 公式和 <code>countInput</code> 基数（text + tool_calls；schema 不计）。</p>
+<p>指针已更新：<code>doc/19-v6/19v6-07-compact.md</code> §1、<code>doc/19-v6/19v6-10-mid-run-fold.md</code> §6。<code>19v6-03</code> / 架构总览 / API <strong>未动</strong>（runlog-for-reasoning 未定）。本任务不改那些文件。</p>
+<p><strong>实现主战场</strong>：<code>yk-tako-eino/internal/runengine/midfold.go</code> → <code>BeforeModelRewriteState</code>。详细文件/行号对照见交接：<code>doc/handoff-doc24-滤思考与Usage触发.md</code>。</p>
+<p>这是 <code>19v6-07</code> 第 1 节那条复审的收成。原文是：tool loop 时代若出现每轮检查，用上一笔 Usage 做基数、只对新增消息做 delta 计数，作为替代全量 BPE 的候选，并与「工具 schema 是否计入触发」二选一绑定裁决。WeKnora 的战例是 232 个 MCP schema 约 10 万 token，计进触发后，压缩完仍显示超限。</p>
+<p><strong>主裁决（已对齐）</strong>：同一场下一 Turn 发给 LLM 之前滤掉 <code>ReasoningContent</code>，让自测与真实请求在「思考」上对齐；有账单时可用 Usage 基线加 delta 做 mid-run 触发；schema 仍然不进触发；无账单时仍用全量 <code>countInput</code>。</p>
+</blockquote>
+<h2 id="1-要解决的两件事">1. 要解决的两件事</h2>
+<h3 id="11-思考重发与自测漏数">1.1 思考重发与自测漏数</h3>
+<p>用户在同一场 run 里让模型先想清楚，再调工具，然后根据工具结果接着说。</p>
+<p>第一次模型调用返回时，DeepSeek 这类思考模型把长思考写在 <code>ReasoningContent</code> 里，正文在 <code>Content</code>。eino 的 openai 组件发下一轮请求时，把这个字段原样放进 assistant 消息。思考因此进入下一次的真实请求。</p>
+<p>mid-run 折叠的计数走 <code>convertState</code>：<code>ModelMessage</code> 只有 <code>Text</code> 和 <code>ToolCalls</code>，<code>ReasoningContent</code> 不进这一行。<code>countInput</code> 把思考数成 0。自测偏小被放行，厂商按真实长度拒收或吃掉窗口。</p>
+<p><code>ReasoningContent</code> <strong>今天不落任何表</strong>：<code>drain</code> 只把 <code>merged.Content</code> 和 <code>ToolCalls</code> 写入 <code>TurnEntry</code>；<code>EndRun</code> 进 <code>run_model_messages</code> / <code>runlog_entries</code> 的也只有正文侧。思考只活在本场 ADK <code>state.Messages</code> 里。跨场从库读回，下一场 Run 没有它。</p>
+<h3 id="12-复审项有账单时能不能少做全量-bpe">1.2 复审项：有账单时能不能少做全量 BPE</h3>
+<p><code>19v6-07</code> 第 1 节挂着：有上一笔 Usage 时，用账单加 delta 替代全量自测，并与 schema 是否计入绑定。本篇收成这条复审，且与 1.1 的滤思考一起裁。</p>
+<h2 id="2-今天-countinput-数什么parts-清单">2. 今天 <code>countInput</code> 数什么（parts 清单）</h2>
+<p>触发用的 <code>countInput</code>（<code>compact.go</code>）实际数：</p>
+<ol type="1">
+<li><strong>system</strong>（含笔记快照拼上之后的整段系统提示）</li>
+<li><strong>每条消息正文</strong>（<code>Text</code> / <code>Content</code>：user、assistant 终稿、tool result）</li>
+<li><strong>assistant 行的 <code>tool_calls</code> JSON</strong>（name + arguments）</li>
+</ol>
+<p>明确<strong>不数</strong>：</p>
+<ul>
+<li><strong><code>ReasoningContent</code></strong>（转换层丢掉；但未滤时请求仍会重发）</li>
+<li><strong>工具 schema 声明</strong>（每次请求重发的 name/description/parameters；有意不进触发）</li>
+<li>Role / tool_call_id 等协议壳、多模态块（当前 mh 形状基本不承载）</li>
+</ul>
+<p>tool result <strong>已经在正文里</strong>，会进下一轮对话，也会进触发。用户确认这块 OK，本篇不动。</p>
+<h2 id="3-主裁决滤思考">3. 主裁决：滤思考</h2>
+<p>同一场 run 内，每一次把消息交给模型组件之前（mid-run 的下一 Turn，以及任何会把 state 里旧 assistant 再发出去的路径），清空该条上的 <code>ReasoningContent</code>。</p>
+<p>效果：</p>
+<ul>
+<li>真实请求不再重发上一枪思考</li>
+<li><code>countInput</code> 与真实请求在思考这一维对齐，1.1 的漏数病灶从根上消掉</li>
+<li>跨场本来就不重发思考，形状与场内一致</li>
+</ul>
+<p>滤之前字段还在：若公式需要减项，优先用 <code>Usage.CompletionTokensDetails.ReasoningTokens</code>（&gt; 0 时）；否则对原文做一次与 <code>countInput</code> 相同的 cl100k，记作 <code>reasoning_est</code>（无则 0）。滤完之后字段空了，减项必须事先算好或写在旁路变量里，不能事后从空字段估。</p>
+<p><strong>展示（本拍不做；另裁存储面时再开）</strong>：若要给人看思考，只进 <code>runlog_entries</code>（新列或 <code>payload</code>），<strong>不进</strong> <code>run_model_messages</code>。本拍不定列、不改 <code>19v6-03</code> / 架构总览 / API；定「要展示」时另开存储面。不展示则思考只存在于本枪响应内存，滤掉即丢。</p>
+<p><strong>厂商约束</strong>：部分思考模型要求下一轮带回 <code>reasoning_content</code>。滤掉后若 400，走现有 <code>error</code>，本篇不补假思考、不单独重试。验收用目录里常用思考模型打一枪确认。</p>
+<h2 id="4-账单长什么样">4. 账单长什么样</h2>
+<p>账单是厂商对<strong>上一次请求</strong>的回执，在收到响应时出现，不是发送瞬间就有。eino 放在 <code>schema.ResponseMeta.Usage</code>。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>字段（eino 名）</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PromptTokens</code></td>
+<td>这次<strong>输入</strong>：system、历史、tool 消息、tool_calls、schema，以及若未滤时重发的思考</td>
+</tr>
+<tr>
+<td><code>CompletionTokens</code></td>
+<td>这次<strong>输出</strong>：正文、本轮思考、模型给出的 tool_calls</td>
+</tr>
+<tr>
+<td><code>TotalTokens</code></td>
+<td>二者之和（若厂商给了）</td>
+</tr>
+<tr>
+<td><code>ReasoningTokens</code>（若有）</td>
+<td>输出里思考的子集，已含在 <code>CompletionTokens</code> 里</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>不要</strong>把 <code>CompletionTokens</code> 当成「当前用了多少上下文」。上下文长度看输入侧 <code>PromptTokens</code>，或看即将发出的整份输入。</p>
+<p><strong>不能假定每个 LLM 都返回 Usage。</strong> 名字也会不一样（<code>prompt_tokens</code> / <code>completion_tokens</code> 等）。进 eino 后统一读 <code>ResponseMeta.Usage</code>。openai 兼容常开 IncludeUsage，claude 流末帧常带；缺失时退回全量 <code>countInput</code>（溢出层已登记「usage 缺失 = 沉默盲区」）。思考明细字段可有可无；有则优先，没有就用第 5 节公式里的 <code>reasoning_est</code>（cl100k 估）。</p>
+<p>账单今天不落库。跨场从 <code>run_model_messages</code> 读回没有 <code>ResponseMeta</code>。本篇不把 Usage 写成表列。</p>
+<h2 id="5-有账单时的触发公式">5. 有账单时的触发公式</h2>
+<p>下一次模型调用前，在原始 <code>state.Messages</code> 上找锚点：从队尾往前，最后一条 role 为 assistant 且 <code>Usage</code> 非空（三个整数不全为 0）的消息。<code>convertState</code> 之后账单已丢，不能在转换后再找。</p>
+<pre class="text"><code>reasoning_est =
+  若 Usage.CompletionTokensDetails.ReasoningTokens &gt; 0 → 用它
+  否则 → cl100k(锚点.ReasoningContent)   // 滤之前估；无则 0
+
+visible_completion = CompletionTokens − reasoning_est
+若 visible_completion &lt; 0 → 置 0
+
+next_input = PromptTokens
+           + visible_completion
+           + countInput(&quot;&quot; /* system 空 */, 锚点之后的新行)</code></pre>
+<p>锚点之后的新行主要是还没发给厂商的 tool result（以及若有的新 user）。锚点消息自己的正文 / tool_calls 已由 <code>visible_completion</code> 代表，不进 delta，避免算两遍。</p>
+<p>system 与上一枪 schema 已在 <code>PromptTokens</code> 里，delta 不再加。</p>
+<p><strong>等价写法</strong>（不用 Completion 减思考）：<code>PromptTokens + countInput(上一枪可见输出行) + countInput(新行)</code>。两条验收时应对齐到同一量级，允许分词器偏差。</p>
+<p>与 limit 比。超了走现有 <code>foldInput</code>。没超则放行；放行前仍执行第 3 节滤思考，使发出去的请求不含 <code>ReasoningContent</code>。</p>
+<p><strong>为什么不是 <code>TotalTokens + 新行</code></strong>：Total 的 completion 侧含思考；滤掉后真实请求不带思考，会偏保守早折。可以当保守上界，不作本篇默认。</p>
+<p><strong>为什么不是 <code>CompletionTokens − 思考 + 新行</code>（没有 Prompt）</strong>：缺了整份输入历史。</p>
+<h2 id="6-无账单时仍用全量-countinput">6. 无账单时仍用全量 <code>countInput</code></h2>
+<p>下列情况没有「描述当前即将发出的那一份输入」的本场账单：</p>
+<ul>
+<li>每场 run 的第一次模型调用之前（<code>prepareInput</code>）</li>
+<li>刚折完、厂商还没对折后那一份回执</li>
+<li>Usage 缺失或不完整</li>
+</ul>
+<p>此时：<code>total = countInput(system, 全部可见历史)</code>，与今天 midfold / Run fold 相同。</p>
+<p><strong>禁止</strong>拿上一场末尾账单当本场第一呼长度：旧账单量的是上一场发出去的长输入；跨场 Run fold 后可见行已变短，会误判超限、一开场再折一次。且旧 <code>ResponseMeta</code> 跨场读不回来。</p>
+<p>折叠用 <code>toSchemaMessages</code> 重写 state 时不拷贝 <code>ResponseMeta</code>，折完自然退回全量自测。不另做清锚点开关。</p>
+<h2 id="7-工具-schema-仍然不进触发">7. 工具 schema 仍然不进触发</h2>
+<p>声明折叠拆不掉。计入触发会在目录变大时出现「压完仍超限」。WeKnora 战例仍有效。<code>19v6-09</code> / <code>19v6-10</code> 的「schema 不计入、靠 limit 预留与溢出层兜底」不翻案。</p>
+<p>有账单时，上一枪 <code>PromptTokens</code> 已含当时的声明；delta 只加新消息。无账单的全量自测也不加声明。</p>
+<h2 id="8-本篇不做">8. 本篇不做</h2>
+<ul>
+<li>不写 <code>tmp/</code> 台账</li>
+<li>不改 <code>countInput</code> 的三块基数（system / text / tool_calls）</li>
+<li>不改 limit 公式（<code>window − min(window/5, 16384)</code>）</li>
+<li>不把 Usage 或思考默认写入四个 API / 帧 / <code>run_model_messages</code> / <code>runlog_entries</code>（展示思考另裁存储面）</li>
+<li>本拍不做「思考进 runlog」展示列，不改 <code>19v6-03</code> / 架构总览 / API</li>
+<li>本拍不写 Usage 列；不做挂在引擎对象上的全局 <code>lastUsage</code>；账单粘在产生它的 assistant 消息上</li>
+<li>不替换溢出层；第一呼分词器偏差、schema 未进自测、窗旗标填错，仍靠溢出层</li>
+<li>不给子代理新挂折叠（<code>doc/17</code> 第 6 节另谈）；届时读子代理自己的 state <strong>（2026-10-17 已翻案：<code>doc/17</code> §6 落地，子代理装配点挂 <code>agentFoldHandler</code> 读子代理自己的 state；本拍边界在本拍当时成立）</strong></li>
+<li>滤思考后若厂商 400：不补假思考、不单独重试，走现有 <code>error</code></li>
+</ul>
+<h2 id="9-验收">9. 验收</h2>
+<p>实现顺序建议：<strong>探活 → 滤思考 → Usage 公式</strong>（详见交接 <code>doc/handoff-doc24-滤思考与Usage触发.md</code> §8）。主改位点见文首：<code>midfold.go</code> → <code>BeforeModelRewriteState</code>。</p>
+<p>探活（可先做、改动小）：同一场先 <code>get_time</code>（或任意工具）再回答，迫使第二次模型调用。第二次调用前日志能读到上一条 assistant 的 <code>PromptTokens</code> / <code>CompletionTokens</code>（至少一个 &gt; 0）。对目录常用模型记一笔「Usage 是否稳定 / 是否有 ReasoningTokens」。确认字段再接线。</p>
+<p>算法接上之后，单测钉：</p>
+<ol type="1">
+<li>有 Usage + 其后一条 tool 文本：<code>next_input</code> 等于公式；把思考再加进 delta 的变体更大（钉「可见输出只算一次」）</li>
+<li>无 Usage：结果等于全量 <code>countInput</code>；函数无「传入 schema」参数</li>
+<li>经 <code>toSchemaMessages</code> 重写后：退回全量 <code>countInput</code></li>
+<li>滤思考：发出前 state 上锚点 assistant 的 <code>ReasoningContent</code> 为空；请求侧验收用组件或抓包断言不带该字段</li>
+</ol>
+<p>活体：第二次调用前可打一行 <code>compact usage</code>（baseline / delta / total）。<code>window = 0</code> 时不出现。四端点路径与字段面与这一拍之前同形（未裁「思考进 runlog」之前）。</p>
+<p><strong>旁注全量自测不进活体日志（2026-10-15 用户裁）</strong>：活体行每轮再算一遍全量 <code>countInput</code> 等于把本篇要省的那次整份重数跑回去（§10 收益归零）。两条口径同量级由单测钉（<code>TestUsageBasedInputFormula</code>：公式分项逐 tok 对死、含「思考算两遍的变体必须更大」）；单测钉不住的只剩「厂商报数本身失真」一种情况，由溢出层兜底暴露。</p>
+<h2 id="10-所以这解决了什么">10. 所以这解决了什么</h2>
+<ul>
+<li>场内不再把上一枪思考重发给模型；自测与请求对齐，漏数病灶关掉</li>
+<li>有账单时 mid-run 可用 <code>PromptTokens + 可见 completion + 新行</code>，少做全量 BPE</li>
+<li>无账单时仍用 <code>countInput</code>；schema 不进触发</li>
+<li>tool_calls 与 tool result 继续在触发里</li>
+</ul>
+<p><code>19v6-07</code> 第 1 节复审收成（本篇即实现真源）：滤思考为默认；Usage 基线加 delta 为有账单时的触发；工具 schema 不计入；全量 BPE 留在没有账单的那些检查上。实现细节与文件对照见 <code>doc/handoff-doc24-滤思考与Usage触发.md</code>。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/24-%E7%94%A8%E9%87%8F%E8%AE%A1%E6%95%B0.md"><code>doc/24-用量计数.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

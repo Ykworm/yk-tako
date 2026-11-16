@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>80 · 任务列表按会话过滤（本会话 / 本项目） · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="80--任务列表按会话过滤本会话--本项目">80 · 任务列表按会话过滤（本会话 / 本项目）</h1>
+<blockquote>
+<p>性质：<strong>方案（已落地）</strong>。给任务列表加一个<strong>可选</strong>的会话作用域，把「本会话派发的任务」与「本项目全部任务」分成两档；对话页右侧「任务」标签与「任务」页共用同一个两档切换，默认「本会话」。 状态：✅ 2026-11-14 落地（未 commit，等验收）。后端 <code>go test ./internal/runengine</code> / <code>go vet ./internal/runengine</code> / <code>go build ./cmd/yktako</code> 通过；前端 <code>npm run typecheck</code> / <code>npm run build</code> 通过；契约用例 80（隔离引擎 8943、调度关闭 <code>-task-interval=-1s</code>）全 11 步绿，全量 core <code>PASS 460 / FAIL 0 / SKIP 1</code>；<code>check-expected.sh</code> 退出 0。 代码落点：<code>internal/runengine/{agent_task_api.go,agent_task_store.go}</code>、<code>web/src/{api.ts,TasksView.vue,ChatDock.vue,App.vue}</code>、<code>scripts/acceptance/expected.json</code>（用例 80）、<code>doc/19-v6/19v6-04-验收-curl.md</code>（用例 80）。 前置真源：<a href="77-对话页任务面板.html">doc/77</a>（对话页右侧任务面板）、<a href="78-对话页右侧工作区与改动文件.html">doc/78</a>（右侧多标签工作区）、<a href="70-多Agent编排与Task/README.html">doc/70</a>（持久 Task 与编排）。 边界：不加端点、不改响应字节；不改 Task 的存储、状态机、调度、交付与可见性链；不改「需要我处理」（<code>task-attention</code>）与「Todo」（<code>GET /api/runs/:id/tasks</code>）。</p>
+</blockquote>
+<h2 id="1-病灶一场会话派了什么界面上根本不存在这个信息">1 病灶：一场会话派了什么，界面上根本不存在这个信息</h2>
+<p>一场真实使用：</p>
+<pre class="text"><code>用户在会话 A 里让助手派发三件 Task（调研 / 汇总 / 出稿）
+→ 开一场新会话 B，聊一件别的事
+→ 右侧「任务」标签里躺着 A 的三件 Task（面板跟项目、不跟会话）
+→ 他在 B 里又派了一件，新任务和 A 的三件混在同一张表里
+→ 他分不清「我正在聊的这一场派了什么」——这个信息在界面上根本不存在</code></pre>
+<p>项目一多、会话一多就更糊：一个项目里几十场会话各自派过任务，列表成了一个没有主语的长表。</p>
+<p>反过来也有需要全量的时刻——「我上周让助手跑的那批完成没有」。所以不是把列表绑死到会话，而是<strong>默认看本会话、可一键看本项目</strong>。</p>
+<h2 id="2-完整业务链路谁--谁--谁">2 完整业务链路（谁 → 谁 → 谁）</h2>
+<pre class="text"><code>用户在场 S 的输入框发消息
+→ 引擎跑一场 run（run 属于会话 S）
+→ 助手调 delegate_task / create_orchestration
+→ 建编排组 agent_orchestrations，列 source_session_id = S
+→ 组内建 Task 行 agent_tasks（列 orchestration_id，本身没有会话列）
+→ 调度器领件、跑执行 run、交结果
+→ 右侧面板 / 任务页列这些 Task   ← 本方案动的是这一环的取数范围</code></pre>
+<p>本方案动的唯一一环：<strong>列 Task 时按「谁派发的」（组的 <code>source_session_id</code>）缩小范围</strong>。上游是建组时写下的与会话的关联；下游是列表渲染与详情抽屉。不改调度、不改执行、不改交付。</p>
+<h2 id="3-范围与非目标">3 范围与非目标</h2>
+<p>范围：</p>
+<ol type="1">
+<li>后端：<code>GET /api/workspaces/:id/tasks</code> 新增<strong>可选</strong>查询参数 <code>sessionId</code>（不加端点、不改响应字节）。</li>
+<li>前端：右侧「任务」标签（嵌入模式）与「任务」页都加两档切换（本会话 / 本项目全部），默认本会话。</li>
+<li>契约真源：<code>expected.json</code> 新增用例 80 + <code>doc/19v6-04-验收-curl.md</code> 同批加用例 80，散文与清单用例号集合一致。</li>
+<li>文档：本篇新增；doc/77 §3/§4.2、doc/78 §3/§4.5、doc/16 §2、doc/README.md §1 同批改口径。</li>
+</ol>
+<p>非目标（明确不做）：</p>
+<ul>
+<li>不改 Task 的存储、状态机、调度、交付与可见性链（<code>taskOwnerQuery</code> 一个字不动）。</li>
+<li>不做会话选择器（不挑具体某一场会话，只区分「本会话 / 本项目全部」）。</li>
+<li>不改「需要我处理」（<code>GET /api/workspaces/:id/task-attention</code>）的作用域，仍是项目级聚合（理由见 §4.5）。</li>
+<li>不改「Todo」标签（<code>GET /api/runs/:id/tasks</code>，本来就是 run 级，不是本方案的「任务」）。</li>
+<li>不做分页、不做服务端开关、不落偏好到 localStorage。</li>
+</ul>
+<h2 id="4-已拍定的设计选择">4 已拍定的设计选择</h2>
+<h3 id="41-服务端过滤可选参数不是前端本地过滤">4.1 服务端过滤（可选参数），不是前端本地过滤</h3>
+<p>Task 的所属会话记在<strong>编排组</strong>上（<code>agent_orchestrations.source_session_id</code>），Task 行没有这一列，响应里也没有（<code>agentTaskView</code> 只有 <code>orchestrationId</code>）。前端要本地过滤就得逐条再拉一次 orchestration（N+1 请求）。加一个可选参数，是把「谁派发的」这个关系交给已经持有它的那一层。</p>
+<p>没这么做会怎样：面板一打开就打几十个请求；或者把项目级关系搬到每一行任务上，将来再加一个维度就再加一列。</p>
+<h3 id="42-参数语义纯过滤不校验会话存在性">4.2 参数语义：纯过滤，不校验会话存在性</h3>
+<ul>
+<li><code>sessionId</code> 省略或空串 = 不限定（<strong>字节与今天完全一致</strong>）。</li>
+<li>非空 = 只返回「所属编排组的 <code>source_session_id</code> 等于它」的 Task。</li>
+<li>会话不存在 / 已删 / 不是本人的：<strong>200 + 空列表</strong>，不报 404。</li>
+</ul>
+<p>理由：这是读面的<strong>缩小范围参数</strong>，不是资源路径。若校验存在性，就多一条会误报的失败面——会话在别的窗口被删掉后，面板会弹一条错误横幅，而用户看到的「本会话没有任务」本来是诚实的。而且按会话过滤不泄露任何东西：别人的会话在本人租户里根本查不到编排组，返回空列表与「本会话真的没有任务」同形，没有探测通道。</p>
+<p>被否：像 <code>POST /api/tasks</code> 那样对未知 <code>sourceSessionId</code> 回 404 <code>112001</code>——那条是<strong>写路径</strong>的来源校验（建组要挂到一个真实会话上），语义不同，不能照搬。</p>
+<h3 id="43-两档切换默认本会话">4.3 两档切换，默认本会话</h3>
+<ul>
+<li>一个分段控件：<code>本会话</code> / <code>本项目全部</code>，放在列表头那一行（今天的「任务 N」+ 筛选框旁）。</li>
+<li>默认：<strong>能拿到当前会话 id 时默认「本会话」</strong>；拿不到（新对话还没发过消息、或任务页没有活动会话）时默认「本项目全部」。</li>
+<li>空态文案：搜索无结果 → 「没有匹配的任务。」；本项目无任务 → 「这个项目还没有任务。在对话里让助手用任务功能派发。」
+<ul>
+<li>本会话档下本会话无任务时<strong>不显示任何空态文案</strong>（列表头已有「本项目全部」切换，不再重复提示）。2026-11-14 用户定。</li>
+</ul></li>
+<li><strong>不落 localStorage</strong>：每次进页面都回到默认。理由：默认表达的是「我现在在看哪一场」，不是长期偏好；记住上次选择会让「新会话默认看本会话」这条当场失效。</li>
+</ul>
+<h3 id="44-两处入口同一份实现">4.4 两处入口同一份实现</h3>
+<p>右侧「任务」标签（<code>embedded</code> 模式）与「任务」页（整页）共用 <code>TasksView</code> 的同一个控件与同一份请求逻辑，不写第二套。</p>
+<h3 id="45-需要我处理仍是项目级本方案明确不改">4.5 「需要我处理」仍是项目级（本方案明确不改）</h3>
+<p>面板顶部的处理条来自 <code>/api/workspaces/:id/task-attention</code>，今天就是项目级聚合，左侧导航那个入口吃的是同一份数据（doc/72 §8.2）。按会话过滤会让「别的会话里有事等我」从界面上消失——那恰恰是最不该丢的信号。所以处理条不动。</p>
+<p>代价是面板里会出现「列表是本会话、处理条是本项目」的不一致。处理办法是<strong>把限定词写出来</strong>：<code>scope === 'session'</code> 时，处理块加一行标题「需要我处理 · 本项目」；<code>scope === 'project'</code> 时不加（不冗余）。两块各自的读法就是清楚的。</p>
+<h2 id="5-契约与施工面">5 契约与施工面</h2>
+<h3 id="51-后端三个文件">5.1 后端（三个文件）</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文件</th>
+<th>改动</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>internal/runengine/server.go</code></td>
+<td>路由不变（无新端点）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/agent_task_api.go</code></td>
+<td><code>listWorkspaceAgentTasks</code> 读 <code>c.Query("sessionId")</code>，透传给 store</td>
+</tr>
+<tr>
+<td><code>internal/runengine/agent_task_store.go</code></td>
+<td><code>ListWorkspaceTasks(ctx, p, workspaceID, sessionID string)</code>：<code>sessionID != ""</code> 时追加子查询</td>
+</tr>
+</tbody>
+</table></div>
+<p>SQL 形（在今天的 <code>Where("tenant_id = ? AND workspace_id = ?", …)</code> 之后追加）：</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode go"><code class="sourceCode go"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="cf">if</span> sessionID <span class="op">!=</span> <span class="st">&quot;&quot;</span> <span class="op">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    q <span class="op">=</span> q<span class="op">.</span>Where<span class="op">(</span><span class="st">&quot;orchestration_id IN (SELECT id FROM agent_orchestrations WHERE tenant_id = ? AND source_session_id = ?)&quot;</span><span class="op">,</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>        p<span class="op">.</span>TenantID<span class="op">,</span> sessionID<span class="op">)</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<ul>
+<li>索引已存在：<code>agent_orchestrations</code> 的 <code>(tenant_id, source_session_id, idempotency_key)</code> 唯一索引，子查询走它，<strong>不新增索引</strong>。</li>
+<li><code>sessionId</code> 只作参数值走 GORM 占位符绑定，不拼字符串；子查询自带 <code>tenant_id = ?</code>，跨租户查不到。</li>
+<li>响应字节一个字不变（同一个信封、同一份 18 键序的任务视图）：<code>TestContractAgentTaskViewBytes</code> 不动。</li>
+</ul>
+<h3 id="52-前端四个文件">5.2 前端（四个文件）</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文件</th>
+<th>改动</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>web/src/api.ts</code></td>
+<td><code>listWorkspaceTasks(workspaceId, sessionId?)</code>：<code>sessionId</code> 非空时拼 <code>?sessionId=</code>（<code>encodeURIComponent</code>），空串/省略时字节与今天一致</td>
+</tr>
+<tr>
+<td><code>web/src/TasksView.vue</code></td>
+<td>新 prop <code>activeSessionId?: string | null</code>；列表头加两档切换（本地 <code>scope: 'session' | 'project'</code>，默认见 §4.3）；<code>loadTasks()</code> 按 scope 决定传不传 sessionId；空态文案分两种；<code>watch(scope)</code> 与 <code>watch(props.activeSessionId)</code> 重拉列表；收到带 <code>taskId</code>/<code>orchestrationId</code> 的定位（<code>applyFocus</code>）或手动换项目时 scope 落「本项目全部」</td>
+</tr>
+<tr>
+<td><code>web/src/ChatDock.vue</code></td>
+<td>新 prop <code>sessionId</code>；转发 <code>:active-session-id</code> 给 TasksView；TasksView 的 <code>:key</code> 由 <code>workspaceId</code> 改成 <code>${workspaceId}:${sessionId ?? ''}</code>（换会话即重来，与换项目同一套语义）；<code>scope === 'session'</code> 时处理条加「需要我处理 · 本项目」标题</td>
+</tr>
+<tr>
+<td><code>web/src/App.vue</code></td>
+<td>给任务页 <code>TasksView</code> 与 ChatDock 挂载点都传 <code>:session-id="sessionId"</code>（<code>sessionId</code> 是 App 已有的 computed）</td>
+</tr>
+</tbody>
+</table></div>
+<p>任务页上的两条自动降档（<code>TasksView</code> 内部逻辑，不新增后端概念）：</p>
+<ul>
+<li>用户在任务页手动换项目（项目选择器）→ 当前会话不属于那个项目，落「本项目全部」；</li>
+<li>定位到某条处理项（左侧导航点进来，<code>focusTaskId</code>/<code>focusOrchestrationId</code> 非空）→ 落「本项目全部」，否则列表会把这个抽屉里的任务过滤掉。</li>
+</ul>
+<h3 id="53-必须保持的既有行为">5.3 必须保持的既有行为</h3>
+<ul>
+<li>不传 <code>sessionId</code> 时的响应字节与今天逐字相同（含排序：<code>created_at DESC, id DESC</code>）。</li>
+<li>项目可见性不变：workspace 必须属于本人租户与本人，否则 404 <code>114001</code>。</li>
+<li>任务可见性链不变（<code>taskOwnerQuery</code>：task → orchestration → source_session → 本人）。</li>
+<li>详情抽屉、编排组视图、停止/恢复/发布、处理项、Todo 标签、事件重拉（<code>agent_tasks_changed</code>）、<code>reloadNonce</code> 重连重拉——全部不变。</li>
+</ul>
+<h3 id="54-没有临时实现也没有过渡开关">5.4 没有临时实现，也没有过渡开关</h3>
+<ul>
+<li><code>sessionId</code> 空串 = 不传，是长期语义，不是兼容垫片；</li>
+<li>不保留任何「按会话过滤」的本地开关或 env 变量；</li>
+<li>不落 localStorage 偏好。</li>
+</ul>
+<h2 id="6-验收">6 验收</h2>
+<h3 id="61-机器契约用例-80">6.1 机器（契约用例 80）</h3>
+<p><code>expected.json</code> 用例 80（<code>id: 80-tasks-session-filter</code>、<code>tier: core</code>、<code>needs: pg</code>）：POST 建项目 → SQL 造两场来源会话（同项目同用户）→ 各派一件 Task → SQL 固定 <code>created_at</code> 钉住倒序 → 四条 <code>GET</code> 断言（不传 = 两件且顺序不变、<code>?sessionId=</code> 分别只剩本会话那件、<code>sessionId=s_nope</code> = 200 空列表）。期望字节<strong>先 curl 实跑再抄</strong>，不手写。同号散文进 <code>doc/19v6-04-验收-curl.md</code>；<code>check-expected.sh</code> 守两边用例号集合一致。</p>
+<h3 id="62-活体-curl隔离引擎-8943">6.2 活体 curl（隔离引擎 8943）</h3>
+<div class="sourceCode" id="cb4"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="va">B</span><span class="op">=</span>http://127.0.0.1:8943<span class="kw">;</span> <span class="va">T</span><span class="op">=&lt;</span>access <span class="ex">token</span><span class="op">&gt;</span><span class="kw">;</span> <span class="va">W</span><span class="op">=&lt;</span>项目 <span class="fu">id</span><span class="op">&gt;</span><span class="kw">;</span> <span class="va">S</span><span class="op">=&lt;</span>会话 <span class="fu">id</span><span class="op">&gt;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="st">&quot;</span><span class="va">$B</span><span class="st">/api/workspaces/</span><span class="va">$W</span><span class="st">/tasks&quot;</span>              <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$T</span><span class="st">&quot;</span>   <span class="co"># 两件</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="st">&quot;</span><span class="va">$B</span><span class="st">/api/workspaces/</span><span class="va">$W</span><span class="st">/tasks?sessionId=</span><span class="va">$S</span><span class="st">&quot;</span> <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$T</span><span class="st">&quot;</span>   <span class="co"># 只剩本会话</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="st">&quot;</span><span class="va">$B</span><span class="st">/api/workspaces/</span><span class="va">$W</span><span class="st">/tasks?sessionId=s_nope&quot;</span> <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$T</span><span class="st">&quot;</span>  <span class="co"># 200 空列表</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-s</span> <span class="st">&quot;</span><span class="va">$B</span><span class="st">/api/workspaces/</span><span class="va">$W</span><span class="st">/tasks?sessionId=&quot;</span>   <span class="at">-H</span> <span class="st">&quot;Authorization: Bearer </span><span class="va">$T</span><span class="st">&quot;</span>   <span class="co"># 空串 = 不传（两件）</span></span></code></pre></div>
+<h3 id="63-前端走查浏览器真引擎">6.3 前端走查（浏览器，真引擎）</h3>
+<ol type="1">
+<li>开一场新会话（还没发过消息）→ 右侧「任务」标签默认「本会话」，空态文案是本会话那一条。</li>
+<li>在对话里让助手派一件 Task → 事件到达后它出现在列表里，不用手刷。</li>
+<li>切到「本项目全部」→ 看到本项目其他会话的任务；切回「本会话」→ 只剩这一件。</li>
+<li>点一条开详情抽屉 → Esc 关；编排组视图进出正常。</li>
+<li>切到另一场会话（同项目）→ 列表按新会话重来（不残留上一场的行）。</li>
+<li>切到另一项目的会话 → 面板只列该项目的任务（既有行为不变）。</li>
+<li>左侧导航点一条「待回答」处理项 → 任务页打开，档位自动落「本项目全部」，抽屉里是那条任务。</li>
+<li>任务页手动换项目 → 档位自动落「本项目全部」。</li>
+<li>刷新页面 → 档位回到默认（本会话），不记住上次。</li>
+<li>≤860px 视口无横向溢出、面板不渲染（既有行为不变）。</li>
+</ol>
+<h3 id="64-验收结果2026-11-14">6.4 验收结果（2026-11-14）</h3>
+<ul>
+<li>快闸：<code>go test ./internal/runengine</code> / <code>go vet ./internal/runengine</code> / <code>go build ./cmd/yktako</code> 通过；前端 <code>npm run typecheck</code> / <code>npm run build</code> 通过。</li>
+<li>契约：隔离引擎（PG <code>tako_acc</code>、Redis/7、<code>-task-interval=-1s</code>、<code>-workspace ../tmp/workspace-acc</code>）用例 80 全 11 步绿；全量 core <code>PASS 460 / FAIL 0 / SKIP 1</code>；<code>check-expected.sh</code>、<code>check-master-plan.sh</code>、<code>check-doc-layout.sh</code> 退出 0。</li>
+<li>活体 curl：§6.2 四条实测符合预期（含 <code>?sessionId=s_nope</code> 回 200 空列表、<code>?sessionId=</code> 空串等于不传）。</li>
+<li>前端浏览器走查（§6.3 十条）：<strong>未跑（需人工）</strong>——这十条靠人眼在浏览器里点两档切换、换会话重挂载、处理条文案、空态按钮与 ≤860px 行为，无头环境覆盖不了。前端已过 <code>npm run typecheck</code> / <code>npm run build</code>，两档控件的 <code>data-testid</code> 已落盘；交互结果待人工验收。</li>
+</ul>
+<h2 id="7-风险与边界">7 风险与边界</h2>
+<ul>
+<li><strong>会话与项目不对齐</strong>：任务页手动换项目、或定位到某条处理项时，档位自动落「本项目全部」——否则列表会把不在当前会话的任务过滤掉，看起来像「任务丢了」。这两处降档是规则不是临时补丁。</li>
+<li><strong>处理条与列表作用域不一致</strong>：列表可能按会话收窄，而处理条是项目级。用「需要我处理 · 本项目」一行标题把限定词写出来，两块各自的读法就清楚；不引入第二种聚合。</li>
+<li><strong>按会话过滤不校验存在性</strong>：这是有意的（§4.2），代价是「看不见的会话」与「本会话真的没任务」同形——但两者本来都不该有第二句话。</li>
+</ul>
+<h2 id="8-所以这解决了什么">8 所以这解决了什么</h2>
+<p>用户在场 S 里派的任务，现在默认就在标着 S 的列表里；切到别的会话，列表整体换一场，不残留上一场的行；需要看全项目时一键切「本项目全部」。派发在对话里、执行在后台、结果回到对话，而「我在这一场派了什么」终于在界面上有了主语。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/80-%E4%BB%BB%E5%8A%A1%E5%88%97%E8%A1%A8%E6%8C%89%E4%BC%9A%E8%AF%9D%E8%BF%87%E6%BB%A4.md"><code>doc/80-任务列表按会话过滤.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

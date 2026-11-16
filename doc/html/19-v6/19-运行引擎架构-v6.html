@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>19 · 运行引擎架构 v6（index） · tako 文档</title>
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="19--运行引擎架构-v6index">19 · 运行引擎架构 v6（index）</h1>
+<blockquote>
+<p><strong>本文取代 v5</strong>。本文是 doc/19-v6 文档集的 <strong>index</strong>：目录 + 概要 + 概念表 + 注意事项 + 使用说明。 <strong>版本口径</strong>：v6 是**第六代运行引擎（连同描述它的文档集）**的代际编号，不是对外服务版本，也不是 API 版本。代码在 <code>yk-tako-eino/</code>，文档在 <code>doc/19-v6/</code>，两边是同一代的两种载体。 契约细节分篇，见下方目录。</p>
+<p><strong>最近修订（2026-10-20 二十修：T4/T5 合批，BM25 首版）</strong>：用户裁「一步到位把 T5 也做了」——T4 分级 + tool_search 与 T5 BM25 <strong>同批施工</strong>，BM25 即首版（不先做名称/描述直出过渡）；同拍澄清 mh 只记 tool_search 的调用/结果，不记工具 schema 与激活状态（激活集是 run 状态，每轮用 run 内完整目录 重建声明面 <code>state.ToolInfos</code>——direct + 已激活；不能对当前 ToolInfos 做减法，deferred 项首轮已被移出）。 <strong>代码未动、四个 API 字节零变化</strong>；演进见 <code>19v6-90</code> 二十修。 更早演进（初版定位、一～十九修）见 <code>19v6-90-演进记录.md</code>。</p>
+<p><strong>2026-10-07 文档集拆分</strong>：原单文件拆为本 index + 四篇 + 演进记录，内容逐字节搬运、只改写交叉引用。 引用约定：<code>19v6-NN</code> = <code>doc/19-v6/19v6-NN-….md</code>；不要再用旧「doc/19 §N」（§ 号跨文件会漂）。</p>
+<p><strong>2026-10-08 新增 19v6-05（T 系列 tool loop 立项）</strong>：机制裁定真源（Eino ADK 底座 / 术语 / 工具双投影 / sub agent / 工具目录）。帧新 kind 与 <code>agent</code> 字段等契约扩展<strong>已随七修落 19v6-01</strong>（2026-10-08 T2）； <code>model</code> 字段随十修补记、委派样例随十三修补（2026-10-12，T3 落地）。</p>
+</blockquote>
+<hr />
+<h2 id="概要">概要</h2>
+<p>第一步只跑一件事：<strong>投一条消息，轮询看着回复一点点生成、定稿</strong>。四个 API 就是全部契约面：</p>
+<ul>
+<li><code>POST /api/runs</code> —— 创建 run（= 投递消息；含首条消息懒建会话）——字节真源 19v6-01 §1</li>
+<li><code>GET /api/sessions/{sessionId}</code> —— 状态查询（活 run + runlog 高水位），reconcile 的唯一入口 —— 19v6-01 §4</li>
+<li><code>GET /api/runs/{runId}/frames</code> —— 拉生成中帧（<code>eventOffset</code>，run 内）—— 19v6-01 §2</li>
+<li><code>GET /api/sessions/{sessionId}/log</code> —— 拉定稿历史（<code>runlogOffset</code>，全局）—— 19v6-01 §3</li>
+</ul>
+<p>心智模型一条循环：投递拿 <code>runId</code> → 轮询 frames 看生成 → terminal / <code>gone</code> / <code>liveRunId</code> 变空任一触发收口 → 拉 log 用 assistant 全文替换半截气泡（总流程见 19v6-02）。</p>
+<hr />
+<h2 id="概念表">概念表</h2>
+<p>全文反复出现的词，先在这里钉死：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>概念</th>
+<th>是什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>session（会话）</strong></td>
+<td>服务端登记的资源。首条消息投递时含铸；未登记一律 404。没有跨 client 同步。</td>
+</tr>
+<tr>
+<td><strong>message</strong></td>
+<td>一条对话消息，<code>role</code> 区分：用户投递的是 <code>user</code>，模型产出的是 <code>assistant</code>。<code>messageId</code> 仅 user 消息有、客户端生成、请求前就有，不参与排序。</td>
+</tr>
+<tr>
+<td><strong>run</strong></td>
+<td>一次执行。本步：消费一条 user message、产出一条 assistant message。同一 session 同时最多一场（闸保证）。</td>
+</tr>
+<tr>
+<td><strong>帧（frame）</strong></td>
+<td><code>runlive</code> 列表里的一项（一个 JSON），描述一场 run 的一个事件。七种：<code>start</code> / <code>delta</code> / <code>tool_call</code> / <code>tool_result</code> / <code>usage</code> / <code>resume</code> / <code>terminal</code>；<strong>每帧带 <code>agent</code>（空 = root）与 <code>model</code>（生效 ref；空 = 非模型产物）</strong>。<strong>不是 SSE <code>data:</code>，是拉取响应里的数组元素</strong>。<code>usage</code>（doc/27）与 <code>resume</code>（doc/30）是后加的两种，<code>kind</code> 清单会随机制增长——客户端按 kind 分派、未知 kind 忽略。</td>
+</tr>
+<tr>
+<td><strong>agent / model</strong></td>
+<td>帧与 runlog 行的两个来源字段（恒在）：<code>agent</code> = 产出该帧/行的 agent 名，<strong>空 = root</strong>；<code>model</code> = 生效模型 ref（<code>厂商/模型</code>），<strong>空 = 非模型产物</strong>（<code>start</code>/<code>terminal</code>/<code>user</code> 行）。子代理委派时两者带非空值（T3；机制见 19v6-05 §4）。</td>
+</tr>
+<tr>
+<td><strong>eventOffset</strong></td>
+<td><code>runlive</code> 的游标：<strong>run 内序号</strong>，<code>start</code>=1、每 delta +1、<code>terminal</code> 占末。拉 frames 用它（<code>GET /api/runs/{runId}/frames</code> = <code>LRANGE runlive:{runId} N N+W-1</code>）。定稿、runlive 过期后即失效，<strong>不是历史地址</strong>。</td>
+</tr>
+<tr>
+<td><strong>runlogOffset</strong></td>
+<td><code>runlog</code> 的游标：<strong>session 内全局序号</strong>，跨 run 单调，每条定稿记录占一个，永久有效。<code>GET /api/sessions/{sessionId}</code> 返回它的高水位、<code>GET /api/sessions/{sessionId}/log</code> 拿它当游标。<strong>永久有效 ⇒ 双向合法</strong>：往前拨补新、往回拨翻旧。初始值取 <code>max(0, 高水位 - 窗口)</code>，<strong>不是 0</strong>。</td>
+</tr>
+<tr>
+<td><strong>W（单批上限）</strong></td>
+<td>服务端对两个拉取端点的单批返回条数上限（dev 默认 200，可配）。被截断时 <code>nextOffset</code> = 本批末条 offset，客户端从它续拉即补齐——<strong>没有「一次拿全部」</strong>。</td>
+</tr>
+<tr>
+<td><strong>runlive</strong></td>
+<td>Redis LIST，键 <code>runlive:{runId}</code>：一场 run 的<strong>生成过程帧序列</strong>。开跑建、每 delta 追加、定稿压 <code>terminal</code> 并设 TTL（到期自动清）。客户端经 <code>GET /api/runs/{runId}/frames</code> 轮询它看正在生成的回复。</td>
+</tr>
+<tr>
+<td><strong>runlog</strong></td>
+<td>PG 表 <code>runlog_entries</code>（序号列 <code>seq</code>）：session 的<strong>定稿记录序列</strong>（<code>role</code>：<code>user</code>/<code>assistant</code> + 工具扩展行 <code>tool_call</code>/<code>tool_result</code>；每行带 <code>runId</code>+<code>role</code>+<code>agent</code>+<code>model</code>+<code>text</code>，扩展行带 <code>payload</code>），<strong><code>seq</code> 即 runlogOffset</strong>。<strong>永久，历史真源</strong>，经 <code>GET /api/sessions/{sessionId}/log</code> 有界读（<code>seq &gt; N ORDER BY seq LIMIT W</code>）。</td>
+</tr>
+<tr>
+<td><strong>delta</strong></td>
+<td><code>kind:delta</code> 帧的 <code>text</code> 是增量片段（非累计全文）。客户端按 <code>eventOffset</code> 顺序<strong>追加</strong>进该 run 的气泡。</td>
+</tr>
+<tr>
+<td><strong>run 结束</strong></td>
+<td>run 侧收尾：<code>running</code> → 终态 <code>status</code>（本步 <code>complete</code>/<code>error</code>；<code>stopped</code> 后续 loop）。压 <code>terminal</code> 帧、给 <code>runlive</code> 设 TTL、放闸、删 <code>runepoch</code>——<strong>无条件</strong>，不管结局如何闸必放。入口 <code>endRun(sessionId, runId, status)</code>。</td>
+</tr>
+<tr>
+<td><strong>定稿</strong></td>
+<td>message 侧收尾：assistant 碎片 → 一条完整 message 记录（<code>runlog</code> 追加 <code>assistant</code> 全文记录）。<strong>只有 <code>status=complete</code> 那一次发生</strong>；此后该回复的权威内容以 <code>runlog</code> 为准。run 结束与定稿<strong>同一笔原子写</strong>——拆名不拆原子性，否则客户端能观察到「闸已放、历史还没那行」的窗口。<code>error</code> 结局不进历史（runlog 永远只有定稿记录），残缺输出不进历史。</td>
+</tr>
+<tr>
+<td><strong>收口</strong></td>
+<td>客户端见 frames 的 <code>terminal</code>（或 <code>liveRunId</code> 变化 / frames 已 <code>gone</code>）→ 拉 log 拿那条 <code>assistant</code> 全文，按 <code>runId</code> <strong>替换</strong>用 delta 拼的半截气泡。</td>
+</tr>
+<tr>
+<td><strong>闸</strong></td>
+<td><code>runs</code> 表上的 <code>one_live_run_per_session</code> 部分唯一索引（<code>UNIQUE (session_id) WHERE status='running'</code>）：插入活行成功 = 抢到 run；失败 = 409 <code>session_busy</code>。进程死亡由租约列 <code>lease_until</code> 判死（watchdog 续约；租约过期读侧即不算活）。</td>
+</tr>
+<tr>
+<td><strong>liveRunId</strong></td>
+<td><code>GET /api/sessions/{sessionId}</code> 返回的当前活 run id；<code>""</code> = 会话闲着（无 running run）。</td>
+</tr>
+<tr>
+<td><strong>reconcile（对账）</strong></td>
+<td>refresh / reconnect 共用的<strong>纯轮询</strong>流程：查 session → 拉 log 补历史 → 有活 run 则轮询 frames → 见 terminal 收口。无长连接、无挂流。</td>
+</tr>
+</tbody>
+</table></div>
+<p>没有合并语义，没有 inbox，没有跨 client 同步。</p>
+<hr />
+<h2 id="目录">目录</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>篇</th>
+<th>管什么</th>
+<th>谁在读</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>19v6-01-契约-四个API.md</code></td>
+<td>§0 范围 + 四个端点的请求/响应/错误字节</td>
+<td>写客户端的人、写验收的人</td>
+</tr>
+<tr>
+<td><code>19v6-02-reconcile与双游标.md</code></td>
+<td>客户端纯轮询总流程；对齐游标 vs 翻页游标</td>
+<td>写客户端的人</td>
+</tr>
+<tr>
+<td><code>19v6-03-存储形态与生命周期.md</code></td>
+<td>PG 四表 + Redis 两键（三搬两留一消失）、闸 = 部分唯一索引、生命周期、真源划分、多副本</td>
+<td>改 engine 的人</td>
+</tr>
+<tr>
+<td><code>19v6-04-验收-curl.md</code></td>
+<td>curl 手打用例 1–7（含委派 sub agent + 回传裁剪）+ 期望字节</td>
+<td>验收的人</td>
+</tr>
+<tr>
+<td><code>19v6-05-tool-loop.md</code></td>
+<td>T 系列机制裁定：Eino ADK 底座、工具双投影、sub agent（AgentTool）、工具目录/tool_search（<strong>T4/T5 2026-10-20 指令开工、合批施工</strong>）、帧扩展（<strong>已随七修落 01</strong>）、§4 实施口径（<strong>T3 已落地</strong>）</td>
+<td>改 engine 的人</td>
+</tr>
+<tr>
+<td><code>19v6-06-deferred-tools与缓存机制.md</code></td>
+<td>T 系列附属：工具 deferred 加载与缓存机制（<strong>纯背景篇</strong>：client mode 已为终态底座，hosted mode 2026-10-21 裁定不接）</td>
+<td>改 engine 的人</td>
+</tr>
+<tr>
+<td><code>19v6-07-compact.md</code></td>
+<td>compact 机制裁定：触发形态 / 折叠算法 / 摘要调用规格（C2 施工面）/ 落库事务边界 / 前方登记</td>
+<td>改 engine 的人</td>
+</tr>
+<tr>
+<td><code>19v6-08-file-tools.md</code></td>
+<td>F 系列文件工具族：workspace 约束 / 11 工具契约表 / 装配登记（lint 转正）/ 与 fileOps 咬合</td>
+<td>改 engine 的人</td>
+</tr>
+<tr>
+<td><code>19v6-09-溢出修复层.md</code></td>
+<td>溢出修复层立项方案：两层检测（报错匹配 + 截断检测）/ 强制压缩只重试一次 / trim 落二期。一期 A1–A4 + 三期（预留重裁）2026-10-12 落地</td>
+<td>改 engine 的人</td>
+</tr>
+<tr>
+<td><code>19v6-10-mid-run-fold.md</code></td>
+<td>mid-run fold：触发面 / 没有第二写点 / 计数基数 / 三件套不变量闸门。2026-10-12 用户判定 A5 完成</td>
+<td>改 engine 的人</td>
+</tr>
+<tr>
+<td><code>19v6-90-演进记录.md</code></td>
+<td>初版定位 + 一～二十修全文（当前形态为什么长这样；十四修 = 笔记层落地，真源 doc/17；十五修 = 三期预留重裁；十六修 = 同会话历史查找，真源 doc/21；十七修 = 笔记写入检查裁到隐形字符一档，真源 doc/17；十八修 = hidden 语义校正；十九修 = hidden 档删除、只留 direct/deferred；二十修 = T4/T5 合批、BM25 首版、mh 与激活集分家，真源 19v6-05 §5）</td>
+<td>考古的人</td>
+</tr>
+</tbody>
+</table></div>
+<hr />
+<h2 id="注意事项跨切面不变量改哪篇都适用">注意事项（跨切面不变量，改哪篇都适用）</h2>
+<ul>
+<li><strong>纯拉模型</strong>：无 SSE / 长连接 / 推送 / heartbeat（19v6-01 §0）。</li>
+<li><strong>拉取一律有界</strong>：单批上限 W 管两个拉取端点；<strong>没有「一次拿全部」</strong>（19v6-01 §0）。</li>
+<li><strong>两种游标别混</strong>：对齐游标只前进；翻页游标是临时值、不回退对齐游标（19v6-02）。</li>
+<li><strong>闸在共享存储不在进程</strong>：<code>runs</code> 表 <code>one_live_run_per_session</code> 部分唯一索引（<code>WHERE status='running'</code>）——插入失败本身就是 409；进程死亡由租约列 <code>lease_until</code> 兜底（watchdog 续约、租约过期读侧即判死）（概念表「闸」、19v6-03）。</li>
+<li><strong>runlog 只增不删</strong>：只追加、永久、历史真源；任何失败路径都不删行（19v6-03）。</li>
+<li><strong>run 结束与定稿同一笔原子写</strong>；<code>error</code> 结局不进历史（概念表「run 结束」「定稿」、19v6-03 生命周期）。</li>
+<li><strong>帧的头尾是应用层造的生命周期标记</strong>：<code>start</code> 由投递事务压、<code>terminal</code> 由 <code>endRun</code> 造；provider 的 done 事件不产生帧（实现裁定见 <code>tmp/19-v6/planning.md</code> §5 第 8 条）。</li>
+<li><strong>「从未存在」与「已过期删除」不区分</strong>：frames 对未知 run 回 200 <code>gone</code> 而非 404（19v6-01 §0）。</li>
+<li><strong>没有用例逼出的端点不进契约</strong>；需要时照既有通道扩，不预留字段（19v6-90 四修）。</li>
+</ul>
+<hr />
+<h2 id="使用说明">使用说明</h2>
+<ul>
+<li><strong>真源分工</strong>：本目录（<code>doc/19-v6/</code>）= 契约真源；<code>tmp/19-v6/planning.md</code> + <code>todos.md</code> = 执行台账（阶段、脚手架与转正、储备裁定 §8）。冲突以本目录为准，回头改台账。</li>
+<li><strong>引用约定</strong>：<code>19v6-NN</code> = <code>doc/19-v6/19v6-NN-….md</code>。代码注释与台账引用分篇用「19v6-NN §N / 「标题」」。</li>
+<li><strong>改契约</strong>：动任何一个端点的字节 → 同步改 19v6-04 的 curl 期望、重跑 baseline（台账 A4-1 ①–⑫）、补一条修订记录进 19v6-90。</li>
+<li><strong>演进记录只追加不篡改</strong>；版本号跳不跳由用户判定（AGENTS.md）。</li>
+<li><strong>v5 及更早版本已废</strong>：不作论据、不作施工面（AGENTS.md）。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/19-v6/19-%E8%BF%90%E8%A1%8C%E5%BC%95%E6%93%8E%E6%9E%B6%E6%9E%84-v6.md"><code>doc/19-v6/19-运行引擎架构-v6.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

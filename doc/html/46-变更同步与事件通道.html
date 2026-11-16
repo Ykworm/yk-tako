@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>46 · 变更同步与事件通道 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="46--变更同步与事件通道">46 · 变更同步与事件通道</h1>
+<blockquote>
+<p>性质：<strong>已落地</strong>（2026-10-23）。Loop A（BroadcastChannel 同机失效）+ Loop B（账号级 SSE 事件流）全部施工并验收。 状态：✅ A1–A2、B1–B4 六拍 + P3 收口全部完成。 <strong>验收结论（2026-10-23）</strong>：</p>
+<ul>
+<li><strong>Loop A</strong>：<code>handleMutation</code> 失效函数（清落点/重拉列表/作废气泡+横幅）+ BroadcastChannel 广播/监听（sourceId 挡自回声、tenantId 挡跨租户）；三个写口（删会话/删项目/改名）成功后广播；<strong>A2 投递自愈</strong>——落点项目被删后 114001 自动清落点回落默认项目重试一次。iframe harness（同机双 tab 的等效物）5/5 + 3/3 全过。</li>
+<li><strong>Loop B</strong>：<code>events.go</code> 写口 <code>XADD tk:events:&lt;tid&gt; MAXLEN ~1000</code>（三个写口 + 租户归档 DEL）；<code>GET /api/events</code> SSE 端点（XREAD 挂读；新连接从 <code>$</code> 起只推新事件、<code>Last-Event-ID</code> 续传；鉴权走 <code>?access_token=</code> query 兜底——gin 日志只记 Path）。活体 7/7（挂读/续传不回放/新连接静默/query token/<strong>双副本互证</strong>）；前端 EventSource 与 BroadcastChannel 并存、同喂一个 dispatch，真后端事件 harness 3/3。</li>
+<li><strong>契约收口</strong>：<code>TestContractStreamEventBytes</code> 钉事件帧字节；用例 9 登记进 <code>expected.json</code> 的 declared_not_asserted + 19v6-04 散文，<code>scripts/acceptance/events_live.sh</code> 判红（挂读型断言）；doc/16 §2c 扩两行（第三临时键 + 变更端点必发事件）。 日期：2026-10-23（方案 → 落地同日）。 代码落点：<code>yk-tako-eino/internal/runengine/{events.go,server.go,auth.go,product_api.go,contract_test.go}</code>；<code>web/src/{mutation.ts,api.ts,chat.ts,App.vue,ProjectsView.vue}</code>；验收 <code>scripts/acceptance/events_live.sh</code> + <code>expected.json</code>（用例 9）+ <code>19v6-04</code> 用例 9。 台账 <code>tmp/46-变更同步与事件通道/</code>（本地，不入库，验收后清理）。 参照：doc/31（SSE 端点与「拉是正确性、流是优化」的运输哲学）；doc/30 §12（无 client 可触发场景的预留口）；doc/38 与 doc/16 §2c（Redis 临时键纪律，已扩第三键）；doc/44（落点记忆的存法与三处多 tab 症状）；doc/16 #8b（IM/cron 入口——本方案是其前置）。 灵感来源（不作论据）：用户观察到 Kimi 产品有「向各 client 同步删除操作」的连接通道；其内部实现未核实，本文只取这个模式本身。</li>
+</ul>
+</blockquote>
+<hr />
+<h2 id="0-为什么写这份方案">0. 为什么写这份方案</h2>
+<p><strong>背景</strong>：tako 的所有同步都是「拉」——会话列表是一次性 <code>GET /api/sessions</code>，项目页靠手动「刷新」，对话页在打开那一刻 reconcile 一次。系统里没有任何「谁改了什么」的通知。client（浏览器 tab）越多，每个 tab 手里的快照就越可能是假的。</p>
+<p>这个病已经咬过三口，都是真实发生、不是假想：</p>
+<p><strong>症状一（已修）</strong>：项目页展开过面板后，另一个 tab 在项目里新建了会话；原 tab 点「删除项目」时，级联文案和「连带清空当前对话」的判断用的是旧快照——服务端删的是 3 场，前端以为只有 2 场（2026-10-23 修：删除前无条件重拉）。</p>
+<p><strong>症状二（已修）</strong>：项目页对同一场会话双击「打开」，两次 reconcile 交错，历史整体重复渲染——第一次重拉在清屏之后继续补行（2026-10-23 修：reconcile 全程令牌校验）。</p>
+<p><strong>症状三（开着，即 doc/44 遗留 nit）</strong>：tab A 记住的「新对话落点项目」在 tab B 被删；tab A 发新对话时带着死项目 id，吃 404 <code>114001</code>，页面只能弹错，不会自愈回默认项目。</p>
+<p>三个症状的共同点：<strong>变更发生的那一刻，其它 client 没有任何途径知道</strong>。Kimi 那类多端产品的标准件正是补这个的：一条长连接把「谁删了什么」推到所有在线 client（灵感来源见头注，内部实现未核实，不作依据）。本方案把这个模式落到 tako 的栈上，分两步走。</p>
+<p><strong>端到端链路</strong>（机制在链路中的位置见 §3）：</p>
+<pre><code>client A（tab A）          服务端                      client B（tab B / 将来 IM）
+    │  DELETE /api/sessions/:id                        │
+    │ ─────────────────────→ │ 删行（PG 真源）           │
+    │                        │ ── Loop A：A 自己广播 ──→│ BroadcastChannel：
+    │                        │   （同机才有这条路）       │   「session X 没了」→ 失效
+    │                        │ ── Loop B：XADD 事件流 ─→│ SSE /api/events：
+    │                        │   （跨机跨端的路）         │   「session X 没了」→ 失效
+    │                        │                          │ 失效 = 清落点 / 刷列表 /
+    │                        │                          │   被删会话提示并退出
+    │ ←── 下次任何拉取：真相都是新的（拉是正确性，流只是让它早点知道）</code></pre>
+<h2 id="1-名词准入操作定义后文不重复解释">1. 名词准入（操作定义，后文不重复解释）</h2>
+<ul>
+<li><strong>变更事件</strong>：一条「什么变了」的通知，格式 <code>{seq, type, id, at}</code>。起步词表只有两个 type：<code>session_deleted</code>、<code>workspace_deleted</code>（外加 <code>workspace_renamed</code>，见 §3.2）；doc/52 C3 起追加第四个 <code>skills_changed</code>（见 §7.6）。<strong>事件不携带状态</strong>——不带会话标题、不带项目名、不带技能内容，只带 id。</li>
+<li><strong>失效（invalidate）</strong>：client 收到事件后的动作——把本地与 id 相关的状态作废：清掉落点记忆、把打开着的项目列表重拉、把正显示的被删会话换成提示条。失效之后永远跟一次重拉，本地不留事件的任何副本。</li>
+<li><strong>事件流</strong>：按租户一条的有序事件序列，Redis Stream 承载（<code>XADD</code> 追加、<code>XREAD</code> 挂读），cursor 就是 stream entry id。<strong>易失</strong>：流有界（<code>MAXLEN</code>），旧事件被挤掉、Redis 重启清空，都是设计内行为——事件丢了，client 下次全量拉就追回真相（这正是「拉是正确性」的含义）。</li>
+<li><strong>BroadcastChannel</strong>：浏览器原生 API，同 origin 的 tab 之间广播消息，不经过服务器。Loop A 用它：删东西的那个 tab 顺手广播一条变更事件，其它 tab 走与 Loop B 完全相同的失效逻辑。</li>
+<li><strong>半步/一步</strong>：Loop A 是半步——只覆盖同机多 tab，零后端改动，半天内；Loop B 是一步——账号级 SSE 事件流，覆盖跨机跨端，是一个正经 loop。</li>
+</ul>
+<h2 id="2-现状锚点方案就建立在这些事实上">2. 现状锚点（方案就建立在这些事实上）</h2>
+<ol type="1">
+<li><strong>拉的清单</strong>（2026-10-23 实读）：<code>GET /api/sessions</code>（<code>server.go:772</code>，一次性）、项目页手动「刷新」、对话页 reconcile 只在打开/恢复时跑一次（<code>chat.ts:525</code>）。没有任何变更推送。</li>
+<li><strong>SSE 已有先例</strong>（doc/31）：<code>GET /api/runs/:id/stream</code> 把 run 帧面推给 client，纪律是「<strong>拉是正确性、流是优化</strong>」。事件流复用这条纪律与这套运输认知，不新造哲学。</li>
+<li><strong>Redis 已在栈里</strong>（<code>tk:runlive:*</code> / <code>tk:runepoch:*</code> 两个临时键 + asynq）。多副本纪律：进程内的 channel/缓存上线即失效，事件流必须落在共享的 Redis 上（根 AGENTS.md「部署形态」）。</li>
+<li><strong>临时键契约 currently 是两个</strong>（doc/16 §2c、doc/38）：事件流键 <code>tk:events:&lt;tid&gt;</code> 会是第三个。这不是偷偷加键——§4 把它作为契约变更显式登记：事件流是「易失通知设施」，不是「run 存活态」，生命周期与真源划分和前两键不同。</li>
+<li><strong>多 tab 症状的病根已确认</strong>（doc/44 落地当天）：症状一、二已修（都是「用前重拉/令牌」的治标法），症状三（落点失效）开着——治本的失效通知通道就是本方案。</li>
+<li><strong>#8b 预留口</strong>（doc/30 §12）：IM/cron 入口没有常驻页面可拉，「run 被删/被改」只能靠推。事件流是它们的共同前置——现在做一半的 BroadcastChannel 解决不了 IM 入口。</li>
+<li><strong>落点记忆的存法</strong>（doc/44、api.ts）：<code>localStorage['tako.workspaceId.&lt;tid&gt;']</code>——失效逻辑要清的就是这个键；会话存储是 <code>localStorage['tako.sessionId.&lt;tid&gt;']</code>（同源同机，BroadcastChannel 够得着）。</li>
+</ol>
+<h2 id="3-总设计">3. 总设计</h2>
+<h3 id="31-共同哲学事件只通知状态永远重拉">3.1 共同哲学：事件只通知，状态永远重拉</h3>
+<p>事件流是优化，不是真源。真源永远是 PG，client 的任何展示状态都必须能通过一次重拉重建——这条直接继承 doc/31。<strong>没这条纪律会怎样</strong>： tempted 在事件里带状态（标题、名字），client 开始省掉重拉，事件流一丢数据（<code>MAXLEN</code> 挤出、Redis 重启）各端状态就永久分叉——恰好是这套设施要消灭的病，以另一种形式回来。</p>
+<h3 id="32-loop-a--broadcastchannel-半步先行半天">3.2 Loop A · BroadcastChannel 半步（先行，半天）</h3>
+<p><strong>做什么</strong>：变更端点成功后（当前只有三个写口：<code>DELETE /api/sessions/:id</code>、<code>DELETE /api/workspaces/:id</code>、<code>PATCH /api/workspaces/:id</code> 改名），前端在拿到成功响应后向同 origin 广播一条变更事件；每个 tab 启动时挂监听，收到事件交给<strong>统一的失效处理函数</strong> <code>handleMutation(evt)</code>。</p>
+<p><strong>失效处理函数起步只做三件事</strong>（每步四问）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>事件</th>
+<th>做什么</th>
+<th>输入</th>
+<th>输出</th>
+<th>不做的后果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>workspace_deleted</code></td>
+<td>清落点记忆（若落点 == id）；项目页开着就重拉列表；<strong>侧栏树重拉</strong>（doc/50 A5）</td>
+<td>localStorage 键 + 当前视图</td>
+<td>干净的落点/列表/侧栏</td>
+<td>症状三原样复发；侧栏躺着一个点进去 404 的死项目</td>
+</tr>
+<tr>
+<td><code>session_deleted</code></td>
+<td>若正是当前打开的会话 → 气泡区换「已被删除」提示条并断 reconcile；项目页开着则移除该行</td>
+<td>当前 sessionId</td>
+<td>不显示已死会话</td>
+<td>对着尸体发言，发出去吃 404</td>
+</tr>
+<tr>
+<td><code>workspace_renamed</code></td>
+<td>项目页开着就重拉列表；<strong>侧栏树重拉</strong>（落点只存 id 不受影响，doc/50 A5）</td>
+<td>当前视图</td>
+<td>新名字</td>
+<td>名不对版，刷新才好的小刺</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>关键设计：这个 <code>handleMutation</code> 就是 Loop B 的前端部分</strong>。Loop A 的通知源是 BroadcastChannel，Loop B 换成 EventSource——失效逻辑一份，两个源都喂它。<strong>没这个设计会怎样</strong>：Loop B 落地时把失效逻辑重写第二遍，两个源的语义悄悄分叉。</p>
+<p><strong>盲区明说</strong>：BroadcastChannel 只到同机同 origin 的 tab。多设备、IM 入口不在它的覆盖里——那是 Loop B 存在的理由。</p>
+<h3 id="33-loop-b--账号级-sse-变更事件流">3.3 Loop B · 账号级 SSE 变更事件流</h3>
+<p><strong>端点</strong>：<code>GET /api/events</code>（SSE，<code>authn</code>，按 token 里的租户过滤）。连接即挂读 Redis Stream；无事件时挂起（<code>XREAD BLOCK</code> 或等价轮询），有事件按 SSE <code>data:</code> 帧吐出。cursor 语义：<code>Last-Event-ID</code> 续传 = 从某个 entry id 之后读——断线重连不丢窗口内事件。</p>
+<p><strong>写口（落地后即成横切契约）</strong>：每个「变更类端点」在<strong>删改成功之后</strong> <code>XADD tk:events:&lt;tid&gt;</code> 一条事件。起步只接三个写口（同 Loop A）；<code>POST</code> 创建类<strong>不发</strong>——新会话/新项目主要与创建者自己有关，列表页重拉即可覆盖，created 事件会把它变成噪音（登记为后话，见 §6）。<strong>没写口会怎样</strong>：流是空的，SSE 端点成了摆设——这正是「契约」和「一个端点」的区别：契约要求每个新变更端点落地时自觉地发事件。<strong>doc/52 C3 追加的写口</strong>：技能的安装（含 HITL 确认后的 <code>skill_install</code>）、更新、删除都发 <code>skills_changed</code>——它跨进程改变「下一场 run 的目录」，别的端不重拉就会拿旧目录办事（§7.6）。</p>
+<p><strong>事件字节</strong>（SSE 不进信封，同 doc/40 §6 对帧面的裁决）：</p>
+<pre><code>data: {&quot;seq&quot;:&quot;1729628000000-0&quot;,&quot;type&quot;:&quot;session_deleted&quot;,&quot;id&quot;:&quot;s_01M…&quot;,&quot;at&quot;:&quot;2026-10-23T02:13:20Z&quot;}</code></pre>
+<p><strong>前端接线</strong>：登录后挂 <code>EventSource('/api/events')</code>，收到帧 → 同一个 <code>handleMutation</code>。断线：EventSource 原生重连；重连后从 <code>Last-Event-ID</code> 续。Redis 挂了/流被清空：事件窗口内的事件丢失——client 无感，因为下次任何拉取都拿回真相（§3.1）。</p>
+<p><strong>多副本</strong>：写口所在副本 <code>XADD</code> 到共享 Redis，任何副本的 SSE 连接都能 <code>XREAD</code> 到——没有「事件必须经过哪个进程」的调度问题。这是事件流落 Redis 而不落进程内 channel 的直接理由（根 AGENTS.md：进程内状态上线即失效）。</p>
+<h2 id="4-契约与契约变更登记">4. 契约与契约变更登记</h2>
+<ol type="1">
+<li><strong>新端点</strong>：<code>GET /api/events</code>（SSE、authn、按租户隔离、Last-Event-ID 续传）。成功响应是 SSE 流，<strong>不进 <code>{code,message,data}</code> 信封</strong>（doc/40 §6 的既有裁决：SSE 帧面不进信封）；鉴权失败按既有 401。</li>
+<li><strong>新 Redis 键（第三个，契约变更显式登记）</strong>：<code>tk:events:&lt;tid&gt;</code> = Stream，<code>MAXLEN ~ 1000</code> 有界截断，易失。<strong>doc/16 §2c「临时键形态」契约随施工拍扩一行</strong>：前两键（runlive/runepoch）是「run 存活态」，本键是「租户级易失通知」，真源仍是 PG、丢了全量拉追回。这正是 doc/16 §2c 那三行表的既有写法——「是什么（人话）」里说清生命周期差异。</li>
+<li><strong>变更端点横切契约</strong>：自本方案落地起，新增「删除/改名/不可忽略的状态翻转」类端点时，必须同时接事件写口（<code>XADD</code>）或显式登记不发的原因。登记进 doc/16 §2c。</li>
+<li><strong>前端</strong>：<code>handleMutation</code> 是唯一失效入口，两个源（BroadcastChannel / EventSource）都喂它；失效必跟重拉。</li>
+</ol>
+<h2 id="5-loop-拆分点头后逐拍施工每拍先交-todosmd">5. Loop 拆分（点头后逐拍施工；每拍先交 todos.md）</h2>
+<p>顺序 <strong>A → B</strong>：A 半天埋掉症状三并把失效逻辑做成形；B 把通知源换成服务端通道，天然成为 #8b 前置。</p>
+<h3 id="loop-a--broadcastchannel-半步">Loop A · BroadcastChannel 半步</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>拍</th>
+<th>改什么</th>
+<th>怎么验收（第一行是 curl/两个窗口）</th>
+<th>回答什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A1</td>
+<td><code>handleMutation</code> 失效函数 + BroadcastChannel 监听/广播，接三个写口（删会话/删项目/改名）</td>
+<td><strong>两个窗口</strong>：A 窗口删会话 → B 窗口当场换提示条；A 删项目 → B 的落点记忆被清（再发新对话落在默认项目，不再 404）；A 改名 → B 项目页名字当场变。<code>npm run typecheck &amp;&amp; build</code> 绿</td>
+<td>同机多 tab 的三个症状当场失效</td>
+</tr>
+<tr>
+<td>A2</td>
+<td>nit 4 顺手埋掉：投递吃 404 <code>114001</code> 且 id == 当前落点 → 清落点、回落默认项目重试一次</td>
+<td>curl 造不出（要页面状态），验收走单测/手验：删落点项目后发新对话无感落到默认项目</td>
+<td>报错路径变成自愈路径</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="loop-b--账号级-sse-事件流">Loop B · 账号级 SSE 事件流</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>拍</th>
+<th>改什么</th>
+<th>怎么验收（第一行是 curl）</th>
+<th>回答什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>B1</td>
+<td><code>events.go</code>：<code>XADD</code> 写口封装（三个写口接入）+ <code>tk:events:&lt;tid&gt;</code> 流初始化；dev 探针或直连 redis-cli 可读</td>
+<td><code>curl -N $TAKO/api/events -H "Authorization: Bearer $TOK"</code> 挂住；另一个终端 <code>curl -X DELETE $TAKO/api/sessions/:id</code> → SSE 收到 <code>data: {"type":"session_deleted",…}</code> 一字不差</td>
+<td>写口到流的链路通、字节钉死</td>
+</tr>
+<tr>
+<td>B2</td>
+<td><code>GET /api/events</code> 端点（XREAD 挂读、Last-Event-ID 续传、authn、租户隔离）</td>
+<td>同 B1 但走真端点；断线重连带 <code>Last-Event-ID</code> 能追回窗口内事件；<strong>跨两个引擎副本</strong>（起 8943 第二个实例连同一 Redis）：A 副本删、B 副本的连接收到——多副本成立</td>
+<td>服务端通道跨副本、跨进程</td>
+</tr>
+<tr>
+<td>B3</td>
+<td>前端 EventSource 接线：挂 <code>/api/events</code>，帧喂同一个 <code>handleMutation</code>；断线静默重连</td>
+<td>两个窗口，其中一个换成<strong>隐私窗口（无 BroadcastChannel 通道的另一 profile 不行——同机同 origin 广播会漏给它；改用：杀掉另一窗口改用纯 SSE 验证：断开源码里的广播即可）</strong>；实操：浏览器 + curl 当第二个 client——curl 删会话，浏览器页面当场失效</td>
+<td>浏览器吃服务端事件走同一失效逻辑</td>
+</tr>
+<tr>
+<td>B4</td>
+<td>契约收口：<code>contract_test.go</code> 登记事件字节；<code>expected.json</code> 登记 B1/B2 用例；doc/16 §2c 两行（新键形态 + 变更端点契约）同批落；跑 <code>check-master-plan.sh</code></td>
+<td><code>go test</code> + <code>assert_contract.py</code> + <code>check-expected.sh</code> 全绿</td>
+<td>两台机器 + 横切契约都钉住</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>脚手架与转正</strong>：无临时脚手架（B1 的 redis-cli 直读就是探针本身）。BroadcastChannel 代码在 B3 之后<strong>保留</strong>——它是同机失效的快路径，SSE 断线时兜底的正是它（两者喂同一函数，语义天然一致）。</p>
+<h2 id="6-明确不做本期">6. 明确不做（本期）</h2>
+<ul>
+<li><strong>WebSocket</strong>：客户端只收不发（发言走 POST），WS 的重连/协议成本换不到东西；SSE + Last-Event-ID 够用（doc/31 同款取舍）。</li>
+<li><strong>事件携带状态</strong>：见 §3.1，带了就是把真源劈成两半。</li>
+<li><strong>created 类事件</strong>（session_created/workspace_created）：噪音大于收益，登记为后话；哪天真做 IM 入口再补。</li>
+<li><strong>离线推送</strong>（APNs/邮件/Webhook）：#8b 的场景里再议。</li>
+<li><strong>事件落 PG</strong>：易失设施不背持久化；要对账用审计表（<code>audit_log</code>），那是另一条线。</li>
+<li><strong>协同编辑/状态同步</strong>（doc/42 已拍不做）：本方案只管「删除/改名」这类离散变更，不同步编辑中的内容。</li>
+</ul>
+<h2 id="7-开放问题点头时一起拍">7. 开放问题（点头时一起拍）</h2>
+<ol type="1">
+<li><strong>顺序 A→B</strong>（荐）：A 半天埋症状三、把失效逻辑做成形；B 是 #8b 前置，等主线上需要多入口时再施工也来得及。</li>
+<li><strong>起步事件词表</strong>（荐）：<code>session_deleted</code> / <code>workspace_deleted</code> / <code>workspace_renamed</code> 三个；created 不发。</li>
+<li><strong>流容量</strong>：<code>MAXLEN ~ 1000</code> 拍脑袋值，够覆盖「断线几分钟重连」的窗口；有异议施工拍再调。</li>
+<li><strong>B3 的纯 SSE 验证姿势</strong>：BroadcastChannel 在同机存在会让「浏览器只靠 SSE 失效」不好单独验；方案里的姿势是 curl 当第二个 client。若有更干净的想法欢迎拍。</li>
+<li><strong>SSE 鉴权姿势</strong>（实现拍，荐 query token）：EventSource API 不能自定义头，而 token 存在 sessionStorage。荐 <code>GET /api/events?access_token=&lt;jwt&gt;</code>（仅本端点特例、token 短效）；施工拍同时确认引擎 access log 不因此长期留存 token（会记则该端点摘出 query 日志），结论写进 §4。备选：前端 fetch + ReadableStream 手动读流（无自动重连，代码更多）。</li>
+</ol>
+<h2 id="75-2026-10-23-复审sse-重连死循环已修">7.5 2026-10-23 复审：SSE 重连死循环（已修）</h2>
+<p><strong>这是本篇落地之后的复审发现，不在原方案里</strong>——原方案把「断线重连」当成网络抖动的小事，没料到它跟<strong>短效 access token</strong> 撞在一起会变成一个刷屏的死循环。</p>
+<h3 id="病灶">病灶</h3>
+<p><code>web/src/mutation.ts</code> 的 <code>ensureEventStream</code> 里，事件流用 <code>EventSource</code> 连 <code>GET /api/events?access_token=&lt;jwt&gt;</code>。 <code>onerror</code> 的原处置是「关掉、3 秒后取最新 token 重建」。看着像能自愈，其实<strong>取不到新 token</strong>：</p>
+<ul>
+<li>access token 只有 15 分钟有效期（<code>TAKO_ACCESS_TTL</code>）；</li>
+<li><strong>页面静止时没有任何 API 调用</strong> → <code>authFetch</code> 不会被触发 → 那套「401 就刷新 token」的逻辑<strong>没人跑</strong> → sessionStorage 里那个 token 就一直是过期的；</li>
+<li>于是：连接一断 → onerror → 3 秒后拿<strong>过期</strong>的 token 重建 → 服务端一律 401 → 再 onerror → …… <strong>每 3 秒一次，永远停不下来</strong>。</li>
+</ul>
+<p><strong>后果</strong>：引擎日志被 <code>/api/events</code> 的 401 刷满；事件流（跨端变更通知）<strong>实际是死的</strong>——别的端删了会话，这边收不到。</p>
+<h3 id="为什么难发现">为什么难发现</h3>
+<p>它要<strong>三个条件同时成立</strong>才会现形：token 过期 + 连接断开 + 页面静止。 日常点几下页面，token 早就被 <code>authFetch</code> 顺手续上了，连接也不断——所以平时看不出问题。 一旦出问题，症状是「日志很吵」而不是「功能报错了」，很容易被当成网络抖动放过。</p>
+<h3 id="修法">修法</h3>
+<p><code>onerror</code> 里<strong>重建之前自己先刷一次 token</strong>：</p>
+<pre><code>onerror → 关掉 → 3 秒后 → refreshAccessToken() → 刷到了就用新 token 重建；刷不到（refresh token 也失效，clearAuth 已清）→ 就不重建，等用户重新登录</code></pre>
+<ul>
+<li>刷得到：401 只出现<strong>一次</strong>，随后重连成功（实测 200）；</li>
+<li>刷不到：登录态本来就失效了，停止重连是<strong>正确</strong>行为（否则会一直 401 刷屏）；</li>
+<li>网络抖动：刷新失败但 token 还在 → 照常重建（跟原来一样）。</li>
+</ul>
+<h3 id="验收对照实验2026-10-23">验收（对照实验，2026-10-23）</h3>
+<p>对着一个 <strong>access token 只有 20 秒</strong>的隔离引擎（<code>TAKO_ACCESS_TTL=20s</code>），让页面<strong>静静不动</strong>直到 token 过期，再<strong>重启引擎</strong>制造断线：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th></th>
+<th><code>/api/auth/refresh</code></th>
+<th><code>/api/events</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>修之前</strong></td>
+<td>0 次</td>
+<td><strong>401 × 7（每 3 秒一次）、200 × 0</strong> —— 死循环，事件流实际是死的</td>
+</tr>
+<tr>
+<td><strong>修之后</strong></td>
+<td>1 次（200）</td>
+<td><strong>401 × 0、200 × 1</strong> —— 一次刷新后自愈</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>回归网</strong>：<code>scripts/acceptance/sse_reconnect.sh</code>（把上面这套对照实验固化成可重跑的活体验收；未修复时判红退出）。 它自带一个短 TTL 的隔离引擎 + 一个指向它的 vite，<strong>不需要手工准备任何东西</strong>。</p>
+<blockquote>
+<p><strong>注意</strong>：起隔离引擎<strong>必须在 <code>yk-tako-eino/</code> 目录下</strong>——引擎从 cwd 找 <code>.env</code>（模型密钥），找不到就「没有可用的模型厂商」直接退出。</p>
+</blockquote>
+<h2 id="76-2026-10-28-追加skills_changeddoc52-c3">7.6 2026-10-28 追加：<code>skills_changed</code>（doc/52 C3）</h2>
+<p>技能是<strong>跨 run 生效</strong>的状态：一个窗口里装了/删了一个技能，改的是「这个租户下一场 run 的目录」；别的窗口/别的机器如果只拿着旧列表，用户会看到「我刚装的怎么不见了」，管理员会对着已经删掉的技能点开关。这正是本方案 §3.1 那条纪律要覆盖的第四类变更，所以按 §4-3 的横切契约接了写口，而不是新造通道。</p>
+<ul>
+<li><strong>形状</strong>：<code>{seq, type:"skills_changed", id:"&lt;技能名&gt;", at}</code>。<code>id</code> 是技能名而不是行 id——技能在用户心里的名字就是它，且 <code>GET /api/skills</code> 的列表键也是名字（重拉时直接按名字比对）。<strong>仍不带状态</strong>：不带正文、不带描述、不带禁用与否；收到就重拉列表/详情。</li>
+<li><strong>写口</strong>（都在成功之后）：<code>POST /api/skills/install</code>（multipart / JSON 两条分支）、<code>POST /api/skills/:name/update</code>、<code>DELETE /api/skills/:name</code>、以及 HITL 确认落盘（<code>skill_install</code> 的 approve 分支，<code>installApprovedProposal</code>）。一次请求装多个技能就发多条。</li>
+<li><strong>为什么 <code>use_skill</code>/<code>read_skill</code> 不发</strong>：它们只读，不改任何租户级状态；每场 run 里动辄几十次，发了会把流冲成噪音。</li>
+<li><strong>丢了怎么办</strong>：与 §3.1 同款——流是有界的，事件丢了下次重拉列表就是真相；本事件<strong>不是</strong>「技能已装」的唯一凭据。</li>
+<li><strong>实测</strong>（隔离引擎 8943）：<code>curl -N /api/events</code> 挂着，另一个终端 <code>DELETE /api/skills/&lt;name&gt;</code> → 收到 <code>{"type":"skills_changed","id":"&lt;name&gt;"}</code>；重装同样的包再收一条。</li>
+</ul>
+<h2 id="77-2026-11-10-追加任务编排两类事件--心跳与续读doc70-103">7.7 2026-11-10 追加：任务编排两类事件 + 心跳与续读（doc/70 §10.3）</h2>
+<p>持久 Task 让「用户不在场的后台工作」有了自己的状态机：任务页若只靠轮询，一行 Task 从执行到完成最长要等一个刷新周期；若靠浏览器自己 XREAD，又把通道复制了一份。所以按 §4-3 横切契约接两个写口，任务页收事件重拉——事件仍只通知，状态永远重拉（§3.1）。</p>
+<ul>
+<li><strong>形状与 id</strong>：<code>agent_tasks_changed</code> 的 <code>id</code> 是 Task 行 id（<code>at_…</code>）；<code>agent_orchestrations_changed</code> 的 <code>id</code> 是编排组行 id（<code>or_…</code>）。仍不带状态——不带任务状态、不带组交付状态；收到就重拉列表，id 命中当前打开的详情再重拉详情。</li>
+<li><strong>写口</strong>（都在 PG 成功之后）：创建（整组原子建好，组事件 + 每件 Task 事件；幂等重打命中旧组<strong>不发</strong>）；调度侧翻转——领取铸执行 run、结果提交、失败传播 blocked、依赖满足 ready、组收口；页面动作——停任务／停整组、显式恢复接管；交付侧——通知认领铸交付 run、交付完成／交付失败翻 <code>delivery_status</code>。</li>
+<li><strong>两个落地教训</strong>（不在原设计里，验收浏览器走查抓的）：
+<ol type="1">
+<li><strong>创建不发事件，新行最长要等第一次状态翻转才出现</strong>——blocked 的尾巴要等到上游跑完才可见（实测空白约 50 秒）。所以创建也写口，幂等重打除外。</li>
+<li><strong><code>PublishEvent</code> 对空租户是空操作</strong>——调度侧早先把组收口与交付翻转发成空串租户，事件被静默吞掉，页面永远等不到；任务页当时全靠 Task 事件捎带刷新。发事件必须带真实租户，这条对所有新写口成立。</li>
+</ol></li>
+<li><strong><code>: ping</code> 心跳</strong>：<code>XREAD BLOCK 10s</code> 超时后写一行 SSE 注释再继续挂读。挂读期间零字节的连接会被中间层当闲置掐掉（浏览器走查实测约 94 秒一次），注释行 <code>EventSource</code> 不当帧，只让链路上有字节。</li>
+<li><strong><code>last_event_id</code> 续读</strong>：浏览器断线后退避重建的是<strong>新</strong> <code>EventSource</code>（token 短效，旧 URL 重连只会 401），<code>Last-Event-ID</code> 头拿不到；客户端把收到的最后一个 <code>seq</code> 放进 <code>?last_event_id=</code> 续读，服务端先看头、再看 query、都没有才从 <code>$</code> 起步——重连间隙的变更不丢，§3.3 的「账号级不漏」在断线窗口内成立。</li>
+<li><strong>实测</strong>（dev 引擎 + 浏览器走查，2026-11-10）：创建三件链式 Task 后，blocked 尾巴约 1 秒出现在任务页；停整组当场翻已取消（此前只发组事件、列表停在旧态，修后组事件也触发重拉）；<code>kill -9</code> 引擎再重启，页面静置跨过死窗口，重连后按 <code>last_event_id</code> 补读 4 条积压事件、任务行翻到已中断。</li>
+</ul>
+<h2 id="8-所以这解决了什么">8. 所以这解决了什么</h2>
+<p>三个多 tab 症状里，重拉和令牌只治了两个的标；本方案把第三个（落点失效）埋掉的同时，给系统装上「变更通知」这个一直缺的零件——先以 BroadcastChannel 的便宜形态在同机生效，再以 SSE 事件流成为跨端与 IM/cron 入口（doc/16 #8b）的共同前置。事件只通知、状态永远重拉，流的易失性因此不是缺陷而是设计。点头后从 A1 开工。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/46-%E5%8F%98%E6%9B%B4%E5%90%8C%E6%AD%A5%E4%B8%8E%E4%BA%8B%E4%BB%B6%E9%80%9A%E9%81%93.md"><code>doc/46-变更同步与事件通道.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

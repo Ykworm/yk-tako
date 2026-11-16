@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>没有沙箱的系统怎么办 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="没有沙箱的系统怎么办">没有沙箱的系统怎么办</h1>
+<blockquote>
+<p>模块：bash 沙箱（<code>internal/runengine/sandbox.go</code>、<code>bash.go</code>、<code>mcp.go</code>）｜ 状态：已落地（2026-11-03；Debian 活体待跑）｜ 证据：<code>scripts/acceptance/linux_sandbox.sh</code>、<code>tmp/35-linux-bash沙箱/planning.md</code>、<code>doc/28-多租户.md</code> §（Linux 口径）、<code>doc/52</code> D16/D37</p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>试用要卖的是「能动手的 agent」：客户传一份 PDF 问「主要讲什么」，agent 要能 <code>pdftotext</code>、写脚本、跑 python 抽正文。dev 机器是 macOS，<code>sandbox-exec</code> 把 bash 关进会话目录；试用机是 Debian，没有 <code>sandbox-exec</code>。</p>
+<p>于是 Linux 上每一次 bash 都回一句「这台机器的 sandbox-exec 不能 apply，不能把工作目录当成隔离」，模型只能说「我执行不了命令」，只好按文件名猜内容。十来个客户每人试两下，试用结论就是「这产品一半功能是坏的」——而且每失败一次还烧一轮模型往返。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 放开裸 bash</td>
+<td><code>requireSandbox=false</code> 直接跑</td>
+<td>PDF 场景当天可用</td>
+<td>工作区在 <code>tmp/workspace/tenants/&lt;tid&gt;/…</code>，引擎 <code>.env</code> 就在上一级：<code>cat ../.env</code> 就能拿 key 再发出去，还能读别的租户、<code>rm -rf</code> 全工作区。<code>bashEnvWhitelist</code> 只挡环境变量，挡不住磁盘文件</td>
+</tr>
+<tr>
+<td>B bubblewrap 后端</td>
+<td>Linux 上加 bwrap：挂载表 + 命名空间，与 macOS 语义对齐</td>
+<td>真隔离；Debian 官方源有；codex 也内置 bwrap</td>
+<td>要维护两套后端；<code>npx</code> 式依赖下载路径会撞围栏（MCP 同理）</td>
+</tr>
+<tr>
+<td>C Landlock</td>
+<td>用内核 Landlock 做文件隔离</td>
+<td>不依赖安装 bwrap</td>
+<td>Debian 12 内核 6.1 只有 ABI v2，只管文件；作为 bwrap 不可用时的后置方案</td>
+</tr>
+<tr>
+<td>D 容器</td>
+<td>每个 bash 进容器</td>
+<td>隔离最强</td>
+<td>首拍背镜像、卷、网络、启动延迟</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>裁定：B；A 不做；C 后置；D 不做。</strong></p>
+<h2 id="3-同族小裁定">3. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>probe 怎么做？</td>
+<td>不只 <code>LookPath</code>：真跑一次最小沙箱，stdout 含探针串才算 ok</td>
+<td>区分「binary 不在 / userns 被禁 / seccomp 挡住」三种失败</td>
+</tr>
+<tr>
+<td>probe 不过怎么办？</td>
+<td>继续拒绝（fail closed），错误文案改成可行动的一句话（提到装 bubblewrap）</td>
+<td>不提供「裸 bash」开关、不把 bwrap 设 setuid</td>
+</tr>
+<tr>
+<td>bwrap 挂载表？</td>
+<td><strong>逐个卸命名空间</strong>（user/pid/ipc/uts/cgroup，<strong>不卸 net</strong>）、<code>--die-with-parent</code>、<code>--new-session</code>、<code>--proc /proc</code>、<code>--dev /dev</code>、<code>--tmpfs /tmp</code>；<code>/usr</code> 只读、<code>/etc</code> 只白名单文件；<strong>只 bind 会话根可写</strong></td>
+<td>绝不 <code>--ro-bind / /</code>——那会把 <code>.env</code>、home、别的租户全部只读暴露；不 bind <code>$HOME</code>。不用 <code>--unshare-all</code>：它含 net，会把 D37 的出站网络一起断掉</td>
+</tr>
+<tr>
+<td>会话根之外能看见什么？</td>
+<td>系统目录只读；看不到引擎目录、其他租户目录、用户 home</td>
+<td>父目录不 bind，兄弟租户天然不可见</td>
+</tr>
+<tr>
+<td>后端怎么可见？</td>
+<td>启动日志一行 <code>bash sandbox: seatbelt / bwrap / none（bash 工具将拒绝执行）</code>；dev 端点 <code>sandboxed</code> 与实际后端一致</td>
+<td>配错在启动日志里就暴露，不等客户第一次调工具</td>
+</tr>
+<tr>
+<td>超时/杀进程语义变吗？</td>
+<td>不变：外层 <code>exec.CommandContext</code> 杀 bwrap，<code>--die-with-parent</code> 带走沙箱</td>
+<td>与现有 bash 收尾惯例一致</td>
+</tr>
+<tr>
+<td>沙箱内有网吗？</td>
+<td><strong>2026-10-28 翻案：出站开、入站不开</strong>（<code>doc/52</code> D37）；bwrap 因此不卸 net namespace</td>
+<td>技能正文里的 <code>curl</code>、下载数据集、调外部 API 是常见步骤；断网等于把技能判死。代价：bwrap 进程能在宿主网卡上 bind 端口（macOS 侧是「入站禁」），这是两套后端唯一的已知语义差</td>
+</tr>
+<tr>
+<td>技能脚本的权限？</td>
+<td>继承围栏：项目根可读写、系统路径只读、出站开</td>
+<td>准确含义是「第三方代码能以改整个项目、能出网的权限跑，但写不到围栏外」</td>
+</tr>
+<tr>
+<td>Linux 上 MCP 呢？</td>
+<td>与 bash 同口径：走同一个后端（bwrap），根 = 该租户目录；probe 失败 → 拒绝启动租户 MCP</td>
+<td>不假装已隔离</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-证据">4. 证据</h2>
+<ul>
+<li>方案：<code>tmp/35-linux-bash沙箱/planning.md</code> §0–§4（背景、病灶、候选、bwrap 命令形状、probe）；<code>doc/28-多租户.md</code> §9.4（Linux 口径）；<code>doc/33</code> 头注（租户 MCP fail closed）；<code>doc/52</code> D16（Linux 沙箱单独 loop）、D37（出站网络）。</li>
+<li>代码（现状，2026-11-03）：
+<ul>
+<li><code>sandbox.go</code> 后端选择 <code>currentSandboxBackend()</code>／<code>detectSandboxBackend()</code>：先真跑 seatbelt 探针，再真跑 bwrap 探针；全失败回到 <code>none</code> 并把原因带进启动日志与拒绝文案。</li>
+<li><code>bwrapArgs()</code> 生成挂载表；<code>startBash()</code> 的 bwrap 分支与 <code>sandboxWrap()</code>（租户 MCP）共用它，<code>--</code> 后面接原命令。</li>
+<li><code>bash.go</code> 产品路径恒 <code>requireSandbox=true</code>；<code>mcp.go</code> 在 <code>sandboxWrap</code> 返回错误时拒绝启动。</li>
+<li>启动日志：<code>main.go</code> 打 <code>bash sandbox: &lt;seatbelt|bwrap|none（原因…）&gt;</code>；dev 端点 <code>sandboxed</code> 取自同一份后端探测。</li>
+</ul></li>
+<li>单测：<code>linux_sandbox_test.go</code> 钉 bwrap 挂载表金样（绝不 <code>--ro-bind / /</code>、绝不 <code>--unshare-net</code>）与探针失败路径；<code>bashfence_test.go</code>／<code>skillfence_test.go</code> 的拒绝判据兼容两套后端的报错文案。</li>
+<li>活体验收：<code>scripts/acceptance/linux_sandbox.sh</code>（Debian 上跑：能干活、越界读、越界写、出站网络、超时与孤儿进程）。</li>
+</ul>
+<h2 id="5-现状">5. 现状</h2>
+<p><strong>已落地（2026-11-03）</strong>：macOS 仍走 seatbelt（改动前后 dev bash 端点输出逐字节相同，启动日志 <code>bash sandbox: seatbelt</code>）；Linux 走 bwrap，挂载表见 §3；两套后端共用「probe 不过就拒绝」的 fail closed 口径，不提供裸 bash 开关。</p>
+<p><strong>还没做的一步</strong>：Debian 12 上的活体没跑过——本轮开发机是 macOS，没有 bwrap/Docker。代码已通过 <code>GOOS=linux GOARCH=amd64 go build</code> 与 linux 目标的 <code>go vet</code>，但这只证明能编译，不证明隔离成立。上线前在试用机跑 <code>scripts/acceptance/linux_sandbox.sh</code>（给 <code>TAKO_BASE</code> 与 <code>TAKO_ENGINE_LOG</code>），五条全绿才算 A2 收口。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E6%B2%A1%E6%9C%89%E6%B2%99%E7%AE%B1%E7%9A%84%E7%B3%BB%E7%BB%9F%E6%80%8E%E4%B9%88%E5%8A%9E/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/没有沙箱的系统怎么办/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

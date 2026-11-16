@@ -19,6 +19,8 @@
    - [`19v6-02-reconcile与双游标.md`](19-v6/19v6-02-reconcile与双游标.md)：客户端轮询与游标。
    - [`19v6-04-验收-curl.md`](19-v6/19v6-04-验收-curl.md)：用例 → curl → 期望字节。
 
+**想在浏览器里读：** `doc/html/` 下每个 md 都有一页网页版（[站点首页](index.html) · [本索引的网页版](html/index.html)），由 `scripts/build-doc-html.py` 从 md 自动生成。**内容以 md 为准**——网页版是同批生成的读物，改了 md 要重跑脚本，别直接改 html。
+
 **按任务查：**
 
 - 改运行引擎、API、存储：先读 19-v6 四篇，再查本表第 1 节。
@@ -396,6 +398,7 @@
 | `doc/assets/` | [单场 run 生命周期](assets/tako-run-lifecycle.html) | 非方案，交互图 | 从 POST /api/runs 到定稿、记忆与显式续跑；含九种帧、runlog/模型输入/journal 分工、问答与 compact |
 | `doc/assets/` | [长任务与多 Agent 编排](assets/tako-orchestration.html) | 非方案，交互图 | 持久 Task、依赖调度、wait_task、shared/isolated、结果发布、后台 bash、通知恢复、同组修订与继任组 |
 | `doc/assets/` | [数据、状态与存储](assets/tako-data-model.html) | 非方案，交互图 | PostgreSQL 当前模型、四类 Redis 临时状态、项目 content/runtime、会话 wire、记忆双模式与多副本共享卷边界 |
+| `doc/html/` | [文档站首页](index.html) · [全部文档索引](html/index.html) | 非方案，网页版 | 2026-11-16：每个已入库 md 对应一页网页版，由 `scripts/build-doc-html.py`（pandoc gfm→html5）生成并重写链接——doc 之间的链接转成 html、代码与脚本链接转成 GitHub blob、仓库里没有的（tmp/ 施工包、ref-agent 参考实现）去掉链接保留文字。**只转已被 git 跟踪的 md**（`doc/interview/` 等被 .gitignore 挡住的私有材料不入站）；内容以 md 为准，改了 md 要重跑脚本。`--check` 只比对不写盘，可进机器验收 |
 
 ## 4. `doc/log/` 记录
 

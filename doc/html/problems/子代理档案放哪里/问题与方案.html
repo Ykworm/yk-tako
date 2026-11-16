@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>子代理档案放哪里：文件是索引，不建 PG 目录表 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="子代理档案放哪里文件是索引不建-pg-目录表">子代理档案放哪里：文件是索引，不建 PG 目录表</h1>
+<blockquote>
+<p>模块：运行引擎 · 子代理委派与持久化（doc/39）｜状态：<strong>已落地</strong>（2026-10-21 S1–S3）｜证据：<code>doc/39-子代理持久化与resume.md</code>、<code>internal/runengine/{subagent_wire.go,resume_subagent.go,agents.go,archive_sweep.go}</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>researcher 子代理跑两小时、十几个工具调用，折叠成三行摘要回主对话。用户想追问「那个对比表的数据源是哪几个？」——父 agent 手里没有：子代理的现场在跑完那一刻<strong>即弃</strong>（doc/25 原话：「无 AfterAgent：子代理 state 跑完即弃，没有取货口」）。只能从头交代背景重跑一遍。</p>
+<p>副故事：子代理在跑的时候，人只能看 Redis 帧流推给页面的片段；库里没有按实例组织的持久化档案——<code>runlog_entries</code> 按 run 混排、无父子配对结构。崩死的委派连「死在哪」都要翻混排日志。</p>
+<p>两个故事同根：<strong>完整跑完的子代理，价值在过程里；而过程只活在内存。</strong> 追问接不上、过程查不了。</p>
+<p>要补这件事，必须回答一个存储问题：<strong>每次委派的档案放哪儿、谁当索引、过期怎么回收。</strong> 摆上桌的直觉是「建张表」——但表会带来一整套额外的缝：写表与写文件两份真源、清理要同时清两边、跨副本要处理行锁。设计要回答的正是：能不能不建表，还找得到、删得掉、查得着。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A PG 目录表 + 内容存表</td>
+<td>每次委派一行，消息序列序列化进列</td>
+<td>查询强、跨会话 SQL 聚合方便</td>
+<td>与运行现场（文件）两份真源；写表与跑并行要事务；清理要清两处；跨副本多一层一致性</td>
+</tr>
+<tr>
+<td>B 纯 wire 文件（选定）</td>
+<td>每实例一份 JSONL，目录布局 + 首行 metadata + 尾行 terminal 当索引</td>
+<td>少一张表、少一类清扫、少一层一致性缝；<code>tail -f</code> 能看过程；删会话随 <code>.tako/</code> 级联回收</td>
+<td>跨会话 SQL 聚合审计没有；定位靠约定，读错约定就找不到</td>
+</tr>
+<tr>
+<td>C 只存折叠后的摘要</td>
+<td>把三行摘要落库</td>
+<td>便宜</td>
+<td>追问需要的是过程与工具结果，摘要里没有；等于把故事一原样保留</td>
+</tr>
+<tr>
+<td>D 事件溯源 journal（Kimi wire 形态的完整版）</td>
+<td>每行一条事件、重放折状态</td>
+<td>可回放、可审计</td>
+<td>引擎级改造；与 Redis 帧流 / runlog 形成第二、第三真源；resume 只需消息序列，不需要事件粒度</td>
+</tr>
+<tr>
+<td>E 更简单：不给入口</td>
+<td>保持「跑完即弃」</td>
+<td>零改动</td>
+<td>用户每次都要重讲一遍背景；过程永远黑箱</td>
+</tr>
+</tbody>
+</table></div>
+<p>选 B。判断依据不是「文件比数据库好」，而是<strong>索引是否必须是一张独立的表</strong>。这里定位一个实例只需要三件事，而且三件都天然长在文件上：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>要定位什么</th>
+<th>从哪读</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>哪个实例</td>
+<td>文件名 <code>&lt;sa_id&gt;.jsonl</code>（<code>sa_</code> + ULID，创建时铸，免并发撞号）</td>
+</tr>
+<tr>
+<td>哪个规格 / 哪场 run / 是否续跑</td>
+<td>首行 <code>metadata</code>（<code>agent_name</code>、<code>model_ref</code>、<code>run_id</code>、<code>resumed_from</code>、<code>created_at</code>）</td>
+</tr>
+<tr>
+<td>是否完整、何时结束</td>
+<td>尾行 <code>terminal</code>（<code>status</code>、<code>result</code>、<code>finished_at</code>）→ 完整档案的标志</td>
+</tr>
+</tbody>
+</table></div>
+<p>目录布局 <code>sessions/&lt;sid&gt;/.tako/subagents/</code> 本身就是「按会话」这层索引。真需要跨会话聚合时，从 metadata 反向同步出一张表即可——那是查询需求出现后的加法，不是今天的必需。</p>
+<h2 id="3-档案的真身与四个消费方">3. 档案的真身与四个消费方</h2>
+<p><strong>一行 JSONL 长这样</strong>：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode jsonl"><code class="sourceCode json"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;metadata&quot;</span><span class="fu">,</span><span class="dt">&quot;sa_id&quot;</span><span class="fu">:</span><span class="st">&quot;sa_…&quot;</span><span class="fu">,</span><span class="dt">&quot;agent_name&quot;</span><span class="fu">:</span><span class="st">&quot;researcher&quot;</span><span class="fu">,</span><span class="dt">&quot;model_ref&quot;</span><span class="fu">:</span><span class="st">&quot;deepseek/…&quot;</span><span class="fu">,</span><span class="dt">&quot;run_id&quot;</span><span class="fu">:</span><span class="st">&quot;r_…&quot;</span><span class="fu">,</span><span class="dt">&quot;resumed_from&quot;</span><span class="fu">:</span><span class="st">&quot;sa_…或空&quot;</span><span class="fu">,</span><span class="dt">&quot;protocol&quot;</span><span class="fu">:</span><span class="dv">1</span><span class="fu">,</span><span class="dt">&quot;created_at&quot;</span><span class="fu">:</span><span class="st">&quot;…&quot;</span><span class="fu">}</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;message&quot;</span><span class="fu">,</span><span class="dt">&quot;msg&quot;</span><span class="fu">:{</span> <span class="er">…assistant，含</span> <span class="er">tool_calls…</span> <span class="fu">}}</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;message&quot;</span><span class="fu">,</span><span class="dt">&quot;msg&quot;</span><span class="fu">:{</span> <span class="er">…tool</span> <span class="er">结果…</span> <span class="fu">}}</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;type&quot;</span><span class="fu">:</span><span class="st">&quot;terminal&quot;</span><span class="fu">,</span><span class="dt">&quot;status&quot;</span><span class="fu">:</span><span class="st">&quot;complete&quot;</span><span class="fu">,</span><span class="dt">&quot;result&quot;</span><span class="fu">:</span><span class="st">&quot;…回传终稿…&quot;</span><span class="fu">,</span><span class="dt">&quot;finished_at&quot;</span><span class="fu">:</span><span class="st">&quot;…&quot;</span><span class="fu">}</span></span></code></pre></div>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>消费方</th>
+<th>动作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>委派工具</td>
+<td>铸 <code>sa_id</code> → 建目录 + 写 metadata → 每轮模型往返后<strong>追加</strong>消息行 → 终态（含 error）写 terminal → 回传文本带「本次委派实例：sa_…」。中断（ctx 取消/panic）<strong>不写 terminal</strong>，文件留成半成品</td>
+</tr>
+<tr>
+<td><code>resume_subagent</code> 工具</td>
+<td><code>{id}</code> 拼路径，或 <code>{agent}</code> glob 取该规格最新<strong>带 terminal</strong> 的实例 → 校验未过窗、消息逐条可解析（末尾半截行丢掉）→ 反序列化 → <code>GenModelInput</code> 注入 <code>[历史…, 新指令]</code></td>
+</tr>
+<tr>
+<td>清扫器</td>
+<td>glob 各租户 <code>sessions/*/.tako/subagents/*.jsonl</code> → 有 terminal 且过窗 → 删；无 terminal 且 <code>created_at</code> 过窗 → 删（孤儿）；其余跳过。只删文件，不碰表</td>
+</tr>
+<tr>
+<td>查询端点</td>
+<td><code>GET /api/sessions/:id/subagents</code> → glob + 读 metadata/末行组装 JSON，标 <code>complete</code> / <code>interrupted</code>，权限同 SessionAccess</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-最难的一处半截档案救不救v4-反转">4. 最难的一处：半截档案救不救（v4 反转）</h2>
+<p>初版曾打算「从断点重接」：崩了就从最后一条消息接着跑。v4 把它<strong>反转</strong>为「不重接」：</p>
+<ul>
+<li>半截现场的工具副作用<strong>已经部分发生</strong>（写了文件、发了请求），续跑要逐项处理幂等；</li>
+<li>干净重跑更可靠，且与 doc/30 的 run 级语义一致——journal 重放对中断的工具调用只回一句「引擎不会自动重跑这次调用，需要的话请重新发起」；</li>
+<li>省掉 running lease / 尾轮重试一整层复杂度。</li>
+</ul>
+<p>结果：半成品 wire <strong>保留到清扫</strong>（人 <code>tail</code> 能看死在哪），resume 一律拒绝（「该实例未完成或已中断，请重新委派」）；想继续 = 重新委派（新实例），或 resume 一个<strong>之前完整跑完</strong>的档案。error 终态的档案<strong>可以</strong> resume——模型自己会看到上一轮怎么死的。</p>
+<p>这条也解释了为什么不需要「判断实例是否正在跑」：<code>created_at</code> 新的半成品自然豁免清扫，<code>created_at</code> 过窗的就是死透的孤儿——不需要 lease 区分死活。</p>
+<h2 id="5-同族小裁定doc39-4-的-s-as-k">5. 同族小裁定（doc/39 §4 的 S-a…S-k）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>档案存哪</td>
+<td><strong>纯 wire 文件，无 PG 表</strong></td>
+<td>约定即索引；跨会话聚合审计暂缺，真需要时反向同步出表</td>
+</tr>
+<tr>
+<td>resume 入口</td>
+<td><strong>模型侧工具 <code>resume_subagent</code></strong>，<code>{id}</code> 或 <code>{agent}</code> 两种寻址</td>
+<td>模型不必记 ULID——回传文本与对话内容就是它的记忆</td>
+</tr>
+<tr>
+<td>可见范围</td>
+<td><strong>先限同会话</strong></td>
+<td>文件挂会话目录，SessionAccess 拦会话即拦文件</td>
+</tr>
+<tr>
+<td>行格式</td>
+<td><strong>消息粒度 JSONL</strong>（metadata / message / terminal）</td>
+<td>消息是 resume 的最小充分单元；不用事件粒度</td>
+</tr>
+<tr>
+<td>resume 产出</td>
+<td><strong>新实例</strong>，新 metadata 的 <code>resumed_from</code> 指回原档案</td>
+<td>原现场不可变，链条可追溯</td>
+</tr>
+<tr>
+<td>运行环境跟谁</td>
+<td><strong>跟当前 run</strong>：作业根用当前 run 的，模型/工具池按当前租户 profile 重新装配</td>
+<td>档案只带知识与上下文，不带目录/模型绑定</td>
+</tr>
+<tr>
+<td>过期与清扫</td>
+<td><strong>继承 doc/37 的 <code>-archive-ttl</code></strong>（默认 7 天），清扫第三类只删文件</td>
+<td>同一个数、同一套窗口，不另立</td>
+</tr>
+<tr>
+<td>半截重接</td>
+<td><strong>不做</strong>（v4 反转）</td>
+<td>工具副作用幂等成本 &gt; 干净重跑；对齐 doc/30</td>
+</tr>
+<tr>
+<td>写入时机</td>
+<td><strong>每轮模型往返后追加</strong>；写失败只记日志</td>
+<td>追加 O(1)；档案是增强不是正确性依赖；并发同名委派各写各文件</td>
+</tr>
+<tr>
+<td>实例 id</td>
+<td><strong><code>sa_</code> + ULID</strong></td>
+<td>免并发撞号；metadata、回传、参数三处一致</td>
+</tr>
+<tr>
+<td>与 Kimi 的关系</td>
+<td><strong>取形态、不取协议</strong></td>
+<td>取「每实例一份、追加写、metadata 首行 + terminal 尾行、版本号」；不取事件溯源与 replay 引擎</td>
+</tr>
+<tr>
+<td>折叠后的正文</td>
+<td>不进档案</td>
+<td>wire 是过程记录；折叠是模型输入的优化，不反向改写档案</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="6-证据">6. 证据</h2>
+<p><strong>方案</strong>：<code>doc/39-子代理持久化与resume.md</code> §0（做什么/不做什么）§1（两个故事）§2（名词）§3（现状机制；§3.1 与 Kimi 的关系）§4（S-a…S-k）§5（目录布局与 wire 字节、四个消费方）§6（四条端到端链路：正常委派 / resume / 中断 / 过期 / 删会话）§7（S1–S3 分拍）§9（明确不做：崩溃半截重接、跨会话 resume、常驻后台子代理）。真源关系：折叠 doc/25、装配 doc/34、run 级语义 doc/30、清扫窗口 doc/37 §5.5。</p>
+<p><strong>代码符号</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>是什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>internal/runengine/subagent_wire.go:50</code></td>
+<td><code>newSubagentID</code>（<code>sa_</code> + ULID）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/subagent_wire.go:59</code></td>
+<td><code>subagentWireDir</code>（会话目录下 <code>.tako/subagents</code>）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/subagent_wire.go:103</code></td>
+<td><code>openSubagentWire</code>（建文件 + 写 metadata）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/subagent_wire.go:171</code></td>
+<td><code>finish</code>（写 terminal 行）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/subagent_wire.go:191/207/225</code></td>
+<td><code>appendRange</code> / <code>appendBefore</code> / <code>appendAfter</code>（每轮追加）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/subagent_wire.go:270-303</code></td>
+<td><code>wireAppendHandler</code>（挂 middleware 链）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/resume_subagent.go:176-224</code></td>
+<td><code>locateSubagentArchive</code>（按 id / agent 定位）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/resume_subagent.go:299</code></td>
+<td><code>validateSubagentArchive</code>（terminal、窗口、解析完整性）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/resume_subagent.go:269</code></td>
+<td><code>dropPartialTail</code>（丢弃末尾半行）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/agents.go:427</code></td>
+<td><code>runSubagentGuarded</code>（委派与 resume 共用后半段）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/agents.go:472</code></td>
+<td>中断时不写 terminal（半成品）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/archive_sweep.go:235</code></td>
+<td><code>sweepSubagentFiles</code>（清扫第三类：只删文件）</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>复核命令</strong>：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;func newSubagentID\|func openSubagentWire\|func (w \*subagentWire) finish&quot;</span> internal/runengine/subagent_wire.go</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;func locateSubagentArchive\|func validateSubagentArchive&quot;</span> internal/runengine/resume_subagent.go</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;func sweepSubagentFiles&quot;</span> internal/runengine/archive_sweep.go</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="va">PATH</span><span class="op">=</span><span class="st">&quot;</span><span class="va">$HOME</span><span class="st">/sdk/go1.27.0/bin:</span><span class="va">$PATH</span><span class="st">&quot;</span> <span class="ex">go</span> test ./internal/runengine <span class="at">-run</span> <span class="st">&#39;Subagent|Resume|Archive|Locate&#39;</span></span></code></pre></div>
+<p><strong>活体验收（2026-10-21，<code>tmp/ws-38</code>）</strong>：会话 <code>s_01M5D7XEPP9ZC4QMG1V58X0SS6</code> 的实例 <code>sa_01M5D7XFPTZYDEBTCYHTCRYE1G</code>，其 wire 的 SHA-256 在重启与清扫后仍是 <code>71a4d705…d79856455</code>；续跑 run <code>r_01M5D94WR1NK5R96CKRN1T5B6B</code> 完成，新实例 <code>sa_01M5D94XYAGRZX720Q1T4Z74C0</code>，父工具结果以「（本次委派实例：sa_01M5D94XYAGRZX720Q1T4Z74C0）」收尾。半截副本回「该实例未完成或已中断，请重新委派」；过窗副本回「档案已过期」；不存在的 id 回「找不到该子代理档案，请重新委派」。清扫探针删掉过窗且有 terminal 的副本与 <code>created_at</code> 过窗的半成品，窗口内的两种都留下。</p>
+<h2 id="7-现状">7. 现状</h2>
+<ul>
+<li><strong>仍有效</strong>：纯文件 + 三件约定（目录布局 / metadata / terminal）当索引；resume 只认完整档案；新实例成链；窗口与清扫继承 doc/37；同会话可见；模型侧工具入口（页面入口由 doc/44 的「继续」补上，做法是把指令追加到输入框，不让页面起第二场 run）。</li>
+<li><strong>已翻转</strong>：「从断点重接半截档案」方案作废（v4）；「建 PG 目录表」不再考虑。</li>
+<li><strong>未做</strong>：跨会话 resume、跨会话子代理用量统计、事件溯源级 replay、常驻后台子代理。</li>
+<li><strong>同族问题</strong>：子代理折叠与窗口 → <a href="../子代理窗口谁来压/问题与方案.html">子代理窗口谁来压</a>；规格与工具边界 → <a href="../子代理规格与工具边界/问题与方案.html">子代理规格与工具边界</a>；崩溃后 run 的状态语义 → <a href="../崩溃后这场run算什么状态/问题与方案.html">崩溃后这场run算什么状态</a>；页面入口 → <a href="../前端可用性欠账/问题与方案.html">前端可用性欠账</a>。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E5%AD%90%E4%BB%A3%E7%90%86%E6%A1%A3%E6%A1%88%E6%94%BE%E5%93%AA%E9%87%8C/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/子代理档案放哪里/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>等人现场放哪里：进程内等待 vs 库里一行 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="等人现场放哪里进程内等待-vs-库里一行">等人现场放哪里：进程内等待 vs 库里一行</h1>
+<blockquote>
+<p>模块：运行引擎 · 人审与追问（doc/47，复用 doc/41 Loop A 档案）｜状态：<strong>已落地</strong>（2026-10-23，Q1–Q5 + P1–P3）｜证据：<code>doc/47-Plan审核与追问澄清.md</code> §3、<code>internal/runengine/questions.go</code>、<code>waittools.go</code>、<code>plangate.go</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>两个会真实发生的戏：</p>
+<p><strong>戏一（plan 无审核）</strong>：租户里的运营同事发「把 workspace 里的旧文件清理一下，再把报告整理成归档目录」。模型对「旧文件」的理解和小张不同——<code>rm</code> 掉一批文件，里面混着没提交的配置和财务表。每一道现有防线都放行：沙箱围栏只挡租户目录<strong>之外</strong>的读写，这些操作全在目录<strong>之内</strong>，合法；PII 脱敏管敏感串外泄；看板只是让丢的过程<strong>可见</strong>。破坏发生在第几秒，人没有任何动手前的检查点。</p>
+<p><strong>戏二（追问无载体）</strong>：小张的消息本身有歧义（「那个报告」是哪份？）。模型有两条路：猜——答错二十分钟的活全白干；把问题当终稿文本交出来等下一条消息——这条路能走，但问题没有身份（答案回来时「在答哪道题」靠自然语言维系）、前端画不出问题卡、模型「决定提问」这个承诺不留痕迹。</p>
+<p>两个病灶同一副地基：<strong>「人」这个外部输入源在引擎里没有正式进入通道</strong>。今天人只能靠「发一条普通消息」影响 agent，既无结构化的问题/方案载体，也无「任务在等输入」的状态。</p>
+<h2 id="2-核心候选等待现场放进程还是放库">2. 核心候选：等待现场放进程还是放库</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 进程内 park（kimi / dsh / eino HITL 原语）</td>
+<td>工具 handler 里起一个 promise / <code>StatefulInterrupt</code>，人在同进程回调里回答</td>
+<td>实现最短；eino 有现成原语</td>
+<td>进程一死现场全丢；裁决端点在别的副本够不着；eino 的 gob checkpoint 是进程内字节，v6 目标多副本直接不成立</td>
+</tr>
+<tr>
+<td>B 库里一行 + 轮询（选定）</td>
+<td>落 <code>run_questions</code> 行 → 发帧 → handler 阻塞轮询该行直到 <code>status != pending</code></td>
+<td>现场在库；任何副本都能答；崩溃后 resume 重建等待者；多副本天然正确</td>
+<td>一次 1–2s 的轮询开销；挂起期间占用一个 goroutine</td>
+</tr>
+<tr>
+<td>C 挂号立即返回、答案走下一条 user 消息</td>
+<td>工具立刻返回「已挂号」，人的回答作为下一条用户消息进来</td>
+<td>不阻塞、不占 goroutine</td>
+<td>run 被切成两段，看板/账目/上下文全断；runlog 语义变复杂；省的钱比看起来少</td>
+</tr>
+<tr>
+<td>D 不做，模型自己猜</td>
+<td>保持现状</td>
+<td>零成本</td>
+<td>戏一、戏二原样发生</td>
+</tr>
+</tbody>
+</table></div>
+<p>选 B。v6 的既有哲学已经给出了答案（doc/30 §2.3）：<code>interrupted</code> 是<strong>读侧派生视图</strong>，runs 行保持 <code>status='running'</code> + 租约过期，语义是「执行者死了」。挂起沿用同一哲学——<strong>不加第四种存储状态</strong>，挂起 = running + 存在 pending 行，读侧可派生「在等审批」。</p>
+<p><strong>准确表述</strong>：阻塞中的 goroutine 只是<strong>可重建的临时雇员</strong>。进程死了 → 租约过期 → interrupted → 客户端 resume 在任何副本重建等待者，现场全部从 PG（行 + journal + runs 租约 + plan_mode 列）恢复。家规原话：「<strong>现场在库不在进程</strong>」。</p>
+<h2 id="3-三拍落行--发帧--阻塞等">3. 三拍：落行 → 发帧 → 阻塞等</h2>
+<p>每个「等人」工具（<code>ask_user</code>、<code>submit_plan</code>）的 handler 都走同一套：</p>
+<ol type="1">
+<li><strong>落行</strong>：<code>INSERT run_questions</code>（kind=question/plan，status=pending，tool_call_id）。不做会怎样：进程死了对不清在等什么。</li>
+<li><strong>发帧</strong>：<code>AppendFrame</code> 一条 <code>kind=question</code>（<code>name</code> 区分发起工具，<code>args</code> 是原始参数 JSON，<code>text</code> 是问题/方案全文，<code>messageId</code> = 行 id）。不做会怎样：前端不知道在等人，页面死寂。</li>
+<li><strong>阻塞等</strong>：goroutine 内 1–2s 轮询该行直到 <code>status != pending</code>；全程尊重 ctx（stopRun 能打断，run 走 stopped，行留 pending）。答案文本作为 tool_result 返回，模型<strong>同一轮继续</strong>。</li>
+</ol>
+<p>为什么选「同轮注回」而不是 C：工具契约完整（工具返回的就是答案，不是「挂号凭证」）、run 连续性（runlog/看板/账目不切碎）。</p>
+<h2 id="4-plan-gate为什么是运行时守卫而不是装配剥工具">4. plan gate：为什么是运行时守卫而不是装配剥工具</h2>
+<p>模型能自己判断「这个任务多步/破坏性/不可逆」，调 <code>enter_plan_mode</code> 把 <code>runs.plan_mode</code> 置 true。此后每一次写/执行类工具调用都过 <code>planGuardHandler</code>——<code>isMutatingTool(name)</code> 为真就 <strong>deny</strong>：解释文本当 tool_result 回模型，工具未执行、不落 intent。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>候选</th>
+<th>做法</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A 装配剥工具</td>
+<td>进 plan mode 时把写工具从池里拿掉</td>
+<td>模型物理上看不见写工具</td>
+<td>需要入口 flag（用户已否）；池子在装配期定，运行中改要重建</td>
+</tr>
+<tr>
+<td>B 运行时守卫（选定）</td>
+<td>handler 链上逐调用判定</td>
+<td>触发权还给模型，与 kimi 全套同款</td>
+<td>「进不进模式」仍是提示词（软约束）</td>
+</tr>
+<tr>
+<td>C 首次写前必审</td>
+<td>模型发第一把写工具时强制问人</td>
+<td>硬保证，不依赖模型自觉</td>
+<td>每个干活 run 多一次打断；留档为将来升级路径</td>
+</tr>
+<tr>
+<td>D 不做</td>
+<td>只靠提示词劝阻</td>
+<td>零成本</td>
+<td>戏一原样发生</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>硬保证的准确表述</strong>：「<strong>进模式后</strong>想写也没有通道」——deny 是 middleware 硬拦，不依赖提示词。「<strong>进不进模式</strong>」是提示词（软）。这是 A 形态与开关形态的取舍：残余风险是模型该进不进直接干，靠提示词 + deny 反馈 + 用户 stopRun 兜底。</p>
+<p><strong>批准与放行</strong>：人在方案卡上点「批准执行」或「编辑后批准」→ answer 端点 CAS（<code>decision=approve</code>）→ 行 answered → 轮询注回批准文本（有修改则附全文）→ <strong>同时 <code>runs.plan_mode</code> 置回 false</strong> → 守卫放行，同一轮继续执行。</p>
+<p><strong>退回修改不是拒绝</strong>：<code>decision=revise</code> → 注回「方案被驳回，尚未执行；计划模式仍然开启…」+ 意见 → <code>plan_mode</code> <strong>保持 true</strong> → 模型改完重新 <code>submit_plan</code>，落新行、新帧、新卡，旧卡标「已驳回」并留住意见。</p>
+<h2 id="5-崩溃兼容journal-重放的第三分支">5. 崩溃兼容：journal 重放的第三分支</h2>
+<p>挂起中进程死 → 租约过期 → 派生 interrupted（既有）→ 客户端 resume（既有 claim CAS）→ <code>replayJournal</code> 重放到这条 intent 时查 <code>run_questions</code>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>账本 intent 对到的行</th>
+<th>重放行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>无行</td>
+<td>维持现状：<code>interruptedResultText</code> 回注，不重跑（at-most-once）</td>
+</tr>
+<tr>
+<td><code>pending</code></td>
+<td><strong>重新挂起</strong>：重发 question 帧（<code>seedResume</code> 已清空 runlive，天然幂等），继续轮询</td>
+</tr>
+<tr>
+<td><code>answered</code></td>
+<td><strong>注回答案/批准</strong>：内容作为该次调用的 tool_result（submit_plan 行附带退出 plan mode），模型继续跑</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>没这个分支会怎样</strong>：批准了的调用在 resume 后被当成「结果未知」跳过——人白批了，且模型拿到的文本与批准语义矛盾。</p>
+<p><code>resumeCount</code> 语义不变：挂起不消耗次数（<code>lease_epoch</code> 不动），只有崩溃接管才 +1。</p>
+<h2 id="6-同族小裁定">6. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>表叫什么</td>
+<td><code>run_questions</code>（doc/41 的 <code>run_approvals</code> 改名）</td>
+<td><code>kind</code> 列区分 question/plan，P/Q 共用一张表、一种帧、一套 resume 分支</td>
+</tr>
+<tr>
+<td>状态机</td>
+<td><code>pending → answered</code>（外加终态清扫的 <code>stale</code>）</td>
+<td><strong>2026-10-27 发现：<code>stale</code> 没有生产者</strong>——全仓 <code>UPDATE run_questions</code> 只有 <code>pending → answered</code> 那一处 CAS，进程收摊或被 stop 的 run 会留一行永远 pending。补法与 doc/37 会话清理同一拍</td>
+</tr>
+<tr>
+<td>一答终答怎么保证</td>
+<td>PG 条件更新 <code>WHERE id=? AND status='pending'</code>，影响 0 行回 409 <code>115101</code></td>
+<td>CAS 在多副本下成立，无「第二个副本一起判」的窗口</td>
+</tr>
+<tr>
+<td>挂起时长上限</td>
+<td><strong>无上限</strong>、lease 照续、stopRun 可打断</td>
+<td>人几天不答，会话闸就占几天——与 doc/41 同款取舍。代价：不需要超时清扫</td>
+</tr>
+<tr>
+<td>授权语义</td>
+<td>没有拒绝分支——answer 只可能是回答/批准</td>
+<td>想撤回用 stopRun</td>
+</tr>
+<tr>
+<td>答案形态</td>
+<td><code>ask_user</code> 带可选 <code>options: string[]</code>，前端快捷按钮 + 自由文本框</td>
+<td>有明确候选取值时给 2–4 个；option 文本就是 answer，端点和表不变</td>
+</tr>
+<tr>
+<td>方案审批几态</td>
+<td>批准 / 编辑后批准 / 退回修改三态</td>
+<td><code>decision</code> 列承载 approve/revise；编辑后全文走 <code>answer</code> 列</td>
+</tr>
+<tr>
+<td>plan mode 放在哪</td>
+<td><code>runs.plan_mode bool</code> 列，<strong>不出 API</strong></td>
+<td>崩溃恢复后仍在（durable）；前端靠 list 端点感知等待，既有端点字节零变更</td>
+</tr>
+<tr>
+<td>plan mode 内放行什么</td>
+<td>读类工具、看板四工具、<code>ask_user</code>、enter/submit</td>
+<td>看板工具只改 <code>run_tasks</code>、不动工作区，放行是为了方案阶段先把步骤立成 todo</td>
+</tr>
+<tr>
+<td>为什么能悄悄退出</td>
+<td><strong>不做</strong> <code>exit_plan_mode</code> 无审退出</td>
+<td>进了模式要么 submit_plan 过人审、要么 stopRun</td>
+</tr>
+<tr>
+<td>帧词表</td>
+<td>8 → 9，新增 <code>question</code>（P/Q 共用一个 kind）</td>
+<td><code>contract_test.go</code> 词表测试是显式同步点，红即提醒</td>
+</tr>
+<tr>
+<td>刷新后怎么恢复待答面板</td>
+<td>前端查 <code>questions?status=pending</code> 从 PG 重建</td>
+<td>不依赖 runlive 的 300s TTL；换窗口、换副本都不丢</td>
+</tr>
+<tr>
+<td>子代理继承</td>
+<td><code>ask_user</code> 静态注册进一手池，researcher 走 exclude 路会继承它；coder 白名单不含</td>
+<td>中途问人符合 researcher 定位；金样 <code>TestShippedAgentSpecToolGuards</code> 同步一行</td>
+</tr>
+<tr>
+<td>脚手架</td>
+<td><code>seed-question</code> / <code>plan-gate-check</code> 两个 dev 探针</td>
+<td>转正点已走完：<code>seed-question</code> 换成只读 <code>question-check</code>；<code>plan-gate-check</code> 本就是纯判定，保留为长期诊断口</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="7-证据">7. 证据</h2>
+<p><strong>方案</strong>：<code>doc/47-Plan审核与追问澄清.md</code> §3.1（共享机器）§3.2（plan gate）§3.3（ask_user + resume 第三分支）§3.4（外部参照对照）§5.1（表与改列）§5.2（帧）§5.3（端点）§5.4（批准/答案形态）§6（十拍收口）§7（不做清单）§8（1–6 全拍）。<strong>取档来源</strong>：<code>doc/41-任务看板与人工审批.md</code> §3.1（Loop A 原设计，整条不做但设计在案）。</p>
+<p><strong>台账</strong>：<code>tmp/47-Plan审核与追问澄清/</code>（本地，不入库）；<code>tmp/审批回路/决策记录.md</code>（Loop A 时代的三项拍板，其中「走队列」思路被 Q 线继承）。</p>
+<p><strong>代码符号</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>位置</th>
+<th>是什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>internal/runengine/questions.go:52</code></td>
+<td><code>RunQuestion</code> struct（PG 表 <code>run_questions</code>）</td>
+</tr>
+<tr>
+<td><code>internal/runengine/questions.go:78</code></td>
+<td><code>Store.InsertQuestion</code>：第 1 拍落行</td>
+</tr>
+<tr>
+<td><code>internal/runengine/questions.go:123</code></td>
+<td><code>Store.AnswerQuestion</code>：CAS 一答终答</td>
+</tr>
+<tr>
+<td><code>internal/runengine/questions.go:184</code></td>
+<td><code>Server.listQuestions</code>：<code>GET /api/runs/:id/questions</code></td>
+</tr>
+<tr>
+<td><code>internal/runengine/questions.go:226</code></td>
+<td><code>Server.answerQuestion</code>：<code>POST /api/questions/:id/answer</code></td>
+</tr>
+<tr>
+<td><code>internal/runengine/waittools.go:44</code></td>
+<td><code>handleAskUser</code>：三拍主机</td>
+</tr>
+<tr>
+<td><code>internal/runengine/waittools.go:62</code></td>
+<td><code>openWaitRow</code>：落行</td>
+</tr>
+<tr>
+<td><code>internal/runengine/waittools.go:100</code></td>
+<td><code>emitQuestionFrame</code>：发帧</td>
+</tr>
+<tr>
+<td><code>internal/runengine/waittools.go:129</code></td>
+<td><code>newSubmitPlanTool</code></td>
+</tr>
+<tr>
+<td><code>internal/runengine/waittools.go:192</code></td>
+<td><code>reconcileResumeWaits</code>：resume 第三分支</td>
+</tr>
+<tr>
+<td><code>internal/runengine/waittools.go:262</code></td>
+<td><code>waitForAnswer</code>：轮询</td>
+</tr>
+<tr>
+<td><code>internal/runengine/plangate.go:54</code></td>
+<td><code>isMutatingTool</code>：写/执行黑名单纯函数</td>
+</tr>
+<tr>
+<td><code>internal/runengine/plangate.go:73</code></td>
+<td><code>planGuardDenies</code></td>
+</tr>
+<tr>
+<td><code>internal/runengine/plangate.go:83</code></td>
+<td><code>planGuardHandler</code>：守卫 middleware</td>
+</tr>
+<tr>
+<td><code>internal/runengine/plangate.go:125</code></td>
+<td><code>newEnterPlanModeTool</code></td>
+</tr>
+<tr>
+<td><code>internal/runengine/plangate.go:157</code></td>
+<td><code>Store.SetPlanMode</code></td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>复核命令</strong>：</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> yk-tako-eino</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;run_questions\|status=&#39;pending&#39;\|</span><span class="dt">\&quot;</span><span class="st">stale</span><span class="dt">\&quot;</span><span class="st">&quot;</span> internal/runengine/questions.go</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-rn</span> <span class="st">&quot;stale&quot;</span> internal/runengine/<span class="pp">*</span>.go <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-v</span> _test     <span class="co"># 看有没有写入点</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="fu">grep</span> <span class="at">-n</span> <span class="st">&quot;isMutatingTool\|planGuardDenies&quot;</span> internal/runengine/plangate.go</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="fu">bash</span> ../scripts/acceptance/question_crash.sh                 <span class="co"># 需起隔离引擎，见 README</span></span></code></pre></div>
+<p><strong>活体验收（2026-10-23）</strong>：问题卡瀑布、方案卡编辑后执行、<code>question_crash.sh</code> 16 条断言全过（挂起中 <code>kill -9</code> → interrupted → resume 202 → 帧重发 → answer → complete）。交互层重做后重跑：提问 → 选项 → 看板 → 方案 → 驳回 → 重提 → 编辑后批准 → 执行，看板 5/5。</p>
+<h2 id="8-现状">8. 现状</h2>
+<ul>
+<li><strong>仍有效</strong>：库里一行 + 轮询的等待形态；三拍；CAS 一答终答；resume 第三分支；plan guard 运行时守卫；无上限挂起；同轮注回。</li>
+<li><strong>未落地 / 已知缺口</strong>：<code>stale</code> 无生产者（run 终态清扫未实现）；<code>run_questions</code> 与 <code>run_tasks</code> 都还没进会话清扫清单。</li>
+<li><strong>明确不做</strong>：ask_user 的 B 形态（挂号立即返回）、首次写前必审、用户侧强制进模式入口、<code>exit_plan_mode</code> 无审退出、框架拦截式审批 gate、超时自动拒答、运行中插话。</li>
+<li><strong>同族问题</strong>：审批闸为什么整条不做 → <a href="../工具三态守卫与审批回路/问题与方案.html">工具三态守卫与审批回路</a>；看板正本 → <a href="../看板正本放哪里/问题与方案.html">看板正本放哪里</a>；崩溃状态怎么派生 → <a href="../崩溃后这场run算什么状态/问题与方案.html">崩溃后这场 run 算什么状态</a>；技能与 plan mode → <a href="../技能谁读谁执行/问题与方案.html">技能谁读谁执行</a>。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E7%AD%89%E4%BA%BA%E7%8E%B0%E5%9C%BA%E6%94%BE%E5%93%AA%E9%87%8C/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/等人现场放哪里/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>用量怎么让用户看见 · tako 文档</title>
+<link rel="stylesheet" href="../../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../../index.html">tako 文档</a>
+  <nav class="links"><a href="../../../assets/tako-architecture.html">架构总览</a><a href="../../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../../assets/tako-orchestration.html">长任务编排</a><a href="../../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="用量怎么让用户看见">用量怎么让用户看见</h1>
+<blockquote>
+<p>模块：用量可见 / 前端（<code>internal/runengine/worker.go</code> + <code>web/src/</code>）｜ 状态：已落地（<code>c211637</code>，2026-10-21）｜ 证据：<code>doc/27-用量可见.md</code>、<code>tmp/27-用量可见/planning.md</code></p>
+</blockquote>
+<h2 id="1-场景与病灶">1. 场景与病灶</h2>
+<p>用户聊了一下午，想知道「上下文还剩多少、这条回复花了多少」。今天唯一把 token 数透给用户的时刻是 413 <code>message_too_large</code>——<strong>而且只在死后说话</strong>：墙已经撞上了才告诉用户墙在哪。用户既不能提前开新会话，也不知道 413 之前已经压过几轮。</p>
+<p>要让这件事可见，要回答五个问题：长什么样、没数据时怎么办、历史回看存哪、看见了要不要替用户做决定、百分比的分母是什么。</p>
+<h2 id="2-候选与代价">2. 候选与代价</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>问题</th>
+<th>候选</th>
+<th>好处</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>展示形态</td>
+<td>A pi 式 footer 一行小字（&gt;70% 橙、&gt;90% 红）</td>
+<td>轻量、每轮更新</td>
+<td>没有明细拆分</td>
+</tr>
+<tr>
+<td></td>
+<td>B Octop 式 segments 环形图</td>
+<td>知道钱花在哪</td>
+<td>要动 <code>countInput</code> 基数；第一版用户要的是一个数，不是饼图</td>
+</tr>
+<tr>
+<td></td>
+<td>C 不做</td>
+<td>零成本</td>
+<td>继续 413 死后报数</td>
+</tr>
+<tr>
+<td>没账单时</td>
+<td>A 发 0</td>
+<td>简单</td>
+<td>用户以为上下文空了，误导决策</td>
+</tr>
+<tr>
+<td></td>
+<td>B 不发帧、前端显示「?」</td>
+<td>诚实，与 pi 压缩后无新响应前的 <code>?/200k</code> 同款</td>
+<td>用户看不到具体数</td>
+</tr>
+<tr>
+<td></td>
+<td>C 发本地估算</td>
+<td>有数</td>
+<td>假数与引擎真值分叉</td>
+</tr>
+<tr>
+<td>历史回看存哪</td>
+<td>A 新表</td>
+<td>语义干净</td>
+<td>多表、多一致性缝、多一次清扫</td>
+</tr>
+<tr>
+<td></td>
+<td>B 复用 <code>runlog_entries.payload</code>，按 role 分派</td>
+<td>零 schema 变更</td>
+<td>列语义变宽，读侧要按 role 解释</td>
+</tr>
+<tr>
+<td></td>
+<td>C 不存</td>
+<td>简单</td>
+<td>usage 帧只在 Redis，TTL 一到就蒸发，永远无法回看</td>
+</tr>
+<tr>
+<td>看见之后自动动作吗</td>
+<td>A 自动压缩 / 自动建议开新会话</td>
+<td>省心</td>
+<td>夺走决定权；与引擎自动折叠重复或冲突</td>
+</tr>
+<tr>
+<td></td>
+<td>B 只可见、只变色</td>
+<td>决定权在人；压缩仍由 doc/24 的线自动判</td>
+<td>用户要自己判断何时开新会话</td>
+</tr>
+<tr>
+<td>分母</td>
+<td>A 配置窗口 <code>compact-window</code>（定案）</td>
+<td>简单、与引擎折叠同一把尺</td>
+<td>旗标填错就全错</td>
+</tr>
+<tr>
+<td></td>
+<td>B 模型真值/自动校准</td>
+<td>更准</td>
+<td>要扩溢出层的 <code>extractWindow</code>，本篇不碰</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>裁定：A / B / B / B / A。</strong> 一行小字；没账单就诚实地显示「?」；历史用量塞进 payload 列；不自动做任何事；分母是配置值不是模型真值。</p>
+<h2 id="3-同族小裁定">3. 同族小裁定</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>小问题</th>
+<th>裁定</th>
+<th>代价 / 备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>新帧长什么样？</td>
+<td><code>kind=usage</code>，带 <code>promptTokens</code> / <code>completionTokens</code> / <code>window</code> 等</td>
+<td>与既有帧同一套序号与续传语义</td>
+</tr>
+<tr>
+<td>payload 列注释怎么改？</td>
+<td>从「只有工具扩展行有」放宽为「扩展行与 assistant 行（usage）有」，语义按 role 分派</td>
+<td>同一列两用，读侧必须按 role 解释</td>
+</tr>
+<tr>
+<td>账单三个整数全为 0 怎么办？</td>
+<td>按「缺失」处理，不发帧</td>
+<td>全 0 与「厂商不报」在语义上都是不可用</td>
+</tr>
+<tr>
+<td>费用估算、缓存命中、图表做吗？</td>
+<td>不做</td>
+<td>第一版只要一个数；<code>countInput</code> 的基数拆分是 doc/24 明令不动的东西</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-证据">4. 证据</h2>
+<ul>
+<li>方案：<code>doc/27-用量可见.md</code> §3（参考形态与取舍）、§4a（新帧）、§4b（历史行扩展）、§1/§7（不做自动动作）。</li>
+<li>台账：<code>tmp/27-用量可见/planning.md</code> 待拍项。</li>
+<li>代码：<code>worker.go</code> 的 <code>usageFrame</code> / <code>usageBill</code>；<code>store.go</code> 的 assistant 行落 usage；<code>pgstore.go</code> 读侧解出 usage；前端 <code>App.vue</code> 的 <code>usageText</code> / <code>usageClass</code>，<code>chat.ts</code> 的 <code>usageUnknown</code>。</li>
+<li>复核命令：<code>grep -n "usageFrame\|usageBill" yk-tako-eino/internal/runengine/worker.go</code>。</li>
+</ul>
+<h2 id="5-现状">5. 现状</h2>
+<p>仍有效。百分比分母固定取 <code>compact-window</code> 配置值；模型真值校准仍归溢出层，未动。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/problems/%E7%94%A8%E9%87%8F%E6%80%8E%E4%B9%88%E8%AE%A9%E7%94%A8%E6%88%B7%E7%9C%8B%E8%A7%81/%E9%97%AE%E9%A2%98%E4%B8%8E%E6%96%B9%E6%A1%88.md"><code>doc/problems/用量怎么让用户看见/问题与方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

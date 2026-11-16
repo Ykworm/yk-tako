@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>文件写入竞争：短写入互斥、版本校验、原子替换与长任务隔离 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="文件写入竞争短写入互斥版本校验原子替换与长任务隔离">文件写入竞争：短写入互斥、版本校验、原子替换与长任务隔离</h1>
+<blockquote>
+<p>性质：<strong>部分落地（2026-11-10，短写入三件套已落地；长任务隔离由 <a href="74-并行任务工作区隔离.html">doc/74</a> 承担，已落地 2026-11-12）</strong> 状态：短写入的互斥、版本校验与原子替换已按本稿 §4.3 落地并验收；§6 只保留长任务隔离的动机与方向，具体施工设计由 doc/74 承担。 日期：2026-11-09；落地回填：2026-11-10；doc/74 指针补记：2026-11-11 代码落点：互斥 = <code>filelock.go</code>（PG advisory lock，多副本裁决）；写入依据 = <code>filefp.go</code>（读取基准 + 指纹比对）；原子替换 = <code>atomicfile.go</code>（同目录 <code>.tako-tmp-*</code> 临时文件 + rename，write_file / edit_file / move_file 之后的 Markdown 记忆文件与迁移搬运共用）；调用面 <code>filetools.go</code>。 验收：存储侧 <code>atomicfile_test.go</code>（失败路径目标字节不变、临时文件清理、软链写穿、0644）与 <code>filefp_test.go</code>；活体 <code>scripts/acceptance/memory_file_race.sh</code>（两台隔离引擎共连同一 PG/共享 workspace：flock 串行、写前版本拒绝、原子读、kill -9 释放，11/11 通过）。 关系：<a href="61-并发控制设计.html">doc/61</a> 解释当前已落地的存储层互斥；本文补普通文件写入的完整边界。记忆文件的特殊写入由 <a href="65-记忆两层方案.html">doc/65</a> §5 消费本文原则；多 Agent 长任务编排以 <a href="70-多Agent编排与Task/README.html">doc/70</a> 为执行底座，通用工作区隔离、不可变结果交接与发布恢复由 <a href="74-并行任务工作区隔离.html">doc/74</a> 专项设计；Git 只是其中一种 Provider。</p>
+</blockquote>
+<h2 id="0-一句话">0. 一句话</h2>
+<p>同一份文件有多个写者时，最终只有三条根本路径：</p>
+<ol type="1">
+<li><strong>串行写入</strong>：同一路径的短写入临界区排队；</li>
+<li><strong>隔离后合并</strong>：长任务各写自己的 worktree/副本，最后显式合并；</li>
+<li><strong>协同编辑算法</strong>：CRDT/OT 让多份操作持续收敛，适合实时协同文本，不自动解决代码语义。</li>
+</ol>
+<p>哈希、revision、互斥锁和原子 rename 不是互相替代的四种答案。它们分别防止不同事故，必须讲清谁服务哪一段。</p>
+<h2 id="1-先演一场只有锁也会输的戏">1. 先演一场只有锁也会输的戏</h2>
+<p>文件最初是：</p>
+<pre class="text"><code>name=alpha
+port=5432</code></pre>
+<ol type="1">
+<li>会话 A 读取该版本，准备整篇重写端口，模型据此生成 <code>name=alpha + port=5433</code>，尚未写盘。</li>
+<li>会话 B 先把名字改成 <code>name=beta</code>，写盘成功。</li>
+<li>A 随后拿到文件锁，把自己基于旧版生成的整份内容写进去。</li>
+</ol>
+<p>A 的结果变成 <code>name=alpha + port=5433</code>，B 的名字修改被抹掉。锁确实保证了两个写盘动作没有重叠，却没有回答「A 的写入依据是否已经过期」。</p>
+<p>所以：</p>
+<ul>
+<li><strong>锁</strong>回答：此刻有没有另一个合作写者正在写；</li>
+<li><strong>版本校验</strong>回答：我生成内容时读到的那版，现在还是不是当前版；</li>
+<li><strong>原子替换</strong>回答：读者此刻会不会看到只写了一半的文件。</li>
+</ul>
+<p>少了第一项，检查与写入之间会插入别人；少了第二项，旧理解会覆盖新版本；少了第三项，不加锁的读者可能看到半截内容。</p>
+<h2 id="2-当前-tako-代码事实">2. 当前 tako 代码事实</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>机制</th>
+<th>当前真实行为</th>
+<th>不能据此宣称什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>fileBaseline</code></td>
+<td>run 内按 agent + 绝对路径记录读取指纹；写后刷新</td>
+<td>不是跨 run、跨进程或跨机器锁</td>
+</tr>
+<tr>
+<td>指纹</td>
+<td>≤64MB 以 SHA256 判断内容是否同版；大文件退化为 mtime + size</td>
+<td>弱判据可能漏掉同大小且保留 mtime 的变化</td>
+</tr>
+<tr>
+<td><code>write_file</code></td>
+<td>flock 内在写前比较当前指纹；未读、已变化或读后被删会拒绝</td>
+<td>不只靠锁就能防旧版整份覆盖</td>
+</tr>
+<tr>
+<td><code>edit_file</code></td>
+<td>flock 内现读，按 <code>old_text</code> 精确匹配，0 处/多处默认拒绝；不查整份基准表</td>
+<td>只能发现内容锚点失配，不能理解业务语义冲突</td>
+</tr>
+<tr>
+<td>锁文件</td>
+<td>使用独立锁文件与固定桶，不锁会被删除/rename 的目标 inode</td>
+<td>不同路径可能撞桶而多等，但不会因此失去互斥</td>
+</tr>
+<tr>
+<td>最终写盘</td>
+<td><strong>已走原子替换</strong>（<code>atomicfile.go</code>，2026-11-10）：同目录临时文件写完整内容 → rename 覆盖目标</td>
+<td>原子替换不防「最后写者覆盖」——防那个靠锁 + 写前指纹比对（上面两行）</td>
+</tr>
+<tr>
+<td>bash</td>
+<td>任意命令可以绕开文件工具锁</td>
+<td>文件工具声明路径不能证明 bash 不写别处</td>
+</tr>
+</tbody>
+</table></div>
+<p>现行实现分别见 <code>filefp.go</code> 的 <code>Fingerprint</code>、<code>fileBaseline</code>、<code>lockPaths</code>，<code>filelock.go</code>（PG advisory lock），<code>atomicfile.go</code>（原子替换），以及 <code>filetools.go</code> 的 <code>newWriteFileTool</code> / <code>newEditFileTool</code>。§6 的长任务隔离未施工，仍按本稿原样作方向。</p>
+<h2 id="3-为什么-write_fileedit_file-和-memory-不该共用一套借口">3. 为什么 <code>write_file</code>、<code>edit_file</code> 和 Memory 不该共用一套借口</h2>
+<h3 id="31-整文件覆盖write_file">3.1 整文件覆盖：<code>write_file</code></h3>
+<p>模型给程序的是完整新文件。程序无法分辨哪些字节是故意修改、哪些是从旧版照抄，因此需要：</p>
+<pre class="text"><code>读取时记录整份指纹
+→ 模型在锁外生成完整内容
+→ 写入前拿锁并重新计算当前指纹
+→ 一致才覆盖；不一致则重读、合并、重新生成</code></pre>
+<p>这相当于文件系统中的 <code>expectedRevision</code>。它不是为了把 map 全局化，而是为了让当前 agent 证明「我读过，而且依据仍有效」。</p>
+<h3 id="32-局部修改edit_file">3.2 局部修改：<code>edit_file</code></h3>
+<p>模型只给 <code>old_text</code> 与 <code>new_text</code>。程序在锁内读取最新内容并应用修改：</p>
+<ul>
+<li>别人先改了别处：最新读取自然带上别人的修改；</li>
+<li>别人先改了目标段：<code>old_text</code> 找不到，拒绝；</li>
+<li>同一锚点有多处：默认拒绝，要求补上下文或显式 <code>replace_all</code>。</li>
+</ul>
+<p><code>old_text</code> 是操作的内容前提，因此不必再查整文件基准表。<strong>它仍然是整份文件写回，只是最终结果在锁内根据最新内容计算。</strong></p>
+<h3 id="33-条目式-memory">3.3 条目式 Memory</h3>
+<p>Hermes 的 <code>MEMORY.md</code> / <code>USER.md</code> 使用 add/replace/remove/batch：锁内重读条目、定位目标、校验预算、原子替换。它同样是「锁内根据最新状态执行操作」，所以不需要额外的文件指纹 map。</p>
+<p>doc/65 的 <code>markdown</code> 模式沿用这条，而不是把通用 <code>write_file</code> 的基准表硬搬过去。详见 doc/65 §5。</p>
+<h2 id="4-原子-rename-与锁各负责什么">4. 原子 rename 与锁各负责什么</h2>
+<h3 id="41-没有写锁只有原子-rename">4.1 没有写锁，只有原子 rename</h3>
+<p>两个写者分别写自己的临时文件，再先后 rename：</p>
+<ul>
+<li>读者能看到完整 A 或完整 B，不会看到半截；</li>
+<li>但最后 rename 的一方覆盖另一方，丢失更新仍会发生。</li>
+</ul>
+<h3 id="42-有写锁但直接截断目标写入">4.2 有写锁，但直接截断目标写入</h3>
+<p>合作写者会排队，但不参加锁的读者可能在写入中途读取目标，看到空文件或部分内容。</p>
+<h3 id="43-推荐的短写入临界区">4.3 推荐的短写入临界区</h3>
+<pre class="text"><code>模型生成内容或修改意图（不持锁）
+→ 取得稳定锁文件/数据库锁
+→ 重新读取当前文件；write_file 校验整份指纹，edit/memory 应用操作
+→ 在目标同目录创建唯一临时文件并写完整内容
+→ 关闭临时文件；需要崩溃持久性时再明确 fsync 策略
+→ 原子 rename 替换目标
+→ 刷新本 agent 的读取基准、清理临时文件
+→ 释放锁</code></pre>
+<p>结果：</p>
+<ul>
+<li>写者之间排队，检查与写入之间不插入合作写者；</li>
+<li>读者不用排队，只会打开完整旧版或完整新版；</li>
+<li>写临时文件失败时旧目标不动，PG 锁也不需要承担「回滚文件系统」这种做不到的事。</li>
+</ul>
+<p><code>fsync</code> 服务崩溃后的持久性，不是原子可见性的来源；临时文件必须与目标在同一文件系统，否则 rename 可能退化为复制或失败。</p>
+<p>锁要锁<strong>独立且稳定的存在</strong>，不能锁将被 rename 替换的目标 inode。当前 tako 使用独立锁文件，这一点保留。</p>
+<h2 id="5-多副本与锁住不释放">5. 多副本与「锁住不释放」</h2>
+<h3 id="51-短临界区可以持锁整场-run-不应持锁">5.1 短临界区可以持锁，整场 run 不应持锁</h3>
+<p>锁内只放读取、校验、修改和落盘，不放 LLM 思考、网络搜索或长时间测试。否则一个慢 agent 会把同文件其他工作全部堵住。</p>
+<p>锁还需要崩溃释放与等待上限：</p>
+<ul>
+<li>单机的 flock 在进程退出、文件描述符关闭时由内核释放；</li>
+<li>多副本可用 PG advisory lock，连接/事务结束时释放；</li>
+<li>等待超时返回可重试错误，不能无限卡住；</li>
+<li>若未来改成可过期租约，必须同时有 fencing token，防止旧持有者在租约过期后复活继续写。</li>
+</ul>
+<h3 id="52-锁的粒度">5.2 锁的粒度</h3>
+<ul>
+<li>普通文件：规范化后的绝对路径；</li>
+<li>Markdown 用户文件：tenant + user；</li>
+<li>Markdown 项目文件：workspace；</li>
+<li>多文件 patch：路径去重并按固定顺序取锁，防 AB-BA 死锁。</li>
+</ul>
+<p>PG advisory lock 只提供多副本协调，不会把多次文件写入变成一个数据库事务。跨文件全部成功/全部失败不能靠它承诺；需要这种语义时，应使用版本化副本和一次 Git 提交/合并，而不是继续堆锁。</p>
+<h3 id="53-非合作写者仍是边界">5.3 非合作写者仍是边界</h3>
+<p>bash、外部编辑器、其他服务可能不取锁。可选处理只有：</p>
+<ul>
+<li>明确承认该入口不受文件锁保护，并把风险写入工具契约；</li>
+<li>对可能写任意位置的 bash 做更大范围串行，付出并发下降；</li>
+<li>长任务直接给独立 worktree，让 bash 也只能改自己的副本。</li>
+</ul>
+<p>不能因为在文件工具里加了锁，就宣称整个 workspace 已无并发写风险。</p>
+<h2 id="6-长任务优先隔离与合并不引入-crdt">6. 长任务：优先隔离与合并，不引入 CRDT</h2>
+<p>Kimi 普通工具的 <code>ToolScheduler</code> 按 <code>ToolAccesses</code> 让同路径读写冲突排队；但调度器在一次工具批次内创建，不是跨机器队列。</p>
+<p>其 Tower 模式则给每个 mission 独立 Git worktree，worker 只能写自己的副本；范围重叠的任务建立依赖，合并串行，冲突交回 worker 解决。这比让长任务一直持有文件锁更适合 coding agent。</p>
+<p>对 tako：</p>
+<ul>
+<li>小修改共享文档、配置、记忆：使用 §4 的短临界区；</li>
+<li>多 agent 长时间并行修改同一项目：以 doc/70 的持久 Task 为执行底座，具体方案由 <a href="74-并行任务工作区隔离.html">doc/74</a> 承担（已落地 2026-11-12）；</li>
+<li>LLM 只决定编排与隔离需求，WorkspaceProvider 按真实项目选择实现：已有 Git 且需要合回时用组级中间 bare clone + 每 Task linked worktree；非 Git 目录用独立目录副本与文件变更清单，不自动 <code>git init</code>；</li>
+<li>原始仓库管理目录不向执行者开放；同组 Git worktree 共享本组元数据，不冒充独立 <code>.git</code> 级别的相互隔离；</li>
+<li>父结果按不可变版本交接，冲突交当前子任务；配置了验证命令时由程序在合并后实际执行，最终发布还要检查项目是否已经变化；</li>
+<li>文本无冲突不等于业务正确，Git 合并与目录清单都不能代替验证。</li>
+</ul>
+<p>CRDT/OT 留到真正的多人实时协同编辑需求。它们不自动理解代码或方案语义，不是这次文件竞争的默认答案。</p>
+<h2 id="7-参考实现核查">7. 参考实现核查</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>实现</th>
+<th>已核实的机制</th>
+<th>对 tako 的边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Kimi <code>toolContract</code> / <code>toolScheduler</code></td>
+<td>声明 read/write/readwrite/all；路径重叠且至少一方写就排队，纯读可并行</td>
+<td>当前调度器按工具批次创建，不是分布式锁</td>
+</tr>
+<tr>
+<td>Kimi Tower</td>
+<td>每 mission 独立 worktree；写越界拒绝；scope 重叠建立依赖；rebase/merge 处理冲突</td>
+<td>长任务隔离的参照，不是普通文件锁的替代品</td>
+</tr>
+<tr>
+<td>Hermes <code>FileStateRegistry</code></td>
+<td>同进程跨 subagent 的 per-path 锁、读取记录、last-writer 与过期覆盖拒绝</td>
+<td>普通文件协调主要是进程内，不是多副本证明</td>
+</tr>
+<tr>
+<td>Hermes 文件工具</td>
+<td>整文件写入有完整读取基准与 SHA256；patch 多路径排序取锁；底层临时文件 + 原子替换</td>
+<td>与本文短写入方向一致；外部写者仍是边界</td>
+</tr>
+<tr>
+<td>Hermes Memory</td>
+<td>独立 flock、锁内重读、条目操作、原子替换；subagent 默认无 memory 工具</td>
+<td>条目式 Memory 不需要通用 write_file 的指纹 map</td>
+</tr>
+<tr>
+<td>Rakazo</td>
+<td>PG 文档以 expectedRevision + Serializable 事务防覆盖，并保存修订</td>
+<td>适合正文在 PG 的文档，不直接解决磁盘文件与 PG 的跨存储原子性</td>
+</tr>
+</tbody>
+</table></div>
+<p>本地核查位置：<code>ref-agent/kimi-code/packages/agent-core-v2/</code> 的 <code>tool/toolContract.ts</code>、<code>agent/toolExecutor/</code>、<code>features/tower/</code>；<code>ref-agent/hermes-agent/tools/</code> 的 <code>file_state.py</code>、<code>file_tools.py</code>、<code>file_operations.py</code>、<code>memory_tool_store.py</code>；<code>ref-agent/rakazo/packages/memory/src/index.ts</code>。</p>
+<h2 id="8-活体与回归验收">8. 活体与回归验收</h2>
+<p>正式施工前仍需另写 todos 交审。验收至少覆盖：</p>
+<ol type="1">
+<li>两个并发 run 基于同一版本整篇重写：先写者成功，后写者因版本过期被拒绝；重新读取后合并成功。</li>
+<li>两个局部编辑修改不同位置：后一次读取带上前一次结果；修改同一旧锚点时后者明确失败。</li>
+<li>写入期间持续读文件：只能看到完整旧版或新版，不能出现空文件、半截行或混合版本。</li>
+<li>写者 <code>kill -9</code>：锁按所用机制释放，临时文件不冒充目标；另一写者可在等待上限后重试，不发生旧持有者复活覆盖。</li>
+<li>两个引擎副本共写同一路径：多副本锁真实生效；不同路径/项目仍能并行。</li>
+<li>多文件 patch 以相反顺序提交：不死锁；若中途失败，不把它描述成跨文件事务。</li>
+<li>bash/外部编辑器绕锁的负路径单独记录，不能用合作写者测试假装覆盖。</li>
+<li>长任务的完整活体验收归 <a href="74-并行任务工作区隔离.html">doc/74</a>：Git 项目与同组 worktree、非 Git 项目与独立目录副本都要验证并行执行、不可变结果交接、冲突处理、最终发布和崩溃恢复；不能只验 Git 一条路径。</li>
+</ol>
+<p>断言以真实文件字节、错误返回、锁等待与进程状态为准，不以模型说「已经安全写入」作为证据。</p>
+<h2 id="9-所以这解决了什么">9. 所以这解决了什么</h2>
+<p>本文把普通文件竞争拆成三条互不冒充的保证：**写者短临界区互斥、写入依据仍然新鲜、读者只见完整文件。**普通共享写入用锁 + 版本校验 + 原子替换，多副本把协调放到所有副本共享的 PG；长任务不靠整场持锁，通用工作区隔离、结果交接与发布恢复见 <a href="74-并行任务工作区隔离.html">doc/74</a>（已落地 2026-11-12）；Memory 使用条目操作，不背通用整文件基准表；bash 与外部写者的边界明说，不假装一把锁覆盖所有入口。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/71-%E6%96%87%E4%BB%B6%E5%86%99%E5%85%A5%E7%AB%9E%E4%BA%89.md"><code>doc/71-文件写入竞争.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

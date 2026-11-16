@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>35 · 项目目录（workspace） · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="35--项目目录workspace">35 · 项目目录（workspace）</h1>
+<blockquote>
+<p>性质：<strong>已落地</strong>（2026-10-21 收口）。A1–A8c 共 13 拍全部落地并 curl 验收过，随 <code>e30d1f9</code> 入库（2026-10-20）。 后续修改方案：<a href="76-项目内容目录与运行资源容器.html">doc/76</a>（<strong>2026-11-13 已落地</strong>）已把项目目录改为“资源容器 + content 用户内容根 + runtime 运行资源根”：本篇描述的磁盘路径（<code>workspaces/&lt;wid&gt;</code> 直接放用户文件、<code>.media/</code>、<code>.tako/</code>）与取回端点路径以 doc/76 为准；项目的归属、会话挂载与默认项目这些语义仍以本篇为准。 <strong>验收结论</strong>：逐拍实测实录在 <code>tmp/35-项目目录/planning.md</code> 第 12 节（引擎 <code>127.0.0.1:8904</code>，PG 5433 / Redis 6390）。 2026-10-21 活体抽验（引擎 <code>127.0.0.1:8942</code>、独立库、Redis db 8，本篇 10 项断言全过）：建项目拿到 <code>ws_</code> 前缀 id； 空项目名回 400；跨租户读别人的项目回 404；带 <code>workspaceId</code> 投消息拿到 sessionId； <code>GET /api/sessions?workspaceId=</code> 只列该项目下的会话；<code>PATCH /api/sessions/:id</code> 传空串解绑后该项目不再列它； 同项目第二场 live run 回 HTTP 409、业务码 <code>114004</code>；带图投消息的占位 path 锚在 <code>workspaces/&lt;wid&gt;/.media/</code>， <code>GET /api/media</code> 取回字节与上传同长、跨租户取同一张图回 404；删默认工作区回 HTTP 409、业务码 <code>114005</code>。 <strong>这一批明确不做的</strong>：项目目录的前端页面（独立 loop；<strong>2026-10-23 已由 <a href="44-前端三处欠账.html">doc/44</a> 落地</strong>）；把别人的会话改挂到别的项目（只能解绑）； 乐观并发（write_file 写前校验版本）留为远期缝，v1 不做；<strong>不做两套路径并存</strong>——存量 <code>sessions/&lt;sid&gt;/.media/</code> 已清，老占位 path 自然 404（dev 期接受，上线前写进 release note）。 <strong>2026-10-22 已落地（形态收窄，doc/42）</strong>：跨成员共享项目退役 + 项目闸（A7d）退役 + 「乐观并发远期缝」撤销。 本篇的「共享」语义改为<strong>个人项目</strong>（一个成员自己的项目，项目文件由他的多场 session 共享）； A7d 那道整层串行的闸改为<strong>文件级</strong>防护：flock 写锁 + 写前指纹比对（<a href="19-v6/19v6-08-file-tools.html">doc/19-v6/19v6-08</a> §语义裁定）。 代码侧的落点：可见性判定只剩属主（<code>pgstore.go</code> 三处 SQL + 列举）、<code>PATCH /api/workspaces/:id/visibility</code> 端点退役（恒 404 <code>114001</code>）、 <strong><code>runs.one_live_run_per_workspace</code> 索引已 DROP</strong>（<code>pgstore.go</code> 迁移处）、业务码 <code>114004</code> 退役（doc/40 §4.1）。 另：<strong>不再有「游离会话」</strong>——每场会话都挂一个项目（没指定就用该成员的默认项目，存量游离会话在下一场 run 时归位）， 产出因此落项目目录、会话目录只放会话自己的档案（子代理 wire / .media）→ <strong>删会话不再留孤儿文件</strong>。 真源关系：租户、token、会话默认私有看 <a href="28-多租户.html">doc/28</a>。附件的目标落点是本篇第 0 节第 2 条和第 6 条。 <a href="32-media-offload.html">doc/32</a> 里「字节落在会话目录、占位 path 带 <code>sessions/&lt;sid&gt;/</code>」那一版已经被本篇换掉。 回执仍按 doc/32：<code>read_media_file</code> 只写 size 和 sha，不把图字节写进对话。 施工面只有 <code>yk-tako-eino/</code>。 不在本篇：前端页面（<strong>2026-10-23 已由 <a href="44-前端三处欠账.html">doc/44</a> 落地</strong>）。删除项目时连带删会话已由 <a href="37-删除与档案清理.html">doc/37</a> 落地（2026-10-21）。</p>
+</blockquote>
+<h2 id="0-已拍的六条">0. 已拍的六条</h2>
+<p>开工时前五条按推荐项生效。第 2 条、第 5 条在 2026-10-20 重拍。第 6 条同一天补上。</p>
+<ol type="1">
+<li>挂在同一个项目上的所有会话，共用一个物理目录 <code>tenants/&lt;tid&gt;/workspaces/&lt;wid&gt;/</code>。A 会话的 agent 写下的文件，B 会话的 agent 在同一路径读得到。</li>
+<li>附件永远挂 workspace。目标工作区是会话行上的 <code>workspace_id</code>；这一列为空时，落到第 6 条的默认工作区。字节在 <code>tenants/&lt;tid&gt;/workspaces/&lt;wid&gt;/.media/&lt;sha16&gt;.&lt;ext&gt;</code>，占位 path 是 <code>workspaces/&lt;wid&gt;/.media/&lt;sha16&gt;.&lt;ext&gt;</code>。取图和模型读图按这个工作区的可见性查，复用 <code>VisibleWorkspace</code>。图跟着容器走：项目是 <code>tenant</code>，同租户成员取得到图；项目或默认工作区是 <code>private</code>，只有属主取得到。会话自己的 <code>visibility</code> 不决定这张图谁能取。agent 的工作产出仍按今天的规则：挂了项目进项目目录，没挂进会话目录。存量 <code>sessions/&lt;sid&gt;/.media/</code> 清掉，旧占位 path 直接 404，不做两套路径并存。施工分成三拍，三拍都已写。A8a 做默认工作区，以及「会话和这次请求都没有项目」时入口图的字节目录。A8b 把占位 path、<code>getMedia</code>、已经挂上项目的入口图换到工作区。A8c 让模型按工作区读图，并在进程启动时清掉 <code>sessions/&lt;sid&gt;/.media/</code>。</li>
+<li>删除只删空项目。项目下还有会话时回 409，先把会话挪走。空项目删表行，并递归删掉项目目录。连带删会话另立拍。默认工作区即使下面没有会话也不能删，见第 6 条。2026-10-21 <a href="37-删除与档案清理.html">doc/37</a> 已落地，本条里「项目下还有会话时回 409」和「连带删会话另立拍」不再作施工依据：有会话改为连带软删，<code>114002</code> 退役；项目下有活 run 回 <code>114006</code>，删单场会话遇到活 run 回 <code>114007</code>。</li>
+<li><strong>项目只有创建者能看、能改名、能删</strong>（2026-10-22 形态收窄，doc/42）。表上的 <code>visibility</code> 列保留但<strong>只写 <code>private</code></strong>——跨成员共享项目已退役：<code>GET /api/workspaces?scope=tenant</code> 不再有任何作用（与不传同形），<code>PATCH /api/workspaces/:id/visibility</code> 端点退役（恒 404 <code>114001</code>）。 ⚠️ <strong>别混</strong>：<strong>会话</strong>自己的 <code>visibility</code>（private/tenant，同租户成员可读对方的<strong>对话</strong>）<strong>不受影响</strong>——那是 doc/28 的另一码事；退役的只是<strong>项目与文件</strong>的共享。</li>
+<li><strong><code>POST /api/runs</code> 不带 <code>workspaceId</code> → 挂该成员的默认项目</strong>（没有就当场建，doc/35 §0 第 6 条）。2026-10-22 形态收窄（doc/42）：<strong>不再有「游离会话」</strong>——每场会话都挂一个项目，产出落项目目录。存量会话（<code>workspace_id</code> 为空）在下一场 run 时归位到默认项目。附件照旧落工作区的 <code>.media/</code>（内容寻址）。</li>
+<li>每个（租户，用户）有一个私有默认工作区。<code>workspaces.is_default</code> 为 true 时，部分唯一索引 <code>(tenant_id, user_id) WHERE is_default</code> 保证这一对至多一行。插入冲突就是闸，闸在库里。id 仍是随机的 <code>ws_</code>，名字是「默认」，<code>visibility</code> 是 <code>private</code>。创建、列表、改名和普通项目相同，列表响应里不额外露出 <code>is_default</code>。它特殊的两处：解析附件目标时，会话和这次请求都没有项目，就用这一行，没有就当场建；<code>DELETE</code> 回 HTTP 409 <code>{"code":114005,"message":"默认工作区不能删除","data":null}</code>，行不删，目录不删。注册时不建这行。纯文本的游离 run 也不建。同租户的另一个用户有自己的一行，默认列表互相看不见。团队里不设「全员共用的一个默认工作区」，否则一个人的私人附件会进所有成员的眼。</li>
+</ol>
+<h2 id="1-背景与动机">1. 背景与动机</h2>
+<p>doc/28 落地之后，一个租户看不到另一个租户的会话和文件。同一个租户里面，文件仍按一场会话一个目录隔开。agent 的文件工具根是 <code>tenants/&lt;tid&gt;/sessions/&lt;sid&gt;/</code>。</p>
+<p>用户在租户 <code>t_acme</code> 里做「Q4 调研」，连开三场会话。第一场让 agent 写下 <code>中间产物.md</code>。第二场想接着改，agent 调用 <code>read_file("中间产物.md")</code> 失败：文件根是第二场自己的目录，第一场的文件在隔壁 <code>sessions/&lt;sid&gt;/</code> 里。用户只能把内容复制过去。一个月后想把这几场翻出来继续，会话列表是平铺的，哪几场属于哪件事只能靠标题回忆。</p>
+<p>tenant 管租户之间的隔离，session 管一场对话。中间缺的那一层，是同一件事的多场对话，加上它们共用的文件。这一层叫项目，表名 <code>workspaces</code>。</p>
+<p>项目是 tenant 下的一行表记录，外加一个目录。表管归属和名字，目录管字节。会话挂进项目后，这场 run 的 agent 以项目目录为工作根。没挂的会话，包括全部存量，维持现状。「按项目切换」是每次请求自己带 <code>workspaceId</code> 做筛选。当前看哪个项目，由前端记住。多副本下服务端不保存「我正在看哪个项目」。</p>
+<h2 id="2-名词">2. 名词</h2>
+<ul>
+<li><strong>项目（workspace）</strong>：<code>workspaces</code> 表一行。<code>id</code> 以 <code>ws_</code> 开头，后面是 ULID。列还有 <code>tenant_id</code>、<code>user_id</code>（创建者）、<code>name</code>、<code>visibility</code>、<code>is_default</code>、<code>created_at</code>。<code>visibility</code> 是 <code>private</code> 或 <code>tenant</code>。<code>is_default</code> 为 true 的那一行是第 0 节第 6 条的默认工作区。磁盘路径是 <code>&lt;workspace&gt;/tenants/&lt;tid&gt;/workspaces/&lt;wid&gt;/</code>。<code>&lt;workspace&gt;</code> 是启动参数 <code>-workspace</code>，沿用现义，不改这个参数的名字。</li>
+<li><strong>作业根</strong>：一场 run 里，agent 的文件工具和 bash 的工作目录。今天是 <code>tenants/&lt;tid&gt;/sessions/&lt;sid&gt;/</code>。挂上项目之后是 <code>tenants/&lt;tid&gt;/workspaces/&lt;wid&gt;/</code>。</li>
+<li><strong>游离会话</strong>：<code>sessions.workspace_id</code> 为 NULL 的会话。全部存量会话都是游离的。以后建会话时不传 <code>workspaceId</code>，也是游离的。这个词只描述作业根。附件另有归属，见第 0 节第 2 条。</li>
+<li><strong>默认工作区</strong>：当前租户里、当前用户名下、<code>is_default</code> 为 true 的那一行项目。没有这行时，第一次要给游离会话落附件才会建。</li>
+<li><strong>active tenant</strong>：access token 里的 <code>tid</code>。<code>POST /api/auth/switch-tenant</code> 切换它。新建项目挂在这个租户下。</li>
+</ul>
+<p>A1 只插入表行，不建磁盘目录。目录在 A3：worker 起一场已经挂上项目的 run 时创建。一个项目如果还没有任何 run，盘上可以还没有 <code>workspaces/&lt;wid&gt;/</code>。A6 删除时空目录不存在，<code>RemoveAll</code> 也算成功。</p>
+<h2 id="3-用户原话怎么落">3. 用户原话怎么落</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>用户原话</th>
+<th>落法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>系统支持多 tenant</td>
+<td>现状已有（doc/28），本篇不动</td>
+</tr>
+<tr>
+<td>tenant 下面每个 user 能建多个项目目录</td>
+<td><code>workspaces</code> 带 <code>tenant_id</code> 和 <code>user_id</code>。<code>POST /api/workspaces</code></td>
+</tr>
+<tr>
+<td>session 挂到某个项目下</td>
+<td><code>sessions</code> 加可空列 <code>workspace_id</code>。<code>POST /api/runs</code> 的请求体加可选 <code>workspaceId</code></td>
+</tr>
+<tr>
+<td>一个目录对应多个 session</td>
+<td>挂同一个项目的 session，作业根都是 <code>workspaces/&lt;wid&gt;/</code></td>
+</tr>
+<tr>
+<td>按项目切换</td>
+<td><code>GET /api/sessions?workspaceId=</code> 做无状态过滤。后端没有「当前项目」</td>
+</tr>
+<tr>
+<td>删除</td>
+<td><code>DELETE /api/workspaces/:id</code>。创建者才能删。还有会话则 409。空则删行并删目录</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="4-端到端链路">4. 端到端链路</h2>
+<p>用户注册或登录，token 带上 active tenant。</p>
+<ol type="1">
+<li><code>POST /api/workspaces</code>，body 是 <code>{"name":"Q4 调研"}</code>。服务端用 token 的 tenant 和 user 插入一行，回 201。这一跳是 A1，代码已经写上。</li>
+<li><code>POST /api/runs</code> 带 <code>workspaceId</code>。请求字段是 <code>text</code>，不是 <code>input</code>。<code>postRuns</code> 先确认这个项目当前用户看得见：自己创建的，或本租户 <code>visibility=tenant</code> 的。对不上则 404，code <code>114001</code>，不建 run。对得上，新会话仍由服务端铸 <code>sessionId</code>（请求里不带这个字段）。<code>AcquireRun</code> 只在插入新 <code>sessions</code> 行时写下 <code>workspace_id</code>，写入前锁的是看得见的项目行。请求里带了未登记的 <code>sessionId</code>，仍是 404 <code>{"code":112001,"message":"找不到这场会话","data":null}</code>，不建行。已有会话再带 <code>workspaceId</code> 也不改这一列，挪进挪出走 A5 的 PATCH。下一场 run 的作业根看的是库里的列，不看这次请求。已经挂上的会话再发消息时，按这一列再看一次项目；成员已经看不见，同样 114001，不建 run。</li>
+<li>worker 起 run，读 session 行的 <code>workspace_id</code>。有值，作业根是 <code>tenants/&lt;tid&gt;/workspaces/&lt;wid&gt;/</code>。没有值，作业根仍是 <code>tenants/&lt;tid&gt;/sessions/&lt;sid&gt;/</code>。</li>
+<li>agent 调用 <code>write_file("中间产物.md")</code>，字节落在项目目录。同一项目的另一场会话再 <code>read_file("中间产物.md")</code>，读得到。</li>
+<li><code>GET /api/sessions?workspaceId=ws_x</code> 只返回挂在这个项目上的会话。不带这个参数时，返回这个用户能看到的全部会话，含游离的。</li>
+<li><code>PATCH /api/sessions/:id</code>，body <code>{"workspaceId":""}</code>，把会话解绑。<code>{"workspaceId":"ws_x"}</code> 则挂上去。解绑之后，已经写在项目目录里的文件留在原地。下一场 run 的作业根跟着新的归属走。</li>
+<li>项目下已经没有会话时，<code>DELETE /api/workspaces/ws_x</code> 删掉表行，并递归删掉目录。成功是 HTTP 200 <code>{"code":0,"message":"","data":{"status":"deleted"}}</code>。还有会话则 409，code <code>114002</code>。会话行不删。</li>
+</ol>
+<p>链路可以点名：用户 → <code>postWorkspaces</code> 或 <code>postRuns</code>（<code>server.go</code>）→ <code>AcquireRun</code>（<code>store.go</code>）→ worker 起 run 时调用 <code>runWorkspace</code>（<code>worker.go</code>）→ <code>scope.go</code> 的目录解析 → <code>listSessions</code>。挪进挪出走 <code>patchSessionWorkspace</code> → <code>SetSessionWorkspace</code>。删空项目走 <code>deleteWorkspace</code> → <code>DeleteWorkspace</code>，提交之后 <code>RemoveAll</code>。A1 到 A6 已经接通。入口图在 <code>postRuns</code> 里先走 <code>imageRoot</code>。已有会话只看会话行上的项目；新会话看这次请求的 <code>workspaceId</code>。两边都空时，<code>EnsureDefaultWorkspace</code> 取出或建出默认工作区。字节写到 <code>workspaces/&lt;wid&gt;/.media/</code>，占位 path 是 <code>workspaces/&lt;wid&gt;/.media/&lt;sha16&gt;.&lt;ext&gt;</code>。登录后的 <code>GET /api/media</code> 先 Clean 这条 path，再按 <code>VisibleWorkspace</code> 决定能不能读。看不见回 404 <code>{"code":114001,"message":"找不到这个项目","data":null}</code>（2026-10-22 换信封，见 <a href="40-响应信封统一.html">doc/40</a>）。<code>read_media_file</code> 用同一条 path：先查 <code>VisibleWorkspace</code>，再从租户根下的 <code>workspaces/&lt;wid&gt;/</code> 读。回执带 size 和 sha，不带图字节。<code>sessions/&lt;sid&gt;/...</code> 读不到。进程启动时删掉各租户 <code>sessions/&lt;sid&gt;/.media/</code>，工作区里的 <code>.media</code> 不动。dev 探针继续用会话目录。</p>
+<h2 id="5-分拍">5. 分拍</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>拍</th>
+<th>用例</th>
+<th>API</th>
+<th>存储</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A1</td>
+<td>建项目</td>
+<td><code>POST /api/workspaces</code></td>
+<td>新表 <code>workspaces</code></td>
+<td>已落地 + curl 验收（<code>e30d1f9</code>）</td>
+</tr>
+<tr>
+<td>A2</td>
+<td>列表、改名、创建者边界</td>
+<td><code>GET /api/workspaces</code>，<code>PATCH /api/workspaces/:id</code></td>
+<td>同一张表</td>
+<td>已落地 + curl 验收（<code>e30d1f9</code>）</td>
+</tr>
+<tr>
+<td>A3</td>
+<td>在项目里开聊，文件互通</td>
+<td><code>POST /api/runs</code> 加可选 <code>workspaceId</code></td>
+<td><code>sessions.workspace_id</code>；磁盘 <code>workspaces/&lt;wid&gt;/</code></td>
+<td>已落地 + curl 验收（<code>e30d1f9</code>）</td>
+</tr>
+<tr>
+<td>A4</td>
+<td>按项目看会话</td>
+<td><code>GET /api/sessions?workspaceId=</code>；详情带 <code>workspaceId</code></td>
+<td>同一列</td>
+<td>已落地 + curl 验收（<code>e30d1f9</code>）</td>
+</tr>
+<tr>
+<td>A5</td>
+<td>挪进、挪出</td>
+<td><code>PATCH /api/sessions/:id</code> 接 <code>workspaceId</code>，空串表示解绑</td>
+<td>同一列</td>
+<td>已落地 + curl 验收（<code>e30d1f9</code>）</td>
+</tr>
+<tr>
+<td>A6</td>
+<td>删空项目</td>
+<td><code>DELETE /api/workspaces/:id</code></td>
+<td>删行，并 <code>RemoveAll</code> 目录</td>
+<td>已落地 + curl 验收（<code>e30d1f9</code>）</td>
+</tr>
+<tr>
+<td>A7a</td>
+<td>项目可见性、团队列表</td>
+<td><code>PATCH /api/workspaces/:id/visibility</code>；<code>GET /api/workspaces?scope=tenant</code></td>
+<td><code>workspaces.visibility</code>，默认 <code>private</code></td>
+<td>已落地 + curl 验收（<code>e30d1f9</code>）</td>
+</tr>
+<tr>
+<td>A7b</td>
+<td>成员在共享项目里新开会话</td>
+<td><code>POST /api/runs</code> 不带 <code>sessionId</code>、带 <code>workspaceId</code></td>
+<td>新会话 <code>user_id</code> 是成员，<code>workspace_id</code> 是项目，会话 <code>visibility</code> 是 <code>private</code></td>
+<td>已落地 + curl 验收（<code>e30d1f9</code>）</td>
+</tr>
+<tr>
+<td>A7c</td>
+<td>创建者看见并解绑别人的会话</td>
+<td><code>GET /api/sessions?workspaceId=</code>；<code>PATCH</code> 空 <code>workspaceId</code></td>
+<td>只改列，不删会话，不搬文件</td>
+<td>已落地 + curl 验收（<code>e30d1f9</code>）</td>
+</tr>
+<tr>
+<td>A7d</td>
+<td><del>同一项目同时一场 live run</del></td>
+<td><del><code>POST /api/runs</code> 抢闸失败回 409，code <code>114004</code></del></td>
+<td><del><code>runs.workspace_id</code> 上 <code>status='running'</code> 的部分唯一索引</del></td>
+<td><strong>已退役（2026-10-22，doc/42）</strong>：项目闸随跨成员共享项目一起取消；同项目并发不再被拒，改由文件级防护兜（flock + 写前指纹比对，doc/19-v6-08）</td>
+</tr>
+<tr>
+<td>A8a</td>
+<td>每人一个私有默认工作区；没挂项目的入口图字节落进去</td>
+<td><code>DELETE</code> 命中默认工作区回 409，code <code>114005</code></td>
+<td><code>workspaces.is_default</code>；部分唯一索引 <code>(tenant_id, user_id) WHERE is_default</code></td>
+<td>已落地 + curl 验收（<code>e30d1f9</code>）</td>
+</tr>
+<tr>
+<td>A8b</td>
+<td>占位 path 和取图换到工作区</td>
+<td><code>GET /api/media</code> 按 <code>VisibleWorkspace</code></td>
+<td>占位 path <code>workspaces/&lt;wid&gt;/.media/…</code></td>
+<td>已落地 + curl 验收（<code>e30d1f9</code>）</td>
+</tr>
+<tr>
+<td>A8c</td>
+<td>模型按工作区读图，清掉旧目录</td>
+<td><code>read_media_file</code></td>
+<td>租户根下的工作区目录；启动时删除旧 <code>sessions/&lt;sid&gt;/.media/</code></td>
+<td>已落地 + curl 验收（<code>e30d1f9</code>）</td>
+</tr>
+</tbody>
+</table></div>
+<p>施工时的纪律：每拍做完停下等验收，不自动 commit。</p>
+<blockquote>
+<p><strong>2026-10-21 收口</strong>：13 拍全部落地并 curl 验收过，随 <code>e30d1f9</code> 入库。A6 的删除语义已由 <a href="37-删除与档案清理.html">doc/37</a> 改写（2026-10-21 已落地）：有会话改为连带软删，<code>114002</code> 退役；项目下有活 run 回 <code>114006</code>。<strong>第 0 节第 3 条与 §10 的错误码表是现行口径</strong>，本表 A6 那一行是当时的施工口径。</p>
+</blockquote>
+<h2 id="6-a1-契约post-apiworkspaces">6. A1 契约：POST /api/workspaces</h2>
+<p>调用者是已登录用户。路由挂 <code>RequireAuth</code>。归属不从 body 取：<code>tenant_id</code> 用 token 的 <code>tid</code>，<code>user_id</code> 用 token 的 <code>sub</code>。</p>
+<pre class="http"><code>POST /api/workspaces
+Authorization: Bearer &lt;accessToken&gt;
+Content-Type: application/json
+
+{&quot;name&quot;:&quot;Q4 调研&quot;}</code></pre>
+<p>成功是 HTTP 201。字段顺序是 <code>code</code>、<code>message</code>、<code>data</code>，项目对象里是 <code>id</code>、<code>name</code>、<code>createdAt</code>：</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;code&quot;</span><span class="fu">:</span><span class="dv">0</span><span class="fu">,</span><span class="dt">&quot;message&quot;</span><span class="fu">:</span><span class="st">&quot;&quot;</span><span class="fu">,</span><span class="dt">&quot;data&quot;</span><span class="fu">:{</span><span class="dt">&quot;workspace&quot;</span><span class="fu">:{</span><span class="dt">&quot;id&quot;</span><span class="fu">:</span><span class="st">&quot;ws_…&quot;</span><span class="fu">,</span><span class="dt">&quot;name&quot;</span><span class="fu">:</span><span class="st">&quot;Q4 调研&quot;</span><span class="fu">,</span><span class="dt">&quot;createdAt&quot;</span><span class="fu">:</span><span class="st">&quot;2026-10-19T12:00:00.123456+08:00&quot;</span><span class="fu">}}}</span></span></code></pre></div>
+<p><code>createdAt</code> 是 Go <code>time.Time</code> 的 RFC3339。响应不带回 <code>tenantId</code> 和 <code>userId</code>，这两列只在表里。同名项目可以有多行，名字不是唯一键。这一拍不建磁盘目录。</p>
+<p>名字先去掉首尾空白。去掉之后是空字符串，HTTP 400：</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;code&quot;</span><span class="fu">:</span><span class="dv">114003</span><span class="fu">,</span><span class="dt">&quot;message&quot;</span><span class="fu">:</span><span class="st">&quot;请填写项目名称&quot;</span><span class="fu">,</span><span class="dt">&quot;data&quot;</span><span class="fu">:</span><span class="kw">null</span><span class="fu">}</span></span></code></pre></div>
+<p>请求体不是 JSON，HTTP 400，code <code>111001</code>，message 是「请求格式不对」。</p>
+<p>没带 token，HTTP 401：</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;code&quot;</span><span class="fu">:</span><span class="dv">111102</span><span class="fu">,</span><span class="dt">&quot;message&quot;</span><span class="fu">:</span><span class="st">&quot;请先登录&quot;</span><span class="fu">,</span><span class="dt">&quot;data&quot;</span><span class="fu">:</span><span class="kw">null</span><span class="fu">}</span></span></code></pre></div>
+<p>插入失败，HTTP 500，code <code>111901</code>，message 是「服务暂时不可用，请再试一次」。具体错误只进服务端日志。</p>
+<h2 id="7-后面几拍的契约">7. 后面几拍的契约</h2>
+<p>A2 到 A6 已经按下面的形状写进代码。</p>
+<p><strong>A2 列表。</strong> <code>GET /api/workspaces</code>。条件是 <code>tenant_id</code> 等于 active tenant，并且 <code>user_id</code> 等于当前用户。按 <code>created_at</code>、再按 <code>id</code> 升序。没有项目时 <code>workspaces</code> 是空数组，不是 <code>null</code>。成功是 HTTP 200：</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;code&quot;</span><span class="fu">:</span><span class="dv">0</span><span class="fu">,</span><span class="dt">&quot;message&quot;</span><span class="fu">:</span><span class="st">&quot;&quot;</span><span class="fu">,</span><span class="dt">&quot;data&quot;</span><span class="fu">:{</span><span class="dt">&quot;workspaces&quot;</span><span class="fu">:</span><span class="ot">[</span><span class="fu">{</span><span class="dt">&quot;id&quot;</span><span class="fu">:</span><span class="st">&quot;ws_…&quot;</span><span class="fu">,</span><span class="dt">&quot;name&quot;</span><span class="fu">:</span><span class="st">&quot;Q4 调研&quot;</span><span class="fu">,</span><span class="dt">&quot;createdAt&quot;</span><span class="fu">:</span><span class="st">&quot;…&quot;</span><span class="fu">}</span><span class="ot">]</span><span class="fu">}}</span></span></code></pre></div>
+<p>同租户的另一个用户看到的是 <code>{"code":0,"message":"","data":{"workspaces":[]}}</code>。他后来自己建的项目只出现在他自己的列表里。</p>
+<p><strong>A2 改名。</strong> <code>PATCH /api/workspaces/:id</code>，body <code>{"name":"…"}</code>。名字的空白规则和创建相同，空名称仍是 HTTP 400，code <code>114003</code>。只有创建者能改。成功是 HTTP 200，体和创建一样，<code>createdAt</code> 不变：</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;code&quot;</span><span class="fu">:</span><span class="dv">0</span><span class="fu">,</span><span class="dt">&quot;message&quot;</span><span class="fu">:</span><span class="st">&quot;&quot;</span><span class="fu">,</span><span class="dt">&quot;data&quot;</span><span class="fu">:{</span><span class="dt">&quot;workspace&quot;</span><span class="fu">:{</span><span class="dt">&quot;id&quot;</span><span class="fu">:</span><span class="st">&quot;ws_…&quot;</span><span class="fu">,</span><span class="dt">&quot;name&quot;</span><span class="fu">:</span><span class="st">&quot;Q4 调研（改）&quot;</span><span class="fu">,</span><span class="dt">&quot;createdAt&quot;</span><span class="fu">:</span><span class="st">&quot;…&quot;</span><span class="fu">}}}</span></span></code></pre></div>
+<p>别人来改、项目不存在、或者 active tenant 对不上，都是 HTTP 404。不存在和无权看用同一个响应，避免靠状态码区分出别人有这个项目：</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;code&quot;</span><span class="fu">:</span><span class="dv">114001</span><span class="fu">,</span><span class="dt">&quot;message&quot;</span><span class="fu">:</span><span class="st">&quot;找不到这个项目&quot;</span><span class="fu">,</span><span class="dt">&quot;data&quot;</span><span class="fu">:</span><span class="kw">null</span><span class="fu">}</span></span></code></pre></div>
+<p><strong>A3 挂接。</strong> <code>POST /api/runs</code> 增加可选字段 <code>workspaceId</code>。预检失败是上面的 404，并且 <code>sessions</code> 和 <code>runs</code> 都不新增行。预检在会话准入之前。未登记的 <code>sessionId</code> 再加一个对不上的 <code>workspaceId</code>，回 <code>114001</code>。<code>workspaceId</code> 对得上、<code>sessionId</code> 却未登记，仍是 404 <code>{"code":112001,"message":"找不到这场会话","data":null}</code>。预检通过之后，新会话的 <code>workspace_id</code> 写成这个 id。worker 起 run 时读这一列：有值就 <code>MkdirAll</code> 到 <code>tenants/&lt;tid&gt;/workspaces/&lt;wid&gt;/</code>，没有值就仍用 <code>sessions/&lt;sid&gt;/</code>。2026-10-20 在 <code>127.0.0.1:8904</code> 打过：项目里的 <code>hello.md</code> 内容是 <code>abc</code>；同一项目的另一场会话 <code>read_file</code> 读到 <code>abc</code>；不带 <code>workspaceId</code> 的 <code>free.md</code> 落在会话目录；已有游离会话再带上合法 <code>workspaceId</code>，列仍是 NULL，新文件仍进会话目录。</p>
+<p><strong>A4 筛选。</strong> <code>GET /api/sessions?workspaceId=ws_x</code> 只返回挂在这个项目上的会话。参数先按创建者预检：对不上是 HTTP 404 <code>{"code":114001,"message":"找不到这个项目","data":null}</code>。项目在、下面没有会话，则是 HTTP 200 <code>{"code":0,"message":"","data":{"sessions":[]}}</code>。不带这个参数时，本人的全部会话都在，含游离的。过滤加在现有 <code>scope</code> 上，默认仍是本人。列表项在原字段后加 <code>workspaceId</code>，游离时为 <code>null</code>。<code>GET /api/sessions/:id</code> 仍是旧的成功体，字段顺序是 <code>liveRunId</code>、<code>runlogOffset</code>、<code>lastRunStatus</code>、<code>lastRunId</code>、<code>workspaceId</code>。游离会话的 <code>workspaceId</code> 是 <code>null</code>，键仍在。2026-10-20 在 <code>127.0.0.1:8904</code> 打过：项目 <code>ws_01M5AEXM2D81379KN6HC2FKATN</code> 的过滤结果是两场挂着的会话，游离的 <code>s_01M5AEXP8PT5XKX6VPX3E17SZT</code> 只出现在不带参数的列表里。</p>
+<p><strong>A5 挪动。</strong> 新增 <code>PATCH /api/sessions/:id</code>，与现有的 <code>PATCH /api/sessions/:id/visibility</code> 并存。body 必须带 <code>workspaceId</code>。<code>{"workspaceId":"ws_x"}</code> 挂上。<code>{"workspaceId":""}</code> 解绑；去掉首尾空白后仍是空，也解绑。字段缺席，或 JSON 值是 <code>null</code>，是 HTTP 400 <code>{"code":111001,"message":"请求格式不对","data":null}</code>，不会当成解绑。挂上之前做和 A3 相同的项目预检。对不上是 HTTP 404 <code>{"code":114001,"message":"找不到这个项目","data":null}</code>，列不改。门槛是 <code>sessions.user_id</code> 等于当前用户。看不到这场会话的人，仍是 404 <code>{"code":112001,"message":"找不到这场会话","data":null}</code>。同租户里能看见、但不是本人的，是 HTTP 403 <code>{"code":111204,"message":"只有本人能修改","data":null}</code>。成功是新信封 HTTP 200。挂上时 <code>data.workspaceId</code> 是项目 id，解绑时是 <code>null</code>。已经写下的文件留在原地。下一场 run 的作业根读更新后的列，不搬旧文件。</p>
+<p>2026-10-20 在 <code>127.0.0.1:8904</code> 打过。用户沿用 A3 的 <code>u_01M5AEXM1X5FCWHDM3M26TFVJW</code>，项目 <code>ws_01M5AEXM2D81379KN6HC2FKATN</code>，会话 <code>s_01M5AEXP8PT5XKX6VPX3E17SZT</code>。</p>
+<ul>
+<li>挂上：200 <code>{"code":0,"message":"","data":{"workspaceId":"ws_01M5AEXM2D81379KN6HC2FKATN"}}</code>。详情的 <code>workspaceId</code> 是这个 id。</li>
+<li><code>workspaceId</code> 为 <code>ws_no</code>：404，code <code>114001</code>。列仍是这个项目。</li>
+<li>另一个用户来解绑：404 <code>{"code":112001,"message":"找不到这场会话","data":null}</code>。同租户、能看见但不是本人的 403 这一拍没有单独打。</li>
+<li>body 是 <code>{}</code>：400 <code>{"code":111001,"message":"请求格式不对","data":null}</code>。</li>
+<li>挂上之后让 agent 写 <code>moved-in.md</code>：202，run <code>r_01M5AFQD87GNKZGEE5AR09FAAB</code>，状态 <code>complete</code>。文件在项目目录，字节是 <code>in</code>，不在会话目录。<code>hello.md</code> 和 <code>free.md</code> 仍在原处。</li>
+<li>解绑 <code>{"workspaceId":""}</code>：200 <code>{"code":0,"message":"","data":{"workspaceId":null}}</code>。详情是 <code>{"liveRunId":"","runlogOffset":12,"lastRunStatus":"complete","lastRunId":"r_01M5AFQD87GNKZGEE5AR09FAAB","workspaceId":null}</code>。</li>
+<li>解绑后再写 <code>moved-out.md</code>：202，run <code>r_01M5AFQF8BS3FFVZCH1BPRGS84</code>，状态 <code>complete</code>。文件在 <code>sessions/&lt;sid&gt;/</code>，字节是 <code>out</code>，不在项目目录。<code>hello.md</code> 和 <code>moved-in.md</code> 仍在项目目录。列是 NULL。</li>
+</ul>
+<p><strong>A6 删除。</strong> <code>DELETE /api/workspaces/:id</code>。同一笔事务里锁住创建者自己的项目行，数 <code>sessions.workspace_id</code> 等于这个 id 的行。大于 0 则整笔回滚，HTTP 409：</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;code&quot;</span><span class="fu">:</span><span class="dv">114002</span><span class="fu">,</span><span class="dt">&quot;message&quot;</span><span class="fu">:</span><span class="st">&quot;项目里还有会话，先挪走再删&quot;</span><span class="fu">,</span><span class="dt">&quot;data&quot;</span><span class="fu">:</span><span class="kw">null</span><span class="fu">}</span></span></code></pre></div>
+<p>等于 0 则删行，提交之后再 <code>RemoveAll</code> 项目目录。目录还没建过，<code>RemoveAll</code> 也算成功。别人的项目、已经删掉的项目，都是 HTTP 404 <code>{"code":114001,"message":"找不到这个项目","data":null}</code>。没带 token 是 HTTP 401 <code>{"code":111102,"message":"请先登录","data":null}</code>。</p>
+<p><code>DELETE /api/tenants/:id</code> 回的是 HTTP 200 <code>{"code":0,"message":"","data":{"status":"archived"}}</code>，因为那一拍是归档。项目删除是真删，成功体因此用 <code>deleted</code>：</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span><span class="dt">&quot;code&quot;</span><span class="fu">:</span><span class="dv">0</span><span class="fu">,</span><span class="dt">&quot;message&quot;</span><span class="fu">:</span><span class="st">&quot;&quot;</span><span class="fu">,</span><span class="dt">&quot;data&quot;</span><span class="fu">:{</span><span class="dt">&quot;status&quot;</span><span class="fu">:</span><span class="st">&quot;deleted&quot;</span><span class="fu">}}</span></span></code></pre></div>
+<p>新建会话写入 <code>workspace_id</code>、以及 <code>PATCH</code> 把会话挂进项目时，也锁同一行。删除持有锁的时候，挂接会等到锁释放；行已经没了，挂接就回 <code>114001</code>，不会把列写成一个已删的 id。反过来，挂接先提交，删除的计数能看见这场会话，于是回 <code>114002</code>。</p>
+<p>2026-10-20 在 <code>127.0.0.1:8904</code> 打过。用户 <code>u_01M5AEXM1X5FCWHDM3M26TFVJW</code>，项目 <code>ws_01M5AEXM2D81379KN6HC2FKATN</code> 上还有两场会话。当时目录里 <code>hello.md</code> 的字节是 <code>abc</code>，<code>moved-in.md</code> 的字节是 <code>in</code>。</p>
+<ul>
+<li>没登录就删：401，code <code>111102</code>。</li>
+<li>创建者来删：409，code <code>114002</code>。两个文件还在。</li>
+<li>另一个用户 <code>u_01M5AGN5V10AK3A4D27CC0S4NG</code> 来删：404，code <code>114001</code>。创建者再删仍是 409。</li>
+<li><code>ws_no</code>：404，code <code>114001</code>。</li>
+<li>从没建过目录的空项目 <code>ws_01M5AFDV316H8FB7FFFNDAYJMR</code>：200，<code>data.status</code> 是 <code>deleted</code>。再删一次是 404。列表里不再有它。</li>
+<li>另一个用户自己的 <code>ws_01M5AGN5W3X46JGAJK9T2P0595</code>：创建者去删是 404，对方自己删是 200 <code>deleted</code>。</li>
+<li>两场会话解绑之后，<code>GET /api/sessions?workspaceId=</code> 这个项目是 200 <code>{"code":0,"message":"","data":{"sessions":[]}}</code>。再删项目：200 <code>deleted</code>。目录没了，<code>hello.md</code> 和 <code>moved-in.md</code> 一起没了。三场会话还在，<code>workspace_id</code> 是 NULL。游离会话目录里的 <code>free.md</code> 字节仍是 <code>free-ok</code>。</li>
+<li>再删同一个 id，以及再用这个 id 过滤会话，都是 404，code <code>114001</code>。</li>
+</ul>
+<h2 id="8-这一篇明确不动的部分">8. 这一篇明确不动的部分</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>保持原样</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>媒体落盘和 <code>getMedia</code> 的路径检查</td>
+<td>2026-10-19 刚收掉的路径问题。项目只装 agent 的工作产出</td>
+</tr>
+<tr>
+<td>存储上限 <code>rejectStorage</code> / <code>directoryBytes</code></td>
+<td>上限数的是 <code>tenants/&lt;tid&gt;/</code> 整棵目录。项目目录在这棵下面，会被数进去</td>
+</tr>
+<tr>
+<td>子代理槽、<code>tenant_usage_daily</code></td>
+<td>配额按 tenant 算，项目不新开一档配额</td>
+</tr>
+<tr>
+<td><code>sessionWorkspace</code> 现有的三处调用里，媒体和 dev 探针那两处</td>
+<td>这两处要维持会话目录。只改 worker 起 run 时选根的那一处</td>
+</tr>
+<tr>
+<td>游离会话和存量行</td>
+<td>可空列加可选参数，不做迁移</td>
+</tr>
+<tr>
+<td><code>POST /api/auth/switch-tenant</code></td>
+<td>租户切换已经有了。项目不在服务端记「当前项目」</td>
+</tr>
+<tr>
+<td>runs、sessions、mcp、media、memory 的旧成功体</td>
+<td>换成 <code>{code,message,data}</code> 是 doc/28 的 A7，不借这一篇改</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="9-存储与多副本">9. 存储与多副本</h2>
+<p><code>Workspace</code> 经 GORM <code>AutoMigrate</code> 建表，不另写迁移文件。这和 <code>pgstore.go</code> 里现有表的建法相同。</p>
+<p>列表会按 <code>tenant_id</code> 加 <code>user_id</code> 查，所以建表时带了复合索引 <code>workspaces_owner</code>。</p>
+<p>归属和权限都在 PG 的行上。worker 起 run 时从 session 行读 <code>workspace_id</code>，再决定作业根。没有进程内缓存，也没有用 channel 等「当前项目」。多副本要读到同一批文件，仍然靠 <code>-workspace</code> 指向同一块共享盘。项目目录是 tenant 目录的子树。</p>
+<h2 id="10-错误码">10. 错误码</h2>
+<p>新码用 <code>114</code> 段。身份模块的 <code>111</code> 段不拿来表示项目不存在。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>code</th>
+<th>场景</th>
+<th>HTTP</th>
+<th>哪一拍开始用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>114001</code></td>
+<td>项目不存在，或当前用户不是创建者</td>
+<td>404</td>
+<td>A2</td>
+</tr>
+<tr>
+<td><code>114002</code></td>
+<td>项目里还有会话，不能删</td>
+<td>409</td>
+<td>A6 起用；2026-10-21 起退役，删除项目不再返回，码位不重用</td>
+</tr>
+<tr>
+<td><code>114003</code></td>
+<td>项目名称去掉空白后是空的</td>
+<td>400</td>
+<td>A1</td>
+</tr>
+<tr>
+<td><del><code>114004</code></del></td>
+<td><del>项目正在另一场会话里运行</del></td>
+<td>—</td>
+<td><strong>已退役</strong>（2026-10-22，doc/42；同项目并发不再被拒）</td>
+</tr>
+<tr>
+<td><code>114005</code></td>
+<td>默认工作区不能删除</td>
+<td>409</td>
+<td>A8a</td>
+</tr>
+<tr>
+<td><code>114006</code></td>
+<td>项目下有活 run，拒绝删除项目</td>
+<td>409</td>
+<td>doc/37 D1</td>
+</tr>
+<tr>
+<td><code>114007</code></td>
+<td>会话下有活 run，拒绝删除会话</td>
+<td>409</td>
+<td>doc/37 D3</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>114003</code> 的 message 是「请填写项目名称」。tenant 名称是空的仍用 <code>111003</code>「请填写工作区名称」。两个空名称不是同一件事，页面靠 code 区分，弹窗文案用各自的 message。<code>114006</code> 的 message 是「项目里有正在运行的会话，等它跑完再删」。<code>114007</code> 的 message 是「这场会话正在运行，等它跑完再删」。<code>114002</code> 从 2026-10-21 起不再返回。</p>
+<p>可见性不是 <code>private</code> 或 <code>tenant</code>，以及 body 里没有 <code>visibility</code> 字段，用已有的 <code>111002</code>，message 是「可见性只能是 private 或 tenant」，HTTP 400。缺 JSON 仍是 <code>111001</code>「请求格式不对」。不是创建者，或项目不存在，仍是 <code>114001</code>。</p>
+<p>成功和失败都回 <code>code</code>、<code>message</code>、<code>data</code>。失败且没有额外内容时 <code>data</code> 是 <code>null</code>，字段仍在。HTTP 状态保持 400、401、404、409、500，不把失败收成 200。</p>
+<h2 id="11-a1-的代码落点">11. A1 的代码落点</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>事情</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Workspace</code> 结构体、<code>CreateWorkspace</code>、<code>AutoMigrate</code></td>
+<td><code>yk-tako-eino/internal/runengine/pgstore.go</code></td>
+</tr>
+<tr>
+<td><code>POST</code> 处理</td>
+<td><code>product_api.go</code> 的 <code>postWorkspaces</code></td>
+</tr>
+<tr>
+<td>列表和改名</td>
+<td><code>product_api.go</code> 的 <code>listWorkspaces</code>、<code>patchWorkspace</code>；存储是 <code>ListWorkspaces</code>、<code>RenameWorkspace</code></td>
+</tr>
+<tr>
+<td>路由</td>
+<td><code>server.go</code> 的 <code>POST</code>、<code>GET /api/workspaces</code> 和 <code>PATCH /api/workspaces/:id</code>，中间件是 <code>RequireAuth</code></td>
+</tr>
+<tr>
+<td>空名称业务码</td>
+<td><code>auth.go</code> 的 <code>codeWorkspaceNameRequired</code>，值 <code>114003</code></td>
+</tr>
+<tr>
+<td>找不到项目</td>
+<td><code>auth.go</code> 的 <code>codeWorkspaceMissing</code>，值 <code>114001</code></td>
+</tr>
+<tr>
+<td>挂接</td>
+<td><code>server.go</code> 的 <code>postRuns</code> 预检 <code>VisibleWorkspace</code>；<code>AcquireRun</code> 插入 <code>workspace_id</code>；<code>scope.go</code> 的 <code>workspaceRoot</code>、<code>runWorkspace</code>；<code>worker.go</code> 起 run 时调用 <code>runWorkspace</code></td>
+</tr>
+<tr>
+<td>按项目列会话、详情带项目</td>
+<td><code>server.go</code> 的 <code>listSessions</code>、<code>getSession</code>；<code>ListSessions</code> 增加 <code>workspaceID</code> 条件</td>
+</tr>
+<tr>
+<td>挪进、挪出</td>
+<td><code>server.go</code> 的 <code>PATCH /api/sessions/:id</code> 指向 <code>patchSessionWorkspace</code>；存储是 <code>session_access.go</code> 的 <code>SetSessionWorkspace</code></td>
+</tr>
+<tr>
+<td>删空项目</td>
+<td><code>product_api.go</code> 的 <code>deleteWorkspace</code>；存储是 <code>pgstore.go</code> 的 <code>DeleteWorkspace</code>。挂接和新建会话写列前调用 <code>lockOwnedWorkspace</code>。目录路径是 <code>scope.go</code> 的 <code>workspaceDir</code>，删除时不创建目录</td>
+</tr>
+<tr>
+<td>项目闸</td>
+<td><code>runs.workspace_id</code> 加部分唯一索引 <code>one_live_run_per_workspace</code>（<code>status='running'</code>）。<code>AcquireRun</code> 写入这列；冲突时 <code>postRuns</code> 回 409，code <code>114004</code></td>
+</tr>
+<tr>
+<td>项目可见性</td>
+<td><code>workspaces.visibility</code>，默认 <code>private</code>。<code>product_api.go</code> 的 <code>patchWorkspaceVisibility</code>；存储是 <code>SetWorkspaceVisibility</code>。<code>listWorkspaces</code> 在 <code>scope=tenant</code> 时列本租户已共享的项目。路由是 <code>PATCH /api/workspaces/:id/visibility</code></td>
+</tr>
+<tr>
+<td>成员新开会话</td>
+<td><code>VisibleWorkspace</code> 认创建者或本租户 <code>visibility=tenant</code>。新建会话用 <code>lockVisibleWorkspace</code>。已挂上的会话在 <code>AcquireRun</code> 里用 <code>seeVisibleWorkspace</code> 再看一次，不加第二把项目锁。删除和 PATCH 挪进仍用 <code>lockOwnedWorkspace</code></td>
+</tr>
+<tr>
+<td>创建者解绑别人的会话</td>
+<td><code>ListSessions</code> 在默认列表筛到创建者自己的项目时，不再按 <code>user_id</code> 收窄。<code>SetSessionWorkspace</code> 在 <code>workspaceId</code> 为空、且会话正挂在创建者的项目上时，允许创建者解绑。改挂仍要会话主人</td>
+</tr>
+<tr>
+<td>默认工作区</td>
+<td><code>workspaces.is_default</code>，部分唯一索引 <code>one_default_workspace_per_user</code>。<code>pgstore.go</code> 的 <code>EnsureDefaultWorkspace</code> 在自己的事务里先查、再在保存点 <code>default_ws</code> 里插入；唯一冲突就回滚到保存点，再读已有的那一行。<code>server.go</code> 的 <code>imageRoot</code> 在目标工作区为空时调用它。<code>DeleteWorkspace</code> 在锁住创建者的行之后、数会话之前，看到 <code>is_default</code> 就回 <code>ErrWorkspaceDefault</code>。<code>deleteWorkspace</code> 把它写成 409，code <code>114005</code>。业务码常量在 <code>auth.go</code> 的 <code>codeWorkspaceDefault</code></td>
+</tr>
+<tr>
+<td>入口图换锚</td>
+<td><code>imageRoot</code> 返回工作区目录和前缀 <code>workspaces/&lt;wid&gt;/</code>。<code>ingestImagesAt</code> 把字节写进该目录的 <code>.media/</code>。<code>parseSessionMediaPath</code> 先 Clean，再认 <code>workspaces/&lt;wid&gt;/</code>。<code>getMedia</code> 有登录身份时用 <code>VisibleWorkspace</code>，字节从 <code>tenants/&lt;tid&gt;/workspaces/&lt;wid&gt;/</code> 读。没有身份时仍相对 <code>-workspace</code> 根</td>
+</tr>
+<tr>
+<td>模型读图</td>
+<td><code>filetools.go</code> 的 <code>resolveReadMediaPath</code>。<code>workspaces/&lt;wid&gt;/</code> 先过 <code>VisibleWorkspace</code>，再从 <code>WorkspaceRef.TenantRoot</code> 下的这个工作区读。<code>sessions/&lt;sid&gt;/</code> 直接报文件不存在。<code>newReadMediaFileTool</code> 收 <code>*Store</code>，在 <code>worker.go</code> 里单独装配。回执函数仍是 <code>mediaReceiptPlaceholder</code>。<code>media.go</code> 的 <code>ClearSessionMedia</code> 在 <code>cmd/yktako/main.go</code> 启动时调用</td>
+</tr>
+</tbody>
+</table></div>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/35-%E9%A1%B9%E7%9B%AE%E7%9B%AE%E5%BD%95.md"><code>doc/35-项目目录.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>

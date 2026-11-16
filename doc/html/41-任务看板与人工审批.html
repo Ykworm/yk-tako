@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>41 · 任务看板与人工审批 · tako 文档</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">tako 文档</a>
+  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="41--任务看板与人工审批">41 · 任务看板与人工审批</h1>
+<blockquote>
+<p>性质：<strong>已落地</strong>（2026-10-23）。<strong>B（PII 脱敏）+ C（任务看板）两线全部施工并验收</strong>；<strong>Loop A（人审回路）整条不做</strong>（留档备查，见 §3.1 与 §6 的 A1–A7）。 状态：✅ B1–B3、C1–C3 六拍 + P4 收口，全部完成。 <strong>验收结论（2026-10-23）</strong>：</p>
+<ul>
+<li><strong>PII 脱敏（B 线）三处挂载点全上</strong>：① <strong>工具统一出口</strong> <code>wrapToolErrors</code>（<code>tools.go:49</code>）——自家工具 / media / pdf / tool_search / <strong>MCP</strong> 的结果都走它，成功与错误两路都打码；② <strong>模型输入的唯一转换口</strong> <code>toSchemaMessages</code>（<code>midfold.go:373</code>）——首轮 / 折叠 / 救援三条路一次覆盖；③ <strong>记忆入库前</strong> <code>writeMemoryJobResult</code>（<code>memory.go</code>）——密钥类整条拒收（<code>extractStats.Rejected</code> 计数），证件类打码后入库。 规则：7 条密钥正则（继承 doc/06 口径）+ 证件类（身份证 / 手机 / 邮箱 / 银行卡）；掩码串与 span 由 <code>pii_test.go</code> 金样钉住，探针 <code>POST /api/dev/pii-check</code> 可手打复核。 ⚠️ <strong>挂载点是踩坑后定的，别照旧方案抄</strong>：原计划「贴真工具内侧」会漏 MCP；只挂 <code>prepareInput</code> 会在折叠后让 PII 复活（折叠的原料是 mh 原文）——两条都已改，见 §3.2。</li>
+<li><strong>任务看板（C 线）</strong>：PG 表 <code>run_tasks</code>（正本在库里，不在进程内存）+ 四把工具（TaskCreate / TaskUpdate / TaskList / TaskGet）+ <code>kind=task</code> 帧 + 前端看板块（状态色）。<strong>活得过崩溃</strong>：实测 <code>kill -9</code> 引擎 → 重启 → <code>POST /api/runs/{id}/resume</code>（202，lease_epoch 1→2）→ 崩前建的行<strong>一条没丢</strong>，且在续跑里被<strong>继续更新</strong>（不是一张死表）；机器可重跑的验收在 <code>scripts/acceptance/taskboard_crash.sh</code>。</li>
+<li><strong>帧 kind 词表 7→8</strong>（加 <code>task</code>；原计划的 8→9 随 Loop A 的 <code>approval</code> 帧一起取消）。task 帧的字节在 doc/19-v6-04「用例 8」登记为<strong>声明但暂不断言</strong>（要模型真的去调 TaskCreate 才造得出，模型行为不稳）；帧词表由 <code>contract_test.go</code> 钉住。</li>
+<li><strong>人工审批（Loop A）：整条不做。</strong> bash 的越界由沙箱围栏硬挡、MCP 的越界进了同款围栏（围栏根 = 该租户目录，doc/33）→ <strong>没有需要「挂起问人」的场景</strong>。 日期：2026-10-22（方案）→ 2026-10-23（落地）。 <strong>随 <code>fd6a489</code> 入库</strong>（2026-10-23）：B/C 两线的代码、前端与验收脚本都在那一笔；本篇头注与 doc/16、doc/README 的状态翻转由它之后的 docs 笔回填。 代码落点：<code>yk-tako-eino/internal/runengine/{pii.go,pii_test.go,pii_mount_test.go,tasktools.go,tasktools_test.go,tools.go,midfold.go,memory.go,worker.go,pgstore.go,server.go,contract_test.go,store_test.go}</code>；前端 <code>yk-tako-eino/web/src/{api.ts,chat.ts,App.vue}</code>；验收 <code>scripts/acceptance/taskboard_crash.sh</code> + <code>scripts/acceptance/expected.json</code>（用例 8 登记为暂不断言）；契约文档 <code>doc/19-v6/19v6-04-验收-curl.md</code>；台账 <code>tmp/41-任务看板与人工审批/</code>（本地，不入库）。 参照：doc/01、02、07（旧线看板，存档）；doc/06（旧线三态守卫与 PII 打码，存档）；<code>doc/archive/old-line/specs/</code> 的 MAF 审批设计（冻结存档）；doc/30（崩溃续跑底座）；doc/40（响应信封与业务码表）；doc/33（MCP 围栏）。 与 doc/16 的关系：不给总纲改排序，给 §5.1 第 1、2 项与 §2 表 #2／#3 行补一份已落地的方案真源（#7 行随 Loop A 一并不做）。 <strong>2026-10-28 追加（已落地 B5/B6）</strong>：看板加 <code>run_tasks.skill_name</code> 列（doc/52 D32，B5）与「会话内跨 run 续做」读口（doc/52 D34，B6）——<code>TaskList</code> 带上一场未完成行及说明、<code>description</code> 语义升级为「这一步具体做什么」、写回执不带这一段；执行权按看板恢复（doc/52 D35，B6）。设计与验收口径见 §3.3、§5.1。 <strong>2026-11-06 追加（已落地，doc/64）</strong>：看板加 <code>run_tasks.result</code> 列，<code>TaskUpdate</code> 标 <code>completed</code> 时必须带 result，否则整笔拒写；<code>TaskList</code>/<code>TaskGet</code>/「上一场」段把结果带回模型眼前。字段、闸、放行口与渲染口径见 §5.1；台账在 <code>doc/log/2026-11-06-看板结果列/</code>。</li>
+</ul>
+</blockquote>
+<hr />
+<h2 id="0-为什么三件事捆成一份方案">0. 为什么三件事捆成一份方案</h2>
+<p><strong>背景</strong>：doc/16 §5.1 把「人工审批 + PII 脱敏」排为当前待做第 1 项（原话：agent 能写文件、能跑 bash，没有闸等于让租户数据裸奔），「v6 任务看板」排第 2 项；§2 表 #7 行还挂着一个 ⬜ 的「内存 checkpoint + interrupt 审批」。用户要求出一份结合现行代码状况的独立方案，本文就是。</p>
+<p>先讲三个会真实发生的病灶故事：</p>
+<p><strong>病灶一（看板）</strong>：用户发了条「把这三个接口改造成异步，顺便补测试」的长任务，run 跑了二十分钟。页面上只有一段段 tool_call 帧在滚，用户看不出整体进展——哪步做完了、卡在哪、还剩几件，全在模型脑子里。旧线的任务看板（doc/01）本来解决这个，但它的正本是<strong>进程内内存 Store</strong>（doc/01 §3：「进程退出即清空」），随 v1–v5 旧线一起删了，v6 至今空着。</p>
+<p><strong>病灶二（PII 与审批）</strong>：租户 A 的 agent 跑 <code>cat .env</code>——bash 工具今天零守卫（<code>bash.go:3-4</code> 明文写着「不做危险命令表」），<code>.env</code> 里的厂商 API Key 原样进 tool_result 帧、进 mh（模型消息表）、进 runlog（历史真源），再被记忆抽取带进 memory_items 长期保存。多租户已经能区分人和组织（doc/28），但数据在 agent 工具链里是裸奔的。密钥之外，用户消息里的身份证号、手机号也一路原样喂给模型、抽进记忆。</p>
+<p><strong>病灶三（interrupt 审批）</strong>：就算定出「危险命令要拦下来问人」的规则，v6 的 run 也只有三种活法：complete / error / stopped（<code>worker.go</code> 收尾三态）。引擎里<strong>没有任何「暂停等人」的生命周期</strong>——<code>interrupted</code> 存在，但那是崩溃后的读侧派生视图（<code>server.go:864-872</code>：status 仍 'running'、租约过期），语义是「执行者死了」，不是「挂起等人」。旧线用过 eino 的 <code>compose.StatefulInterrupt</code> + gob checkpoint（doc/06、doc/blog），v6 翻篇时明确不做 eino checkpoint 接入（doc/30 §15），这条技术路线没有随代码留下来。</p>
+<p>三个病灶共用同一副地基：<strong>把 run 停在工具调用前、问人、按人的决定继续</strong>。PII 的「拒收／打码」要挂在同一处工具链上才能全覆盖；看板的「任务进度」挂在 PG 上之后才天然活得过崩溃续跑。分开做，等于三次重造同一套帧、端点、表和前端卡片。所以：一份方案，三个 loop（§6），<strong>人审回路只做一次</strong>。</p>
+<p><strong>端到端链路</strong>（每环可点名，机制在链路中的位置见 §3）：</p>
+<pre><code>用户发消息 → POST /api/runs 起 run（会话闸：runs 行部分唯一索引）
+  → worker 主循环 agent.Run（worker.go:620-774）
+  → 模型决策 → tool_call 帧（AppendFrame 进 tk:runlive）
+  → journalWrapHandler 先记意图（run_journal 表，intent 写失败不执行）
+  → 审批闸 gateMW 判定：allow / deny / ask
+       deny  → 解释文本当 tool_result 回给模型（不调工具、不打扰人）
+       ask   → run_approvals 表落一行 + approval 帧 + 阻塞轮询该行
+             → 人看帧/审批卡 → POST /api/approvals/:id/decide（PG CAS 一裁终裁）
+             → 批准：真执行，结果照常回模型；拒绝：拒绝文本当 tool_result
+  → PII 打码贴在真工具内侧：工具返回先打码再往外流（模型/mh/帧/runlog 全干净）
+  → 模型继续或定稿 → terminal 帧 → EndRun 事务（mh + runlog 一笔落库）
+  → 挂起期间进程死了：租约过期 → 派生 interrupted → 客户端 resume（doc/30 通路）
+  → 重放 journal 时对到 run_approvals 行：pending → 重新挂起；approved → 补执行；rejected → 补拒绝文本</code></pre>
+<h2 id="1-名词准入操作定义后文不再重复解释">1. 名词准入（操作定义，后文不再重复解释）</h2>
+<ul>
+<li><strong>人审回路</strong>：工具调用执行前的一道闸 + 一次等人。闸判 allow/deny/ask 三态；ask 时 run 挂起，人的决定回来后 run 继续。三态语义逐字继承 doc/06：allow 直接放行；deny 把解释性 string 当结果挡回给模型（<strong>不抛 error</strong>）；ask 暂停问人。</li>
+<li><strong>审批行（run_approvals 表一行）</strong>：一次 ask 的持久态。字段见 §5.1；状态机只有 <code>pending → approved/rejected</code>（外加终态 run 死亡后清扫的 <code>stale</code>）。它是多副本下「人在另一个入口裁决、worker 在本进程等」的共享阵地——裁决不是进程间消息，是** UPDATE 这一行**。</li>
+<li><strong>挂起</strong>：worker goroutine 阻塞在审批轮询上（SELECT 该行，1–2s 间隔），run 不结束、租约照续、不烧 token、不消耗迭代数。与之相对的 <code>interrupted</code> 是<strong>死了</strong>，挂起是<strong>活着在等</strong>。</li>
+<li><strong>裁决</strong>：人对一条审批行做出的 approve/reject。端点里用 PG 条件更新实现一裁终裁：<code>UPDATE run_approvals SET status=$2 WHERE id=$1 AND status='pending' RETURNING</code>——影响 0 行就是被别人裁过了，回 409。没有「第二个副本一起判」的窗口。</li>
+<li><strong>打码</strong>：正则命中后把敏感串换成保留头尾的掩码（旧线口径：头尾各 4 位；证件类中间位全掩）。打码不是删除原文的唯一策略——三处挂载点策略不同，见 §3.2。</li>
+<li><strong>tasktracker</strong>：任务看板在 v6 的统称（命名已裁定，doc/XX handoff，仓库零落点）。对外是 TaskCreate/TaskUpdate/TaskList/TaskGet 四把工具，状态词表 <code>pending/in_progress/completed/deleted</code>。</li>
+<li><strong>checkpoint（v6 语义）</strong>：本文<strong>不重建</strong>旧线意义的 eino gob checkpoint。v6 的等价物已经存在：mh（<code>run_model_messages</code>，模型输入唯一读源）+ run_journal（意图账本）+ runs 行的租约/令牌。interrupt 审批新增的持久态只有 run_approvals 一行。理由见 §3.1 第四段。</li>
+</ul>
+<h2 id="2-现状锚点方案就建立在这些事实上">2. 现状锚点（方案就建立在这些事实上）</h2>
+<p>结合现行代码（2026-10-22，main @ 7ef004e）逐条锚定：</p>
+<ol type="1">
+<li><strong>工具链零守卫</strong>。一手工具池在 <code>worker.go:192-245</code> 逐个 append，执行链 = ADK <code>ToolsNode</code> 直执行；唯一的包装是 <code>wrapToolErrors</code>（错误回注）和 <code>journalWrapHandler</code>（记账）。<code>bash.go:3-4</code> 明文不做危险命令表。<code>tools.go:47</code> 留了一句注释「interrupt 类错误原样透传，不挡未来 HITL」——eino 的错误通道是预留未用的出口。</li>
+<li><strong>middleware 挂点现成</strong>。<code>journalWrapHandler</code> 就是 <code>adk.ChatModelAgentMiddleware</code>，覆写 <code>WrapInvokableToolCall</code>（<code>journal.go:55-65</code>），在 handler 链最内位。审批闸和 PII 打码用同一个钩子类再包两层即可。<strong>顺序即语义</strong>（doc/blog §3：handlers[0] 最外层），本方案的执行序：gate（外）→ journal（中，既有）→ pii（内，贴真工具）。</li>
+<li><strong>帧只有 7 种</strong>。<code>contract_test.go:148-158</code> 用生产代码字面量钉死词表：<code>start/delta/tool_call/tool_result/usage/terminal/resume</code>。写帧唯一口 <code>AppendFrame</code>（Redis RPUSH 进 <code>tk:runlive</code>），轮询与 SSE 两条运输都原样透传 kind——加第 8、9 种 kind 传输层无障碍，但词表测试会立刻红，<strong>这是显式的同步点，不是隐患</strong>。</li>
+<li><strong>journal 意图先行，这就是挂起现场的半边</strong>。<code>journal.go:79-121</code>：intent 写失败不执行工具；result 写失败 run 走 error。崩溃恢复 <code>replayJournal</code>（<code>journal.go:141-255</code>）按 call id 归组重放，缺结果的调用回注固定文本 <code>interruptedResultText</code>（at-most-once，不重跑）。<strong>审批挂起天然借这层</strong>：挂起时 intent 已在账本里，进程死了重放也对得上。</li>
+<li><strong>interrupted 是派生视图，不是存储状态</strong>（doc/30 §2.3 的选择原文）：runs 行保持 <code>status='running'</code> + 租约过期，读侧派生。部分唯一索引 <code>one_live_run_per_session</code> 不放闸。本方案的挂起<strong>沿用同一哲学</strong>：不加第四种存储状态，挂起 = running + 存在 pending 审批行（读侧可派生「等审批」）。</li>
+<li><strong>恢复通路现成且已验收</strong>。<code>POST /api/runs/:id/resume</code>（<code>server.go:579-645</code>）：claim 用 PG <code>FOR UPDATE</code> CAS、epoch+1、三个 409（112102/112103/112104）；<code>seedResume</code> 丢 runlive 重建；<code>RunResume</code> 与 Run 共用主体（<code>worker.go:428-430</code>）。审批恢复是它的一个分支，不新造通路。</li>
+<li><strong>PII 是彻底空白</strong>。记忆条目 <code>MemoryItem</code>（<code>memory.go:65-77</code>）只有 kind 词表（fact/preference/decision/episode），无敏感分级；抽取只有提示词劝阻「不抽密钥」（<code>memory.go</code> 抽取提示词），无程序拦截；写入校验只查隐形字符与伪造块。全仓唯一带 mask 字样的是 <code>maskSecrets</code>（<code>product_store.go:874</code>，租户配置密钥出 API 打 <code>***</code>），与 PII 无关。<code>bash.go:24-26</code> 的 env 白名单是唯一「密钥不进历史」的现役机制。</li>
+<li><strong>旧线的两份设计档案还在</strong>。doc/06 记录了三态守卫（allow/deny/ask）、命令/文件守卫规则（<code>.env/.git/.ssh</code> deny、工作区外 ask）、7 条密钥正则打码（<code>sk-proj-</code>/<code>AKIA</code>/<code>AIza</code> 等，头尾各 4 位）、两个挂载点；<code>doc/archive/old-line/specs/</code> 的 MAF 设计记录了消息级请求-回执协议（框架替你把调用换成审批请求，人回执后按 call id 重入）。<strong>两者代码都已出仓，本文只继承结论，不继承实现</strong>。</li>
+<li><strong>eino StatefulInterrupt 这次不用</strong>。旧线博客（doc/blog）记过它的真实成本：信号树、地址链、gob 序列化全链、文档与实现互斥的坑。更硬的理由是 v6 的 run 循环是 worker 直驱动（<code>agent.Run</code> 单调用 + 事件消费），没有可重入的执行图，StatefulInterrupt 的恢复语义（checkpoint + 地址重入）无用武之地；而「阻塞在工具包装里 + 决定落 PG 行」在多副本目标栈下天然正确——gob checkpoint 是进程内字节，DB 行是共享阵地。</li>
+<li><strong>tasktracker 是空位</strong>。名字已裁定（doc/XX），代码零落点；旧方案的对外协议（四工具、四状态、约束写 tool description、明确不做三件）是重建时唯一的体内参照。</li>
+</ol>
+<h2 id="3-总设计">3. 总设计</h2>
+<h3 id="31-人审回路底座只做一次">3.1 人审回路（底座，只做一次）</h3>
+<p><strong>闸的判定</strong>（纯函数，金样单测钉死）：</p>
+<pre><code>gate(toolName, argsJSON, workspaceCtx) → allow | deny(理由) | ask(理由)</code></pre>
+<ul>
+<li><strong>deny 规则</strong>（硬拦，解释文本当 tool_result 回模型，不问人）：写类文件工具目标命中 <code>.env</code>/<code>.git</code>/<code>.ssh</code>/<code>id_rsa*</code>；写系统目录（<code>/etc</code>、<code>/usr</code>、根）；bash 命中危险命令正则一级表（<code>rm -rf /</code>、<code>mkfs</code>、<code>dd of=/dev/sd*</code>、fork bomb、<code>chmod -R 777 /</code> 等，逐条金样）。继承 doc/06 口径：「能问的不拒，该拒的不问」，全 ask 会把审批弹窗变成噪音。</li>
+<li><strong>ask 规则</strong>（挂起问人）：写类文件工具目标在工作区外；<strong>MCP 工具（<code>mcp__*</code> 前缀）一律 ask</strong>——第三方 server 不可信，且它们本就走 deferred 档、调用低频，噪音可接受。
+<ul>
+<li><strong>bash 不再「一律 ask」（2026-10-22 用户拍板）</strong>：bash 的作用范围<strong>由沙箱围栏硬挡</strong>，不是问人。实测（<code>sandbox-exec</code> 的 seatbelt profile，<code>sandbox.go</code>）：读 <code>/etc/hosts</code>／<code>~/.ssh</code>／<code>~/.zshrc</code> 与写工作区外<strong>全部 Operation not permitted</strong>；工作区内读写正常。→ <strong>越界 = 禁止，模型自己改路</strong>（bash 的结果里会附一句人话提示，见 <code>bash.go</code> 的「沙箱围栏」提示）。</li>
+<li><strong>因此 A 拍（人审回路）可以缩到最小</strong>：bash 不再需要「一律 ask」，人审回路只剩 <strong>MCP 工具</strong>与<strong>写类工具越界</strong>两类需问的场景——若这两类也按范围/白名单硬挡（如 MCP 只允许白名单 server），<strong>整条人审回路都可不做</strong>，本文的 A 拍整个取消（见 §8 开放问题 1）。</li>
+</ul></li>
+<li><strong>allow</strong>：其余（读类文件工具在工作区内、memory、search_history、get_time 等）。</li>
+<li>策略表一期硬编码在 <code>gate.go</code> + 金样测试；租户级可配（挂 tenant_settings）登记为后续拍，不做进 v1。</li>
+</ul>
+<p><strong>ask 的三拍</strong>（每步四问齐全）：</p>
+<ol type="1">
+<li><strong>落行</strong>：<code>INSERT run_approvals</code>（tenant_id/run_id/session_id/tool_name/args/reason/status=pending）。不做会怎样：进程死了解释不清在等什么。</li>
+<li><strong>发帧</strong>：<code>AppendFrame</code> 一条 <code>kind=approval</code> 的帧（字段映射见 §5.2）。不做会怎样：前端不知道在等人，页面死寂。</li>
+<li><strong>阻塞等</strong>：goroutine 内 1–2s 轮询该行，直到 <code>status != pending</code>；全程尊重 ctx（stopRun 能打断，run 走 stopped，行留 pending，裁决端点后补 409）。批准 → 调真 endpoint（原参数，不换）；拒绝 → 返回拒绝文案（「用户拒绝了这次调用。不要重试相同命令；需要的话先跟用户商量替代方案。」语义继承 doc/06）。</li>
+</ol>
+<p><strong>挂起现场 = 账本 intent + 审批行，不新造 checkpoint</strong>。挂起期间 worker 活着：watchdog 照续租约（<code>worker.go:519-526</code>），帧流静止，agent loop 不消耗迭代数。这解决什么：一次 ask 不需要把内存里的消息列表、循环进度序列化到任何地方——模型输入的下一次装配本来就从 mh 全序 + 账本重放出发（<code>prepareInput</code>），中断 run 的行本就未进 mh（EndRun 才落），journal 已经记了 intent。<strong>没这层会怎样</strong>：要么退回旧线 gob checkpoint（多副本下是进程内字节，裁决端点在别的副本够不着），要么挂起期间进程一死现场全丢。</p>
+<p><strong>崩溃兼容是 journal 重放的一个分支</strong>。挂起中进程死 → 租约过期 → 派生 interrupted（既有）；客户端 resume（既有 claim CAS）→ <code>replayJournal</code> 重放到这条 intent 时查 run_approvals：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>账本 intent 对到的审批行</th>
+<th>重放行为（对齐 doc/30 两个恢复分支的新第三分支）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>无行</td>
+<td>维持现状：<code>interruptedResultText</code> 回注，不重跑（at-most-once）</td>
+</tr>
+<tr>
+<td><code>pending</code></td>
+<td><strong>重新挂起</strong>：重发 approval 帧（seedResume 已清空 runlive，天然幂等），继续轮询</td>
+</tr>
+<tr>
+<td><code>approved</code></td>
+<td><strong>补执行</strong>：此刻真调 endpoint，结果落账本</td>
+</tr>
+<tr>
+<td><code>rejected</code></td>
+<td>拒绝文案回注</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>没这个分支会怎样</strong>：批准了的调用在 resume 后被当成「结果未知」跳过——人白批了，且模型拿到的文本与批准语义矛盾。<strong>resumeCount 语义不变</strong>：挂起不消耗次数（lease_epoch 不动），只有崩溃接管才 +1（doc/30 既有语义）。</p>
+<h3 id="32-pii-脱敏三个挂载点三种策略">3.2 PII 脱敏（三个挂载点，三种策略）</h3>
+<p>PII 在本方案指两类：<strong>密钥类</strong>（API Key、token、密码——旧线 7 条正则口径，直接继承并扩到 <code>AKIA</code>/<code>AIza</code>/<code>hf_</code>/<code>sk-</code> 家族与赋值形式）与<strong>证件类</strong>（身份证号、手机号、邮箱、银行卡）。打码掩码规则：密钥类头尾各 4 位（旧线口径）；证件类保留可人工核对的头尾、掩掉可直接利用的中段——逐条金样钉死。</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>挂载点</th>
+<th>位置（执行序）</th>
+<th>策略</th>
+<th>没它会怎样</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>① 工具返回</td>
+<td><strong>工具统一出口</strong> <code>wrapToolErrors</code>（<code>tools.go:49</code>）——自家工具 / media / pdf / tool_search / <strong>MCP</strong> 都走它，成功与错误两路都打码</td>
+<td><strong>打码后返回</strong>：模型、mh、runlog、tool_result 帧全部只见过干净文本（打码即焚，原文不进任何持久层）</td>
+<td><code>cat .env</code> 的密钥落帧落库，被记忆抽走，多租户数据裸奔</td>
+</tr>
+<tr>
+<td>② 模型输入装配</td>
+<td><strong>模型输入的唯一转换口</strong> <code>toSchemaMessages</code>（<code>midfold.go:373</code>）——首轮 / 折叠 / 救援三条路一次覆盖</td>
+<td><strong>喂模型前打码</strong>：mh/runlog 保留原文（页面要显示用户原话），模型侧只见掩码</td>
+<td>用户消息里的身份证号被模型复述进终稿、带进记忆</td>
+</tr>
+<tr>
+<td>③ 记忆抽取入库</td>
+<td><code>memory.go</code> 抽取管线 parseExtraction 之后、入库之前</td>
+<td><strong>密钥类拒收</strong>（整条丢弃，提示词劝阻变成程序拦截）；<strong>证件类打码后入库</strong>（记忆要复用，拒收会把可用信息一起扔掉）</td>
+<td>memory_items 慢慢攒成 PII 库，召回一次带一次</td>
+</tr>
+</tbody>
+</table></div>
+<p>三个点共用同一个扫描函数（<code>pii.go</code> 纯函数 + 金样单测 + dev 探针端点）。①与②策略不同是刻意的：工具输出夹带的密钥没有「用户想在页面上看到原文」的需求，焚掉最干净；用户消息原文要留在 runlog 里给页面回放，模型侧出口打码就足够。③的拒收/打码分档是开放问题第 2 条。</p>
+<p><strong>⚠️ 挂载点落位是踩坑后改的（2026-10-23 落地时）</strong>——本节原写的是「① 贴真工具内侧、② <code>prepareInput</code> 出口」，两处都<strong>不能用</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>原方案</th>
+<th>为什么不能用</th>
+<th>改成的</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>① 贴真工具内侧（每把工具各包一层）</td>
+<td>只覆盖第一方工具，<strong>MCP 工具的结果会漏</strong>——MCP 恰是最不可信的一路</td>
+<td>挂 <code>wrapToolErrors</code>（所有工具结果的唯一必经之路）</td>
+</tr>
+<tr>
+<td>② 挂 <code>prepareInput</code></td>
+<td>只管<strong>首轮</strong>；折叠的原料是 <strong>mh 原文</strong>（user 行按设计存原文给页面显示）→ <strong>折叠一次 PII 就复活</strong>（短对话安全、长对话漏，越重要的对话越漏）</td>
+<td>挂 <code>toSchemaMessages</code>（模型输入的唯一转换口，三条路一次覆盖）</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>本期不做</strong>：落库加密（at-rest）、向量库侧的 PII、对外 API 返回体的 PII 审查（记忆端点本来就是 dev 观测口）。这些是数据安全另案，不是 agent 工具链的闸。</p>
+<h3 id="33-任务看板tasktracker">3.3 任务看板（tasktracker）</h3>
+<p><strong>对外协议逐字继承 doc/01</strong>（旧线被验证过的部分，不重新发明）：</p>
+<ul>
+<li>四把工具：<code>TaskCreate(subject, description?, activeForm?) → taskId</code>、<code>TaskUpdate(taskId, status?, ...)</code>、<code>TaskList()</code>、<code>TaskGet(taskId)</code>。</li>
+<li>状态词表：<code>pending → in_progress → completed</code>，不再需要时 <code>deleted</code>（TaskList 不列出）。</li>
+<li><strong>约束写在 tool description，不写状态机</strong>：≥3 步或用户列了多件事才建表；一步任务不建；动手前标 in_progress，同时尽量一条；做完立刻 completed；测试红/做了一半/未解报错不准 completed；卡住就 Create 一条 blocker。</li>
+<li><strong>每个工具输出 = 操作回执 + 当前看板紧凑视图 + 催更块</strong>（模型的眼睛始终能自校准）。</li>
+<li><strong>Plan 层不重建</strong>：doc/01 既定——Plan 是给人审的文档，v1 没有人审 gate、没有 ExitPlanMode 式 interrupt，仅以提示词约定的口述方案形态存在。看板使用约定（什么时候建表）静态拼进系统提示——doc/blog 的同款答案：「提示词和工具，一个都不能少」。</li>
+<li><strong>明确不做三件</strong>（继承 doc/01 §6）：Action↔︎Task 双射、模型漏 Update 时自动勾选、Graph 拓扑强制执行顺序。「要硬进度：收窄执行模型，不要在开放 ReAct 上做语义对齐。」</li>
+</ul>
+<p><strong>存储改掉旧线的死因</strong>：正本从「进程内内存 Store + eino session 镜像」（doc/01 §3，进程退出即清空）改成 <strong>PG 表 <code>run_tasks</code></strong>（字段见 §5.1）。每个操作四问：做什么——工具 handler 直写一行；不做的后果——回到进程内存就是回到「崩溃即丢」；输入——TaskCreate/TaskUpdate 的参数（handler 拿到 args）；输出——该行 + 回执文本。崩溃续跑兼容性免费获得：已执行的 TaskCreate 行在 PG 里活着，resume 后 <code>TaskList</code> 读到的就是真相；被中断未执行的调用按 doc/30 默认不回放，模型从 TaskList 自校准（这正是旧线「回执带紧凑视图」的跨进程版）。</p>
+<p><strong>注入方式从旧线的动态 middleware 改为静态注册</strong>：v6 没有「只在有看板语义下才有意义」的状态——每个 run 都是干活 run。四把工具直接 append 进一手池（<code>worker.go:192-245</code> 那段），子代理通过既有的 <code>tools:</code>/<code>exclude_tools:</code> 四态自行裁剪（对齐 doc/26 四态表，金样测试 <code>TestShippedAgentSpecToolGuards</code> 需要同步——出厂规格的 effective 名单会多四把工具，金样行逐条更新）。</p>
+<p><strong>会话内跨 run 续做（2026-10-28 落地，doc/52 D34，B6）</strong>：现在的读口是按 run 的——<code>ListTasks</code>/<code>GetTask</code> 都拿 <code>run_id</code> 查（<code>tasktools.go:132</code>、<code>:141</code>，<code>taskBox</code> 在 <code>worker.go:596</code> 按 <code>(sessionID, runID)</code> 建）。用户发下一条消息就是新 run，于是<strong>上一场的看板在新 run 里完全看不见</strong>，而用户常说的是「第 3 步改一下」。补法：</p>
+<ul>
+<li><code>TaskList</code> 除当前 run 的看板，再带一段「<strong>上一场</strong>」：取本会话里最近一个（排除当前 run）<strong>有任务</strong>的 <code>run_id</code>，只列 <code>pending</code>/<code>in_progress</code> 的行，每行带 <code>description</code>；上一场全完成时只给一行提示、不带说明。</li>
+<li><strong>写操作回执不带这一段</strong>：<code>taskReceipt</code>（<code>tasktools.go:173</code>）仍只渲染当前 run——否则每建/改一条任务就把上一场的说明重付一遍。只有显式调 <code>TaskList</code> 才有。</li>
+<li><strong><code>description</code> 的语义因此升级</strong>：从「可选补充说明」（<code>tasktools.go:222</code>）变成「<strong>这一步具体做什么</strong>；下一场靠它续上」。这是 schema 文案 + 提示词约定，<strong>靠模型自觉、不是结构闸</strong>——模型没写细时的兜底是重读 doc/52 的技能正文。</li>
+<li>用户口中的「第 N 步」是页面上看到的 <code>task_no</code>（<code>#%d [%s] %s</code>，<code>tasktools.go:156</code>），<strong>不是</strong>技能正文的步骤编号，两者不保证对齐。</li>
+</ul>
+<p><strong>帧</strong>：tool_result 文本始终带紧凑视图（模型的眼睛，零契约成本）；另发 <code>kind=task</code> 帧给前端结构化渲染看板（契约 +1，见 §5.2）。没 task 帧会怎样：前端要解析自然语言文本才能画看板，换个提示词措辞就渲染错——帧是结构，文本是给人和模型的。</p>
+<h2 id="4-顺序即语义handler-链与装配点">4. 顺序即语义：handler 链与装配点</h2>
+<pre><code>一手池工具
+  └─ wrapToolErrors（既有，错误回注）
+       └─ gateMW（新增，最外）：allow 透传 / deny 返回解释 / ask 三拍
+            └─ journalWrapHandler（既有）：intent 记账——挂起前落账，崩溃重放对得上
+                 └─ piiMW（新增，贴真工具）：返回路径打码
+                      └─ 真工具</code></pre>
+<ul>
+<li>gate 在 journal <strong>外</strong>：deny 的调用从未发生，不该有 intent；ask 的调用intent 必须先落（挂起现场的半边）。</li>
+<li>pii 在 journal <strong>内</strong>、贴真工具：打码发生在结果返程上，意图与结果的分工不被打乱。</li>
+<li>MCP 工具与委派工具走同一个 <code>WrapInvokableToolCall</code> 链（<code>mcp.go:274</code>、<code>agents.go:507-509</code> 都在 handler 覆盖范围内）——<strong>审批与打码对 MCP/子代理调用天然生效</strong>，帧进当前 run 的 runlive。v1 验收只覆盖主代理；子代理调用触发审批时帧出现在父 run 帧面，属预期行为（登记为已知形态，不单独立拍）。</li>
+</ul>
+<h2 id="5-契约">5. 契约</h2>
+<h3 id="51-新表automigrate-从-struct沿用-pgstorego488-498-模式">5.1 新表（autoMigrate 从 struct，沿用 <code>pgstore.go:488-498</code> 模式）</h3>
+<p><strong><code>run_approvals</code></strong>（多副本阵地，闸的「等问题」）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>列</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>id</td>
+<td>string ULID <code>ap_</code></td>
+<td>主键；同时进 approval 帧的 <code>messageId</code> 字段</td>
+</tr>
+<tr>
+<td>tenant_id / workspace</td>
+<td>string</td>
+<td>可见性过滤键（对齐全部 PG 表的 scope 口径）</td>
+</tr>
+<tr>
+<td>run_id / session_id</td>
+<td>string</td>
+<td>回属；resume 重放按 run_id 对账</td>
+</tr>
+<tr>
+<td>tool_name / args / reason</td>
+<td>string</td>
+<td>问人内容：工具名、原始参数 JSON、命中规则的人话</td>
+</tr>
+<tr>
+<td>status</td>
+<td>string</td>
+<td><code>pending → approved/rejected</code>；run 终态后清扫器收 <code>stale</code>（挂 doc/37 同一轮）</td>
+</tr>
+<tr>
+<td>decided_by / comment / created_at / decided_at</td>
+<td>—</td>
+<td>审计面；comment 为可选的人填理由</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong><code>run_tasks</code></strong>（看板正本）：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>列</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>id</td>
+<td>string ULID <code>tk_</code></td>
+<td>主键</td>
+</tr>
+<tr>
+<td>tenant_id / run_id</td>
+<td>string</td>
+<td>一场 run 一块看板；TaskList 按 run_id 查。<strong>另有按会话的续做读</strong>（<code>tenant_id + session_id</code>，索引现成：<code>index:run_tasks_scope</code>），见 §3.3 与下方 D34 补记</td>
+</tr>
+<tr>
+<td>task_no</td>
+<td>int</td>
+<td>run 内自增，TaskUpdate 的 taskId（对齐旧线「taskId 只寻址看板行」）</td>
+</tr>
+<tr>
+<td>subject / description / active_form</td>
+<td>string</td>
+<td>逐字继承 doc/01 字段语义；<strong><code>description</code> 升级为「这一步具体做什么」</strong>（doc/52 D34，2026-10-28）</td>
+</tr>
+<tr>
+<td>result</td>
+<td>string</td>
+<td><strong>这一步的产出</strong>（数字、结论、路径、跑过的命令；2026-11-06，doc/64）。<code>not null default ''</code>；标 completed 时必填（写闸在 <code>UpdateTask</code>），入库前截到 300 字</td>
+</tr>
+<tr>
+<td>status</td>
+<td>string</td>
+<td><code>pending/in_progress/completed/deleted</code></td>
+</tr>
+<tr>
+<td>created_at / updated_at</td>
+<td>time</td>
+<td>—</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong><code>run_tasks</code> 行的生命周期（2026-10-27 补记）</strong>：</p>
+<ul>
+<li><strong>完成不删</strong>：<code>TaskUpdate</code> 把状态改成 <code>completed</code> 只改 <code>status</code> 列；<code>deleted</code> 也只是个状态值，行还在。全仓 <code>DELETE FROM</code> 语句里没有一条指向 <code>run_tasks</code>（2026-10-27 实读）。</li>
+<li><strong>删除单位是会话，不是 run</strong>：行带 <code>session_id</code>，与 <code>run_model_messages</code> 同一条生命周期——run 结束留着，项目删除也留着；会话软删（doc/37 §5.3）当时仍不动表，物理清除归清扫器的会话窗口（doc/37 §5.5）。</li>
+<li><strong>今天的缺口</strong>：<code>sweepDeletedSessionBatch</code>（<code>archive_sweep.go:190</code>）只清 <code>run_model_messages</code>；<code>run_tasks</code> 与 doc/47 的 <code>run_questions</code> 都没进清单。两张表都带 <code>session_id</code>，补法是同一批各加一条按会话过滤的 <code>DELETE</code> + 单测；要单独一拍，不在别的方案里顺手做。</li>
+</ul>
+<p><strong><code>run_tasks</code> 加 <code>skill_name</code> 列（2026-10-28 登记，doc/52 D32；<strong>B5 已落地 2026-10-28</strong>）</strong>：</p>
+<ul>
+<li><strong>为什么加</strong>：doc/52 的技能执行模型是「<strong>manager 自己读正文、自己执行</strong>」——正文里的步骤展开成看板任务，任务才是要完成的东西（正文是说明书，可折；任务在 PG 表里，不参与折叠）。于是需要回答「<strong>哪几条任务属于哪个技能</strong>」。</li>
+<li><strong>列</strong>：<code>skill_name string</code>（<code>gorm:"not null;default:''"</code>；空串 = 与技能无关的普通任务）。<strong>唯一写入点是 <code>TaskCreate</code></strong>：按本 run 最近一次成功 <code>use_skill</code>（skill 盒子的末尾项）盖戳。<strong>程序不代建任务</strong>——<code>read_skill</code> 不写盒子，<code>use_skill</code> 之后没 <code>TaskCreate</code> 就一行都不多；「<code>load_skill</code> 成功自动建兜底任务」的旧口径作废（doc/52 D32）。</li>
+<li><strong>两个读取口</strong>：① <code>taskBoardView</code> 每行带「（技能：名字）」，<code>TaskList</code>、写操作回执、<code>kind=task</code> 帧三处同源；<code>TaskGet</code> 详情多一行「技能：名字」。② <code>kind=task</code> 帧另有顶层 <code>skillName</code> 字段（<code>omitempty</code>）= 触发这次写入的那一行所属技能（<code>UpdatedAt</code> 最新、同刻取 <code>task_no</code> 大）；逐行归属以 <code>text</code> 为准。第三个读者是 <strong>run 装配</strong>——按看板里已有的 <code>skill_name</code> 把技能根补回 bash 盒子（doc/52 D35，B6 拍）。<strong>compact 不查这张表</strong>——「技能 → 任务号范围」的映射由看板回答，压缩管线保持纯函数（doc/52 D31，选项乙）。</li>
+<li><strong>为什么不用 <code>Subject</code> 前缀编码</strong>：前缀脆、且与「步骤 3/5」这类序号挤在一起；加列是可查询的事实。</li>
+<li><strong>落地证据（2026-10-28 隔离引擎 8943，真跑一场）</strong>：<code>use_skill(demo)</code> → 两条 <code>TaskCreate</code> → <code>kind=task</code> 帧 <code>{"eventOffset":12,"kind":"task","agent":"","model":"deepseek/deepseek-flash","name":"TaskCreate","skillName":"demo","text":"看板：\n#1 [pending] 读演示技能的资源清单（技能：demo）\n#2 [pending] 用演示技能跑一次检查（技能：demo）\n（还有 2 项没完成：…）"}</code> ；同场再 <code>use_skill(other)</code> 不建任务 → <code>run_tasks</code> 仍两行、<code>skill_name</code> 都是 <code>demo</code>；新 run 只 <code>read_skill</code> 后 <code>TaskCreate</code> → 帧不带 <code>skillName</code>、行 <code>skill_name</code> 为空。</li>
+</ul>
+<p><strong><code>TaskList</code> 的会话续做读（2026-10-28 落地，doc/52 D34，B6）</strong>：</p>
+<ul>
+<li><p><strong>查什么</strong>：<code>SELECT run_id FROM run_tasks WHERE tenant_id = ? AND session_id = ? AND run_id &lt;&gt; ? ORDER BY created_at DESC LIMIT 1</code>，再取该 run 的 <code>pending</code>/<code>in_progress</code> 行。走 <code>(tenant_id, session_id)</code> 复合索引（<code>tasktools.go:32-35</code>），不加新列、不加新表。</p></li>
+<li><p><strong>为什么是「最近一个有任务的」，不是「最近一个 run」</strong>：最新的 run 就是当前这场，看板还没建行；取它等于取空。要的是用户上一场干到一半的那块板。</p></li>
+<li><p><strong>为什么只列未完成</strong>：全完成时用户说的「改第 3 步」是<strong>重做</strong>，不是续做——这时 manager 该重读技能正文重新规划，列已完成的说明只会多付 token。所以全完成只回一行提示。</p></li>
+<li><p><strong>返回形状</strong>：仍是文本（与现有看板视图一致），当前看板在前、<code>上一场（r_…）</code> 段在后；<code>description</code> 只在「上一场」段渲染，当前场的行仍只显示 <code>#序号 [状态] 主题</code>——这是为了不让每张回执都变胖。</p></li>
+<li><p><strong>风险登记</strong>：<code>description</code> 写得细不细由模型决定，写不细就没有可续的内容；兜底是 doc/52 的重读正文（技能正文永远在盘上）。</p></li>
+<li><p><strong>落地（2026-10-28，B6）</strong>：<code>PreviousBoardRun</code>（同租户同会话最近一场、<code>status &lt;&gt; deleted</code>、按 <code>created_at</code> 倒序）→ <code>ListOpenTasks</code>（<code>pending</code>/<code>in_progress</code>、按 <code>task_no</code>）→ <code>previousBoardView</code> 渲染（<code>上一场（r_…）还有 N 项没完成：</code> + <code>#N [status] subject</code> + <code>说明：description</code>；全完成只一行 <code>上一场（r_…）已全部完成</code>）。只在 <code>TaskList</code> 的闭包里拼（<code>taskTenantOf(ctx) != ""</code> 才查），写回执与 <code>kind=task</code> 帧走原 <code>taskBoardView</code>，签名未动；查询失败只记日志、不影响看板主段。工具描述与 <code>taskBoardPrompt</code> 同步写「description 写这一步具体做什么」。活体见 doc/52 B6 段：run A 建 3 条完成 #1 → run B 的 <code>TaskList</code> 出现上一场 #2/#3 及说明、写回执不带，且不调 <code>use_skill</code> 直接跑脚本成功；run C 回「已全部完成」；只 use 不建任务的 run D → run E 不给执行权、无「上一场」。</p></li>
+</ul>
+<p><strong><code>run_tasks</code> 加 <code>result</code> 列与「标完成必须带 result」（2026-11-06 落地，doc/64）</strong>：</p>
+<ul>
+<li><strong>病灶</strong>：第 2 步跑统计脚本输出三万 token、中间有 <code>p95 = 1.8s</code>；模型用它写了结论、把任务标 completed，继续做后面几步。上下文超窗后 mid-run 折叠把那次工具往返折掉，摘要器看到的原料已被截到 2000 字，关键数字没进「重要事实」；模型对第 2 步失忆，要么编一个数，要么重跑脚本。跨 run 更常见：<code>TaskList</code> 只回 <code>#2 [completed] 统计延迟分布</code>，没有任何产出，要看数只能重跑。数据本身没丢（mh 原文行、runlog、<code>.tako/</code> 落盘文件都在），丢的是模型眼前那一份。</li>
+<li><strong>列</strong>：<code>result string</code>（<code>gorm:"not null;default:''"</code>）= 这一步的产出（关键数字、结论、产物路径、跑过的命令）。入库前 <code>truncateRunes(result, 300)</code>，超长截断并标原长（<code>…〔截断：原 N 字符〕</code>），<strong>不拒写</strong>——拒写会制造第二次涨停。</li>
+<li><strong>闸</strong>：<code>TaskUpdate</code> 把某行标 <code>completed</code> 时，<code>effectiveResult</code> = 本次传入 || 行上已有的结果；为空 → 返回哨兵 <code>ErrTaskResultRequired</code>，<strong>整笔回滚</strong>（状态与 result 都不写，其它字段也不写）。已经有结果的行再改主题/状态不会被二次拦。闸只管「有没有字」不管「有没有用」：「已完成」三个字能过闸，质量靠 schema 文案与系统提示约束。</li>
+<li><strong>拒写文本</strong>（模型唯一能看见的信号；走 <code>wrapToolErrors</code>，<code>toolErrorText</code> 对已带「错误：」的消息不重复加前缀）：<code>错误：标 completed 必须带 result——写这一步的产出（关键数字、结论、产物路径、跑过的命令），不是「已完成」「已修复」。</code></li>
+<li><strong>放行口</strong>：同 run 第 3 次因缺结果被拒起放行，<code>status</code> 落 <code>completed</code>、<code>result</code> 落固定串 <code>（未记录：连续 3 次没写结果）</code>；回执不追加任何催促。计数在 <code>taskBox</code>（随 run 死，同 noteBox 先例）。没有它，模型固执时会在同一个调用上无限撞墙。</li>
+<li><strong>读者</strong>（写了没人读等于没写）：① <code>TaskList</code> 用 <code>taskListView</code>：completed 且有结果的行多一行 <code>  结果：&lt;前 100 字&gt;</code>；② <code>TaskGet</code> 多一行 <code>结果：&lt;全文，已 cap 300&gt;</code>；③ 「上一场」段加「已完成的结果」子段，一条一行前 100 字（<code>ListCompletedResults</code>）——跨 run 续做唯一的入口；④ <strong>写回执与 <code>kind=task</code> 帧不变</strong>（沿用 D34 取舍：不让每张回执重付所有历史结果）；⑤ 前端不显示 result（另拍）。</li>
+<li><strong>不做的</strong>：不自动回填旧行、不给「已完成但空结果」打标、不生成任何「回去补」的措辞（这类措辞是唯一能诱发重跑的东西）；不改 <code>TaskCreate</code>（建任务时还没有结果）；不改帧词表、<code>expected.json</code> 与前端。</li>
+<li><strong>边界与证据</strong>：旧数据（本方案前完成的行）<code>result</code> 为空，不产生任何回补提示。机器证据在 <code>tasktools_test.go</code>：<code>taskResultGate</code> 判定金样、拒绝后状态与结果都没动、通过后两列一起写、350 字截断、<code>taskListView</code> 与上一场段金样。活体（隔离引擎 8943）：探针 <code>POST /api/dev/task-check</code> 已按转正点收成只读 <code>action=list</code>，钉住视图字节；真跑一场时模型收到 <code>错误：标 completed 必须带 result…</code> 后没有当场补写、转而问「要不要带上 result 重新标一次」——<strong>这条行为断言不判红</strong>（模型行为不稳，不进 <code>expected.json</code>）。</li>
+</ul>
+<h3 id="52-帧词表7--9">5.2 帧词表：7 → 9</h3>
+<p><code>contract_test.go:148-158</code> 词表测试同步改（这是快闸显式同步点，红即提醒）。新帧<strong>复用现有 Frame 字段，不加列</strong>：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>kind</th>
+<th>name</th>
+<th>args</th>
+<th>text</th>
+<th>messageId</th>
+<th>语义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>approval</code></td>
+<td>工具名</td>
+<td>原始参数 JSON</td>
+<td>命中规则的人话（问什么）</td>
+<td>审批行 id</td>
+<td>run 在等这条行的裁决</td>
+</tr>
+<tr>
+<td><code>task</code></td>
+<td>工具名（TaskCreate/TaskUpdate）</td>
+<td>参数 JSON</td>
+<td>看板紧凑视图（当前全量；属于技能的行带「（技能：名字）」，doc/52 B5）</td>
+<td>—</td>
+<td>看板结构态，前端据此渲染</td>
+</tr>
+</tbody>
+</table></div>
+<p>task 帧另带顶层 <code>skillName</code>（<code>omitempty</code>）= 触发这次写入的那一行所属技能；空串省略（doc/52 B5，2026-10-28 落地）。</p>
+<p>SSE 与轮询同真源透传（<code>server.go:978</code> 原样透传，零改动）；前端 <code>chat.ts:243-249</code> 的分派加两个分支。</p>
+<h3 id="53-端点信封走-doc40全部新端点不动已验收端点的字节">5.3 端点（信封走 doc/40；全部新端点，不动已验收端点的字节）</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>端点</th>
+<th>契约（成功体在 <code>data</code>）</th>
+<th>失败码（提议；<strong>新增 <code>115</code> 审批段</strong>，施工拍同步在 doc/40 §4.2 补行）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET /api/runs/:id/approvals?status=pending</code></td>
+<td><code>[{approvalId,runId,toolName,args,reason,status,createdAt}]</code></td>
+<td>404 <code>112002</code>（run 不在）</td>
+</tr>
+<tr>
+<td><code>POST /api/approvals/:id/decide</code> body <code>{decision:"approve"|"reject",comment?}</code></td>
+<td><code>{approvalId,status}</code></td>
+<td>404 <code>115002</code>；409 <code>115101</code>（已裁决）；403（非本会话属主，v1 仅属主可裁，对齐单场删除口径）</td>
+</tr>
+<tr>
+<td><code>POST /api/dev/seed-approval</code>（仅 -dev）</td>
+<td>造一条 pending 行</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>POST /api/dev/gate-check</code> body <code>{tool,args}</code></td>
+<td><code>{verdict,reason}</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>POST /api/dev/pii-check</code> body <code>{text}</code></td>
+<td><code>{masked,hits:[{kind,span}]}</code></td>
+<td>—</td>
+</tr>
+</tbody>
+</table></div>
+<p>挂起期间「在等审批」的可见性<strong>不改 <code>GET /api/runs/:id</code> 的响应字节</strong>：前端 reconcile 时查 <code>approvals?status=pending</code>（PG 是真源，刷新/换窗口都不丢；长挂起不依赖 runlive 的 TTL）。这是刻意对齐 doc/30「读侧派生、不动存储状态」的哲学。</p>
+<h3 id="54-记忆端点与-dev-观测口">5.4 记忆端点与 dev 观测口</h3>
+<p>PII 拍的活体验收走 doc/29 已就位的记忆 dev 观测口（端点只读、dev 面）；不新增产品面端点。</p>
+<h2 id="6-loop-拆分点头后逐拍施工每拍先交-todosmd">6. Loop 拆分（点头后逐拍施工；每拍先交 todos.md）</h2>
+<p>顺序 <strong>A（人审回路）→ B（PII）→ C（看板）</strong>：A 是 doc/16 §5.1 第 1 项的硬项主体；B 的两个工具链挂载点贴着 A 的链，顺手全覆盖；C 最独立放最后。B1 是独立纯函数拍，可与 A1 并行。每拍粒度目标 ≤80 行 diff；每拍「怎么验收」第一行都是打在一个跑着的东西上（硬闸门）。</p>
+<h3 id="loop-a--人审回路--2026-10-22-整条不做留档备查">Loop A · 人审回路 —— <strong>2026-10-22 整条不做</strong>（留档备查）</h3>
+<blockquote>
+<p>为什么不做：bash 的越界由<strong>沙箱围栏硬挡</strong>（实测：越界读/写全被沙箱拒绝），MCP 的越界也进了围栏 （围栏根 = 该租户目录，doc/33）→ <strong>没有需要「挂起问人」的场景</strong>。真要人点头的场景只剩「MCP server 自己要往租户目录外写」——那已经在围栏里被拒了（启动前置检查就说清「依赖要预装在租户目录里」）。 下面 A1–A7 的设计（<code>run_approvals</code> 表 / 挂起 / 裁决端点 / 审批卡 / resume 第三分支）<strong>保留在案</strong>， 将来若出现真需要人拍板的场景（例如「删除项目」这种不可逆动作），可从这里直接取。</p>
+</blockquote>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>拍</th>
+<th>改什么</th>
+<th>怎么验收（curl 第一）</th>
+<th>回答什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A1</td>
+<td><del><code>run_approvals</code> 表 + decide/list 端点 + <code>seed-approval</code> 造数口</del> <strong>（2026-10-22 整条不做）</strong></td>
+<td><code>seed-approval</code> 造行 → <code>decide</code> 批 → 行 approved；再 <code>decide</code> 拿 409 <code>115101</code>；<code>decide</code> 不存在的 id 拿 404 <code>115002</code></td>
+<td>裁决的 CAS 一裁终裁成立</td>
+</tr>
+<tr>
+<td>A2</td>
+<td><del><code>gate.go</code> 纯函数（deny 表 + ask 表）</del> <strong>（不做）</strong></td>
+<td><code>gate-check {"tool":"bash","args":{"command":"ls"}}</code> → <code>{"verdict":"ask","reason":"bash 一律问人"}</code>；<code>rm -rf /</code> → <code>deny</code>；<code>read_text_file</code> 工作区内 → <code>allow</code></td>
+<td>三态判定与规则表钉死</td>
+</tr>
+<tr>
+<td>A3</td>
+<td><del>gateMW 接线（journal 外）</del> <strong>（不做）</strong></td>
+<td>活体：起 run 让模型读 <code>.env</code> 路径 → 帧里 tool_result 是解释文本、工具未执行（runlog 无该行）</td>
+<td>硬拦不进人、不打扰人</td>
+</tr>
+<tr>
+<td>A4</td>
+<td><del>ask 三拍全回路（落行+发帧+阻塞轮询）</del> <strong>（不做）</strong></td>
+<td>活体：发「删掉 /tmp/tako-a.txt」→ 帧见 <code>kind=approval</code>；run 仍 running、帧流静止 → <code>decide approve</code> → run complete 且 tool_result 见执行结果；再来一次 <code>decide reject</code> → 拒绝文本进帧、run complete</td>
+<td>挂起-裁决-继续全链路</td>
+</tr>
+<tr>
+<td>A5</td>
+<td><del>resume 重放第三分支</del> <strong>（不做）</strong></td>
+<td>活体：挂起中 <code>kill -9</code> 引擎 → <code>GET /api/runs/:id</code> 派生 interrupted → <code>POST /resume</code>（202）→ approval 帧重发 → <code>decide</code> → run complete</td>
+<td>挂起现场活得过进程死亡</td>
+</tr>
+<tr>
+<td>A6</td>
+<td><del>前端审批卡</del> <strong>（不做）</strong></td>
+<td>浏览器：A4 场景卡片出现，点批准后帧流继续</td>
+<td>人在页面上能裁</td>
+</tr>
+<tr>
+<td>A7</td>
+<td><del>契约收口（词表 9 种 / expected.json 登记 A1）</del> <strong>（不做）</strong></td>
+<td><code>go test ./internal/runengine</code> 绿 + <code>assert_contract.py</code> 绿 + <code>check-expected.sh</code> 绿</td>
+<td>两台机器都钉住新契约</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="loop-b--pii-脱敏">Loop B · PII 脱敏</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>拍</th>
+<th>改什么</th>
+<th>怎么验收</th>
+<th>回答什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>B1</td>
+<td><code>pii.go</code> 扫描纯函数（密钥 7 条继承 + 证件类）+ <code>pii-check</code> 探针 + 金样单测</td>
+<td><code>pii-check {"text":"key=sk-proj-AbCdEfGhIjKlMnOp…"}</code> → <code>masked</code> 保留头尾各 4 位；身份证号/手机号/邮箱/银行卡逐条金样</td>
+<td>打码规则机器钉死</td>
+</tr>
+<tr>
+<td>B2</td>
+<td>挂载①工具返回 + ②装配出口（piiMW 贴真工具；prepareInput 出口打码）</td>
+<td>单测金样（装配函数输入含 PIi、输出无）；活体 smoke：发含假证件号消息 run 正常 complete（「模型不复述」类断言登记 <code>declared_not_asserted</code>）</td>
+<td>模型侧全程不见明文</td>
+</tr>
+<tr>
+<td>B3</td>
+<td>挂载③记忆抽取（密钥拒收、证件打码入库）</td>
+<td>活体：发「我的身份证号是 110101…，请记住」→ 抽取后记忆 dev 观测口读到打码后条目；密钥类断言：构造夹带 <code>sk-</code> 的原文 → 该条不入库</td>
+<td>记忆库不攒 PII</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="loop-c--任务看板">Loop C · 任务看板</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>拍</th>
+<th>改什么</th>
+<th>怎么验收</th>
+<th>回答什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>C1</td>
+<td><code>run_tasks</code> 表 + 四工具静态注册 + 回执文本（操作回执+紧凑视图+催更块）+ 系统提示约定</td>
+<td>活体：发「三步任务：…」→ 帧里 <code>TaskCreate</code> 多次、tool_result 文本含紧凑视图；<code>TaskUpdate</code> 状态翻转后 TaskList 文本同步</td>
+<td>模型有了进度账本</td>
+</tr>
+<tr>
+<td>C2</td>
+<td><code>task</code> 帧 + 前端看板渲染 + 词表测试/expected 登记</td>
+<td>浏览器：看板随帧渲染，状态色随 TaskUpdate 变；快闸绿</td>
+<td>人看得到进度</td>
+</tr>
+<tr>
+<td>C3</td>
+<td>resume 兼容验证 + 金样同步（<code>TestShippedAgentSpecToolGuards</code> 有效名单 +4）+ 收口（test/vet/活体）</td>
+<td>活体：run 中 kill -9 → resume → <code>TaskList</code> 行仍在、视图连续；<code>go test</code> + <code>assert_contract.py</code> 绿</td>
+<td>看板活得过崩溃</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>脚手架与转正</strong>：三个 dev 探针端点（seed-approval/gate-check/pii-check）是脚手架，转正点 = 对应 Loop 的活体验收通过后改为只读诊断口（对齐 doc/37 clean-sweep 探针先例）；不登记转正点的脚手架会永远留在代码里。</p>
+<h2 id="7-明确不做本期">7. 明确不做（本期）</h2>
+<ul>
+<li><strong>不做 eino checkpoint / gob 快照</strong>：v6 已有等价物（mh + journal + 租约），doc/30 §15 裁断沿用。interrupt 审批的现场 = 账本 intent + 审批行。</li>
+<li><strong>不做 Plan 层人审 gate</strong>：doc/01 既定，Plan 只是口述方案。</li>
+<li><strong>不做看板三件</strong>：Action↔︎Task 双射、自动勾选、拓扑强制（doc/01 §6）。</li>
+<li><strong>不做 server 巡检自动恢复/自动裁决</strong>：挂起期间恢复触发沿用 doc/30 A6 裁断——客户端触发；用户不在场 run 一直挂着，是同一取舍的直接后果，不是缺陷。</li>
+<li><strong>不做 at-rest 加密、对外 API 的 PII 审查</strong>：数据安全另案。</li>
+<li><strong>不做沙箱</strong>：命令守卫是正则闸，不是隔离（doc/06 §8 自留口径）。<strong>围栏本身是既有的</strong>（<code>sandbox-exec</code> 的 seatbelt profile，写只在工作区根内、读是工作区根 + 系统路径白名单，2026-10-22 实测）——不做的是「再加一层目录级沙箱」。</li>
+<li><strong>运行中插话 steer 不做</strong>（doc/16 §5 纪律）：挂起期间会话闸仍占着（running），与忙时拒绝同语义。</li>
+<li><strong>子代理半截重接不做</strong>（doc/39 v4）：审批挂起不改变子代理的崩溃语义。</li>
+</ul>
+<h2 id="8-开放问题点头时一起拍">8. 开放问题（点头时一起拍）</h2>
+<ol type="1">
+<li><del><strong>bash 一律 ask 还是命中才 ask</strong></del> → <strong>已定（2026-10-22 用户拍板）</strong>：bash 按<strong>范围</strong>判定，<strong>越界由沙箱硬挡（禁止），不问人</strong>（实测越界读/写全被拒）。MCP 工具仍一律 ask（第三方 server 不可信、调用低频）。→ <strong>若 MCP 也按白名单硬挡，Loop A 整条可不做</strong>（待拍，见 §8 开放问题 7）。</li>
+<li><strong>记忆 PII 分档</strong>：荐密钥类拒收、证件类打码入库。备选 = 全部拒收（保守但丢可用信息）／全部打码（密钥进库不可接受）。</li>
+<li><strong>挂起时长上限</strong>：荐无上限、lease 照续（人可能离开几小时）。备选 = N 小时未裁决自动拒绝（需新增超时清扫，复杂度 +1）。</li>
+<li><strong>码段</strong>：提议新增 <code>115</code> 审批段（§5.3），与 doc/40 §4「前两位是模块」口径一致。</li>
+<li><strong>Loop 顺序 A→B→C</strong>（B1 可与 A1 并行）。</li>
+<li><del><strong>MCP 工具要不要也按白名单硬挡</strong></del> → <strong>已定（2026-10-22，用户拍板「选 b」）</strong>：<strong>MCP 进程也进 seatbelt 围栏</strong>，围栏根 = 该租户的存储根 → 它只能读写这个租户的文件；平台的系统 MCP 不围栏；没有沙箱 → 拒绝启动（fail closed）。<strong>连带 Loop A 整条不做</strong>（见 §6 Loop A 头注）。</li>
+<li><del><strong>Loop A 做不做</strong></del> → <strong>已定：不做</strong>。本方案 = **B（PII 脱敏）+ C（任务看板）**两拍。连带 doc/16 的 #7（内存 checkpoint + interrupt 审批）一并退役。</li>
+</ol>
+<h2 id="9-所以这解决了什么">9. 所以这解决了什么</h2>
+<p>doc/16 的地基硬项 #2（审批闸）从「裸奔」变成三态闸 + PG 裁决阵地，多副本下成立；#3（任务看板）从进程内存空位变成 PG 正本 + 四工具，活得过崩溃；#7（checkpoint + interrupt 审批）以 v6 自己的方式补上——不重建 gob checkpoint，用 journal 账本 + 审批行实现「暂停问人、死了能续」。三件事一份方案，人审回路只做一次，帧、端点、表、前端卡各加一层。点头后按 §6 拆 todos.md 开工。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/41-%E4%BB%BB%E5%8A%A1%E7%9C%8B%E6%9D%BF%E4%B8%8E%E4%BA%BA%E5%B7%A5%E5%AE%A1%E6%89%B9.md"><code>doc/41-任务看板与人工审批.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>
