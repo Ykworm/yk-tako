@@ -82,4 +82,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_SHA: ${{ github.sha }}
           SITE_HOST: tako.docs.yktea.fun
+        # 通知失败不拖累发布：站点已经上线的，索引器慢一天不影响它。
+        # 失败仍会留在日志里（红字），不会静默。
+        continue-on-error: true
         run: python3 scripts/notify-indexnow.py

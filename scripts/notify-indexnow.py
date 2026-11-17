@@ -79,14 +79,17 @@ def main():
 
     sha = os.environ.get("GITHUB_SHA", "").strip()
     token = os.environ.get("GITHUB_TOKEN", "").strip()
-    urls = {"/"}
+    paths = {"/"}
     for name in changed_files(sha, token):
-        url = file_to_url(name)
-        if url:
-            urls.add(url)
+        path = file_to_url(name)
+        if path:
+            paths.add(path)
+
+    # IndexNow 只认绝对 URL：传路径（"/html/x.html"）它回 400 InvalidRequestParameters。
+    urls = sorted(f"https://{HOST}{path}" for path in paths)
 
     body = json.dumps(
-        {"host": HOST, "key": key, "urlList": sorted(urls)}, ensure_ascii=False
+        {"host": HOST, "key": key, "urlList": urls}, ensure_ascii=False
     ).encode("utf-8")
     request = urllib.request.Request(
         f"{ENDPOINT}?key={key}&host={HOST}",
