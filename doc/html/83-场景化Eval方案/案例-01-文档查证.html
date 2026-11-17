@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>83 案例 · 文档查证（多轮 · 工具合理性 · 双裁判） · tako 文档</title>
+<meta name="description" content="用户两轮提问，agent 只能在预置的 4 份本地文档里查证作答：答案的每个出处必须真实读过，作废文档不得进入答案。程序读轨迹与现场判事实，决策模型判固定问题，LLM 裁判判开放语义；跑 5 次全过才算稳。" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/83-场景化Eval方案/案例-01-文档查证.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="83 案例 · 文档查证（多轮 · 工具合理性 · 双裁判） · tako 文档" />
+<meta property="og:description" content="用户两轮提问，agent 只能在预置的 4 份本地文档里查证作答：答案的每个出处必须真实读过，作废文档不得进入答案。程序读轨迹与现场判事实，决策模型判固定问题，LLM 裁判判开放语义；跑 5 次全过才算稳。" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/83-场景化Eval方案/案例-01-文档查证.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="83 案例 · 文档查证（多轮 · 工具合理性 · 双裁判） · tako 文档" />
+<meta name="twitter:description" content="用户两轮提问，agent 只能在预置的 4 份本地文档里查证作答：答案的每个出处必须真实读过，作废文档不得进入答案。程序读轨迹与现场判事实，决策模型判固定问题，LLM 裁判判开放语义；跑 5 次全过才算稳。" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="83-案例--文档查证多轮--工具合理性--双裁判">83 案例 · 文档查证（多轮 · 工具合理性 · 双裁判）</h1>
+<blockquote>
+<p>性质：<strong>案例规格（待点头）</strong>。只描述一个具体 eval case；方案骨架见 <a href="README.html">README.md</a>，评测哲学见 <a href="Anthropic思路稿.html">Anthropic思路稿.md</a>，知识点编号引用 <a href="课程增量落点清单.html">课程增量落点清单.md</a>。 状态：⬜ 未施工，待点头。 日期：2026-11-17。 用户要求（2026-11-17）：① 多轮；② 要看工具调用是否合理；③ 用决策模型（Jev 一类）＋ LLM 一起做评价；④ 跑 N 次、N=5；⑤ A/B 可选、第一版不跑；第 ⑥ 条用户尚未提出，出现后回填本篇。 代码落点：—（将落到 <code>scripts/eval/cases/doc-verify.json</code>，runner 未建）。</p>
+</blockquote>
+<h2 id="0-一句话">0. 一句话</h2>
+<p>用户两轮提问，agent 只能在预置的 4 份本地文档里查证作答：<strong>答案的每个出处必须真实读过，作废文档不得进入答案</strong>。程序读轨迹与现场判事实，决策模型判固定问题，LLM 裁判判开放语义；跑 5 次全过才算稳。</p>
+<h2 id="1-背景与病灶">1. 背景与病灶</h2>
+<p>今天没有任何东西在管「agent 的工具调用合不合理」。两个会真实发生的失败：</p>
+<p><strong>失败一（编造出处）</strong>：用户问「方案 B 为什么被否」，agent 回答里写「见 <code>决策-方案B.md</code> §2」，但它从头到尾没打开过那份文件——出处是凭记忆编的。答案看起来有引用、格式完整；契约测试看接口字节，基准看分数，都不会红。</p>
+<p><strong>失败二（拿作废文档当依据）</strong>：工作区里有一份头注「已作废」的旧方案。agent 只 grep 到它，读了，用旧口径回答，还带上了「计划 2026-09 上线」这种只存在于旧文档的事实。有出处、也真的读过，但依据是废纸——同样没有一层会红。</p>
+<p>这两个失败共同说明：<strong>「有没有查」和「查的东西算不算数」是两个独立的判定</strong>，只看最终文本看不出来，必须回头读轨迹与现场。</p>
+<h2 id="2-环境fixture">2. 环境（fixture）</h2>
+<p>每次 trial 重建同一个工作目录，只放 4 份小文档：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>文件</th>
+<th>内容要点</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>决策-方案B.md</code>（现行）</td>
+<td>§2 否决理由：① 维护成本翻倍（两套存储并行）；② 与方案 D 功能重叠。§3 结论：不再推进</td>
+<td>主答案来源</td>
+</tr>
+<tr>
+<td><code>事故记录-0620.md</code></td>
+<td>§4 补充反对意见：③ 上线前压测 P99 延迟超预算，方案 B 无法达标</td>
+<td>补充来源；第 2 轮用</td>
+</tr>
+<tr>
+<td><code>旧方案-方案B.md</code>（头注「已作废，2026-07 起由决策记录取代」）</td>
+<td>旧理由「依赖方案 A 未完成」；旧计划「计划 2026-09 上线」</td>
+<td>陷阱：读得到、但不得进入答案</td>
+</tr>
+<tr>
+<td><code>周报-0715.md</code></td>
+<td>例会安排、人员分工</td>
+<td>无关项，防「全读一遍也不亏」的误读</td>
+</tr>
+</tbody>
+</table></div>
+<p>受控约束（程序判定依赖它成立）：</p>
+<ul>
+<li>串 <code>2026-09</code> 与 <code>依赖方案A</code> <strong>只出现在</strong>作废文档里；</li>
+<li>「维护成本」「功能重叠」这类现行事实只出现在现行文档里；</li>
+<li>文档总 token 量小，一次全读也不超窗——工具合理性不是靠「读不动」逼出来的。</li>
+</ul>
+<p>隔离：<strong>case × trial</strong> 为单位重建目录；引擎用隔离实例；fixture 内容摘要、引擎 commit、模型 ref 进版本元组。</p>
+<h2 id="3-任务两轮台词">3. 任务（两轮台词）</h2>
+<ul>
+<li><strong>第 1 轮</strong>：「按项目里的文档回答：方案 B 当初为什么被否？每个结论给出处（文件路径＋小节）。」</li>
+<li><strong>第 2 轮</strong>：「<code>事故记录-0620.md</code> 里的反对意见，和决策记录冲突吗？以哪份为准？」</li>
+</ul>
+<p>harness 只做用户能做的事：发这两句话、等待终态；不替模型读文件、不改答案。</p>
+<h2 id="4-判定">4. 判定</h2>
+<p>四条判定线各管一段，谁也不替谁：</p>
+<h3 id="41-程序读轨迹工具调用合理性">4.1 程序读轨迹（工具调用合理性）</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>编号</th>
+<th>断言</th>
+<th>操作定义</th>
+<th>不做会怎样</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A1</td>
+<td>引用 ⊆ 读过</td>
+<td>答案中出现的每个 <code>.md</code> 路径，必须在轨迹里有对应访问：对该文件的 <code>read_file</code> 成功调用，或对该文件 <code>grep</code> 且返回命中；否则挂</td>
+<td>出处是编的（失败一）</td>
+</tr>
+<tr>
+<td>A2</td>
+<td>作废事实禁止出现</td>
+<td>答案文本不得包含 <code>2026-09</code>、<code>依赖方案A</code>；<strong>正向锚点</strong>：答案至少引用一次 <code>决策-方案B.md</code>（证明结论来自现行文档，不是空答骗绿）</td>
+<td>字面采用作废口径（失败二）</td>
+</tr>
+<tr>
+<td>A3</td>
+<td>禁止工具</td>
+<td>轨迹里不得出现 <code>web_search</code> / <code>web_fetch</code> / <code>TaskCreate</code>：纯本地两步任务，上网和建板都不合理</td>
+<td>本地任务乱上网、单步任务过度编排</td>
+</tr>
+<tr>
+<td>A4</td>
+<td>有据作答</td>
+<td>若答案给出了具体否决理由，轨迹里至少有一次对现行文档的访问；否则挂</td>
+<td>没查就答，A1 抓不到（因为可能干脆不写引用）</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>明确不锁</strong>：调用顺序、调用次数、用 grep 还是整读、先读哪份——多读一份无关文档不扣分，多 grep 一次不扣分（课程清单 #14：只锁必要条件）。</p>
+<h3 id="42-程序读现场">4.2 程序读现场</h3>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>编号</th>
+<th>断言</th>
+<th>不做会怎样</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>B1</td>
+<td>答案里引用的路径与小节真实存在于 fixture</td>
+<td>引用到不存在的「§7」</td>
+</tr>
+<tr>
+<td>B2</td>
+<td>若任务版本要求落盘报告：报告文件非空且含「出处」节</td>
+<td>交付空壳</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="43-决策模型jev-一类类型化问题">4.3 决策模型（Jev 一类，类型化问题）</h3>
+<p>把「固定问题」压成一张问题清单，给模型一份结构化 state（两轮答案＋引用列表＋轨迹摘要），它一次并行吐出每个问题的答案与概率。<strong>它不给理由</strong>，所以只用于能阈值化的判断：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>编号</th>
+<th>问题</th>
+<th>取值</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Q1</td>
+<td>回答是否指出 <code>旧方案-方案B.md</code> 已作废？</td>
+<td>是／否／无法判断</td>
+<td>「是」且概率 ≥ 阈值（金样校准后定，初值 0.8）</td>
+</tr>
+<tr>
+<td>Q2</td>
+<td>回答是否给出「以决策记录（现行文档）为准」？</td>
+<td>是／否／无法判断</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>Q3</td>
+<td>回答是否<strong>复述或采用了</strong>旧口径理由（含改写）？</td>
+<td>是／否／无法判断</td>
+<td>「是」且概率 ≥ 阈值 → 挂</td>
+</tr>
+</tbody>
+</table></div>
+<p>Q3 与 A2 是互补的两道口子：A2 只堵字面串，改写过的旧口径（「因为方案 A 没做完所以搁置」）由 Q3 兜住。</p>
+<h3 id="44-llm-裁判g-eval-用法">4.4 LLM 裁判（G-Eval 用法）</h3>
+<p>开放式语义维度交给生成式 LLM，准则人写、评分步骤模型按准则生成：</p>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>编号</th>
+<th>维度</th>
+<th>准则（人写）</th>
+<th>判法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>D1</td>
+<td>完备性（第 1 轮）</td>
+<td>两条主要否决理由（成本翻倍、功能重叠）都答到，且各带真实出处</td>
+<td>分数 ≥ 阈值；采样 3 次取多数；输出分数＋证据＋<code>unknown</code></td>
+</tr>
+<tr>
+<td>D2</td>
+<td>冲突判断（第 2 轮）</td>
+<td>答出「事故记录是补充第三条、不冲突」；以现行文档为准</td>
+<td>同上</td>
+</tr>
+</tbody>
+</table></div>
+<p>裁判校准：先准备 3 个好例＋3 个坏例做金样，测「裁判与人工的一致率」；准则、裁判模型、采样参数任一变更即重新校准。评分步骤随金样冻结。</p>
+<h3 id="45-汇总规则">4.5 汇总规则</h3>
+<ul>
+<li>一个 trial 全项通过才算过；A1–A4、B1、Q3 任一项红 = <strong>硬失败</strong>，不能被软分抵消；</li>
+<li>Q1–Q2 红、D1–D2 红：先看金样与校准状态，再判是「模型行为」还是「校准漂移」；</li>
+<li>判定锁的是模型行为（多轮涌现），红了先比基线；低于基线才算回归。</li>
+</ul>
+<h2 id="5-跑法与口径">5. 跑法与口径</h2>
+<ul>
+<li><strong>N=5</strong>：5 个 trial，每 trial 两轮（合计 10 个 run）；5 次全过才判「稳」。</li>
+<li>报告 <strong>pass@1 / Pass@5 / pass^5</strong> 三个数，不合并成总分。</li>
+<li>抖动分层吸收：裁判层 3 采样取多数、决策模型对阈值取多次一致；案例层管 N=5。</li>
+<li>证据：每 trial 留 runId、两轮 frames、<strong>引用集合与读过集合的差集</strong>、决策模型原始概率、裁判原始输出、版本元组。</li>
+<li>失败归因：程序项红 = 引擎/工具回归类；Q1–Q2/裁判项红 = 先查校准，再比基线；跑挂（500/超时）= <code>errored</code> 单列，不算模型答错。</li>
+</ul>
+<h2 id="6-ab-留口本版不跑">6. A/B 留口（本版不跑）</h2>
+<p>结构沿 <code>case × {base, variant} × trial</code> 留好：</p>
+<ul>
+<li>候选臂：base vs 装「引用前先查文档头注」的 skill；或 base vs 提示词加一句「引用前必须读过原文」；</li>
+<li>配对按 (case, trial)，报四格（只 base 过／只 variant 过／都过／都不过），缺一臂不进分母；</li>
+<li>第一版明确不跑，只在 runner 里预留字段。</li>
+</ul>
+<h2 id="7-完成线与校准自测">7. 完成线与校准自测</h2>
+<p>开工前必须先证明「判定会红」，做法是人为注入：</p>
+<ol type="1">
+<li>把 <code>2026-09 上线</code> 塞进答案 → A2 必须红；</li>
+<li>答案引用 <code>决策-方案B.md</code> 但轨迹里删掉对应读取 → A1 必须红；</li>
+<li>把旧口径改写成「方案 A 没做完所以搁置」→ Q3 必须红；</li>
+<li>给一份标准好答案 → 全部绿；</li>
+<li>裁判金样一致率达标（阈值按金样定，不抄默认）。</li>
+</ol>
+<p>完成线：<strong>5/5 通过或基线记录完整；三数报告可贴；任一失败 trial 能打开证据复查到具体引用/帧；注入自测红绿符合预期。</strong></p>
+<h2 id="8-本版不做">8. 本版不做</h2>
+<ul>
+<li>不锁调用顺序、次数、工具选型（grep 还是整读都合法）；</li>
+<li>不判「检索是否最优」——那是调优题，不是本 case 的判定；</li>
+<li>不联网、不接真实外网文档（全 fixture）；</li>
+<li>不跑 A/B；不做评测 UI；不改 <code>internal/runengine/</code> 生产代码。</li>
+</ul>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/83-%E5%9C%BA%E6%99%AF%E5%8C%96Eval%E6%96%B9%E6%A1%88/%E6%A1%88%E4%BE%8B-01-%E6%96%87%E6%A1%A3%E6%9F%A5%E8%AF%81.md"><code>doc/83-场景化Eval方案/案例-01-文档查证.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>
