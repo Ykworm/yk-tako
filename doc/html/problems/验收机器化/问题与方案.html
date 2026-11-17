@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>验收机器化：期望字节要有能自己判红的真源 · tako 文档</title>
+<meta name="description" content="下一轮有人改契约字节——比如给 GET /api/sessions/:id 的 data 加一个字段，或把某个业务码从 112001 改成 112011。" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/problems/验收机器化/问题与方案.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="验收机器化：期望字节要有能自己判红的真源 · tako 文档" />
+<meta property="og:description" content="下一轮有人改契约字节——比如给 GET /api/sessions/:id 的 data 加一个字段，或把某个业务码从 112001 改成 112011。" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/problems/验收机器化/问题与方案.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="验收机器化：期望字节要有能自己判红的真源 · tako 文档" />
+<meta name="twitter:description" content="下一轮有人改契约字节——比如给 GET /api/sessions/:id 的 data 加一个字段，或把某个业务码从 112001 改成 112011。" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="../../style.css" />
 </head>
 <body>
@@ -91,7 +104,7 @@
 <td>E 用场景级 Eval 取代</td>
 <td>每件事写成场景</td>
 <td>更贴近真实</td>
-<td>它管「活干完没有」，管不了「字节对不对」；今天还没建（doc/45）</td>
+<td>它管「活干完没有」，管不了「字节对不对」；今天还没建（doc/83-场景化Eval方案）</td>
 </tr>
 </tbody>
 </table></div>
@@ -250,7 +263,7 @@
 <ul>
 <li><strong>仍有效</strong>：散文 + 机器真源双份同批改；骨架进 Go 快闸、活体进 <code>scripts/acceptance/</code>；期望字节先实跑再抄；<code>declared_not_asserted</code> 必须写原因；隔离靶子参数化。</li>
 <li><strong>已翻转</strong>：<code>tmp/</code> 里的验收脚本不再算资产（旧两份已坏在信封切换前，被取代）；「重跑」从一段散文变成一句命令。</li>
-<li><strong>未做</strong>：<code>doc/45</code> 场景级 Eval——它能回答「活干完没有」，但今天没有建成，不属于这一层。</li>
+<li><strong>未做</strong>：<code>doc/83-场景化Eval方案</code> 场景级 Eval——它能回答「活干完没有」，但今天没有建成，不属于这一层。</li>
 <li><strong>同族问题</strong>：界面验收怎么分层 → <a href="../界面验收双轨/问题与方案.html">界面验收双轨</a>；契约字节里的信封形状 → <a href="../响应信封统一/问题与方案.html">响应信封统一</a>；帧与 runlog 的状态语义 → <a href="../崩溃后这场run算什么状态/问题与方案.html">崩溃后这场 run 算什么状态</a>。</li>
 </ul>
 

@@ -5,6 +5,21 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="tako 数据与存储：PostgreSQL 表、四类 Redis 临时状态、项目 content/runtime、会话 wire、记忆双模式与多副本边界。">
 <title>tako · 数据、状态与存储</title>
+<!-- seo:head:start -->
+<meta name="description" content="tako 数据与存储：PostgreSQL 表、四类 Redis 临时状态、项目 content/runtime、会话 wire、记忆双模式与多副本边界。" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/assets/tako-data-model.html" />
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="tako · 数据、状态与存储 · tako 文档" />
+<meta property="og:description" content="tako 数据与存储：PostgreSQL 表、四类 Redis 临时状态、项目 content/runtime、会话 wire、记忆双模式与多副本边界。" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/assets/tako-data-model.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="tako · 数据、状态与存储 · tako 文档" />
+<meta name="twitter:description" content="tako 数据与存储：PostgreSQL 表、四类 Redis 临时状态、项目 content/runtime、会话 wire、记忆双模式与多副本边界。" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<!-- seo:head:end -->
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='8' y='26' width='12' height='12' rx='2' fill='%23543A29'/%3E%3Crect x='26' y='8' width='12' height='12' rx='2' fill='%23BB7738'/%3E%3Crect x='26' y='26' width='12' height='12' rx='2' fill='%23543A29'/%3E%3Crect x='26' y='44' width='12' height='12' rx='2' fill='%23BB7738'/%3E%3Crect x='44' y='26' width='12' height='12' rx='2' fill='%23543A29'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="tako-architecture.css">
 </head>
@@ -32,7 +47,204 @@
     <section class="mobile-view" id="mobile-view" aria-label="数据与存储列表"></section>
   </div>
   <div class="content-sections" id="content-sections"></div>
-  <noscript><div class="noscript-note">交互图需要 JavaScript。可直接阅读 <a href="../html/19-v6/19v6-03-存储形态与生命周期.html">核心存储</a>、<a href="../html/46-变更同步与事件通道.html">事件通道</a>、<a href="../html/65-记忆两层方案.html">记忆双模式</a> 和 <a href="../html/76-项目内容目录与运行资源容器.html">项目容器</a>。</div></noscript>
+  <!-- static-outline:start -->
+<section class="static-outline" id="static-outline" aria-labelledby="static-outline-title">
+<style>
+.static-outline { margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid rgba(84,58,41,.22); }
+.static-outline h2 { font-size: 1.3rem; margin: 0 0 .4rem; color: #543A29; }
+.static-outline > p { font-size: .9rem; opacity: .8; margin: 0 0 1rem; }
+.static-outline h3.outline-band { font-size: 1rem; margin: 1.6rem 0 .6rem; color: #543A29; }
+.static-outline .outline-grid { display: grid; gap: .7rem; grid-template-columns: repeat(auto-fill, minmax(19rem, 1fr)); }
+.static-outline .outline-item { border: 1px solid rgba(84,58,41,.18); border-radius: .5rem; padding: .7rem .85rem; background: rgba(255,255,255,.55); }
+.static-outline h4 { font-size: .95rem; margin: 0 0 .3rem; }
+.static-outline .outline-sub { font-weight: 400; font-size: .8rem; opacity: .65; }
+.static-outline p { font-size: .84rem; line-height: 1.6; margin: .25rem 0; }
+.static-outline .outline-summary { opacity: .9; }
+.static-outline .outline-key { display: inline-block; min-width: 5.2em; margin-right: .45em; font-size: .78rem; opacity: .7; }
+.static-outline .outline-facts { margin: .3rem 0; padding-left: 1.1rem; font-size: .82rem; }
+@media (max-width: 40rem) { .static-outline .outline-grid { grid-template-columns: 1fr; } }
+</style>
+<h2 id="static-outline-title">文字版：全部模块清单</h2>
+<p>上面的图解由 JavaScript 绘制；下面是同一批模块的纯文字清单，便于检索、复制与外部引用。内容与图一致，由 <code>scripts/build-doc-html.py</code> 从本页的 <code>page-data</code> 生成。</p>
+<h3 class="outline-band">身份与可见范围（4）</h3>
+<div class="outline-grid">
+<article class="outline-item">
+<h4>用户与成员身份 <span class="outline-sub">users / tenant_members / refresh_tokens</span></h4>
+<p class="outline-summary">账号本身不直接决定能看哪些文件；还要结合租户成员关系、会话属主和项目归属。refresh token 与登录状态也不是 run 状态。</p>
+<p class="outline-row"><span class="outline-key">输入</span>注册、登录、成员邀请与令牌刷新。</p>
+<p class="outline-row"><span class="outline-key">输出</span>用户 ID、成员角色与当前租户范围。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/identity_store.go</code> <code>internal/runengine/members_store.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/28-多租户.html">doc/28 · 身份与成员</a></p>
+</article>
+<article class="outline-item">
+<h4>租户配置与额度 <span class="outline-sub">tenants / settings / usage / storage</span></h4>
+<p class="outline-summary">团队共享模型配置、额度和审计，但项目文件不因此在成员间共享。容量、日 token 与存储额度都按租户裁决或记账。</p>
+<p class="outline-row"><span class="outline-key">输入</span>租户设置、成员配置与运行用量。</p>
+<p class="outline-row"><span class="outline-key">输出</span>运行时配置、配额限制、审计与团队管理视图。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/product_store.go</code> <code>internal/runengine/identity_store.go</code> <code>internal/runengine/storage_reserve.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/28-多租户.html">doc/28 · 租户边界</a> <a href="../html/42-产品形态收窄与共享项目退役.html">doc/42 · 不共享文件</a></p>
+</article>
+<article class="outline-item">
+<h4>项目容器 <span class="outline-sub">workspaces + layout.json</span></h4>
+<p class="outline-summary">一个员工一个项目，项目内多场会话共享 content。layout.json 标识容器格式；旧布局未迁移时入口明确拒绝，避免新旧两根各自读写。</p>
+<p class="outline-row"><span class="outline-key">输入</span>项目创建、迁移与当前用户归属。</p>
+<p class="outline-row"><span class="outline-key">输出</span>content/runtime 路径、项目可见性与删除清理范围。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/pgstore.go</code> <code>internal/runengine/project_layout.go</code> <code>internal/runengine/project_migrate.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/76-项目内容目录与运行资源容器.html">doc/76 · 项目容器</a></p>
+</article>
+<article class="outline-item">
+<h4>会话归属 <span class="outline-sub">sessions · 普通聊天 / Task 执行</span></h4>
+<p class="outline-summary">首条用户消息可懒建普通聊天 session；持久 Task 使用独立 agent_task session，不进普通聊天列表。会话目录还保存子代理 wire。</p>
+<p class="outline-row"><span class="outline-key">输入</span>用户消息、项目归属或 Task 调度。</p>
+<p class="outline-row"><span class="outline-key">输出</span>run 的归属链、会话历史与会话级文件范围。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/pgstore.go</code> <code>internal/runengine/session_access.go</code> <code>internal/runengine/agent_task_scheduler.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/35-项目目录.html">doc/35 · 会话与项目</a> <a href="../html/70-多Agent编排与Task/03-第一版方案.html">doc/70 · Task 执行会话</a></p>
+</article>
+</div>
+<h3 class="outline-band">单场 run 的记录（4）</h3>
+<div class="outline-grid">
+<article class="outline-item">
+<h4>执行与定稿 <span class="outline-sub">runs / runlog_entries</span></h4>
+<p class="outline-summary">runs 管当前执行权、租约与终态；runlog_entries 管真实产出的历史。页面最终读 runlog，而不是把 Redis 临时帧当永久记录。</p>
+<p class="outline-row"><span class="outline-key">输入</span>API 创建、worker 执行与结束。</p>
+<p class="outline-row"><span class="outline-key">输出</span>会话 liveRunId、终态、全文与工具历史。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/pgstore.go</code> <code>internal/runengine/store.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/19-v6/19v6-03-存储形态与生命周期.html">19v6-03 · runs/runlog</a></p>
+</article>
+<article class="outline-item">
+<h4>模型当前输入 <span class="outline-sub">run_model_messages</span></h4>
+<p class="outline-summary">保存下一枪模型应看到的内容。compact/fold 可以压缩这里的可见形状，但不改写 runlog 的真实历史。</p>
+<p class="outline-row"><span class="outline-key">输入</span>历史装配、召回与压缩。</p>
+<p class="outline-row"><span class="outline-key">输出</span>模型输入；不是用户历史页面。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/pgstore.go</code> <code>internal/runengine/compact.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/19-v6/19v6-07-compact.html">19v6-07 · 两个视图</a></p>
+</article>
+<article class="outline-item">
+<h4>逐步恢复记录 <span class="outline-sub">run_journal</span></h4>
+<p class="outline-summary">每个模型/工具意图与结果按执行顺序保存。resume 用它恢复已经完成的步骤，并识别只有意图、没有结果的调用。</p>
+<p class="outline-row"><span class="outline-key">输入</span>worker 在动作前后记账。</p>
+<p class="outline-row"><span class="outline-key">输出</span>显式续跑输入与未完成副作用边界。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/journal.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/30-崩溃续跑.html">doc/30 · journal</a></p>
+</article>
+<article class="outline-item">
+<h4>问答与 Todo <span class="outline-sub">run_questions / run_tasks</span></h4>
+<p class="outline-summary">run_questions 保存 ask/plan/install 的等待和答案；run_tasks 保存当前 run 的 Todo。两者都不是持久 Task 调度节点。</p>
+<p class="outline-row"><span class="outline-key">输入</span>等人工具、用户答案与 Todo 工具。</p>
+<p class="outline-row"><span class="outline-key">输出</span>问题卡恢复、方案批准、安装确认与当前工作清单。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/questions.go</code> <code>internal/runengine/tasktools.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/47-Plan审核与追问澄清.html">doc/47 · 等人记录</a> <a href="../html/41-任务看板与人工审批.html">doc/41 · Todo</a></p>
+</article>
+</div>
+<h3 class="outline-band">长任务的记录（4）</h3>
+<div class="outline-grid">
+<article class="outline-item">
+<h4>编排与 Task <span class="outline-sub">orchestrations / tasks / links</span></h4>
+<p class="outline-summary">agent_orchestrations 保存同一目标与当前计划版本，agent_tasks 保存独立工作，agent_task_links 保存真实结果依赖。</p>
+<p class="outline-row"><span class="outline-key">输入</span>创建、领取、执行与结果提交。</p>
+<p class="outline-row"><span class="outline-key">输出</span>ready 推进、独立执行、结果版本与状态视图。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/agent_task_types.go</code> <code>internal/runengine/agent_task_store.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/70-多Agent编排与Task/03-第一版方案.html">doc/70 · 编排表</a></p>
+</article>
+<article class="outline-item">
+<h4>计划修订 <span class="outline-sub">agent_plan_revisions</span></h4>
+<p class="outline-summary">每次接受的计划修改保存版本、原因与规范命令。journey 的初始版本由 created_revision=0 的节点合成，后续版本从这张表读取。</p>
+<p class="outline-row"><span class="outline-key">输入</span>revise_orchestration 与版本检查。</p>
+<p class="outline-row"><span class="outline-key">输出</span>计划时间线与过期修订拒绝依据。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/agent_task_revision.go</code> <code>internal/runengine/orchestration_journey.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/72-多Agent编排下一阶段.html">doc/72 · 修订审计</a></p>
+</article>
+<article class="outline-item">
+<h4>通知与处理尝试 <span class="outline-sub">notifications / notification_attempts</span></h4>
+<p class="outline-summary">通知保存待交付事实，attempt 保存每次处理。结果版本管“结果是什么”，lease_epoch 管“谁可执行”，当前 claim run 管“谁在收尾通知”，三者不混用。</p>
+<p class="outline-row"><span class="outline-key">输入</span>Task/后台命令终态与来源会话处理。</p>
+<p class="outline-row"><span class="outline-key">输出</span>单次交付、失败重试与执行历程中的交付记录。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/agent_task_delivery.go</code> <code>internal/runengine/agent_task_types.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/73-协调通知与交付恢复.html">doc/73 · 通知与 attempt</a></p>
+</article>
+<article class="outline-item">
+<h4>后台命令 <span class="outline-sub">background_jobs</span></h4>
+<p class="outline-summary">保存 bj_… 的来源、状态、停止请求、退出码、owner 租约和输出逻辑路径。真实进程由 owner 管，PG 行不代表进程永远存活。</p>
+<p class="outline-row"><span class="outline-key">输入</span>bash 启动、watcher、停止端点与 sweeper。</p>
+<p class="outline-row"><span class="outline-key">输出</span>页面状态、bash_output、停止与失联判断。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/agent_task_types.go</code> <code>internal/runengine/bash_job.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/82-可组合执行原语与后台任务.html">doc/82 · background_jobs</a></p>
+</article>
+</div>
+<h3 class="outline-band">记忆与对话召回（4）</h3>
+<div class="outline-grid">
+<article class="outline-item">
+<h4>pipeline 记忆 <span class="outline-sub">memory_items / memory_jobs</span></h4>
+<p class="outline-summary">memory_items 按 resident/recall 分层，并按 user/workspace/tenant 归属；memory_jobs 保存 inrun/postrun 作业与租约。应用通过对应视图读取，不再使用旧 notes 路径。</p>
+<p class="outline-row"><span class="outline-key">输入</span>主 Agent 登记、抽取消费者与对账器。</p>
+<p class="outline-row"><span class="outline-key">输出</span>常驻记忆、BM25 召回、search_memory 与补投。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/memory_types.go</code> <code>internal/runengine/memory_pipeline.go</code> <code>internal/runengine/memory_search.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/65-记忆两层方案.html">doc/65 · pipeline</a></p>
+</article>
+<article class="outline-item">
+<h4>Markdown 记忆 <span class="outline-sub">USER.md / runtime/memory/MEMORY.md</span></h4>
+<p class="outline-summary">用户记忆在 tenants/&lt;tid&gt;/users/&lt;uid&gt;/USER.md；项目记忆在项目 runtime/memory/MEMORY.md。主 Agent 同步 add/replace/remove/batch，跨副本用 PG advisory lock 协调，文件原子替换。</p>
+<p class="outline-row"><span class="outline-key">输入</span>主 Agent 的 memory 工具操作与锁内重读。</p>
+<p class="outline-row"><span class="outline-key">输出</span>后续回合直接读取的两份文件；不起 Redpanda/BM25。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/memory_markdown.go</code> <code>internal/runengine/scope.go</code> <code>internal/runengine/project_layout.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/65-记忆两层方案.html">doc/65 · markdown</a> <a href="../html/76-项目内容目录与运行资源容器.html">doc/76 · 项目记忆位置</a></p>
+</article>
+<article class="outline-item">
+<h4>对话块召回 <span class="outline-sub">dialogue_chunks · 两模式共用</span></h4>
+<p class="outline-summary">把对话原文按 run 建成可检索块，为“当时具体怎么说”提供召回。它是服务 Agent 的支撑，不把产品变成知识库。</p>
+<p class="outline-row"><span class="outline-key">输入</span>run 历史与增量索引。</p>
+<p class="outline-row"><span class="outline-key">输出</span>后续回合的对话召回内容。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/dialogue.go</code> <code>internal/runengine/worker.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/29-长期记忆.html">doc/29 · 对话块线</a></p>
+</article>
+<article class="outline-item">
+<h4>记忆派送 <span class="outline-sub">Redpanda · 仅 pipeline</span></h4>
+<p class="outline-summary">正常路径按 session 分区派送记忆作业，消费者执行抽取。Redpanda 不是作业状态真源；PG memory_jobs、前置条件与对账器负责故障正确性。</p>
+<p class="outline-row"><span class="outline-key">输入</span>inrun/postrun 作业与 trace 上下文。</p>
+<p class="outline-row"><span class="outline-key">输出</span>抽取消费；未配置 broker 时持久作业等待。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/memory_redpanda.go</code> <code>internal/runengine/memory_dispatch.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/65-记忆两层方案.html">doc/65 · 派送与对账</a></p>
+</article>
+</div>
+<h3 class="outline-band">存储与外部出口（5）</h3>
+<div class="outline-grid">
+<article class="outline-item">
+<h4>PostgreSQL <span class="outline-sub">权威业务记录与事务协调</span></h4>
+<p class="outline-summary">需要跨刷新和换副本成立的业务事实以 PG 为准。唯一索引、行锁与 advisory lock 分别解决唯一运行、容量、文件写入和发布协调，不是一个“分布式锁”名词能概括。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/pgstore.go</code> <code>internal/runengine/store.go</code> <code>internal/runengine/filelock.go</code> <code>internal/runengine/workspace_publish.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/61-并发控制设计.html">doc/61 · 存储层协调</a> <a href="../html/43-租户并发闸入DB.html">doc/43 · 容量事务</a></p>
+</article>
+<article class="outline-item">
+<h4>Redis <span class="outline-sub">LIST / STRING / 两类 Stream</span></h4>
+<p class="outline-summary">当前四类临时状态，不是两类，也不是 Pub/Sub。runlive/runepoch 随 run 租约变化；events 有界截断；wake 丢失由 PG 对账兜住。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/redisstore.go</code> <code>internal/runengine/events.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/46-变更同步与事件通道.html">doc/46 · 账号 Stream</a> <a href="../html/72-多Agent编排下一阶段.html">doc/72 · 唤醒 Stream</a></p>
+</article>
+<article class="outline-item">
+<h4>共享持久卷 <span class="outline-sub">content / runtime / users / sessions / skills / tools</span></h4>
+<p class="outline-summary">文件工具、Provider、输出、媒体、Markdown 记忆、子代理 wire、技能和工具根都产生真实文件。共享路径与原子替换保证读者看到完整版本，但外部编辑器仍是非合作写者。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/project_layout.go</code> <code>internal/runengine/atomicfile.go</code> <code>internal/runengine/filelock.go</code> <code>internal/runengine/subagent_wire.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/71-文件写入竞争.html">doc/71 · 短写入</a> <a href="../html/76-项目内容目录与运行资源容器.html">doc/76 · 目录布局</a></p>
+</article>
+<article class="outline-item">
+<h4>OTel 观测副本 <span class="outline-sub">CozeLoop / Langfuse</span></h4>
+<p class="outline-summary">观测后端帮助分析模型、工具和内部步骤，但 run 的恢复、页面历史和任务交付不读取它。缺配置为 noop，可单发或双发。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/observability/</code> <code>internal/runengine/trace.go</code> <code>internal/runengine/trace_run.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/54-运行级OTel追踪.html">doc/54 · OTel</a></p>
+</article>
+<article class="outline-item">
+<h4>浏览器重拉 <span class="outline-sub">通知失效，不就地猜状态</span></h4>
+<p class="outline-summary">frames、session log、Task API、job API 和文件 API 各自提供权威读取。账号事件只提示重拉，不直接改本地业务状态。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>web/src/mutation.ts</code> <code>web/src/api.ts</code> <code>web/src/chat.ts</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/46-变更同步与事件通道.html">doc/46 · 失效与重拉</a></p>
+</article>
+</div>
+</section>
+<!-- static-outline:end -->
+
+<noscript>
+
+<div class="noscript-note">交互图需要 JavaScript。可直接阅读 <a href="../html/19-v6/19v6-03-存储形态与生命周期.html">核心存储</a>、<a href="../html/46-变更同步与事件通道.html">事件通道</a>、<a href="../html/65-记忆两层方案.html">记忆双模式</a> 和 <a href="../html/76-项目内容目录与运行资源容器.html">项目容器</a>。</div></noscript>
 </main>
 <footer class="page-footer"><p>本页列当前新库模型；升级库还需执行已有迁移，旧表存在不代表仍是现行读取路径。</p><p><code>doc/assets/tako-data-model.html · 2026-11-16</code></p></footer>
 <script type="application/json" id="page-data">

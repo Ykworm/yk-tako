@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>05 · Octop 架构剖析与生长式复刻 · tako 文档</title>
+<meta name="description" content="关键设计：无外部 MQ，进程内 HarnessProcessor 统一路由所有入口； 无外部中间件依赖，默认 ~/.octop/octop.db SQLite 一把梭。 对 yk-tako 的启示：入口多不等于架构复杂——多入口收敛到一个处理器里，是后面&quot;多入口统一路由&quot;那一层…" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/archive/old-line/05-Octop架构剖析与生长式复刻.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="05 · Octop 架构剖析与生长式复刻 · tako 文档" />
+<meta property="og:description" content="关键设计：无外部 MQ，进程内 HarnessProcessor 统一路由所有入口； 无外部中间件依赖，默认 ~/.octop/octop.db SQLite 一把梭。 对 yk-tako 的启示：入口多不等于架构复杂——多入口收敛到一个处理器里，是后面&quot;多入口统一路由&quot;那一层…" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/archive/old-line/05-Octop架构剖析与生长式复刻.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="05 · Octop 架构剖析与生长式复刻 · tako 文档" />
+<meta name="twitter:description" content="关键设计：无外部 MQ，进程内 HarnessProcessor 统一路由所有入口； 无外部中间件依赖，默认 ~/.octop/octop.db SQLite 一把梭。 对 yk-tako 的启示：入口多不等于架构复杂——多入口收敛到一个处理器里，是后面&quot;多入口统一路由&quot;那一层…" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="../../style.css" />
 </head>
 <body>

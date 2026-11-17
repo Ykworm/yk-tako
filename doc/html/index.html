@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>doc/ 文档索引 · tako 文档</title>
+<meta name="description" content="第一次进仓库，按这个顺序：" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/index.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="doc/ 文档索引 · tako 文档" />
+<meta property="og:description" content="第一次进仓库，按这个顺序：" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/index.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="doc/ 文档索引 · tako 文档" />
+<meta name="twitter:description" content="第一次进仓库，按这个顺序：" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -21,7 +34,7 @@
 <p><strong>第一次进仓库，按这个顺序：</strong></p>
 <ol type="1">
 <li>根 <code>README.md</code>：项目是什么、怎么把引擎和前端跑起来。</li>
-<li>系统说明页：<a href="https://ykworm.github.io/yk-tako/assets/tako-architecture.html">总览</a> → <a href="https://ykworm.github.io/yk-tako/assets/tako-run-lifecycle.html">单场 run</a> → <a href="https://ykworm.github.io/yk-tako/assets/tako-orchestration.html">长任务与编排</a> → <a href="https://ykworm.github.io/yk-tako/assets/tako-data-model.html">数据与存储</a>。先建立结构，再读契约。（上面是线上版；离线看就克隆仓库后打开 <code>doc/assets/</code> 下的同名 HTML——GitHub 上点 HTML 文件只会显示源码。）</li>
+<li>系统说明页：<a href="https://tako.docs.yktea.fun/assets/tako-architecture.html">总览</a> → <a href="https://tako.docs.yktea.fun/assets/tako-run-lifecycle.html">单场 run</a> → <a href="https://tako.docs.yktea.fun/assets/tako-orchestration.html">长任务与编排</a> → <a href="https://tako.docs.yktea.fun/assets/tako-data-model.html">数据与存储</a>。先建立结构，再读契约。（上面是线上版；离线看就克隆仓库后打开 <code>doc/assets/</code> 下的同名 HTML——GitHub 上点 HTML 文件只会显示源码。）</li>
 <li>本索引：分清哪些文档能施工、哪些只是历史。</li>
 <li><a href="19-v6/19-运行引擎架构-v6.html"><code>19-v6/19-运行引擎架构-v6.md</code></a>：v6（第六代引擎，非服务版本）文档集总入口。</li>
 <li>契约与存储四篇，按这个顺序读：
@@ -32,7 +45,7 @@
 <li><a href="19-v6/19v6-04-验收-curl.html"><code>19v6-04-验收-curl.md</code></a>：用例 → curl → 期望字节。</li>
 </ul></li>
 </ol>
-<p><strong>想在浏览器里读：</strong> 在线 <a href="https://ykworm.github.io/yk-tako/">https://ykworm.github.io/yk-tako/</a>；本地 <code>doc/html/</code> 下每个 md 都有一页网页版（站点首页 <code>doc/index.html</code> · 本索引的网页版 <code>doc/html/index.html</code>），由 <code>scripts/build-doc-html.py</code> 从 md 自动生成。<strong>内容以 md 为准</strong>——网页版是同批生成的读物，改了 md 要重跑脚本，别直接改 html。</p>
+<p><strong>想在浏览器里读：</strong> 在线 <a href="https://tako.docs.yktea.fun/">https://tako.docs.yktea.fun/</a>；本地 <code>doc/html/</code> 下每个 md 都有一页网页版（站点首页 <code>doc/index.html</code> · 本索引的网页版 <code>doc/html/index.html</code>），由 <code>scripts/build-doc-html.py</code> 从 md 自动生成。<strong>内容以 md 为准</strong>——网页版是同批生成的读物，改了 md 要重跑脚本，别直接改 html。</p>
 <p><strong>按任务查：</strong></p>
 <ul>
 <li>改运行引擎、API、存储：先读 19-v6 四篇，再查本表第 1 节。</li>
@@ -41,7 +54,7 @@
 <li>改登录、租户、会话归属：<code>doc/28</code>、<code>doc/34</code>、<code>doc/35</code>。</li>
 <li>改响应信封／业务码表：<code>doc/40</code>（规则在根 <code>AGENTS.md</code>，码表在 doc/40 §4）。</li>
 <li>改契约字节、要重跑验收：<code>doc/19-v6/19v6-04</code>（人读版）、<code>scripts/acceptance/</code>（机器真源与断言器）、<code>yk-tako-eino/internal/runengine/contract_test.go</code>（快闸）。</li>
-<li>改 Eval／验收口径：<code>doc/45</code>（场景化 Eval 框架，口径 2026-11-01 已拍板、未施工）、<code>doc/56</code>（公开基准与配对协议，已部分落地）、<code>doc/83</code>（Anthropic 思路稿，待点头；与 doc/45 并存，取代关系待裁定）。</li>
+<li>改 Eval／验收口径：<code>doc/83-场景化Eval方案</code>（场景化 Eval 方案，原 doc/45 迁入并重写；第一版 = 阶段一·最小骨架，方案待点头、未施工）、<code>doc/56</code>（公开基准与配对协议，已部分落地）；思路参照在 <code>doc/83-场景化Eval方案/Anthropic思路稿</code>。</li>
 <li>改团队前端（切换器／成员管理／邀请落地页）：<code>doc/36</code>。</li>
 <li>改界面可用性（markdown 渲染／会话历史入口／停止按钮／文件可达／破坏性操作与文案／<strong>md 文件按 markdown 渲染显示</strong>，doc/48 §10）：<code>doc/48</code>。</li>
 <li>改侧栏项目树（项目 → 对话二级、10 条上限、展示全部）：<code>doc/50</code>。</li>
@@ -263,11 +276,6 @@
 <li>落点：<code>web/src/{api.ts,chat.ts,App.vue,ProjectsView.vue,ConfirmDialog.vue}</code></li>
 <li>2026-10-23 落地。三处前端入口：<strong>个人项目页</strong>（列表／新建／改名／删除／项目下会话／开新对话）、<strong>项目与单场会话删除 + 确认弹窗</strong>（服务端 409 文案原样显示）、<strong>当前会话的子代理列表与「继续」</strong>（把带 <code>sa_id</code> 的指令追加进输入框，由父 agent 调 <code>resume_subagent</code>，不新增 HTTP 端点）。<strong>后端零改动</strong>。当前项目按租户存 <code>localStorage['tako.workspaceId.&lt;tid&gt;']</code>，<code>workspaceId</code> 只随新会话的 <code>POST /api/runs</code> 发送。对应 doc/16 §5.1 第 2 项与 §2 表 #5b/#12/#13</li>
 </ul></li>
-<li><p><strong>45</strong> <a href="45-场景化Eval框架.html">场景化 Eval 框架（方案）</a> ⬜（方案待点头）</p>
-<ul>
-<li>落点：—（未施工）</li>
-<li>2026-10-23 立项。给「<strong>活有没有干完</strong>」建一层可机器重跑的回归——前两层（快闸 <code>contract_test.go</code> + 契约 <code>scripts/acceptance/</code>）只断"接口有没有按约定回"，断不了"活干完了没有"（2026-10-23 PII 挂载点选错时两层全绿）。场景 = 准备/动作/判定/证据四件套；判定分 <strong>K 系统字节 / S 引擎裁决 / B 模型行为 / C 只登记</strong> 四组（按「判定锁在被测系统上」分，不按「模型会不会抖」分）；判定 = <strong>M=M</strong>（跑 M 次全过才算过，M=5），不通过也逐次记录；红的成因分<strong>归因</strong>（<code>engine_regression</code> / <code>model_below_baseline</code> / <code>model_baseline</code> / <code>unasserted</code> / <code>incomplete</code>），<strong>只有前两者拦门禁</strong>；语料 = <strong>17 条四组目录</strong>（K 7 / S 4 / B 4 / C 1 + 示例 2）。<strong>不改 <code>internal/runengine/</code> 生产代码</strong>——Eval 站在引擎外面看它。预计落点 <code>scripts/eval/</code>（复用 <code>scripts/acceptance/harness.py</code>，不另起 HTTP 底座）。对应 doc/16 §2b 第 6 行与 §2c「验收可机器重跑」第三层</li>
-</ul></li>
 <li><p><strong>46</strong> <a href="46-变更同步与事件通道.html">变更同步与事件通道</a> ✅</p>
 <ul>
 <li>落点：<code>yk-tako-eino/internal/runengine/{events.go,server.go,auth.go,product_api.go,contract_test.go}</code>、<code>web/src/{mutation.ts,api.ts,chat.ts,App.vue,ProjectsView.vue}</code>、<code>scripts/acceptance/events_live.sh</code></li>
@@ -335,8 +343,8 @@
 </ul></li>
 <li><p><strong>56</strong> <a href="56-Agent测试与基准选型.html">Agent 测试与基准选型（方案·部分落地）</a> 🔶（G1 已跑完出数，两臂配对 11-01，k=5 基线 11-02）</p>
 <ul>
-<li>落点：<code>scripts/bench/</code>（<code>row.schema.json</code> / <code>arms/tako.py</code> / <code>arms/dsh.py</code> / <code>judge.py</code> / <code>cases/gaia_l1_25.json</code> / <code>slice.py</code> / <code>run_bench.py</code> / <code>pricing.json</code> / <code>check-schema.sh</code>）；回填 <code>scripts/eval/</code>（doc/45）仍未施工；不改 <code>internal/runengine/</code></li>
-<li>2026-10-31 立项。11-01 第一批落地：把「测谁」钉死（<strong>公开基准测的是模型 + 它自带的 harness，不是 tako</strong>），并落纸<strong>可比性协议</strong>（doc/56 §4.7：受试者=runtime、钉死的变量、答案抽取规则、官方 scorer 三支、报告必带口径字段、三条禁语）。GAIA 验证集 L1 的 25 题纯文本切片是<strong>唯一现在能直接跑 tako</strong> 的公开基准——切片<strong>只入配方 + <code>slice_hash</code></strong>（题面/答案/task_id 不入库，依据 GAIA 条款），判定器内置官方 scorer 三支并有 <code>--selftest</code> 对照官方源码；<strong>GAIA 25 题已实跑两轮单臂并出报告</strong>（题面本身 2/25；题面 + 尾句 21/25——差的全在「答案长什么样」，口径钉死见 doc/56 §4.8）；<strong>同日装上 dsh 臂并跑出两臂配对</strong>（tako 22/25 vs dsh 20/25，都过 18、只有 tako 过 4、只有 dsh 过 2——但同臂隔一小时重跑的逐题分歧率 28% 比两臂之间的 24% 还大，即换 harness 的影响不如重跑一次，<strong>所以这轮不给两臂排名</strong>，见 doc/56 §4.9）；pi 臂未装；<strong>11-02 凌晨 k=5 首轮基线跑完</strong>（tako Pass@5 24/25 · pass^5 20/25，dsh 23/25 · 14/25，配对 pass^5 为 都过 13 / 只 tako 7 / 只 dsh 1 / 都没过 4；基线落 <code>scripts/bench/baselines/gaia.json</code>，只存 task_id 短哈希，见 doc/56 §4.10），三臂并排留到下一轮；SWE-bench 先在 Linux 服务器用 mini-swe-agent 跑 25 题作<strong>模型基线</strong>（C2，明确不叫 tako 分数），tako 级要补引擎镜像与 bash 容器后端（G4，容器当围栏，见 §5.5）；HumanEval/MBPP/LiveCodeBench/AgentBench 不作 tako 测试；τ-bench/Claw-Eval 不移植环境，只借 pass^k、终态断言、安全一票否决回填 doc/45；另借 pi <code>packages/evals</code> 的 A/B 对照协议（case × 两臂 × 重复 → 配对 lift，只借协议不移植 vitest 栈，§6.5/G5），Eino 开源仓无 eval 包可接。<strong>CI 门禁仍只认确定性断言</strong>（L0 快闸 / L1 契约 / L2 doc/45 K/S 组）</li>
+<li>落点：<code>scripts/bench/</code>（<code>row.schema.json</code> / <code>arms/tako.py</code> / <code>arms/dsh.py</code> / <code>judge.py</code> / <code>cases/gaia_l1_25.json</code> / <code>slice.py</code> / <code>run_bench.py</code> / <code>pricing.json</code> / <code>check-schema.sh</code>）；回填 <code>scripts/eval/</code>（doc/83-场景化Eval方案）仍未施工；不改 <code>internal/runengine/</code></li>
+<li>2026-10-31 立项。11-01 第一批落地：把「测谁」钉死（<strong>公开基准测的是模型 + 它自带的 harness，不是 tako</strong>），并落纸<strong>可比性协议</strong>（doc/56 §4.7：受试者=runtime、钉死的变量、答案抽取规则、官方 scorer 三支、报告必带口径字段、三条禁语）。GAIA 验证集 L1 的 25 题纯文本切片是<strong>唯一现在能直接跑 tako</strong> 的公开基准——切片<strong>只入配方 + <code>slice_hash</code></strong>（题面/答案/task_id 不入库，依据 GAIA 条款），判定器内置官方 scorer 三支并有 <code>--selftest</code> 对照官方源码；<strong>GAIA 25 题已实跑两轮单臂并出报告</strong>（题面本身 2/25；题面 + 尾句 21/25——差的全在「答案长什么样」，口径钉死见 doc/56 §4.8）；<strong>同日装上 dsh 臂并跑出两臂配对</strong>（tako 22/25 vs dsh 20/25，都过 18、只有 tako 过 4、只有 dsh 过 2——但同臂隔一小时重跑的逐题分歧率 28% 比两臂之间的 24% 还大，即换 harness 的影响不如重跑一次，<strong>所以这轮不给两臂排名</strong>，见 doc/56 §4.9）；pi 臂未装；<strong>11-02 凌晨 k=5 首轮基线跑完</strong>（tako Pass@5 24/25 · pass^5 20/25，dsh 23/25 · 14/25，配对 pass^5 为 都过 13 / 只 tako 7 / 只 dsh 1 / 都没过 4；基线落 <code>scripts/bench/baselines/gaia.json</code>，只存 task_id 短哈希，见 doc/56 §4.10），三臂并排留到下一轮；SWE-bench 先在 Linux 服务器用 mini-swe-agent 跑 25 题作<strong>模型基线</strong>（C2，明确不叫 tako 分数），tako 级要补引擎镜像与 bash 容器后端（G4，容器当围栏，见 §5.5）；HumanEval/MBPP/LiveCodeBench/AgentBench 不作 tako 测试；τ-bench/Claw-Eval 不移植环境，只借 pass^k、终态断言、安全一票否决回填 doc/83-场景化Eval方案；另借 pi <code>packages/evals</code> 的 A/B 对照协议（case × 两臂 × 重复 → 配对 lift，只借协议不移植 vitest 栈，§6.5/G5），Eino 开源仓无 eval 包可接。<strong>CI 门禁仍只认确定性断言</strong>（L0 快闸 / L1 契约 / L2 doc/83-场景化Eval方案 K/S 组）</li>
 </ul></li>
 <li><p><strong>57</strong> <a href="57-网络抓取.html">网络抓取（<code>web_fetch</code>）</a> ✅（2026-11-01，A1–A3）</p>
 <ul>
@@ -447,12 +455,18 @@
 <li>2026-11-15 立项并落地。bash 的 30 秒改为前台等待窗口（默认 8s，超时保留进程并返回 <code>bj_…</code>），补输出读取／有限等待／停止（SIGKILL 整进程组）／持久通知与失联处理（owner watcher 续租写终态、sweeper 对账 interrupted）；<code>wait_task</code> 让当前 run 已读结果时就地认领通知（<code>claimed_in_place=true</code>，不建 run、不写 attempt 行），避免重复交付；编排组内并发按 <code>workspace_mode</code> 取值（shared=1、isolated=2）；创建编排补 <code>finalTaskId</code>；新增路径账本 <code>GET /api/orchestrations/:id/journey</code>（只读投影，从计划修订、Task 终态、结果复用、通知尝试与继任 handoff 派生，刷新与换副本一致）</li>
 <li>不增加用户可见 DAG 模式或 JS 引擎：同步子代理、持久 Task、等待和依赖保持可组合；新工作继续走 doc/72 同组修订，已交付后走 doc/75 继任组；shared 组改为串行，需并行修改时使用 doc/74 isolated 现场。验收：单测/契约 506/0、活体四脚本（bash job 62/0、编排 49/49、journey 22/0、orchestration 回归）+ <code>spotcheck.sh</code> 37/0 + 浏览器走查（桌面/移动端 390 断言）；doc/58 的 bash 落盘落点与清扫触发点被本篇改定</li>
 </ul></li>
-<li><p><strong>83</strong> <a href="83-场景化Eval方案.html">场景化 Eval 方案（Anthropic 思路）</a> ⬜（方案待点头）</p>
+<li><p><strong>83</strong> <a href="83-场景化Eval方案/README.html">场景化 Eval 方案</a> ⬜（方案待点头，2026-11-17 立项）</p>
 <ul>
-<li>落点：—（未施工；文中提到的 <code>scripts/eval/</code> 是 <a href="45-场景化Eval框架.html">doc/45</a> 的计划落点，尚未存在）</li>
-<li>病灶：doc/45 的口径在 2026-11-01 已拍板但一直没开工；本篇是另一条思路——把评测定成「给真实任务、重复跑多次、查任务结束后的真实世界状态、留完整轨迹」，与 Anthropic 的 Agent Eval 工程实践同调</li>
-<li>2026-11-16 从仓库根 <code>eval/README.md</code>（讨论稿、无编号）迁入 doc 树，补 NN 编号与状态头注。<strong>与 doc/45／doc/56 并存，取代关系尚未裁定</strong>；裁定前不动 doc/45 的已拍板口径、不开工</li>
-<li>验收：无（未施工）。裁定口径后按仓库流程出 <code>tmp/83-场景化Eval/施工包.md</code> 交审</li>
+<li>落点：—（未施工。第一版建 <code>scripts/eval/</code>：<code>run_eval.py</code> + <code>casefile.py</code> + <code>target.py</code> + <code>prepare.py</code> + <code>act.py</code> + <code>grader.py</code> + <code>report.py</code> + <code>cases/*.json</code> + <code>baselines/</code> + <code>up.sh</code>／<code>reset.sh</code>；复用 <code>scripts/acceptance/harness.py</code> 的 HTTP／psql／取密钥底座，不另起一套；不改 <code>internal/runengine/</code> 生产代码——Eval 站在引擎外面看它）</li>
+<li>2026-10-23 立项（原 doc/45；2026-11-17 用户裁定迁入 83 章并重写为施工方案）。给「<strong>活有没有干完</strong>」建一层可机器重跑的回归——前两层（快闸 <code>contract_test.go</code> + 契约 <code>scripts/acceptance/</code>）只断"接口有没有按约定回"，断不了"活干完了没有"（2026-10-23 PII 挂载点选错时两层全绿）。判定仍分 <strong>K 系统字节 / S 引擎裁决 / B 模型行为 / C 只登记</strong> 四组、判定 = <strong>M=M</strong>（跑 5 次全过才算过），归因／退出码／安全一票否决三层分开；<strong>第一版完成线 = 阶段一·最小骨架</strong>：先做 B 组两条（<code>b-pii-fold</code>、<code>b-file-write</code>），JSON 案例、隔离单位 = case × trial、证据落 <code>tmp/eval/&lt;ts&gt;/</code>。K/S 组与其余语料是方案内阶段二，启动条件写在 §8，不推给「下一版」。对应 doc/16 §2b 第 6 行与 §2c「验收可机器重跑」第三层</li>
+<li>验收：无（未施工）。开工前按仓库流程出 <code>tmp/83-场景化Eval/施工包.md</code> 交审；完成线见正文 §3.2</li>
+<li>讨论记录：<a href="83-场景化Eval方案/讨论.html">讨论.md</a>：为什么旧 <code>doc/45</code> 回归框架稿不能直接当方案（语料过期、完成线不足、缺 case×trial 隔离、YAML 依赖本机没有）、Anthropic 思路稿缺 tako 契约、三处拍板（参考 Anthropic 稿／第一版取阶段一／两个文件都放 83 章）</li>
+<li>素材：<a href="83-场景化Eval方案/回归框架稿.html">回归框架稿</a>：旧 doc/45 正文，保留 K/S/B/C 分组、17 条语料、outcome 与归因口径；<strong>不作施工真源</strong>，案例形状（YAML）与步骤（E0–E6）已被 README 取代</li>
+<li>思路参照：<a href="83-场景化Eval方案/Anthropic思路稿.html">Anthropic 思路稿</a>（2026-11-16 从仓库根 <code>eval/README.md</code> 迁入）：把评测定成「给真实任务、重复跑多次、查任务结束后的真实世界状态、留完整轨迹」，与 Anthropic 的 Agent Eval 工程实践同调；<strong>2026-11-17 起降为配套思路稿</strong>，其中安全一票否决、能力集与正反例、裁判金样、A/B 配对等增量待并入正文</li>
+<li>配套分析：<a href="83-场景化Eval方案/DataAgent课程借鉴与Tako落地分析.html">企业级 Agent 课程对 Tako 的借鉴分析</a>（待点头、未施工）：按完整十篇课程逐篇逐课对账六大架构域，覆盖 EvalOps、Runtime／Context／Memory、Tool／Skill、Verifier 与 Grader 分工、Replay／Ablation、DataAgent 专属内容与 3D／多模态迁移边界</li>
+<li>增量清单：<a href="83-场景化Eval方案/课程增量落点清单.html">课程增量落点清单</a>（2026-11-17 全量扫描，素材）：把配套分析里与 tako 契合的 Eval 知识点逐条抽出编号（83 条），每条给落点（阶段一 38／后续 32／已有 4／不搬 7／待裁 1／Runtime 线 1）；写讨论与方案时按「课程清单 #N」引用</li>
+<li>案例规格：案例-01-文档查证（待点头）：多轮文档查证 case——引用必须真读过、作废文档不得进答案；判定四线（程序读轨迹／程序读现场／决策模型 Jev 类／LLM 裁判 G-Eval）；N=5，A/B 留口不跑</li>
+<li>学习清单：<a href="83-场景化Eval方案/Tako-EvalOps学习知识点表.html">Tako Agent 全课程学习知识点表</a>：覆盖模型、Runtime、Context、Tool／Skill、Memory 与 EvalOps，含概念解释、5 分制价值、当前功能状态；User 自评列留空</li>
 </ul></li>
 </ul>
 <h2 id="2-历史存档docarchive不作施工面">2. 历史存档（<code>doc/archive/</code>，不作施工面）</h2>
@@ -548,31 +562,31 @@
 </tr>
 <tr>
 <td><code>doc/assets/</code></td>
-<td><a href="https://ykworm.github.io/yk-tako/assets/tako-architecture.html">系统架构总览</a></td>
+<td><a href="https://tako.docs.yktea.fun/assets/tako-architecture.html">系统架构总览</a></td>
 <td>非方案，交互图</td>
 <td>2026-11-16 重基线：约 20 个责任节点讲清前端、接入、run worker、长任务、结果发布、模型、扩展与存储；点节点/连线看输入输出、代码与真源。静态版 <code>tako-architecture.png</code>（3840×2822）由 <code>scripts/export-architecture-poster.sh</code> 派生。四页共享 <code>tako-architecture.css/js</code>，<code>scripts/check-architecture-pages.mjs</code> 检查数据与链接</td>
 </tr>
 <tr>
 <td><code>doc/assets/</code></td>
-<td><a href="https://ykworm.github.io/yk-tako/assets/tako-run-lifecycle.html">单场 run 生命周期</a></td>
+<td><a href="https://tako.docs.yktea.fun/assets/tako-run-lifecycle.html">单场 run 生命周期</a></td>
 <td>非方案，交互图</td>
 <td>从 POST /api/runs 到定稿、记忆与显式续跑；含九种帧、runlog/模型输入/journal 分工、问答与 compact</td>
 </tr>
 <tr>
 <td><code>doc/assets/</code></td>
-<td><a href="https://ykworm.github.io/yk-tako/assets/tako-orchestration.html">长任务与多 Agent 编排</a></td>
+<td><a href="https://tako.docs.yktea.fun/assets/tako-orchestration.html">长任务与多 Agent 编排</a></td>
 <td>非方案，交互图</td>
 <td>持久 Task、依赖调度、wait_task、shared/isolated、结果发布、后台 bash、通知恢复、同组修订与继任组</td>
 </tr>
 <tr>
 <td><code>doc/assets/</code></td>
-<td><a href="https://ykworm.github.io/yk-tako/assets/tako-data-model.html">数据、状态与存储</a></td>
+<td><a href="https://tako.docs.yktea.fun/assets/tako-data-model.html">数据、状态与存储</a></td>
 <td>非方案，交互图</td>
 <td>PostgreSQL 当前模型、四类 Redis 临时状态、项目 content/runtime、会话 wire、记忆双模式与多副本共享卷边界</td>
 </tr>
 <tr>
 <td><code>doc/html/</code></td>
-<td><a href="https://ykworm.github.io/yk-tako/">在线站点</a> · 本地入口 <code>doc/index.html</code>、<code>doc/html/index.html</code></td>
+<td><a href="https://tako.docs.yktea.fun/">在线站点</a> · 本地入口 <code>doc/index.html</code>、<code>doc/html/index.html</code></td>
 <td>非方案，网页版</td>
 <td>2026-11-16：每个已入库 md 对应一页网页版，由 <code>scripts/build-doc-html.py</code>（pandoc gfm→html5）生成并重写链接——doc 之间的链接转成 html、代码与脚本链接转成 GitHub blob、仓库里没有的（tmp/ 施工包、ref-agent 参考实现）去掉链接保留文字。<strong>只转已被 git 跟踪的 md</strong>（<code>doc/interview/</code> 等被 .gitignore 挡住的私有材料不入站）；内容以 md 为准，改了 md 要重跑脚本。<code>--check</code> 只比对不写盘、<code>--audit-only</code> 只查断链，都可进机器验收；<code>.github/workflows/pages.yml</code> 负责发布</td>
 </tr>

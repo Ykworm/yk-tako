@@ -48,6 +48,11 @@ jobs:
           find _site -name '.DS_Store' -delete
           ls -l _site/index.html
 
+      - name: 生成站点地图
+        # 构建时生成，不提交进仓库：lastmod 跟着本次发布走，
+        # 提交进仓库会让本地与 CI 的 HEAD 日期对不上，机器验收一直报差异。
+        run: python3 scripts/build-sitemap.py _site/sitemap.xml
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
@@ -63,3 +68,18 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+  notify-indexnow:
+    # 发布完通知 Bing 等索引器：不用等它们例行巡检，改完就能被重抓。
+    # 没配 INDEXNOW_KEY 时脚本自己跳过，不影响发布。
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 通知索引器（IndexNow）
+        env:
+          INDEXNOW_KEY: ${{ secrets.INDEXNOW_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_SHA: ${{ github.sha }}
+          SITE_HOST: tako.docs.yktea.fun
+        run: python3 scripts/notify-indexnow.py

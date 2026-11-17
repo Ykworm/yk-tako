@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>并行度由谁裁：租户槽、进程 sem，还是跨 pod 的执行池 · tako 文档</title>
+<meta name="description" content="一个租户在跑一场长任务，主代理在一条 assistant 消息里同时发出三个 coder 委派和几个 bash。同一时刻另一个租户也在跑。所有请求落在同一个 pod 上。" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/problems/并行度由谁裁/问题与方案.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="并行度由谁裁：租户槽、进程 sem，还是跨 pod 的执行池 · tako 文档" />
+<meta property="og:description" content="一个租户在跑一场长任务，主代理在一条 assistant 消息里同时发出三个 coder 委派和几个 bash。同一时刻另一个租户也在跑。所有请求落在同一个 pod 上。" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/problems/并行度由谁裁/问题与方案.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="并行度由谁裁：租户槽、进程 sem，还是跨 pod 的执行池 · tako 文档" />
+<meta name="twitter:description" content="一个租户在跑一场长任务，主代理在一条 assistant 消息里同时发出三个 coder 委派和几个 bash。同一时刻另一个租户也在跑。所有请求落在同一个 pod 上。" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="../../style.css" />
 </head>
 <body>

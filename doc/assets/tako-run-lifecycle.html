@@ -5,6 +5,21 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="tako 单场 run 的完整生命周期：创建、模型工具循环、帧与日志、等人、压缩、记忆和显式续跑。">
 <title>tako · 单场 run 生命周期</title>
+<!-- seo:head:start -->
+<meta name="description" content="tako 单场 run 的完整生命周期：创建、模型工具循环、帧与日志、等人、压缩、记忆和显式续跑。" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/assets/tako-run-lifecycle.html" />
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="tako · 单场 run 生命周期 · tako 文档" />
+<meta property="og:description" content="tako 单场 run 的完整生命周期：创建、模型工具循环、帧与日志、等人、压缩、记忆和显式续跑。" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/assets/tako-run-lifecycle.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="tako · 单场 run 生命周期 · tako 文档" />
+<meta name="twitter:description" content="tako 单场 run 的完整生命周期：创建、模型工具循环、帧与日志、等人、压缩、记忆和显式续跑。" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<!-- seo:head:end -->
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='8' y='26' width='12' height='12' rx='2' fill='%23543A29'/%3E%3Crect x='26' y='8' width='12' height='12' rx='2' fill='%23BB7738'/%3E%3Crect x='26' y='26' width='12' height='12' rx='2' fill='%23543A29'/%3E%3Crect x='26' y='44' width='12' height='12' rx='2' fill='%23BB7738'/%3E%3Crect x='44' y='26' width='12' height='12' rx='2' fill='%23543A29'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="tako-architecture.css">
 </head>
@@ -32,7 +47,207 @@
     <section class="mobile-view" id="mobile-view" aria-label="run 生命周期列表"></section>
   </div>
   <div class="content-sections" id="content-sections"></div>
-  <noscript><div class="noscript-note">交互图需要 JavaScript。可直接阅读 <a href="../html/19-v6/19v6-01-契约-四个API.html">四个 API 契约</a>、<a href="../html/19-v6/19v6-02-reconcile与双游标.html">双游标</a> 和 <a href="../html/30-崩溃续跑.html">崩溃续跑</a>。</div></noscript>
+  <!-- static-outline:start -->
+<section class="static-outline" id="static-outline" aria-labelledby="static-outline-title">
+<style>
+.static-outline { margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid rgba(84,58,41,.22); }
+.static-outline h2 { font-size: 1.3rem; margin: 0 0 .4rem; color: #543A29; }
+.static-outline > p { font-size: .9rem; opacity: .8; margin: 0 0 1rem; }
+.static-outline h3.outline-band { font-size: 1rem; margin: 1.6rem 0 .6rem; color: #543A29; }
+.static-outline .outline-grid { display: grid; gap: .7rem; grid-template-columns: repeat(auto-fill, minmax(19rem, 1fr)); }
+.static-outline .outline-item { border: 1px solid rgba(84,58,41,.18); border-radius: .5rem; padding: .7rem .85rem; background: rgba(255,255,255,.55); }
+.static-outline h4 { font-size: .95rem; margin: 0 0 .3rem; }
+.static-outline .outline-sub { font-weight: 400; font-size: .8rem; opacity: .65; }
+.static-outline p { font-size: .84rem; line-height: 1.6; margin: .25rem 0; }
+.static-outline .outline-summary { opacity: .9; }
+.static-outline .outline-key { display: inline-block; min-width: 5.2em; margin-right: .45em; font-size: .78rem; opacity: .7; }
+.static-outline .outline-facts { margin: .3rem 0; padding-left: 1.1rem; font-size: .82rem; }
+@media (max-width: 40rem) { .static-outline .outline-grid { grid-template-columns: 1fr; } }
+</style>
+<h2 id="static-outline-title">文字版：全部模块清单</h2>
+<p>上面的图解由 JavaScript 绘制；下面是同一批模块的纯文字清单，便于检索、复制与外部引用。内容与图一致，由 <code>scripts/build-doc-html.py</code> 从本页的 <code>page-data</code> 生成。</p>
+<h3 class="outline-band">浏览器（4）</h3>
+<div class="outline-grid">
+<article class="outline-item">
+<h4>用户投递 <span class="outline-sub">POST /api/runs</span></h4>
+<p class="outline-summary">首条消息可懒建会话；后续消息挂到既有 session。响应返回 runId 后，浏览器开始观察，而不是在一个 HTTP 请求里等完整答案。</p>
+<p class="outline-row"><span class="outline-key">输入</span>用户文本、附件与可选 workspaceId。</p>
+<p class="outline-row"><span class="outline-key">输出</span>带 access token 的创建 run 请求。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>web/src/chat.ts</code> <code>web/src/api.ts</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/19-v6/19v6-01-契约-四个API.html">19v6-01 · 创建 run</a></p>
+</article>
+<article class="outline-item">
+<h4>过程帧与工具卡 <span class="outline-sub">eventOffset 只向前</span></h4>
+<p class="outline-summary">轮询 frames 是正确性来源，run SSE 是同一帧面的优化运输。文本增量、工具调用、用量、Todo 与问题卡按 eventOffset 合并。</p>
+<p class="outline-row"><span class="outline-key">输入</span>GET frames 或 GET run stream。</p>
+<p class="outline-row"><span class="outline-key">输出</span>生成中的气泡、工具卡、问题卡、用量和状态。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>web/src/chat.ts</code> <code>web/src/App.vue</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/31-sse流式端点.html">doc/31 · run SSE</a> <a href="../html/59-工具调用可见性.html">doc/59 · 工具卡</a></p>
+</article>
+<article class="outline-item">
+<h4>定稿历史 <span class="outline-sub">runlogOffset 跨 run 单调</span></h4>
+<p class="outline-summary">见 terminal 或会话不再有活 run 后，页面拉 session log，用 runlog 的完整记录替换生成中的临时气泡。历史可分页回查，不依赖 Redis 帧还存在。</p>
+<p class="outline-row"><span class="outline-key">输入</span>GET /api/sessions/:id 与 /log。</p>
+<p class="outline-row"><span class="outline-key">输出</span>最终回复、工具行、问题与答案的历史视图。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>web/src/chat.ts</code> <code>internal/runengine/server.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/19-v6/19v6-02-reconcile与双游标.html">19v6-02 · reconcile</a></p>
+</article>
+<article class="outline-item">
+<h4>中断与显式续跑 <span class="outline-sub">用户确认后继续这一轮</span></h4>
+<p class="outline-summary">租约过期后页面把 run 显示为 interrupted，由用户点击继续。普通 run 没有服务端自动巡检接管，也不把旧进程谎称仍在工作。</p>
+<p class="outline-row"><span class="outline-key">输入</span>会话状态中的中断标志与用户动作。</p>
+<p class="outline-row"><span class="outline-key">输出</span>POST /api/runs/:id/resume。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>web/src/App.vue</code> <code>web/src/chat.ts</code> <code>internal/runengine/server.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/30-崩溃续跑.html">doc/30 · 客户端触发恢复</a></p>
+</article>
+</div>
+<h3 class="outline-band">HTTP 接入（2）</h3>
+<div class="outline-grid">
+<article class="outline-item">
+<h4>run 与 session API <span class="outline-sub">创建 · 拉帧 · 拉日志 · 停止/续跑</span></h4>
+<p class="outline-summary">认证与可见性检查后，路由调用存储和 worker。创建、过程帧、会话状态和定稿日志各有不同读取契约。</p>
+<p class="outline-row"><span class="outline-key">输入</span>浏览器请求与身份范围。</p>
+<p class="outline-row"><span class="outline-key">输出</span>统一 JSON 响应或 run SSE 帧面。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/server.go</code> <code>internal/runengine/auth.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/19-v6/19v6-01-契约-四个API.html">19v6-01 · 端点字节</a></p>
+</article>
+<article class="outline-item">
+<h4>账号事件 API <span class="outline-sub">Redis Stream → SSE</span></h4>
+<p class="outline-summary">这是项目、Task、后台命令等变更的账号级通知通道，不是某一场 run 的 delta 流。事件只让本地副本失效，随后必须重拉。</p>
+<p class="outline-row"><span class="outline-key">输入</span>tk:events:&lt;tid&gt; 的 XREAD 与续读游标。</p>
+<p class="outline-row"><span class="outline-key">输出</span>seq/type/id/at；空闲时发送 SSE 注释心跳。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/events.go</code> <code>web/src/mutation.ts</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/46-变更同步与事件通道.html">doc/46 · 账号事件</a></p>
+</article>
+</div>
+<h3 class="outline-band">run worker（7）</h3>
+<div class="outline-grid">
+<article class="outline-item">
+<h4>取得运行权 <span class="outline-sub">PG 唯一索引 + 容量事务</span></h4>
+<p class="outline-summary">runs 的部分唯一索引保证同会话只有一个 running；租户容量在同一 PG 事务里计数与放行。租约和执行代次从创建起就属于这场 run。</p>
+<p class="outline-row"><span class="outline-key">为什么需要它</span>如果先数再放行分成两个独立操作，多副本会同时看到“还没满”，实际运行数就会超过上限。</p>
+<p class="outline-row"><span class="outline-key">输入</span>已认证的租户、会话和用户消息。</p>
+<p class="outline-row"><span class="outline-key">输出</span>running 行、租约、epoch=1；冲突返回明确业务错误。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/store.go</code> <code>internal/runengine/pgstore.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/43-租户并发闸入DB.html">doc/43 · 容量事务</a> <a href="../html/19-v6/19v6-03-存储形态与生命周期.html">19v6-03 · 核心表</a></p>
+</article>
+<article class="outline-item">
+<h4>装配当前输入 <span class="outline-sub">模型 · 工具 · 项目 · 记忆</span></h4>
+<p class="outline-summary">worker 解析项目 content/runtime、租户模型、工具、MCP、技能和记忆，读取 run_model_messages 中当前可见的消息。</p>
+<p class="outline-row"><span class="outline-key">输入</span>运行记录、租户配置、项目路径、历史模型输入。</p>
+<p class="outline-row"><span class="outline-key">输出</span>RunProfile 与第一枪模型输入。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/profile.go</code> <code>internal/runengine/worker.go</code> <code>internal/runengine/project_layout.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/34-租户运行时装配.html">doc/34 · 运行时装配</a> <a href="../html/76-项目内容目录与运行资源容器.html">doc/76 · 项目路径</a></p>
+</article>
+<article class="outline-item">
+<h4>模型—工具循环 <span class="outline-sub">Generate → call → result → Generate</span></h4>
+<p class="outline-summary">每次模型返回后，文本写帧，工具调用先记 journal 再执行，结果回灌模型；没有更多工具调用时进入定稿。OTel span 同步记录，但不参与业务裁决。</p>
+<p class="outline-row"><span class="outline-key">输入</span>当前模型输入与后续工具结果。</p>
+<p class="outline-row"><span class="outline-key">输出</span>delta/tool/usage/task/question 帧、journal 与最终 assistant 内容。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/worker.go</code> <code>internal/runengine/tools.go</code> <code>internal/runengine/journal.go</code> <code>internal/runengine/trace_run.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/19-v6/19v6-05-tool-loop.html">19v6-05 · tool loop</a> <a href="../html/54-运行级OTel追踪.html">doc/54 · 观测</a></p>
+</article>
+<article class="outline-item">
+<h4>工具与真实动作 <span class="outline-sub">bash · 文件 · 网络 · MCP</span></h4>
+<p class="outline-summary">工具在沙箱和路径范围内执行。长文件分页读取，长输出保留尾部并写全文；超过前台等待窗口的 bash 转到后台命令链。</p>
+<p class="outline-row"><span class="outline-key">输入</span>模型工具参数与当前项目/租户范围。</p>
+<p class="outline-row"><span class="outline-key">输出</span>工具结果、文件修改、输出路径或后台 jobId。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/bash.go</code> <code>internal/runengine/bash_job.go</code> <code>internal/runengine/filetools.go</code> <code>internal/runengine/webfetch.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/58-读分页与输出留存.html">doc/58 · 输出留存</a> <a href="../html/82-可组合执行原语与后台任务.html">doc/82 · 后台命令</a></p>
+</article>
+<article class="outline-item">
+<h4>等人记录 <span class="outline-sub">ask · plan · install</span></h4>
+<p class="outline-summary">ask_user、submit_plan 与技能安装提案先写 run_questions，再发 question 帧。worker 等的是数据库里的答案，不是只存在当前进程内的回调。</p>
+<p class="outline-row"><span class="outline-key">输入</span>模型决定需要人提供答案、批准方案或确认安装。</p>
+<p class="outline-row"><span class="outline-key">输出</span>pending/answered 行、question 帧；resume 后接回同一工具结果。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/questions.go</code> <code>internal/runengine/waittools.go</code> <code>internal/runengine/skillask.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/47-Plan审核与追问澄清.html">doc/47 · 等人现场</a> <a href="../html/52-技能.html">doc/52 · 安装确认</a></p>
+</article>
+<article class="outline-item">
+<h4>压缩与溢出处理 <span class="outline-sub">只改模型可见输入</span></h4>
+<p class="outline-summary">compact、mid-run fold 和 overflow 在窗口不足时重写 run_model_messages 的可见部分；runlog 原文仍用于页面历史和回查。文件与技能清单由程序从记录继承。</p>
+<p class="outline-row"><span class="outline-key">输入</span>当前模型消息、工具结果与窗口预算。</p>
+<p class="outline-row"><span class="outline-key">输出</span>摘要行、折叠标记与可继续生成的输入。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/compact.go</code> <code>internal/runengine/midfold.go</code> <code>internal/runengine/overflow.go</code> <code>internal/runengine/fileops.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/19-v6/19v6-07-compact.html">19v6-07 · compact</a> <a href="../html/19-v6/19v6-09-溢出修复层.html">19v6-09 · 溢出处理</a></p>
+</article>
+<article class="outline-item">
+<h4>定稿与结束 <span class="outline-sub">终态 + 全文历史</span></h4>
+<p class="outline-summary">模型不再调用工具后，worker 保存 run 终态和 assistant 定稿记录，再让客户端通过 terminal 或会话状态进入收口。失败但已有产出的内容也保留。</p>
+<p class="outline-row"><span class="outline-key">输入</span>最终文本、工具记录、用量与执行结果。</p>
+<p class="outline-row"><span class="outline-key">输出</span>runs 终态、runlog_entries、terminal 帧与后续记忆工作。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/store.go</code> <code>internal/runengine/worker.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/19-v6/19v6-03-存储形态与生命周期.html">19v6-03 · 定稿与失败留痕</a></p>
+</article>
+</div>
+<h3 class="outline-band">模型与同步委派（3）</h3>
+<div class="outline-grid">
+<article class="outline-item">
+<h4>外部模型 <span class="outline-sub">流式文本与工具决策</span></h4>
+<p class="outline-summary">根据当前输入生成内容，不直接持有 run、Task 或文件权威状态。</p>
+<p class="outline-row"><span class="outline-key">输入</span>模型可见消息和工具声明。</p>
+<p class="outline-row"><span class="outline-key">输出</span>delta、工具调用、用量。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/config/model.go</code> <code>internal/config/provider-catalog.json</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/34-租户运行时装配.html">doc/34 · 模型装配</a></p>
+</article>
+<article class="outline-item">
+<h4>同步子代理 <span class="outline-sub">独立上下文，父 run 等待</span></h4>
+<p class="outline-summary">需要隔离中间过程时同步委派，结果回父 run；wire 档案落会话目录。</p>
+<p class="outline-row"><span class="outline-key">输入</span>父 Agent 委派输入。</p>
+<p class="outline-row"><span class="outline-key">输出</span>折叠结果与可 resume 的完整档案。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/agents.go</code> <code>internal/runengine/subagent_wire.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/39-子代理持久化与resume.html">doc/39 · wire 档案</a></p>
+</article>
+<article class="outline-item">
+<h4>技能与 MCP <span class="outline-sub">按需装配，不保存执行事实</span></h4>
+<p class="outline-summary">技能正文经工具进入上下文；MCP 工具经本地进程执行。二者都遵循当前 run 的范围与权限。</p>
+<p class="outline-row"><span class="outline-key">输入</span>技能目录、MCP 配置与工具策略。</p>
+<p class="outline-row"><span class="outline-key">输出</span>技能内容、外部工具声明与结果。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/skilltools.go</code> <code>internal/runengine/mcp.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/52-技能.html">doc/52 · 技能</a> <a href="../html/33-mcp-client.html">doc/33 · MCP</a></p>
+</article>
+</div>
+<h3 class="outline-band">持久记录与临时设施（5）</h3>
+<div class="outline-grid">
+<article class="outline-item">
+<h4>PostgreSQL <span class="outline-sub">run / runlog / 模型输入 / journal / 问答</span></h4>
+<p class="outline-summary">run 的业务状态与永久历史在这里。runlog、模型输入、journal 和问答各自服务不同读取者，不能合并成“聊天记录”一个词。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/pgstore.go</code> <code>internal/runengine/store.go</code> <code>internal/runengine/questions.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/19-v6/19v6-03-存储形态与生命周期.html">19v6-03 · 存储分工</a></p>
+</article>
+<article class="outline-item">
+<h4>Redis run 状态 <span class="outline-sub">runlive / runepoch</span></h4>
+<p class="outline-summary">runlive 供过程帧读取，runepoch 拒绝旧执行者写帧。它们是临时面，不是定稿历史。runliveStart 在 AcquireRun 的 PG 事务内调用，失败会使 PG 回滚；EndRun 则在 PG 提交后再收敛 Redis，两种存储不是一个数据库，但调用顺序与补偿明确。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/redisstore.go</code> <code>internal/runengine/store.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/19-v6/19v6-03-存储形态与生命周期.html">19v6-03 · 临时状态</a></p>
+</article>
+<article class="outline-item">
+<h4>共享文件系统 <span class="outline-sub">content / runtime / 会话 wire</span></h4>
+<p class="outline-summary">真实文件、长输出和子代理 wire 都在文件系统。多副本要共享持久卷，不能用进程所在机器的临时目录代替。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/project_layout.go</code> <code>internal/runengine/subagent_wire.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/76-项目内容目录与运行资源容器.html">doc/76 · 项目容器</a></p>
+</article>
+<article class="outline-item">
+<h4>记忆读写 <span class="outline-sub">inrun / postrun</span></h4>
+<p class="outline-summary">记忆并非全部等 run 结束：inrun 可在当前对话中登记或同步写入，postrun 再做场后处理；模式决定具体路径。</p>
+<p class="outline-row"><span class="outline-key">输入</span>用户原话、run 日志与历史记忆。</p>
+<p class="outline-row"><span class="outline-key">输出</span>后续回合的常驻与召回内容。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/memory_pipeline.go</code> <code>internal/runengine/memory_markdown.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/65-记忆两层方案.html">doc/65 · 双模式</a></p>
+</article>
+<article class="outline-item">
+<h4>Redpanda <span class="outline-sub">仅 pipeline</span></h4>
+<p class="outline-summary">pipeline 的异步抽取派送。PG memory_jobs 与对账器保留故障语义；markdown 不走这里。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/memory_redpanda.go</code> <code>internal/runengine/memory_queue.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/65-记忆两层方案.html">doc/65 · 抽取派送</a></p>
+</article>
+</div>
+</section>
+<!-- static-outline:end -->
+
+<noscript>
+
+<div class="noscript-note">交互图需要 JavaScript。可直接阅读 <a href="../html/19-v6/19v6-01-契约-四个API.html">四个 API 契约</a>、<a href="../html/19-v6/19v6-02-reconcile与双游标.html">双游标</a> 和 <a href="../html/30-崩溃续跑.html">崩溃续跑</a>。</div></noscript>
 </main>
 <footer class="page-footer"><p>本页描述单场 run；持久 Task、后台命令和整组交付见“长任务与编排”。</p><p><code>doc/assets/tako-run-lifecycle.html · 2026-11-16</code></p></footer>
 <script type="application/json" id="page-data">

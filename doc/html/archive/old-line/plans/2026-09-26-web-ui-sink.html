@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>最小 Web-UI T1：事件 sink 重构 Implementation Plan · tako 文档</title>
+<meta name="description" content="Goal: 把 adkrun 的「产生事件」与「呈现事件」拆开——驱动层只产出结构化事件，REPL 退化成第一个 sink；重构前后终端输出逐字符一致（《10》§2.4 步 1）。" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/archive/old-line/plans/2026-09-26-web-ui-sink.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="最小 Web-UI T1：事件 sink 重构 Implementation Plan · tako 文档" />
+<meta property="og:description" content="Goal: 把 adkrun 的「产生事件」与「呈现事件」拆开——驱动层只产出结构化事件，REPL 退化成第一个 sink；重构前后终端输出逐字符一致（《10》§2.4 步 1）。" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/archive/old-line/plans/2026-09-26-web-ui-sink.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="最小 Web-UI T1：事件 sink 重构 Implementation Plan · tako 文档" />
+<meta name="twitter:description" content="Goal: 把 adkrun 的「产生事件」与「呈现事件」拆开——驱动层只产出结构化事件，REPL 退化成第一个 sink；重构前后终端输出逐字符一致（《10》§2.4 步 1）。" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="../../../style.css" />
 </head>
 <body>

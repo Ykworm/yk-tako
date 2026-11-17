@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>54 · 运行级追踪：OTel GenAI 语义 + CozeLoop 上报 · tako 文档</title>
+<meta name="description" content="今天要看一场 run 干得怎么样，人得打开页面翻帧、或者 curl /api/runs/{id}/frames 把几十上百帧拉下来，自己按 eventOffset 拼时间线：哪一枪模型慢、哪次工具等了三分钟、折叠发生在第几轮、最后为什么 error。" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/54-运行级OTel追踪.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="54 · 运行级追踪：OTel GenAI 语义 + CozeLoop 上报 · tako 文档" />
+<meta property="og:description" content="今天要看一场 run 干得怎么样，人得打开页面翻帧、或者 curl /api/runs/{id}/frames 把几十上百帧拉下来，自己按 eventOffset 拼时间线：哪一枪模型慢、哪次工具等了三分钟、折叠发生在第几轮、最后为什么 error。" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/54-运行级OTel追踪.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="54 · 运行级追踪：OTel GenAI 语义 + CozeLoop 上报 · tako 文档" />
+<meta name="twitter:description" content="今天要看一场 run 干得怎么样，人得打开页面翻帧、或者 curl /api/runs/{id}/frames 把几十上百帧拉下来，自己按 eventOffset 拼时间线：哪一枪模型慢、哪次工具等了三分钟、折叠发生在第几轮、最后为什么 error。" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -863,14 +876,14 @@ GET &lt;base&gt;/api/public/v2/metrics</code></pre>
 <li><strong>内容属性的掩码、租户级开关、外部存储引用</strong>：内容本身按 §2.2 的开关记录（<code>.env</code> 默认开）；本篇不做出口前掩码、不做按租户开关、不把内容搬到外部存储再放引用（OTel 规范的生产态用法）。多租户上线前必须先补掩码，否则默认开就是把用户原文推给 Loop SaaS。</li>
 <li><strong>内容事件（events）与 <code>gen_ai.tool.definitions</code></strong>：只写 span 属性；<code>SPAN_AND_EVENT</code> 退化为 <code>SPAN_ONLY</code>，<code>EVENT_ONLY</code> 等于关闭（tako 不产出内容事件）。工具 schema 不是用户/模型内容，不写。</li>
 <li><strong>工具检索的 BM25 span</strong>：<code>toolsearch.go</code> 的 BM25 给延迟加载的工具挑声明，发生在工具装配/首轮，耗时通常可忽略；本篇不单独开 span。</li>
-<li><strong>CozeLoop 的 Eval / 实验管理</strong>：doc/45 的场景化 Eval 仍是我们自己的回归层；Loop 的 experiment 不替代它。trace 只解决「看」。</li>
+<li><strong>CozeLoop 的 Eval / 实验管理</strong>：doc/83-场景化Eval方案 的场景化 Eval 仍是我们自己的回归层；Loop 的 experiment 不替代它。trace 只解决「看」。</li>
 <li><strong>入站 trace context 与跨请求链路传播</strong>：客户端不传 traceparent，每次 HTTP 请求一条独立 trace；同一 run 的续跑是另一条 trace，靠 <code>tako.run.id</code> + <code>tako.run.epoch</code> 归组，跨会话靠 <code>gen_ai.conversation.id</code> / <code>tako.workspace.id</code>（§2.5）。</li>
 <li><strong>产品级业务/任务 ID</strong>：加字段本身可行，缺的是任务语义——谁创建、一场 run 归属几个任务、生命周期归谁、UI 怎么承载都未定义（§2.5）。最小形态是客户端自带的不透明归组键，那要求客户端改造，属于产品决定；本篇不发明。</li>
 </ul>
 <hr />
 <h2 id="7-收尾所以这解决了什么">7. 收尾：所以这解决了什么</h2>
 <p>今天「一场 run 干得怎么样」只能靠人翻帧；跨 run 的比较、租户维度的失败聚集、换模型前后的耗时对比都没有一个可检索的集合。这一层把每场 run 变成一条按 OTel GenAI 语义命名的记录，经 OTLP 报到 CozeLoop：<strong>字段名是公共语言（换后端不改代码），内容由标准开关控制（<code>.env</code> 默认开、改 <code>NO_CONTENT</code> 一键关），失败隔离（观测坏了业务照跑）</strong>。完整形态下，一条 trace 从服务收到请求开始，包住 run、每次模型调用、每次工具执行，以及召回/折叠/准入/定稿这些内部步骤（§2.6）；同一场对话的后续提问按 <code>gen_ai.conversation.id</code> 归组，换了会话还能按 <code>tako.workspace.id</code> 找回（§2.5）；token 口径显式钉为对话账本（§2.3），与 usage 帧逐值对得上。</p>
-<p>它不替代 doc/27 的账本，也不替代 doc/45 的回归——它补的是「门牌」：出了事，先能按租户、会话、项目、状态、模型把相关 run 找出来。</p>
+<p>它不替代 doc/27 的账本，也不替代 doc/83-场景化Eval方案 的回归——它补的是「门牌」：出了事，先能按租户、会话、项目、状态、模型把相关 run 找出来。</p>
 
 </main>
 <footer class="foot">

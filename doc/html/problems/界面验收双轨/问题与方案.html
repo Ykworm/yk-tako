@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>界面验收双轨：能断言的写脚本，不能断言的先量基线 · tako 文档</title>
+<meta name="description" content="改完前端，问「这次改好了吗」。答案通常只有一句：「我看着还行」。这句话既不能重跑，也不能在下次改动时报警——写它的人和读它的人之间没有任何可对质的东西。" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/problems/界面验收双轨/问题与方案.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="界面验收双轨：能断言的写脚本，不能断言的先量基线 · tako 文档" />
+<meta property="og:description" content="改完前端，问「这次改好了吗」。答案通常只有一句：「我看着还行」。这句话既不能重跑，也不能在下次改动时报警——写它的人和读它的人之间没有任何可对质的东西。" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/problems/界面验收双轨/问题与方案.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="界面验收双轨：能断言的写脚本，不能断言的先量基线 · tako 文档" />
+<meta name="twitter:description" content="改完前端，问「这次改好了吗」。答案通常只有一句：「我看着还行」。这句话既不能重跑，也不能在下次改动时报警——写它的人和读它的人之间没有任何可对质的东西。" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="../../style.css" />
 </head>
 <body>
@@ -15,7 +28,7 @@
 <main class="doc">
 <h1 id="界面验收双轨能断言的写脚本不能断言的先量基线">界面验收双轨：能断言的写脚本，不能断言的先量基线</h1>
 <blockquote>
-<p>模块：前端 · 验收面（doc/48 / doc/49 / doc/51，缺口感见 doc/45）｜状态：<strong>双轨已落地</strong>（2026-10-23 行为层、2026-10-24 视觉层）；<strong>场景级 Eval 未施工</strong>｜证据：<code>doc/48-前端可用性欠账.md</code>、<code>doc/49-走查缺陷修复.md</code>、<code>doc/51-UI视觉重做.md</code>、<code>doc/45-场景化Eval框架.md</code>、<code>yk-tako-eino/web/{playwright.config.ts,package.json,e2e/,test/}</code></p>
+<p>模块：前端 · 验收面（doc/48 / doc/49 / doc/51，缺口感见 doc/83-场景化Eval方案）｜状态：<strong>双轨已落地</strong>（2026-10-23 行为层、2026-10-24 视觉层）；<strong>场景级 Eval 未施工</strong>｜证据：<code>doc/48-前端可用性欠账.md</code>、<code>doc/49-走查缺陷修复.md</code>、<code>doc/51-UI视觉重做.md</code>、<code>doc/83-场景化Eval方案/README.md</code>、<code>yk-tako-eino/web/{playwright.config.ts,package.json,e2e/,test/}</code></p>
 </blockquote>
 <h2 id="1-场景与病灶">1. 场景与病灶</h2>
 <p>改完前端，问「这次改好了吗」。答案通常只有一句：<strong>「我看着还行」</strong>。这句话既不能重跑，也不能在下次改动时报警——写它的人和读它的人之间没有任何可对质的东西。</p>
@@ -24,7 +37,7 @@
 <p><strong>病灶二：markdown 每个 token 重解析一遍。</strong> 模板里写 <code>v-html="renderSafe(b.text)"</code>，流式输出时每来一个 token，<strong>所有气泡</strong>的 parse + sanitize 全部重跑一次。功能完全正常，表现只是「越跑越卡」。没有时间/次数这类<strong>数值</strong>，这个缺陷永远不会被提出来（doc/48 第 6 条，修法是 <code>v-memo</code>）。</p>
 <p><strong>病灶三：「统一风格」没有共同标尺。</strong> 改版前 8 个组件里散着 <strong>150 处</strong>硬编码颜色（App.vue 99、Configure.vue 16、ProjectsView.vue 12、MembersView.vue 8、ConfirmDialog.vue 6、InviteLanding.vue 5、PlanDoc.vue 3、PendingInvites.vue 1），同时存在 999/22/18/14/10/5px 六种圆角、六档字号。两个人各自「调好看」，改完谁也没法说清哪里变了、是变好还是变坏；下次再换方向，逐页找颜色必然漏（doc/51 §2）。</p>
 <p>这三种病灶的共同结构是：<strong>「页面上的结果」不是一个可以断言的字节，而验收动作却只有一句口头结论</strong>。项目在字节面上已经有两台机器（快闸 + 活体，见 AGENTS.md「验收：两台机器」），界面面此前没有对应物。</p>
-<p>还有一个反过来的教训（doc/45）：<strong>字节面全绿，场景仍可能是坏的</strong>。PII 打码最初挂在 <code>prepareInput</code>，单测断言的是「挂载点被调用」——绿；但折叠发生在这之后，历史摘要把原文重新带回来，模型看到的是明文本。测试断言的是<strong>装配位置</strong>，不是<strong>用户场景的结果</strong>。这说明「有测试」不等于「场景被守住」，也是界面层必须按真实路径驱动的原因。</p>
+<p>还有一个反过来的教训（doc/83-场景化Eval方案）：<strong>字节面全绿，场景仍可能是坏的</strong>。PII 打码最初挂在 <code>prepareInput</code>，单测断言的是「挂载点被调用」——绿；但折叠发生在这之后，历史摘要把原文重新带回来，模型看到的是明文本。测试断言的是<strong>装配位置</strong>，不是<strong>用户场景的结果</strong>。这说明「有测试」不等于「场景被守住」，也是界面层必须按真实路径驱动的原因。</p>
 <h2 id="2-候选与代价">2. 候选与代价</h2>
 <div class="table-wrap"><table>
 <thead>
@@ -58,7 +71,7 @@
 <td>D 直接用场景级 Eval 替换所有验收</td>
 <td>每个功能写成「准备/执行/断言」的场景</td>
 <td>最贴近真实用户</td>
-<td>今天还没有这一层（doc/45 未施工）；它管「agent 有没有把事办成」，管不了 CSS 对比度与 DOM 响应式，替换不了前两层</td>
+<td>今天还没有这一层（doc/83-场景化Eval方案 未施工）；它管「agent 有没有把事办成」，管不了 CSS 对比度与 DOM 响应式，替换不了前两层</td>
 </tr>
 </tbody>
 </table></div>
@@ -111,8 +124,8 @@
 <li>活体：<code>scripts/acceptance/expected.json</code> + <code>assert_contract.py</code>（真起引擎、真跑一轮）。</li>
 </ul>
 <p>doc/48 的 B1（新增 <code>GET /api/workspaces/:id/files</code>）就是两头都做：快闸加字节断言、活体加「用例 12」9 步，界面侧再加一条 Playwright。<strong>新增端点不许只加浏览器断言</strong>——浏览器看到的形状不是契约。</p>
-<h3 id="33-已知缺口场景级-evaldoc45未施工">3.3 已知缺口：场景级 Eval（doc/45，未施工）</h3>
-<p>前两轨断言的是「这个请求/这个页面」；它们回答不了「让 agent 做一件事，它有没有真办成」。doc/45 的失败故事正是这个空洞：任务看板的行为（模型该不该建任务、该不该升级描述）今天<strong>没有任何护栏</strong>，只有人工抽验。方案已给出场景 = 准备 / 执行 / 断言 三层与 <code>scripts/eval/</code> 落点，状态是<strong>未施工</strong>——本文件只记录它属于同一张验收图，不当成已覆盖。</p>
+<h3 id="33-已知缺口场景级-evaldoc83-场景化eval方案未施工">3.3 已知缺口：场景级 Eval（doc/83-场景化Eval方案，未施工）</h3>
+<p>前两轨断言的是「这个请求/这个页面」；它们回答不了「让 agent 做一件事，它有没有真办成」。doc/83-场景化Eval方案 的失败故事正是这个空洞：任务看板的行为（模型该不该建任务、该不该升级描述）今天<strong>没有任何护栏</strong>，只有人工抽验。方案已给出场景 = 准备 / 执行 / 断言 三层与 <code>scripts/eval/</code> 落点，状态是<strong>未施工</strong>——本文件只记录它属于同一张验收图，不当成已覆盖。</p>
 <h2 id="4-轨道二观感先量基线再断言">4. 轨道二：观感，先量基线再断言</h2>
 <h3 id="41-顺序先跑基线再改">4.1 顺序：先跑基线，再改</h3>
 <p>doc/51 的做法是这条轨道的样子：改版前先用 Playwright 无头在 <strong>1440×900 与 390×844</strong> 两档实拍，量出四个具体失败（侧栏底部盖住最下面那行会话；手机端项目树占约 560px、聊天正文只剩约 120px；圆角六种、字号六档；用户气泡 474px / 助手 232px 宽度跳动）。<strong>「现在挺差的」由此变成四条可复现的数字/现象</strong>，改完可以逐条对账。</p>
@@ -238,7 +251,7 @@
 </tbody>
 </table></div>
 <h2 id="6-证据">6. 证据</h2>
-<p><strong>方案</strong>：<code>doc/48-前端可用性欠账.md</code>（17 现象 → 14 修复；§6 为什么引 Playwright、两层验收表；10 条落地自审）；<code>doc/49-走查缺陷修复.md</code>（第二次走查 12 项，P0 = 子代理名带空格导致全租户 <code>tools[25].function.name</code> 400）；<code>doc/51-UI视觉重做.md</code> §0 四病灶 / §2 token 层 / §7 四档判据与实测 / §7.1 数值表；<code>doc/45-场景化Eval框架.md</code> §0 三层缺口与两个失败故事（PII 在折叠后复活、任务看板行为无护栏），状态<strong>未施工</strong>。</p>
+<p><strong>方案</strong>：<code>doc/48-前端可用性欠账.md</code>（17 现象 → 14 修复；§6 为什么引 Playwright、两层验收表；10 条落地自审）；<code>doc/49-走查缺陷修复.md</code>（第二次走查 12 项，P0 = 子代理名带空格导致全租户 <code>tools[25].function.name</code> 400）；<code>doc/51-UI视觉重做.md</code> §0 四病灶 / §2 token 层 / §7 四档判据与实测 / §7.1 数值表；<code>doc/83-场景化Eval方案/README.md</code> §0 三层缺口与两个失败故事（PII 在折叠后复活、任务看板行为无护栏），状态<strong>未施工</strong>。</p>
 <p><strong>台账</strong>：<code>tmp/48-前端可用性欠账/</code>、<code>tmp/49-走查缺陷修复/</code>、<code>tmp/51-UI重做/</code>（本地，不入库）。</p>
 <p><strong>代码符号</strong>：</p>
 <div class="table-wrap"><table>
@@ -297,7 +310,7 @@
 <h2 id="7-现状">7. 现状</h2>
 <ul>
 <li><strong>仍有效</strong>：「能断言的写脚本，不能断言的先量基线」；界面层 = Playwright（<code>web/e2e/</code>）+ 纯逻辑单测（<code>web/test/</code>）+ 四档数值判据；契约字节仍归快闸/活体，不重复；截图与视觉脚本不入库。</li>
-<li><strong>已知缺口</strong>：doc/45 场景级 Eval <strong>未施工</strong>——「agent 有没有把事办成」今天没有机器护栏；doc/51 的 <code>PendingInvites</code> / <code>PlanDoc</code> 两屏未纳入实测。</li>
+<li><strong>已知缺口</strong>：doc/83-场景化Eval方案 场景级 Eval <strong>未施工</strong>——「agent 有没有把事办成」今天没有机器护栏；doc/51 的 <code>PendingInvites</code> / <code>PlanDoc</code> 两屏未纳入实测。</li>
 <li><strong>已翻转</strong>：2026-10-24 之前「界面只靠人眼走查」作废；「统一风格」不再靠逐页改颜色，先落 token 层（doc/51 §2/§3）。</li>
 <li><strong>同族问题</strong>：界面变更为什么需要事件通道 → <a href="../变更同步用事件通道/问题与方案.html">变更同步用事件通道</a>；走查中暴露的 P0（子代理名合法性）→ <a href="../子代理规格与工具边界/问题与方案.html">子代理规格与工具边界</a>；侧栏树的呈现与验收 → <a href="../前端可用性欠账/问题与方案.html">前端可用性欠账</a>。</li>
 </ul>

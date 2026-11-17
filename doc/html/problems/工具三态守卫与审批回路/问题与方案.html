@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>工具三态守卫与审批回路 · tako 文档</title>
+<meta name="description" content="agent 有了手（bash、文件读写）之后，怎么防止它闯祸？最早的设计是三态闸：allow 放行、deny 把解释文本当结果挡回模型（不抛 error）、ask 暂停整张图等人裁决。旧线（doc/06）把它实现成命令规则引擎 + 文件路径三态 + PII 打码，ask 用 e…" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/problems/工具三态守卫与审批回路/问题与方案.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="工具三态守卫与审批回路 · tako 文档" />
+<meta property="og:description" content="agent 有了手（bash、文件读写）之后，怎么防止它闯祸？最早的设计是三态闸：allow 放行、deny 把解释文本当结果挡回模型（不抛 error）、ask 暂停整张图等人裁决。旧线（doc/06）把它实现成命令规则引擎 + 文件路径三态 + PII 打码，ask 用 e…" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/problems/工具三态守卫与审批回路/问题与方案.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="工具三态守卫与审批回路 · tako 文档" />
+<meta name="twitter:description" content="agent 有了手（bash、文件读写）之后，怎么防止它闯祸？最早的设计是三态闸：allow 放行、deny 把解释文本当结果挡回模型（不抛 error）、ask 暂停整张图等人裁决。旧线（doc/06）把它实现成命令规则引擎 + 文件路径三态 + PII 打码，ask 用 e…" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="../../style.css" />
 </head>
 <body>

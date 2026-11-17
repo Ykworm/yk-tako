@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>多 Agent 编排参照调研：Comma、Hermes、Octop 分别回答什么 · tako 文档</title>
+<meta name="description" content="用户说：“分别调研 A、B 两个市场，等两份证据都齐了，再写一份综合报告。”" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/70-多Agent编排与Task/02-多Agent编排/01-参照项目调研.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="多 Agent 编排参照调研：Comma、Hermes、Octop 分别回答什么 · tako 文档" />
+<meta property="og:description" content="用户说：“分别调研 A、B 两个市场，等两份证据都齐了，再写一份综合报告。”" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/70-多Agent编排与Task/02-多Agent编排/01-参照项目调研.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="多 Agent 编排参照调研：Comma、Hermes、Octop 分别回答什么 · tako 文档" />
+<meta name="twitter:description" content="用户说：“分别调研 A、B 两个市场，等两份证据都齐了，再写一份综合报告。”" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="../../style.css" />
 </head>
 <body>
@@ -101,7 +114,7 @@
 <p>Worker 可提交完成、请求审查或报告阻塞；reviewer 可接受或退回。状态变化和结构化 summary／metadata 留档，后续 worker 能读到同一事实，而不是依赖上一个 Agent 的私有记忆。</p>
 <h3 id="55-不照搬的部分">5.5 不照搬的部分</h3>
 <p>Hermes Kanban 以本地 SQLite 与 OS 进程为重要运行边界，产品设计包含单主机假设。tako 的目标是多副本 Go＋PostgreSQL／Redis，因此只摄取任务语义、状态约束和调度责任，不把 SQLite、PID 管理或本地 worktree 布局照搬过来。</p>
-<p>此外，状态机只能证明“系统按规定推进”，不能证明模型报告写得对；结果质量仍需要独立验证与 doc/45 的场景化 Eval。</p>
+<p>此外，状态机只能证明“系统按规定推进”，不能证明模型报告写得对；结果质量仍需要独立验证与 doc/83-场景化Eval方案 的场景化 Eval。</p>
 <h2 id="6-对-tako-的最终摄取分工">6. 对 tako 的最终摄取分工</h2>
 <div class="table-wrap"><table>
 <thead>
@@ -134,7 +147,7 @@
 </tr>
 <tr>
 <td>质量验证</td>
-<td>tako 自身 doc/45</td>
+<td>tako 自身 doc/83-场景化Eval方案</td>
 <td>独立检查最终产物，不采信“Agent 说完成”</td>
 </tr>
 </tbody>

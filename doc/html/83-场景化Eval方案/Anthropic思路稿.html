@@ -3,19 +3,32 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>83 · 场景化 Eval 方案（Anthropic 思路） · tako 文档</title>
-<link rel="stylesheet" href="style.css" />
+<title>83 配套 · 场景化 Eval 方案（Anthropic 思路） · tako 文档</title>
+<meta name="description" content="如果按 Anthropic 做 Agent 评测的思路，我会把核心定为一句话：" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/83-场景化Eval方案/Anthropic思路稿.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="83 配套 · 场景化 Eval 方案（Anthropic 思路） · tako 文档" />
+<meta property="og:description" content="如果按 Anthropic 做 Agent 评测的思路，我会把核心定为一句话：" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/83-场景化Eval方案/Anthropic思路稿.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="83 配套 · 场景化 Eval 方案（Anthropic 思路） · tako 文档" />
+<meta name="twitter:description" content="如果按 Anthropic 做 Agent 评测的思路，我会把核心定为一句话：" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<link rel="stylesheet" href="../style.css" />
 </head>
 <body>
 <header class="topbar">
-  <a class="brand" href="index.html">tako 文档</a>
-  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
   <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
 </header>
 <main class="doc">
-<h1 id="83--场景化-eval-方案anthropic-思路">83 · 场景化 Eval 方案（Anthropic 思路）</h1>
+<h1 id="83-配套--场景化-eval-方案anthropic-思路">83 配套 · 场景化 Eval 方案（Anthropic 思路）</h1>
 <blockquote>
-<p>性质：<strong>方案（待点头）</strong>。把 Agent 评测定成一句话：「给 Tako 一个真实任务，重复跑多次，检查任务结束后的真实世界状态，并保留完整轨迹解释为什么成功或失败」——结果检查优先、确定性评分器优先、多次试验、人工抽查轨迹、能力评测与回归评测分开。 状态：⬜ 未施工、<strong>待用户评审</strong>。本文是 <a href="45-场景化Eval框架.html">doc/45</a> 口径拍板（2026-11-01）之后另起的一版思路稿，<strong>与 doc/45／<a href="56-Agent测试与基准选型.html">doc/56</a> 并存，取代关系尚未裁定</strong>；裁定前不动 doc/45 的已拍板口径、不开工。2026-11-16 从仓库根的 <code>eval/README.md</code>（讨论稿，无编号）迁入本仓 doc 树，补 NN 编号与状态头注。 日期：2026-11-16 立项并迁入 doc/。 代码落点：—（未施工。文中提到的 <code>scripts/eval/</code> 是 <a href="45-场景化Eval框架.html">doc/45</a> 的计划落点，尚未存在；本篇不改 <code>internal/runengine/</code> 生产代码）。 与总纲关系：doc/16 §5.1「场景化 Eval」待做项的方案分支之一；口径若变更，须同批回填 doc/45、doc/16 与 doc/README.md。</p>
+<p>性质：<strong>思路稿（待点头，不作施工真源）</strong>。把 Agent 评测定成一句话：「给 Tako 一个真实任务，重复跑多次，检查任务结束后的真实世界状态，并保留完整轨迹解释为什么成功或失败」——结果检查优先、确定性评分器优先、多次试验、人工抽查轨迹、能力评测与回归评测分开。 状态：⬜ 未施工。施工真源是 <a href="README.html">doc/83-场景化Eval方案</a>（2026-11-17 立项；第一版 = 阶段一·最小骨架）。<strong>2026-11-17 用户裁定</strong>：本篇是新方案的评测哲学骨架与增量来源，不作施工契约；原 doc/45 回归框架稿降为同目录素材。2026-11-16 从仓库根的 <code>eval/README.md</code>（讨论稿，无编号）迁入本仓 doc 树。 日期：2026-11-16 立项并迁入 doc/；2026-11-17 随 83 章收拢改为配套思路稿。 代码落点：—（未施工。文中提到的 <code>scripts/eval/</code> 是 <a href="README.html">doc/83-场景化Eval方案</a> 的计划落点，尚未存在；本篇不改 <code>internal/runengine/</code> 生产代码）。 与总纲关系：doc/16 §5.1「场景化 Eval」待做项的思路参照；口径若变更，须同批回填 <a href="README.html">doc/83-场景化Eval方案</a>、doc/16 与 doc/README.md。 配套分析：<a href="DataAgent课程借鉴与Tako落地分析.html">企业级 Agent 课程对 Tako 的借鉴分析</a>——按完整十篇课程逐篇逐课对账六大架构域，补充质量契约、Fixture／版本元组、Multi-Grader、根因实验、Runtime／Memory 边界与发布阶段；不改变施工真源口径。 学习清单：<a href="Tako-EvalOps学习知识点表.html">Tako Agent 全课程学习知识点表</a>——覆盖模型、Runtime、Context、Tool／Skill、Memory 与 EvalOps，逐项给出概念解释、对 Tako 的 5 分制价值与当前功能状态；User 是否了解该概念一栏留空自评。</p>
 </blockquote>
 <p>如果按 Anthropic 做 Agent 评测的思路，我会把核心定为一句话：</p>
 <blockquote>
@@ -230,7 +243,7 @@
 </ul>
 <h2 id="五首批语料回归集与能力集分开建设">五、首批语料：回归集与能力集分开建设</h2>
 <h3 id="a-回归集从真实事故和手工验收来">A. 回归集：从真实事故和手工验收来</h3>
-<p>以 <code>doc/45</code> 已有场景为基础，再补最近落地但旧草案尚未覆盖的能力：</p>
+<p>以同目录 <a href="回归框架稿.html">回归框架稿</a> 已有场景为基础，再补最近落地但旧草案尚未覆盖的能力：</p>
 <div class="table-wrap"><table>
 <thead>
 <tr>
@@ -432,7 +445,7 @@ Harness 自己卡住是 <code>errored</code>；Agent 在明确规定的任务预
 
 </main>
 <footer class="foot">
-  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/83-%E5%9C%BA%E6%99%AF%E5%8C%96Eval%E6%96%B9%E6%A1%88.md"><code>doc/83-场景化Eval方案.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/83-%E5%9C%BA%E6%99%AF%E5%8C%96Eval%E6%96%B9%E6%A1%88/Anthropic%E6%80%9D%E8%B7%AF%E7%A8%BF.md"><code>doc/83-场景化Eval方案/Anthropic思路稿.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
 </footer>
 </body>
 </html>

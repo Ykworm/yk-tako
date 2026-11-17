@@ -3,19 +3,32 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>45 · 场景化 Eval 框架 · tako 文档</title>
-<link rel="stylesheet" href="style.css" />
+<title>83 素材 · 场景化 Eval 回归框架稿（历史稿） · tako 文档</title>
+<meta name="description" content="tako 今天有两层机器能自动判红的东西，都是&quot;接口有没有按约定回&quot;，没有一层能判&quot;这件事有没有做成&quot;：" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/83-场景化Eval方案/回归框架稿.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="83 素材 · 场景化 Eval 回归框架稿（历史稿） · tako 文档" />
+<meta property="og:description" content="tako 今天有两层机器能自动判红的东西，都是&quot;接口有没有按约定回&quot;，没有一层能判&quot;这件事有没有做成&quot;：" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/83-场景化Eval方案/回归框架稿.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="83 素材 · 场景化 Eval 回归框架稿（历史稿） · tako 文档" />
+<meta name="twitter:description" content="tako 今天有两层机器能自动判红的东西，都是&quot;接口有没有按约定回&quot;，没有一层能判&quot;这件事有没有做成&quot;：" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<link rel="stylesheet" href="../style.css" />
 </head>
 <body>
 <header class="topbar">
-  <a class="brand" href="index.html">tako 文档</a>
-  <nav class="links"><a href="../assets/tako-architecture.html">架构总览</a><a href="../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../assets/tako-orchestration.html">长任务编排</a><a href="../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
   <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
 </header>
 <main class="doc">
-<h1 id="45--场景化-eval-框架">45 · 场景化 Eval 框架</h1>
+<h1 id="83-素材--场景化-eval-回归框架稿历史稿">83 素材 · 场景化 Eval 回归框架稿（历史稿）</h1>
 <blockquote>
-<p>性质：<strong>方案（2026-11-01 口径已拍板，待施工）</strong>。给「agent 有没有把活干完」建一层可机器重跑的回归——不是端点字节的回归，是任务场景的回归。 状态：⬜ 未施工。<strong>口径已定</strong>（2026-11-01 用户拍板，见下方「口径拍板」五条）。开工前由主 Agent 编写 <code>tmp/45-场景化Eval/施工包.md</code> 交审；用户点头后开发模型一次完成 §4 的完整交付，内部 loop 不再逐拍向用户交审，机器验收后由主 Agent 终审。 日期：2026-10-23 初稿；2026-11-01 口径修订（§1 换成 17 条四组目录、§0.3 补三层与 outcome 枚举、§2 补字段与两种场景形状）。 代码落点：—（未施工。预计落点：<code>scripts/eval/</code>（runner + 场景目录 + 报告）、<code>scripts/acceptance/harness.py</code>（复用，不另起一套 HTTP 底座）；不改 <code>internal/runengine/</code> 的生产代码——<strong>Eval 是站在引擎外面看它的，不进去改它</strong>）。 参照：doc/16 §2b 第 6 项（场景化 Eval 框架，借鉴 Pi evals + Hermes 场景化 evals，队列里写着「回归的地基，别放到最后」）；<code>scripts/acceptance/</code>（契约字节那一层的做法，本篇是它的姊妹层，不是替代）。 与 doc/16 的关系：给 §2b 第 6 行补一份可施工的方案真源；<strong>不改</strong> §2 能力表的状态（那一行是 §2b 表外创意池，不是 §2 的十项主能力）。 <strong>口径拍板（2026-11-01，用户定）</strong>：</p>
+<p>性质：<strong>素材（不作施工真源）</strong>。保留 2026-10-23 立项、2026-11-01 拍板的回归框架口径与 17 条语料，供新方案吸收；不再直接施工。 状态：<strong>已被 <a href="README.html">README.md</a> 取代为施工真源</strong>（2026-11-17 用户裁定：本篇不能作为方案）。读者注意：本篇的 YAML 案例形状、17 条语料、E0–E6 步骤都是历史素材；现行方案用 JSON、先做两条案例、按阶段推进，见 README。 日期：2026-10-23 初稿；2026-11-01 口径修订；2026-11-17 降为 83 章素材并改名。 代码落点：—（未施工；现行落点见 <a href="README.html">README.md</a> 的 <code>scripts/eval/</code>）。 参照：doc/16 §2b 第 6 项；<code>scripts/acceptance/</code>（契约字节那一层）。本篇是它的姊妹层的早期草案，不是替代。 与 doc/16 的关系：给 §2b 第 6 行提供判定思想与语料素材；<strong>不改</strong> §2 能力表的状态。 <strong>口径拍板（2026-11-01，用户定）</strong>：</p>
 <ol type="1">
 <li><strong>M = M</strong>：跑 M 次，M 次全过才算这个案例通过（<strong>不是</strong> N 次里至少 M 次过）。</li>
 <li><strong>不通过也要记录结果</strong>：每一次 run 的结果（过 / 没过 / 为什么）必须落盘并出现在报告里，不许只剩一个红叉。</li>
@@ -698,7 +711,7 @@
 <td>E6</td>
 <td>文档收口</td>
 <td>状态与真源一致</td>
-<td>doc/45 头注、doc/16 §2b 第 6 行、doc/README</td>
+<td>doc/83-场景化Eval方案/README.md 头注、doc/16 §2b 第 6 行、doc/README</td>
 </tr>
 </tbody>
 </table></div>
@@ -726,7 +739,7 @@
 
 </main>
 <footer class="foot">
-  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/45-%E5%9C%BA%E6%99%AF%E5%8C%96Eval%E6%A1%86%E6%9E%B6.md"><code>doc/45-场景化Eval框架.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/83-%E5%9C%BA%E6%99%AF%E5%8C%96Eval%E6%96%B9%E6%A1%88/%E5%9B%9E%E5%BD%92%E6%A1%86%E6%9E%B6%E7%A8%BF.md"><code>doc/83-场景化Eval方案/回归框架稿.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
 </footer>
 </body>
 </html>

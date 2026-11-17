@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>60 · 前端多会话并发（单主视图 + 后台保留） · tako 文档</title>
+<meta name="description" content="后端一直允许不同会话并发跑（会话闸 one_live_run_per_session 只管同一场，租户容量闸默认 8）；限制全在前端：整个应用只调用一次 useChat()，切会话就是把这唯一一份状态清空重填。本篇把「谁在观察」从一份全局闭包变成一组并行实例——切走只是换 ac…" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/60-多会话并发.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="60 · 前端多会话并发（单主视图 + 后台保留） · tako 文档" />
+<meta property="og:description" content="后端一直允许不同会话并发跑（会话闸 one_live_run_per_session 只管同一场，租户容量闸默认 8）；限制全在前端：整个应用只调用一次 useChat()，切会话就是把这唯一一份状态清空重填。本篇把「谁在观察」从一份全局闭包变成一组并行实例——切走只是换 ac…" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/60-多会话并发.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="60 · 前端多会话并发（单主视图 + 后台保留） · tako 文档" />
+<meta name="twitter:description" content="后端一直允许不同会话并发跑（会话闸 one_live_run_per_session 只管同一场，租户容量闸默认 8）；限制全在前端：整个应用只调用一次 useChat()，切会话就是把这唯一一份状态清空重填。本篇把「谁在观察」从一份全局闭包变成一组并行实例——切走只是换 ac…" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>

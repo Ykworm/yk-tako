@@ -83,7 +83,11 @@ for (const [page, name] of PAGES) {
   const ids = [...html.matchAll(/\bid=["']([^"']+)["']/g)].map(match => match[1]);
   uniqueIDs(name, ids, "HTML");
   for (const match of html.matchAll(/\b(?:href|src)=["']([^"']*)["']/g)) checkLocalLink(file, match[1]);
-  for (const match of html.matchAll(/\b(?:href|src)=["'](https?:\/\/[^"']+)["']/gi)) {
+  // 外部 URL 一律不算——说明页要能离线打开，不许依赖站外的脚本、样式或图片。
+  // 唯一的例外是 <link rel="canonical">：它指向本页在正式域名下的地址，是给搜索引擎看的
+  // 元数据，不是页面渲染要加载的资源（页面本身不加载它，缺了照样显示）。
+  const withoutCanonical = html.replace(/<link[^>]*\brel=["']canonical["'][^>]*>/gi, "");
+  for (const match of withoutCanonical.matchAll(/\b(?:href|src)=["'](https?:\/\/[^"']+)["']/gi)) {
     fail(name, `存在外部运行时资源：${match[1]}`);
   }
 

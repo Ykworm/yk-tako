@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>56 · Agent 测试与基准选型 · tako 文档</title>
+<meta name="description" content="公开基准测的是「模型 + 它自带的脚手架」，不是 tako。 在这份清单里：" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/56-Agent测试与基准选型.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="56 · Agent 测试与基准选型 · tako 文档" />
+<meta property="og:description" content="公开基准测的是「模型 + 它自带的脚手架」，不是 tako。 在这份清单里：" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/56-Agent测试与基准选型.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="56 · Agent 测试与基准选型 · tako 文档" />
+<meta name="twitter:description" content="公开基准测的是「模型 + 它自带的脚手架」，不是 tako。 在这份清单里：" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -15,7 +28,7 @@
 <main class="doc">
 <h1 id="56--agent-测试与基准选型">56 · Agent 测试与基准选型</h1>
 <blockquote>
-<p>性质：<strong>方案（部分落地，2026-10-31 立项）</strong>。回答「拿什么测现在的 tako」——哪些公开基准值得跑、谁来跑、多久跑一次、哪些只该借方法不该搬环境。 状态：🔶 部分落地。<strong>已施工（2026-11-01）</strong>：<code>scripts/bench/</code>——行 schema（<code>row.schema.json</code>）、<strong>两臂（tako / dsh）</strong>、判定器（<code>judge.py</code>，内置官方 scorer 三支 + <code>--selftest</code>）、切片配方与派生核对（<code>cases/gaia_l1_25.json</code> + <code>slice.py</code>）、批量 runner（<code>run_bench.py</code>，支持多臂配对）、价目表（<code>pricing.json</code>）、键集守门（<code>check-schema.sh</code>）；<strong>§4.7 可比性协议</strong>已落纸。<strong>G1 已跑完</strong>（2026-11-01）：GAIA 25 题两轮单臂实测——题面本身 2/25，题面 + 尾句 21/25，口径钉死见 §4.8；<strong>两臂配对也已跑完</strong>——tako 22/25 vs dsh 20/25，见 §4.9。<strong>pass^k 与基线归因已施工（2026-11-01 夜）</strong>：<code>--repeat</code> / <code>--baseline</code> / <code>--write-baseline</code> + 归因五态（§6.1），trace 取证走 Langfuse v2（<code>scripts/bench/traces.py</code>）。<strong>D1 首轮 k=5 基线已跑完（2026-11-02 凌晨）</strong>：tako Pass@5 24/25 · pass^5 20/25，dsh 23/25 · 14/25，基线落 <code>scripts/bench/baselines/gaia.json</code>（§4.10）。<strong>未施工</strong>：pi 臂（未装）、SWE-bench（gated）。 日期：2026-10-31 立项；2026-11-01 第一批落地（口径见 §4.7），同日第二批落地并实跑出数（§4.8），同日第三批：装 dsh 臂并跑两臂配对（§4.9）；11-02 凌晨第四批：k=5 基线与 pass^k 归因（§4.10）。 代码落点：<code>scripts/bench/</code>（公开题标定）、<code>scripts/eval/</code>（doc/45 内部回归，本方案只回填指标，不另起 runner）；<strong>不改 <code>internal/runengine/</code> 的生产代码</strong>（本轮实测确认：跑评测不需要改引擎一行）。 参照：doc/45（内部场景回归，本方案的下层）、doc/16 §2b 第 6 项、用户 2026-10-31 给的候选清单（SWE-bench / HumanEval / MBPP / LiveCodeBench / GAIA / τ-bench / AgentBench / Claw-Eval）。 与 doc/45 的关系：doc/45 测「tako 的机制有没有把活干完」；本篇测「模型+tako 在标准任务上有多强」。两层不合并，也不互相替代。</p>
+<p>性质：<strong>方案（部分落地，2026-10-31 立项）</strong>。回答「拿什么测现在的 tako」——哪些公开基准值得跑、谁来跑、多久跑一次、哪些只该借方法不该搬环境。 状态：🔶 部分落地。<strong>已施工（2026-11-01）</strong>：<code>scripts/bench/</code>——行 schema（<code>row.schema.json</code>）、<strong>两臂（tako / dsh）</strong>、判定器（<code>judge.py</code>，内置官方 scorer 三支 + <code>--selftest</code>）、切片配方与派生核对（<code>cases/gaia_l1_25.json</code> + <code>slice.py</code>）、批量 runner（<code>run_bench.py</code>，支持多臂配对）、价目表（<code>pricing.json</code>）、键集守门（<code>check-schema.sh</code>）；<strong>§4.7 可比性协议</strong>已落纸。<strong>G1 已跑完</strong>（2026-11-01）：GAIA 25 题两轮单臂实测——题面本身 2/25，题面 + 尾句 21/25，口径钉死见 §4.8；<strong>两臂配对也已跑完</strong>——tako 22/25 vs dsh 20/25，见 §4.9。<strong>pass^k 与基线归因已施工（2026-11-01 夜）</strong>：<code>--repeat</code> / <code>--baseline</code> / <code>--write-baseline</code> + 归因五态（§6.1），trace 取证走 Langfuse v2（<code>scripts/bench/traces.py</code>）。<strong>D1 首轮 k=5 基线已跑完（2026-11-02 凌晨）</strong>：tako Pass@5 24/25 · pass^5 20/25，dsh 23/25 · 14/25，基线落 <code>scripts/bench/baselines/gaia.json</code>（§4.10）。<strong>未施工</strong>：pi 臂（未装）、SWE-bench（gated）。 日期：2026-10-31 立项；2026-11-01 第一批落地（口径见 §4.7），同日第二批落地并实跑出数（§4.8），同日第三批：装 dsh 臂并跑两臂配对（§4.9）；11-02 凌晨第四批：k=5 基线与 pass^k 归因（§4.10）。 代码落点：<code>scripts/bench/</code>（公开题标定）、<code>scripts/eval/</code>（doc/83-场景化Eval方案 内部回归，本方案只回填指标，不另起 runner）；<strong>不改 <code>internal/runengine/</code> 的生产代码</strong>（本轮实测确认：跑评测不需要改引擎一行）。 参照：doc/83-场景化Eval方案（内部场景回归，本方案的下层）、doc/16 §2b 第 6 项、用户 2026-10-31 给的候选清单（SWE-bench / HumanEval / MBPP / LiveCodeBench / GAIA / τ-bench / AgentBench / Claw-Eval）。 与 doc/83-场景化Eval方案 的关系：doc/83-场景化Eval方案 测「tako 的机制有没有把活干完」；本篇测「模型+tako 在标准任务上有多强」。两层不合并，也不互相替代。</p>
 </blockquote>
 <hr />
 <h2 id="0-一句话结论">0. 一句话结论</h2>
@@ -23,9 +36,9 @@
 <ul>
 <li>能<strong>直接跑 tako</strong>、且值得跑的只有 <strong>GAIA</strong>（验证集 Level 1 的纯文本切片）——它不需要容器，正好落在 tako 现有的 <code>web_search</code> + 文件工具 + 多轮 loop 上；</li>
 <li><strong>SWE-bench</strong> 是编码 agent 的事实标准，但它要 Linux 容器。<strong>开发机没有 Docker，评测机可以是 Linux 服务器</strong>（装 Docker 即可）：v1 先在服务器上用 <strong>mini-swe-agent</strong> 跑 25 题，只当<strong>模型基线</strong>（明确标注「不是 tako 分数」）；tako 自己跑要补的不是 Docker，而是「bash 在 Linux 上能执行」——现在没有 <code>sandbox-exec</code> 就 fail closed，谁当围栏见 §5.5；</li>
-<li><strong>τ-bench / Claw-Eval 不移植环境</strong>，只借三样判定方法（pass^k、终态断言、安全一票否决）回填 doc/45——搬它们的环境比写我们自己的失败场景更贵，而且它们不测我们真正怕的缺陷；</li>
+<li><strong>τ-bench / Claw-Eval 不移植环境</strong>，只借三样判定方法（pass^k、终态断言、安全一票否决）回填 doc/83-场景化Eval方案——搬它们的环境比写我们自己的失败场景更贵，而且它们不测我们真正怕的缺陷；</li>
 <li><strong>HumanEval / MBPP / LiveCodeBench / AgentBench 不作为 tako 的测试</strong>：前两个是单步函数题且已饱和/污染，LiveCodeBench 只测模型，AgentBench 已停更；</li>
-<li><strong>CI 门禁仍然只认确定性断言</strong>（快闸 + 契约 + doc/45 的 K/S 两组）。公开基准只出分数与趋势，不判红绿。</li>
+<li><strong>CI 门禁仍然只认确定性断言</strong>（快闸 + 契约 + doc/83-场景化Eval方案 的 K/S 两组）。公开基准只出分数与趋势，不判红绿。</li>
 </ul>
 <hr />
 <h2 id="1-先分清测谁三种测试三个受试者">1. 先分清「测谁」：三种测试，三个受试者</h2>
@@ -54,7 +67,7 @@
 <tr>
 <td>同一件事重复做，几次能做成？</td>
 <td>tako + 模型</td>
-<td>doc/45 场景回归（未施工）</td>
+<td>doc/83-场景化Eval方案 场景回归（未施工）</td>
 <td>K/S 组硬断言，红绿 + 通过率</td>
 <td>发布前 / 每天</td>
 </tr>
@@ -166,7 +179,7 @@
 <ul>
 <li><strong>是什么</strong>：HumanEval 164 道手写函数题；MBPP 974 道众包题（最常报的 sanitized 子集 427 道）。都给函数签名/描述，模型补函数体，跑单元测试。</li>
 <li><strong>为什么不采纳</strong>：它们是<strong>单步生成</strong>，没有工具、没有文件、没有多轮 loop——测的是模型的补全能力，不是 tako 的 agent 能力。而且强模型已经在 90%+，天花板效应明显；题目公开多年，污染不可避免。拿它当 CI 门禁，红了大概率是模型抽样抖动，不是 tako 坏了。</li>
-<li><strong>唯一可能的用途</strong>：如果哪天想加一个「最便宜的慢档烟雾」——让 tako 用 <code>write_file</code> 写答案、用 <code>bash</code> 跑测试——可以用 10–20 道 MBPP。但这本质上是在测工具链能不能跑通，doc/45 的场景 5–8 已经用真实失败故事覆盖了，优先级更低。</li>
+<li><strong>唯一可能的用途</strong>：如果哪天想加一个「最便宜的慢档烟雾」——让 tako 用 <code>write_file</code> 写答案、用 <code>bash</code> 跑测试——可以用 10–20 道 MBPP。但这本质上是在测工具链能不能跑通，doc/83-场景化Eval方案 阶段二的 K/S 场景已经用真实失败故事覆盖了，优先级更低。</li>
 </ul>
 <h3 id="23-livecodebench">2.3 LiveCodeBench</h3>
 <ul>
@@ -186,7 +199,7 @@
 <ul>
 <li><strong>是什么</strong>：零售 / 航空（τ² 加电信，τ³ 加银行与语音）的客服场景。一个 LLM 扮演用户，agent 调领域 API，判定看<strong>对话结束后的数据库状态</strong>是否等于目标状态，以及是否说出必需信息（如退款金额）。核心指标 <strong>pass^k</strong>：同一题连续 k 次全过才算过；强模型 pass@1 可能 60%+，pass^8 掉到 25% 以下。</li>
 <li><strong>为什么不移植</strong>：要搬零售/航空的 mock API、政策文件、用户模拟器、终态判定，工作量远大于写一批我们自己的场景；而且它测的是「客服政策遵从」，不是 tako 的 PII、围栏、看板、续跑。</li>
-<li><strong>借什么</strong>：pass^k 的思想（<strong>能力天花板 vs 可靠性地板</strong>）和「读终态、不读模型自述」的判定原则。doc/45 的判定口径已定为 <strong>M=M（跑 M 次全过）= pass^k</strong>，不需要额外加容忍层；读库/读文件那组（K/S 组）本来就读终态，符合终态断言。</li>
+<li><strong>借什么</strong>：pass^k 的思想（<strong>能力天花板 vs 可靠性地板</strong>）和「读终态、不读模型自述」的判定原则。doc/83-场景化Eval方案 的判定口径已定为 <strong>M=M（跑 M 次全过）= pass^k</strong>，不需要额外加容忍层；读库/读文件那组（K/S 组）本来就读终态，符合终态断言。</li>
 <li><strong>版本注意</strong>：原始 τ-bench 仓库已标注过时，后续是 τ² / τ³；如果将来真要做客服域评测，从 τ³ 起步。</li>
 </ul>
 <h3 id="26-agentbench">2.6 AgentBench</h3>
@@ -201,7 +214,7 @@
 <li><strong>为什么不移植</strong>：它自带环境与评分细则，移植成本高；并且它的任务分布（通用服务编排、多模态、专业对话）不等于 tako 的失败故事。</li>
 <li><strong>借什么</strong>：
 <ol type="1">
-<li><strong>Pass^3 与 Pass@3 分开报</strong>——doc/45 的 B/C 组按这个口径输出；</li>
+<li><strong>Pass^3 与 Pass@3 分开报</strong>——doc/83-场景化Eval方案 的 B/C 组按这个口径输出；</li>
 <li><strong>安全一票否决</strong>——PII 泄漏、围栏越界、越权访问任何一条命中，整场失败，即使任务完成；</li>
 <li><strong>过程可审计</strong>——doc/54 的 step span 已经能给出每一步耗时，天然支持「过程指标」；但 CozeLoop 目前没有公开的查询 API，自动报告先用 frames 的步数/工具数 + 墙钟，span 供人进控制台看。</li>
 </ol></li>
@@ -217,7 +230,7 @@
 │ L1 契约        scripts/acceptance/                            │ 0 元 · 分钟 · 改契约时
 │               expected.json + assert_contract.py              │
 ├──────────────────────────────────────────────────────────────┤
-│ L2 场景回归    scripts/eval/（doc/45，未施工）                 │ 模型钱 · 10–30 分钟
+│ L2 场景回归    scripts/eval/（doc/83-场景化Eval方案，未施工）                 │ 模型钱 · 10–30 分钟
 │               PII / 看板 / 续跑 / 围栏 / 并发                  │ ← 唯一可做门禁的模型层
 ├──────────────────────────────────────────────────────────────┤
 │ C1 通用标定    scripts/bench/run_bench.py（25 题 L1）         │ 模型钱 · 20–60 分钟
@@ -938,7 +951,7 @@
 <li><strong>用工具那 17 题上，两臂的 5 处分歧全是「说话方式」与「什么时候收工」</strong>：3 题格式（中文答案、带单位）、2 题超时（<strong>tako 超时 1 题、dsh 超时 1 题，两臂各撞一次 300s 上限</strong>），<strong>没有一题是知识</strong>。而且<strong>分歧率 29% 仍低于同臂重跑在这 17 题上的 35%</strong>。</li>
 </ul>
 <p><strong>结论要说准</strong>：「GAIA 上 tako ≈ dsh」<strong>不是</strong>「我们的运行时跟别人的运行时打平」，而是「在这 25 道题里，能体现运行时差异的地方只有 17 题，而且这 17 题跑的还是同一套通用工具」。更要紧的是：<strong>tako 独有的那些面（子代理、项目隔离、文件落盘、多租户、安全门）在 GAIA 里一道题都没碰到</strong>——GAIA 只有「搜网页 + 读文件 + 跑 bash」。</p>
-<p>所以 <strong>GAIA 上就算 tako 拿满分，也证明不了 tako 这个产品比 dsh 强</strong>；它证明的是「同一个 deepseek-flash + 中文提示词 + 一套通用搜索工具，能答对几道公开题」。GAIA 这条线能回答的只有「模型 + 提示词 + 预算」；<strong>tako 的产品能力要去 doc/45 的场景化 eval 测</strong>（K/S/B/C 四组：准备/动作/判定/证据），那里才有项目隔离、落盘、子代理、安全门这些 tako 独有的面。</p>
+<p>所以 <strong>GAIA 上就算 tako 拿满分，也证明不了 tako 这个产品比 dsh 强</strong>；它证明的是「同一个 deepseek-flash + 中文提示词 + 一套通用搜索工具，能答对几道公开题」。GAIA 这条线能回答的只有「模型 + 提示词 + 预算」；<strong>tako 的产品能力要去 doc/83-场景化Eval方案 的场景化 eval 测</strong>（K/S/B/C 四组：准备/动作/判定/证据），那里才有项目隔离、落盘、子代理、安全门这些 tako 独有的面。</p>
 <h4 id="494--的两列不能互相比">4.9.4 $ 的两列不能互相比</h4>
 <div class="table-wrap"><table>
 <thead>
@@ -1123,12 +1136,12 @@
 <p><strong>推荐 A</strong>：它把「隔离」交给容器，把「执行位置」抽成 bash 的一个后端，引擎本身保持现在的单进程形态；B 留到我们真要做「引擎整体容器化部署」时再收。</p>
 <p><strong>G4 的前置因此变成三件可验收的小事</strong>：① 写一个能跑引擎的 Dockerfile；② bash 容器后端跑通一条 <code>echo</code>；③ 起一个 SWE-bench 实例容器，让 tako 读到 issue、改文件、<code>git diff</code> 拿到 patch。三件都绿了，再谈 25 题。</p>
 <hr />
-<h2 id="6-从-τ-bench--claw-eval-借到-doc45-的三样东西">6. 从 τ-bench / Claw-Eval 借到 doc/45 的三样东西</h2>
-<p>这三样不需要新目录、不需要移植环境，只是在 doc/45 的 runner 里加字段和一条判定原则。</p>
+<h2 id="6-从-τ-bench--claw-eval-借到-doc83-场景化eval方案-的三样东西">6. 从 τ-bench / Claw-Eval 借到 doc/83-场景化Eval方案 的三样东西</h2>
+<p>这三样不需要新目录、不需要移植环境，只是在 doc/83-场景化Eval方案 的 runner 里加字段和一条判定原则。</p>
 <h3 id="61-passk把能做对一次与次次做对分开">6.1 pass^k：把「能做对一次」与「次次做对」分开</h3>
-<p><strong>本仓库的口径就是 pass^k 本身</strong>（2026-11-01 拍板）：跑 M 次，<strong>M 次全过</strong>才算这个案例通过——不是「N 次里至少 M 次过」。所以 doc/45 的判定字段是：</p>
-<div class="sourceCode" id="cb5"><pre class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">repeat</span><span class="kw">:</span><span class="at"> </span><span class="dv">5</span><span class="co">          # 跑 M=5 次</span></span>
-<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co"># 判定：passed == M 才算过（= pass^5，严格全过）</span></span></code></pre></div>
+<p><strong>本仓库的口径就是 pass^k 本身</strong>（2026-11-01 拍板）：跑 M 次，<strong>M 次全过</strong>才算这个案例通过——不是「N 次里至少 M 次过」。所以 doc/83-场景化Eval方案 的判定字段是：</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span> <span class="dt">&quot;repeat&quot;</span><span class="fu">:</span> <span class="dv">5</span> <span class="fu">}</span></span></code></pre></div>
+<p>（案例字段见 doc/83-场景化Eval方案 §4.2；判定：<code>passed == M</code> 才算过，= pass^5，严格全过。）</p>
 <p>报告同时给 <strong>Pass@N</strong>（N 次里至少 1 次过，能力天花板）与 <strong>pass^k</strong>（k 次全过，可靠性地板）。两个数差得越大，说明模型越「靠运气」——但<strong>只有 pass^k 参与判红</strong>，Pass@N 只是信息。</p>
 <p>B 组还有一层：<strong>模型水平低本身不算回归</strong>。<code>baseline</code>（首次实测抄真值）用来把「红」分成两种——<code>model_baseline</code>（红但等于基线 = 已知的模型水平，<strong>不拦门禁</strong>）与 <code>model_below_baseline</code>（红且低于基线 = 要查，<strong>拦门禁</strong>）。基线只影响归因，不改变判定。C 组也照此输出，但不判红。</p>
 <p><strong>已落地（2026-11-01 夜）</strong>：<code>run_bench.py --repeat N</code> 出 Pass@N / pass^N 两列与逐次明细；基线用 <code>--write-baseline</code> 落 <code>scripts/bench/baselines/&lt;题集&gt;.json</code>，键是 <code>sha256(task_id)[:12]</code>——<strong>题面、gold、task_id 明文都不入库</strong>。归因按「判定 + 基线 + trace 取证」三份证据推：</p>
@@ -1164,14 +1177,14 @@
 </table></div>
 <p>取证走 Langfuse（<code>traces.py</code>，doc/54 §3.1）；trace 是异步上报的，所以流程是「跑 → 贴 traceId → 拉事实 → <code>--rebuild</code> 回填归因」，<code>--rebuild</code> 也执行红码规则。<strong>只有 <code>engine_regression</code> / <code>model_below_baseline</code> 让退出码非零</strong>。</p>
 <h3 id="62-终态断言读世界不读模型自述">6.2 终态断言：读世界，不读模型自述</h3>
-<p>τ-bench 的判定不看对话里说了什么漂亮话，只看结束后的数据库状态。doc/45 的 K/S 两组已经是这个路子（<code>db_rows</code> / <code>db_no_plaintext</code> / <code>db_value_contains</code> / <code>file_content</code>）；补一条成文原则：</p>
+<p>τ-bench 的判定不看对话里说了什么漂亮话，只看结束后的数据库状态。doc/83-场景化Eval方案 阶段二的 K/S 两组会用这个路子（<code>db_rows</code> / <code>db_no_plaintext</code> / <code>db_value_contains</code> / <code>file_content</code>）；判定原则已写进正文 §1：</p>
 <blockquote>
 <p><strong>判定只读任务结束后的世界状态（库、文件、帧），不读模型在回复里的自我汇报。</strong> 模型说「已写入」不算，文件里有没有才算。</p>
 </blockquote>
 <h3 id="63-安全一票否决">6.3 安全一票否决</h3>
-<p>Claw-Eval 把安全当乘法门：命中一条违规，任务分归零。doc/45 加一个场景级开关：</p>
-<div class="sourceCode" id="cb6"><pre class="sourceCode yaml"><code class="sourceCode yaml"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">safety_gate</span><span class="kw">:</span><span class="at"> </span><span class="ch">true</span><span class="co">   # 命中 pg 里的明文密钥 / 围栏越界 / 越权访问 → 整场 fail</span></span></code></pre></div>
-<p>即使 <code>run_status=complete</code>、任务看上去做完了，只要安全项命中，这条场景就是红的。PII 那几条场景（doc/45 §1 的 <code>k-pii-mask</code> 与 <code>b-pii-model-input</code> / <code>b-pii-fold</code> / <code>b-pii-memory</code>）默认打开。</p>
+<p>Claw-Eval 把安全当乘法门：命中一条违规，任务分归零。doc/83-场景化Eval方案 用断言级开关（正文 §2.6）：</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode json"><code class="sourceCode json"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">{</span> <span class="dt">&quot;type&quot;</span><span class="fu">:</span> <span class="st">&quot;db_no_plaintext&quot;</span><span class="fu">,</span> <span class="dt">&quot;safety&quot;</span><span class="fu">:</span> <span class="kw">true</span> <span class="fu">}</span></span></code></pre></div>
+<p>即使 <code>run_status=complete</code>、任务看上去做完了，只要安全项命中，这条场景就是红的。阶段二补上的 PII 场景（<code>k-pii-mask</code> 与 <code>b-pii-model-input</code> / <code>b-pii-memory</code>）默认打开；阶段一先落 <code>b-pii-fold</code> 的「禁止位置无明文」。</p>
 <h3 id="64-过程指标有-span但先别指望自动报告">6.4 过程指标：有 span，但先别指望自动报告</h3>
 <p>doc/54 已经给 recall / compact / 每个工具调用打了 span，能看每一步耗时。但 CozeLoop 目前没有公开的查询 API（search / query / list 都 404），自动报告拿不到 span 数据。v1 的过程指标只用：</p>
 <ul>
@@ -1189,7 +1202,7 @@
 <li><strong>报告字段</strong>：每个 case 集的 <code>lift</code>、两臂通过率、flags（<code>no-lift</code> / <code>negative-delta</code> / <code>control-saturated</code> / <code>treatment-saturated</code> / <code>flaky</code>），以及配对后的 tokens / toolCalls / totalMs / cost 均值差；</li>
 <li><strong>产物</strong>：每臂 session 快照按 hash 落盘，<code>protocolDigest</code> 钉住协议版本；存在 blocked pair 时非零退出。</li>
 </ul>
-<p>这套协议与语言无关。<strong>不要移植 <code>vitest-evals</code></strong>：那会把 Node 测试栈拖进 Go + Python 的评测面。只借协议，在 <code>scripts/eval/</code>（doc/45）实现一次，<code>scripts/bench/</code> 复用。</p>
+<p>这套协议与语言无关。<strong>不要移植 <code>vitest-evals</code></strong>：那会把 Node 测试栈拖进 Go + Python 的评测面。只借协议，在 <code>scripts/eval/</code>（doc/83-场景化Eval方案）实现一次，<code>scripts/bench/</code> 复用。</p>
 <p>对 tako 直接能用的三种变体：</p>
 <div class="table-wrap"><table>
 <thead>
@@ -1247,9 +1260,9 @@
 </tr>
 <tr>
 <td><strong>G3</strong></td>
-<td>把终态断言 / safety_gate / 报告的 pass^k 列回填 doc/45（<strong>pass^k 口径已在 doc/45 E0 对齐</strong>，本步只搬另两项）</td>
+<td>把终态断言 / safety_gate / 报告的 pass^k 列回填 doc/83-场景化Eval方案（<strong>pass^k 口径已在 doc/83-场景化Eval方案 §2.3 对齐</strong>，本步只搬另两项）</td>
 <td>场景回归的判据从「过/不过」升级为「可靠性 + 安全门」</td>
-<td><strong>依赖 doc/45 E1–E2 已落地</strong>；同一场景 <code>repeat:5</code> 跑出 <code>3/5</code> 的报告（判定不过；归因 <code>model_baseline</code> 时退出码仍 0）</td>
+<td><strong>依赖 doc/83-场景化Eval方案 E1–E2 已落地</strong>；同一场景 <code>repeat:5</code> 跑出 <code>3/5</code> 的报告（判定不过；归因 <code>model_baseline</code> 时退出码仍 0）</td>
 </tr>
 <tr>
 <td><strong>G4</strong></td>
@@ -1269,7 +1282,7 @@
 <ul>
 <li>G1 先做，因为它是唯一零新增基础设施、又能直接打到 tako 的一层；它 concurrently 验证了「外部题 → 我们的 HTTP 面」这条管道，后面 G2 的报告也能共用同一套落盘格式。</li>
 <li>G2 独立于 G1，但需要外部机器；放在 G1 后是因为先把「我们的报告长什么样」定下来，避免两边各写一套。</li>
-<li>G3 必须在 doc/45 的 E1–E2 之后，否则没有 runner 可改；它搬的是<strong>口径之外的方法</strong>（终态断言 / safety_gate / 报告的 pass^k 列），口径本身已在 doc/45 E0 前移对齐。</li>
+<li>G3 必须在 doc/83-场景化Eval方案 的 E1–E2 之后，否则没有 runner 可改；它搬的是<strong>口径之外的方法</strong>（终态断言 / safety_gate / 报告的 pass^k 列），口径本身已在 doc/83-场景化Eval方案 §2.3 前移对齐。</li>
 <li>G4 卡在 Linux 沙箱 + 容器化，是另一条工程线；不在本方案的 v1 里假装能做完。</li>
 <li>G5 与 G1 并行即可：它不依赖外部数据集，先用 3–5 个自有场景把「计划 → 两臂 → 配对 → 报告」跑通；§4.5 的浏览器实验要靠它才有可比口径。</li>
 </ul>
@@ -1301,7 +1314,7 @@
 <td>开发者</td>
 </tr>
 <tr>
-<td>L2 场景回归（doc/45 全量）</td>
+<td>L2 场景回归（doc/83-场景化Eval方案 全量）</td>
 <td>约 $1–3</td>
 <td>10–30 分钟</td>
 <td>发布前 / 每天</td>
@@ -1339,7 +1352,7 @@
 <li><strong>不接 CI</strong>：仓库没有 CI 基建；外部基准又慢又抖，接进去只会制造「习惯性忽略的红灯」。</li>
 <li><strong>不跑全量</strong>：SWE-bench 500 / LiveCodeBench 1055 / Claw-Eval 300 全量不在 v1；固定小切片足够看趋势。</li>
 <li><strong>不做多模态 GAIA / Claw-Eval 全量</strong>：多模态题需要附件与视觉链路，先把纯文本链路跑稳。</li>
-<li><strong>不为评测改 <code>internal/runengine/</code></strong>：评测站在引擎外面看它；发现缺陷另开一拍修引擎，不在评测里开后门（同 doc/45 §5）。</li>
+<li><strong>不为评测改 <code>internal/runengine/</code></strong>：评测站在引擎外面看它；发现缺陷另开一拍修引擎，不在评测里开后门（同 doc/83-场景化Eval方案 §5）。</li>
 <li><strong>不在评测脚本里替模型补能力</strong>：没有 <code>web_fetch</code> 就不在 runner 里偷偷抓页面；分数必须反映真实能力。</li>
 <li><strong>不拿公开分数做营销</strong>：口径（模型 + harness + 切片）不写清的数字不对外。</li>
 <li><strong>不在 Apple Silicon 本机跑 x86 评测镜像</strong>：模拟层会把时间和结果都拖坏。</li>
@@ -1351,7 +1364,7 @@
 <ul>
 <li><strong>能直接问 tako 的，只有 GAIA</strong>——所以先跑它，25 题、纯文本、只出分数；</li>
 <li><strong>SWE-bench 是模型基线，不是 tako 成绩</strong>——先用 mini-swe-agent 跑，等容器与 Linux 沙箱落地再让 tako 自己上场；</li>
-<li><strong>τ-bench / Claw-Eval 不搬环境，只借判定方法</strong>——pass^k、终态断言、安全一票否决进 doc/45，成本低、收益直接；</li>
+<li><strong>τ-bench / Claw-Eval 不搬环境，只借判定方法</strong>——pass^k、终态断言、安全一票否决进 doc/83-场景化Eval方案，成本低、收益直接；</li>
 <li><strong>CI 门禁仍然只认确定性断言</strong>——公开基准是体检报告，不是录取通知书。</li>
 </ul>
 <p>一句话：<strong>先把「测谁」钉死，再谈跑哪个榜。</strong> 否则分数涨了，产品该漏的还在漏。</p>

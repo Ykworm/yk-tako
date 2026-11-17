@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>多 Agent 编排方案：依赖、调度与结果汇合 · tako 文档</title>
+<meta name="description" content="tako 已有主 Agent 委派子代理，但如果直接把“多 Agent”做成“允许主 Agent 多叫几个子代理”，会遇到一条断掉的业务链：" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/70-多Agent编排与Task/02-多Agent编排/02-多Agent编排方案.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="多 Agent 编排方案：依赖、调度与结果汇合 · tako 文档" />
+<meta property="og:description" content="tako 已有主 Agent 委派子代理，但如果直接把“多 Agent”做成“允许主 Agent 多叫几个子代理”，会遇到一条断掉的业务链：" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/70-多Agent编排与Task/02-多Agent编排/02-多Agent编排方案.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="多 Agent 编排方案：依赖、调度与结果汇合 · tako 文档" />
+<meta name="twitter:description" content="tako 已有主 Agent 委派子代理，但如果直接把“多 Agent”做成“允许主 Agent 多叫几个子代理”，会遇到一条断掉的业务链：" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="../../style.css" />
 </head>
 <body>
@@ -151,7 +164,7 @@ tenant_id</code></pre>
 <li>时间线证明 C 的 run 晚于两份成功结果；</li>
 <li>中途 <code>kill -9</code> 自己启动的一个执行实例，恢复前 C 不启动，显式恢复后只产生一个 C；</li>
 <li>记录每个 Task 的 run ID、模型、用量和最终文件；</li>
-<li>模型未按预期拆任务时按 doc/45 登记为模型行为／未覆盖，不能用假数据冒充引擎调度已通过。</li>
+<li>模型未按预期拆任务时按 doc/83-场景化Eval方案 登记为模型行为／未覆盖，不能用假数据冒充引擎调度已通过。</li>
 </ul>
 <p>契约字节一旦实施，期望进入 <code>scripts/acceptance/expected.json</code> 与 doc/19-v6-04；任务效果进入场景化 Eval，不与接口验收混为一谈。</p>
 <h2 id="12-分期与非目标">12. 分期与非目标</h2>

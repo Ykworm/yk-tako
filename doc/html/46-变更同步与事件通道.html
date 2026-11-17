@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>46 · 变更同步与事件通道 · tako 文档</title>
+<meta name="description" content="背景：tako 的所有同步都是「拉」——会话列表是一次性 GET /api/sessions，项目页靠手动「刷新」，对话页在打开那一刻 reconcile 一次。系统里没有任何「谁改了什么」的通知。client（浏览器 tab）越多，每个 tab 手里的快照就越可能是假的。" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/46-变更同步与事件通道.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="46 · 变更同步与事件通道 · tako 文档" />
+<meta property="og:description" content="背景：tako 的所有同步都是「拉」——会话列表是一次性 GET /api/sessions，项目页靠手动「刷新」，对话页在打开那一刻 reconcile 一次。系统里没有任何「谁改了什么」的通知。client（浏览器 tab）越多，每个 tab 手里的快照就越可能是假的。" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/46-变更同步与事件通道.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="46 · 变更同步与事件通道 · tako 文档" />
+<meta name="twitter:description" content="背景：tako 的所有同步都是「拉」——会话列表是一次性 GET /api/sessions，项目页靠手动「刷新」，对话页在打开那一刻 reconcile 一次。系统里没有任何「谁改了什么」的通知。client（浏览器 tab）越多，每个 tab 手里的快照就越可能是假的。" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>

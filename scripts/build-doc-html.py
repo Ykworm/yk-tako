@@ -22,6 +22,7 @@
 
 import argparse
 import html as htmllib
+import json
 import os
 import re
 import subprocess
@@ -35,6 +36,18 @@ REPO_SLUG = "Ykworm/yk-tako"
 BLOB = f"https://github.com/{REPO_SLUG}/blob/main/"
 STYLE = os.path.join(OUT, "style.css")
 PANDOC = "pandoc"
+
+# 站点对外地址。站点根 = doc/，所以 doc/index.html 就是 https://tako.docs.yktea.fun/ 。
+# 换域名时改这三行 + doc/robots.txt + scripts/build-sitemap.py 的 HOST + workflow 里的 SITE_HOST。
+SITE_ORIGIN = "https://tako.docs.yktea.fun"
+SITE_NAME = "tako 文档"
+OG_IMAGE = SITE_ORIGIN + "/assets/tako-architecture.png"
+
+# 生成物插入的标记块：重跑脚本时按标记整块替换，不动手写内容。
+SEO_HEAD_START = "<!-- seo:head:start -->"
+SEO_HEAD_END = "<!-- seo:head:end -->"
+OUTLINE_START = "<!-- static-outline:start -->"
+OUTLINE_END = "<!-- static-outline:end -->"
 
 ASSET_PAGES = [
     ("tako-architecture.html", "架构总览"),
@@ -85,6 +98,237 @@ def tree_url(repo_rel):
 
 def strip_tags(text):
     return re.sub(r"<[^>]+>", "", text)
+
+
+def site_url(repo_rel):
+    """仓库里的产物路径 → 站点 URL。站点根是 doc/。
+
+    doc/index.html          → https://tako.docs.yktea.fun/
+    doc/html/53-模块地图.html → https://tako.docs.yktea.fun/html/53-模块地图.html
+    """
+    rel = repo_rel[len("doc/") :]
+    if rel == "index.html":
+        return SITE_ORIGIN + "/"
+    return f"{SITE_ORIGIN}/{rel}"
+
+
+def first_paragraph_text(fragment):
+    """正文第一段（跳过引用块——那里面是「性质／最后核对」这类元信息）。
+
+    拿去当 meta description：搜索引擎只显示摘要，不显示正文。
+    有些文档正文以列表开头，没有 <p>，退而取第一条列表项。
+    """
+    body = re.sub(r"<blockquote.*?</blockquote>", " ", fragment, flags=re.S)
+    for pattern in (r"<p>(.*?)</p>", r"<li>(.*?)</li>"):
+        match = re.search(pattern, body, flags=re.S)
+        if match:
+            return re.sub(r"\s+", " ", strip_tags(match.group(1))).strip()
+    return ""
+
+
+def clamp_description(text, limit=140):
+    """摘要截断到 ~140 字。中文按字算，Bing 的展示上限在 160 字上下。"""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip("，。、；：,; ") + "…"
+
+
+def head_meta_block(title, description, canonical, og_type="article"):
+    """canonical + OG + Twitter Card——搜索摘要与社交分享共用一套。
+
+    摘要抓不到时**不输出** description meta：显式写空值比不写更糟，
+    它等于告诉搜索引擎「这一页没有摘要」，而没写只是让它自己判断。
+    """
+    title_full = f"{title} · {SITE_NAME}"
+    lines = []
+    if description:
+        lines.append(f'<meta name="description" content="{htmllib.escape(description, quote=True)}" />')
+    lines += [
+        f'<link rel="canonical" href="{canonical}" />',
+        f'<meta property="og:type" content="{og_type}" />',
+        f'<meta property="og:site_name" content="{htmllib.escape(SITE_NAME, quote=True)}" />',
+        f'<meta property="og:title" content="{htmllib.escape(title_full, quote=True)}" />',
+    ]
+    if description:
+        lines.append(
+            f'<meta property="og:description" content="{htmllib.escape(description, quote=True)}" />'
+        )
+    lines += [
+        f'<meta property="og:url" content="{canonical}" />',
+        f'<meta property="og:image" content="{OG_IMAGE}" />',
+        '<meta property="og:locale" content="zh_CN" />',
+        '<meta name="twitter:card" content="summary_large_image" />',
+        f'<meta name="twitter:title" content="{htmllib.escape(title_full, quote=True)}" />',
+    ]
+    if description:
+        lines.append(
+            f'<meta name="twitter:description" content="{htmllib.escape(description, quote=True)}" />'
+        )
+    lines.append(f'<meta name="twitter:image" content="{OG_IMAGE}" />')
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- 说明页静态文字版
+
+
+def asset_outline_html(data):
+    """把说明页 page-data 里的节点渲染成纯文字区块。
+
+    为什么必须静态化：说明页的内容（图、19～21 个责任节点、每个节点的输入输出与代码落点）
+    原本只存在于 <script type="application/json"> 里。搜索引擎与 Copilot 抽取的是页面正文，
+    script 里的 JSON 不算正文——不落地成真文字，全站最有信息量的那部分对检索是不可见的。
+    落地后同时解决三件事：爬虫能读到、无 JS 的人能读、AI 摘录时能拿到可引用的段落。
+    """
+    nodes = data.get("nodes") or []
+    if not nodes:
+        return ""
+
+    groups = []
+    group_index = {}
+    for node in nodes:
+        band = node.get("band") or "其他"
+        if band not in group_index:
+            group_index[band] = len(groups)
+            groups.append((band, []))
+        groups[group_index[band]][1].append(node)
+
+    out = [OUTLINE_START, '<section class="static-outline" id="static-outline" aria-labelledby="static-outline-title">']
+    out.append(
+        """<style>
+.static-outline { margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid rgba(84,58,41,.22); }
+.static-outline h2 { font-size: 1.3rem; margin: 0 0 .4rem; color: #543A29; }
+.static-outline > p { font-size: .9rem; opacity: .8; margin: 0 0 1rem; }
+.static-outline h3.outline-band { font-size: 1rem; margin: 1.6rem 0 .6rem; color: #543A29; }
+.static-outline .outline-grid { display: grid; gap: .7rem; grid-template-columns: repeat(auto-fill, minmax(19rem, 1fr)); }
+.static-outline .outline-item { border: 1px solid rgba(84,58,41,.18); border-radius: .5rem; padding: .7rem .85rem; background: rgba(255,255,255,.55); }
+.static-outline h4 { font-size: .95rem; margin: 0 0 .3rem; }
+.static-outline .outline-sub { font-weight: 400; font-size: .8rem; opacity: .65; }
+.static-outline p { font-size: .84rem; line-height: 1.6; margin: .25rem 0; }
+.static-outline .outline-summary { opacity: .9; }
+.static-outline .outline-key { display: inline-block; min-width: 5.2em; margin-right: .45em; font-size: .78rem; opacity: .7; }
+.static-outline .outline-facts { margin: .3rem 0; padding-left: 1.1rem; font-size: .82rem; }
+@media (max-width: 40rem) { .static-outline .outline-grid { grid-template-columns: 1fr; } }
+</style>"""
+    )
+    out.append('<h2 id="static-outline-title">文字版：全部模块清单</h2>')
+    out.append(
+        "<p>上面的图解由 JavaScript 绘制；下面是同一批模块的纯文字清单，"
+        "便于检索、复制与外部引用。内容与图一致，由 "
+        "<code>scripts/build-doc-html.py</code> 从本页的 <code>page-data</code> 生成。</p>"
+    )
+    for band, items in groups:
+        out.append(f'<h3 class="outline-band">{htmllib.escape(band)}（{len(items)}）</h3>')
+        out.append('<div class="outline-grid">')
+        for node in items:
+            out.append('<article class="outline-item">')
+            title = htmllib.escape(node.get("title", ""))
+            subtitle = node.get("subtitle")
+            out.append(
+                f'<h4>{title}'
+                + (f' <span class="outline-sub">{htmllib.escape(subtitle)}</span>' if subtitle else "")
+                + "</h4>"
+            )
+            if node.get("summary"):
+                out.append(f'<p class="outline-summary">{htmllib.escape(node["summary"])}</p>')
+            for label, key in (("为什么需要它", "need"), ("输入", "input"), ("输出", "output")):
+                if node.get(key):
+                    out.append(
+                        f'<p class="outline-row"><span class="outline-key">{label}</span>'
+                        f'{htmllib.escape(node[key])}</p>'
+                    )
+            facts = node.get("facts") or []
+            if facts:
+                items_html = "".join(
+                    f'<li><span class="outline-key">{htmllib.escape(str(a))}</span>'
+                    f'{htmllib.escape(str(b))}</li>'
+                    for a, b in facts
+                )
+                out.append(f'<ul class="outline-facts">{items_html}</ul>')
+            code = node.get("code") or []
+            if code:
+                # 只写文字不写链接：说明页有「不许有外部资源」的机器检查
+                # （scripts/check-architecture-pages.mjs），可点击的代码链接在
+                # 交互面板里由 JS 渲染（那边才是链接）。
+                paths = " ".join(f"<code>{htmllib.escape(str(c))}</code>" for c in code)
+                out.append(f'<p class="outline-row"><span class="outline-key">代码落点</span>{paths}</p>')
+            docs = node.get("docs") or []
+            if docs:
+                links = []
+                for item in docs:
+                    path = item if isinstance(item, str) else item.get("path", "")
+                    label = path if isinstance(item, str) else item.get("label", path)
+                    if not path:
+                        continue
+                    links.append(
+                        f'<a href="../{htmllib.escape(path, quote=True)}">{htmllib.escape(label)}</a>'
+                    )
+                if links:
+                    out.append(
+                        f'<p class="outline-row"><span class="outline-key">现行文档</span>{" ".join(links)}</p>'
+                    )
+            out.append("</article>")
+        out.append("</div>")
+    out.append("</section>")
+    out.append(OUTLINE_END)
+    return "\n".join(out)
+
+
+def replace_marked(text, start, end, block):
+    """按标记整块替换（标记不存在就原样返回）。"""
+    pattern = re.escape(start) + r".*?" + re.escape(end)
+    return re.sub(pattern, lambda _: block, text, flags=re.S)
+
+
+def inject_asset_outline(text):
+    """把静态文字版写进说明页：有就整块替换，没有就插到 noscript-note 之前。"""
+    match = re.search(r'<script[^>]*id="page-data"[^>]*>(.*?)</script>', text, re.S)
+    if not match:
+        return text
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return text
+    block = asset_outline_html(data)
+    if not block:
+        return text
+    # 先把旧的块整块摘掉（连同它后面的换行），再插到 <noscript> 之前。
+    # 连换行一起摘是为了幂等：否则每跑一次就多留一个空行，--check 永远报「需要更新」。
+    text = re.sub(
+        re.escape(OUTLINE_START) + r".*?" + re.escape(OUTLINE_END) + r"\n*",
+        "",
+        text,
+        flags=re.S,
+    )
+    # 插在 <noscript> 之前，不能插在里面：noscript 是「没开 JS 时才显示」的降级块，
+    # 开了 JS 的浏览器不渲染它，搜索引擎渲染后也会丢掉——那等于白做。
+    marker = "<noscript>"
+    if marker in text:
+        return text.replace(marker, block + "\n\n" + marker, 1)
+    marker = '<div class="noscript-note">'
+    if marker in text:
+        return text.replace(marker, block + "\n\n" + marker, 1)
+    return text.replace("</main>", block + "\n\n</main>", 1)
+
+
+def inject_asset_head_meta(text, page_name):
+    """给手写说明页补 canonical 与 OG（description 页面里已经有了）。"""
+    title_match = re.search(r"<title>(.*?)</title>", text, re.S)
+    if not title_match:
+        return text
+    title = title_match.group(1).strip()
+    desc_match = re.search(r'<meta name="description" content="([^"]*)"', text)
+    description = desc_match.group(1).strip() if desc_match else ""
+    canonical = f"{SITE_ORIGIN}/assets/{page_name}"
+    block = "\n".join(
+        [
+            SEO_HEAD_START,
+            head_meta_block(title, description, canonical, og_type="website"),
+            SEO_HEAD_END,
+        ]
+    )
+    if SEO_HEAD_START in text:
+        return replace_marked(text, SEO_HEAD_START, SEO_HEAD_END, block)
+    return text.replace(title_match.group(0), title_match.group(0) + "\n" + block, 1)
 
 
 # ---------------------------------------------------------------- 链接重写
@@ -189,7 +433,7 @@ def rewrite_fragment(fragment, src_rel, out_rel):
 # ---------------------------------------------------------------- 页面外壳
 
 
-def page_html(fragment, src_rel, out_rel, title):
+def page_html(fragment, src_rel, out_rel, title, description=""):
     out_dir = os.path.dirname(out_rel)
     css = rel_from("doc/html/style.css", out_dir)
     index = rel_from("doc/html/index.html", out_dir)
@@ -198,12 +442,17 @@ def page_html(fragment, src_rel, out_rel, title):
         f'<a href="{assets}{name}">{label}</a>' for name, label in ASSET_PAGES
     )
     source = blob_url(src_rel)
+    canonical = site_url(out_rel)
+    if not description:
+        description = clamp_description(first_paragraph_text(fragment))
+    meta = head_meta_block(title, description, canonical)
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>{htmllib.escape(title)} · tako 文档</title>
+{meta}
 <link rel="stylesheet" href="{css}" />
 </head>
 <body>
@@ -459,6 +708,11 @@ def rewrite_asset_pages(write=True):
 
         new_text = re.sub(r'(<a\b[^>]*?\bhref=")([^"]*\.md)(")', sub_attr, text)
         new_text = re.sub(r'("(?:path|href)":")([^"]*\.md)(")', sub_attr, new_text)
+
+        # 说明页是手写的：canonical / OG 与静态文字版由这里补进去。
+        # 顺序有讲究——先改道 .md 链接，静态文字版才拿得到已经改道过的 page-data。
+        new_text = inject_asset_head_meta(new_text, name)
+        new_text = inject_asset_outline(new_text)
 
         if new_text != text:
             changed.append(f"doc/assets/{name}")

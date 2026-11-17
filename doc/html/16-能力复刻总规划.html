@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>16 · 能力复刻总规划 · tako 文档</title>
+<meta name="description" content="tako 是什么：从 pi 式 agent 循环长出来的 AI 工作伙伴，单入口产品（cmd/yktako）。核心是&quot;一个能自主干活、带任务看板、带工具安全、能长时间跑任务的 agent&quot;。" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/16-能力复刻总规划.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="16 · 能力复刻总规划 · tako 文档" />
+<meta property="og:description" content="tako 是什么：从 pi 式 agent 循环长出来的 AI 工作伙伴，单入口产品（cmd/yktako）。核心是&quot;一个能自主干活、带任务看板、带工具安全、能长时间跑任务的 agent&quot;。" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/16-能力复刻总规划.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="16 · 能力复刻总规划 · tako 文档" />
+<meta name="twitter:description" content="tako 是什么：从 pi 式 agent 循环长出来的 AI 工作伙伴，单入口产品（cmd/yktako）。核心是&quot;一个能自主干活、带任务看板、带工具安全、能长时间跑任务的 agent&quot;。" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -631,9 +644,9 @@
 <td><strong>T2</strong></td>
 </tr>
 <tr>
-<td>场景化 Eval 框架</td>
+<td>场景化 Eval 方案</td>
 <td>Pi <code>packages/evals</code> + Hermes <code>evals/</code></td>
-<td>不做通用 BLEU/ROUGE，按任务场景跑回归（完成率/步骤数/token 消耗）——<strong>方案 doc/45（2026-10-23 立项，待点头）</strong>：场景 = 准备/动作/判定/证据四件套，判定按「锁在被测系统还是模型身上」分 K/S/B/C 四组、判定 = M=M（跑 M 次全过）、红的成因分归因（只有引擎回归与低于基线拦门禁），语料 = 17 条四组目录。<strong>另有 <a href="83-场景化Eval方案.html">doc/83</a>（2026-11-16 迁入 doc/ 的思路稿，待点头）：把评测定成「给真实任务、重复跑多次、查任务结束后的真实世界状态、留完整轨迹」，与 Anthropic 的 Agent Eval 工程实践同调；与 doc/45 已拍板口径并存，取代关系待裁定，裁定前不动 doc/45 口径、不开工</strong>。<strong>外部基准选型见 <a href="56-Agent测试与基准选型.html">doc/56</a>（2026-10-31 立项；<strong>2026-11-01 第一批已施工、G1 已跑完出数、且装上 dsh 臂跑出两臂配对；11-02 凌晨 k=5 首轮基线跑完</strong>（tako Pass@5 24/25 · pass^5 20/25，dsh 23/25 · 14/25，§4.10）：<code>scripts/bench/</code>——行 schema + 判定器（内置 GAIA 官方 scorer 三支，<code>--selftest</code> 对照官方源码）+ 切片配方与 <code>slice_hash</code>（题面不入库）+ 批量 runner（支持多臂配对）+ 报告；口径落纸在 doc/56 §4.7，<strong>GAIA 25 题两轮单臂实测出数在 §4.8：题面本身 2/25，题面 + 尾句 21/25——差的全在「答案长什么样」；两臂配对在 §4.9：tako 22/25 vs dsh 20/25，但同臂隔一小时重跑的逐题分歧率（7/25 = 28%）比两臂之间（6/25 = 24%）还大——换 harness 的影响不如把同一 harness 重跑一遍，所以这轮不给两臂排名</strong>）</strong>：公开基准测的是模型 + 它自带的 harness，不是 tako；GAIA L1 25 题切片是唯一现在能直接跑 tako 的公开基准，SWE-bench 先在 Linux 服务器以 mini-swe-agent 跑模型基线（服务器 Docker 可用），tako 级等引擎镜像 + bash 容器后端（容器当围栏）</td>
+<td>不做通用 BLEU/ROUGE，按任务场景跑回归（完成率/步骤数/token 消耗）——<strong>方案 <a href="83-场景化Eval方案/README.html">doc/83-场景化Eval方案</a>（原 doc/45，2026-10-23 立项；2026-11-17 迁入 83 章并重写，待点头）</strong>：判定按「锁在被测系统还是模型身上」分 K/S/B/C 四组、判定 = M=M（跑 5 次全过）、归因／退出码／安全一票否决三层分开；<strong>第一版 = 阶段一·最小骨架：B 组两条（<code>b-pii-fold</code>、<code>b-file-write</code>）、JSON 案例、隔离单位 = case × trial、证据落 <code>tmp/eval/&lt;ts&gt;/</code></strong>；K/S 组与其余语料是方案内阶段二（启动条件见正文 §8）。<strong>素材与思路参照 <a href="83-场景化Eval方案/Anthropic思路稿.html">Anthropic 思路稿</a>（2026-11-16 迁入，2026-11-17 起降为配套思路稿）：把评测定成「给真实任务、重复跑多次、查任务结束后的真实世界状态、留完整轨迹」；<a href="83-场景化Eval方案/回归框架稿.html">回归框架稿</a> 是旧 doc/45 正文，只作语料与口径素材，YAML 案例形状与 E0–E6 步骤已被 README 取代</strong>。<strong>外部基准选型见 <a href="56-Agent测试与基准选型.html">doc/56</a>（2026-10-31 立项；<strong>2026-11-01 第一批已施工、G1 已跑完出数、且装上 dsh 臂跑出两臂配对；11-02 凌晨 k=5 首轮基线跑完</strong>（tako Pass@5 24/25 · pass^5 20/25，dsh 23/25 · 14/25，§4.10）：<code>scripts/bench/</code>——行 schema + 判定器（内置 GAIA 官方 scorer 三支，<code>--selftest</code> 对照官方源码）+ 切片配方与 <code>slice_hash</code>（题面不入库）+ 批量 runner（支持多臂配对）+ 报告；口径落纸在 doc/56 §4.7，<strong>GAIA 25 题两轮单臂实测出数在 §4.8：题面本身 2/25，题面 + 尾句 21/25——差的全在「答案长什么样」；两臂配对在 §4.9：tako 22/25 vs dsh 20/25，但同臂隔一小时重跑的逐题分歧率（7/25 = 28%）比两臂之间（6/25 = 24%）还大——换 harness 的影响不如把同一 harness 重跑一遍，所以这轮不给两臂排名</strong>）</strong>：公开基准测的是模型 + 它自带的 harness，不是 tako；GAIA L1 25 题切片是唯一现在能直接跑 tako 的公开基准，SWE-bench 先在 Linux 服务器以 mini-swe-agent 跑模型基线（服务器 Docker 可用），tako 级等引擎镜像 + bash 容器后端（容器当围栏）</td>
 <td><strong>T2</strong></td>
 </tr>
 <tr>
@@ -734,7 +747,7 @@
 <tr>
 <td>受限自修改（RSI）实验</td>
 <td>外部能力清单</td>
-<td>固定评测集 + 沙箱内生成／评测候选 Harness 版本 + 晋级／拒绝／回滚；地基是 doc/45（场景化 Eval）与 doc/56（配对协议与 pass^k 基线）</td>
+<td>固定评测集 + 沙箱内生成／评测候选 Harness 版本 + 晋级／拒绝／回滚；地基是 doc/83-场景化Eval方案（场景化 Eval）与 doc/56（配对协议与 pass^k 基线）</td>
 <td>待评估</td>
 </tr>
 </tbody>
@@ -792,8 +805,8 @@
 <tr>
 <td><strong>验收可机器重跑</strong></td>
 <td>✅（两层在跑；<strong>第三层场景化 Eval 方案已出、待点头</strong>）</td>
-<td>契约字节的期望<strong>不能只以散文形式存在</strong>。两层：快闸（<code>contract_test.go</code>——信封字节序、session/frames/log 响应字节、帧 kind 词表、业务码值；不打模型、不用 API Key，每拍收尾随 go test 跑）+ 活体（<code>scripts/acceptance/</code>——机器真源 <code>expected.json</code> + 断言器，红打 ❌、退出码非零）。散文版在 19v6-04，与机器真源<strong>同批改</strong>。<strong>第三层（场景化 Eval）</strong>：前两层断的是"接口有没有按约定回"，断不了"<strong>活有没有干完</strong>"——2026-10-23 PII 挂载点选错（只挂首轮→折叠后复活）时两层<strong>全绿</strong>。方案见 <a href="45-场景化Eval框架.html">doc/45</a>（2026-10-23 立项，待点头；判定分 K/S/B/C 四组——按「判定锁在被测系统还是模型身上」分，判定 = M=M（跑 M 次全过，M=5），不通过也逐次记录，红了再分归因：只有引擎回归与低于基线拦门禁）</td>
-<td>前两层：<code>scripts/acceptance/{expected.json,assert_contract.py,matrix.py,spotcheck.sh,check-expected.sh,taskboard_crash.sh,events_live.sh}</code>、<code>yk-tako-eino/internal/runengine/contract_test.go</code>（规则见根 AGENTS.md「验收：两台机器，各管一段」）；第三层：<code>scripts/eval/</code>（<strong>待建</strong>，doc/45）</td>
+<td>契约字节的期望<strong>不能只以散文形式存在</strong>。两层：快闸（<code>contract_test.go</code>——信封字节序、session/frames/log 响应字节、帧 kind 词表、业务码值；不打模型、不用 API Key，每拍收尾随 go test 跑）+ 活体（<code>scripts/acceptance/</code>——机器真源 <code>expected.json</code> + 断言器，红打 ❌、退出码非零）。散文版在 19v6-04，与机器真源<strong>同批改</strong>。<strong>第三层（场景化 Eval）</strong>：前两层断的是"接口有没有按约定回"，断不了"<strong>活有没有干完</strong>"——2026-10-23 PII 挂载点选错（只挂首轮→折叠后复活）时两层<strong>全绿</strong>。方案见 <a href="83-场景化Eval方案/README.html">doc/83-场景化Eval方案</a>（原 doc/45，2026-10-23 立项，2026-11-17 迁入 83 章并重写为施工方案，待点头；第一版 = 阶段一·最小骨架：B 组两条、JSON 案例、隔离单位 = case × trial；判定分 K/S/B/C 四组、判定 = M=M（跑 5 次全过），归因／退出码／安全一票否决三层分开）</td>
+<td>前两层：<code>scripts/acceptance/{expected.json,assert_contract.py,matrix.py,spotcheck.sh,check-expected.sh,taskboard_crash.sh,events_live.sh}</code>、<code>yk-tako-eino/internal/runengine/contract_test.go</code>（规则见根 AGENTS.md「验收：两台机器，各管一段」）；第三层：<code>scripts/eval/</code>（<strong>待建</strong>，doc/83-场景化Eval方案）</td>
 </tr>
 <tr>
 <td><strong>变更端点发事件</strong></td>
@@ -858,7 +871,7 @@
 <li><strong>记忆（#6）</strong> — 子代理做完后紧接着。借鉴 Hermes learning_graph 经验归纳 + memory_provider 分层</li>
 <li><strong>context_usage（#4c）</strong> — 与子代理配套补齐。media_offload（#4b）旧线已提前做完（代码随翻篇删除）；v6 重做已落地（doc/32，2026-10-21 收口）</li>
 </ol>
-<p><strong>T2 · 创意差异化</strong>（核心做完后挑有趣的做）： 4. <strong>树状会话历史</strong>（§2b）— 借鉴 Pi tree-based session，压缩 = 子树折叠，Go 生态独一无二 5. <strong>Skill 使用追踪</strong>（§2b）— 借鉴 Hermes skill_usage，子代理/skill 的调用频次与淘汰 6. <strong>场景化 Eval 框架</strong>（§2b）— 借鉴 Pi evals + Hermes 场景化 evals，按任务回归而非通用指标</p>
+<p><strong>T2 · 创意差异化</strong>（核心做完后挑有趣的做）： 4. <strong>树状会话历史</strong>（§2b）— 借鉴 Pi tree-based session，压缩 = 子树折叠，Go 生态独一无二 5. <strong>Skill 使用追踪</strong>（§2b）— 借鉴 Hermes skill_usage，子代理/skill 的调用频次与淘汰 6. <strong>场景化 Eval 方案</strong>（§2b）— 借鉴 Pi evals + Hermes 场景化 evals，按任务回归而非通用指标</p>
 <p><strong>T3 · 基础设施 / 延后</strong>： 7. <del>崩溃续跑（#7c）</del> — <strong>已落地</strong>（doc/30 A1–A5 + A8 前端 reattach，2026-10-21）；server 端 自动巡检裁掉，恢复走客户端触发（显式「继续这一轮」按钮） 8. IM / cron 入口（#8b） 9. 多用户多 Agent（#9） 10. 对话→召回（#10）— 受 §4 护栏约束；PG 词面全文检索方案并入 doc/29（语义召回已裁，2026-10-18）</p>
 <p><strong>明确不做 / 暂缓</strong>：</p>
 <ul>
@@ -935,7 +948,7 @@
 </tr>
 <tr>
 <td>8</td>
-<td>§2b 创意池：树状会话历史、Skill 使用追踪、<strong>场景化 Eval</strong>（方案 <a href="45-场景化Eval框架.html">doc/45</a> 待点头）</td>
+<td>§2b 创意池：树状会话历史、Skill 使用追踪、<strong>场景化 Eval</strong>（方案 <a href="83-场景化Eval方案/README.html">doc/83-场景化Eval方案</a> 待点头）</td>
 <td>§2b</td>
 <td>Pi / Hermes</td>
 <td>差异化叙事；其中<strong>场景化 Eval 是回归的地基</strong>，别放到最后</td>
@@ -993,7 +1006,7 @@
 <li><p>任务列表按会话过滤（<strong>已落地 2026-11-14</strong>，commit <code>8c01d0c</code>：<code>GET /api/workspaces/:id/tasks</code> 加可选 <code>sessionId</code>（不传=全项目、非空=按来源会话过滤、未知会话=200 空列表）；面板／任务页默认「本会话」可切「本项目全部」，处理条仍项目级聚合；纯过滤不校验会话存在性，不动 Task 存储/状态机/调度）：doc/80（取代 doc/77 §3「不按会话过滤」与 doc/78 §3 同名条款）</p></li>
 <li><p>刷新失败不误判登出（<strong>已落地 2026-11-14</strong>，commit <code>8c01d0c</code>：<code>web/src/auth.ts</code> 的 <code>doRefresh</code> 从「非 2xx 即登出」改成三态判定——只有「HTTP 401 且响应是引擎信封且 <code>code≠0</code>」才 <code>clearAuth('expired')</code>，5xx／dev 下 Vite 代理在引擎重启窗口回的 500／非信封 401 都是暂时性故障、静默保留 token 等下一拍；纯前端、无后端改动）：doc/81</p></li>
 <li><p>可组合执行原语与后台任务（<strong>已落地 2026-11-15</strong>：bash 前台等待超时转后台 job（<code>bj_…</code>）并补输出／有限等待／停止／通知与失联恢复；<code>wait_task</code> 让当前 run 就地认领通知避免重复交付；DAG 仍由现有创建和修订工具维护，不新增用户模式或 JS 引擎；组内并发 shared=1、isolated=2；页面补路径账本，展示计划版本、失败／取消节点、结果复用与交付尝试）：doc/82</p></li>
-<li><p>场景化 Eval 方案（Anthropic 思路稿，<strong>待点头，未施工</strong>，2026-11-16 从仓库根 <code>eval/README.md</code> 迁入 doc/ 并补 NN 编号与状态头注；把评测定成「真实任务重复跑、查任务结束后的真实世界状态、留完整轨迹」，<strong>与 doc/45 已拍板口径并存，取代关系待裁定</strong>，裁定前不动 doc/45 口径、不开工）：doc/83</p></li>
+<li><p>场景化 Eval 思路稿（Anthropic 思路，<strong>待点头，未施工</strong>，2026-11-16 从仓库根 <code>eval/README.md</code> 迁入 doc/；把评测定成「真实任务重复跑、查任务结束后的真实世界状态、留完整轨迹」；<strong>2026-11-17 起降为 83 章的配套思路稿</strong>，施工真源见 doc/83-场景化Eval方案）：doc/83-场景化Eval方案/Anthropic思路稿</p></li>
 <li><p>崩溃续跑：doc/30</p></li>
 <li><p>SSE 流式端点：doc/31</p></li>
 <li><p>MCP client：doc/33</p></li>
@@ -1006,7 +1019,7 @@
 <li><p>响应信封统一（业务码表在 doc/40 §4）：doc/40</p></li>
 <li><p>任务看板与人工审批（<strong>已落地 2026-10-23</strong>；人工审批那半边不做）：doc/41</p></li>
 <li><p>产品形态收窄与共享项目退役（<strong>已落地 2026-10-22</strong>）：doc/42</p></li>
-<li><p>场景化 Eval 框架（<strong>方案待点头，未施工</strong>，2026-10-23 立项）：doc/45</p></li>
+<li><p>场景化 Eval 方案（<strong>方案待点头，未施工</strong>，2026-10-23 立项；2026-11-17 由 doc/45 迁入 83 章并重写：第一版 = 阶段一·最小骨架，B 组 <code>b-pii-fold</code> + <code>b-file-write</code>）：doc/83-场景化Eval方案/README.md</p></li>
 <li><p>Agent 测试与基准选型（<strong>2026-10-31 立项；2026-11-01 第一批已施工、G1 已跑完出数、两臂配对已跑完；11-02 凌晨 k=5 基线已跑完</strong>：测谁 / 选哪个公开基准 / 多久跑；公开分数不进 CI；口径真源在 doc/56 §4.7，实测数与口径钉死在 §4.8，两臂配对在 §4.9）：doc/56。其中 A/B 对照协议借 pi <code>packages/evals</code> 的「计划 → 两臂 → 配对 → 报告」，只借协议不移植 vitest 栈；Eino 开源仓（core / ext / examples）无 eval 包可接，观测只靠 callbacks（doc/54）</p></li>
 <li><p>前端三处欠账（项目页／删除确认／子代理列表与继续，<strong>已落地 2026-10-23</strong>）：doc/44</p></li>
 <li><p>变更同步与事件通道（<strong>已落地 2026-10-23</strong>：Loop A 同机广播 + Loop B 账号级 SSE 事件流，doc/16 #8b 前置；§2c 扩第三临时键 + 变更端点契约）：doc/46</p></li>

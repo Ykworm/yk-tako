@@ -14,7 +14,7 @@
   python3 scripts/bench/run_bench.py --cases gaia --arms tako --repeat 5 \
       --baseline scripts/bench/baselines/gaia.json --traces tmp/trace-facts.json
 
-跑同一批题 N 次时，报告给两列（doc/45）：Pass@N = N 次里至少过一次，
+跑同一批题 N 次时，报告给两列（doc/83-场景化Eval方案）：Pass@N = N 次里至少过一次，
 pass^N = N 次全过。归因（engine_regression / model_below_baseline / …）要先有基线，
 基线里只有「题 id 的短哈希 → 判定」，没有题面与答案；题面明文始终只在 tmp/。
 退出码：出现 engine_regression 或 model_below_baseline 时非零——分数掉了要能挡住流水线。
@@ -61,7 +61,7 @@ BUDGET_COMPARABILITY = {
                         "usd 是各臂本来的账（tako 为上界）。",
 }
 BASELINE_DIR = os.path.join(HERE, "baselines")
-PASSK_SEMANTICS = ("Pass@N = N 次里至少过一次；pass^N = N 次全过（doc/45 口径）。"
+PASSK_SEMANTICS = ("Pass@N = N 次里至少过一次；pass^N = N 次全过（doc/83-场景化Eval方案 口径）。"
                    "N=1 时两者相同。归因只在 D1-1 有基线时给结论，否则记 unasserted——"
                    "没有基线就说「掉分」是猜。")
 

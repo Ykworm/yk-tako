@@ -416,7 +416,7 @@ A4–A9 都只依赖 A2 的 run span 与 A3 的文档收口；A7 的折叠 `chat
 - **内容属性的掩码、租户级开关、外部存储引用**：内容本身按 §2.2 的开关记录（`.env` 默认开）；本篇不做出口前掩码、不做按租户开关、不把内容搬到外部存储再放引用（OTel 规范的生产态用法）。多租户上线前必须先补掩码，否则默认开就是把用户原文推给 Loop SaaS。
 - **内容事件（events）与 `gen_ai.tool.definitions`**：只写 span 属性；`SPAN_AND_EVENT` 退化为 `SPAN_ONLY`，`EVENT_ONLY` 等于关闭（tako 不产出内容事件）。工具 schema 不是用户/模型内容，不写。
 - **工具检索的 BM25 span**：`toolsearch.go` 的 BM25 给延迟加载的工具挑声明，发生在工具装配/首轮，耗时通常可忽略；本篇不单独开 span。
-- **CozeLoop 的 Eval / 实验管理**：doc/45 的场景化 Eval 仍是我们自己的回归层；Loop 的 experiment 不替代它。trace 只解决「看」。
+- **CozeLoop 的 Eval / 实验管理**：doc/83-场景化Eval方案 的场景化 Eval 仍是我们自己的回归层；Loop 的 experiment 不替代它。trace 只解决「看」。
 - **入站 trace context 与跨请求链路传播**：客户端不传 traceparent，每次 HTTP 请求一条独立 trace；同一 run 的续跑是另一条 trace，靠 `tako.run.id` + `tako.run.epoch` 归组，跨会话靠 `gen_ai.conversation.id` / `tako.workspace.id`（§2.5）。
 - **产品级业务/任务 ID**：加字段本身可行，缺的是任务语义——谁创建、一场 run 归属几个任务、生命周期归谁、UI 怎么承载都未定义（§2.5）。最小形态是客户端自带的不透明归组键，那要求客户端改造，属于产品决定；本篇不发明。
 
@@ -426,4 +426,4 @@ A4–A9 都只依赖 A2 的 run span 与 A3 的文档收口；A7 的折叠 `chat
 
 今天「一场 run 干得怎么样」只能靠人翻帧；跨 run 的比较、租户维度的失败聚集、换模型前后的耗时对比都没有一个可检索的集合。这一层把每场 run 变成一条按 OTel GenAI 语义命名的记录，经 OTLP 报到 CozeLoop：**字段名是公共语言（换后端不改代码），内容由标准开关控制（`.env` 默认开、改 `NO_CONTENT` 一键关），失败隔离（观测坏了业务照跑）**。完整形态下，一条 trace 从服务收到请求开始，包住 run、每次模型调用、每次工具执行，以及召回/折叠/准入/定稿这些内部步骤（§2.6）；同一场对话的后续提问按 `gen_ai.conversation.id` 归组，换了会话还能按 `tako.workspace.id` 找回（§2.5）；token 口径显式钉为对话账本（§2.3），与 usage 帧逐值对得上。
 
-它不替代 doc/27 的账本，也不替代 doc/45 的回归——它补的是「门牌」：出了事，先能按租户、会话、项目、状态、模型把相关 run 找出来。
+它不替代 doc/27 的账本，也不替代 doc/83-场景化Eval方案 的回归——它补的是「门牌」：出了事，先能按租户、会话、项目、状态、模型把相关 run 找出来。

@@ -5,6 +5,21 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="tako 长任务与多 Agent 编排：持久 Task、依赖调度、shared/isolated、后台 bash、结果发布、通知恢复与重规划。">
 <title>tako · 长任务与多 Agent 编排</title>
+<!-- seo:head:start -->
+<meta name="description" content="tako 长任务与多 Agent 编排：持久 Task、依赖调度、shared/isolated、后台 bash、结果发布、通知恢复与重规划。" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/assets/tako-orchestration.html" />
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="tako · 长任务与多 Agent 编排 · tako 文档" />
+<meta property="og:description" content="tako 长任务与多 Agent 编排：持久 Task、依赖调度、shared/isolated、后台 bash、结果发布、通知恢复与重规划。" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/assets/tako-orchestration.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="tako · 长任务与多 Agent 编排 · tako 文档" />
+<meta name="twitter:description" content="tako 长任务与多 Agent 编排：持久 Task、依赖调度、shared/isolated、后台 bash、结果发布、通知恢复与重规划。" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<!-- seo:head:end -->
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect x='8' y='26' width='12' height='12' rx='2' fill='%23543A29'/%3E%3Crect x='26' y='8' width='12' height='12' rx='2' fill='%23BB7738'/%3E%3Crect x='26' y='26' width='12' height='12' rx='2' fill='%23543A29'/%3E%3Crect x='26' y='44' width='12' height='12' rx='2' fill='%23BB7738'/%3E%3Crect x='44' y='26' width='12' height='12' rx='2' fill='%23543A29'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="tako-architecture.css">
 </head>
@@ -32,7 +47,205 @@
     <section class="mobile-view" id="mobile-view" aria-label="长任务与编排列表"></section>
   </div>
   <div class="content-sections" id="content-sections"></div>
-  <noscript><div class="noscript-note">交互图需要 JavaScript。可直接阅读 <a href="../html/70-多Agent编排与Task/README.html">Task 方案集</a>、<a href="../html/74-并行任务工作区隔离.html">工作区隔离</a> 和 <a href="../html/82-可组合执行原语与后台任务.html">后台任务</a>。</div></noscript>
+  <!-- static-outline:start -->
+<section class="static-outline" id="static-outline" aria-labelledby="static-outline-title">
+<style>
+.static-outline { margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid rgba(84,58,41,.22); }
+.static-outline h2 { font-size: 1.3rem; margin: 0 0 .4rem; color: #543A29; }
+.static-outline > p { font-size: .9rem; opacity: .8; margin: 0 0 1rem; }
+.static-outline h3.outline-band { font-size: 1rem; margin: 1.6rem 0 .6rem; color: #543A29; }
+.static-outline .outline-grid { display: grid; gap: .7rem; grid-template-columns: repeat(auto-fill, minmax(19rem, 1fr)); }
+.static-outline .outline-item { border: 1px solid rgba(84,58,41,.18); border-radius: .5rem; padding: .7rem .85rem; background: rgba(255,255,255,.55); }
+.static-outline h4 { font-size: .95rem; margin: 0 0 .3rem; }
+.static-outline .outline-sub { font-weight: 400; font-size: .8rem; opacity: .65; }
+.static-outline p { font-size: .84rem; line-height: 1.6; margin: .25rem 0; }
+.static-outline .outline-summary { opacity: .9; }
+.static-outline .outline-key { display: inline-block; min-width: 5.2em; margin-right: .45em; font-size: .78rem; opacity: .7; }
+.static-outline .outline-facts { margin: .3rem 0; padding-left: 1.1rem; font-size: .82rem; }
+@media (max-width: 40rem) { .static-outline .outline-grid { grid-template-columns: 1fr; } }
+</style>
+<h2 id="static-outline-title">文字版：全部模块清单</h2>
+<p>上面的图解由 JavaScript 绘制；下面是同一批模块的纯文字清单，便于检索、复制与外部引用。内容与图一致，由 <code>scripts/build-doc-html.py</code> 从本页的 <code>page-data</code> 生成。</p>
+<h3 class="outline-band">先选执行对象（5）</h3>
+<div class="outline-grid">
+<article class="outline-item">
+<h4>直接工具 <span class="outline-sub">当前上下文直接完成</span></h4>
+<p class="outline-summary">当前 run 能完成的工作直接调用，不为了显得复杂而创建 Task。结果作为一次工具回执返回。</p>
+<p class="outline-row"><span class="outline-key">输入</span>模型工具调用。</p>
+<p class="outline-row"><span class="outline-key">输出</span>同步工具结果。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/tools.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/82-可组合执行原语与后台任务.html">doc/82 · 选择规则</a></p>
+</article>
+<article class="outline-item">
+<h4>同步子代理 <span class="outline-sub">独立上下文，立即要结果</span></h4>
+<p class="outline-summary">需要独立上下文并且父 Agent 马上要结果继续时使用。它不是后台 Task，也不靠 wire 档案获得自动恢复。</p>
+<p class="outline-row"><span class="outline-key">输入</span>委派输入与规格。</p>
+<p class="outline-row"><span class="outline-key">输出</span>同步折叠结果；完整 wire 可供之后 resume。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/agents.go</code> <code>internal/runengine/resume_subagent.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/39-子代理持久化与resume.html">doc/39 · 子代理恢复</a></p>
+</article>
+<article class="outline-item">
+<h4>run 内 Todo <span class="outline-sub">步骤清单，不是执行单元</span></h4>
+<p class="outline-summary">TaskCreate/TaskUpdate 等工具维护当前 run 的可见步骤和结果。它不被调度器领取，也不是 DAG 节点。</p>
+<p class="outline-row"><span class="outline-key">输入</span>当前 run 的计划与进展。</p>
+<p class="outline-row"><span class="outline-key">输出</span>run_tasks 行、task 帧和跨 run 续做信息。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/tasktools.go</code> <code>internal/runengine/runviews.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/41-任务看板与人工审批.html">doc/41 · 看板</a></p>
+</article>
+<article class="outline-item">
+<h4>持久 Task <span class="outline-sub">独立身份，可等待可离开</span></h4>
+<p class="outline-summary">需要后台推进、独立恢复、依赖或交付时创建。调用方可继续做无关工作，需要结果时用 wait_task，也可结束本轮等通知。</p>
+<p class="outline-row"><span class="outline-key">输入</span>delegate_task / create_orchestration。</p>
+<p class="outline-row"><span class="outline-key">输出</span>taskId/orchestrationId、独立执行与结果版本。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/agent_task_tools.go</code> <code>internal/runengine/agent_task_types.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/70-多Agent编排与Task/03-第一版方案.html">doc/70 · 持久 Task</a></p>
+</article>
+<article class="outline-item">
+<h4>后台 bash <span class="outline-sub">命令持久，进程不自动重放</span></h4>
+<p class="outline-summary">适合长构建和长测试。background_jobs 保存命令状态，owner 管真实进程；引擎重启后不会自动重新执行命令。</p>
+<p class="outline-row"><span class="outline-key">输入</span>bash 超时转后台或显式 runInBackground。</p>
+<p class="outline-row"><span class="outline-key">输出</span>bj_…、持续输出、退出或 interrupted。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/bash_job.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/82-可组合执行原语与后台任务.html">doc/82 · 后台 bash</a></p>
+</article>
+</div>
+<h3 class="outline-band">Task 与编排组（7）</h3>
+<div class="outline-grid">
+<article class="outline-item">
+<h4>创建与修订计划 <span class="outline-sub">已知节点一次写，新工作按事实追加</span></h4>
+<p class="outline-summary">create_orchestration 原子写入当前已知的 Task 与依赖，并返回 finalTaskId。revise_orchestration 用 baseRevision 拒绝过期修订，追加未来工作、取消未开始节点或调整最终节点。</p>
+<p class="outline-row"><span class="outline-key">为什么需要它</span>要求一开始编出完整 DAG 会诱导模型猜测；允许无限改图又会让旧结果和预算失去边界。</p>
+<p class="outline-row"><span class="outline-key">输入</span>目标、当前已知节点、真实依赖与后续新事实。</p>
+<p class="outline-row"><span class="outline-key">输出</span>编排组、依赖边、planRevision 与修订审计。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/agent_task_graph.go</code> <code>internal/runengine/agent_task_revision.go</code> <code>internal/runengine/agent_task_store.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/72-多Agent编排下一阶段.html">doc/72 · 有界修订</a></p>
+</article>
+<article class="outline-item">
+<h4>依赖调度 <span class="outline-sub">wake Stream + 30s PG 对账</span></h4>
+<p class="outline-summary">只有 parents 成功的 Task 才 ready；失败沿依赖边阻断。tk:agent-task-wake 只叫醒调度，启动与默认 30 秒 PG 对账保证事件丢失后仍能推进。</p>
+<p class="outline-row"><span class="outline-key">输入</span>Task 状态、依赖边、组内并发与租户容量。</p>
+<p class="outline-row"><span class="outline-key">输出</span>原子领取的 ready Task 和独立执行 session/run。</p>
+<ul class="outline-facts"><li><span class="outline-key">shared</span>同组同时 1 件</li><li><span class="outline-key">isolated</span>同组最多 2 件</li><li><span class="outline-key">丢失唤醒</span>由 PG 对账兜底</li></ul>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/agent_task_scheduler.go</code> <code>internal/runengine/agent_task_types.go</code> <code>internal/runengine/events.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/72-多Agent编排下一阶段.html">doc/72 · 事件驱动</a> <a href="../html/82-可组合执行原语与后台任务.html">doc/82 · 组内并发</a></p>
+</article>
+<article class="outline-item">
+<h4>独立执行 session/run <span class="outline-sub">沿用模型工具循环与恢复底座</span></h4>
+<p class="outline-summary">每个被领取的 Task 有自己的执行 session 和 run，不进入普通聊天列表。执行中使用同一套模型、工具、journal 和显式恢复机制。</p>
+<p class="outline-row"><span class="outline-key">输入</span>Task 输入、上游结构化结果与文件路径、选定工作现场。</p>
+<p class="outline-row"><span class="outline-key">输出</span>结果摘要、产物清单、终态或错误。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/agent_task_runner.go</code> <code>internal/runengine/agent_task_recovery.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/70-多Agent编排与Task/03-第一版方案.html">doc/70 · 独立执行</a></p>
+</article>
+<article class="outline-item">
+<h4>通知与单次交付 <span class="outline-sub">pending → claimed → consumed / failed</span></h4>
+<p class="outline-summary">整组结果通过持久通知回来源会话。通知认领、处理 attempt、消费确认与失败重试都留记录；执行失败和来源会话交付失败分开处理。</p>
+<p class="outline-row"><span class="outline-key">输入</span>Task 与编排终态、结果版本和来源会话状态。</p>
+<p class="outline-row"><span class="outline-key">输出</span>orchestration_finished 或 task_failed 等交付结果，以及通知尝试审计。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/agent_task_delivery.go</code> <code>internal/runengine/agent_task_recovery.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/73-协调通知与交付恢复.html">doc/73 · 交付恢复</a></p>
+</article>
+<article class="outline-item">
+<h4>wait_task <span class="outline-sub">需要结果时主动等待</span></h4>
+<p class="outline-summary">当前 run 按 taskId 从 PG 读取状态，可立即返回或有限等待。若结果已由当前 run 读取并交付，通知标为就地认领，不另建重复交付 run。</p>
+<p class="outline-row"><span class="outline-key">输入</span>当前来源会话可见的 taskId 与 wait 标志。</p>
+<p class="outline-row"><span class="outline-key">输出</span>taskId/orchestrationId/status/result/error。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/agent_task_tools.go</code> <code>internal/runengine/agent_task_delivery.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/82-可组合执行原语与后台任务.html">doc/82 · wait_task</a></p>
+</article>
+<article class="outline-item">
+<h4>同组有界修订 <span class="outline-sub">最终节点尚未开始</span></h4>
+<p class="outline-summary">新事实出现时修改未来工作，保留已完成的有效结果。累计节点与修订次数有上限，baseRevision 防止旧计划覆盖新计划。</p>
+<p class="outline-row"><span class="outline-key">输入</span>最新 planRevision、追加/取消命令与原因。</p>
+<p class="outline-row"><span class="outline-key">输出</span>新计划版本与修订时间线。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/agent_task_revision.go</code> <code>internal/runengine/agent_task_revision_api.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/72-多Agent编排下一阶段.html">doc/72 · 修订边界</a></p>
+</article>
+<article class="outline-item">
+<h4>继任编排组 <span class="outline-sub">只有 feasible 才允许创建</span></h4>
+<p class="outline-summary">原组已经交付后，如需重规划，先判断目标可行性。只有 goalAssessment.outcome == feasible 才能创建继任组；不可行或不确定应告知或问用户，不自动新建。</p>
+<p class="outline-row"><span class="outline-key">输入</span>原组结果、可行性证据、重规划原因、复用清单和 noReplay。</p>
+<p class="outline-row"><span class="outline-key">输出</span>successor.json、handoff.md、新组 preparing → 可调度；深度与预算继续受限。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/agent_task_successor.go</code> <code>internal/runengine/agent_task_handoff.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/75-目标重规划与继任编排组.html">doc/75 · 继任条件</a></p>
+</article>
+</div>
+<h3 class="outline-band">工作现场与发布（4）</h3>
+<div class="outline-grid">
+<article class="outline-item">
+<h4>shared 工作现场 <span class="outline-sub">同组共享，当前串行</span></h4>
+<p class="outline-summary">同组 Task 共用工作现场，当前同组只执行一件，避免兄弟节点同时写同一批文件。中间结果仍不直接写 content，最终节点同样经过结果固化与发布。</p>
+<p class="outline-row"><span class="outline-key">输入</span>编排 workspace_mode=shared 与项目现场。</p>
+<p class="outline-row"><span class="outline-key">输出</span>串行执行的共享工作目录与最终结果。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/workspace_provider.go</code> <code>internal/runengine/agent_task_types.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/82-可组合执行原语与后台任务.html">doc/82 · shared 串行</a> <a href="../html/76-项目内容目录与运行资源容器.html">doc/76 · shared 发布</a></p>
+</article>
+<article class="outline-item">
+<h4>isolated 工作现场 <span class="outline-sub">每 Task 独立，当前最多两件并行</span></h4>
+<p class="outline-summary">Provider 按真实项目选择 Git worktree 或普通目录副本，让并行 Task 不互踩。Task 与 DAG 不认识 Git 内部细节。</p>
+<p class="outline-row"><span class="outline-key">输入</span>workspace_mode=isolated、项目形态与 Task 工作需求。</p>
+<p class="outline-row"><span class="outline-key">输出</span>每 Task 独立工作目录、变更清单与结果材料。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/workspace_git.go</code> <code>internal/runengine/workspace_directory.go</code> <code>internal/runengine/workspace_provider.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/74-并行任务工作区隔离.html">doc/74 · Provider 选择</a></p>
+</article>
+<article class="outline-item">
+<h4>不可变结果 <span class="outline-sub">结果版本 + 文件清单 + 验证</span></h4>
+<p class="outline-summary">执行结果先在组容器形成不可变版本，Provider 校验产物、验证命令与变更。PG 保存通用结果版本和状态，不保存 branch/commit/文件哈希。</p>
+<p class="outline-row"><span class="outline-key">输入</span>Task 结果、工作现场与 verifyCommand。</p>
+<p class="outline-row"><span class="outline-key">输出</span>(taskId,resultRevision) 可引用的结果与产物路径。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/workspace_result.go</code> <code>internal/runengine/workspace_verify.go</code> <code>internal/runengine/agent_task_artifact.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/74-并行任务工作区隔离.html">doc/74 · 不可变结果</a></p>
+</article>
+<article class="outline-item">
+<h4>协调发布 <span class="outline-sub">验证通过才写 content</span></h4>
+<p class="outline-summary">引擎排除其他活 run，新 run 准入与发布标记共用项目级 PG 事务协调；Provider 检查项目是否变化并执行 Git/Directory 发布。受阻可人工处理后重试。</p>
+<p class="outline-row"><span class="outline-key">输入</span>完整不可变结果、项目当前状态与发布代次。</p>
+<p class="outline-row"><span class="outline-key">输出</span>最终 content 文件、发布状态或 publication_blocked。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/workspace_publish.go</code> <code>internal/runengine/workspace_result.go</code> <code>internal/runengine/project_layout.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/74-并行任务工作区隔离.html">doc/74 · 发布恢复</a> <a href="../html/76-项目内容目录与运行资源容器.html">doc/76 · 最终内容</a></p>
+</article>
+</div>
+<h3 class="outline-band">后台 bash 生命周期（4）</h3>
+<div class="outline-grid">
+<article class="outline-item">
+<h4>启动与 owner 租约 <span class="outline-sub">bj_… · running</span></h4>
+<p class="outline-summary">程序先登记 job 并确认沙箱和进程启动成功。前台窗口到点未完或显式后台后返回同一 jobId，owner watcher 续租并等待进程退出。</p>
+<p class="outline-row"><span class="outline-key">输入</span>命令、项目/会话范围与后台选择。</p>
+<p class="outline-row"><span class="outline-key">输出</span>running、固定输出目录与 owner 租约。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/bash_job.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/82-可组合执行原语与后台任务.html">doc/82 · 启动与超时</a></p>
+</article>
+<article class="outline-item">
+<h4>读取与有限等待 <span class="outline-sub">bash_output(wait=true|false)</span></h4>
+<p class="outline-summary">按 jobId 读当前状态、退出码、stdout/stderr 尾部与全文路径；wait=true 最多等当前窗口，仍运行就返回 running，不伪造终态。</p>
+<p class="outline-row"><span class="outline-key">输入</span>jobId 与 wait 标志。</p>
+<p class="outline-row"><span class="outline-key">输出</span>jobId/status/exitCode/stdout/stderr/stdoutPath/stderrPath。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/bash_job.go</code> <code>internal/runengine/bashspill.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/82-可组合执行原语与后台任务.html">doc/82 · 输出读取</a></p>
+</article>
+<article class="outline-item">
+<h4>停止整个进程组 <span class="outline-sub">running → stopping → stopped</span></h4>
+<p class="outline-summary">停止请求先落库并返回 stopping；owner 看到后发 SIGKILL 给整个进程组，确认退出才写 stopped。不能把“已请求”说成“已经停止”。</p>
+<p class="outline-row"><span class="outline-key">输入</span>stop_bash 或 POST /api/jobs/:id/stop。</p>
+<p class="outline-row"><span class="outline-key">输出</span>stopRequested、stopping 与最终 stopped/失败状态。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/bash_job.go</code> <code>internal/runengine/sandbox.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/82-可组合执行原语与后台任务.html">doc/82 · 停止语义</a></p>
+</article>
+<article class="outline-item">
+<h4>失联对账与通知 <span class="outline-sub">terminal / interrupted + 持久通知</span></h4>
+<p class="outline-summary">owner 正常退出时写终态与 bash_job_finished 通知；租约过期仍显示运行的行由 sweeper 收为 interrupted。interrupted 不表示仍在运行，也不触发命令重放。</p>
+<p class="outline-row"><span class="outline-key">输入</span>owner 退出、租约与对账周期。</p>
+<p class="outline-row"><span class="outline-key">输出</span>succeeded/failed/stopped/interrupted、通知与页面重拉事件。</p>
+<p class="outline-row"><span class="outline-key">代码落点</span><code>internal/runengine/bash_job_sweeper.go</code> <code>internal/runengine/bash_job.go</code> <code>internal/runengine/agent_task_delivery.go</code></p>
+<p class="outline-row"><span class="outline-key">现行文档</span><a href="../html/82-可组合执行原语与后台任务.html">doc/82 · 失联恢复</a></p>
+</article>
+</div>
+</section>
+<!-- static-outline:end -->
+
+<noscript>
+
+<div class="noscript-note">交互图需要 JavaScript。可直接阅读 <a href="../html/70-多Agent编排与Task/README.html">Task 方案集</a>、<a href="../html/74-并行任务工作区隔离.html">工作区隔离</a> 和 <a href="../html/82-可组合执行原语与后台任务.html">后台任务</a>。</div></noscript>
 </main>
 <footer class="page-footer"><p>本页不承诺外部副作用 exactly-once；执行结果、进程状态和通知状态分别判断。</p><p><code>doc/assets/tako-orchestration.html · 2026-11-16</code></p></footer>
 <script type="application/json" id="page-data">

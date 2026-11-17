@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>19v6-10 · mid-run fold（run 中途压缩 · 立项方案） · tako 文档</title>
+<meta name="description" content="Run = 用户发一条消息到引擎给出终稿的一次执行。run 起手时引擎往 PG 抢闸 （runs 表部分唯一索引，running 行 = 会话同时只允许一个 run），并把这条 user 消息 写进 run_model_messages 表（简称 mh），恒 seq=1。run…" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/19-v6/19v6-10-mid-run-fold.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="19v6-10 · mid-run fold（run 中途压缩 · 立项方案） · tako 文档" />
+<meta property="og:description" content="Run = 用户发一条消息到引擎给出终稿的一次执行。run 起手时引擎往 PG 抢闸 （runs 表部分唯一索引，running 行 = 会话同时只允许一个 run），并把这条 user 消息 写进 run_model_messages 表（简称 mh），恒 seq=1。run…" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/19-v6/19v6-10-mid-run-fold.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="19v6-10 · mid-run fold（run 中途压缩 · 立项方案） · tako 文档" />
+<meta name="twitter:description" content="Run = 用户发一条消息到引擎给出终稿的一次执行。run 起手时引擎往 PG 抢闸 （runs 表部分唯一索引，running 行 = 会话同时只允许一个 run），并把这条 user 消息 写进 run_model_messages 表（简称 mh），恒 seq=1。run…" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="../style.css" />
 </head>
 <body>

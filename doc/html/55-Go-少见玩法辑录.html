@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Go 少见玩法辑录 · tako 文档</title>
+<meta name="description" content="病灶。 两个 agent 同时改同一个文件：A 读了 v1，B 也读了 v1；A 写 v2，B 基于 v1 算出内容写 v3——v2 被覆盖，两边都报成功。只在内存里放互斥量挡不住另一个进程/另一个副本；要对文件本身加排它锁。" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/55-Go-少见玩法辑录.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="Go 少见玩法辑录 · tako 文档" />
+<meta property="og:description" content="病灶。 两个 agent 同时改同一个文件：A 读了 v1，B 也读了 v1；A 写 v2，B 基于 v1 算出内容写 v3——v2 被覆盖，两边都报成功。只在内存里放互斥量挡不住另一个进程/另一个副本；要对文件本身加排它锁。" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/55-Go-少见玩法辑录.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="Go 少见玩法辑录 · tako 文档" />
+<meta name="twitter:description" content="病灶。 两个 agent 同时改同一个文件：A 读了 v1，B 也读了 v1；A 写 v2，B 基于 v1 算出内容写 v3——v2 被覆盖，两边都报成功。只在内存里放互斥量挡不住另一个进程/另一个副本；要对文件本身加排它锁。" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>

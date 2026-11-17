@@ -1,0 +1,7 @@
+# tako 文档站（https://tako.docs.yktea.fun/）
+# 爬虫规则：全站都允许抓取，站点地图在下面。
+# 换域名时改 Sitemap 那行的地址（和 scripts/build-sitemap.py 的 HOST 保持一致）。
+User-agent: *
+Allow: /
+
+Sitemap: https://tako.docs.yktea.fun/sitemap.xml

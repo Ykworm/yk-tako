@@ -10,22 +10,22 @@ tako **不是知识库产品**：记忆与检索只支撑 Agent 工作。它也*
 
 ## 架构导览
 
-**在线文档站**：<https://ykworm.github.io/yk-tako/> —— 四张可交互说明页，加上全部文档的网页版（每个 md 一页）。改 `doc/` 里的东西推 main 就自动重新发布。
+**在线文档站**：<https://tako.docs.yktea.fun/> —— 四张可交互说明页，加上全部文档的网页版（每个 md 一页）。改 `doc/` 里的东西推 main 就自动重新发布。
 
-[![tako 系统架构总览](doc/assets/tako-architecture.png)](https://ykworm.github.io/yk-tako/assets/tako-architecture.html)
+[![tako 系统架构总览](doc/assets/tako-architecture.png)](https://tako.docs.yktea.fun/assets/tako-architecture.html)
 
 四张说明页，点开即用：
 
-- [系统架构总览](https://ykworm.github.io/yk-tako/assets/tako-architecture.html)：谁把什么交给谁，同步执行与异步任务怎样接成一条交付链。
-- [单场 run 生命周期](https://ykworm.github.io/yk-tako/assets/tako-run-lifecycle.html)：创建、模型工具循环、九种帧、定稿、等人、压缩与显式续跑。
-- [长任务与多 Agent 编排](https://ykworm.github.io/yk-tako/assets/tako-orchestration.html)：持久 Task、依赖、shared/isolated、后台 bash、发布、通知与重规划。
-- [数据、状态与存储](https://ykworm.github.io/yk-tako/assets/tako-data-model.html)：PostgreSQL 表、四类 Redis 临时状态、项目 content/runtime、会话 wire 与记忆双模式。
+- [系统架构总览](https://tako.docs.yktea.fun/assets/tako-architecture.html)：谁把什么交给谁，同步执行与异步任务怎样接成一条交付链。
+- [单场 run 生命周期](https://tako.docs.yktea.fun/assets/tako-run-lifecycle.html)：创建、模型工具循环、九种帧、定稿、等人、压缩与显式续跑。
+- [长任务与多 Agent 编排](https://tako.docs.yktea.fun/assets/tako-orchestration.html)：持久 Task、依赖、shared/isolated、后台 bash、发布、通知与重规划。
+- [数据、状态与存储](https://tako.docs.yktea.fun/assets/tako-data-model.html)：PostgreSQL 表、四类 Redis 临时状态、项目 content/runtime、会话 wire 与记忆双模式。
 
 离线看：克隆仓库后用浏览器打开 `doc/assets/` 下的同名 HTML，无需构建或联网（GitHub 上点 HTML 文件只会显示源码，所以上面的链接指向线上站）。
 
 这些页面是现行文档的导读，不是另一份施工契约；实现与专项文档冲突时，以代码和专项文档为准。
 
-全部文档另有网页版：`doc/html/` 下每个 md 对应一页，由 `scripts/build-doc-html.py` 从 md 自动生成（内容以 md 为准）。线上入口是 <https://ykworm.github.io/yk-tako/>；本地入口是 `doc/index.html`（站点首页）与 `doc/html/index.html`（全部文档索引）。
+全部文档另有网页版：`doc/html/` 下每个 md 对应一页，由 `scripts/build-doc-html.py` 从 md 自动生成（内容以 md 为准）。线上入口是 <https://tako.docs.yktea.fun/>；本地入口是 `doc/index.html`（站点首页）与 `doc/html/index.html`（全部文档索引）。
 
 ## 快速开始
 
@@ -209,7 +209,7 @@ flowchart LR
 当前已确定的待做与候选：
 
 - **IM / cron 入口**：成为 Web 之外的第二个产品入口。
-- **场景化 Eval**：把“接口按约返回”推进到“任务结果真正完成”；方案见 [doc/45](doc/45-场景化Eval框架.md)（口径已拍板、未施工），另有 [doc/83](doc/83-场景化Eval方案.md) 的思路稿待点头，两者取代关系待裁定。
+- **场景化 Eval**：把“接口按约返回”推进到“任务结果真正完成”；方案见 [doc/83-场景化Eval方案](doc/83-场景化Eval方案/README.md)（原 doc/45 迁入并重写，第一版 = 阶段一·最小骨架，待点头、未施工），思路参照见 [Anthropic 思路稿](doc/83-场景化Eval方案/Anthropic思路稿.md)。
 - **待评估候选**：浏览器操作、跨子代理结构化产物黑板、run 级预算中断、Prompt 缓存边界优化、受限自修改实验。
 
 多 Agent 编排、持久 Task、并行工作区和后台命令已经落地，不再列为未做。完整能力状态与排序以 [doc/16](doc/16-能力复刻总规划.md) 为准。
@@ -235,6 +235,7 @@ doc/
   70-多Agent编排与Task/        持久 Task 与编排方案集
   assets/                      四张系统说明页与总览海报
   html/                        文档网页版（由 build-doc-html.py 从 md 生成）
+  robots.txt                   爬虫规则（sitemap 指向构建时生成的 sitemap.xml）
   problems/                    设计决策档案
   log/                         交接、施工记录与文章，不作施工真源
   archive/                     被整代取代的旧线与旧引擎
@@ -242,7 +243,9 @@ scripts/
   dev.sh                       一键开发环境
   acceptance/                  可机器重跑的契约与活体验收
   bench/                       公开基准对照
-  build-doc-html.py            doc/ 树转网页站（pandoc + 链接改道）
+  build-doc-html.py            doc/ 树转网页站（pandoc + 链接改道 + 每页 SEO meta）
+  build-sitemap.py             生成站点地图（构建时产出，不入库）
+  notify-indexnow.py           发布后通知 Bing 等索引器（IndexNow）
   export-architecture-poster.sh 从总览 HTML 导出 PNG
   check-architecture-pages.mjs  检查页面数据、导航与本地链接
 .github/workflows/pages.yml    把 doc/ 发布成 GitHub Pages
@@ -251,7 +254,7 @@ scripts/
 ## 文档与协作
 
 - [doc/README.md](doc/README.md)：文档索引，区分现行真源、历史记录与归档。
-- [在线文档站](https://ykworm.github.io/yk-tako/)：四张系统说明页 + 全部文档的网页版。本地入口：`doc/index.html`（站点首页，可离线打开）、`doc/html/index.html`（全部文档索引）。
+- [在线文档站](https://tako.docs.yktea.fun/)：四张系统说明页 + 全部文档的网页版。本地入口：`doc/index.html`（站点首页，可离线打开）、`doc/html/index.html`（全部文档索引）。
 - [doc/16-能力复刻总规划.md](doc/16-能力复刻总规划.md)：产品能力、当前状态与下一步。
 - [doc/19-v6/19-运行引擎架构-v6.md](doc/19-v6/19-运行引擎架构-v6.md)：第六代运行引擎架构入口；v6 是代际编号，不是服务版本。
 - [doc/53-模块地图.md](doc/53-模块地图.md)：模块职责与真实代码落点。

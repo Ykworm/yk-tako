@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>模块地图 · tako 文档</title>
+<meta name="description" content="规模只用于理解仓库形状，不作为质量指标。runengine 仍是单 Go 包、文件平铺；下面的小模块按职责划分，不表示真实目录层级。" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/53-模块地图.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="模块地图 · tako 文档" />
+<meta property="og:description" content="规模只用于理解仓库形状，不作为质量指标。runengine 仍是单 Go 包、文件平铺；下面的小模块按职责划分，不表示真实目录层级。" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/53-模块地图.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="模块地图 · tako 文档" />
+<meta name="twitter:description" content="规模只用于理解仓库形状，不作为质量指标。runengine 仍是单 Go 包、文件平铺；下面的小模块按职责划分，不表示真实目录层级。" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -15,7 +28,7 @@
 <main class="doc">
 <h1 id="模块地图">模块地图</h1>
 <blockquote>
-<p>性质：<strong>结构索引</strong>，不是方案——本文只回答「有哪些模块、每个模块落在哪些文件、干什么」。 最后核对：2026-11-16（代码基线 <code>a3ee354</code>）。 口径：<strong>一层 = 顶层模块</strong>（谁负责什么）；<strong>二层 = 小模块</strong>（落点文件 + 一句话职责）。 代码路径均相对 <code>yk-tako-eino/</code>；文档路径相对 <code>doc/</code>。 本文与 <a href="index.html">doc/README.md</a>（目录页）分工：README 说「哪篇文档能施工」，本文说「代码在哪一块」。四张系统说明页在 <a href="https://ykworm.github.io/yk-tako/assets/tako-architecture.html">线上架构总览</a>（本地 <code>doc/assets/tako-architecture.html</code>）。</p>
+<p>性质：<strong>结构索引</strong>，不是方案——本文只回答「有哪些模块、每个模块落在哪些文件、干什么」。 最后核对：2026-11-16（代码基线 <code>a3ee354</code>）。 口径：<strong>一层 = 顶层模块</strong>（谁负责什么）；<strong>二层 = 小模块</strong>（落点文件 + 一句话职责）。 代码路径均相对 <code>yk-tako-eino/</code>；文档路径相对 <code>doc/</code>。 本文与 <a href="index.html">doc/README.md</a>（目录页）分工：README 说「哪篇文档能施工」，本文说「代码在哪一块」。四张系统说明页在 <a href="https://tako.docs.yktea.fun/assets/tako-architecture.html">线上架构总览</a>（本地 <code>doc/assets/tako-architecture.html</code>）。</p>
 </blockquote>
 <h2 id="0-一眼看全">0. 一眼看全</h2>
 <h3 id="01-顶层模块">0.1 顶层模块</h3>
@@ -853,7 +866,7 @@
 </tbody>
 </table></div>
 <blockquote>
-<p>方案：<a href="45-场景化Eval框架.html">doc/45</a>（待点头）、<a href="56-Agent测试与基准选型.html">doc/56</a>、<a href="70-多Agent编排与Task/README.html">doc/70</a>、<a href="82-可组合执行原语与后台任务.html">doc/82</a></p>
+<p>方案：<a href="83-场景化Eval方案/README.html">doc/83-场景化Eval方案</a>（待点头）、<a href="56-Agent测试与基准选型.html">doc/56</a>、<a href="70-多Agent编排与Task/README.html">doc/70</a>、<a href="82-可组合执行原语与后台任务.html">doc/82</a></p>
 </blockquote>
 <h2 id="7-文档与运行时产物">7. 文档与运行时产物</h2>
 <h3 id="71-文档归属">7.1 文档归属</h3>

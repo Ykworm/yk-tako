@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>31 · SSE 流式端点（方案草稿，待点头） · tako 文档</title>
+<meta name="description" content="动机（2026-10-18 用户拍）：API 面通用流式。tako 的 HTTP API 是产品面的一部分，外部消费方——curl 脚本、SDK、别的产品进程——要观测「一场 run 怎么跑」：回复怎么一个字一个字长出来、中间调了什么工具、什么时候定稿。web 前端只是众多消费…" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/31-sse流式端点.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="31 · SSE 流式端点（方案草稿，待点头） · tako 文档" />
+<meta property="og:description" content="动机（2026-10-18 用户拍）：API 面通用流式。tako 的 HTTP API 是产品面的一部分，外部消费方——curl 脚本、SDK、别的产品进程——要观测「一场 run 怎么跑」：回复怎么一个字一个字长出来、中间调了什么工具、什么时候定稿。web 前端只是众多消费…" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/31-sse流式端点.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="31 · SSE 流式端点（方案草稿，待点头） · tako 文档" />
+<meta name="twitter:description" content="动机（2026-10-18 用户拍）：API 面通用流式。tako 的 HTTP API 是产品面的一部分，外部消费方——curl 脚本、SDK、别的产品进程——要观测「一场 run 怎么跑」：回复怎么一个字一个字长出来、中间调了什么工具、什么时候定稿。web 前端只是众多消费…" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>

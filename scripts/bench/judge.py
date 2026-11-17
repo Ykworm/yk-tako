@@ -5,7 +5,7 @@
       sha256 0d44c07f3046eec521697c22e3eaca8719cc81e422a8eaf32695c5f22bdac6e2
       抓取日期 2026-11-01（走 hf-mirror；huggingface.co 直连不通）
 移植只去掉官方那版「数字解析失败就 print 一行」的副作用——它会污染 stdout。
-判定只读世界状态，不读 agent 自述（doc/45 §6.2）。
+判定只读世界状态，不读 agent 自述（doc/83-场景化Eval方案 §1）。
 
 `--selftest` 不靠记忆：把官方那份源码抓下来当**对照实现**，逐条比对本移植的结果。
 """
@@ -87,7 +87,7 @@ def judge(case, answer, workspace_dir=None):
     """判定一个 case。返回 {"pass": bool, "reason": str}。
 
     case 里取 "answer" 当标准答案。workspace_dir 留着：将来有题要看世界状态
-    （文件/页面）时，判定只读世界状态、不读 agent 自述（doc/45 §6.2）。
+    （文件/页面）时，判定只读世界状态、不读 agent 自述（doc/83-场景化Eval方案 §1）。
 
     reason 的取值：判过 = 走了哪支（number / list / string）；判不过 = "mismatch"。
     """

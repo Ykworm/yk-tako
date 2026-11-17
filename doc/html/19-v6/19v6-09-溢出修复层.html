@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>19v6-09 · 溢出修复层（立项方案） · tako 文档</title>
+<meta name="description" content="估算计数（countInput）：发送前的长度自测。谁：worker 的 prepareInput；数什么：system 提示词 + mh 每条可见行的文本（19v6-10 D3 起 + tool_calls JSON）；怎么数：cl100k BPE 逐条 编码求和；跟谁比：l…" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/19-v6/19v6-09-溢出修复层.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="19v6-09 · 溢出修复层（立项方案） · tako 文档" />
+<meta property="og:description" content="估算计数（countInput）：发送前的长度自测。谁：worker 的 prepareInput；数什么：system 提示词 + mh 每条可见行的文本（19v6-10 D3 起 + tool_calls JSON）；怎么数：cl100k BPE 逐条 编码求和；跟谁比：l…" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/19-v6/19v6-09-溢出修复层.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="19v6-09 · 溢出修复层（立项方案） · tako 文档" />
+<meta name="twitter:description" content="估算计数（countInput）：发送前的长度自测。谁：worker 的 prepareInput；数什么：system 提示词 + mh 每条可见行的文本（19v6-10 D3 起 + tool_calls JSON）；怎么数：cl100k BPE 逐条 编码求和；跟谁比：l…" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="../style.css" />
 </head>
 <body>

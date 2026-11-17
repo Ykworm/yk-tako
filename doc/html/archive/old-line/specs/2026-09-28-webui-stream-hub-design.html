@@ -4,6 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Web UI 流式枢纽设计（v3：落盘地基 + seq 续传） · tako 文档</title>
+<meta name="description" content="当前实现的事件信封里没有 Seq。 现有 SSE 载荷是 sseEvent （yk-tako-eino/internal/webui/sse.go:24-32），字段只有 kind / agent / role / text / toolName / toolNames / a…" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/archive/old-line/specs/2026-09-28-webui-stream-hub-design.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="Web UI 流式枢纽设计（v3：落盘地基 + seq 续传） · tako 文档" />
+<meta property="og:description" content="当前实现的事件信封里没有 Seq。 现有 SSE 载荷是 sseEvent （yk-tako-eino/internal/webui/sse.go:24-32），字段只有 kind / agent / role / text / toolName / toolNames / a…" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/archive/old-line/specs/2026-09-28-webui-stream-hub-design.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="Web UI 流式枢纽设计（v3：落盘地基 + seq 续传） · tako 文档" />
+<meta name="twitter:description" content="当前实现的事件信封里没有 Seq。 现有 SSE 载荷是 sseEvent （yk-tako-eino/internal/webui/sse.go:24-32），字段只有 kind / agent / role / text / toolName / toolNames / a…" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
 <link rel="stylesheet" href="../../../style.css" />
 </head>
 <body>

@@ -36,6 +36,9 @@ yk-tako-eino/mcp.json
 # Python 字节码（scripts/acceptance 的工具跑起来会生成）
 __pycache__/
 
+# 站点地图在构建时生成到 _site/，本地默认路径跑出来的那份不入库
+doc/sitemap.xml
+
 # README 的人工润色版草稿，仅本地参考，不进版本库
 /README-human.md
 

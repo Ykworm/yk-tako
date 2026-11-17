@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>83 配套 · 课程增量落点清单（83 条全量扫描） · tako 文档</title>
+<meta name="description" content="落点缩写：一 = 第一版（阶段一，PII case 方案就落）；二／三／四 = 方案内后续阶段；已 = 已拍沿用；不搬 = 判了不进；待裁 = 写方案时要拍。" />
+<link rel="canonical" href="https://tako.docs.yktea.fun/html/83-场景化Eval方案/课程增量落点清单.html" />
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="tako 文档" />
+<meta property="og:title" content="83 配套 · 课程增量落点清单（83 条全量扫描） · tako 文档" />
+<meta property="og:description" content="落点缩写：一 = 第一版（阶段一，PII case 方案就落）；二／三／四 = 方案内后续阶段；已 = 已拍沿用；不搬 = 判了不进；待裁 = 写方案时要拍。" />
+<meta property="og:url" content="https://tako.docs.yktea.fun/html/83-场景化Eval方案/课程增量落点清单.html" />
+<meta property="og:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<meta property="og:locale" content="zh_CN" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="83 配套 · 课程增量落点清单（83 条全量扫描） · tako 文档" />
+<meta name="twitter:description" content="落点缩写：一 = 第一版（阶段一，PII case 方案就落）；二／三／四 = 方案内后续阶段；已 = 已拍沿用；不搬 = 判了不进；待裁 = 写方案时要拍。" />
+<meta name="twitter:image" content="https://tako.docs.yktea.fun/assets/tako-architecture.png" />
+<link rel="stylesheet" href="../style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">tako 文档</a>
+  <nav class="links"><a href="../../assets/tako-architecture.html">架构总览</a><a href="../../assets/tako-run-lifecycle.html">run 生命周期</a><a href="../../assets/tako-orchestration.html">长任务编排</a><a href="../../assets/tako-data-model.html">数据与存储</a></nav>
+  <a class="repo" href="https://github.com/Ykworm/yk-tako" rel="noopener">GitHub</a>
+</header>
+<main class="doc">
+<h1 id="83-配套--课程增量落点清单83-条全量扫描">83 配套 · 课程增量落点清单（83 条全量扫描）</h1>
+<blockquote>
+<p>性质：<strong>素材清单（不作施工真源）</strong>。把 <a href="DataAgent课程借鉴与Tako落地分析.html">DataAgent课程借鉴与Tako落地分析</a> 里与 tako 契合的 Eval 知识点逐条抽出并编号，每条给落点判定。写 <a href="讨论.html">讨论</a> 与 <a href="README.html">README</a> 方案时按编号引用（记法：「课程清单 #N」）——防漏，也防把课程图当「缺什么就建什么」的采购清单（原文 §11 的警告）。 状态：2026-11-17 完成全量扫描（83 条）。落点是扫描当时的判断；对齐对话推进后如有调整，回填对应行，不另开新清单。 日期：2026-11-17。 来源与扫描方法：按原文 §2–§10 逐节抽取、去重编号；§3 各篇散点里前面没覆盖到的单独收在 §X 一节。每条 = 一句操作定义 + 一个落点。 已核事实：原文第 221 行证据行的「journey」在 tako 真实存在（<code>yk-tako-eino/internal/runengine/orchestration_journey.go</code>、<code>web/src/TasksView.vue</code>、<code>scripts/acceptance/orchestration_live.sh</code>），原文无需修改。</p>
+</blockquote>
+<p>落点缩写：<strong>一</strong> = 第一版（阶段一，PII case 方案就落）；<strong>二／三／四</strong> = 方案内后续阶段；<strong>已</strong> = 已拍沿用；<strong>不搬</strong> = 判了不进；<strong>待裁</strong> = 写方案时要拍。</p>
+<h2 id="2-链路3-条">§2 链路（3 条）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>知识点</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Eval 读两类产出：终态（文件/库/Task）+ 执行证据（frames/runlog/trace）</td>
+<td>一</td>
+</tr>
+<tr>
+<td>2</td>
+<td>三者分工：Runtime 执行留证据、Eval 只读不改、发布消费结论</td>
+<td>一</td>
+</tr>
+<tr>
+<td>3</td>
+<td>真实失败缩成可重跑 case 回流评测集</td>
+<td>一</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="41-质量契约4-条">§4.1 质量契约（4 条）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>知识点</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4</td>
+<td>Outcome/Trajectory/System 三层</td>
+<td>一</td>
+</tr>
+<tr>
+<td>5</td>
+<td>轨迹只限必要条件，不锁唯一工具路径</td>
+<td>一</td>
+</tr>
+<tr>
+<td>6</td>
+<td>软评分与硬性否决分开，安全不被高分抵消</td>
+<td>一</td>
+</tr>
+<tr>
+<td>7</td>
+<td>契约五项（结果/证据/轨迹/代价/硬风险）的 tako 翻译</td>
+<td>一</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="42-覆盖面3-条">§4.2 覆盖面（3 条）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>知识点</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>8</td>
+<td>任务类型覆盖 12 类</td>
+<td>二</td>
+</tr>
+<tr>
+<td>9</td>
+<td>每类四覆盖：正常/边界/故障/对抗</td>
+<td>二</td>
+</tr>
+<tr>
+<td>10</td>
+<td>正反向配对（该搜/不该搜、该问/不该反复问、该记/不乱记、该并行/不乱编排）</td>
+<td>二</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="43-fixture4-条">§4.3 Fixture（4 条）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>知识点</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>11</td>
+<td>Fixture 预置清单（文件/Git/权限/记忆/技能/MCP/时间/外部响应）</td>
+<td>一（用子集）</td>
+</tr>
+<tr>
+<td>12</td>
+<td>隔离单位 = case × trial</td>
+<td>一</td>
+</tr>
+<tr>
+<td>13</td>
+<td>固定网络响应 + 少量真实联网烟雾</td>
+<td>二</td>
+</tr>
+<tr>
+<td>14</td>
+<td>Harness 不替模型干活</td>
+<td>一</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="44-版本与治理5-条">§4.4 版本与治理（5 条）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>知识点</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>15</td>
+<td>版本元组</td>
+<td>一精简版（引擎 commit/模型 ref/case 版/grader 版/预算），11 项全量归二</td>
+</tr>
+<tr>
+<td>16</td>
+<td>Baseline/Candidate 只允许研究变量不同</td>
+<td>二</td>
+</tr>
+<tr>
+<td>17</td>
+<td>无法记版本标 unversioned；密钥不进报告</td>
+<td>一</td>
+</tr>
+<tr>
+<td>18</td>
+<td>数据集分层与 K/S/B/C 正交</td>
+<td>二</td>
+</tr>
+<tr>
+<td>19</td>
+<td>能力集稳定后毕业进回归集</td>
+<td>二/三</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="51-四类-grader5-条">§5.1 四类 Grader（5 条）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>知识点</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>20</td>
+<td>Code Grader</td>
+<td>一</td>
+</tr>
+<tr>
+<td>21</td>
+<td>Environment Grader</td>
+<td>一</td>
+</tr>
+<tr>
+<td>22</td>
+<td>Trace Grader</td>
+<td>一</td>
+</tr>
+<tr>
+<td>23</td>
+<td>LLM Grader</td>
+<td>二/三</td>
+</tr>
+<tr>
+<td>24</td>
+<td>优先级：确定性 &gt; 终态 &gt; 语义裁判</td>
+<td>一</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="52-校准5-条">§5.2 校准（5 条）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>知识点</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>25</td>
+<td>每个 Case 至少一个参考解法</td>
+<td>一</td>
+</tr>
+<tr>
+<td>26</td>
+<td>每个 Grader 正误样例自测</td>
+<td>一</td>
+</tr>
+<tr>
+<td>27</td>
+<td>LLM 裁判单维度 + 结构化输出 + unknown</td>
+<td>二/三</td>
+</tr>
+<tr>
+<td>28</td>
+<td>人工金样校准 + 裁判变更重校</td>
+<td>二/三</td>
+</tr>
+<tr>
+<td>29</td>
+<td>采样 3 次取多数只降波动、不代替校准</td>
+<td>二/三</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="53-multi-trial-与证据6-条">§5.3 Multi-Trial 与证据（6 条）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>知识点</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>30</td>
+<td>M=5 全过才算过</td>
+<td>已拍沿用</td>
+</tr>
+<tr>
+<td>31</td>
+<td>pass@1 / Pass@5 / pass^5 三数分开</td>
+<td>一（bench 已在算，沿用）</td>
+</tr>
+<tr>
+<td>32</td>
+<td>5 过 1 ≠ 可交付</td>
+<td>一（报告措辞）</td>
+</tr>
+<tr>
+<td>33</td>
+<td>5 次不足以证明 2~3% 小改进</td>
+<td>二（配对比较时加试验数）</td>
+</tr>
+<tr>
+<td>34</td>
+<td>Scorecard 分开报、不合成总分</td>
+<td>一</td>
+</tr>
+<tr>
+<td>35</td>
+<td>证据包字段清单；PII/密钥不复制进报告</td>
+<td>一</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="54-runner3-条">§5.4 Runner（3 条）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>知识点</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>36</td>
+<td>Runner 八步职责</td>
+<td>一</td>
+</tr>
+<tr>
+<td>37</td>
+<td>Runner 三不（不替操作/不改引擎/不承担发布）</td>
+<td>一</td>
+</tr>
+<tr>
+<td>38</td>
+<td>复用 acceptance harness；acceptance 已覆盖的不重复搬</td>
+<td>已有共识沿用</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="6-失败诊断7-条">§6 失败诊断（7 条）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>知识点</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>39</td>
+<td>症状/直接原因/根因三分</td>
+<td>一定格式，二大量用</td>
+</tr>
+<tr>
+<td>40</td>
+<td>失败记录七字段（symptom/direct_cause/root_cause/evidence/reproduction_case/fix/verification）</td>
+<td>一</td>
+</tr>
+<tr>
+<td>41</td>
+<td>失败不全归「模型不行」</td>
+<td>一</td>
+</tr>
+<tr>
+<td>42</td>
+<td>Ablation = 固定其他只动一个</td>
+<td>二</td>
+</tr>
+<tr>
+<td>43</td>
+<td>A/B 统一形状 case×{base,variant}×trial + 五纪律</td>
+<td>二</td>
+</tr>
+<tr>
+<td>44</td>
+<td>第一批六组实验清单</td>
+<td>二/三</td>
+</tr>
+<tr>
+<td>45</td>
+<td>六名词分开：Retry/Resume/证据回看/受控重跑/确定性重放/Fork</td>
+<td>一定义；Fork 不进一</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="6364-边界与沉淀2-条">§6.3/6.4 边界与沉淀（2 条）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>知识点</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>46</td>
+<td>续跑 ≠ 重放后答案相同；journal ≠ 完整世界快照</td>
+<td>已有认知，写作时遵守</td>
+</tr>
+<tr>
+<td>47</td>
+<td>Regression Case 沉淀七步</td>
+<td>一立规矩</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="7-runtimememory-边界9-条">§7 Runtime/Memory 边界（9 条）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>知识点</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>48</td>
+<td>Harness 预算 ≠ 引擎预算（超时停只证明「没在外部预算内完成」）</td>
+<td>一口径写准</td>
+</tr>
+<tr>
+<td>49</td>
+<td>run 级原生预算</td>
+<td>Runtime 线单独立项，不进 eval</td>
+</tr>
+<tr>
+<td>50</td>
+<td>Verifier（可阻止发布）≠ Eval Grader（只读不改）</td>
+<td>一</td>
+</tr>
+<tr>
+<td>51</td>
+<td>检查规则可复用，Grader 不替 Agent 修结果</td>
+<td>一</td>
+</tr>
+<tr>
+<td>52</td>
+<td>Human Gate 四测（等待禁止/恢复/答案只消费一次/拒绝没执行）</td>
+<td>二</td>
+</tr>
+<tr>
+<td>53</td>
+<td>不新增通用工具审批</td>
+<td>不搬（维持裁定）</td>
+</tr>
+<tr>
+<td>54</td>
+<td>证据字段统一，执行原语不统一</td>
+<td>一</td>
+</tr>
+<tr>
+<td>55</td>
+<td>Memory Eval 九行清单</td>
+<td>二/三</td>
+</tr>
+<tr>
+<td>56</td>
+<td>pipeline 与 markdown 分开报告</td>
+<td>二/三</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="8-发布8-条">§8 发布（8 条）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>知识点</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>57</td>
+<td>CI Regression Gate</td>
+<td>四</td>
+</tr>
+<tr>
+<td>58</td>
+<td>安全不能被平均分抵消（发布视图）</td>
+<td>二定口径、四执行</td>
+</tr>
+<tr>
+<td>59</td>
+<td>incomplete 双口径：本地默认放行 vs 正式发布「本次未验证」</td>
+<td><strong>待裁</strong>（写方案时拍）</td>
+</tr>
+<tr>
+<td>60</td>
+<td>Shadow</td>
+<td>不搬（会重复副作用；无稳定流量）</td>
+</tr>
+<tr>
+<td>61</td>
+<td>Canary 按租户</td>
+<td>四</td>
+</tr>
+<tr>
+<td>62</td>
+<td>Kill Switch</td>
+<td>四</td>
+</tr>
+<tr>
+<td>63</td>
+<td>版本回滚 ≠ 撤销已发副作用</td>
+<td>四口径</td>
+</tr>
+<tr>
+<td>64</td>
+<td>AI 自动优化</td>
+<td>一版不做</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="83-业务翻译2-条">§8.3 业务翻译（2 条）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>知识点</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>65</td>
+<td>GMV→编码/研究/长任务、SQL 证据→文件/URL/测试/runlog/journey 等六条</td>
+<td>不搬业务，语义翻译可用</td>
+</tr>
+<tr>
+<td>66</td>
+<td>Metric Registry</td>
+<td>不搬，只借「先确认定义/权限/新鲜度」</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="9-七项补强--10-顺序8-条">§9 七项补强 + §10 顺序（8 条）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>知识点</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>67</td>
+<td>场景 Eval 主链</td>
+<td>一 = 本方案本体</td>
+</tr>
+<tr>
+<td>68</td>
+<td>失败诊断闭环</td>
+<td>二</td>
+</tr>
+<tr>
+<td>69</td>
+<td>Context 可解释性（候选/过滤/排序/预算证据）</td>
+<td>三</td>
+</tr>
+<tr>
+<td>70</td>
+<td>Memory 价值与风险实验（Memory Off 对照）</td>
+<td>三</td>
+</tr>
+<tr>
+<td>71</td>
+<td>技能与工具效果实验</td>
+<td>二/三</td>
+</tr>
+<tr>
+<td>72</td>
+<td>模型可靠执行与路由</td>
+<td>证据驱动，不在 eval 施工</td>
+</tr>
+<tr>
+<td>73</td>
+<td>外部 Action 与生产发布</td>
+<td>四/真实流量后</td>
+</tr>
+<tr>
+<td>74</td>
+<td>四阶段顺序本身</td>
+<td>采用为方案章节骨架</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="x-各篇散点前面没覆盖到的9-条">§X 各篇散点（前面没覆盖到的，9 条）</h2>
+<div class="table-wrap"><table>
+<thead>
+<tr>
+<th>#</th>
+<th>知识点</th>
+<th>落点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>75</td>
+<td>Tool Eval 四问（选对/传对/读懂错误/不该看到时不可见）</td>
+<td>二</td>
+</tr>
+<tr>
+<td>76</td>
+<td>技能版本配对/效果干扰评测</td>
+<td>并 71</td>
+</tr>
+<tr>
+<td>77</td>
+<td>独立验证：Agent 自述测试通过 ≠ 证据，Eval 重读产物</td>
+<td>一</td>
+</tr>
+<tr>
+<td>78</td>
+<td>每个调优技巧要 A/B 证明净收益</td>
+<td>并 42/43</td>
+</tr>
+<tr>
+<td>79</td>
+<td>Context Manifest</td>
+<td>不搬</td>
+</tr>
+<tr>
+<td>80</td>
+<td>能力自评四问</td>
+<td>面试材料，不进方案</td>
+</tr>
+<tr>
+<td>81</td>
+<td>M0 基线/ADR</td>
+<td>ADR 已有位（doc/problems/）；M0 基线 = 一</td>
+</tr>
+<tr>
+<td>82</td>
+<td>验收叙事三链（正常/故障/版本对照，不只演成功 Demo）</td>
+<td>一（演示口径）</td>
+</tr>
+<tr>
+<td>83</td>
+<td>课程对比不当源码证据</td>
+<td>已遵守</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="汇总">汇总</h2>
+<p>83 条的去向：</p>
+<ul>
+<li><strong>阶段一 38 条</strong>：#1–7、11–12、14–15、17、20–22、24–26、31–32、34–37、39–41、45、47–48、50–51、54、67、74、77、81（半条）、82——写 PII case 方案时 README 必须吸收的清单；</li>
+<li><strong>已拍沿用 4 条</strong>：#30（M=5）、#38（复用 acceptance 底座）、#46（续跑≠重放）、#83（纪律）；</li>
+<li><strong>方案内后续阶段 32 条</strong>：#8–10、13、16、18–19、23、27–29、33、42–44、52、55–56、57–58、61–63、68–73、75、76（并 71）、78（并 42/43）；</li>
+<li><strong>不搬 7 条</strong>：#53、60、64、65、66、79、80；</li>
+<li><strong>待裁 1 条</strong>：#59 incomplete 双口径——唯一挂起的裁定项；</li>
+<li><strong>Runtime 线 1 条</strong>：#49 run 级原生预算——eval 只留口径不施工。</li>
+</ul>
+<p>三条双落点：#15（一精简版→二全量）、#39（一定格式→二大量用）、#45（一定义，Fork 不进一）。</p>
+
+</main>
+<footer class="foot">
+  <p>本页由 <code>scripts/build-doc-html.py</code> 从 <a href="https://github.com/Ykworm/yk-tako/blob/main/doc/83-%E5%9C%BA%E6%99%AF%E5%8C%96Eval%E6%96%B9%E6%A1%88/%E8%AF%BE%E7%A8%8B%E5%A2%9E%E9%87%8F%E8%90%BD%E7%82%B9%E6%B8%85%E5%8D%95.md"><code>doc/83-场景化Eval方案/课程增量落点清单.md</code></a> 自动生成。内容以仓库里的 md 为准——要改，改 md 再重跑脚本。</p>
+</footer>
+</body>
+</html>
