@@ -53,6 +53,17 @@ jobs:
         # 提交进仓库会让本地与 CI 的 HEAD 日期对不上，机器验收一直报差异。
         run: python3 scripts/build-sitemap.py _site/sitemap.xml
 
+      - name: 发布 AI 可读形态（md 原文树 + llms.txt）
+        # 网页只有 HTML：AI 抓到的得先自己剥标签（导航、样式、表格壳），剥得对不对
+        # 由它决定。md 原文是干净的源文件——DeepSeek 的 Fetch 直接返回 Markdown，
+        # 长上下文模型整页读，agent 抓取也偏好它。
+        # llms.txt 是社区约定（llmstxt.org）的站点清单：告诉 AI 这个站有哪些页、
+        # 每篇讲什么，让它不用瞎抓。不是 Bing/Google 官方标准，但成本极低。
+        run: |
+          python3 scripts/build-doc-html.py --publish-md _site/md --llms-txt _site/llms.txt
+          ls -l _site/llms.txt
+          find _site/md -name '*.md' | wc -l
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:

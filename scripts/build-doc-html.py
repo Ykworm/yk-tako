@@ -339,10 +339,13 @@ TRACKED_DIRS = set()
 DEAD = []
 
 
-def resolve(src_rel, out_rel, href):
+def resolve(src_rel, out_rel, href, md_tree=False):
     """决定一个 href 怎么改。
 
     返回 ("keep", href) 原样 / ("rel", 新相对路径) / ("blob", 绝对 URL) / ("dead", None)。
+
+    md_tree=True 时按「md 树」解释：md→md 的链接保持 .md（这样 /md/ 树内互链照常
+    工作），其余规则不变。
     """
     if not href or href.startswith("#"):
         return ("keep", href)
@@ -378,6 +381,10 @@ def resolve(src_rel, out_rel, href):
         if cand.startswith("..") or cand not in TRACKED:
             continue
         if cand.startswith("doc/") and cand.endswith(".md"):
+            if md_tree:
+                # md 树：保持 .md，md→md 的链接在 /md/ 树里照样能走通
+                target_rel = "doc/md/" + cand[len("doc/") :]
+                return ("rel", rel_from(target_rel, os.path.dirname(out_rel)) + suffix)
             html_rel = "doc/html/" + cand[len("doc/") : -len(".md")] + ".html"
             if cand == "doc/README.md":
                 html_rel = "doc/html/index.html"
@@ -726,6 +733,214 @@ def rewrite_asset_pages(write=True):
     return changed
 
 
+# ---------------------------------------------------------------- AI 可读形态
+
+
+MD_LINK = re.compile(r"(!?)\[([^\]]*)\]\(([^)\s]+)\)")
+CODE_SPAN = re.compile(r"(```.*?```|`[^`\n]+`)", re.S)
+INDEX_ENTRY = re.compile(r"^-\s+\*\*([^*]+)\*\*\s+\[([^\]]+)\]\(([^)]+)\)\s*(.*)$")
+
+
+def markdown_sources():
+    """已入库的 md 源文档（仓库相对路径），排除 doc/html/ 生成物。"""
+    out = []
+    for dirpath, dirnames, filenames in os.walk(DOC):
+        dirnames[:] = sorted(d for d in dirnames if os.path.join(dirpath, d) != OUT)
+        for name in sorted(filenames):
+            if not name.endswith(".md"):
+                continue
+            src = os.path.join(dirpath, name)
+            rel = os.path.relpath(src, ROOT).replace(os.sep, "/")
+            if rel not in TRACKED:
+                continue
+            out.append((src, rel))
+    return out
+
+
+def rewrite_md_link(match, src_rel, out_rel):
+    bang, label, target = match.group(1), match.group(2), match.group(3)
+    if target.startswith("<") and target.endswith(">"):
+        target = target[1:-1]
+    kind, value = resolve(src_rel, out_rel, target, md_tree=True)
+    if kind == "keep":
+        return f"{bang}[{label}]({target})"
+    if kind in ("rel", "blob"):
+        return f"{bang}[{label}]({value})"
+    return label  # 死链：去掉链接保留文字（与网页版一致）
+
+
+def rewrite_markdown_links(text, src_rel, out_rel):
+    """改写 md 原文里的链接。代码块与行内代码不动——那里面可能有看起来像链接的举例。"""
+    parts = CODE_SPAN.split(text)
+    for index in range(0, len(parts), 2):  # 偶数位普通文本，奇数位代码
+        parts[index] = MD_LINK.sub(lambda m: rewrite_md_link(m, src_rel, out_rel), parts[index])
+    return "".join(parts)
+
+
+def publish_markdown(out_dir):
+    """把已入库的 md 原文发布成 /md/ 树。
+
+    为什么线上要有一份 md：网页只有 HTML，AI 抓到的得先自己剥标签（导航、样式、
+    表格壳），剥得对不对由它决定——DeepSeek 的检索管道明确不执行 JavaScript，
+    Fetch API 是把页面转成 Markdown 再返回。md 原文是干净的源文件，
+    长上下文模型会整页读，agent 抓取也偏好它。
+
+    链接改道：md→md 保持 .md（在 /md/ 树内照样走通）；指向代码文件的换成 GitHub
+    blob 绝对地址；死链（tmp/、ref-agent/、本机绝对路径）去掉链接保留文字。
+    """
+    count = 0
+    for src, rel in markdown_sources():
+        with open(src, encoding="utf-8") as f:
+            text = f.read()
+        out_rel = "doc/md/" + rel[len("doc/") :]
+        new_text = rewrite_markdown_links(text, rel, out_rel)
+        dst = os.path.join(ROOT, out_dir, rel[len("doc/") :])
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        count += 1
+    return count
+
+
+def md_summary(src_path, limit=110):
+    """从 md 头部取一句摘要：优先引用块里的「性质：」，否则取第一段正文。"""
+    with open(src_path, encoding="utf-8") as f:
+        text = f.read()
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith(">"):
+            content = stripped.lstrip("> ").strip()
+            if content.startswith("性质："):
+                content = content[len("性质：") :].strip().replace("**", "")
+                return content[:limit]
+    body = re.sub(r"(?m)^>.*$", "", text)
+    for para in body.split("\n\n"):
+        para = para.strip()
+        if not para or para.startswith("#"):
+            continue
+        return re.sub(r"[`*_]", "", para)[:limit]
+    return ""
+
+
+def parse_index_entries():
+    """doc/README.md 的「现行真源」章节 → [(编号, 标题, doc 内路径, 状态, 摘要)]。
+
+    那一章是仓库自己认定的真源列表——按目录猜谁是现行真源会出错，所以读它。
+    """
+    path = os.path.join(DOC, "README.md")
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    entries = []
+    current = None
+    in_section = False
+    for line in lines:
+        if line.startswith("## "):
+            in_section = line.startswith("## 1.")
+            current = None
+            continue
+        if not in_section:
+            continue
+        match = INDEX_ENTRY.match(line)
+        if match:
+            current = {
+                "num": match.group(1).strip(),
+                "title": match.group(2).strip(),
+                "path": match.group(3).strip(),
+                "status": match.group(4).strip(),
+                "desc": "",
+            }
+            entries.append(current)
+            continue
+        if current is not None:
+            sub = re.match(r"^\s+-\s+(.*)$", line)
+            if sub:
+                content = sub.group(1).strip()
+                if not content.startswith("落点：") and not current["desc"]:
+                    current["desc"] = content
+            elif not line.strip():
+                continue
+            else:
+                current = None
+    return entries
+
+
+def build_llms_txt():
+    """生成 llms.txt——给 AI 读的站点清单。
+
+    社区约定（llmstxt.org，2024-09），**不是** Bing/Google 的官方标准：官方指南里
+    没提它，Bing 也不会因为它多抓你。成本极低，而且已经有工具会主动读它。
+    它解决的是「这个站有哪些页、每篇讲什么」——让 AI 不用瞎抓。
+
+    清单来源：doc/README.md 的「现行真源」章节（仓库自己认定的真源列表），
+    外加四张系统说明页与决策档案。
+    """
+    out = [
+        "# tako 文档站",
+        "",
+        "> tako 是多租户 Agent 运行时与 AI 工作台。这里是它的现行文档：产品能力总纲、",
+        "> 四张系统说明页（交互图 + 纯文字版）、运行引擎契约与存储约定、记忆与子代理方案。",
+        "",
+        "## 三个入口",
+        "",
+        f"- 全部文档索引：{SITE_ORIGIN}/html/index.html",
+        f"- 原始 markdown（省去剥 HTML）：{SITE_ORIGIN}/md/README.md",
+        "- 本清单自身就是给程序读的入口（这个文件）",
+        "",
+        "## 架构说明页（四张交互图，均附纯文字版）",
+        "",
+    ]
+    for name, _ in ASSET_PAGES:
+        path = os.path.join(DOC, "assets", name)
+        summary = ""
+        label = name
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                head = f.read()
+            match = re.search(r'<meta name="description" content="([^"]*)"', head)
+            summary = match.group(1).strip() if match else ""
+            title_match = re.search(r"<title>(.*?)</title>", head, re.S)
+            if title_match:
+                label = title_match.group(1).strip().replace("tako · ", "")
+        out.append(f"- [{label}]({SITE_ORIGIN}/assets/{name})" + (f"：{summary}" if summary else ""))
+
+    out += ["", "## 现行文档", ""]
+    for entry in parse_index_entries():
+        rel = entry["path"]
+        if rel == "README.md":
+            url = f"{SITE_ORIGIN}/html/index.html"
+        else:
+            url = f"{SITE_ORIGIN}/html/{rel[:-3]}.html"
+        desc = entry["desc"].replace("**", "")
+        if len(desc) > 90:
+            desc = desc[:89].rstrip("，。、；：,; ") + "…"
+        out.append(
+            f"- **{entry['num']}** [{entry['title']}]({url})"
+            + (f" {entry['status']}" if entry["status"] else "")
+            + (f"：{desc}" if desc else "")
+        )
+
+    problems = []
+    for src, rel in markdown_sources():
+        if rel.startswith("doc/problems/") and rel.endswith("/问题与方案.md"):
+            problems.append((rel, md_summary(src, 80)))
+    if problems:
+        out += ["", "## 决策档案（为什么这样设计）", ""]
+        for rel, summary in sorted(problems):
+            url = f"{SITE_ORIGIN}/html/{rel[len('doc/'):-3]}.html"
+            out.append(f"- [{os.path.basename(os.path.dirname(rel))}]({url})" + (f"：{summary}" if summary else ""))
+
+    out += [
+        "",
+        "## 说明",
+        "",
+        "- 说明页是现行文档的导读，不是施工真源；与代码和专项文档冲突时以代码与专项文档为准。",
+        "- 站点只发布已入库的文档（未入库的私有材料不上站）。",
+        "- 更新：每次改动 doc/ 后自动发布，并用 IndexNow 通知 Bing 等索引器。",
+        "",
+    ]
+    return "\n".join(out)
+
+
 def main():
     parser = argparse.ArgumentParser(description="生成 doc/html 静态站")
     parser.add_argument("--check", action="store_true", help="只比对不写盘：有差异或断链就非零退出")
@@ -733,6 +948,16 @@ def main():
         "--audit-only",
         action="store_true",
         help="只查已生成站的链接（不需要 pandoc，可在 CI 里跑）",
+    )
+    parser.add_argument(
+        "--publish-md",
+        metavar="DIR",
+        help="把已入库的 md 原文发布到 DIR（构建时用，给 AI 读）",
+    )
+    parser.add_argument(
+        "--llms-txt",
+        metavar="FILE",
+        help="生成 llms.txt 到 FILE（构建时用，给 AI 读的站点清单）",
     )
     args = parser.parse_args()
 
@@ -755,6 +980,19 @@ def main():
     if not sources:
         print("没找到 doc/ 下已入库的 .md")
         return 1
+
+    # AI 可读形态：md 原文树 + llms.txt。构建时生成，不入库（与 sitemap 同理——
+    # 入库就得跟着 md 树同步更新，机器验收会一直报差异）。
+    if args.publish_md or args.llms_txt:
+        if args.publish_md:
+            count = publish_markdown(args.publish_md)
+            print(f"md 原文：{count} 篇 → {args.publish_md}/")
+        if args.llms_txt:
+            os.makedirs(os.path.dirname(os.path.abspath(args.llms_txt)), exist_ok=True)
+            with open(args.llms_txt, "w", encoding="utf-8") as f:
+                f.write(build_llms_txt())
+            print(f"llms.txt → {args.llms_txt}")
+        return 0
 
     os.makedirs(OUT, exist_ok=True)
     expected = {"doc/html/style.css"}
