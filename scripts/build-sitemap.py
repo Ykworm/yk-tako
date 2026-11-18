@@ -93,17 +93,44 @@ def build_xml(urls, lastmod):
     return "\n".join(lines) + "\n"
 
 
+def build_index_xml(sitemap_url, lastmod):
+    """站点地图索引（sitemap index）。
+
+    为什么要有这个：GSC 对「抓取失败过」的站点地图不会立刻重试，状态会一直卡在
+    「无法抓取」。索引文件是一个**从未提交过的新地址**——提交它等于排一次全新的
+    抓取，而抓取动作发生在站点稳定时（不在 GitHub Pages 换产物的窗口里）。
+    同时它也是规范做法：以后要按章节拆成多个 sitemap，这里就是汇合点。
+    """
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        "  <sitemap>\n"
+        f"    <loc>{sitemap_url}</loc>\n"
+        f"    <lastmod>{lastmod}</lastmod>\n"
+        "  </sitemap>\n"
+        "</sitemapindex>\n"
+    )
+
+
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(DOC, "sitemap.xml")
     urls, skipped = collect_urls()
-    xml = build_xml(urls, git_head_date())
+    lastmod = git_head_date()
+    xml = build_xml(urls, lastmod)
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         f.write(xml)
+
+    index_path = os.path.join(os.path.dirname(os.path.abspath(out)), "sitemap-index.xml")
+    sitemap_url = f"{HOST}/{os.path.basename(out)}"
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write(build_index_xml(sitemap_url, lastmod))
+
     print(
         f"sitemap：{len(urls)} 条 URL → {os.path.relpath(out, ROOT)}"
         + (f"（排除 archive/log {skipped} 条）" if skipped else "")
     )
+    print(f"索引入口：{sitemap_url} → {os.path.relpath(index_path, ROOT)}")
     return 0
 
 
