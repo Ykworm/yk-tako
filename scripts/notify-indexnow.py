@@ -18,7 +18,10 @@
 """
 import json
 import os
+import re
+import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -27,23 +30,48 @@ REPO = os.environ.get("REPO", "Ykworm/yk-tako")
 HOST = os.environ.get("SITE_HOST", "tako.docs.yktea.fun")
 
 
+def http_get(url, headers=None):
+    """取一个 URL 的正文。
+
+    为什么要 curl 兜底：本机 python3 的证书链在某些域名上找不到本地签发者，
+    urllib 会直接抛 SSLCertVerificationError；curl 用系统 CA，没这个问题。
+    """
+    headers = headers or {}
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "yk-tako-indexnow", **headers})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.read().decode("utf-8")
+    except (urllib.error.URLError, OSError):
+        cmd = ["curl", "-s", "--max-time", "30", "-H", "User-Agent: yk-tako-indexnow"]
+        for name, value in headers.items():
+            cmd += ["-H", f"{name}: {value}"]
+        cmd.append(url)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        return proc.stdout
+
+
+def sitemap_urls():
+    """站点根 sitemap.xml 里的全部 URL。
+
+    新站第一次交给索引器时用这个：sitemap 是「我有多少页」的清单，
+    IndexNow 是「现在来看」的通知——两者合起来等于一次性把站点交给它。
+    """
+    body = http_get(f"https://{HOST}/sitemap.xml")
+    return re.findall(r"<loc>([^<]+)</loc>", body)
+
+
 def changed_files(sha, token):
     """这次发布动了哪些文件（仓库相对路径）。"""
     if not sha:
         return []
     url = f"https://api.github.com/repos/{REPO}/commits/{sha}"
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "yk-tako-indexnow",
-            **({"Authorization": f"Bearer {token}"} if token else {}),
-        },
-    )
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    body = http_get(url, headers)
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            payload = json.load(response)
-    except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
         print(f"取改动清单失败：{exc}")
         return []
     return [item.get("filename", "") for item in payload.get("files", [])]
@@ -77,40 +105,85 @@ def main():
         print("未配置 INDEXNOW_KEY，跳过 IndexNow 通知（不影响发布）")
         return 0
 
+    all_urls = "--all" in sys.argv[1:]
+    if all_urls:
+        paths = set()
+        try:
+            for loc in sitemap_urls():
+                paths.add(loc)
+        except (urllib.error.URLError, OSError) as exc:
+            print(f"读 sitemap 失败，改用改动清单：{exc}")
+            all_urls = False
+
     sha = os.environ.get("GITHUB_SHA", "").strip()
     token = os.environ.get("GITHUB_TOKEN", "").strip()
-    paths = {"/"}
-    for name in changed_files(sha, token):
-        path = file_to_url(name)
-        if path:
-            paths.add(path)
 
-    # IndexNow 只认绝对 URL：传路径（"/html/x.html"）它回 400 InvalidRequestParameters。
-    urls = sorted(f"https://{HOST}{path}" for path in paths)
+    if all_urls:
+        urls = sorted(paths)
+    else:
+        paths = {"/"}
+        for name in changed_files(sha, token):
+            path = file_to_url(name)
+            if path:
+                paths.add(path)
+        # IndexNow 只认绝对 URL：传路径（"/html/x.html"）它回 400 InvalidRequestParameters。
+        urls = sorted(f"https://{HOST}{path}" for path in paths)
 
     body = json.dumps(
         {"host": HOST, "key": key, "urlList": urls}, ensure_ascii=False
     ).encode("utf-8")
-    request = urllib.request.Request(
-        f"{ENDPOINT}?key={key}&host={HOST}",
-        data=body,
-        headers={
-            "Content-Type": "application/json; charset=utf-8",
-            "User-Agent": "yk-tako-indexnow",
-        },
-        method="POST",
-    )
+    status, detail = post(ENDPOINT, body, key, HOST)
+    if status.startswith("2"):
+        print(f"IndexNow 已通知 {len(urls)} 个 URL，状态 {status}")
+        return 0
+    print(f"IndexNow 返回 {status}：{detail}")
+    return 1
+
+
+def post(endpoint, body, key, host):
+    """POST 通知。返回 (状态码, 响应正文)。
+
+    为什么 curl 优先：某些网络环境下 urllib 的 TLS 行为会被服务端直接掐断
+    （RemoteDisconnected），或者本机证书链不全（SSLCertVerificationError）；
+    curl 用系统 CA 且行为稳定。urllib 留作 curl 不可用时的兜底。
+    """
+    url = f"{endpoint}?key={key}&host={host}"
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "User-Agent": "yk-tako-indexnow",
+    }
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as fh:
+        fh.write(body)
+        payload = fh.name
+    try:
+        proc = subprocess.run(
+            [
+                "curl", "-s", "-o", "-", "-w", "\n%{http_code}", "-X", "POST",
+                # -H 要完整头行（"Name: value"），只给值会发出畸形头，服务端直接回 400。
+                "-H", f"Content-Type: {headers['Content-Type']}",
+                "-H", f"User-Agent: {headers['User-Agent']}",
+                "--data", "@" + payload, url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        parts = proc.stdout.rsplit("\n", 1)
+        if len(parts) == 2 and parts[1].strip().isdigit():
+            return parts[1].strip(), parts[0][:300]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    finally:
+        os.unlink(payload)
+
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            print(f"IndexNow 已通知 {len(urls)} 个 URL，状态 {response.status}")
-            return 0
+            return str(response.status), response.read().decode("utf-8", "ignore")[:300]
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "ignore")[:300]
-        print(f"IndexNow 返回 {exc.code}：{detail}")
-        return 1
+        return str(exc.code), exc.read().decode("utf-8", "ignore")[:300]
     except (urllib.error.URLError, OSError) as exc:
-        print(f"IndexNow 通知失败：{exc}")
-        return 1
+        return "000", str(exc)
 
 
 if __name__ == "__main__":
