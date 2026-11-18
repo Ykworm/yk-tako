@@ -26,6 +26,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOC = os.path.join(ROOT, "doc")
 HOST = "https://tako.docs.yktea.fun"
 
+# 不进 sitemap 的目录。sitemap 是「我希望被收录的页面清单」，把下面这些塞进去
+# 等于告诉搜索引擎「这些也值得收录」：
+#   archive/ 被整代取代的旧线与旧引擎 —— 明确作废，是纯负资产；
+#   log/     交接与施工台账 —— 对外读者没有价值（里面的少数文章靠内链与外链被发现，
+#            照样能被引用，只是不由 sitemap 主动推荐）。
+# 排除后仍会照常发布，只是不再主动推荐收录。
+EXCLUDE_PATH_PARTS = ("/archive/", "/log/")
+
 
 def site_url(repo_rel):
     """仓库相对路径 → 站点 URL（站点根 = doc/）。"""
@@ -48,15 +56,20 @@ def git_head_date():
 
 def collect_urls():
     urls = []
+    skipped = 0
     for dirpath, dirnames, filenames in os.walk(DOC):
         dirnames[:] = sorted(d for d in dirnames if d != ".git")
         for name in sorted(filenames):
             if not name.endswith(".html"):
                 continue
             rel = os.path.relpath(os.path.join(dirpath, name), ROOT).replace(os.sep, "/")
-            urls.append(site_url(rel))
+            url = site_url(rel)
+            if any(part in url for part in EXCLUDE_PATH_PARTS):
+                skipped += 1
+                continue
+            urls.append(url)
     # 首页排最前，其余按字典序——输出稳定，diff 干净
-    return sorted(urls, key=lambda u: (u != HOST + "/", u))
+    return sorted(urls, key=lambda u: (u != HOST + "/", u)), skipped
 
 
 def build_xml(urls, lastmod):
@@ -77,12 +90,15 @@ def build_xml(urls, lastmod):
 
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(DOC, "sitemap.xml")
-    urls = collect_urls()
+    urls, skipped = collect_urls()
     xml = build_xml(urls, git_head_date())
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         f.write(xml)
-    print(f"sitemap：{len(urls)} 条 URL → {os.path.relpath(out, ROOT)}")
+    print(
+        f"sitemap：{len(urls)} 条 URL → {os.path.relpath(out, ROOT)}"
+        + (f"（排除 archive/log {skipped} 条）" if skipped else "")
+    )
     return 0
 
 

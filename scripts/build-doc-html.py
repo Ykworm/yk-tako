@@ -446,6 +446,10 @@ def page_html(fragment, src_rel, out_rel, title, description=""):
     if not description:
         description = clamp_description(first_paragraph_text(fragment))
     meta = head_meta_block(title, description, canonical)
+    if "/archive/" in src_rel:
+        # 归档页（被整代取代的旧线与旧引擎）明确作废：不进索引，
+        # 但 follow 保留——页面里的链接仍把权重传给被链的现行文档。
+        meta += '\n<meta name="robots" content="noindex,follow" />'
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
