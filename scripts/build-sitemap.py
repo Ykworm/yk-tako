@@ -63,6 +63,11 @@ def collect_urls():
             if not name.endswith(".html"):
                 continue
             rel = os.path.relpath(os.path.join(dirpath, name), ROOT).replace(os.sep, "/")
+            # doc/ 根下的 .html 只有 index.html 是页面；其余是站点根的辅助文件
+            # （如 Google 站点验证文件 google*.html），不是页面，不进 sitemap。
+            if rel.count("/") == 1 and rel != "doc/index.html":
+                skipped += 1
+                continue
             url = site_url(rel)
             if any(part in url for part in EXCLUDE_PATH_PARTS):
                 skipped += 1
