@@ -120,6 +120,11 @@ def main():
 
     if all_urls:
         urls = sorted(paths)
+        if not urls:
+            # 取不到 sitemap 就会交一份空清单——IndexNow 仍回 200，
+            # 于是「通知成功但什么都没通知」。这里必须显式失败。
+            print("sitemap 取不到 URL 列表，未发送通知（不当作成功）")
+            return 1
     else:
         paths = {"/"}
         for name in changed_files(sha, token):

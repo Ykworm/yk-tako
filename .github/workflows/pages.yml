@@ -15,9 +15,11 @@ on:
     paths:
       - "doc/**"
       # 凡是影响站点产物的构建脚本，改了就得重新发布。
-      # 漏一个的后果是「脚本改了但线上没变」——sitemap-index.xml 缺席过一次。
+      # 漏一个的后果是「脚本改了但线上没变」——sitemap-index.xml 缺席过一次，
+      # notify-indexnow.py 也漏过一次（改了脚本却没触发通知任务去验证它）。
       - "scripts/build-doc-html.py"
       - "scripts/build-sitemap.py"
+      - "scripts/notify-indexnow.py"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
