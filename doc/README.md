@@ -1,7 +1,7 @@
 # doc/ 文档索引
 
 > 性质：**索引**，不是方案。本文只回答「这篇文档是什么、能不能照着施工、代码在哪、被谁取代」。
-> 最后核对：2026-11-16。
+> 最后核对：2026-11-19。
 > 状态口径：✅ 已落地 · 🔶 部分落地／待收口 · ⬜ 未做 · 存档 = 历史材料，不作施工面。
 > 代码路径均相对 `yk-tako-eino/`。
 
@@ -36,7 +36,7 @@
 - 改视觉（配色／字阶／间距／圆角／侧栏三段／手机抽屉／气泡）：`doc/51`。
 - 加技能、改技能目录／加载／依赖／管理面：`doc/52`。
 - 改删除与档案清理（连带删会话、单场删除、保留窗口）：`doc/37`。
-- 改记忆、召回：`doc/65`（已落地：`pipeline` = PG 两层 + 抽取代理 + Redpanda；`markdown` = `USER.md` / 项目 `runtime/memory/MEMORY.md` 同步直写）；`doc/29` 的线一已被 doc/65 取代，线二 `dialogue_chunks` 仍现行；想借鉴别家记忆设计（nanoMuse：防重／整理／变更账）：`doc/62`。
+- 改记忆、召回：`doc/65`（已落地：`pipeline` = PG 两层 + 抽取代理 + Redpanda；`markdown` = `USER.md` / 项目 `runtime/memory/MEMORY.md` 同步直写）；`doc/29` 的线一已被 doc/65 取代，线二 `dialogue_chunks` 仍现行；历史对话的 ES + Milvus 混合检索见 `doc/84`（方案待点头、未施工）；想借鉴别家记忆设计（nanoMuse：防重／整理／变更账）：`doc/62`。
 - 改崩溃续跑：`doc/30`。
 - 改 Redis 临时键（移除 draft）：`doc/38`。
 - 改流式端点：`doc/31`。
@@ -378,6 +378,11 @@
   - 增量清单：[课程增量落点清单](83-场景化Eval方案/课程增量落点清单.md)（2026-11-17 全量扫描，素材）：把配套分析里与 tako 契合的 Eval 知识点逐条抽出编号（83 条），每条给落点（阶段一 38／后续 32／已有 4／不搬 7／待裁 1／Runtime 线 1）；写讨论与方案时按「课程清单 #N」引用
   - 案例规格：[旧方案还能重新排期吗？](83-场景化Eval方案/案例-01-文档查证.md)（待点头、未施工）：同一个 session 三轮区分现行决定、压测事实和失效计划，按输入、步骤、证据和判定表达式定义评测；决策模型采用 `decision-model-preview` 的 `systemone` 接口、Q1–Q3 使用 `noul`，另由 LLM 评价回答。2026-11-18 补齐无依据推断的 D 硬性准则、输入文件终态路径与 SHA-256 检查 B2、出处路径与小节解析、单次裁判异常使相关检查无效、有效 MCP 配置为空及反例自测。独立运行 5 次，A/B 暂不跑；决策模型响应契约与裁判校准尚待实测
   - 学习清单：[Tako Agent 全课程学习知识点表](83-场景化Eval方案/Tako-EvalOps学习知识点表.md)：覆盖模型、Runtime、Context、Tool／Skill、Memory 与 EvalOps，含概念解释、5 分制价值、当前功能状态；User 自评列留空
+
+- **84** [历史对话混合检索方案](84-历史对话混合检索方案.md) ⬜（方案待点头，2026-11-19）
+  - 落点：—（未施工。预计 `internal/runengine/dialogue_{retrieval,es,milvus,embedding,rrf,index_jobs,index_worker,retrieval_api}.go` 与 `scripts/acceptance/dialogue_hybrid_*.sh`；开工包在 `tmp/84-历史对话混合检索/施工包.md`，不入库）
+  - 只处理 `dialogue_chunks` 历史对话原文：ES 负责 BM25、Milvus 负责 embedding 语义候选，两路 Top-10 经 RRF 合并后回 PG 复核正文哈希与 tenant/user/workspace 可见性，前 3 段注入。active 记忆、resident 硬性指令与 supersede 历史链不动；`pg_search` 缺省路径保留，hybrid 显式启用且故障时不静默降级
+  - 完成线：真实 embedding 与 ES/Milvus 跑通语义增益、项目内跨 session、更新/删除、双副本、`kill -9` 补建和全量重建；新增 PG `dialogue_index_jobs`、dev `query/status` 与 119xxx 错误码。无真实 embedding 或任一组活体未过，不得宣布完成
 
 ## 2. 历史存档（`doc/archive/`，不作施工面）
 
