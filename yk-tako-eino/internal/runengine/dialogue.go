@@ -152,6 +152,8 @@ SELECT r.id, r.session_id, COALESCE(se.tenant_id, '') AS tenant_id, COALESCE(se.
 }
 
 // indexDialogueRun 组装一场 run 的 passage 并 upsert（doc/29 §5.1/§5.3）。
+// hybrid 模式下（doc/84 P1）chunk 写入与两条目标任务（es/milvus）登记同笔事务：
+// 业务写提交 ⇒ outbox 事件一定存在；事务回滚 ⇒ 什么都没发生。
 func (s *Store) indexDialogueRun(ctx context.Context, r unindexedRun) error {
 	var entries []RunlogEntry
 	if err := s.db.WithContext(ctx).Where("run_id = ?", r.ID).Order("seq").Find(&entries).Error; err != nil {
@@ -162,15 +164,44 @@ func (s *Store) indexDialogueRun(ctx context.Context, r unindexedRun) error {
 	if tid == "" {
 		tid = s.memoryCfg.TenantID
 	}
-	return s.db.WithContext(ctx).Exec(`
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`
 INSERT INTO dialogue_chunks (run_id, session_id, tenant_id, user_id, workspace, passage, runes, truncated, indexed_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, now())
 ON CONFLICT (run_id) DO UPDATE SET
   passage = EXCLUDED.passage, runes = EXCLUDED.runes,
   truncated = EXCLUDED.truncated, indexed_at = EXCLUDED.indexed_at,
   tenant_id = EXCLUDED.tenant_id, user_id = EXCLUDED.user_id`,
-		r.ID, r.SessionID, tid, uid, s.memoryCfg.Workspace,
-		passage, utf8.RuneCountInString(passage), truncated).Error
+			r.ID, r.SessionID, tid, uid, s.memoryCfg.Workspace,
+			passage, utf8.RuneCountInString(passage), truncated).Error; err != nil {
+			return err
+		}
+		// hybrid 未开启：pg_search 模式零新增行为（不登记 outbox）。
+		if !s.dialogueRetrieval.Hybrid {
+			return nil
+		}
+		// 归属的项目 id 真源在 runs.workspace_id（chunk.workspace 是作业根路径，语义不同）。
+		var runRows []struct {
+			WorkspaceID *string
+		}
+		if err := tx.Raw(`SELECT workspace_id FROM runs WHERE id = ?`, r.ID).Scan(&runRows).Error; err != nil {
+			return err
+		}
+		workspaceID := ""
+		if len(runRows) > 0 && runRows[0].WorkspaceID != nil {
+			workspaceID = *runRows[0].WorkspaceID
+		}
+		_, err := registerDialogueIndexJobs(ctx, tx, DialogueIndexEventSpec{
+			RunID:          r.ID,
+			SessionID:      r.SessionID,
+			TenantID:       tid,
+			UserID:         uid,
+			WorkspaceID:    workspaceID,
+			Kind:           DialogueJobKindUpsert,
+			EmbeddingModel: s.dialogueRetrieval.EmbeddingModel,
+		})
+		return err
+	})
 }
 
 // 线二召回的上限（doc/29 §6.2/§8）。

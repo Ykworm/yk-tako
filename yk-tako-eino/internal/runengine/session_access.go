@@ -169,6 +169,38 @@ func (s *Store) SetSessionWorkspace(ctx context.Context, id SessionID, p princip
 		if workspaceID != "" {
 			wid = workspaceID
 		}
-		return tx.Exec(`UPDATE sessions SET workspace_id = ? WHERE id = ?`, wid, id).Error
+		if err := tx.Exec(`UPDATE sessions SET workspace_id = ? WHERE id = ?`, wid, id).Error; err != nil {
+			return err
+		}
+		// 历史对话检索的移动事件（doc/84 §6.3）：同一事务更新对话块项目归属（上面那条
+		// UPDATE 已改 sessions.workspace_id）并登记 kind=move 任务——每个**已有 chunk**的
+		// run 一条（两个目标共用 event_id），只更新 ES/Milvus 的 workspace_id 元数据，
+		// 不重新 embedding。没有 chunk 的 run 不需要：它们的 upsert 任务登记时（chunk
+		// 写入事务里）会读到移动后的 runs.workspace_id。hybrid 未开启只改会话行。
+		if !s.dialogueRetrieval.Hybrid {
+			return nil
+		}
+		var chunkRows []struct {
+			RunID    string
+			TenantID string
+			UserID   string
+		}
+		if err := tx.Raw(
+			`SELECT run_id, tenant_id, user_id FROM dialogue_chunks WHERE session_id = ?`, id).Scan(&chunkRows).Error; err != nil {
+			return err
+		}
+		for _, row := range chunkRows {
+			if _, err := registerDialogueIndexJobs(ctx, tx, DialogueIndexEventSpec{
+				RunID:       RunID(row.RunID),
+				SessionID:   id,
+				TenantID:    row.TenantID,
+				UserID:      row.UserID,
+				WorkspaceID: workspaceID, // 解绑 = ""：外部元数据一并清空
+				Kind:        DialogueJobKindMove,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }

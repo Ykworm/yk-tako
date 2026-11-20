@@ -267,6 +267,8 @@ func (s *Server) RouterFor() *gin.Engine {
 		r.POST("/api/dev/file-fingerprint", authn, s.devFileFingerprint)
 		r.POST("/api/dev/file-lock-check", authn, s.devFileLockCheck)
 		r.POST("/api/dev/pii-check", authn, s.devPiiCheck)
+		r.POST("/api/dev/dialogue-retrieval/query", authn, s.devDialogueRetrievalQuery)
+		r.GET("/api/dev/dialogue-retrieval/status", authn, s.devDialogueRetrievalStatus)
 		r.POST("/api/dev/question-check", authn, s.devQuestionCheck)
 		r.POST("/api/dev/plan-gate-check", authn, s.devPlanGateCheck)
 		r.POST("/api/dev/task-check", authn, s.devTaskCheck)

@@ -73,28 +73,41 @@ func (s *Store) Recall(ctx context.Context, query string) (res RecallResult, err
 			blocks = append(blocks, block)
 		}
 	}
-	// 线二用原文整句（分词由扩展按索引声明的 tokenizer 做，我们侧零切词）。
+	// 线二用原文整句。hybrid 模式（doc/84 §7）：查询文本脱敏 → ES 词法臂 + 查询
+	// embedding → Milvus 向量臂 + RRF 合并；pg_search 模式：分词由扩展按索引声明的
+	// tokenizer 做，我们侧零切词——这条路径与 doc/29 逐字节不变。
 	if s.memoryCfg.RAG && strings.TrimSpace(query) != "" {
-		lineCtx, lineSpan := observability.Tracer().Start(ctx, "retrieval", trace.WithSpanKind(trace.SpanKindInternal))
-		lineSpan.SetAttributes(
-			attribute.String(attrOperation, "retrieval"),
-			attribute.String("gen_ai.data_source.id", "pg_search"),
-			attribute.Int("gen_ai.retrieval.top_k", dialogueRecallItemsMax),
-		)
-		observability.SetTextJSON(lineSpan, "gen_ai.retrieval.query.text", query)
-		chunks, derr := s.recallDialogueItems(lineCtx, query)
-		if derr != nil {
-			finishSpan(lineSpan, derr)
-			return res, derr
-		}
-		if b, jerr := json.Marshal(chunks); jerr == nil {
-			observability.SetTextJSON(lineSpan, "gen_ai.retrieval.documents", string(b))
-		}
-		finishSpan(lineSpan, nil)
-		block, hits := renderDialogueBlock(chunks)
-		if hits > 0 {
-			res.DialogueHits = hits
-			blocks = append(blocks, block)
+		if s.dialogueRetrieval.Hybrid {
+			hits, block, derr := s.recallDialogueHybrid(ctx, query)
+			if derr != nil {
+				return res, derr
+			}
+			if block != "" {
+				res.DialogueHits = hits
+				blocks = append(blocks, block)
+			}
+		} else {
+			lineCtx, lineSpan := observability.Tracer().Start(ctx, "retrieval", trace.WithSpanKind(trace.SpanKindInternal))
+			lineSpan.SetAttributes(
+				attribute.String(attrOperation, "retrieval"),
+				attribute.String("gen_ai.data_source.id", "pg_search"),
+				attribute.Int("gen_ai.retrieval.top_k", dialogueRecallItemsMax),
+			)
+			observability.SetTextJSON(lineSpan, "gen_ai.retrieval.query.text", query)
+			chunks, derr := s.recallDialogueItems(lineCtx, query)
+			if derr != nil {
+				finishSpan(lineSpan, derr)
+				return res, derr
+			}
+			if b, jerr := json.Marshal(chunks); jerr == nil {
+				observability.SetTextJSON(lineSpan, "gen_ai.retrieval.documents", string(b))
+			}
+			finishSpan(lineSpan, nil)
+			block, hits := renderDialogueBlock(chunks)
+			if hits > 0 {
+				res.DialogueHits = hits
+				blocks = append(blocks, block)
+			}
 		}
 	}
 	res.Block = strings.Join(blocks, "\n\n")

@@ -244,9 +244,16 @@ const (
 	codeLayoutUnmigrated    = 117116 // 409 这个项目还是旧目录布局，需要先跑显式迁移
 	// 117117–117118：后台命令（doc/82 §6.3）。117119（Task 尚有未收口后台命令）只在 doc/40 词表登记，
 	// 没有 HTTP 提交面——实际拒绝走工具错误句子（submitErrText 的 errSubmitJobsRunning）。
-	codeJobMissing       = 117117 // 404 找不到这条命令（不存在、不可见或跨租户）
-	codeJobNotStoppable  = 117118 // 409 这条命令正在停止中，不能重复请求
-	codeInternal         = 111901
+	codeJobMissing      = 117117 // 404 找不到这条命令（不存在、不可见或跨租户）
+	codeJobNotStoppable = 117118 // 409 这条命令正在停止中，不能重复请求
+	// 119xxx：历史对话混合检索（doc/84 §6.4）。119001–119003 资源不可用（503），
+	// 119004 指纹冲突（409），119005 模式未启用（409）。映射见 dialogue_retrieval.go。
+	codeDialogueLexicalUnavailable   = 119001 // 503 历史对话词法索引不可用
+	codeDialogueVectorUnavailable    = 119002 // 503 历史对话向量索引不可用
+	codeDialogueEmbeddingUnavailable = 119003 // 503 历史对话向量生成服务不可用
+	codeDialogueDimensionMismatch    = 119004 // 409 向量模型或维度已变化，请重建对话索引
+	codeDialogueRetrievalOff         = 119005 // 409 当前未启用历史对话混合检索
+	codeInternal                     = 111901
 )
 
 var (

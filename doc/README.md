@@ -1,7 +1,7 @@
 # doc/ 文档索引
 
 > 性质：**索引**，不是方案。本文只回答「这篇文档是什么、能不能照着施工、代码在哪、被谁取代」。
-> 最后核对：2026-11-19。
+> 最后核对：2026-11-20。
 > 状态口径：✅ 已落地 · 🔶 部分落地／待收口 · ⬜ 未做 · 存档 = 历史材料，不作施工面。
 > 代码路径均相对 `yk-tako-eino/`。
 
@@ -36,7 +36,7 @@
 - 改视觉（配色／字阶／间距／圆角／侧栏三段／手机抽屉／气泡）：`doc/51`。
 - 加技能、改技能目录／加载／依赖／管理面：`doc/52`。
 - 改删除与档案清理（连带删会话、单场删除、保留窗口）：`doc/37`。
-- 改记忆、召回：`doc/65`（已落地：`pipeline` = PG 两层 + 抽取代理 + Redpanda；`markdown` = `USER.md` / 项目 `runtime/memory/MEMORY.md` 同步直写）；`doc/29` 的线一已被 doc/65 取代，线二 `dialogue_chunks` 仍现行；历史对话的 ES + Milvus 混合检索见 `doc/84`（方案待点头、未施工）；想借鉴别家记忆设计（nanoMuse：防重／整理／变更账）：`doc/62`。
+- 改记忆、召回：`doc/65`（已落地：`pipeline` = PG 两层 + 抽取代理 + Redpanda；`markdown` = `USER.md` / 项目 `runtime/memory/MEMORY.md` 同步直写）；`doc/29` 的线一已被 doc/65 取代，线二 `dialogue_chunks` 仍现行；历史对话的 ES + Milvus 混合检索见 `doc/84`（已落地 2026-11-20）；想借鉴别家记忆设计（nanoMuse：防重／整理／变更账）：`doc/62`。
 - 改崩溃续跑：`doc/30`。
 - 改 Redis 临时键（移除 draft）：`doc/38`。
 - 改流式端点：`doc/31`。
@@ -50,6 +50,7 @@
 - 改对话页的工具卡（哪些工具进气泡、摘要／失败／截断口径）：`doc/59`。
 - 改多会话并发（切走保留／实例上限／空对话项目落点／侧栏运行中）：`doc/60`。
 - 改持久 Task／多 Agent 编排：`doc/70`、`doc/72`、`doc/73`；并行任务的工作区隔离、结果交接与发布恢复：`doc/74`（已落地）。
+- 改 Dynamic Workflow 或 `/agent`／`/dag`／`/flow` 执行方式：`doc/85`（方案待点头、未施工；第一版仅临时 `/flow`，现有可组合原语与旧决定见 `doc/82`）。
 - 改后台命令（前台等待窗口／job 输出／停止／失联恢复）、`wait_task` 就地认领与路径账本：`doc/82`（已落地）。
 - 改目标可行性判断、继任编排组与 handoff：`doc/75`；改项目内容根、运行资源容器与整容器删除：`doc/76`（两篇 2026-11-13 已落地）。
 - 改对话页右侧任务面板（项目 Task 常驻、处理项就地打开）：`doc/77`（已落地）。
@@ -379,10 +380,16 @@
   - 案例规格：[旧方案还能重新排期吗？](83-场景化Eval方案/案例-01-文档查证.md)（待点头、未施工）：同一个 session 三轮区分现行决定、压测事实和失效计划，按输入、步骤、证据和判定表达式定义评测；决策模型采用 `decision-model-preview` 的 `systemone` 接口、Q1–Q3 使用 `noul`，另由 LLM 评价回答。2026-11-18 补齐无依据推断的 D 硬性准则、输入文件终态路径与 SHA-256 检查 B2、出处路径与小节解析、单次裁判异常使相关检查无效、有效 MCP 配置为空及反例自测。独立运行 5 次，A/B 暂不跑；决策模型响应契约与裁判校准尚待实测
   - 学习清单：[Tako Agent 全课程学习知识点表](83-场景化Eval方案/Tako-EvalOps学习知识点表.md)：覆盖模型、Runtime、Context、Tool／Skill、Memory 与 EvalOps，含概念解释、5 分制价值、当前功能状态；User 自评列留空
 
-- **84** [历史对话混合检索方案](84-历史对话混合检索方案.md) ⬜（方案待点头，2026-11-19）
-  - 落点：—（未施工。预计 `internal/runengine/dialogue_{retrieval,es,milvus,embedding,rrf,index_jobs,index_worker,retrieval_api}.go` 与 `scripts/acceptance/dialogue_hybrid_*.sh`；开工包在 `tmp/84-历史对话混合检索/施工包.md`，不入库）
-  - 只处理 `dialogue_chunks` 历史对话原文：ES 负责 BM25、Milvus 负责 embedding 语义候选，两路 Top-10 经 RRF 合并后回 PG 复核正文哈希与 tenant/user/workspace 可见性，前 3 段注入。active 记忆、resident 硬性指令与 supersede 历史链不动；`pg_search` 缺省路径保留，hybrid 显式启用且故障时不静默降级
-  - 完成线：真实 embedding 与 ES/Milvus 跑通语义增益、项目内跨 session、更新/删除、双副本、`kill -9` 补建和全量重建；新增 PG `dialogue_index_jobs`、dev `query/status` 与 119xxx 错误码。无真实 embedding 或任一组活体未过，不得宣布完成
+- **84** [历史对话混合检索方案](84-历史对话混合检索方案.md) ✅（**2026-11-20 落地**：`internal/runengine/dialogue_*.go`、`cmd/tako-dialogue-eval`、`scripts/acceptance/dialogue_hybrid_*.sh`；四组活体全绿——基本 75／崩溃 27／双副本 34／重建 28，红 0）
+  - 落点：`internal/runengine/dialogue_{retrieval,retrieval_api,es,milvus,embedding,rrf,index_jobs,outbox_relay,es_consumer,milvus_consumer,rebuild,reconcile,recall_hybrid}.go`（父 `dialogue.go` 索引循环扩 outbox 登记）、`cmd/tako-dialogue-eval/main.go`、`scripts/acceptance/dialogue_hybrid_{up,live_lib,live,crash_live,two_replicas_live,rebuild_live,realrun_live}.sh` 与 `dialogue_hybrid_chaos_proxy.py`；契约快闸在 `internal/runengine/dialogue_*_test.go` 与 `contract_test.go`
+  - 只处理 `dialogue_chunks` 历史对话原文：`pg_search` 与 ES 是词法臂二选一，pgvector 与 Milvus 是向量臂二选一。PG 对话块与 outbox 两类目标任务同事务提交，Redpanda 按 run_id 分区，ES/Milvus 独立消费者组幂等写入；两路 Top-10 经 RRF 合并并按 tenant/user/workspace 过滤，前 3 段带来源会话、run、日期和原文片段注入。active 代码逻辑不改；Milvus 零命中时即使 ES 有候选也不注入，命中必须标“仅供参考”
+  - 完成线：真实 embedding 与 ES/Milvus 跑通语义增益、项目内跨 session、消息重复/乱序、更新/删除、双副本、`kill -9` 补建和版本化重建；新增 PG `dialogue_index_jobs`（outbox）、Redpanda topic、活跃指针表、dev `query/status` 与 119xxx 错误码。无真实 embedding 或任一组活体未过，不得宣布完成。初始化只清对话数据（含 `memory_items`），账号、项目与硬指令配置保留；active 代码逻辑不变并重新起链，递增 `index_version` 忽略旧消息，不做旧对话 backfill
+
+- **85** [Dynamic Workflow（Flow）](85-动态工作流Flow.md) ⬜（最终综合方案待点头，2026-11-20）
+  - 落点：—（未施工。预计 `internal/runengine/flow_{types,store,service,runner,protocol,recovery,api,tools}.go`、固定 Node 通信 runner + QuickJS-WASM、`web/src/FlowView.vue` 与 `scripts/acceptance/flow_*.sh`；方案点头后另写 `tmp/85-动态工作流/施工包.md` 交审）
+  - 新增 `/agent`／`/dag`／`/flow` 三个显式入口，第一版只有临时 `/flow` 能创建 Flow。Flow 不是动态计划或多 Agent 的从无到有：现有 ReAct + Todo + 持久 Task + 可修订 DAG 已能完成同类目标；增量是把稳定、重复、大规模的协调交给程序，让中间结果留在脚本与执行记录中，并按求值 step 重放核对。一次 Flow 一份不可变 JavaScript，用循环、分支、await 和动态扇出决定下一步；JS 在 QuickJS-WASM 中执行，Node 只负责宿主通信与进程边界；Go 通过 stdio NDJSON 提供普通 subagent 宿主调用，PG 保存不可变脚本、求值 step（stepSeq + agent_output + 整批 agent_input）、调用结果和 append-only 执行历史。历史 prompt 不改，常规重规划在同一 Flow 内追加未来工作；不支持命名 Flow Agent、主 Agent 同步委派 Flow、任意 Node 模块、直接文件/shell/网络、Flow 嵌套、在线脚本编辑、inputHash 或 revision 复用。跨任务编排复用（命名 Workflow／命令、不同 args 多次实例化、共享／插件分发）第一版不做，下一期按真实需求另立方案
+  - 完成线：同一不可变脚本按求值 step 重放并逐批比较、成功子代理零重跑、子代理持久执行、严格结果与未知副作用处理、双副本与旧代防写、暂停/停止/恢复、持久执行历史、心跳与用户停止、通知交付、真实页面、安全拒绝及全窗口 `kill -9` 验收。不按 JS 时间/步数自动判死，但进程资源、Agent 数和费用必须有界；Node/QuickJS-WASM 能启动、只有内存 AgentTool 或只有调用流水页面都不算完成；开工前须交施工包
+  - 最终综合：base=85；从 86-GPT 移植 QuickJS-WASM 执行、求值轮次、未知副作用恢复前处理、严格 outputSchema/成功失败结果与 unjoined_calls，从 86-ds 吸收固定运行时前置能力验证。后续讨论已删去命名 Flow Agent 与同步子执行容量预留，同日拍定 QuickJS-WASM 纳入本期。两份 86 均已标记为候选记录、不作施工真源；纯 Go 内嵌 JS、revision 复用和 Flow 专属文件发布替换未进入最终稿。评分、取舍与验证见 `doc/log/2026-11-20-Flow-Arena最终综合.md`
 
 ## 2. 历史存档（`doc/archive/`，不作施工面）
 

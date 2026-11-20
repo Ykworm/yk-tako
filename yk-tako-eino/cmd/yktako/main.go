@@ -3,14 +3,18 @@ package main
 import (
 	"context"
 
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/cloudwego/eino/components/model"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"yk-tako-eino/internal/config"
@@ -128,6 +132,7 @@ func main() {
 	subagentConcurrency := flag.Int("subagent-concurrency", 8, "max concurrent subagent delegations (process-wide semaphore; must be >= 1)")
 	subagentReturnCap := flag.Int("subagent-return-cap", 51200, "max bytes of a subagent's return text handed back to the parent; excess is truncated with a notice (<=0 disables)")
 	rebuildDialogue := flag.Bool("rebuild-dialogue", false, "clear dialogue_chunks at startup and let the indexer rebuild them from complete runs (requires TAKO_RAG=on)")
+	rebuildDialogueRetrieval := flag.Bool("rebuild-dialogue-retrieval", false, "offline versioned rebuild of hybrid dialogue retrieval (doc/84 §6.4): build ES index & Milvus collection vN+1 from dialogue_chunks, verify counts+samples, switch pointer in one transaction; old version kept for manual rollback; requires TAKO_DIALOGUE_RETRIEVAL=hybrid env and stopped engine replicas")
 	migrateTo := flag.String("memory-migrate-to", "", "offline memory mode migration: markdown|pipeline; stop all engine replicas first; does not start HTTP/worker/consumer (doc/65 §6.2)")
 	migrateProjectLayout := flag.Bool("migrate-project-layout", false, "offline project container layout migration: content/ + runtime/ split (doc/76 §8); stop all engine replicas first; does not start HTTP/worker/consumer")
 	migrateProjectID := flag.String("migrate-project-id", "", "with -migrate-project-layout, migrate only this workspace id (default: every project, at most 32 per run)")
@@ -183,6 +188,17 @@ func main() {
 		return
 	}
 
+	// 版本化重建（doc/84 §6.4）：同一处置——不起 HTTP/Worker/消费者，只连 PG 与
+	// 外部索引（ES/Milvus/embedding 口径全部来自环境变量）。重建期间指针不动，
+	// 旧版本继续服务；正确性前提是「没有副本还在写 dialogue_chunks」（先停引擎），
+	// 漏停导致的少量缺口重跑本命令即可收敛（幂等回放 + 计数门）。
+	if *rebuildDialogueRetrieval {
+		if err := runengine.RunDialogueRebuild(context.Background(), *pgDSN); err != nil {
+			log.Fatalf("rebuild-dialogue-retrieval: %v", err)
+		}
+		return
+	}
+
 	// 必须 leaseRenew 严格小于 leaseTTL：
 	//   ① renew >= ttl → 第一次 watchdog 触发前租约已过期 = 进程稳定地自己放闸，
 	//      其他副本能抢同 session，并发写 runlog/model_messages 把帧序和历史写乱。
@@ -210,7 +226,9 @@ func main() {
 		log.Fatalf("task-input-timeout %s < 0：不限制请写 0（负值没有语义）", *taskInputTimeout)
 	}
 
-	ctx := context.Background()
+	// 信号_ctx：SIGINT/SIGTERM 触发收尾（先停 hybrid 检索的后台工作，再收 HTTP）。
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 
 	// fail fast：模型配置不可用 = 引擎起不来，不留半个只能 409 的进程（config 自己向 stderr 报原因）。
 	opened := config.MustOpen(ctx)
@@ -390,6 +408,16 @@ func main() {
 		_ = stop // 进程生命周期与 main 一致（log.Fatal 退出）；显式停服路径归 API 层
 	}
 
+	// 历史对话混合检索（doc/84）：hybrid 模式才启动——启动前真打外部（ES mapping/analyzer、
+	// embedding 维度探针、Milvus collection 维度比对、Redpanda topic 元数据），任何一步失败
+	// = 启动失败（fail fast，不静默降级）；pg_search 模式整个跳过、不碰外部。
+	// 必须先于线二索引循环启动：StartDialogueRetrieval 返回后 Store 的 hybrid 开关才置位，
+	// 索引循环登记的 job 才有 relay 去投递。
+	dialogueStop, err := runengine.StartDialogueRetrieval(ctx, store, counter)
+	if err != nil {
+		log.Fatalf("dialogue retrieval: %v", err)
+	}
+
 	// 线二索引循环（doc/29 §5.2）：RAG 关时不启动；反查「complete 且未入 dialogue_chunks」，
 	// 删行/漏写由下一轮自愈，不建 outbox。
 	if memCfg.RAG {
@@ -439,5 +467,32 @@ func main() {
 		log.Printf("job supervisor loop off (-job-reconcile-interval <= 0; stop/query endpoints still work)")
 	}
 	r := srv.RouterFor()
-	log.Fatal(r.Run(*engine))
+	// 优雅退出（doc/84 施工包 §6.2）：SIGINT/SIGTERM 先停 hybrid 检索后台（relay/两个消费者
+	// 把手头的批处理完、写回 job 状态），再收 HTTP 监听。改用 http.Server 才有 Shutdown 可调。
+	httpSrv := &http.Server{Addr: *engine, Handler: r}
+	listenErr := make(chan error, 1)
+	go func() {
+		if e := httpSrv.ListenAndServe(); e != nil && !errors.Is(e, http.ErrServerClosed) {
+			listenErr <- e
+		}
+	}()
+	log.Printf("engine listening on %s", *engine)
+	select {
+	case e := <-listenErr:
+		// 监听失败（端口被占等）：立刻退出，别拖着后台循环空转。
+		if dialogueStop != nil {
+			dialogueStop()
+		}
+		log.Fatal(e)
+	case <-ctx.Done():
+		if dialogueStop != nil {
+			dialogueStop()
+		}
+		shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if e := httpSrv.Shutdown(shutCtx); e != nil {
+			log.Printf("http shutdown: %v", e)
+		}
+		log.Printf("engine stopped")
+	}
 }

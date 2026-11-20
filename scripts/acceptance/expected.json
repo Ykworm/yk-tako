@@ -1,6 +1,6 @@
 {
- "version": "2026-11-13",
- "source": "doc/19-v6/19v6-04-验收-curl.md；持久 Task 与编排（doc/70）用例 44–50 同批；多 Agent 编排下一阶段（doc/72）用例 51–54 同批；并行任务工作区隔离（doc/74）用例 57–60 同批；对话页右侧工作区与改动文件（doc/78）用例 65 同批",
+ "version": "2026-11-20",
+ "source": "doc/19-v6/19v6-04-验收-curl.md；持久 Task 与编排（doc/70）用例 44–50 同批；多 Agent 编排下一阶段（doc/72）用例 51–54 同批；并行任务工作区隔离（doc/74）用例 57–60 同批；对话页右侧工作区与改动文件（doc/78）用例 65 同批；历史对话混合检索（doc/84）用例 84–86 同批",
  "note": [
   "本文件是契约字节的**机器真源**；doc/19-v6/19v6-04-验收-curl.md 是同一份内容的人读版。",
   "两份**同批改**。check-expected.sh 守两边的用例号集合一致。",
@@ -8,7 +8,7 @@
   "expect 字段：http / code / message / data（子集比对：只断点名的键，值写 \"$any\" 是通配）/ data_keys（data 对象的键集与键序必须逐字相同）/ frame_kinds_contains / rows_len_equals / data_items_some（数组里**至少有一项**满足条件，如 {\"path\":\"workspaces\",\"match\":{\"id\":\"{wid}\",\"isDefault\":false}}——expect 里也能写 {var}）。",
   "expect 字段另加 data_contains（只断 data 里某个字符串**含**哪几段：{\"path\":\"output\",\"contains\":[\"…\",\"…\"]}）——给**逐请求变**的字节用（例：bash 落盘提示行里的 run id 每次都不同，全文比不了）。",
   "step 字段：method / path / body / auth / sql（请求前先跑的 SQL）/ capture（把响应里的值存成变量）/ op=signup（建账号+租户+配模型）/ op=wait_terminal（等这一场跑完）。",
-  "用例级字段：needs（\"pg\"=要直连 PG、\"sandbox\"=要 macOS sandbox-exec；不满足就跳过并说明原因，不假装跑过）。"
+  "用例级字段：needs（\"pg\"=要直连 PG、\"sandbox\"=要 macOS sandbox-exec；\"dialogue_hybrid\"=要 hybrid 检索引擎（起引擎与跑本套件都带 TAKO_DIALOGUE_RETRIEVAL=hybrid，doc/84）、\"dialogue_pg_search\"=要非 hybrid 引擎（缺省即 pg_search）；不满足就跳过并说明原因，不假装跑过）。"
  ],
  "cases": [
   {
@@ -7459,6 +7459,255 @@
      }
     }
    ]
+  },
+  {
+   "id": "84-dialogue-status",
+   "case": "用例 84",
+   "tier": "core",
+   "needs": "dialogue_hybrid",
+   "desc": "对话检索诊断 status（doc/84 §6.3）：hybrid 全形状键序 mode→pointer→lexical→vector→coverage，两臂健康、embedding 指纹、覆盖水位与消费 lag；字节序由快闸 TestContractDialogueStatusBytes 钉",
+   "steps": [
+    {
+     "method": "GET",
+     "path": "/api/dev/dialogue-retrieval/status",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "mode",
+       "pointer",
+       "lexical",
+       "vector",
+       "coverage"
+      ],
+      "data": {
+       "mode": "hybrid",
+       "pointer": {
+        "indexVersion": "$any",
+        "esIndex": "$any",
+        "milvusCollection": "$any"
+       },
+       "lexical": {
+        "kind": "elasticsearch",
+        "healthy": true
+       },
+       "vector": {
+        "kind": "milvus",
+        "healthy": true,
+        "embeddingModel": "$any",
+        "dimensions": "$any"
+       },
+       "coverage": {
+        "pending": 0,
+        "running": 0,
+        "retry": 0,
+        "failed": 0,
+        "oldestPendingAt": "$any",
+        "consumerLag": 0
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "85-dialogue-query",
+   "case": "用例 85",
+   "tier": "core",
+   "needs": "dialogue_hybrid",
+   "desc": "对话检索诊断 query（doc/84 §6.2）：SQL 播种一条 complete run（用例 65 惯例），等引擎索引循环真实走完 chunk→outbox→relay→两消费者（ES BM25 + 真实 embedding + Milvus COSINE），query 正向命中（rrfScore=2/61 的 float64 最短表示、sources 词表序 lexical→vector）；空 query / limit 超界 111002、伪造项目 404 114001、未登录 401 111102。守卫次序 119005→111001→111002→114001→执行",
+   "steps": [
+    {
+     "method": "POST",
+     "path": "/api/workspaces",
+     "body": {
+      "name": "acc-dialogue-query"
+     },
+     "capture": {
+      "wid": "data.workspace.id"
+     },
+     "expect": {
+      "http": 201,
+      "code": 0,
+      "message": ""
+     }
+    },
+    {
+     "sql": "INSERT INTO sessions (id, title, tenant_id, user_id, visibility, workspace_id, kind, created_at) SELECT 's85'||substring('{wid}' from 3), 'dialogue query', '{ten}', id, 'private', '{wid}', 'chat', now() FROM users WHERE email='{email}' RETURNING id",
+     "capture_stdout": [
+      "sid"
+     ]
+    },
+    {
+     "sql": "INSERT INTO runs (id, session_id, status, lease_epoch, lease_until, created_at, finished_at, workspace_id) VALUES ('r85'||substring('{wid}' from 3), '{sid}', 'complete', 1, now(), now(), now(), '{wid}') RETURNING id",
+     "capture_stdout": [
+      "rid"
+     ]
+    },
+    {
+     "sql": "INSERT INTO runlog_entries (id, session_id, seq, run_id, role, agent, model, message_id, text, payload, created_at) VALUES ('rl85a'||substring('{wid}' from 3),'{sid}',1,'r85'||substring('{wid}' from 3),'user','','','','发布窗口改到周六凌晨','',now()),('rl85b'||substring('{wid}' from 3),'{sid}',2,'r85'||substring('{wid}' from 3),'assistant','','','','好的，发布窗口已改到周六凌晨三点，到时候自动上线。','',now())"
+    },
+    {
+     "op": "sleep",
+     "seconds": 20,
+     "desc": "等索引链收敛：索引循环 2s 扫描 + relay 5s 投递 + 两个消费者各自真实 embedding 写 ES/Milvus"
+    },
+    {
+     "method": "POST",
+     "path": "/api/dev/dialogue-retrieval/query",
+     "body": {
+      "workspaceId": "{wid}",
+      "query": "发布窗口改到周六凌晨",
+      "limit": 10
+     },
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "mode",
+       "lexical",
+       "vector",
+       "merged"
+      ],
+      "data": {
+       "mode": "hybrid",
+       "lexical": [
+        {
+         "runId": "{rid}",
+         "score": "$any"
+        }
+       ],
+       "vector": [
+        {
+         "runId": "{rid}",
+         "score": "$any"
+        }
+       ],
+       "merged": [
+        {
+         "runId": "{rid}",
+         "rrfScore": 0.03278688524590164,
+         "sources": [
+          "lexical",
+          "vector"
+         ]
+        }
+       ]
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/dev/dialogue-retrieval/query",
+     "body": {
+      "workspaceId": "{wid}",
+      "query": "",
+      "limit": 10
+     },
+     "expect": {
+      "http": 400,
+      "code": 111002,
+      "message": "query 不能为空",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/dev/dialogue-retrieval/query",
+     "body": {
+      "workspaceId": "{wid}",
+      "query": "发布窗口",
+      "limit": 21
+     },
+     "expect": {
+      "http": 400,
+      "code": 111002,
+      "message": "limit 必须是 1–20 的整数",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/dev/dialogue-retrieval/query",
+     "body": {
+      "workspaceId": "ws_nope_85",
+      "query": "发布窗口",
+      "limit": 10
+     },
+     "expect": {
+      "http": 404,
+      "code": 114001,
+      "message": "找不到这个项目",
+      "data": null
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/dev/dialogue-retrieval/query",
+     "auth": false,
+     "body": {
+      "workspaceId": "{wid}",
+      "query": "发布窗口",
+      "limit": 10
+     },
+     "expect": {
+      "http": 401,
+      "code": 111102,
+      "message": "请先登录",
+      "data": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "86-dialogue-pg-search",
+   "case": "用例 86",
+   "tier": "core",
+   "needs": "dialogue_pg_search",
+   "desc": "非 hybrid（默认 pg_search）形状（doc/84 §6.3/§6.4）：status 只剩 mode+coverage（pointer/lexical/vector omitempty 缺席）；query 回 409 119005 且守卫在最前（参数都不看）；119001–119004 失败信封字节由快闸钉（TestContractDialogueQueryBytes）",
+   "steps": [
+    {
+     "method": "GET",
+     "path": "/api/dev/dialogue-retrieval/status",
+     "expect": {
+      "http": 200,
+      "code": 0,
+      "message": "",
+      "data_keys": [
+       "mode",
+       "coverage"
+      ],
+      "data": {
+       "mode": "pg_search",
+       "coverage": {
+        "pending": 0,
+        "running": 0,
+        "retry": 0,
+        "failed": 0,
+        "oldestPendingAt": "$any",
+        "consumerLag": 0
+       }
+      }
+     }
+    },
+    {
+     "method": "POST",
+     "path": "/api/dev/dialogue-retrieval/query",
+     "body": {
+      "workspaceId": "ws_nope_86",
+      "query": "发布窗口",
+      "limit": 10
+     },
+     "expect": {
+      "http": 409,
+      "code": 119005,
+      "message": "当前未启用历史对话混合检索",
+      "data": null
+     }
+    }
+   ]
   }
  ],
  "declared_not_asserted": {
@@ -7484,6 +7733,8 @@
   "用例 42": "旧 notes/memory_items 升级迁移与模式互切（doc/65 §13.3-5）——要预置旧形态数据的库 + 双向互切命令；由 scripts/acceptance/memory_migrate_live.sh 判红（42 断言），幂等重放与失败预检在其中逐条断",
   "用例 43": "项目删除的连带清理（doc/65 §13.3-6）——workspace 两类行都清、user 行跨项目仍可见、USER.md 不变、runs/runlog 不变：要真删一个挂了记忆的项目；由 scripts/acceptance/memory_project_delete_live.sh 判红，删除级联的存储侧由 go test 的 delete_cascade_test.go 钉住",
   "用例 60": "模型执行、Provider 故障与崩溃场景（doc/74 §12.3）——并行成功／父冲突／验证返工／主分支前进／不可变产物／非 Git 并行／结果清单／同路径冲突／部分发布恢复／忙脏受阻／人工重新发布／多标签页事件／各窗口 kill -9 与双副本对账，都要真模型＋真 Git／文件现场＋特殊起引擎才造得出，core tier 没有对应 HTTP 路径；由 scripts/acceptance/workspace_git_live.sh、workspace_directory_live.sh、workspace_publication_live.sh、workspace_crash_live.sh 判红，纯函数与存储侧由 go test 的 workspace_*_test.go 钉住",
-  "用例 64": "迁移命令、真实模型重规划与故障场景（doc/75 §10.2；doc/76 §6）——存量迁移与幂等、真模型对「不可行／不确定／同组可修订」的判定、Git／Directory 两类 Provider 的结果复用、创建各窗口 kill -9、双副本只创建一个继任组与旧 epoch 防写，都要真模型＋真 Git／文件现场＋特殊起引擎／双实例才造得出，core tier 没有对应 HTTP 路径；由 scripts/acceptance/project_layout_live.sh、project_layout_migration_live.sh、goal_replan_live.sh、goal_replan_crash_live.sh 判红，纯函数与存储侧由 go test 的 project_layout_test.go / project_cleanup_test.go / agent_task_successor_test.go 钉住"
+  "用例 64": "迁移命令、真实模型重规划与故障场景（doc/75 §10.2；doc/76 §6）——存量迁移与幂等、真模型对「不可行／不确定／同组可修订」的判定、Git／Directory 两类 Provider 的结果复用、创建各窗口 kill -9、双副本只创建一个继任组与旧 epoch 防写，都要真模型＋真 Git／文件现场＋特殊起引擎／双实例才造得出，core tier 没有对应 HTTP 路径；由 scripts/acceptance/project_layout_live.sh、project_layout_migration_live.sh、goal_replan_live.sh、goal_replan_crash_live.sh 判红，纯函数与存储侧由 go test 的 project_layout_test.go / project_cleanup_test.go / agent_task_successor_test.go 钉住",
+  "用例 85": "111001（JSON 坏体）的信封字节由快闸 TestContractDialogueQueryBytes 钉住；隔离引擎已 curl 取证（tmp/84-历史对话混合检索/p4-curl证据.md §5），清单没有 raw-body 表达进不了断言器。",
+  "用例 86": "119001–119004（ES/Milvus/embedding 宕机与维度漂移的 503/409 失败信封）要外部依赖真宕才造得出，健康隔离引擎打不出；映射语义由 go test 的 dialogue_clients_test.go 钉住，信封字节由快闸 TestContractDialogueQueryBytes 钉住（文案即哨兵错误原文）。"
  }
 }

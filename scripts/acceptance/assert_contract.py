@@ -252,6 +252,15 @@ def run_case(case, key, tally, only_print, seed):
                 return False
             continue
 
+        if op == "sleep":
+            # 定长等待（doc/84 用例 85）：等引擎的后台索引链收敛（索引循环 2s 扫描 +
+            # relay 5s 投递 + 两个消费者真实 embedding 写 ES/Milvus）。没有可观测的
+            # 「收敛」读口（coverage 只反映任务行，不反映 ES/Milvus 已可查），所以
+            # 用宽裕的定长等待，不用轮询假收敛。
+            time.sleep(int(step["seconds"]))
+            tally.ok(f"{label} 等 {step['seconds']}s")
+            continue
+
         if op == "seed_ws":
             # 往项目容器里造文件/目录/符号链接：产出文件在**文件系统**上，SQL 造不出来。
             # 容器布局见 doc/76：<WS_ROOT>/tenants/<tid>/workspaces/<wid>/{layout.json,
@@ -543,6 +552,16 @@ def main():
             continue
         if case.get("needs") == "pipeline-mode" and mode == "markdown":
             tally.skip(case["id"], "markdown 模式引擎跑不了这条（要 pipeline 观测口）")
+            continue
+        # 对话检索模式门（doc/84）：status/query 字节随 TAKO_DIALOGUE_RETRIEVAL 分叉。
+        # 引擎的模式由操作员起引擎时定；跑套件时把同一个值给到运行器，两边对不上就
+        # 跳过并明说，不硬跑假红（与 memory-mode 门同款约定；缺省 = pg_search）。
+        dlg = os.environ.get("TAKO_DIALOGUE_RETRIEVAL", "").strip().lower()
+        if case.get("needs") == "dialogue_hybrid" and dlg != "hybrid":
+            tally.skip(case["id"], "要 hybrid 检索引擎：起引擎与跑本套件都带 TAKO_DIALOGUE_RETRIEVAL=hybrid（doc/84）")
+            continue
+        if case.get("needs") == "dialogue_pg_search" and dlg == "hybrid":
+            tally.skip(case["id"], "hybrid 引擎跑不了这条（119005 只在非 hybrid 模式出现，doc/84）")
             continue
         # 每个用例自带上一个账号，别互相污染（用例 0 那条要「没配模型」的租户）
         run_case(case, key, tally, args.print, base_vars)

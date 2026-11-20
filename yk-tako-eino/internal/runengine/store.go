@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/cloudwego/eino/schema"
@@ -66,6 +67,27 @@ type Store struct {
 	// 隔离组的工作区摘要要现读组目录 state.json 与验证证据（doc/74 §4.3）；
 	// 空 = 没有文件面（单测直接构造 Store），摘要退化为 pending/未运行。
 	workspaceRoot string
+	// dialogueRetrieval 是历史对话混合检索的运行配置（doc/84 §3）：启动装配期由
+	// ConfigureDialogueRetrieval 写入一次，之后只读。hybrid=false（pg_search）时
+	// outbox 登记、relay 与消费者全部不启动——pg_search 模式零新增行为。
+	dialogueRetrieval dialogueRetrievalCfg
+	// dialogueRuntime 是 hybrid 模式的查询面运行时（doc/84 P4）：StartDialogueRetrieval
+	// 预检全过后挂上，stop 第一时间摘除。nil = hybrid 未装配（pg_search 生效）；
+	// Hybrid=true 而 nil = 关停窗口——召回按 fail closed 处理，不退回 pg_search。
+	dialogueRuntime atomic.Pointer[dialogueHybridRuntime]
+}
+
+// dialogueRetrievalCfg 是混合检索的运行配置（见 Store.dialogueRetrieval）。
+type dialogueRetrievalCfg struct {
+	Hybrid         bool   // hybrid 模式开启（预检全过、队列就绪后才置位）
+	EmbeddingModel string // 登记任务行 embedding_model 用；pg_search 恒空
+}
+
+// ConfigureDialogueRetrieval 在启动装配期写入混合检索配置（StartDialogueRetrieval 调用一次）。
+func (s *Store) ConfigureDialogueRetrieval(hybrid bool, embeddingModel string) {
+	if s != nil {
+		s.dialogueRetrieval = dialogueRetrievalCfg{Hybrid: hybrid, EmbeddingModel: embeddingModel}
+	}
 }
 
 // SetWorkspaceRoot 注入作业根（NewServer 装配时调用一次，之后只读）。

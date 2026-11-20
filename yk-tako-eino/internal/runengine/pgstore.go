@@ -461,6 +461,43 @@ func (s *Store) DeleteWorkspaceCascade(ctx context.Context, tenantID, userID, id
 			`DELETE FROM memory_jobs WHERE workspace = ?`, id).Error; err != nil {
 			return err
 		}
+		// 历史对话检索的删除事件（doc/84 §6.3）：先枚举 run_id 并登记 delete 任务
+		// （任务行保留归属信息，**不能**随项目级联删除——两个外部目标都确认不存在后
+		// 事件才算完成），再删对话块。登记与块删除同笔事务：项目删了、chunk 没了，
+		// outbox 里一定有补删的凭据。hybrid 未开启（或指针未播种）只删块不登记。
+		if s.dialogueRetrieval.Hybrid {
+			var runs []struct {
+				RunID     string
+				SessionID string
+				TenantID  string
+				UserID    string
+			}
+			if err := tx.Raw(
+				`SELECT c.run_id, c.session_id, c.tenant_id, c.user_id
+				  FROM dialogue_chunks c
+				  JOIN runs r ON r.id = c.run_id
+				 WHERE r.workspace_id = ?`, id).Scan(&runs).Error; err != nil {
+				return err
+			}
+			for _, run := range runs {
+				if _, err := registerDialogueIndexJobs(ctx, tx, DialogueIndexEventSpec{
+					RunID:          RunID(run.RunID),
+					SessionID:      SessionID(run.SessionID),
+					TenantID:       run.TenantID,
+					UserID:         run.UserID,
+					WorkspaceID:    id,
+					Kind:           DialogueJobKindDelete,
+					EmbeddingModel: "",
+				}); err != nil {
+					return err
+				}
+			}
+		}
+		if err := tx.Exec(
+			`DELETE FROM dialogue_chunks WHERE run_id IN (SELECT id FROM runs WHERE workspace_id = ?)`,
+			id).Error; err != nil {
+			return err
+		}
 		// 磁盘清理进度先落在同一笔事务里（doc/76 §5.4）：提交后调用方删容器，
 		// 失败时回写 pending 由调度器补偿。放事务里是为了「项目行在、清理记录一定在」。
 		if err := tx.Exec(
@@ -866,6 +903,7 @@ func autoMigrateLocked(db *gorm.DB) error {
 	}
 	if err := db.AutoMigrate(&Session{}, &Run{}, &RunModelMessage{}, &RunlogEntry{}, &RunJournal{},
 		&MemoryItem{}, &MemoryJob{}, &DialogueChunk{},
+		&DialogueIndexJob{}, &DialogueRetrievalPointer{},
 		&User{}, &Tenant{}, &TenantMember{}, &RefreshToken{}, &AuditLog{}, &TenantUsageDaily{},
 		&TenantInvitation{}, &TenantAgent{}, &AgentDefault{}, &TenantSetting{}, &TenantStorage{},
 		&Workspace{}, &CleanerState{}, &RunTask{}, &RunQuestion{},
@@ -873,6 +911,23 @@ func autoMigrateLocked(db *gorm.DB) error {
 		&AgentOrchestration{}, &AgentTask{}, &AgentTaskLink{}, &AgentNotification{}, &AgentPlanRevision{},
 		&AgentNotificationAttempt{}, &ProjectCleanup{}, &BackgroundJob{}); err != nil {
 		return err
+	}
+	// dialogue_index_jobs 的词表（doc/84 §4.2）：status/target/kind 固定枚举，CHECK 闸在
+	// 数据库（先 DROP 再 ADD，幂等；名固定，重复启动安全）。
+	for _, ddl := range []string{
+		`ALTER TABLE dialogue_index_jobs DROP CONSTRAINT IF EXISTS dialogue_index_jobs_status_ck`,
+		`ALTER TABLE dialogue_index_jobs ADD CONSTRAINT dialogue_index_jobs_status_ck
+		   CHECK (status IN ('pending', 'running', 'done', 'failed'))`,
+		`ALTER TABLE dialogue_index_jobs DROP CONSTRAINT IF EXISTS dialogue_index_jobs_target_ck`,
+		`ALTER TABLE dialogue_index_jobs ADD CONSTRAINT dialogue_index_jobs_target_ck
+		   CHECK (target IN ('es', 'milvus'))`,
+		`ALTER TABLE dialogue_index_jobs DROP CONSTRAINT IF EXISTS dialogue_index_jobs_kind_ck`,
+		`ALTER TABLE dialogue_index_jobs ADD CONSTRAINT dialogue_index_jobs_kind_ck
+		   CHECK (kind IN ('upsert', 'delete', 'move'))`,
+	} {
+		if err := db.Exec(ddl).Error; err != nil {
+			return err
+		}
 	}
 	// AutoMigrate 只补「新增列」的结构、只管「同名索引在不在」；存量列后加的默认值/可空性
 	// 与形状过期的索引要在这里显式对齐（病灶见两个函数的注释）。

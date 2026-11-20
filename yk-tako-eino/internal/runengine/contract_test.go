@@ -1022,3 +1022,116 @@ func TestContractSuccessorBytes(t *testing.T) {
 		t.Fatalf("117115 失败信封字节 = %s\nwant %s", got, want)
 	}
 }
+
+// ── doc/84 历史对话混合检索（用例 84/85/86）─────────────────────────────────
+// 期望字节全部来自隔离引擎实跑抄写（tmp/84-历史对话混合检索/p4-curl证据.md，
+// 2026-11-20：ES/Zilliz/Redpanda/真实 embedding 全真链，SQL 播种 complete run
+// 由引擎索引循环真实拾取）。快闸只钉信封、data 键序与守卫字节，不打外部依赖；
+// 索引/合并的机制断言在 dialogue_*_test.go，错误映射在 dialogue_clients_test.go。
+
+// TestContractDialogueStatusBytes 钉 GET /api/dev/dialogue-retrieval/status 的两种
+// data 形状：用例 84（hybrid 全形状，needs=dialogue_hybrid）与用例 86 的 status 半边
+//（非 hybrid 只剩 mode+coverage，pointer/lexical/vector 三段 omitempty 缺席）。
+func TestContractDialogueStatusBytes(t *testing.T) {
+	data := dialogueStatusData{
+		Mode: DialogueModeHybrid,
+		Pointer: &dialogueStatusPointer{
+			IndexVersion:     1,
+			EsIndex:          "tako_dialogue_eval_20261120165322",
+			MilvusCollection: "tako_dialogue_eval_20261120165322",
+		},
+		Lexical: &dialogueStatusLexical{
+			Kind: "elasticsearch", Index: "tako_dialogue_eval_20261120165322", Healthy: true,
+		},
+		Vector: &dialogueStatusVector{
+			Kind: "milvus", Collection: "tako_dialogue_eval_20261120165322", Healthy: true,
+			EmbeddingModel: "qwen3.7-text-embedding", Dimensions: 1024,
+		},
+		Coverage: dialogueStatusCoverage{OldestPendingAt: nil},
+	}
+	got := mustJSON(t, envelope{Code: codeOK, Message: "", Data: data})
+	const wantHybrid = `{"code":0,"message":"","data":{"mode":"hybrid","pointer":{"indexVersion":1,"esIndex":"tako_dialogue_eval_20261120165322","milvusCollection":"tako_dialogue_eval_20261120165322"},"lexical":{"kind":"elasticsearch","index":"tako_dialogue_eval_20261120165322","healthy":true},"vector":{"kind":"milvus","collection":"tako_dialogue_eval_20261120165322","healthy":true,"embeddingModel":"qwen3.7-text-embedding","dimensions":1024},"coverage":{"pending":0,"running":0,"retry":0,"failed":0,"oldestPendingAt":null,"consumerLag":0}}}`
+	if got != wantHybrid {
+		t.Fatalf("status hybrid 全形状字节 = %s\nwant %s", got, wantHybrid)
+	}
+
+	data = dialogueStatusData{Mode: DialogueModePGSearch}
+	got = mustJSON(t, envelope{Code: codeOK, Message: "", Data: data})
+	const wantPG = `{"code":0,"message":"","data":{"mode":"pg_search","coverage":{"pending":0,"running":0,"retry":0,"failed":0,"oldestPendingAt":null,"consumerLag":0}}}`
+	if got != wantPG {
+		t.Fatalf("status 非 hybrid 形状字节 = %s\nwant %s", got, wantPG)
+	}
+}
+
+// TestContractDialogueQueryBytes 钉 POST /api/dev/dialogue-retrieval/query 的
+// 正向命中、空臂与守卫字节（用例 85/86）。
+func TestContractDialogueQueryBytes(t *testing.T) {
+	// 用例 85 正向命中：真实 ES BM25 / Zilliz COSINE 算分，两臂各自 rank 1 ⇒
+	// rrfScore = 1/61 + 1/61 的 float64 最短表示；sources 词表序 lexical→vector。
+	data := dialogueQueryData{
+		Mode:    DialogueModeHybrid,
+		Lexical: []dialogueQueryArmItem{{RunID: "r84ev1", Score: 1.9778143}},
+		Vector:  []dialogueQueryArmItem{{RunID: "r84ev1", Score: 0.9051300883293152}},
+		Merged: []dialogueQueryMergedItem{{
+			RunID: "r84ev1", RRFScore: 0.03278688524590164,
+			Sources: []string{"lexical", "vector"},
+		}},
+	}
+	got := mustJSON(t, envelope{Code: codeOK, Message: "", Data: data})
+	const wantHit = `{"code":0,"message":"","data":{"mode":"hybrid","lexical":[{"runId":"r84ev1","score":1.9778143}],"vector":[{"runId":"r84ev1","score":0.9051300883293152}],"merged":[{"runId":"r84ev1","rrfScore":0.03278688524590164,"sources":["lexical","vector"]}]}}`
+	if got != wantHit {
+		t.Fatalf("query 正向命中字节 = %s\nwant %s", got, wantHit)
+	}
+
+	// 用例 85 空臂：无命中也保持四键齐、空数组不塌成 null。
+	data = dialogueQueryData{
+		Mode:    DialogueModeHybrid,
+		Lexical: []dialogueQueryArmItem{},
+		Vector:  []dialogueQueryArmItem{},
+		Merged:  []dialogueQueryMergedItem{},
+	}
+	got = mustJSON(t, envelope{Code: codeOK, Message: "", Data: data})
+	const wantEmpty = `{"code":0,"message":"","data":{"mode":"hybrid","lexical":[],"vector":[],"merged":[]}}`
+	if got != wantEmpty {
+		t.Fatalf("query 空臂字节 = %s\nwant %s", got, wantEmpty)
+	}
+
+	// 守卫次序（实测：119005 → 111001 → 111002 → 114001 → 执行）：
+	guards := []struct {
+		code    int
+		message string
+		want    string
+	}{
+		{codeDialogueRetrievalOff, ErrDialogueRetrievalOff.Error(), `{"code":119005,"message":"当前未启用历史对话混合检索","data":null}`},
+		{codeBadJSON, "请求格式不对", `{"code":111001,"message":"请求格式不对","data":null}`},
+		{codeBadInput, "query 不能为空", `{"code":111002,"message":"query 不能为空","data":null}`},
+		{codeBadInput, "limit 必须是 1–20 的整数", `{"code":111002,"message":"limit 必须是 1–20 的整数","data":null}`},
+		{codeWorkspaceMissing, "找不到这个项目", `{"code":114001,"message":"找不到这个项目","data":null}`},
+	}
+	for _, g := range guards {
+		got = mustJSON(t, envelope{Code: g.code, Message: g.message, Data: nil})
+		if got != g.want {
+			t.Fatalf("query 守卫信封字节（code=%d）= %s\nwant %s", g.code, got, g.want)
+		}
+	}
+
+	// 用例 86：119001–119004 失败信封（活体要外部依赖宕机才造得出，登记
+	// expected.json declared_not_asserted；映射语义在 dialogue_clients_test.go，
+	// 这里钉信封字节——文案即哨兵错误原文）。
+	arms := []struct {
+		code int
+		err  error
+		want string
+	}{
+		{codeDialogueLexicalUnavailable, ErrDialogueLexicalUnavailable, `{"code":119001,"message":"历史对话词法索引不可用","data":null}`},
+		{codeDialogueVectorUnavailable, ErrDialogueVectorUnavailable, `{"code":119002,"message":"历史对话向量索引不可用","data":null}`},
+		{codeDialogueEmbeddingUnavailable, ErrDialogueEmbeddingUnavailable, `{"code":119003,"message":"历史对话向量生成服务不可用","data":null}`},
+		{codeDialogueDimensionMismatch, ErrDialogueDimensionMismatch, `{"code":119004,"message":"向量模型或维度已变化，请重建对话索引","data":null}`},
+	}
+	for _, a := range arms {
+		got = mustJSON(t, envelope{Code: a.code, Message: a.err.Error(), Data: nil})
+		if got != a.want {
+			t.Fatalf("119xxx 失败信封字节（code=%d）= %s\nwant %s", a.code, got, a.want)
+		}
+	}
+}
