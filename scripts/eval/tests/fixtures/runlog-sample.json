@@ -1,0 +1,9 @@
+[
+ {"runlogOffset": 1, "runId": "r1", "role": "user", "agent": "", "model": "", "messageId": "m1", "text": "问题一"},
+ {"runlogOffset": 2, "runId": "r1", "role": "tool_call", "agent": "", "model": "deepseek/deepseek-flash", "text": "read_file({\"path\": \"决策-方案B.md\"})", "payload": "{\"name\": \"read_file\", \"args\": \"{\\\"path\\\": \\\"决策-方案B.md\\\"}\", \"toolCallId\": \"call_a\"}"},
+ {"runlogOffset": 3, "runId": "r1", "role": "tool_result", "agent": "", "model": "deepseek/deepseek-flash", "text": "# 方案 B 决策记录", "payload": "{\"name\": \"read_file\", \"output\": \"# 方案 B 决策记录\", \"toolCallId\": \"call_a\"}"},
+ {"runlogOffset": 4, "runId": "r1", "role": "tool_call", "agent": "researcher", "model": "deepseek/deepseek-flash", "text": "read_file({\"path\": \"决策-方案B.md\"})", "payload": "{\"name\": \"read_file\", \"args\": \"{\\\"path\\\": \\\"决策-方案B.md\\\"}\", \"toolCallId\": \"call_a\"}"},
+ {"runlogOffset": 5, "runId": "r1", "role": "tool_result", "agent": "researcher", "model": "deepseek/deepseek-flash", "text": "子代理读到的正文", "payload": "{\"name\": \"read_file\", \"output\": \"子代理读到的正文\", \"toolCallId\": \"call_a\"}"},
+ {"runlogOffset": 6, "runId": "r1", "role": "assistant", "agent": "researcher", "model": "deepseek/deepseek-flash", "text": "子代理终稿，不能冒充主答案"},
+ {"runlogOffset": 7, "runId": "r1", "role": "assistant", "agent": "", "model": "deepseek/deepseek-flash", "text": "主答案：理由见 决策-方案B.md §2。"}
+]

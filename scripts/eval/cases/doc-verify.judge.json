@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "caseId": "doc-verify",
+  "comment": "两类裁判的配置与响应解析规则。responseParse.status=unverified 表示尚未实测固定：此时 calibrate/run 一律拒绝执行（JudgeConfigError），先把 probe --kind <kind> --execute 的真实响应字段路径与值映射写回本文件并把 status 改为 verified。服务原始值与内部 yes/no/unknown 分开，只映射服务明确表达的取值。",
+  "decision": {
+    "model": "decision-model-preview",
+    "url": "https://llm-d7zdt4gmth2v7k44.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/systemone",
+    "authEnv": "DASHSCOPE_API_KEY",
+    "authPrefix": "",
+    "authNote": "认证头沿用用户示例的 Authorization: ${DASHSCOPE_API_KEY}，不添加 Bearer（案例 §5.2）。密钥只从进程环境读取。",
+    "timeoutSec": 60,
+    "requestShape": {
+      "model": "decision-model-preview",
+      "state": "三轮问题与答案、四份文件原文、citations、read_events、§3 预期结果（JSON 编码，实测后固定具体结构）",
+      "questions": "来自 cases/doc-verify.json 的 decisionQuestions（Q1–Q3，type=noul，逐字）"
+    },
+    "responseParse": {
+      "status": "unverified",
+      "questions": {
+        "Q1": {"path": null},
+        "Q2": {"path": null},
+        "Q3": {"path": null}
+      },
+      "valueMap": {},
+      "verifiedBy": null,
+      "verifiedAt": null
+    },
+    "voteDirection": {"Q1": "yes_pass", "Q2": "yes_pass", "Q3": "no_pass"}
+  },
+  "llm": {
+    "url": "https://api.deepseek.com/v1/chat/completions",
+    "model": "deepseek-v4-pro",
+    "authEnv": "TAKO_ENV:DEEPSEEK_API_KEY",
+    "authPrefix": "Bearer ",
+    "timeoutSec": 60,
+    "temperature": 0,
+    "responseFormat": "json_object",
+    "candidateThresholds": [3, 4, 5],
+    "threshold": null,
+    "thresholdVerified": false,
+    "responseParse": {
+      "status": "verified",
+      "contentPath": "choices.0.message.content",
+      "scorePath": "score",
+      "unknownPath": "unknown",
+      "hardViolationPath": "hardViolation",
+      "evidencePath": "evidence",
+      "verifiedBy": "python3 scripts/eval/run_eval.py probe --kind llm --execute",
+      "verifiedAt": "2026-11-18T02:15:54+08:00"
+    }
+  },
+  "admission": {
+    "smokeDirection": "6 例（3 好 3 坏）通过/失败方向全部符合人工判定",
+    "holdoutAgreement": 0.9,
+    "hardFailRecall": 1.0,
+    "unknownRateMax": 0.10
+  }
+}

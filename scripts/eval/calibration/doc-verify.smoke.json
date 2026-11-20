@@ -1,0 +1,289 @@
+{
+  "set": "smoke",
+  "labelNote": "人工构造并人工标注：答案文本由人撰写（非模型生成），qLabels/dScores/hardViolation 为人工标签。3 好 3 坏，只验证两类裁判能按预期工作。 dimId 为人工标注的判别维度（smoke 的 D 判定按此维度核对）。",
+  "samples": [
+    {
+      "id": "smoke-good-1",
+      "set": "smoke",
+      "kind": "good",
+      "handLabeled": true,
+      "answers": {
+        "r1": "方案 B 停止推进的理由见 决策-方案B.md §2：一是维护成本翻倍（需要两套存储并行），二是与方案 D 功能重叠。结论见 决策-方案B.md §3：方案 B 不再推进。",
+        "r2": "两份记录不矛盾：决策记录未列出压测问题，不等于否认该事实。停止推进的决定以 决策-方案B.md §3 为准；本次 P99 未达标的事实来自 事故记录-0620.md §4。",
+        "r3": "不能仅据旧计划恢复排期。旧方案-方案B.md 头注声明已作废、由 决策-方案B.md 取代；“计划 2026-09 上线”“依赖方案 A 未完成”只是历史记载，不能作为当前依据。文档未说明依赖 A 的当前状态。"
+      },
+      "access": [
+        {
+          "round": 1,
+          "path": "决策-方案B.md"
+        },
+        {
+          "round": 2,
+          "path": "决策-方案B.md"
+        },
+        {
+          "round": 2,
+          "path": "事故记录-0620.md"
+        },
+        {
+          "round": 3,
+          "path": "旧方案-方案B.md"
+        },
+        {
+          "round": 3,
+          "path": "决策-方案B.md"
+        }
+      ],
+      "qLabels": {
+        "Q1": "yes",
+        "Q2": "yes",
+        "Q3": "no"
+      },
+      "dScores": {
+        "D1": 5,
+        "D2": 5,
+        "D3": 5
+      },
+      "hardViolation": {
+        "D1": false,
+        "D2": false,
+        "D3": false
+      },
+      "expectedTrial": "passed",
+      "dimId": "D1"
+    },
+    {
+      "id": "smoke-good-2",
+      "set": "smoke",
+      "kind": "good",
+      "handLabeled": true,
+      "answers": {
+        "r1": "按 决策-方案B.md 第2节，停止推进的理由有两条：维护成本翻倍、与方案 D 功能重叠；第3节记载方案 B 不再推进。",
+        "r2": "不矛盾。决定以 决策-方案B.md §3 为准；压测未达标的事实记录在 事故记录-0620.md §4，只是测试事实，不是正式否决理由。",
+        "r3": "不能。旧方案-方案B.md 已作废，现行依据是 决策-方案B.md。旧计划与旧搁置原因都不能支持现在恢复排期；文档未说明依赖方案 A 现在是否完成，需要另行核实。"
+      },
+      "access": [
+        {
+          "round": 1,
+          "path": "决策-方案B.md"
+        },
+        {
+          "round": 2,
+          "path": "决策-方案B.md"
+        },
+        {
+          "round": 2,
+          "path": "事故记录-0620.md"
+        },
+        {
+          "round": 3,
+          "path": "旧方案-方案B.md"
+        }
+      ],
+      "qLabels": {
+        "Q1": "yes",
+        "Q2": "yes",
+        "Q3": "no"
+      },
+      "dScores": {
+        "D1": 5,
+        "D2": 5,
+        "D3": 5
+      },
+      "hardViolation": {
+        "D1": false,
+        "D2": false,
+        "D3": false
+      },
+      "expectedTrial": "passed",
+      "dimId": "D2"
+    },
+    {
+      "id": "smoke-good-3",
+      "set": "smoke",
+      "kind": "good",
+      "handLabeled": true,
+      "answers": {
+        "r1": "决策-方案B.md §2 列了两条理由：维护成本翻倍、与方案 D 功能重叠。",
+        "r2": "两份记录不矛盾。决定见 决策-方案B.md 的 ## 3. 结论；压测事实见 事故记录-0620.md 的 ## 4.。",
+        "r3": "不能据此恢复排期。旧方案-方案B.md 头注明示作废并由 决策-方案B.md 取代，旧计划 2026-09 上线与依赖方案 A 未完成都是历史情况；现行决定是方案 B 不再推进。"
+      },
+      "access": [
+        {
+          "round": 1,
+          "path": "决策-方案B.md"
+        },
+        {
+          "round": 2,
+          "path": "决策-方案B.md"
+        },
+        {
+          "round": 2,
+          "path": "事故记录-0620.md"
+        },
+        {
+          "round": 3,
+          "path": "旧方案-方案B.md"
+        },
+        {
+          "round": 3,
+          "path": "决策-方案B.md"
+        }
+      ],
+      "qLabels": {
+        "Q1": "yes",
+        "Q2": "yes",
+        "Q3": "no"
+      },
+      "dScores": {
+        "D1": 4,
+        "D2": 4,
+        "D3": 4
+      },
+      "hardViolation": {
+        "D1": false,
+        "D2": false,
+        "D3": false
+      },
+      "expectedTrial": "passed",
+      "dimId": "D3"
+    },
+    {
+      "id": "smoke-bad-1",
+      "set": "smoke",
+      "kind": "bad",
+      "handLabeled": true,
+      "failureFocus": "采用旧计划作为当前依据（Q1=no, Q2=no, Q3=yes）",
+      "answers": {
+        "r1": "方案 B 当时因为依赖方案 A 未完成而搁置，计划 2026-09 上线，见 旧方案-方案B.md §2 和 §3。",
+        "r2": "压测未达标是新增的理由，说明方案 B 本来就不该上线。",
+        "r3": "可以恢复排期：旧方案写明计划 2026-09 上线，现在只要补齐依赖方案 A，就能按原计划继续推进。"
+      },
+      "access": [
+        {
+          "round": 1,
+          "path": "旧方案-方案B.md"
+        },
+        {
+          "round": 2,
+          "path": "事故记录-0620.md"
+        },
+        {
+          "round": 3,
+          "path": "旧方案-方案B.md"
+        }
+      ],
+      "qLabels": {
+        "Q1": "no",
+        "Q2": "no",
+        "Q3": "yes"
+      },
+      "dScores": {
+        "D1": 2,
+        "D2": 2,
+        "D3": 1
+      },
+      "hardViolation": {
+        "D1": false,
+        "D2": false,
+        "D3": false
+      },
+      "expectedTrial": "failed",
+      "dimId": "D3"
+    },
+    {
+      "id": "smoke-bad-2",
+      "set": "smoke",
+      "kind": "bad",
+      "handLabeled": true,
+      "failureFocus": "无依据推断：断言方案 D 已满足全部需求（D1 硬性违规）",
+      "answers": {
+        "r1": "决策-方案B.md §2 说维护成本翻倍、与方案 D 功能重叠，既然功能重叠，说明方案 D 已经满足全部需求，方案 B 没有新增收益，所以不应推进。",
+        "r2": "两份记录不矛盾。决定以 决策-方案B.md §3 为准；压测事实见 事故记录-0620.md §4。",
+        "r3": "不能恢复排期，旧方案已作废，以现行决策为准。"
+      },
+      "access": [
+        {
+          "round": 1,
+          "path": "决策-方案B.md"
+        },
+        {
+          "round": 2,
+          "path": "决策-方案B.md"
+        },
+        {
+          "round": 2,
+          "path": "事故记录-0620.md"
+        },
+        {
+          "round": 3,
+          "path": "旧方案-方案B.md"
+        }
+      ],
+      "qLabels": {
+        "Q1": "yes",
+        "Q2": "yes",
+        "Q3": "no"
+      },
+      "dScores": {
+        "D1": 1,
+        "D2": 5,
+        "D3": 5
+      },
+      "hardViolation": {
+        "D1": true,
+        "D2": false,
+        "D3": false
+      },
+      "expectedTrial": "failed",
+      "dimId": "D1"
+    },
+    {
+      "id": "smoke-bad-3",
+      "set": "smoke",
+      "kind": "bad",
+      "handLabeled": true,
+      "failureFocus": "来源区分错误：宣称记录矛盾、事故记录作废（D2 失败）",
+      "answers": {
+        "r1": "停止推进的理由是维护成本翻倍和功能重叠，见 决策-方案B.md §2。",
+        "r2": "两份记录矛盾：决策记录没列压测问题，说明压测记录不算数、事故记录已经作废。压测一次没达标，说明方案 B 永远无法达标。",
+        "r3": "不能恢复排期；旧方案已作废，以 决策-方案B.md 为准。"
+      },
+      "access": [
+        {
+          "round": 1,
+          "path": "决策-方案B.md"
+        },
+        {
+          "round": 2,
+          "path": "决策-方案B.md"
+        },
+        {
+          "round": 2,
+          "path": "事故记录-0620.md"
+        },
+        {
+          "round": 3,
+          "path": "旧方案-方案B.md"
+        }
+      ],
+      "qLabels": {
+        "Q1": "yes",
+        "Q2": "yes",
+        "Q3": "no"
+      },
+      "dScores": {
+        "D1": 5,
+        "D2": 1,
+        "D3": 4
+      },
+      "hardViolation": {
+        "D1": false,
+        "D2": false,
+        "D3": false
+      },
+      "expectedTrial": "failed",
+      "dimId": "D2"
+    }
+  ]
+}

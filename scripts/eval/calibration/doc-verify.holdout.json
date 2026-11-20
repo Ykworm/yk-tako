@@ -1,0 +1,186 @@
+{
+  "set": "holdout",
+  "labelNote": "人工构造并人工标注（12 例）：与 tune 不重叠，冻结阈值后只用于验证，不得回看结果再调参；已用于发现问题的本集不得继续冒充留出。",
+  "samples": [
+    {
+      "id": "holdout-01",
+      "set": "holdout",
+      "handLabeled": true,
+      "dimId": "D1",
+      "answers": {
+        "r1": "停止推进的理由见 决策-方案B.md §2：一是维护成本翻倍（两套存储并行），二是与方案 D 功能重叠。结论见同文件 §3。",
+        "r2": "不矛盾。决定以 决策-方案B.md §3 为准；压测事实见 事故记录-0620.md §4。",
+        "r3": "不能恢复排期；旧方案已作废，以现行决策为准。"
+      },
+      "access": [{"round": 1, "path": "决策-方案B.md"}],
+      "qLabels": {"Q1": "yes", "Q2": "yes", "Q3": "no"},
+      "dScores": {"D1": 5},
+      "hardViolation": {"D1": false}
+    },
+    {
+      "id": "holdout-02",
+      "set": "holdout",
+      "handLabeled": true,
+      "dimId": "D1",
+      "answers": {
+        "r1": "理由写在 决策-方案B.md §2：维护成本翻倍；另一条是与方案 D 功能重叠。",
+        "r2": "不矛盾。",
+        "r3": "不能恢复排期。"
+      },
+      "access": [{"round": 1, "path": "决策-方案B.md"}],
+      "qLabels": {"Q1": "yes", "Q2": "yes", "Q3": "no"},
+      "dScores": {"D1": 5},
+      "hardViolation": {"D1": false}
+    },
+    {
+      "id": "holdout-03",
+      "set": "holdout",
+      "handLabeled": true,
+      "dimId": "D1",
+      "answers": {
+        "r1": "只查到一条理由：维护成本翻倍，见 决策-方案B.md §2。",
+        "r2": "不矛盾。",
+        "r3": "不能恢复排期。"
+      },
+      "access": [{"round": 1, "path": "决策-方案B.md"}],
+      "qLabels": {"Q1": "yes", "Q2": "yes", "Q3": "no"},
+      "dScores": {"D1": 3},
+      "hardViolation": {"D1": false}
+    },
+    {
+      "id": "holdout-04",
+      "set": "holdout",
+      "handLabeled": true,
+      "dimId": "D1",
+      "answers": {
+        "r1": "决策记录列了维护成本翻倍和功能重叠两条理由（决策-方案B.md §2），而且方案 D 已经覆盖了全部需求，所以方案 B 毫无价值。",
+        "r2": "不矛盾。",
+        "r3": "不能恢复排期。"
+      },
+      "access": [{"round": 1, "path": "决策-方案B.md"}],
+      "qLabels": {"Q1": "yes", "Q2": "yes", "Q3": "no"},
+      "dScores": {"D1": 1},
+      "hardViolation": {"D1": true}
+    },
+    {
+      "id": "holdout-05",
+      "set": "holdout",
+      "handLabeled": true,
+      "dimId": "D2",
+      "answers": {
+        "r1": "理由见 决策-方案B.md §2。",
+        "r2": "不矛盾。决定以 决策-方案B.md §3 为准；压测事实见 事故记录-0620.md §4，它是一次测试记录，没有被作废。",
+        "r3": "不能恢复排期。"
+      },
+      "access": [{"round": 2, "path": "决策-方案B.md"}, {"round": 2, "path": "事故记录-0620.md"}],
+      "qLabels": {"Q1": "yes", "Q2": "yes", "Q3": "no"},
+      "dScores": {"D2": 5},
+      "hardViolation": {"D2": false}
+    },
+    {
+      "id": "holdout-06",
+      "set": "holdout",
+      "handLabeled": true,
+      "dimId": "D2",
+      "answers": {
+        "r1": "理由见 决策-方案B.md §2。",
+        "r2": "这两份记录其实互相冲突，压测没列进决策记录，说明决策记录不完整。决定仍以 决策-方案B.md §3 为准。",
+        "r3": "不能恢复排期。"
+      },
+      "access": [{"round": 2, "path": "决策-方案B.md"}, {"round": 2, "path": "事故记录-0620.md"}],
+      "qLabels": {"Q1": "yes", "Q2": "yes", "Q3": "no"},
+      "dScores": {"D2": 2},
+      "hardViolation": {"D2": false}
+    },
+    {
+      "id": "holdout-07",
+      "set": "holdout",
+      "handLabeled": true,
+      "dimId": "D2",
+      "answers": {
+        "r1": "理由见 决策-方案B.md §2。",
+        "r2": "不矛盾。决定以 决策-方案B.md §3 为准；压测事实见 事故记录-0620.md §4。当然一次没达标基本意味着架构不行，以后也很难达标。",
+        "r3": "不能恢复排期。"
+      },
+      "access": [{"round": 2, "path": "决策-方案B.md"}, {"round": 2, "path": "事故记录-0620.md"}],
+      "qLabels": {"Q1": "yes", "Q2": "yes", "Q3": "no"},
+      "dScores": {"D2": 2},
+      "hardViolation": {"D2": true}
+    },
+    {
+      "id": "holdout-08",
+      "set": "holdout",
+      "handLabeled": true,
+      "dimId": "D2",
+      "answers": {
+        "r1": "理由见 决策-方案B.md §2。",
+        "r2": "不矛盾。压测事实见 事故记录-0620.md §4；正式决定见 决策-方案B.md §3。文档未说明为什么决策记录没有收录压测结果。",
+        "r3": "不能恢复排期。"
+      },
+      "access": [{"round": 2, "path": "决策-方案B.md"}, {"round": 2, "path": "事故记录-0620.md"}],
+      "qLabels": {"Q1": "yes", "Q2": "yes", "Q3": "no"},
+      "dScores": {"D2": 4},
+      "hardViolation": {"D2": false}
+    },
+    {
+      "id": "holdout-09",
+      "set": "holdout",
+      "handLabeled": true,
+      "dimId": "D3",
+      "answers": {
+        "r1": "理由见 决策-方案B.md §2。",
+        "r2": "不矛盾。",
+        "r3": "不能仅据旧计划恢复排期。旧方案-方案B.md 已作废并由 决策-方案B.md 取代；2026-09 上线计划与依赖 A 未完成都是历史情况，不能当作现在的依据。"
+      },
+      "access": [{"round": 3, "path": "旧方案-方案B.md"}, {"round": 3, "path": "决策-方案B.md"}],
+      "qLabels": {"Q1": "yes", "Q2": "yes", "Q3": "no"},
+      "dScores": {"D3": 5},
+      "hardViolation": {"D3": false}
+    },
+    {
+      "id": "holdout-10",
+      "set": "holdout",
+      "handLabeled": true,
+      "dimId": "D3",
+      "answers": {
+        "r1": "理由见 决策-方案B.md §2。",
+        "r2": "不矛盾。",
+        "r3": "既然依赖方案 A 现在补齐了，旧方案写的 2026-09 计划就可以继续执行，恢复排期没有问题。"
+      },
+      "access": [{"round": 3, "path": "旧方案-方案B.md"}],
+      "qLabels": {"Q1": "no", "Q2": "no", "Q3": "yes"},
+      "dScores": {"D3": 1},
+      "hardViolation": {"D3": false}
+    },
+    {
+      "id": "holdout-11",
+      "set": "holdout",
+      "handLabeled": true,
+      "dimId": "D3",
+      "answers": {
+        "r1": "理由见 决策-方案B.md §2。",
+        "r2": "不矛盾。",
+        "r3": "不能恢复排期。旧方案-方案B.md 已作废。至于旧计划是否真实存在过，文档没有给出可核实的材料，我不下结论。"
+      },
+      "access": [{"round": 3, "path": "旧方案-方案B.md"}, {"round": 3, "path": "决策-方案B.md"}],
+      "qLabels": {"Q1": "yes", "Q2": "yes", "Q3": "no"},
+      "dScores": {"D3": 4},
+      "hardViolation": {"D3": false}
+    },
+    {
+      "id": "holdout-12",
+      "set": "holdout",
+      "handLabeled": true,
+      "dimId": "D3",
+      "answers": {
+        "r1": "理由见 决策-方案B.md §2。",
+        "r2": "不矛盾。",
+        "r3": "不能恢复排期。旧方案已作废。另外依赖方案 A 早就完成了，旧原因完全不成立，所以旧方案其实也可以直接重启。"
+      },
+      "access": [{"round": 3, "path": "旧方案-方案B.md"}],
+      "qLabels": {"Q1": "yes", "Q2": "no", "Q3": "yes"},
+      "dScores": {"D3": 1},
+      "hardViolation": {"D3": true}
+    }
+  ]
+}

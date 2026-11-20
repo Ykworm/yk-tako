@@ -1,0 +1,7 @@
+[
+ {"eventOffset": 1, "kind": "start", "agent": "", "model": "", "messageId": "m1"},
+ {"eventOffset": 2, "kind": "delta", "agent": "", "model": "deepseek/deepseek-flash", "text": "主答案："},
+ {"eventOffset": 3, "kind": "delta", "agent": "researcher", "model": "deepseek/deepseek-flash", "text": "子代理流式文本"},
+ {"eventOffset": 4, "kind": "delta", "agent": "", "model": "deepseek/deepseek-flash", "text": "理由见 决策-方案B.md §2。"},
+ {"eventOffset": 5, "kind": "terminal", "agent": "", "model": "", "status": "complete"}
+]
